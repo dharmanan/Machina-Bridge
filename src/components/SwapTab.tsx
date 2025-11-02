@@ -14,6 +14,13 @@ export function SwapTab() {
     setInputAmount(localInputAmount)
   }, [localInputAmount, setInputAmount])
 
+  // Auto-fetch balances when component mounts and wallet is connected
+  useEffect(() => {
+    if (isConnected) {
+      fetchBalances()
+    }
+  }, [isConnected, fetchBalances])
+
   if (!isConnected) {
     return (
       <Container className="py-12">
@@ -53,11 +60,17 @@ export function SwapTab() {
               {/* Balance Display */}
               <div className="flex justify-between items-center mt-2">
                 <span className="text-xs text-dark-400">
-                  Balance: {state.isLoadingBalance ? 'Loading...' : 
+                  Balance: {state.isLoadingBalance ? (
+                    <span className="flex items-center gap-1">
+                      <Loader2 size={10} className="animate-spin" />
+                      Loading...
+                    </span>
+                  ) : (
                     (state.isEthToUsdc ? 
                       (state.ethBalance ? `${parseFloat(state.ethBalance).toFixed(4)} ETH` : '0 ETH') :
                       (state.usdcBalance ? `${parseFloat(state.usdcBalance).toFixed(2)} USDC` : '0 USDC')
-                    )}
+                    )
+                  )}
                 </span>
                 <div className="flex gap-2">
                   <button
