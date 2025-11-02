@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useAccount } from 'wagmi'
 import { Card, Button, Input, Container } from './ui'
 import { useBridgeKit, BridgeToken, SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, CHAIN_TOKENS } from '../hooks/useBridgeKit'
-import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle } from 'lucide-react'
+import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink } from 'lucide-react'
 
 export function BridgeTab() {
   const { address, isConnected, chainId } = useAccount()
@@ -13,6 +13,7 @@ export function BridgeTab() {
   const [selectedToken] = useState<BridgeToken>('USDC')
 
   const sourceChainId = direction === 'sepolia-to-arc' ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID
+  const destinationChainId = direction === 'sepolia-to-arc' ? ARC_CHAIN_ID : SEPOLIA_CHAIN_ID
   const sourceChainName = direction === 'sepolia-to-arc' ? 'Sepolia' : 'Arc Testnet'
   const destinationChainName = direction === 'sepolia-to-arc' ? 'Arc Testnet' : 'Sepolia'
 
@@ -127,13 +128,62 @@ export function BridgeTab() {
               </div>
             )}
 
-            {state.step === 'success' && (
-              <div className="flex items-start p-3 bg-green-500/20 rounded-lg text-green-300">
-                <CheckCircle size={16} className="mr-2 mt-0.5 flex-shrink-0" />
+            {state.isLoading && state.step !== 'success' && (
+              <div className="flex items-start p-3 bg-blue-500/20 rounded-lg text-blue-300">
+                <Loader2 size={16} className="mr-2 mt-0.5 flex-shrink-0 animate-spin" />
                 <div className="text-sm">
-                  <p className="font-semibold">Bridge Successful!</p>
+                  <p className="font-semibold">
+                    {state.step === 'switching-network' && 'Switching to source network...'}
+                    {state.step === 'approving' && 'Approving USDC spend...'}
+                    {state.step === 'signing-bridge' && 'Signing bridge transaction...'}
+                    {state.step === 'waiting-receive-message' && 'Waiting for receive confirmation...'}
+                    {!['switching-network', 'approving', 'signing-bridge', 'waiting-receive-message'].includes(state.step) && 'Processing...'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {state.step === 'success' && (
+              <div className="space-y-2 p-3 bg-green-500/20 rounded-lg text-green-300">
+                <div className="flex items-start gap-2">
+                  <CheckCircle size={16} className="mt-0.5 flex-shrink-0" />
+                  <div className="text-sm">
+                    <p className="font-semibold">Bridge Successful! 🎉</p>
+                    <p className="text-xs mt-1">USDC successfully transferred from {sourceChainName} to {destinationChainName}</p>
+                  </div>
+                </div>
+                
+                {/* Transaction Links */}
+                <div className="space-y-1 mt-3 pt-3 border-t border-green-400/20">
                   {state.sourceTxHash && (
-                    <p className="text-xs mt-1">Source Tx: {state.sourceTxHash.slice(0, 10)}...</p>
+                    <a
+                      href={
+                        sourceChainId === SEPOLIA_CHAIN_ID
+                          ? `https://sepolia.etherscan.io/tx/${state.sourceTxHash}`
+                          : `https://testnet.arcscan.app/tx/${state.sourceTxHash}`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
+                    >
+                      <span>View {sourceChainName} Tx</span>
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
+                  {state.receiveTxHash && (
+                    <a
+                      href={
+                        destinationChainId === SEPOLIA_CHAIN_ID
+                          ? `https://sepolia.etherscan.io/tx/${state.receiveTxHash}`
+                          : `https://testnet.arcscan.app/tx/${state.receiveTxHash}`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
+                    >
+                      <span>View {destinationChainName} Tx</span>
+                      <ExternalLink size={12} />
+                    </a>
                   )}
                 </div>
               </div>
