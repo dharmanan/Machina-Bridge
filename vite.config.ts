@@ -7,4 +7,24 @@ export default defineConfig({
     port: 3000,
     host: 'localhost',
   },
+  optimizeDeps: {
+    esbuildOptions: {
+      supported: {
+        'import-meta': true,
+        'top-level-await': true,
+      },
+      sourcemap: false,
+    },
+    exclude: ['@base-org/account'],
+  },
+  build: {
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          wagmi: ['wagmi'],
+        },
+      },
+    },
+  },
 })

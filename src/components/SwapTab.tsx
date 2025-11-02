@@ -167,7 +167,7 @@ export function SwapTab() {
                   type="number"
                   placeholder="0.0"
                   value={amountIn}
-                  onChange={(e) => setAmountIn(e.target.value)}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setAmountIn(e.target.value)}
                   className="flex-1"
                 />
                 <button className="px-4 py-2 bg-dark-700 hover:bg-dark-600 rounded-lg font-semibold transition-colors">

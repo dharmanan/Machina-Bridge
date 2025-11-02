@@ -46,6 +46,6 @@ export const TOKEN_DECIMALS = {
 
 // Circle Bridge Kit config
 export const CIRCLE_CONFIG = {
-  appId: process.env.REACT_APP_CIRCLE_APP_ID || '',
-  apiKey: process.env.REACT_APP_CIRCLE_API_KEY || '',
+  appId: import.meta.env.VITE_CIRCLE_APP_ID || '',
+  apiKey: import.meta.env.VITE_CIRCLE_API_KEY || '',
 }

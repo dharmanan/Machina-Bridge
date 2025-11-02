@@ -1,4 +1,3 @@
-import React from 'react'
 import { ReactNode } from 'react'
 
 interface ContainerProps {
@@ -30,6 +29,7 @@ export function Card({ children, className = '' }: CardProps) {
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary'
   loading?: boolean
+  children: ReactNode
 }
 
 export function Button({ 
