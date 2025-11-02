@@ -133,11 +133,14 @@ export function useSwap() {
         ? [SEPOLIA_CONFIG.WETH_ADDRESS, SEPOLIA_CONFIG.USDC_ADDRESS]
         : [SEPOLIA_CONFIG.USDC_ADDRESS, SEPOLIA_CONFIG.WETH_ADDRESS]
 
-      const amountIn = ethers.parseEther(inputAmount)
+      const amountIn = state.isEthToUsdc
+        ? ethers.parseEther(inputAmount)  // ETH has 18 decimals
+        : ethers.parseUnits(inputAmount, 6)  // USDC has 6 decimals
+      
       const amounts = await router.getAmountsOut(amountIn, path)
       
-      const decimals = state.isEthToUsdc ? 6 : 18
-      const outputFormatted = ethers.formatUnits(amounts[1], decimals)
+      const outputDecimals = state.isEthToUsdc ? 6 : 18  // USDC = 6, ETH = 18
+      const outputFormatted = ethers.formatUnits(amounts[1], outputDecimals)
       
       setState(prev => ({ ...prev, outputAmount: outputFormatted }))
     } catch (error) {
@@ -224,8 +227,11 @@ export function useSwap() {
         setState(prev => ({ ...prev, status: 'Swapping ETH for USDC...' }))
         
         const amountIn = ethers.parseEther(state.inputAmount)
+        const estimatedOutput = ethers.parseUnits(state.outputAmount, 6)
+        const minAmountOut = estimatedOutput * BigInt(95) / BigInt(100) // 5% slippage tolerance
+        
         tx = await router.swapExactETHForTokens(
-          0, // No minimum amount for simplicity
+          minAmountOut,
           path,
           address,
           deadline,
@@ -256,9 +262,12 @@ export function useSwap() {
 
         setState(prev => ({ ...prev, status: 'Swapping USDC for ETH...' }))
         
+        const estimatedOutput = ethers.parseEther(state.outputAmount)
+        const minAmountOut = estimatedOutput * BigInt(95) / BigInt(100) // 5% slippage tolerance
+        
         tx = await router.swapExactTokensForETH(
           amountIn,
-          0,
+          minAmountOut,
           path,
           address,
           deadline
