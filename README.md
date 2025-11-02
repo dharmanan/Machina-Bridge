@@ -59,7 +59,7 @@ Add Arc Testnet to MetaMask:
 
 ```bash
 # Clone and install
-git clone <repository-url>
+git clone https://github.com/dharmanan/Arc-Testnet-Bridge-Swap.git
 cd Arc-Testnet-Bridge-Swap
 npm install
 
