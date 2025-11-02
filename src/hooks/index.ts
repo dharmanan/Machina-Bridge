@@ -1,7 +1,5 @@
-export { useSwap, useBridge } from './useSwapAndBridge'
-export { useTokenBalance, useTokenDecimals } from './useToken'
-export { useSwapContract } from './useSwapContract'
-export { useBridgeContract } from './useBridgeContract'
+export { useSwap } from './useSwap'
+export { useBridgeKit } from './useBridgeKit'
 
-export type { SwapParams, SwapResult } from './useSwapContract'
-export type { BridgeParams, BridgeResult } from './useBridgeContract'
+export type { BridgeToken, BridgeStep, BridgeState } from './useBridgeKit'
+export { SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, CHAIN_TOKENS, CHAIN_NAMES } from './useBridgeKit'
