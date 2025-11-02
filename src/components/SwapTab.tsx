@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useAccount } from 'wagmi'
 import { ethers } from 'ethers'
 import { Card, Button, Input, Container } from './ui'
-import { UNISWAP_SEPOLIA } from '../config/networks'
+import { SUSHISWAP_SEPOLIA } from '../config/networks'
 import { ArrowDownUp } from 'lucide-react'
 
 // Uniswap V2 Router ABI (minimal)
@@ -36,23 +36,23 @@ export function SwapTab() {
     }
   }, [])
 
-  const tokenIn = isReversed ? UNISWAP_SEPOLIA.USDC : UNISWAP_SEPOLIA.WETH
-  const tokenOut = isReversed ? UNISWAP_SEPOLIA.WETH : UNISWAP_SEPOLIA.USDC
-  const tokenInSymbol = isReversed ? 'USDC' : 'ETH'
-  const tokenOutSymbol = isReversed ? 'ETH' : 'USDC'
-  const decimalsIn = isReversed ? 6 : 18
-  const decimalsOut = isReversed ? 18 : 6
+  const tokenIn = isReversed ? SUSHISWAP_SEPOLIA.USDC : SUSHISWAP_SEPOLIA.WETH
+  const tokenOut = isReversed ? SUSHISWAP_SEPOLIA.WETH : SUSHISWAP_SEPOLIA.USDC
+  const tokenInSymbol = isReversed ? 'DAI' : 'ETH'
+  const tokenOutSymbol = isReversed ? 'ETH' : 'DAI'
+  const decimalsIn = isReversed ? 18 : 18
+  const decimalsOut = isReversed ? 18 : 18
 
   // Estimate swap output
   const estimateSwap = async () => {
-    if (!provider || !amountIn) {
+    if (!provider || !amountIn || parseFloat(amountIn) <= 0) {
       setEstimatedOut('')
       return
     }
 
     try {
       const router = new ethers.Contract(
-        UNISWAP_SEPOLIA.ROUTER,
+        SUSHISWAP_SEPOLIA.ROUTER,
         ROUTER_ABI,
         provider
       )
@@ -77,7 +77,7 @@ export function SwapTab() {
     }, 500)
 
     return () => clearTimeout(timer)
-  }, [amountIn, isReversed, provider])
+  }, [amountIn, isReversed])
 
   const handleSwap = async () => {
     if (!address || !provider || !amountIn || !estimatedOut) {
@@ -89,7 +89,7 @@ export function SwapTab() {
     try {
       const signer = await provider.getSigner()
       const router = new ethers.Contract(
-        UNISWAP_SEPOLIA.ROUTER,
+        SUSHISWAP_SEPOLIA.ROUTER,
         ROUTER_ABI,
         signer
       )
@@ -107,13 +107,13 @@ export function SwapTab() {
       let tx
 
       if (isReversed) {
-        // USDC -> ETH
+        // DAI -> ETH
         const token = new ethers.Contract(tokenIn, ERC20_ABI, signer)
-        const allowance = await token.allowance(address, UNISWAP_SEPOLIA.ROUTER)
+        const allowance = await token.allowance(address, SUSHISWAP_SEPOLIA.ROUTER)
 
         if (allowance < amountInWei) {
           const approveTx = await token.approve(
-            UNISWAP_SEPOLIA.ROUTER,
+            SUSHISWAP_SEPOLIA.ROUTER,
             amountInWei
           )
           await approveTx.wait()
@@ -127,7 +127,7 @@ export function SwapTab() {
           deadline
         )
       } else {
-        // ETH -> USDC
+        // ETH -> DAI
         tx = await router.swapExactETHForTokens(
           minOut,
           path,
@@ -138,12 +138,12 @@ export function SwapTab() {
       }
 
       await tx.wait()
-      alert('Swap successful!')
+      alert('✅ Swap successful! Tx: ' + tx.hash)
       setAmountIn('')
       setEstimatedOut('')
     } catch (error) {
       console.error('Swap error:', error)
-      alert('Swap failed: ' + (error instanceof Error ? error.message : 'Unknown error'))
+      alert('❌ Swap failed: ' + (error instanceof Error ? error.message : 'Unknown error'))
     } finally {
       setIsLoading(false)
     }

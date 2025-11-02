@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useAccount } from 'wagmi'
 import { ethers } from 'ethers'
 import { Card, Button, Input, Container } from './ui'
-import { UNISWAP_SEPOLIA } from '../config/networks'
+import { SUSHISWAP_SEPOLIA } from '../config/networks'
 
 // ERC20 ABI minimal
 const ERC20_ABI = [
