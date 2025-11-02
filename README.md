@@ -11,6 +11,7 @@ A **production-ready** decentralized exchange and cross-chain bridge application
 - ERC20 token approval + swap execution
 - Etherscan transaction links
 - Bidirectional: ETH → USDC or USDC → ETH
+- **Rate limiting**: 0.1 ETH max per wallet per 24 hours (ETH → USDC only)
 - Full error handling and user feedback
 
 ### 🌉 Real Circle Bridge Kit (Bidirectional)
