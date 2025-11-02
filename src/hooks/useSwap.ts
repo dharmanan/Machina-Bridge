@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { ethers } from 'ethers'
 
@@ -8,7 +8,7 @@ const SEPOLIA_CONFIG = {
   UNISWAP_V2_ROUTER: '0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008',
   USDC_ADDRESS: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
   WETH_ADDRESS: '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9',
-  RPC_ENDPOINT: 'https://sepolia.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161',
+  RPC_ENDPOINT: 'https://rpc.sepolia.org',
 }
 
 const ROUTER_ABI = [
@@ -31,6 +31,9 @@ export interface SwapState {
   status: string | null
   txHash: string | null
   isLoading: boolean
+  ethBalance: string | null
+  usdcBalance: string | null
+  isLoadingBalance: boolean
 }
 
 export function useSwap() {
@@ -45,9 +48,12 @@ export function useSwap() {
     status: null,
     txHash: null,
     isLoading: false,
+    ethBalance: null,
+    usdcBalance: null,
+    isLoadingBalance: false,
   })
 
-  // Get provider - using ethers v6
+    // Get provider - using ethers v6
   const getProvider = useCallback(async () => {
     if (typeof window === 'undefined') return null
     
@@ -58,6 +64,53 @@ export function useSwap() {
     // Fallback to public RPC
     return new ethers.JsonRpcProvider(SEPOLIA_CONFIG.RPC_ENDPOINT)
   }, [])
+
+  // Fetch ETH and USDC balances
+  const fetchBalances = useCallback(async () => {
+    if (!address) return
+
+    setState(prev => ({ ...prev, isLoadingBalance: true }))
+
+    try {
+      const provider = await getProvider()
+      if (!provider) return
+
+      // Fetch ETH balance
+      const ethBalance = await provider.getBalance(address)
+      const ethBalanceFormatted = ethers.formatEther(ethBalance)
+
+      // Fetch USDC balance
+      const usdcContract = new ethers.Contract(
+        SEPOLIA_CONFIG.USDC_ADDRESS,
+        ['function balanceOf(address) view returns (uint256)'],
+        provider
+      )
+      const usdcBalance = await usdcContract.balanceOf(address)
+      const usdcBalanceFormatted = ethers.formatUnits(usdcBalance, 6)
+
+      setState(prev => ({
+        ...prev,
+        ethBalance: ethBalanceFormatted,
+        usdcBalance: usdcBalanceFormatted,
+        isLoadingBalance: false,
+      }))
+    } catch (error) {
+      console.error('Error fetching balances:', error)
+      setState(prev => ({
+        ...prev,
+        ethBalance: null,
+        usdcBalance: null,
+        isLoadingBalance: false,
+      }))
+    }
+  }, [address, getProvider])
+
+  // Fetch balances when address or chain changes
+  useEffect(() => {
+    if (address && chainId === SEPOLIA_CONFIG.chainId) {
+      fetchBalances()
+    }
+  }, [address, chainId, fetchBalances])
 
   // Estimate output amount
   const estimateOutput = useCallback(async (inputAmount: string) => {
@@ -270,6 +323,7 @@ export function useSwap() {
     setInputAmount,
     toggleDirection,
     executeSwap,
+    fetchBalances,
     setOutputAmount: (amount: string) => setState(prev => ({ ...prev, outputAmount: amount })),
   }
 }

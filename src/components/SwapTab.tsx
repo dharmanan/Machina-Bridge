@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react'
 import { useAccount } from 'wagmi'
 import { Card, Button, Input, Container } from './ui'
-import { ArrowDownUp, Loader2, AlertCircle, CheckCircle, ExternalLink } from 'lucide-react'
+import { ArrowDownUp, Loader2, AlertCircle, CheckCircle, ExternalLink, RefreshCw } from 'lucide-react'
 import { useSwap } from '../hooks/useSwap'
 
 export function SwapTab() {
   const { isConnected } = useAccount()
-  const { state, setInputAmount, toggleDirection, executeSwap } = useSwap()
+  const { state, setInputAmount, toggleDirection, executeSwap, fetchBalances } = useSwap()
   const [localInputAmount, setLocalInputAmount] = useState('')
 
   // Update parent state when user changes input
@@ -34,19 +34,6 @@ export function SwapTab() {
           <p className="text-dark-400 text-sm mb-6">Swap on Sepolia using Uniswap V2 Protocol</p>
 
           <div className="space-y-4">
-            {/* Direction selector */}
-            <div>
-              <label className="text-sm font-medium text-dark-300 mb-2 block">Swap Direction</label>
-              <select
-                value={state.isEthToUsdc ? 'eth-usdc' : 'usdc-eth'}
-                onChange={(e) => toggleDirection()}
-                className="w-full px-4 py-2 bg-dark-700 border border-dark-600 rounded-lg text-white"
-              >
-                <option value="eth-usdc">ETH → USDC</option>
-                <option value="usdc-eth">USDC → ETH</option>
-              </select>
-            </div>
-
             {/* Input Amount */}
             <div>
               <label className="text-sm font-medium text-dark-300 mb-2 block">From</label>
@@ -62,6 +49,39 @@ export function SwapTab() {
                 <button className="px-4 py-2 bg-dark-700 hover:bg-dark-600 rounded-lg font-semibold transition-colors">
                   {state.isEthToUsdc ? 'ETH' : 'USDC'}
                 </button>
+              </div>
+              {/* Balance Display */}
+              <div className="flex justify-between items-center mt-2">
+                <span className="text-xs text-dark-400">
+                  Balance: {state.isLoadingBalance ? 'Loading...' : 
+                    (state.isEthToUsdc ? 
+                      (state.ethBalance ? `${parseFloat(state.ethBalance).toFixed(4)} ETH` : '0 ETH') :
+                      (state.usdcBalance ? `${parseFloat(state.usdcBalance).toFixed(2)} USDC` : '0 USDC')
+                    )}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => fetchBalances()}
+                    className="text-xs text-blue-400 hover:text-blue-300 transition-colors p-1"
+                    disabled={state.isLoadingBalance}
+                    title="Refresh balance"
+                  >
+                    <RefreshCw size={12} className={state.isLoadingBalance ? 'animate-spin' : ''} />
+                  </button>
+                  <button
+                    onClick={() => {
+                      const balance = state.isEthToUsdc ? state.ethBalance : state.usdcBalance
+                      if (balance && parseFloat(balance) > 0) {
+                        const maxAmount = Math.max(0, parseFloat(balance) - 0.01) // Leave some for gas
+                        setLocalInputAmount(maxAmount.toString())
+                      }
+                    }}
+                    className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                    disabled={state.isLoadingBalance || !state.ethBalance || !state.usdcBalance}
+                  >
+                    MAX
+                  </button>
+                </div>
               </div>
             </div>
 

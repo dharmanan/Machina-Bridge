@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 import { ethers } from 'ethers'
-import { UNISWAP_SEPOLIA } from '../config/networks'
+import { SUSHISWAP_SEPOLIA } from '../config/networks'
 
 const ROUTER_ABI = [
   'function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)',
@@ -40,13 +40,13 @@ export function useSwapContract(provider: ethers.BrowserProvider | null) {
 
       try {
         const router = new ethers.Contract(
-          UNISWAP_SEPOLIA.ROUTER,
+          SUSHISWAP_SEPOLIA.ROUTER,
           ROUTER_ABI,
           provider
         )
 
-        const decimalsIn = tokenIn === UNISWAP_SEPOLIA.WETH ? 18 : 6
-        const decimalsOut = tokenOut === UNISWAP_SEPOLIA.WETH ? 18 : 6
+        const decimalsIn = tokenIn === SUSHISWAP_SEPOLIA.WETH ? 18 : 6
+        const decimalsOut = tokenOut === SUSHISWAP_SEPOLIA.WETH ? 18 : 6
 
         const amountInWei = ethers.parseUnits(amountIn, decimalsIn)
         const amounts = await router.getAmountsOut(amountInWei, [tokenIn, tokenOut])
@@ -70,13 +70,13 @@ export function useSwapContract(provider: ethers.BrowserProvider | null) {
       try {
         const signer = await provider.getSigner()
         const router = new ethers.Contract(
-          UNISWAP_SEPOLIA.ROUTER,
+          SUSHISWAP_SEPOLIA.ROUTER,
           ROUTER_ABI,
           signer
         )
 
-        const decimalsIn = params.tokenIn === UNISWAP_SEPOLIA.WETH ? 18 : 6
-        const decimalsOut = params.tokenOut === UNISWAP_SEPOLIA.WETH ? 18 : 6
+        const decimalsIn = params.tokenIn === SUSHISWAP_SEPOLIA.WETH ? 18 : 6
+        const decimalsOut = params.tokenOut === SUSHISWAP_SEPOLIA.WETH ? 18 : 6
 
         const amountInWei = ethers.parseUnits(params.amountIn, decimalsIn)
         const minOutWei = ethers.parseUnits(params.minAmountOut, decimalsOut)
@@ -84,7 +84,7 @@ export function useSwapContract(provider: ethers.BrowserProvider | null) {
 
         let tx
 
-        if (params.tokenIn === UNISWAP_SEPOLIA.WETH) {
+        if (params.tokenIn === SUSHISWAP_SEPOLIA.WETH) {
           // ETH -> Token
           tx = await router.swapExactETHForTokens(
             minOutWei,
@@ -96,10 +96,10 @@ export function useSwapContract(provider: ethers.BrowserProvider | null) {
         } else {
           // Token -> ETH
           const token = new ethers.Contract(params.tokenIn, ERC20_ABI, signer)
-          const allowance = await token.allowance(params.recipient, UNISWAP_SEPOLIA.ROUTER)
+          const allowance = await token.allowance(params.recipient, SUSHISWAP_SEPOLIA.ROUTER)
 
           if (allowance < amountInWei) {
-            const approveTx = await token.approve(UNISWAP_SEPOLIA.ROUTER, amountInWei)
+            const approveTx = await token.approve(SUSHISWAP_SEPOLIA.ROUTER, amountInWei)
             await approveTx.wait()
           }
 
