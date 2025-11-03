@@ -186,7 +186,17 @@ npm run lint     # Run ESLint
 - Verify sufficient token balance
 - Check Uniswap liquidity
 
-##  License
+## 📝 Additional Resources
+
+- [See all features](./FEATURES.md)
+- [Setup & deployment guide](./SETUP.md)
+- [Development documentation](./DEVELOP.md)
+- [Uniswap V2 Docs](https://docs.uniswap.org/contracts/v2/)
+- [Circle Bridge Kit Docs](https://developers.circle.com/bridge-kit)
+- [ethers.js v6](https://docs.ethers.org/v6/)
+- [wagmi Documentation](https://wagmi.sh/)
+
+## 📄 License
 
 MIT
 
