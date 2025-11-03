@@ -1,6 +1,6 @@
 # Arc Testnet Bridge Swap - Features
 
-## ✅ Gerçek Blockchain İntegrasyonu
+## ✅ Real Blockchain Integration
 
 ### 1. **Real Uniswap V2 Swap (Sepolia)**
 - ✅ Sepolia ETH → USDC swap
