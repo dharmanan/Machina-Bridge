@@ -1,6 +1,7 @@
 import { fallback, http } from 'viem'
 import { createConfig } from 'wagmi'
-import { coinbaseWallet, injected, walletConnect } from 'wagmi/connectors'
+import { connectorsForWallets } from '@rainbow-me/rainbowkit'
+import { coinbaseWallet, injectedWallet, metaMaskWallet, walletConnectWallet } from '@rainbow-me/rainbowkit/wallets'
 import {
   ARBITRUM_SEPOLIA_EVM_CHAIN,
   ARC_EVM_CHAIN,
@@ -10,20 +11,25 @@ import {
   SUPPORTED_EVM_CHAINS,
 } from './chains'
 
-const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID?.trim()
+const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID?.trim() || '00000000000000000000000000000000'
 
-const connectors = [
-  injected({ shimDisconnect: true }),
-  coinbaseWallet({ appName: 'Arc Bridge' }),
-  ...(walletConnectProjectId
-    ? [
-        walletConnect({
-          projectId: walletConnectProjectId,
-          showQrModal: true,
-        }),
-      ]
-    : []),
-]
+const connectors = connectorsForWallets(
+  [
+    {
+      groupName: 'Recommended',
+      wallets: [
+        metaMaskWallet,
+        coinbaseWallet,
+        walletConnectWallet,
+        injectedWallet,
+      ],
+    },
+  ],
+  {
+    appName: 'Arc Bridge',
+    projectId: walletConnectProjectId,
+  },
+)
 
 export const wagmiConfig = createConfig({
   chains: SUPPORTED_EVM_CHAINS,

@@ -6,6 +6,7 @@ import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
+import { useSuiWallet } from './hooks/useSuiWallet'
 import { SUPPORTED_EVM_CHAIN_OPTIONS, addChainToWallet, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X } from 'lucide-react'
@@ -27,6 +28,16 @@ export default function App() {
     isConnecting: isConnectingPhantomSolana,
     isPhantomInstalled,
   } = usePhantomSolana()
+  const {
+    connect: connectSuiWallet,
+    currentWalletName: suiCurrentWalletName,
+    defaultWalletName: defaultSuiWalletName,
+    disconnect: disconnectSuiWallet,
+    error: suiWalletError,
+    isConnected: isSuiWalletConnected,
+    isConnecting: isConnectingSuiWallet,
+    isWalletAvailable: isSuiWalletAvailable,
+  } = useSuiWallet()
   const [activeTab, setActiveTab] = useState<Tab>('swap')
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
@@ -116,6 +127,19 @@ export default function App() {
     }
   }
 
+  const handleSuiWalletAction = async () => {
+    try {
+      if (isSuiWalletConnected) {
+        await disconnectSuiWallet()
+        return
+      }
+
+      await connectSuiWallet(defaultSuiWalletName)
+    } catch (error) {
+      logger.warn('Unable to change Sui wallet connection state:', error)
+    }
+  }
+
   const showMobileNotice = isMobileExperience && !hasDismissedMobileNotice
 
   return (
@@ -184,35 +208,33 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex min-w-0 flex-col gap-3 lg:items-end">
-              <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-                <div className="flex items-center gap-2">
+            <div className="flex min-w-0 flex-col gap-2 lg:items-end">
+                {/* Row 1 — Social icons + EVM network switcher + wallet */}
+                <div className="flex items-center gap-2 lg:justify-end">
                   <a
                     href="https://x.com/KohenEric"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
                   >
-                    <Twitter size={18} />
+                    <Twitter size={16} />
                   </a>
                   <a
                     href="https://github.com/dharmanan"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
                   >
-                    <Github size={18} />
+                    <Github size={16} />
                   </a>
-                </div>
-
                 {isConnected && (
                   <div className="relative" ref={dropdownRef}>
                     <button
                       onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
-                      className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+                      className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
                     >
-                      <span>Network: {getSupportedEvmChainName(chainId)}</span>
-                      <ChevronDown size={14} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
+                      <span>{getSupportedEvmChainName(chainId)}</span>
+                      <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
                     </button>
                     {showNetworkDropdown && (
                       <div className="absolute right-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
@@ -231,40 +253,57 @@ export default function App() {
                     )}
                   </div>
                 )}
+                <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
+              </div>
 
-                <div className="hidden items-center gap-2 rounded-xl border border-slate-200 bg-[#f8faf7] px-3 py-2 text-left sm:flex">
-                  <span className={`h-2.5 w-2.5 rounded-full ${isPhantomConnected ? 'bg-green-500' : isPhantomInstalled ? 'bg-amber-500' : 'bg-slate-300'}`} />
-                  <div>
-                    <p className="text-[11px] uppercase tracking-wide text-slate-400">Solana</p>
-                    <p className="text-xs font-medium text-slate-700">
-                      {isPhantomConnected && phantomSolanaAddress
-                        ? `Phantom ${phantomSolanaAddress.slice(0, 4)}...${phantomSolanaAddress.slice(-4)}`
-                        : isPhantomInstalled
-                          ? 'Phantom ready'
-                          : 'Phantom not installed'}
-                    </p>
-                  </div>
+              {/* Row 2 — Solana + Sui side by side */}
+              <div className="flex items-center gap-3 lg:justify-end">
+                {/* Solana */}
+                <div className="flex items-center gap-1.5">
+                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
+                  <span className="text-xs text-slate-600">
+                    {isPhantomConnected ? 'Connected Solana' : 'Solana'}
+                  </span>
+                  <button
+                    onClick={handlePhantomAction}
+                    disabled={!isPhantomInstalled || isConnectingPhantomSolana}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
+                  </button>
                 </div>
 
-                <button
-                  onClick={handlePhantomAction}
-                  disabled={!isPhantomInstalled || isConnectingPhantomSolana}
-                  className="rounded-xl border border-[#2F6E0C]/20 bg-[#eef7e8] px-3 py-2 text-sm font-medium text-[#2F6E0C] transition-colors hover:bg-[#e4f1db] disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {isConnectingPhantomSolana ? 'Connecting Phantom...' : isPhantomConnected ? 'Disconnect Phantom' : 'Connect Phantom'}
-                </button>
+                <div className="h-4 w-px bg-slate-200" />
 
-                <ConnectButton chainStatus="none" />
+                {/* Sui */}
+                <div className="flex items-center gap-1.5">
+                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isSuiWalletConnected ? 'bg-sky-500' : 'bg-slate-300'}`} />
+                  <span className="text-xs text-slate-600">
+                    {isSuiWalletConnected ? 'Connected Sui' : 'Sui'}
+                  </span>
+                  <button
+                    onClick={handleSuiWalletAction}
+                    disabled={(!isSuiWalletAvailable && !isSuiWalletConnected) || isConnectingSuiWallet}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isConnectingSuiWallet ? '...' : isSuiWalletConnected ? 'Disconnect' : 'Connect'}
+                  </button>
+                </div>
               </div>
 
-              <div className="w-full text-sm text-slate-500 lg:max-w-[560px] lg:text-right">
-                <p>
-                  EVM wallet: {isConnected ? getSupportedEvmChainName(chainId) : 'Not connected'}
-                  {' · '}
-                  Solana wallet: {isPhantomConnected ? 'Phantom connected' : isPhantomInstalled ? 'Phantom ready' : 'Phantom not installed'}
-                </p>
-                {phantomSolanaError && <p className="mt-1 text-red-500">{phantomSolanaError}</p>}
-              </div>
+              {/* Row 3 — wallet name status */}
+              <p className="text-[11px] text-slate-400 lg:text-right">
+                Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
+                {' · '}
+                Sui wallet: {isSuiWalletConnected ? (suiCurrentWalletName || 'Connected') : '—'}
+              </p>
+
+              {(phantomSolanaError || suiWalletError) && (
+                <div className="text-[11px] text-red-500 lg:text-right">
+                  {phantomSolanaError && <p>{phantomSolanaError}</p>}
+                  {suiWalletError && <p>{suiWalletError}</p>}
+                </div>
+              )}
             </div>
           </div>
         </Container>

@@ -2,6 +2,7 @@ export { useSwap } from './useSwap'
 export { useBridgeKit } from './useBridgeKit'
 export { useGatewayForwarding } from './useGatewayForwarding'
 export { usePhantomSolana } from './usePhantomSolana'
+export { useSuiWallet } from './useSuiWallet'
 export { useSolanaBridge } from './useSolanaBridge'
 
 export type { BridgeToken, BridgeStep, BridgeState } from './useBridgeKit'
