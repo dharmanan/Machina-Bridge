@@ -6,6 +6,7 @@ import { ARC_EVM_CHAIN, ARC_EVM_CHAIN_ID, SEPOLIA_EVM_CHAIN, SEPOLIA_EVM_CHAIN_I
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
   deriveSolanaUsdcAta,
+  fetchSolanaUsdcBalance,
   SOLANA_DEVNET_DOMAIN_ID,
   SOLANA_DEVNET_GATEWAY_MINTER,
   SOLANA_DEVNET_NAME,
@@ -17,6 +18,8 @@ const GATEWAY_API_BASE = 'https://gateway-api-testnet.circle.com'
 const GATEWAY_WALLET_ADDRESS = '0x0077777d7EBA4688BDeF3E311b846F25870A19B9'
 const TRANSFER_POLL_INTERVAL_MS = 5_000
 const TRANSFER_POLL_TIMEOUT_MS = 300_000
+const DESTINATION_BALANCE_POLL_INTERVAL_MS = 5_000
+const DESTINATION_BALANCE_POLL_TIMEOUT_MS = 180_000
 const RECEIPT_WAIT_TIMEOUT_MS = 45_000
 const APPROVAL_ALLOWANCE_POLL_TIMEOUT_MS = 30_000
 const APPROVAL_ALLOWANCE_POLL_INTERVAL_MS = 3_000
@@ -112,6 +115,10 @@ export interface GatewayForwardingState {
   transferId?: string
   status?: string
   recipientAta?: string
+  destinationBalanceBefore?: string
+  destinationBalanceAfter?: string
+  fundsArrivalChecked?: boolean
+  fundsArrived?: boolean
   sourceChainId?: GatewaySourceChainId
   result: unknown | null
 }
@@ -304,6 +311,41 @@ function parseFormattedUsdcAmount(value: string) {
     return parseUnits(value, 6)
   } catch {
     return 0n
+  }
+}
+
+async function waitForSolanaUsdcArrival(params: {
+  ownerAddress: string
+  baselineRaw: bigint
+  expectedIncreaseRaw: bigint
+  timeoutMs?: number
+}) {
+  const { ownerAddress, baselineRaw, expectedIncreaseRaw, timeoutMs = DESTINATION_BALANCE_POLL_TIMEOUT_MS } = params
+  const targetRaw = baselineRaw + expectedIncreaseRaw
+  const pollStart = Date.now()
+  let latestBalanceRaw = baselineRaw
+
+  while (Date.now() - pollStart < timeoutMs) {
+    try {
+      const latestBalance = await fetchSolanaUsdcBalance(ownerAddress)
+      latestBalanceRaw = parseFormattedUsdcAmount(latestBalance)
+
+      if (latestBalanceRaw >= targetRaw) {
+        return {
+          arrived: true,
+          balanceRaw: latestBalanceRaw,
+        }
+      }
+    } catch {
+      // Continue polling until timeout.
+    }
+
+    await delay(DESTINATION_BALANCE_POLL_INTERVAL_MS)
+  }
+
+  return {
+    arrived: false,
+    balanceRaw: latestBalanceRaw,
   }
 }
 
@@ -1091,10 +1133,27 @@ export function useGatewayForwarding() {
           error: null,
           isLoading: true,
           result: null,
+          destinationBalanceBefore: undefined,
+          destinationBalanceAfter: undefined,
+          fundsArrivalChecked: false,
+          fundsArrived: false,
           sourceChainId,
         })
 
         const { ata } = deriveSolanaUsdcAta(recipientWalletAddress)
+        let destinationBalanceBeforeRaw: bigint | null = null
+
+        try {
+          const balanceBefore = await fetchSolanaUsdcBalance(recipientWalletAddress)
+          destinationBalanceBeforeRaw = parseFormattedUsdcAmount(balanceBefore)
+
+          setState((previousState) => ({
+            ...previousState,
+            destinationBalanceBefore: balanceBefore,
+          }))
+        } catch {
+          // Continue forwarding even if recipient balance cannot be fetched up-front.
+        }
 
         if (chainId !== sourceChainId && switchChainAsync) {
           setState((previousState) => ({
@@ -1223,6 +1282,35 @@ export function useGatewayForwarding() {
           const transferStatus = details?.status ?? 'unknown'
 
           if (transferStatus === 'finalized' || transferStatus === 'confirmed') {
+            setState((previousState) => ({
+              ...previousState,
+              step: 'waiting-finality',
+              transferId,
+              status: 'Gateway finalized. Verifying recipient Solana balance...',
+              result: details,
+            }))
+
+            let fundsArrived = false
+            let destinationBalanceAfterRaw: bigint | null = null
+
+            if (destinationBalanceBeforeRaw !== null) {
+              const arrivalResult = await waitForSolanaUsdcArrival({
+                ownerAddress: recipientWalletAddress,
+                baselineRaw: destinationBalanceBeforeRaw,
+                expectedIncreaseRaw: transferValue,
+              })
+
+              fundsArrived = arrivalResult.arrived
+              destinationBalanceAfterRaw = arrivalResult.balanceRaw
+            } else {
+              try {
+                const latestBalance = await fetchSolanaUsdcBalance(recipientWalletAddress)
+                destinationBalanceAfterRaw = parseFormattedUsdcAmount(latestBalance)
+              } catch {
+                destinationBalanceAfterRaw = null
+              }
+            }
+
             setState({
               step: 'success',
               error: null,
@@ -1230,6 +1318,12 @@ export function useGatewayForwarding() {
               transferId,
               status: transferStatus,
               recipientAta: ata.toBase58(),
+              destinationBalanceBefore:
+                destinationBalanceBeforeRaw !== null ? formatUsdcAmount(destinationBalanceBeforeRaw) : undefined,
+              destinationBalanceAfter:
+                destinationBalanceAfterRaw !== null ? formatUsdcAmount(destinationBalanceAfterRaw) : undefined,
+              fundsArrivalChecked: true,
+              fundsArrived,
               sourceChainId,
               result: details,
             })
