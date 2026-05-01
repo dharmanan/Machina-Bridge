@@ -335,7 +335,7 @@ export default function App() {
           <div className="text-center text-sm text-slate-500">
             <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
               <p className="mb-2 font-semibold text-[#2F6E0C]">
-                MVP Testnet Application - Educational v2.1 for{' '}
+                MVP Testnet Application - Educational v2.2 for{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"

@@ -4,6 +4,7 @@ import { Card, Container } from './ui'
 import { Wallet, TrendingUp, Loader2, AlertCircle, RefreshCw } from 'lucide-react'
 import { useBridgeKit, SEPOLIA_CHAIN_ID, ARC_CHAIN_ID } from '../hooks/useBridgeKit'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
+import { getSupportedEvmChainName } from '../lib/chains'
 
 interface Transaction {
   id: string;
@@ -143,7 +144,7 @@ export function DashboardTab() {
             <div className="flex justify-between">
               <span className="text-slate-500">Current Network</span>
               <span className="font-semibold">
-                {chainId === SEPOLIA_CHAIN_ID ? 'Sepolia' : chainId === ARC_CHAIN_ID ? 'Arc Testnet' : 'Unknown network'}
+                {chainId ? getSupportedEvmChainName(chainId) : 'Unknown network'}
               </span>
             </div>
           </div>

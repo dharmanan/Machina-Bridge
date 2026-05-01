@@ -1,10 +1,36 @@
-# Arc Bridge v2.1
+# Arc Bridge v2.2
 
-Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and wraps the recent UI, wallet, and security work into a single `v2.1` update.
+Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and wraps the recent UI, wallet, tracker, and reliability work into a single `v2.2` update.
+
+## v2.2 Update
+
+This `v2.2` release bundles the latest bridge tracker, route reliability, and RPC fallback work for the current multi-chain bridge surface.
+
+- Added new EVM bridge chain support for `Base Sepolia`, `Optimism Sepolia`, and `Arbitrum Sepolia`.
+- Added route-aware CCTP tracker coverage for `Optimism -> Arc` and `Base -> Arc` flows.
+- Added clearer tracker completion UX (`Funds received on Arc` + completion time).
+- Fixed stale/waiting tracker states after destination mint confirmation.
+- Fixed Base Sepolia USDC address and balance-read reliability issues.
+- Added RPC fallback transports to reduce single-provider CORS/502 failures.
+- Added attestation delay guidance for Circle IRIS `404` indexing windows.
+- Added Arbitrum fee-overestimation warning copy for MetaMask testnet UX.
+
+## Recent Delivery Notes
+
+- Expanded Arc-centric EVM bridge routing across `Sepolia`, `Base Sepolia`, `Optimism Sepolia`, and `Arbitrum Sepolia`.
+- Refined source/destination selectors and auto chain switching behavior.
+- Added pending bridge persistence and resume flow for long-running CCTP operations.
+- Added dynamic ETA messaging for CCTP routes (`Base 15-20`, `Optimism 20-30`).
+- Fixed tracker modal lifecycle bugs (freeze, dismiss behavior, stale completion state).
+
+## Roadmap
+
+- Planned: wallet-connected `Ready to mint` discovery for pending CCTP messages.
+- Status: intentionally deferred for now; tracked for a later release.
 
 ## v2.1 Update
 
-This `v2.1` release bundles the latest UI, bridge, Solana, and security updates.
+This `v2.1` release bundled the previous UI, bridge, Solana, and security baseline updates.
 
 - Rebuilt the app UI into a cleaner light theme with English-only copy across the product.
 - Refined navigation and branding, including updated docs links, footer versioning, and a direct faucet shortcut.
@@ -19,7 +45,7 @@ This `v2.1` release bundles the latest UI, bridge, Solana, and security updates.
 | Flow | Route | Token | Status |
 | --- | --- | --- | --- |
 | Swap | Sepolia `ETH <-> USDC` | ETH / USDC | Active |
-| EVM Bridge | Sepolia `USDC <-> USDC` Arc Testnet | USDC | Active |
+| EVM Bridge | Sepolia / Base / Optimism / Arbitrum `USDC <-> Arc Testnet USDC` | USDC | Active |
 | Gateway Forwarding | Sepolia or Arc `USDC -> Solana Devnet` | USDC | Active |
 | Solana Bridge | Solana Devnet `USDC -> Arc Testnet` | USDC | Active |
 
@@ -27,16 +53,17 @@ This `v2.1` release bundles the latest UI, bridge, Solana, and security updates.
 
 ### Product and UI
 
-- Reworked the application shell around a calmer `v2.1` visual system.
+- Reworked the application shell around a calmer `v2.x` visual system.
 - Standardized user-facing content in English.
 - Updated the header, footer, docs link, faucet entry point, and wallet status display.
 - Improved contrast, balance visibility, and tab readability across Swap, Bridge, and Dashboard.
 
 ### Bridge and Wallet Work
 
-- Added a shared Wagmi + RainbowKit provider setup for Sepolia and Arc.
+- Added a shared Wagmi + RainbowKit provider setup for Sepolia, Arc, Base, Optimism, and Arbitrum.
 - Added wallet-assisted EVM chain switching and wallet chain registration.
 - Added Phantom Solana support for Solana-side connection and signing.
+- Added Circle CCTP route support for Base, Optimism, and Arbitrum into Arc.
 - Added Circle Gateway forwarding support for EVM to Solana delivery.
 - Added Solana Devnet to Arc bridging support through Bridge Kit + Phantom.
 - Added Gateway deposit tracking, fee estimation, recipient ATA derivation, and forwarding status polling.
@@ -44,7 +71,7 @@ This `v2.1` release bundles the latest UI, bridge, Solana, and security updates.
 
 ### Security and Maintenance
 
-- Updated the dependency set to the current app baseline used by `v2.1`.
+- Updated the dependency set to the current app baseline used by `v2.x`.
 - Added npm `overrides` for known vulnerable transitive packages.
 - Regenerated the lockfile after remediation.
 - Cleaned the npm audit findings and rechecked the production build.
@@ -105,6 +132,9 @@ npm run build
 | Network | Chain / Domain | RPC | Explorer |
 | --- | --- | --- | --- |
 | Ethereum Sepolia | `11155111` | `https://ethereum-sepolia-rpc.publicnode.com` | `https://sepolia.etherscan.io` |
+| Base Sepolia | `84532` | `https://base-sepolia-rpc.publicnode.com` | `https://sepolia.basescan.org` |
+| Optimism Sepolia | `11155420` | `https://sepolia.optimism.io` | `https://sepolia-optimism.etherscan.io` |
+| Arbitrum Sepolia | `421614` | `https://sepolia-rollup.arbitrum.io/rpc` | `https://sepolia.arbiscan.io` |
 | Arc Testnet | `5042002` | `https://rpc.testnet.arc.network` | `https://testnet.arcscan.app` |
 | Solana Devnet | Domain `5` | `https://api.devnet.solana.com` | `https://explorer.solana.com/?cluster=devnet` |
 
@@ -114,6 +144,9 @@ npm run build
 | --- | --- | --- |
 | Uniswap V2 Router | `0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008` | Sepolia |
 | Sepolia USDC | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | Sepolia |
+| Base Sepolia USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | Base Sepolia |
+| Optimism Sepolia USDC | `0x5fd84259d66Cd46123540766Be93DFE6D43130D7` | Optimism Sepolia |
+| Arbitrum Sepolia USDC | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | Arbitrum Sepolia |
 | Arc Native USDC | `0x3600000000000000000000000000000000000000` | Arc Testnet |
 | Gateway Wallet | `0x0077777d7EBA4688BDeF3E311b846F25870A19B9` | EVM forwarding |
 | Solana Devnet USDC Mint | `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` | Solana Devnet |
@@ -151,7 +184,7 @@ src/
 
 ## Validation
 
-The current `v2.1` workspace was validated with:
+The current `v2.2` workspace was validated with:
 
 ```bash
 npm run build

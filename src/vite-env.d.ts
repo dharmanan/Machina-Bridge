@@ -4,6 +4,9 @@ declare module 'vite/client' {
   interface ImportMetaEnv {
     readonly VITE_SEPOLIA_RPC: string
     readonly VITE_ARC_TESTNET_RPC: string
+    readonly VITE_BASE_SEPOLIA_RPC: string
+    readonly VITE_OPTIMISM_SEPOLIA_RPC: string
+    readonly VITE_ARBITRUM_SEPOLIA_RPC: string
     readonly VITE_SOLANA_DEVNET_RPC: string
     readonly VITE_CIRCLE_APP_ID: string
     readonly VITE_WALLETCONNECT_PROJECT_ID: string

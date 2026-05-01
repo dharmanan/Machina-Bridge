@@ -1,14 +1,28 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useAccount, useSwitchChain, useWalletClient } from 'wagmi';
 import { createAdapterFromProvider } from '@circle-fin/adapter-viem-v2';
-import { BridgeKit } from '@circle-fin/bridge-kit';
-import { type EIP1193Provider, createPublicClient, http, parseAbi } from 'viem';
+import { BridgeKit, type BridgeResult } from '@circle-fin/bridge-kit';
+import { type EIP1193Provider, createPublicClient, fallback, getAddress, http, parseAbi } from 'viem';
 import { ethers } from 'ethers';
-import { ARC_EVM_CHAIN, ARC_EVM_CHAIN_ID, SEPOLIA_EVM_CHAIN, SEPOLIA_EVM_CHAIN_ID } from '../lib/chains';
+import {
+  ARBITRUM_SEPOLIA_EVM_CHAIN,
+  ARBITRUM_SEPOLIA_EVM_CHAIN_ID,
+  ARC_EVM_CHAIN,
+  ARC_EVM_CHAIN_ID,
+  BASE_SEPOLIA_EVM_CHAIN,
+  BASE_SEPOLIA_EVM_CHAIN_ID,
+  OPTIMISM_SEPOLIA_EVM_CHAIN,
+  OPTIMISM_SEPOLIA_EVM_CHAIN_ID,
+  SEPOLIA_EVM_CHAIN,
+  SEPOLIA_EVM_CHAIN_ID,
+} from '../lib/chains';
 import { logger } from '../lib/logger';
 
 export const SEPOLIA_CHAIN_ID = SEPOLIA_EVM_CHAIN_ID;
 export const ARC_CHAIN_ID = ARC_EVM_CHAIN_ID;
+export const BASE_CHAIN_ID = BASE_SEPOLIA_EVM_CHAIN_ID;
+export const OPTIMISM_CHAIN_ID = OPTIMISM_SEPOLIA_EVM_CHAIN_ID;
+export const ARBITRUM_CHAIN_ID = ARBITRUM_SEPOLIA_EVM_CHAIN_ID;
 
 export type BridgeToken = 'USDC';
 export type BridgeStep = 
@@ -27,7 +41,8 @@ export interface BridgeState {
   isLoading: boolean;
   sourceTxHash?: string;
   receiveTxHash?: string;
-  direction?: 'sepolia-to-arc' | 'arc-to-sepolia';
+  sourceChainId?: number;
+  destinationChainId?: number;
 }
 
 export interface TokenInfo {
@@ -44,7 +59,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238', // Bridge Kit USDC on Sepolia
+      contractAddress: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', // Bridge Kit USDC on Sepolia
     },
   },
   [ARC_CHAIN_ID]: {
@@ -55,11 +70,116 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       contractAddress: '0x3600000000000000000000000000000000000000', // Bridge Kit USDC on Arc Testnet
     },
   },
+  [BASE_CHAIN_ID]: {
+    USDC: {
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 6,
+      contractAddress: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // Base Sepolia USDC
+    },
+  },
+  [OPTIMISM_CHAIN_ID]: {
+    USDC: {
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 6,
+      contractAddress: '0x5fd84259d66cd46123540766be93dfe6d43130d7', // Optimism Sepolia USDC
+    },
+  },
+  [ARBITRUM_CHAIN_ID]: {
+    USDC: {
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 6,
+      contractAddress: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d', // Arbitrum Sepolia USDC
+    },
+  },
 };
 
 export const CHAIN_NAMES = {
   [SEPOLIA_CHAIN_ID]: 'Sepolia',
   [ARC_CHAIN_ID]: 'Arc Testnet',
+  [BASE_CHAIN_ID]: 'Base Sepolia',
+  [OPTIMISM_CHAIN_ID]: 'Optimism Sepolia',
+  [ARBITRUM_CHAIN_ID]: 'Arbitrum Sepolia',
+};
+
+const SUPPORTED_BRIDGE_ROUTES = new Set<string>([
+  `${SEPOLIA_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${SEPOLIA_CHAIN_ID}`,
+  `${BASE_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${BASE_CHAIN_ID}`,
+  `${OPTIMISM_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${OPTIMISM_CHAIN_ID}`,
+  `${ARBITRUM_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${ARBITRUM_CHAIN_ID}`,
+]);
+
+function getChainName(chainId: number) {
+  return CHAIN_NAMES[chainId as keyof typeof CHAIN_NAMES] ?? `Chain ${chainId}`;
+}
+
+export const PENDING_BRIDGE_KEY = 'arc_pending_bridge';
+
+export interface PendingBridgeRecord {
+  sourceChainId: number;
+  destinationChainId: number;
+  amount: string;
+  token: string;
+  walletAddress: string;
+  startedAt: number; // Date.now()
+  step?: BridgeStep;
+  signatureCount?: number;
+  approvalTxHash?: string;
+  sourceTxHash?: string;
+  receiveTxHash?: string;
+  txHashes?: string[];
+}
+
+const readPendingBridge = (): PendingBridgeRecord | null => {
+  try {
+    const raw = localStorage.getItem(PENDING_BRIDGE_KEY);
+    return raw ? JSON.parse(raw) as PendingBridgeRecord : null;
+  } catch {
+    return null;
+  }
+};
+
+const writePendingBridge = (record: PendingBridgeRecord) => {
+  localStorage.setItem(PENDING_BRIDGE_KEY, JSON.stringify(record));
+};
+
+const updatePendingBridge = (patch: Partial<PendingBridgeRecord>) => {
+  const current = readPendingBridge();
+  if (!current) {
+    return;
+  }
+
+  writePendingBridge({
+    ...current,
+    ...patch,
+  });
+};
+
+type RetryStep = {
+  name: string;
+  state: 'pending' | 'success' | 'error' | 'noop';
+  txHash?: string;
+};
+
+const buildRetryStepsFromTxHashes = (txHashes: string[]): RetryStep[] => {
+  if (txHashes.length === 0) {
+    return [{ name: 'Burn', state: 'pending' }];
+  }
+
+  if (txHashes.length === 1) {
+    return [{ name: 'Burn', state: 'success', txHash: txHashes[0] }];
+  }
+
+  return [
+    { name: 'Approve', state: 'success', txHash: txHashes[0] },
+    { name: 'Burn', state: 'success', txHash: txHashes[1] },
+  ];
 };
 
 // ERC20 ABI for balance reading
@@ -82,9 +202,29 @@ const createClientWithTimeout = (url: string) => {
   });
 };
 
+const createClientWithFallback = (urls: readonly string[]) => {
+  if (urls.length === 1) {
+    return createClientWithTimeout(urls[0]);
+  }
+
+  return createPublicClient({
+    transport: fallback(
+      urls.map((url) =>
+        http(url, {
+          timeout: 3000,
+          retryCount: 0,
+        }),
+      ),
+    ),
+  });
+};
+
 const publicClients: Record<number, any> = {
-  [SEPOLIA_CHAIN_ID]: createClientWithTimeout(import.meta.env.VITE_SEPOLIA_RPC || SEPOLIA_EVM_CHAIN.rpcUrls.default.http[0]),
-  [ARC_CHAIN_ID]: createClientWithTimeout(import.meta.env.VITE_ARC_TESTNET_RPC || ARC_EVM_CHAIN.rpcUrls.default.http[0]),
+  [SEPOLIA_CHAIN_ID]: createClientWithFallback(SEPOLIA_EVM_CHAIN.rpcUrls.default.http),
+  [ARC_CHAIN_ID]: createClientWithFallback(ARC_EVM_CHAIN.rpcUrls.default.http),
+  [BASE_CHAIN_ID]: createClientWithFallback(BASE_SEPOLIA_EVM_CHAIN.rpcUrls.default.http),
+  [OPTIMISM_CHAIN_ID]: createClientWithFallback(OPTIMISM_SEPOLIA_EVM_CHAIN.rpcUrls.default.http),
+  [ARBITRUM_CHAIN_ID]: createClientWithFallback(ARBITRUM_SEPOLIA_EVM_CHAIN.rpcUrls.default.http),
 };
 
 let bridgeKitInstance: BridgeKit | null = null;
@@ -101,7 +241,8 @@ export function useBridgeKit() {
     isLoading: false,
     sourceTxHash: undefined,
     receiveTxHash: undefined,
-    direction: undefined,
+    sourceChainId: undefined,
+    destinationChainId: undefined,
   });
 
   const [tokenBalance, setTokenBalance] = useState('0');
@@ -127,7 +268,8 @@ export function useBridgeKit() {
   // Fetch token balance
   const getWalletProvider = useCallback(
     async (targetChainId: number) => {
-      if (!walletClient || walletClient.chain.id !== targetChainId) {
+      // walletClient.chain can lag briefly after a network switch; use active account chain.
+      if (!walletClient || chainId !== targetChainId) {
         return null;
       }
 
@@ -138,13 +280,13 @@ export function useBridgeKit() {
           },
         },
         {
-          chainId: walletClient.chain.id,
-          name: walletClient.chain.name,
+          chainId: targetChainId,
+          name: getChainName(targetChainId),
           ensAddress: walletClient.chain.contracts?.ensRegistry?.address,
         },
       );
     },
-    [walletClient],
+    [walletClient, chainId],
   );
 
   const fetchTokenBalance = useCallback(
@@ -164,14 +306,14 @@ export function useBridgeKit() {
           throw new Error(`Token ${token} not found on chain ${targetChainId}`);
         }
 
-        logger.debug(`🔍 Fetching ${token} balance from ${CHAIN_NAMES[targetChainId as keyof typeof CHAIN_NAMES]}...`);
+        logger.debug(`🔍 Fetching ${token} balance from ${getChainName(targetChainId)}...`);
         const walletProvider = await getWalletProvider(targetChainId);
 
         let balance: bigint;
 
         if (walletProvider) {
           const tokenContract = new ethers.Contract(
-            tokenInfo.contractAddress,
+            getAddress(tokenInfo.contractAddress),
             ['function balanceOf(address) view returns (uint256)'],
             walletProvider,
           );
@@ -183,7 +325,7 @@ export function useBridgeKit() {
           }
 
           balance = await publicClient.readContract({
-            address: tokenInfo.contractAddress as `0x${string}`,
+            address: getAddress(tokenInfo.contractAddress),
             abi: ERC20_ABI,
             functionName: 'balanceOf',
             args: [address as `0x${string}`],
@@ -194,9 +336,9 @@ export function useBridgeKit() {
         setTokenBalance(balanceFloat.toFixed(6));
         logger.debug(`✅ Balance fetched for ${token} on chain ${targetChainId}: ${balanceFloat.toFixed(6)}`);
       } catch (err: any) {
-        logger.warn(`⚠️ Balance fetch failed for ${CHAIN_NAMES[targetChainId as keyof typeof CHAIN_NAMES]}: ${err.message}`);
+        logger.warn(`⚠️ Balance fetch failed for ${getChainName(targetChainId)}: ${err.message}`);
         setTokenBalance('0.000000');
-        setBalanceError(`Failed to read ${CHAIN_NAMES[targetChainId as keyof typeof CHAIN_NAMES]} ${token} balance. Refresh or switch to that network and try again.`);
+        setBalanceError(`Failed to read ${getChainName(targetChainId)} ${token} balance. Refresh or switch to that network and try again.`);
       } finally {
         setIsLoadingBalance(false);
       }
@@ -225,12 +367,20 @@ export function useBridgeKit() {
       isLoading: false,
       sourceTxHash: undefined,
       receiveTxHash: undefined,
-      direction: undefined,
+      sourceChainId: undefined,
+      destinationChainId: undefined,
     });
   }, []);
 
   const bridge = useCallback(
-    async (token: BridgeToken, amount: string, direction: 'sepolia-to-arc' | 'arc-to-sepolia') => {
+    async (
+      token: BridgeToken,
+      amount: string,
+      route: {
+        sourceChainId: number;
+        destinationChainId: number;
+      },
+    ) => {
       if (!isConnected || !address) {
         setState({
           step: 'error',
@@ -251,13 +401,56 @@ export function useBridgeKit() {
         return;
       }
 
+      const { sourceChainId, destinationChainId } = route;
+      const shouldTrackPendingBridge =
+        destinationChainId === ARC_CHAIN_ID
+        && (sourceChainId === OPTIMISM_CHAIN_ID || sourceChainId === BASE_CHAIN_ID);
+
+      if (sourceChainId === destinationChainId) {
+        setState({
+          step: 'error',
+          error: 'Source and destination chains must be different',
+          result: null,
+          isLoading: false,
+        });
+        return;
+      }
+
+      const routeKey = `${sourceChainId}-${destinationChainId}`;
+      if (!SUPPORTED_BRIDGE_ROUTES.has(routeKey)) {
+        setState({
+          step: 'error',
+          error: `Bridge route ${getChainName(sourceChainId)} -> ${getChainName(destinationChainId)} is not enabled yet.`,
+          result: null,
+          isLoading: false,
+        });
+        return;
+      }
+
+      // Save pending bridge for slower CCTP-to-Arc flows.
+      if (shouldTrackPendingBridge) {
+        const pendingEntry: PendingBridgeRecord = {
+          sourceChainId,
+          destinationChainId,
+          amount,
+          token,
+          walletAddress: address,
+          startedAt: Date.now(),
+          step: 'idle',
+          signatureCount: 0,
+          txHashes: [],
+        };
+        writePendingBridge(pendingEntry);
+      }
+
       try {
         setState(prev => ({
           ...prev,
           step: 'idle',
           error: null,
           isLoading: true,
-          direction,
+          sourceChainId,
+          destinationChainId,
         }));
 
         const provider = getConnectedProvider();
@@ -269,11 +462,7 @@ export function useBridgeKit() {
           bridgeKitInstance = new BridgeKit();
         }
 
-        const isSepoliaToArc = direction === 'sepolia-to-arc';
-        const sourceChainId = isSepoliaToArc ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID;
-        const destinationChainId = isSepoliaToArc ? ARC_CHAIN_ID : SEPOLIA_CHAIN_ID;
-
-        logger.debug(`🌉 Bridging ${amount} ${token} from ${CHAIN_NAMES[sourceChainId]} to ${CHAIN_NAMES[destinationChainId]}`);
+        logger.debug(`🌉 Bridging ${amount} ${token} from ${getChainName(sourceChainId)} to ${getChainName(destinationChainId)}`);
 
         // Get supported chains from Bridge Kit
         const supportedChains = bridgeKitInstance.getSupportedChains();
@@ -333,10 +522,13 @@ export function useBridgeKit() {
         // Switch to source chain if needed and fail closed if the wallet stays on the wrong chain.
         if (chainId !== sourceChainId) {
           if (!switchChainAsync) {
-            throw new Error(`Please switch your wallet to ${CHAIN_NAMES[sourceChainId]} before bridging.`);
+            throw new Error(`Please switch your wallet to ${getChainName(sourceChainId)} before bridging.`);
           }
 
           setState(prev => ({ ...prev, step: 'switching-network' }));
+          if (shouldTrackPendingBridge) {
+            updatePendingBridge({ step: 'switching-network' });
+          }
 
           try {
             await switchChainAsync({ chainId: sourceChainId });
@@ -344,33 +536,97 @@ export function useBridgeKit() {
           } catch (err: any) {
             throw new Error(
               err?.message?.includes('User rejected')
-                ? `You rejected the switch to ${CHAIN_NAMES[sourceChainId]}.`
-                : `Failed to switch your wallet to ${CHAIN_NAMES[sourceChainId]}.`
+                ? `You rejected the switch to ${getChainName(sourceChainId)}.`
+                : `Failed to switch your wallet to ${getChainName(sourceChainId)}.`
             );
           }
         }
 
-        const activeChainHex = await provider.request({ method: 'eth_chainId' }) as string;
+        const trackedProvider: EIP1193Provider = {
+          request: async (args: any) => {
+            const { method, params } = args ?? {};
+            const response = await (provider as any).request({ method, params } as any);
+
+            if (
+              shouldTrackPendingBridge
+              &&
+              (method === 'eth_sendTransaction' || method === 'eth_sendRawTransaction')
+              && typeof response === 'string'
+              && response.startsWith('0x')
+            ) {
+              const current = readPendingBridge();
+              const txHashes = current?.txHashes ?? [];
+
+              if (!txHashes.includes(response)) {
+                const patch: Partial<PendingBridgeRecord> = {
+                  txHashes: [...txHashes, response],
+                };
+
+                if (current?.step === 'waiting-receive-message') {
+                  patch.receiveTxHash = response;
+                } else if (!current?.approvalTxHash) {
+                  patch.approvalTxHash = response;
+                } else if (!current?.sourceTxHash) {
+                  patch.sourceTxHash = response;
+                }
+
+                updatePendingBridge(patch);
+              }
+            }
+
+            if (
+              shouldTrackPendingBridge
+              &&
+              (
+                method === 'eth_sign'
+                || method === 'personal_sign'
+                || method === 'eth_signTypedData'
+                || method === 'eth_signTypedData_v3'
+                || method === 'eth_signTypedData_v4'
+              )
+            ) {
+              const current = readPendingBridge();
+              const signatureCount = current?.signatureCount ?? 0;
+              updatePendingBridge({
+                signatureCount: signatureCount + 1,
+              });
+            }
+
+            return response;
+          },
+          on: (event: any, listener: any) => {
+            if (typeof (provider as any).on === 'function') {
+              (provider as any).on(event, listener);
+            }
+          },
+          removeListener: (event: any, listener: any) => {
+            if (typeof (provider as any).removeListener === 'function') {
+              (provider as any).removeListener(event, listener);
+            }
+          },
+        };
+
+        const activeChainHex = await trackedProvider.request({ method: 'eth_chainId' }) as string;
         const activeChainId = Number.parseInt(activeChainHex, 16);
 
         if (activeChainId !== sourceChainId) {
-          throw new Error(`Wallet is still connected to the wrong chain. Switch to ${CHAIN_NAMES[sourceChainId]} and try again.`);
+          throw new Error(`Wallet is still connected to the wrong chain. Switch to ${getChainName(sourceChainId)} and try again.`);
         }
 
         // Create adapter from the active wagmi wallet provider
         const adapter = await createAdapterFromProvider({
-          provider,
+          provider: trackedProvider,
         });
 
         // Execute bridge
         setState(prev => ({ ...prev, step: 'approving' }));
+        if (shouldTrackPendingBridge) {
+          updatePendingBridge({ step: 'approving' });
+        }
         logger.debug('🔄 Step changed to: approving');
 
         logger.debug(`🔄 Starting bridge transaction...`);
         logger.debug(`💰 Amount: ${amount} USDC`);
-
-        // Execute bridge
-        setState(prev => ({ ...prev, step: 'approving' }));
 
         const result = await bridgeKitInstance.bridge({
           from: {
@@ -388,9 +644,15 @@ export function useBridgeKit() {
 
         // Update step to signing-bridge after approval
         setState(prev => ({ ...prev, step: 'signing-bridge' }));
+        if (shouldTrackPendingBridge) {
+          updatePendingBridge({ step: 'signing-bridge' });
+        }
 
         // Update step to waiting for receive confirmation
         setState(prev => ({ ...prev, step: 'waiting-receive-message' }));
+        if (shouldTrackPendingBridge) {
+          updatePendingBridge({ step: 'waiting-receive-message' });
+        }
 
         // Extract transaction hashes
         let sourceTxHash: string | undefined;
@@ -409,6 +671,17 @@ export function useBridgeKit() {
 
         // Update step to waiting for receive confirmation
         setState(prev => ({ ...prev, step: 'waiting-receive-message' }));
+        if (shouldTrackPendingBridge) {
+          updatePendingBridge({
+            step: 'waiting-receive-message',
+            sourceTxHash: sourceTxHash ?? readPendingBridge()?.sourceTxHash,
+            receiveTxHash: receiveTxHash ?? readPendingBridge()?.receiveTxHash,
+            txHashes: [
+              ...(readPendingBridge()?.txHashes ?? []),
+              ...[sourceTxHash, receiveTxHash].filter((hash): hash is string => Boolean(hash)),
+            ].filter((hash, index, hashes) => hashes.indexOf(hash) === index),
+          });
+        }
         logger.debug('🔄 Step changed to: waiting-receive-message');
 
         setState({
@@ -418,18 +691,19 @@ export function useBridgeKit() {
           isLoading: false,
           sourceTxHash,
           receiveTxHash,
-          direction,
+          sourceChainId,
+          destinationChainId,
         });
 
         logger.debug('🎉 Bridge successful!');
+        if (shouldTrackPendingBridge) {
+          localStorage.removeItem(PENDING_BRIDGE_KEY);
+        }
 
         // Refresh balances after bridge
         setTimeout(async () => {
           logger.debug('🔄 Refreshing balances after bridge...');
-          
-          const sourceChainId = direction === 'sepolia-to-arc' ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID;
-          const destinationChainId = direction === 'sepolia-to-arc' ? ARC_CHAIN_ID : SEPOLIA_CHAIN_ID;
-          
+
           // Fetch both balances
           await fetchTokenBalance('USDC', sourceChainId);
           await fetchTokenBalance('USDC', destinationChainId);
@@ -437,11 +711,16 @@ export function useBridgeKit() {
         }, 1000); // Wait 1 second before refreshing
       } catch (err: any) {
         logger.error('❌ Bridge error:', err);
+        if (shouldTrackPendingBridge) {
+          localStorage.removeItem(PENDING_BRIDGE_KEY);
+        }
 
         let errorMessage = err.message || 'Bridge transaction failed';
 
         if (errorMessage.includes('User rejected') || errorMessage.includes('user rejected')) {
           errorMessage = 'You rejected the bridge request in your wallet';
+        } else if (errorMessage.includes('iris-api-sandbox.circle.com') && errorMessage.includes('404')) {
+          errorMessage = 'Circle attestation is not indexed yet (404). Wait 2-5 minutes and try Continue pending bridge again.';
         } else if (errorMessage.includes('Insufficient funds')) {
           errorMessage = 'Insufficient balance for bridge transaction';
         } else if (errorMessage.includes('not supported')) {
@@ -459,6 +738,104 @@ export function useBridgeKit() {
     [address, isConnected, chainId, switchChainAsync, fetchTokenBalance, getConnectedProvider]
   );
 
+  const resumePendingBridge = useCallback(
+    async (pending: PendingBridgeRecord) => {
+      if (!isConnected || !address) {
+        setState({
+          step: 'error',
+          error: 'Please connect your wallet first',
+          result: null,
+          isLoading: false,
+        });
+        return;
+      }
+
+      if (!bridgeKitInstance) {
+        bridgeKitInstance = new BridgeKit();
+      }
+
+      try {
+        setState((prev) => ({
+          ...prev,
+          step: 'waiting-receive-message',
+          error: null,
+          isLoading: true,
+          sourceChainId: pending.sourceChainId,
+          destinationChainId: pending.destinationChainId,
+        }));
+
+        const provider = getConnectedProvider();
+        if (!provider) {
+          throw new Error('Connected wallet provider is not available. Reconnect your wallet and try again.');
+        }
+
+        const adapter = await createAdapterFromProvider({ provider });
+        const supportedChains = bridgeKitInstance.getSupportedChains();
+
+        const sourceChain = supportedChains.find((c: any) => ('chainId' in c) && c.chainId === pending.sourceChainId);
+        const destinationChain = supportedChains.find((c: any) => ('chainId' in c) && c.chainId === pending.destinationChainId);
+
+        if (!sourceChain || !destinationChain) {
+          throw new Error('Could not map pending bridge chains to supported BridgeKit routes.');
+        }
+
+        const txHashes = pending.txHashes ?? [];
+        const failedResult: BridgeResult = {
+          amount: pending.amount,
+          token: 'USDC',
+          state: 'error',
+          provider: 'CCTPV2BridgingProvider',
+          source: {
+            address,
+            chain: sourceChain,
+          },
+          destination: {
+            address,
+            chain: destinationChain,
+          },
+          steps: buildRetryStepsFromTxHashes(txHashes),
+        };
+
+        logger.debug('🔄 Attempting to resume pending bridge via BridgeKit retry...');
+        const result = await bridgeKitInstance.retry(failedResult, {
+          from: adapter,
+          to: adapter,
+        });
+
+        let sourceTxHash: string | undefined;
+        let receiveTxHash: string | undefined;
+
+        if (result && result.steps) {
+          sourceTxHash = result.steps.find((step) => step.name.toLowerCase().includes('burn'))?.txHash;
+          receiveTxHash = result.steps.find((step) => step.name.toLowerCase().includes('mint'))?.txHash;
+        }
+
+        setState({
+          step: 'success',
+          error: null,
+          result,
+          isLoading: false,
+          sourceTxHash,
+          receiveTxHash,
+          sourceChainId: pending.sourceChainId,
+          destinationChainId: pending.destinationChainId,
+        });
+
+        localStorage.removeItem(PENDING_BRIDGE_KEY);
+        logger.debug('✅ Pending bridge resumed successfully.');
+      } catch (err: any) {
+        logger.error('❌ Pending bridge resume failed:', err);
+        setState((prev) => ({
+          ...prev,
+          step: 'error',
+          error: err?.message || 'Could not resume the pending bridge automatically.',
+          isLoading: false,
+        }));
+      }
+    },
+    [address, getConnectedProvider, isConnected]
+  );
+
   return {
     state,
     tokenBalance,
@@ -466,6 +843,7 @@ export function useBridgeKit() {
     balanceError,
     fetchTokenBalance,
     bridge,
+    resumePendingBridge,
     reset,
   };
 }

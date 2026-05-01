@@ -1,18 +1,64 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { Card, Button, Input, Container } from './ui'
-import { useBridgeKit, BridgeToken, SEPOLIA_CHAIN_ID, ARC_CHAIN_ID } from '../hooks/useBridgeKit'
+import {
+  useBridgeKit,
+  BridgeToken,
+  SEPOLIA_CHAIN_ID,
+  ARC_CHAIN_ID,
+  BASE_CHAIN_ID,
+  OPTIMISM_CHAIN_ID,
+  ARBITRUM_CHAIN_ID,
+  PENDING_BRIDGE_KEY,
+  PendingBridgeRecord,
+  CHAIN_NAMES,
+} from '../hooks/useBridgeKit'
 import { useGatewayForwarding } from '../hooks/useGatewayForwarding'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useSolanaBridge } from '../hooks/useSolanaBridge'
+import { getSupportedEvmChain, getSupportedEvmChainName, SUPPORTED_EVM_CHAIN_OPTIONS } from '../lib/chains'
 import { deriveSolanaUsdcAta, isValidSolanaAddress, SOLANA_DEVNET_NAME } from '../lib/solana'
 import { logger } from '../lib/logger'
-import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink, RefreshCw } from 'lucide-react'
+import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink, RefreshCw, Clock, X } from 'lucide-react'
+
+const EVM_BRIDGE_CHAIN_IDS = [SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID]
+const SOLANA_FORWARD_CHAIN_IDS = [ARC_CHAIN_ID]
+const ENABLED_EVM_BRIDGE_ROUTES = new Set<string>([
+  `${SEPOLIA_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${SEPOLIA_CHAIN_ID}`,
+  `${BASE_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${BASE_CHAIN_ID}`,
+  `${OPTIMISM_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${OPTIMISM_CHAIN_ID}`,
+  `${ARBITRUM_CHAIN_ID}-${ARC_CHAIN_ID}`,
+  `${ARC_CHAIN_ID}-${ARBITRUM_CHAIN_ID}`,
+])
+
+const ALLOWED_DESTINATIONS_BY_SOURCE: Record<number, number[]> = {
+  [SEPOLIA_CHAIN_ID]: [ARC_CHAIN_ID],
+  [ARC_CHAIN_ID]: [SEPOLIA_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID],
+  [BASE_CHAIN_ID]: [ARC_CHAIN_ID],
+  [OPTIMISM_CHAIN_ID]: [ARC_CHAIN_ID],
+  [ARBITRUM_CHAIN_ID]: [ARC_CHAIN_ID],
+}
+
+function getAllowedDestinationChainIds(sourceChainId: number) {
+  return ALLOWED_DESTINATIONS_BY_SOURCE[sourceChainId] ?? []
+}
+
+function resolveDestinationChainId(sourceChainId: number, currentDestinationChainId?: number) {
+  const allowedDestinations = getAllowedDestinationChainIds(sourceChainId)
+  if (currentDestinationChainId && allowedDestinations.includes(currentDestinationChainId)) {
+    return currentDestinationChainId
+  }
+
+  return allowedDestinations[0]
+}
 
 export function BridgeTab() {
   const { address, isConnected, chainId } = useAccount()
   const { switchChainAsync, isPending: isSwitchingChain } = useSwitchChain()
-  const { state, tokenBalance, isLoadingBalance, balanceError, fetchTokenBalance, bridge, reset } = useBridgeKit()
+  const { state, tokenBalance, isLoadingBalance, balanceError, fetchTokenBalance, bridge, resumePendingBridge, reset } = useBridgeKit()
   const {
     state: gatewayState,
     walletState,
@@ -45,9 +91,29 @@ export function BridgeTab() {
   
   const [amount, setAmount] = useState('')
   const [bridgeMode, setBridgeMode] = useState<'evm' | 'solana' | 'solana-source'>('evm')
-  const [direction, setDirection] = useState<'sepolia-to-arc' | 'arc-to-sepolia'>('sepolia-to-arc')
+  const [sourceEvmChainId, setSourceEvmChainId] = useState(SEPOLIA_CHAIN_ID)
+  const [destinationEvmChainId, setDestinationEvmChainId] = useState(ARC_CHAIN_ID)
   const [selectedToken] = useState<BridgeToken>('USDC')
   const [solanaRecipient, setSolanaRecipient] = useState('')
+  const [pendingBridge, setPendingBridge] = useState<PendingBridgeRecord | null>(() => {
+    try {
+      const raw = localStorage.getItem(PENDING_BRIDGE_KEY)
+      if (!raw) return null
+      const parsed: PendingBridgeRecord = JSON.parse(raw)
+      // Only surface entries started within the last 2 hours
+      if (Date.now() - parsed.startedAt > 2 * 60 * 60 * 1000) {
+        localStorage.removeItem(PENDING_BRIDGE_KEY)
+        return null
+      }
+      return parsed
+    } catch {
+      return null
+    }
+  })
+  const [trackerSnapshot, setTrackerSnapshot] = useState<PendingBridgeRecord | null>(null)
+  const [isBridgeTrackerOpen, setIsBridgeTrackerOpen] = useState(false)
+  const [trackerNowMs, setTrackerNowMs] = useState(() => Date.now())
+  const lastPendingBridgeJsonRef = useRef<string | null>(null)
   const [gatewayQuote, setGatewayQuote] = useState<{
     isLoading: boolean
     estimatedFee: string | null
@@ -64,16 +130,22 @@ export function BridgeTab() {
 
   const isSolanaMode = bridgeMode === 'solana'
   const isSolanaSourceMode = bridgeMode === 'solana-source'
+  const bridgeChainOptions = SUPPORTED_EVM_CHAIN_OPTIONS.filter((option) => EVM_BRIDGE_CHAIN_IDS.includes(option.id))
+  const evmDestinationChainIds = getAllowedDestinationChainIds(sourceEvmChainId)
+  const evmDestinationOptions = bridgeChainOptions.filter((option) => evmDestinationChainIds.includes(option.id))
 
-  const sourceChainId = direction === 'sepolia-to-arc' ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID
-  const destinationChainId = isSolanaSourceMode ? ARC_CHAIN_ID : isSolanaMode ? undefined : direction === 'sepolia-to-arc' ? ARC_CHAIN_ID : SEPOLIA_CHAIN_ID
-  const sourceChainName = isSolanaSourceMode ? SOLANA_DEVNET_NAME : direction === 'sepolia-to-arc' ? 'Sepolia' : 'Arc Testnet'
-  const destinationChainName = isSolanaSourceMode ? 'Arc Testnet' : isSolanaMode ? SOLANA_DEVNET_NAME : direction === 'sepolia-to-arc' ? 'Arc Testnet' : 'Sepolia'
-  const completedBridgeDirection = state.direction ?? direction
-  const completedSourceChainId = completedBridgeDirection === 'sepolia-to-arc' ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID
-  const completedDestinationChainId = completedBridgeDirection === 'sepolia-to-arc' ? ARC_CHAIN_ID : SEPOLIA_CHAIN_ID
-  const completedSourceChainName = completedBridgeDirection === 'sepolia-to-arc' ? 'Sepolia' : 'Arc Testnet'
-  const completedDestinationChainName = completedBridgeDirection === 'sepolia-to-arc' ? 'Arc Testnet' : 'Sepolia'
+  const sourceChainId = isSolanaMode ? ARC_CHAIN_ID : sourceEvmChainId
+  const destinationChainId = isSolanaSourceMode ? ARC_CHAIN_ID : isSolanaMode ? undefined : destinationEvmChainId
+  const sourceChainName = isSolanaSourceMode ? SOLANA_DEVNET_NAME : getSupportedEvmChainName(sourceChainId)
+  const destinationChainName = isSolanaSourceMode
+    ? getSupportedEvmChainName(ARC_CHAIN_ID)
+    : isSolanaMode
+      ? SOLANA_DEVNET_NAME
+      : getSupportedEvmChainName(destinationEvmChainId)
+  const completedSourceChainId = state.sourceChainId ?? sourceEvmChainId
+  const completedDestinationChainId = state.destinationChainId ?? destinationEvmChainId
+  const completedSourceChainName = getSupportedEvmChainName(completedSourceChainId)
+  const completedDestinationChainName = getSupportedEvmChainName(completedDestinationChainId)
   const activeState = isSolanaSourceMode ? solanaBridgeState : isSolanaMode ? gatewayState : state
   const hasAmount = Boolean(amount) && parseFloat(amount) > 0
   const isSolanaRecipientValid = solanaRecipient.trim().length > 0 && isValidSolanaAddress(solanaRecipient)
@@ -91,6 +163,94 @@ export function BridgeTab() {
   const topUpNeeded = hasQuotedShortfall ? Math.max(0, totalRequiredAmount - numericGatewayBalance) : 0
   const approxMaxSendable = hasGatewayQuote ? Math.max(0, numericGatewayBalance - estimatedFeeAmount - feeBufferAmount) : 0
   const isUsingConnectedPhantomRecipient = Boolean(phantomSolanaAddress) && solanaRecipient.trim() === phantomSolanaAddress
+  const isRouteEnabled = ENABLED_EVM_BRIDGE_ROUTES.has(`${sourceEvmChainId}-${destinationEvmChainId}`)
+  const isOptimismToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === OPTIMISM_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
+  const isBaseToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === BASE_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
+  const isArbitrumToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === ARBITRUM_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
+  const isTrackedBridgeRoute = isOptimismToArcRoute || isBaseToArcRoute
+  const isTrackedBridgeActive = bridgeMode === 'evm' && state.isLoading && isTrackedBridgeRoute
+
+  const trackedBridge = pendingBridge ?? trackerSnapshot
+  const trackedSourceChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.sourceChainId) : ''
+  const trackedDestinationChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.destinationChainId) : ''
+  const trackedTxHashes = trackedBridge?.txHashes ?? []
+  const trackedSignatureCount = trackedBridge?.signatureCount ?? 0
+  const trackedLatestTxHash = trackedTxHashes.length > 0 ? trackedTxHashes[trackedTxHashes.length - 1] : undefined
+  const trackedHasBurnTx = trackedTxHashes.length >= 2 || trackedBridge?.step === 'waiting-receive-message' || trackedBridge?.step === 'success'
+  const trackedSourceTxHash = state.sourceTxHash ?? trackedBridge?.sourceTxHash ?? trackedBridge?.approvalTxHash ?? (trackedHasBurnTx ? trackedLatestTxHash : undefined)
+  const trackedReceiveTxHash = state.receiveTxHash ?? trackedBridge?.receiveTxHash
+  const isTrackedBaseToArc = Boolean(trackedBridge && trackedBridge.sourceChainId === BASE_CHAIN_ID && trackedBridge.destinationChainId === ARC_CHAIN_ID)
+  const isTrackedOptimismToArc = Boolean(trackedBridge && trackedBridge.sourceChainId === OPTIMISM_CHAIN_ID && trackedBridge.destinationChainId === ARC_CHAIN_ID)
+  const trackedEtaLabel = isTrackedBaseToArc ? '15-20 minutes' : isTrackedOptimismToArc ? '20-30 minutes' : '20-30 minutes'
+  const trackedEstimatedMinutes = isTrackedBaseToArc ? 20 : 30
+  const trackedElapsedMinutes = trackedBridge ? Math.max(0, Math.floor((trackerNowMs - trackedBridge.startedAt) / 60000)) : 0
+  const trackedRemainingMinutes = trackedBridge ? Math.max(0, trackedEstimatedMinutes - trackedElapsedMinutes) : 0
+  const trackedCompletionLabel = trackedElapsedMinutes > 0 ? `Completed in ~${trackedElapsedMinutes} min` : 'Completed just now'
+  const hasBridgeReachedArc = Boolean(state.step === 'success' || trackedReceiveTxHash)
+  const hasOnlyOffchainSignature = trackedSignatureCount > 0 && trackedTxHashes.length === 0
+  const hasBridgeStartedOnSource = Boolean(trackedTxHashes.length > 0 || trackedBridge?.step === 'approving' || trackedBridge?.step === 'signing-bridge' || trackedBridge?.step === 'waiting-receive-message')
+  const isWaitingForArrival = Boolean(trackedBridge) && !hasBridgeReachedArc && (trackedHasBurnTx || state.step === 'waiting-receive-message')
+
+  const getTxExplorerUrl = (evmChainId: number, txHash: string) => {
+    const chain = getSupportedEvmChain(evmChainId)
+    const explorerBaseUrl = chain?.blockExplorers?.default?.url
+
+    if (!explorerBaseUrl) {
+      return undefined
+    }
+
+    return `${explorerBaseUrl.replace(/\/$/, '')}/tx/${txHash}`
+  }
+
+  const getAddressExplorerUrl = (evmChainId: number, walletAddress: string) => {
+    const chain = getSupportedEvmChain(evmChainId)
+    const explorerBaseUrl = chain?.blockExplorers?.default?.url
+
+    if (!explorerBaseUrl) {
+      return undefined
+    }
+
+    return `${explorerBaseUrl.replace(/\/$/, '')}/address/${walletAddress}`
+  }
+
+  const refreshPendingBridge = () => {
+    try {
+      const raw = localStorage.getItem(PENDING_BRIDGE_KEY)
+      if ((raw ?? null) === lastPendingBridgeJsonRef.current) {
+        return
+      }
+
+      lastPendingBridgeJsonRef.current = raw ?? null
+      setPendingBridge(raw ? JSON.parse(raw) : null)
+    } catch {
+      lastPendingBridgeJsonRef.current = null
+      setPendingBridge(null)
+    }
+  }
+
+  const getBridgeTrackerHeadline = () => {
+    if (hasBridgeReachedArc) {
+      return 'Bridge completed on Arc'
+    }
+
+    if (isWaitingForArrival) {
+      return trackedRemainingMinutes > 0 ? `Wait about ${trackedRemainingMinutes} min` : 'Waiting for Arc mint'
+    }
+
+    if (hasOnlyOffchainSignature) {
+      return 'Signature received, waiting to submit chain tx'
+    }
+
+    if (state.step === 'approving' || state.step === 'signing-bridge') {
+      return 'Waiting for wallet confirmations'
+    }
+
+    if (state.step === 'switching-network') {
+      return `Switching to ${sourceChainName}`
+    }
+
+    return 'Ready to continue'
+  }
 
   const formatPendingDepositAmount = (rawAmount: string) => {
     const amountNumber = Number(rawAmount)
@@ -101,12 +261,78 @@ export function BridgeTab() {
     return (amountNumber / 1_000_000).toFixed(6)
   }
 
-  // Fetch balance on mount and when direction changes
+  // Fetch balance on mount and when source chain changes
   useEffect(() => {
     if (isConnected && address && !isSolanaMode && !isSolanaSourceMode) {
       fetchTokenBalance(selectedToken, sourceChainId)
     }
   }, [isConnected, address, sourceChainId, selectedToken, fetchTokenBalance, isSolanaMode, isSolanaSourceMode])
+
+  useEffect(() => {
+    if (!isTrackedBridgeActive && !pendingBridge) {
+      return
+    }
+
+    const syncPendingBridge = () => {
+      refreshPendingBridge()
+    }
+
+    syncPendingBridge()
+    const intervalId = window.setInterval(syncPendingBridge, 1000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [isTrackedBridgeActive])
+
+  useEffect(() => {
+    if (!pendingBridge) {
+      return
+    }
+
+    if (pendingBridge.destinationChainId === ARC_CHAIN_ID && (pendingBridge.sourceChainId === OPTIMISM_CHAIN_ID || pendingBridge.sourceChainId === BASE_CHAIN_ID)) {
+      setTrackerSnapshot(pendingBridge)
+    }
+  }, [pendingBridge])
+
+  useEffect(() => {
+    if (pendingBridge && pendingBridge.destinationChainId === ARC_CHAIN_ID && (pendingBridge.sourceChainId === OPTIMISM_CHAIN_ID || pendingBridge.sourceChainId === BASE_CHAIN_ID)) {
+      setIsBridgeTrackerOpen(true)
+    }
+  }, [pendingBridge])
+
+  useEffect(() => {
+    if (!trackedBridge || !isBridgeTrackerOpen) {
+      return
+    }
+
+    setTrackerNowMs(Date.now())
+    const intervalId = window.setInterval(() => {
+      setTrackerNowMs(Date.now())
+    }, 15000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [trackedBridge, isBridgeTrackerOpen])
+
+  useEffect(() => {
+    if (!isSolanaMode || SOLANA_FORWARD_CHAIN_IDS.includes(sourceEvmChainId)) {
+      return
+    }
+
+    setSourceEvmChainId(ARC_CHAIN_ID)
+    setDestinationEvmChainId(ARC_CHAIN_ID)
+  }, [isSolanaMode, sourceEvmChainId])
+
+  useEffect(() => {
+    const resolvedDestination = resolveDestinationChainId(sourceEvmChainId, destinationEvmChainId)
+    if (!resolvedDestination || resolvedDestination === destinationEvmChainId) {
+      return
+    }
+
+    setDestinationEvmChainId(resolvedDestination)
+  }, [sourceEvmChainId, destinationEvmChainId])
 
   useEffect(() => {
     if (isConnected && address && isSolanaMode) {
@@ -248,7 +474,10 @@ export function BridgeTab() {
       return
     }
 
-    await bridge(selectedToken, amount, direction)
+    await bridge(selectedToken, amount, {
+      sourceChainId,
+      destinationChainId: destinationEvmChainId,
+    })
   }
 
   const handleGatewayDeposit = async () => {
@@ -293,13 +522,47 @@ export function BridgeTab() {
     resetPhantomSolanaError()
   }
 
-  const handleSwapDirection = async () => {
-    if (isSolanaSourceMode) {
+  const switchWalletToChain = async (targetChainId: number) => {
+    if (!isConnected || !switchChainAsync || chainId === targetChainId) {
+      return true
+    }
+
+    try {
+      await switchChainAsync({ chainId: targetChainId })
+      return true
+    } catch (error) {
+      logger.warn('Unable to switch wallet to selected source chain:', error)
+      return false
+    }
+  }
+
+  const handleSourceChainSelection = async (nextSourceChainId: number) => {
+    const switched = await switchWalletToChain(nextSourceChainId)
+    if (!switched) {
       return
     }
 
-    const nextDirection = direction === 'sepolia-to-arc' ? 'arc-to-sepolia' : 'sepolia-to-arc'
-    const nextSourceChainId = nextDirection === 'sepolia-to-arc' ? SEPOLIA_CHAIN_ID : ARC_CHAIN_ID
+    const resolvedDestination = resolveDestinationChainId(nextSourceChainId, destinationEvmChainId)
+    if (resolvedDestination) {
+      setDestinationEvmChainId(resolvedDestination)
+    }
+
+    setSourceEvmChainId(nextSourceChainId)
+    setAmount('')
+  }
+
+  const handleSwapDirection = async () => {
+    if (isSolanaSourceMode || isSolanaMode) {
+      return
+    }
+
+    const nextSourceChainId = destinationEvmChainId
+    const nextDestinationChainId = resolveDestinationChainId(nextSourceChainId, sourceEvmChainId)
+
+    if (!nextDestinationChainId) {
+      logger.warn('No valid destination chain found for selected source chain.')
+      return
+    }
 
     if (isConnected && chainId !== nextSourceChainId && switchChainAsync) {
       try {
@@ -310,7 +573,8 @@ export function BridgeTab() {
       }
     }
 
-    setDirection(nextDirection)
+    setSourceEvmChainId(nextSourceChainId)
+    setDestinationEvmChainId(nextDestinationChainId)
     setAmount('')
   }
 
@@ -319,15 +583,25 @@ export function BridgeTab() {
       return
     }
 
-    if (chainId === SEPOLIA_CHAIN_ID && direction !== 'sepolia-to-arc') {
-      setDirection('sepolia-to-arc')
+    if (!chainId || !EVM_BRIDGE_CHAIN_IDS.includes(chainId) || chainId === sourceEvmChainId) {
       return
     }
 
-    if (chainId === ARC_CHAIN_ID && direction !== 'arc-to-sepolia') {
-      setDirection('arc-to-sepolia')
+    setSourceEvmChainId(chainId)
+    const resolvedDestination = resolveDestinationChainId(chainId, destinationEvmChainId)
+    if (resolvedDestination) {
+      setDestinationEvmChainId(resolvedDestination)
     }
-  }, [isConnected, bridgeMode, activeState.isLoading, walletState.isDepositing, walletState.isPollingDeposit, chainId, direction])
+  }, [
+    isConnected,
+    bridgeMode,
+    activeState.isLoading,
+    walletState.isDepositing,
+    walletState.isPollingDeposit,
+    chainId,
+    sourceEvmChainId,
+    destinationEvmChainId,
+  ])
 
   // Save transaction to localStorage when bridge succeeds
   useEffect(() => {
@@ -335,14 +609,24 @@ export function BridgeTab() {
       return
     }
 
-    if (state.step === 'success' && state.direction && amount) {
-      const transactionSourceChainName = state.direction === 'sepolia-to-arc' ? 'Sepolia' : 'Arc Testnet'
-      const transactionDestinationChainName = state.direction === 'sepolia-to-arc' ? 'Arc Testnet' : 'Sepolia'
+    if (state.step === 'success') {
+      if (pendingBridge) {
+        setTrackerSnapshot(pendingBridge)
+      }
+      localStorage.removeItem(PENDING_BRIDGE_KEY)
+      lastPendingBridgeJsonRef.current = null
+      setPendingBridge(null)
+    }
+
+    if (state.step === 'success' && state.sourceChainId && state.destinationChainId && amount) {
+      const transactionSourceChainName = getSupportedEvmChainName(state.sourceChainId)
+      const transactionDestinationChainName = getSupportedEvmChainName(state.destinationChainId)
+      const transactionDirection = `${transactionSourceChainName.toLowerCase().replace(/\s+/g, '-')}-to-${transactionDestinationChainName.toLowerCase().replace(/\s+/g, '-')}`
 
       const transaction = {
         id: `${Date.now()}`,
         type: 'bridge',
-        direction: state.direction,
+        direction: transactionDirection,
         amount: amount,
         fromNetwork: transactionSourceChainName,
         toNetwork: transactionDestinationChainName,
@@ -358,7 +642,18 @@ export function BridgeTab() {
         localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 10)))
       }
     }
-  }, [bridgeMode, state.step, state.direction, amount, state.sourceTxHash, state.receiveTxHash])
+  }, [bridgeMode, state.step, state.sourceChainId, state.destinationChainId, amount, state.sourceTxHash, state.receiveTxHash, pendingBridge])
+
+  useEffect(() => {
+    if (!pendingBridge?.receiveTxHash) {
+      return
+    }
+
+    setTrackerSnapshot(pendingBridge)
+    localStorage.removeItem(PENDING_BRIDGE_KEY)
+    lastPendingBridgeJsonRef.current = null
+    setPendingBridge(null)
+  }, [pendingBridge])
 
   useEffect(() => {
     if (bridgeMode !== 'solana' || gatewayState.step !== 'success' || !amount || !gatewayState.transferId) {
@@ -461,10 +756,19 @@ export function BridgeTab() {
 
   const isBridgeDisabled =
     activeState.isLoading ||
+    activeState.step === 'success' ||
     !hasAmount ||
+    (!isSolanaMode && !isSolanaSourceMode && sourceEvmChainId === destinationEvmChainId) ||
+    (!isSolanaMode && !isSolanaSourceMode && !isRouteEnabled) ||
     (isSolanaSourceMode && (!phantomSolanaProvider || !isPhantomConnected || isLoadingSolanaBalance || (!solanaBalanceError && parseFloat(amount) > numericSolanaBalance))) ||
     (!isSolanaMode && !isSolanaSourceMode && parseFloat(amount) > numericBalance) ||
     (isSolanaMode && (walletState.isLoadingBalances || gatewayQuote.isLoading || !isSolanaRecipientValid || Boolean(gatewayQuote.error) || hasQuotedShortfall))
+  const trackedSourceTxUrl = trackedBridge && trackedSourceTxHash
+    ? getTxExplorerUrl(trackedBridge.sourceChainId, trackedSourceTxHash)
+    : undefined
+  const trackedReceiveTxUrl = trackedBridge && trackedReceiveTxHash
+    ? getTxExplorerUrl(trackedBridge.destinationChainId, trackedReceiveTxHash)
+    : undefined
 
   if (!isConnected) {
     return (
@@ -472,18 +776,44 @@ export function BridgeTab() {
         <Card className="text-center">
           <ArrowLeftRight size={48} className="mx-auto mb-4 text-slate-400" />
           <h2 className="text-xl font-semibold mb-2">Connect Your Wallet</h2>
-          <p className="text-slate-500">Connect your wallet to bridge USDC between Sepolia and Arc Testnet</p>
+          <p className="text-slate-500">Connect your wallet to bridge USDC across supported EVM routes.</p>
         </Card>
       </Container>
     )
   }
 
   return (
-    <Container className="py-12">
-      <div className="max-w-xl mx-auto">
+    <>
+      <Container className="py-12">
+        <div className="max-w-xl mx-auto">
         <Card>
           <h2 className="text-2xl font-bold mb-2">Bridge USDC</h2>
           <p className="mb-6 text-sm text-slate-500">Choose the route, review balances, then follow the guided confirmations.</p>
+
+          {trackedBridge && (isTrackedOptimismToArc || isTrackedBaseToArc) && (
+            <div className="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="rounded-2xl bg-white p-2 text-[#2F6E0C] shadow-sm">
+                    <Clock size={16} />
+                  </div>
+                  <div>
+                    <p className="font-semibold">Bridge tracker available</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {trackedBridge.amount} {trackedBridge.token} from {trackedSourceChainName} to {trackedDestinationChainName}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">{getBridgeTrackerHeadline()}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsBridgeTrackerOpen(true)}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-100"
+                >
+                  Open tracker
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="space-y-4">
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -527,23 +857,64 @@ export function BridgeTab() {
               <div className="flex items-center justify-between">
                 <div className="text-center flex-1">
                   <p className="mb-1 text-xs text-slate-500">From</p>
-                  <p className="font-semibold">{sourceChainName}</p>
+                  {isSolanaSourceMode || isSolanaMode ? (
+                    <p className="font-semibold">{sourceChainName}</p>
+                  ) : (
+                    <select
+                      value={sourceEvmChainId}
+                      onChange={(event) => {
+                        const nextSourceChainId = Number(event.target.value)
+                        void handleSourceChainSelection(nextSourceChainId)
+                      }}
+                      disabled={
+                        activeState.isLoading ||
+                        walletState.isDepositing ||
+                        walletState.isPollingDeposit ||
+                        isSwitchingChain
+                      }
+                      className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-sm font-semibold text-slate-900"
+                    >
+                      {bridgeChainOptions.map((option) => (
+                        <option key={`source-${option.id}`} value={option.id}>
+                          {option.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
                 <button
                   onClick={handleSwapDirection}
                   className="mx-4 rounded-xl border border-slate-200 bg-white p-2 text-slate-600 shadow-sm transition-colors hover:bg-slate-50"
-                  disabled={isSolanaSourceMode || activeState.isLoading || walletState.isDepositing || walletState.isPollingDeposit || isSwitchingChain}
+                  disabled={isSolanaSourceMode || isSolanaMode || activeState.isLoading || walletState.isDepositing || walletState.isPollingDeposit || isSwitchingChain}
                 >
                   {isSwitchingChain ? <Loader2 size={18} className="animate-spin" /> : <ArrowLeftRight size={18} />}
                 </button>
                 <div className="text-center flex-1">
                   <p className="mb-1 text-xs text-slate-500">To</p>
-                  <p className="font-semibold">{destinationChainName}</p>
+                  {isSolanaSourceMode || isSolanaMode ? (
+                    <p className="font-semibold">{destinationChainName}</p>
+                  ) : (
+                    <select
+                      value={destinationEvmChainId}
+                      onChange={(event) => {
+                        setDestinationEvmChainId(Number(event.target.value))
+                        setAmount('')
+                      }}
+                      disabled={activeState.isLoading || walletState.isDepositing || walletState.isPollingDeposit}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-sm font-semibold text-slate-900"
+                    >
+                      {evmDestinationOptions.map((option) => (
+                        <option key={`destination-${option.id}`} value={option.id}>
+                          {option.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
               </div>
               {isSolanaMode && (
                 <p className="mt-3 text-xs text-slate-500">
-                  This path forwards to Solana using Circle Gateway. The middle switch only changes the EVM source chain.
+                  This path forwards to Solana using Circle Gateway and currently supports Arc as the source chain only.
                 </p>
               )}
               {isSolanaSourceMode && (
@@ -564,6 +935,11 @@ export function BridgeTab() {
               {!isSolanaMode && chainId !== sourceChainId && (
                 <p className="mt-3 text-xs text-[#2F6E0C]">
                   Wallet will switch to {sourceChainName} automatically before bridge signatures are requested.
+                </p>
+              )}
+              {!isSolanaMode && !isSolanaSourceMode && !isRouteEnabled && (
+                <p className="mt-3 text-xs text-amber-700">
+                  This route is not enabled yet. Available now: Sepolia/Base/Optimism/Arbitrum ↔ Arc.
                 </p>
               )}
             </div>
@@ -971,34 +1347,44 @@ export function BridgeTab() {
                 {/* Transaction Links */}
                 <div className="space-y-1 mt-3 pt-3 border-t border-green-400/20">
                   {state.sourceTxHash && (
-                    <a
-                      href={
-                        completedSourceChainId === SEPOLIA_CHAIN_ID
-                          ? `https://sepolia.etherscan.io/tx/${state.sourceTxHash}`
-                          : `https://testnet.arcscan.app/tx/${state.sourceTxHash}`
+                    (() => {
+                      const sourceExplorerUrl = getTxExplorerUrl(completedSourceChainId, state.sourceTxHash)
+                      if (!sourceExplorerUrl) {
+                        return null
                       }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
-                    >
-                      <span>View {completedSourceChainName} Tx</span>
-                      <ExternalLink size={12} />
-                    </a>
+
+                      return (
+                        <a
+                          href={sourceExplorerUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
+                        >
+                          <span>View {completedSourceChainName} Tx</span>
+                          <ExternalLink size={12} />
+                        </a>
+                      )
+                    })()
                   )}
                   {state.receiveTxHash && (
-                    <a
-                      href={
-                        completedDestinationChainId === SEPOLIA_CHAIN_ID
-                          ? `https://sepolia.etherscan.io/tx/${state.receiveTxHash}`
-                          : `https://testnet.arcscan.app/tx/${state.receiveTxHash}`
+                    (() => {
+                      const destinationExplorerUrl = getTxExplorerUrl(completedDestinationChainId, state.receiveTxHash)
+                      if (!destinationExplorerUrl) {
+                        return null
                       }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
-                    >
-                      <span>View {completedDestinationChainName} Tx</span>
-                      <ExternalLink size={12} />
-                    </a>
+
+                      return (
+                        <a
+                          href={destinationExplorerUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 text-xs hover:text-green-100 transition-colors"
+                        >
+                          <span>View {completedDestinationChainName} Tx</span>
+                          <ExternalLink size={12} />
+                        </a>
+                      )
+                    })()
                   )}
                 </div>
               </div>
@@ -1054,6 +1440,28 @@ export function BridgeTab() {
                   {gatewayState.status && <p>Gateway status: {gatewayState.status}</p>}
                   {gatewayState.recipientAta && <p className="break-all">Recipient ATA: {gatewayState.recipientAta}</p>}
                 </div>
+              </div>
+            )}
+
+            {/* EVM bridge wait-time notice */}
+            {isTrackedBridgeRoute && state.step !== 'success' && (
+              <div className="flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+                <Clock size={13} className="mt-0.5 flex-shrink-0 text-blue-500" />
+                <p>
+                  {isBaseToArcRoute ? 'Base (CCTP Bridge)' : 'Optimism (CCTP Bridge)'} typically takes <strong>{trackedEtaLabel}</strong> on testnet. Three wallet confirmations
+                  are required. <strong>Keep this tab open</strong> — if it closes mid-flight, an &quot;Incomplete bridge
+                  detected&quot; notice will appear when you return.
+                </p>
+              </div>
+            )}
+
+            {isArbitrumToArcRoute && state.step !== 'success' && (
+              <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                <AlertCircle size={13} className="mt-0.5 flex-shrink-0 text-amber-600" />
+                <p>
+                  MetaMask can overstate the <strong>max network fee</strong> for Arbitrum Sepolia receive-message transactions.
+                  The value shown in the popup is often a safety cap, while the <strong>actual fee paid on-chain is much lower</strong>.
+                </p>
               </div>
             )}
 
@@ -1141,7 +1549,190 @@ export function BridgeTab() {
             )}
           </div>
         </div>
-      </div>
-    </Container>
+        </div>
+      </Container>
+
+      {trackedBridge && (isTrackedOptimismToArc || isTrackedBaseToArc) && isBridgeTrackerOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bridge-tracker-title"
+            className="relative w-full max-w-lg rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+          >
+            <button
+              type="button"
+              onClick={() => setIsBridgeTrackerOpen(false)}
+              className="absolute right-4 top-4 rounded-full border border-slate-200 p-2 text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
+              aria-label="Close bridge tracker"
+            >
+              <X size={16} />
+            </button>
+
+            <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef7e8] text-[#2F6E0C]">
+              <Clock size={22} />
+            </div>
+
+            <h2 id="bridge-tracker-title" className="text-2xl font-semibold tracking-tight text-slate-900">
+              Bridge {trackedBridge.amount} {trackedBridge.token}
+            </h2>
+            <p className="mt-2 text-sm text-slate-500">{isTrackedBaseToArc ? 'Via Base (CCTP Bridge)' : isTrackedOptimismToArc ? 'Via Optimism (CCTP Bridge)' : 'Bridge status tracker'}</p>
+
+            <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Network</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{trackedSourceChainName} → {trackedDestinationChainName}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Status</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{getBridgeTrackerHeadline()}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              {hasBridgeReachedArc && (
+                <div className="rounded-2xl border border-[#66D121]/25 bg-[#eef7e8] p-4 text-[#25580A]">
+                  <div className="flex items-start gap-3">
+                    <CheckCircle size={18} className="mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm font-semibold">Funds received on Arc</p>
+                      <p className="mt-1 text-xs text-[#25580A]">{trackedBridge.amount} {trackedBridge.token} arrived on {trackedDestinationChainName}. {trackedCompletionLabel}.</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className={`rounded-full p-1 ${hasBridgeStartedOnSource ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
+                      <CheckCircle size={16} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">Start on {trackedSourceChainName}</p>
+                      <p className="text-xs text-slate-500">
+                        {hasOnlyOffchainSignature
+                          ? 'Wallet signature captured. No on-chain transaction has been submitted yet.'
+                          : hasBridgeStartedOnSource
+                            ? 'Source-chain transaction submitted.'
+                            : 'Waiting for source-chain transaction.'}
+                      </p>
+                    </div>
+                  </div>
+                  {trackedSourceTxUrl && (
+                    <a
+                      href={trackedSourceTxUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 text-xs font-medium text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                    >
+                      View tx
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className={`rounded-full p-1 ${isWaitingForArrival ? 'bg-amber-100 text-amber-700' : hasBridgeReachedArc ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
+                      {isWaitingForArrival ? <Loader2 size={16} className="animate-spin" /> : <Clock size={16} />}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {hasBridgeReachedArc ? 'Bridge relayed to Arc' : `Wait ${trackedRemainingMinutes > 0 ? `${trackedRemainingMinutes} min` : 'for Arc mint'}`}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {isTrackedBaseToArc
+                          ? 'Base testnet transfers usually settle in 15-20 minutes.'
+                          : isTrackedOptimismToArc
+                            ? 'Optimism testnet transfers usually settle in 20-30 minutes.'
+                            : 'Waiting for the destination-chain mint to be confirmed.'}
+                      </p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500">Elapsed {trackedElapsedMinutes} min</p>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className={`rounded-full p-1 ${hasBridgeReachedArc ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
+                      {hasBridgeReachedArc ? <CheckCircle size={16} /> : <AlertCircle size={16} />}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">Get {trackedBridge.amount} {trackedBridge.token} on {trackedDestinationChainName}</p>
+                      <p className="text-xs text-slate-500">
+                        {hasBridgeReachedArc ? 'Destination mint confirmed.' : 'Destination mint has not been confirmed yet.'}
+                      </p>
+                    </div>
+                  </div>
+                  {trackedReceiveTxUrl && (
+                    <a
+                      href={trackedReceiveTxUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 text-xs font-medium text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                    >
+                      View tx
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap gap-3">
+              {pendingBridge && !hasBridgeReachedArc && (
+                <button
+                  onClick={() => void resumePendingBridge(pendingBridge)}
+                  disabled={state.isLoading}
+                  className="inline-flex items-center justify-center rounded-2xl bg-[#2F6E0C] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#25580A] disabled:opacity-60"
+                >
+                  {state.isLoading ? 'Continuing...' : 'Continue pending bridge'}
+                </button>
+              )}
+              {getAddressExplorerUrl(trackedBridge.sourceChainId, trackedBridge.walletAddress) && (
+                <a
+                  href={getAddressExplorerUrl(trackedBridge.sourceChainId, trackedBridge.walletAddress)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+                >
+                  Wallet activity
+                  <ExternalLink size={14} />
+                </a>
+              )}
+              {pendingBridge && (
+                <button
+                  onClick={() => setIsBridgeTrackerOpen(false)}
+                  className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+                >
+                  Dismiss
+                </button>
+              )}
+              {trackedBridge && (
+                <button
+                  onClick={() => {
+                    localStorage.removeItem(PENDING_BRIDGE_KEY)
+                    lastPendingBridgeJsonRef.current = null
+                    setPendingBridge(null)
+                    setTrackerSnapshot(null)
+                    setIsBridgeTrackerOpen(false)
+                  }}
+                  className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+                >
+                  Clear tracker
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
