@@ -1,6 +1,28 @@
-# Arc Bridge v2.2
+# Arc Bridge v2.3
 
-Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and wraps the recent UI, wallet, tracker, and reliability work into a single `v2.2` update.
+Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and includes the latest tracker, persistence, and reliability improvements in v2.3.
+
+## v2.3 Update
+
+This v2.3 release focuses on practical bridge usability, activity persistence across devices, and safer long running flow handling.
+
+1. Improved one click UX for Solana forwarding by making deposit and send run in one continuous flow.
+2. Improved bridge success summary with cleaner Sent / Fee / Arrived values and clearer transaction links.
+3. Added server side bridge activity persistence using Redis so history survives browser and device changes.
+4. Added local plus server activity merge with deduplication to keep the bell panel consistent.
+5. Replaced fixed history size behavior with 30 day retention for both local and server activity records.
+6. Added API hardening layers: rate limiting, idempotency keys, strict CORS allowlist, and optional request signing.
+7. Added production ready Vercel serverless activity endpoints and environment setup for Preview and Production.
+8. Improved bridge tracker behavior for already completed mint attempts by handling nonce already used as completed.
+9. Improved activity dismissal behavior so stale items can be dismissed reliably across transfer and activity sources.
+10. Removed long ETA warning for Arc origin routes where that delay guidance does not apply.
+
+### User visible changes in v2.3
+
+1. Activity bell now reflects real status buckets more reliably: In Progress, Ready to Mint, Completed.
+2. Minted transfers are moved to Completed with better edge case handling.
+3. Dismiss and Clear actions now behave consistently for older and mixed source records.
+4. Bridge history no longer disappears when you switch browser, profile, or device with the same wallet.
 
 ## v2.2 Update
 
@@ -184,7 +206,7 @@ src/
 
 ## Validation
 
-The current `v2.2` workspace was validated with:
+The current `v2.3` workspace was validated with:
 
 ```bash
 npm run build

@@ -22,6 +22,40 @@ interface Transaction {
   status?: string;
 }
 
+function formatNetworkLabel(network?: string) {
+  const normalized = (network || '').trim().toLowerCase()
+
+  if (!normalized) return 'Unknown'
+  if (normalized.includes('solana')) return 'Solana Devnet'
+  if (normalized.includes('arbitrum')) return 'Arbitrum'
+  if (normalized.includes('optimism') || normalized.startsWith('op ')) return 'Optimism'
+  if (normalized.includes('base')) return 'Base'
+  if (normalized.includes('arc')) return 'Arc'
+  if (normalized.includes('sepolia') || normalized.includes('ethereum')) return 'Sepolia'
+
+  return network as string
+}
+
+function parseDirectionRoute(direction?: string) {
+  if (!direction || !direction.includes('-to-')) {
+    return { fromNetwork: undefined, toNetwork: undefined }
+  }
+
+  const [fromRaw, toRaw] = direction.split('-to-')
+  const toTitle = (value?: string) =>
+    value
+      ? value
+          .split('-')
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(' ')
+      : undefined
+
+  return {
+    fromNetwork: toTitle(fromRaw),
+    toNetwork: toTitle(toRaw),
+  }
+}
+
 export function DashboardTab() {
   const { address, isConnected, chainId } = useAccount()
   const {
@@ -125,6 +159,8 @@ export function DashboardTab() {
   const bridgeRoutes = Object.values(bridgeRouteStats)
 
   const getTransactionRoute = (transaction: Transaction) => {
+    const parsedDirectionRoute = parseDirectionRoute(transaction.direction)
+
     if (transaction.type === 'solana-bridge' || transaction.direction === 'solana-to-arc' || transaction.fromNetwork === 'Solana Devnet') {
       return {
         label: 'Bridge',
@@ -159,11 +195,18 @@ export function DashboardTab() {
       }
     }
 
+    const fromNetwork = transaction.fromNetwork || parsedDirectionRoute.fromNetwork || 'Sepolia'
+    const toNetwork = transaction.toNetwork || parsedDirectionRoute.toNetwork || 'Arc Testnet'
+
     return {
       label: 'Bridge',
-      fromNetwork: 'Sepolia',
-      toNetwork: 'Arc Testnet',
-      sourceExplorerUrl: transaction.sourceTxHash ? `https://sepolia.etherscan.io/tx/${transaction.sourceTxHash}` : undefined,
+      fromNetwork,
+      toNetwork,
+      sourceExplorerUrl: transaction.sourceTxHash
+        ? fromNetwork.toLowerCase().includes('arc')
+          ? `https://testnet.arcscan.app/tx/${transaction.sourceTxHash}`
+          : `https://sepolia.etherscan.io/tx/${transaction.sourceTxHash}`
+        : undefined,
     }
   }
 
@@ -413,7 +456,7 @@ export function DashboardTab() {
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               {bridgeRoutes.map((route) => (
                 <div key={`${route.from}→${route.to}`} className="rounded-xl border border-slate-200 bg-[#f8faf7] p-4 text-center">
-                  <p className="mb-1 text-xs text-slate-500 leading-snug">{route.from} → {route.to}</p>
+                  <p className="mb-1 text-xs text-slate-500 leading-snug">{formatNetworkLabel(route.from)} → {formatNetworkLabel(route.to)}</p>
                   <p className="text-2xl font-bold text-sky-600">{route.count}</p>
                 </div>
               ))}
@@ -437,7 +480,7 @@ export function DashboardTab() {
                         {route.label} {tx.amount} USDC
                       </p>
                       <p className="text-xs text-slate-500">
-                        {route.fromNetwork} → {route.toNetwork}
+                        {formatNetworkLabel(route.fromNetwork)} → {formatNetworkLabel(route.toNetwork)}
                       </p>
                       <p className="text-xs text-slate-500">
                         {new Date(tx.timestamp).toLocaleString()}

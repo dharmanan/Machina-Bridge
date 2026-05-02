@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { Card, Button, Input, Container } from './ui'
 import {
@@ -11,6 +11,8 @@ import {
   ARBITRUM_CHAIN_ID,
   PENDING_BRIDGE_KEY,
   PendingBridgeRecord,
+  BridgeActivityRecord,
+  readBridgeActivitiesForWallet,
   CHAIN_NAMES,
 } from '../hooks/useBridgeKit'
 import { useGatewayForwarding } from '../hooks/useGatewayForwarding'
@@ -19,7 +21,16 @@ import { useSolanaBridge } from '../hooks/useSolanaBridge'
 import { getSupportedEvmChain, getSupportedEvmChainName, SUPPORTED_EVM_CHAIN_OPTIONS } from '../lib/chains'
 import { deriveSolanaUsdcAta, isValidSolanaAddress, SOLANA_DEVNET_NAME } from '../lib/solana'
 import { logger } from '../lib/logger'
-import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink, RefreshCw, Clock, X } from 'lucide-react'
+import {
+  dismissServerBridgeActivity,
+  dismissTrackedTransfer,
+  dismissTrackedTransferBySourceTxHash,
+  fetchServerBridgeActivities,
+  fetchTrackedTransfers,
+  ServerBridgeActivity,
+  TrackedTransfer,
+} from '../lib/transferTrackerApi'
+import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink, RefreshCw, Clock, X, Bell } from 'lucide-react'
 
 const EVM_BRIDGE_CHAIN_IDS = [SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID]
 const SOLANA_FORWARD_CHAIN_IDS = [ARC_CHAIN_ID]
@@ -55,10 +66,126 @@ function resolveDestinationChainId(sourceChainId: number, currentDestinationChai
   return allowedDestinations[0]
 }
 
+function getTransferKey(sourceTxHash?: string | null, id?: string) {
+  if (sourceTxHash) {
+    return sourceTxHash.toLowerCase()
+  }
+  return (id ?? '').toLowerCase()
+}
+
+function getTransferStatusRank(status: TrackedTransfer['status']) {
+  switch (status) {
+    case 'minted':
+      return 3
+    case 'ready_to_mint':
+      return 2
+    case 'pending_attestation':
+      return 1
+    default:
+      return 0
+  }
+}
+
+function getBridgeEtaDetails(sourceChainId?: number) {
+  if (sourceChainId === BASE_CHAIN_ID) {
+    return { label: '15-20 minutes', minutes: 20 }
+  }
+
+  if (sourceChainId === OPTIMISM_CHAIN_ID) {
+    return { label: '20-30 minutes', minutes: 30 }
+  }
+
+  if (sourceChainId === ARBITRUM_CHAIN_ID) {
+    return { label: '15-25 minutes', minutes: 25 }
+  }
+
+  return { label: '15-25 minutes', minutes: 25 }
+}
+
+function findFirstStringMatch(value: unknown, pattern: RegExp, seen = new WeakSet<object>()): string | undefined {
+  if (typeof value === 'string' && pattern.test(value)) {
+    return value
+  }
+
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+
+  if (seen.has(value)) {
+    return undefined
+  }
+  seen.add(value)
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstStringMatch(item, pattern, seen)
+      if (found) {
+        return found
+      }
+    }
+    return undefined
+  }
+
+  for (const nestedValue of Object.values(value as Record<string, unknown>)) {
+    const found = findFirstStringMatch(nestedValue, pattern, seen)
+    if (found) {
+      return found
+    }
+  }
+
+  return undefined
+}
+
+function mergeLocalAndServerActivities(
+  localActivities: BridgeActivityRecord[],
+  serverActivities: ServerBridgeActivity[],
+): BridgeActivityRecord[] {
+  const byKey = new Map<string, BridgeActivityRecord>()
+
+  const ingest = (activity: BridgeActivityRecord) => {
+    const key = activity.sourceTxHash
+      ? `source:${activity.sourceTxHash.toLowerCase()}`
+      : `id:${String(activity.id).toLowerCase()}`
+    const previous = byKey.get(key)
+
+    if (!previous) {
+      byKey.set(key, activity)
+      return
+    }
+
+    const prevUpdated = Number(previous.updatedAt ?? previous.startedAt ?? 0)
+    const nextUpdated = Number(activity.updatedAt ?? activity.startedAt ?? 0)
+    if (nextUpdated >= prevUpdated) {
+      byKey.set(key, activity)
+    }
+  }
+
+  localActivities.forEach(ingest)
+  serverActivities.forEach((serverActivity) => ingest(serverActivity as BridgeActivityRecord))
+
+  return [...byKey.values()].sort(
+    (a, b) => Number(b.updatedAt ?? b.startedAt ?? 0) - Number(a.updatedAt ?? a.startedAt ?? 0),
+  )
+}
+
 export function BridgeTab() {
   const { address, isConnected, chainId } = useAccount()
   const { switchChainAsync, isPending: isSwitchingChain } = useSwitchChain()
-  const { state, tokenBalance, isLoadingBalance, balanceError, fetchTokenBalance, bridge, resumePendingBridge, reset } = useBridgeKit()
+  const {
+    state,
+    tokenBalance,
+    isLoadingBalance,
+    balanceError,
+    fetchTokenBalance,
+    bridge,
+    resumePendingBridge,
+    approvePendingBridge,
+    startPendingBridge,
+    refreshBridgeActivities,
+    isTransferReadyToMint,
+    claimBridgedTransfer,
+    reset,
+  } = useBridgeKit()
   const {
     state: gatewayState,
     walletState,
@@ -112,8 +239,18 @@ export function BridgeTab() {
   })
   const [trackerSnapshot, setTrackerSnapshot] = useState<PendingBridgeRecord | null>(null)
   const [isBridgeTrackerOpen, setIsBridgeTrackerOpen] = useState(false)
+  const [isActivityOpen, setIsActivityOpen] = useState(false)
+  const [showFeeDetails, setShowFeeDetails] = useState(false)
+  const [selectedTrackerKey, setSelectedTrackerKey] = useState<string | null>(null)
   const [trackerNowMs, setTrackerNowMs] = useState(() => Date.now())
+  const [isMintReadyValidated, setIsMintReadyValidated] = useState(false)
+  const [isCheckingMintReady, setIsCheckingMintReady] = useState(false)
+  const [validatedReadyKeys, setValidatedReadyKeys] = useState<Record<string, boolean>>({})
   const lastPendingBridgeJsonRef = useRef<string | null>(null)
+  const lastMintReadyCheckKeyRef = useRef<string | null>(null)
+  const [trackedTransfers, setTrackedTransfers] = useState<TrackedTransfer[]>([])
+  const [activityRecords, setActivityRecords] = useState<BridgeActivityRecord[]>([])
+  const [isLoadingTrackedTransfers, setIsLoadingTrackedTransfers] = useState(false)
   const [gatewayQuote, setGatewayQuote] = useState<{
     isLoading: boolean
     estimatedFee: string | null
@@ -127,6 +264,11 @@ export function BridgeTab() {
     totalRequired: null,
     error: null,
   })
+  const [lastSolanaSummary, setLastSolanaSummary] = useState<{
+    sentBudget: number
+    totalFee: number
+    estimatedRecipient: number
+  } | null>(null)
 
   const isSolanaMode = bridgeMode === 'solana'
   const isSolanaSourceMode = bridgeMode === 'solana-source'
@@ -155,41 +297,254 @@ export function BridgeTab() {
   const numericWalletBalance = parseFloat(walletState.walletBalance) || 0
   const numericSolanaBalance = parseFloat(solanaBalance) || 0
   const processingGatewayBalance = Math.max(0, numericOnchainGatewayBalance - numericGatewayBalance)
+  const enteredAmount = parseFloat(amount) || 0
   const estimatedFeeAmount = gatewayQuote.estimatedFee ? parseFloat(gatewayQuote.estimatedFee) || 0 : 0
   const feeBufferAmount = gatewayQuote.feeBuffer ? parseFloat(gatewayQuote.feeBuffer) || 0 : 0
-  const totalRequiredAmount = gatewayQuote.totalRequired ? parseFloat(gatewayQuote.totalRequired) || 0 : 0
   const hasGatewayQuote = Boolean(gatewayQuote.totalRequired)
-  const hasQuotedShortfall = hasGatewayQuote && totalRequiredAmount > numericGatewayBalance + 0.000001
-  const topUpNeeded = hasQuotedShortfall ? Math.max(0, totalRequiredAmount - numericGatewayBalance) : 0
+  // In Solana mode the input is treated as total budget to use from Gateway.
+  const hasQuotedShortfall = isSolanaMode && hasAmount && enteredAmount > numericGatewayBalance + 0.000001
+  const topUpNeeded = hasQuotedShortfall ? Math.max(0, enteredAmount - numericGatewayBalance) : 0
+  const estimatedRecipientAmount = hasGatewayQuote ? Math.max(0, enteredAmount - estimatedFeeAmount - feeBufferAmount) : 0
   const approxMaxSendable = hasGatewayQuote ? Math.max(0, numericGatewayBalance - estimatedFeeAmount - feeBufferAmount) : 0
   const isUsingConnectedPhantomRecipient = Boolean(phantomSolanaAddress) && solanaRecipient.trim() === phantomSolanaAddress
   const isRouteEnabled = ENABLED_EVM_BRIDGE_ROUTES.has(`${sourceEvmChainId}-${destinationEvmChainId}`)
   const isOptimismToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === OPTIMISM_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
   const isBaseToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === BASE_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
   const isArbitrumToArcRoute = bridgeMode === 'evm' && sourceEvmChainId === ARBITRUM_CHAIN_ID && destinationEvmChainId === ARC_CHAIN_ID
-  const isTrackedBridgeRoute = isOptimismToArcRoute || isBaseToArcRoute
+  const isTrackedBridgeRoute = bridgeMode === 'evm' && isRouteEnabled
+  const showTrackedEtaWarning = isTrackedBridgeRoute && sourceEvmChainId !== ARC_CHAIN_ID
   const isTrackedBridgeActive = bridgeMode === 'evm' && state.isLoading && isTrackedBridgeRoute
 
-  const trackedBridge = pendingBridge ?? trackerSnapshot
+  const selectedActivity = selectedTrackerKey
+    ? activityRecords.find((activity) => getTransferKey(activity.sourceTxHash, activity.id) === selectedTrackerKey)
+    : null
+  const selectedTransfer = selectedTrackerKey
+    ? trackedTransfers.find((transfer) => getTransferKey(transfer.sourceTxHash, transfer.id) === selectedTrackerKey)
+    : null
+  const selectedTrackedBridge = selectedActivity
+    ? {
+        id: selectedActivity.id,
+        sourceChainId: selectedActivity.sourceChainId,
+        destinationChainId: selectedActivity.destinationChainId,
+        amount: selectedActivity.amount,
+        token: selectedActivity.token,
+        walletAddress: selectedActivity.walletAddress,
+        startedAt: selectedActivity.startedAt,
+        sourceTxHash: selectedActivity.sourceTxHash,
+        approvalTxHash: selectedActivity.approvalTxHash,
+        receiveTxHash: selectedActivity.receiveTxHash,
+        txHashes: [selectedActivity.approvalTxHash, selectedActivity.sourceTxHash, selectedActivity.receiveTxHash].filter((value): value is string => Boolean(value)),
+        step: selectedActivity.status === 'minted'
+          ? 'success'
+          : selectedActivity.status === 'awaiting_approve'
+            ? 'approving'
+            : selectedActivity.status === 'awaiting_burn'
+              ? 'signing-bridge'
+              : 'waiting-receive-message',
+        status: selectedActivity.status,
+      }
+    : (selectedTransfer
+      ? {
+          sourceChainId: selectedTransfer.sourceChainId,
+          destinationChainId: selectedTransfer.destinationChainId,
+          amount: selectedTransfer.amount,
+          token: selectedTransfer.token,
+          walletAddress: address ?? selectedTransfer.walletAddress,
+          startedAt: selectedTransfer.createdAt,
+          step: selectedTransfer.status === 'minted' ? 'success' : 'waiting-receive-message',
+          sourceTxHash: selectedTransfer.sourceTxHash,
+          receiveTxHash: selectedTransfer.destinationTxHash ?? undefined,
+          txHashes: selectedTransfer.destinationTxHash
+            ? [selectedTransfer.sourceTxHash, selectedTransfer.destinationTxHash]
+            : [selectedTransfer.sourceTxHash],
+        }
+      : null)
+  const trackedBridge = selectedTrackedBridge
+    ?? pendingBridge
+    ?? trackerSnapshot
+    ?? null
   const trackedSourceChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.sourceChainId) : ''
   const trackedDestinationChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.destinationChainId) : ''
   const trackedTxHashes = trackedBridge?.txHashes ?? []
-  const trackedSignatureCount = trackedBridge?.signatureCount ?? 0
-  const trackedLatestTxHash = trackedTxHashes.length > 0 ? trackedTxHashes[trackedTxHashes.length - 1] : undefined
-  const trackedHasBurnTx = trackedTxHashes.length >= 2 || trackedBridge?.step === 'waiting-receive-message' || trackedBridge?.step === 'success'
-  const trackedSourceTxHash = state.sourceTxHash ?? trackedBridge?.sourceTxHash ?? trackedBridge?.approvalTxHash ?? (trackedHasBurnTx ? trackedLatestTxHash : undefined)
-  const trackedReceiveTxHash = state.receiveTxHash ?? trackedBridge?.receiveTxHash
-  const isTrackedBaseToArc = Boolean(trackedBridge && trackedBridge.sourceChainId === BASE_CHAIN_ID && trackedBridge.destinationChainId === ARC_CHAIN_ID)
-  const isTrackedOptimismToArc = Boolean(trackedBridge && trackedBridge.sourceChainId === OPTIMISM_CHAIN_ID && trackedBridge.destinationChainId === ARC_CHAIN_ID)
-  const trackedEtaLabel = isTrackedBaseToArc ? '15-20 minutes' : isTrackedOptimismToArc ? '20-30 minutes' : '20-30 minutes'
-  const trackedEstimatedMinutes = isTrackedBaseToArc ? 20 : 30
+  const trackedSignatureCount = trackedBridge && 'signatureCount' in trackedBridge
+    ? (trackedBridge.signatureCount ?? 0)
+    : 0
+  const trackedApprovalTxHash = trackedBridge?.approvalTxHash ?? trackedTxHashes[0]
+  const stateMatchesTrackedSource = Boolean(
+    state.sourceTxHash
+    && trackedBridge?.sourceTxHash
+    && state.sourceTxHash.toLowerCase() === trackedBridge.sourceTxHash.toLowerCase(),
+  )
+  const trackedSourceTxHash = trackedBridge
+    ? (trackedBridge.sourceTxHash
+      ?? (stateMatchesTrackedSource ? state.sourceTxHash : undefined)
+      ?? (trackedTxHashes.length >= 2 ? trackedTxHashes[1] : undefined))
+    : undefined
+  const trackedReceiveTxHash = trackedBridge
+    ? (stateMatchesTrackedSource
+      ? (state.receiveTxHash ?? trackedBridge.receiveTxHash)
+      : trackedBridge.receiveTxHash)
+    : undefined
+  const trackedEta = getBridgeEtaDetails(trackedBridge?.sourceChainId ?? sourceEvmChainId)
+  const trackedEtaLabel = trackedEta.label
+  const trackedEstimatedMinutes = trackedEta.minutes
   const trackedElapsedMinutes = trackedBridge ? Math.max(0, Math.floor((trackerNowMs - trackedBridge.startedAt) / 60000)) : 0
   const trackedRemainingMinutes = trackedBridge ? Math.max(0, trackedEstimatedMinutes - trackedElapsedMinutes) : 0
   const trackedCompletionLabel = trackedElapsedMinutes > 0 ? `Completed in ~${trackedElapsedMinutes} min` : 'Completed just now'
-  const hasBridgeReachedArc = Boolean(state.step === 'success' || trackedReceiveTxHash)
+  const hasBridgeReachedArc = Boolean((state.step === 'success' && stateMatchesTrackedSource) || trackedReceiveTxHash)
   const hasOnlyOffchainSignature = trackedSignatureCount > 0 && trackedTxHashes.length === 0
-  const hasBridgeStartedOnSource = Boolean(trackedTxHashes.length > 0 || trackedBridge?.step === 'approving' || trackedBridge?.step === 'signing-bridge' || trackedBridge?.step === 'waiting-receive-message')
-  const isWaitingForArrival = Boolean(trackedBridge) && !hasBridgeReachedArc && (trackedHasBurnTx || state.step === 'waiting-receive-message')
+  const hasApproveCompleted = Boolean(trackedApprovalTxHash || trackedSourceTxHash || trackedReceiveTxHash)
+  const hasBurnCompleted = Boolean(trackedSourceTxHash)
+  const visibleTrackedTransfers = trackedTransfers.filter((transfer) => transfer.status !== 'dismissed')
+  const activityStatusByKey = activityRecords.reduce<Record<string, BridgeActivityRecord['status']>>((acc, activity) => {
+    acc[getTransferKey(activity.sourceTxHash, activity.id)] = activity.status
+    return acc
+  }, {})
+  const activityTransfers: TrackedTransfer[] = activityRecords
+    .filter((activity) => {
+      if (activity.status === 'dismissed') {
+        return false
+      }
+
+      if (activity.receiveTxHash) {
+        return true
+      }
+
+      if (activity.sourceTxHash) {
+        return true
+      }
+
+      return activity.status !== 'awaiting_approve' && activity.status !== 'awaiting_burn'
+    })
+    .map((activity) => ({
+      id: activity.id,
+      walletAddress: activity.walletAddress,
+      sourceChainId: activity.sourceChainId,
+      destinationChainId: activity.destinationChainId,
+      amount: activity.amount,
+      token: activity.token,
+      sourceTxHash: activity.sourceTxHash ?? '',
+      destinationTxHash: activity.receiveTxHash ?? null,
+      status: activity.status === 'minted' || Boolean(activity.receiveTxHash)
+        ? 'minted'
+        : activity.status === 'ready_to_mint'
+          ? 'ready_to_mint'
+          : activity.sourceTxHash
+            ? 'pending_attestation'
+            : 'pending_attestation',
+      createdAt: activity.startedAt,
+      updatedAt: activity.updatedAt,
+    }))
+  const localFallbackTransfer: TrackedTransfer | null = trackedBridge
+    ? {
+        id: `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
+        walletAddress: trackedBridge.walletAddress,
+        sourceChainId: trackedBridge.sourceChainId,
+        destinationChainId: trackedBridge.destinationChainId,
+        amount: trackedBridge.amount,
+        token: trackedBridge.token,
+        sourceTxHash: trackedBridge.sourceTxHash ?? '',
+        destinationTxHash: trackedBridge.receiveTxHash ?? null,
+        status: trackedBridge.receiveTxHash ? 'minted' : 'pending_attestation',
+        createdAt: trackedBridge.startedAt,
+        updatedAt: Date.now(),
+      }
+    : null
+  const mergedTrackedTransfers = [...activityTransfers, ...visibleTrackedTransfers, ...(localFallbackTransfer ? [localFallbackTransfer] : [])]
+    .reduce<Map<string, TrackedTransfer>>((acc, transfer) => {
+      const transferKey = transfer.sourceTxHash?.toLowerCase() || transfer.id
+      if (!transferKey) {
+        return acc
+      }
+
+      const existing = acc.get(transferKey)
+      if (!existing) {
+        acc.set(transferKey, transfer)
+        return acc
+      }
+
+      const existingRank = getTransferStatusRank(existing.status)
+      const nextRank = getTransferStatusRank(transfer.status)
+      if (nextRank > existingRank || (nextRank === existingRank && transfer.updatedAt > existing.updatedAt)) {
+        acc.set(transferKey, transfer)
+      }
+
+      return acc
+    }, new Map<string, TrackedTransfer>())
+  const mergedTrackedTransfersList = Array.from(mergedTrackedTransfers.values())
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+  const nonMintedTransfers = mergedTrackedTransfersList.filter((transfer) => transfer.status !== 'minted')
+  const actionNeededTransfers = nonMintedTransfers.filter(
+    (transfer) => transfer.status === 'ready_to_mint' || Boolean(validatedReadyKeys[getTransferKey(transfer.sourceTxHash, transfer.id)]),
+  )
+  const inProgressTransfers = nonMintedTransfers.filter((transfer) => {
+    if (transfer.status === 'ready_to_mint') {
+      return false
+    }
+    return !validatedReadyKeys[getTransferKey(transfer.sourceTxHash, transfer.id)]
+  })
+  const completedTransfers = mergedTrackedTransfersList.filter((transfer) => transfer.status === 'minted')
+  const actionNeededCount = actionNeededTransfers.length
+  const pendingReadyToMintTransfer = trackedBridge
+    ? mergedTrackedTransfersList.find((transfer) => {
+        const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+        if (transfer.status !== 'ready_to_mint' && !validatedReadyKeys[transferKey]) {
+          return false
+        }
+
+        if (!trackedBridge.sourceTxHash) {
+          return false
+        }
+
+        return transfer.sourceTxHash.toLowerCase() === trackedBridge.sourceTxHash.toLowerCase()
+      })
+    : undefined
+  const trackerTransferKey = trackedBridge ? getTransferKey(trackedBridge.sourceTxHash, trackedBridge.id) : null
+  const isTrackerReadyValidated = trackerTransferKey ? Boolean(validatedReadyKeys[trackerTransferKey]) : false
+  const trackedStatus =
+    hasBridgeReachedArc
+      ? 'minted'
+      : trackedBridge?.status === 'awaiting_approve'
+        ? 'awaiting_approve'
+        : trackedBridge?.status === 'awaiting_burn'
+          ? 'awaiting_burn'
+          : hasBurnCompleted
+            ? (isTrackerReadyValidated ? 'ready_to_mint' : 'pending_attestation')
+            : hasApproveCompleted
+              ? 'awaiting_burn'
+              : 'awaiting_approve'
+  const canApproveAction = trackedStatus === 'awaiting_approve'
+  const canBurnAction = trackedStatus === 'awaiting_burn'
+  const canMintAction = trackedStatus === 'ready_to_mint' && isMintReadyValidated
+  const isWaitingForArrival = Boolean(trackedBridge) && !hasBridgeReachedArc && !canMintAction && hasBurnCompleted
+  const isAttestationCompleted = canMintAction || hasBridgeReachedArc
+  const hasAnyTrackerData = Boolean(trackedBridge) || mergedTrackedTransfersList.length > 0
+
+  const getTransferProgressLabel = (transfer: TrackedTransfer) => {
+    const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    if (validatedReadyKeys[transferKey]) {
+      return 'Ready to mint'
+    }
+
+    const localStatus = activityStatusByKey[transferKey]
+    if (localStatus === 'awaiting_approve') {
+      return 'Waiting for approve'
+    }
+    if (localStatus === 'awaiting_burn') {
+      return 'Waiting for burn'
+    }
+    if (localStatus === 'pending_attestation') {
+      return 'Waiting for Circle attestation'
+    }
+
+    if (transfer.status === 'ready_to_mint') {
+      return 'Ready to mint'
+    }
+    if (transfer.status === 'pending_attestation') {
+      return 'Waiting for Circle attestation'
+    }
+    return 'In progress'
+  }
 
   const getTxExplorerUrl = (evmChainId: number, txHash: string) => {
     const chain = getSupportedEvmChain(evmChainId)
@@ -228,13 +583,105 @@ export function BridgeTab() {
     }
   }
 
+  const refreshTrackedTransfers = useCallback(async () => {
+    if (!isConnected || !address) {
+      setTrackedTransfers([])
+      setActivityRecords([])
+      setValidatedReadyKeys({})
+      return
+    }
+
+    setIsLoadingTrackedTransfers(true)
+    try {
+      const [localActivities, serverActivities, transfers] = await Promise.all([
+        refreshBridgeActivities(address),
+        fetchServerBridgeActivities(address, 30),
+        fetchTrackedTransfers(address),
+      ])
+
+      const mergedActivities = mergeLocalAndServerActivities(localActivities, serverActivities)
+      setActivityRecords(mergedActivities)
+      setTrackedTransfers(transfers)
+
+      const readyCandidates = [
+        ...mergedActivities
+          .filter((activity) => activity.status !== 'minted' && Boolean(activity.sourceTxHash))
+          .map((activity) => ({
+            sourceChainId: activity.sourceChainId,
+            sourceTxHash: activity.sourceTxHash as string,
+            destinationChainId: activity.destinationChainId,
+            id: activity.id,
+          })),
+        ...transfers
+          .filter((transfer) => transfer.status !== 'minted' && Boolean(transfer.sourceTxHash))
+          .map((transfer) => ({
+            sourceChainId: transfer.sourceChainId,
+            sourceTxHash: transfer.sourceTxHash,
+            destinationChainId: transfer.destinationChainId,
+            id: transfer.id,
+          })),
+      ]
+        .reduce<Array<{ sourceChainId: number; sourceTxHash: string; destinationChainId?: number; id: string }>>((acc, item) => {
+          const key = getTransferKey(item.sourceTxHash, item.id)
+          if (!key || acc.some((entry) => getTransferKey(entry.sourceTxHash, entry.id) === key)) {
+            return acc
+          }
+          acc.push(item)
+          return acc
+        }, [])
+
+      const readinessChecks = await Promise.all(
+        readyCandidates.map(async (candidate) => {
+          const key = getTransferKey(candidate.sourceTxHash, candidate.id)
+          const ready = await isTransferReadyToMint(candidate.sourceChainId, candidate.sourceTxHash, candidate.destinationChainId)
+          return [key, ready] as const
+        }),
+      )
+
+      const nextReadiness = readinessChecks.reduce<Record<string, boolean>>((acc, [key, ready]) => {
+        acc[key] = ready
+        return acc
+      }, {})
+      setValidatedReadyKeys(nextReadiness)
+    } catch {
+      try {
+        const [localFallback, serverFallback] = await Promise.all([
+          Promise.resolve(readBridgeActivitiesForWallet(address)),
+          fetchServerBridgeActivities(address, 30),
+        ])
+        setActivityRecords(mergeLocalAndServerActivities(localFallback, serverFallback))
+      } catch {
+        setActivityRecords(readBridgeActivitiesForWallet(address))
+      }
+      setValidatedReadyKeys({})
+    } finally {
+      setIsLoadingTrackedTransfers(false)
+    }
+  }, [address, isConnected, isTransferReadyToMint, refreshBridgeActivities])
+
   const getBridgeTrackerHeadline = () => {
     if (hasBridgeReachedArc) {
-      return 'Bridge completed on Arc'
+      return `Bridge completed on ${trackedDestinationChainName}`
+    }
+
+    if (trackedStatus === 'ready_to_mint' && isCheckingMintReady) {
+      return 'Checking mint readiness...'
+    }
+
+    if (canMintAction) {
+      return `Ready to mint on ${trackedDestinationChainName}`
     }
 
     if (isWaitingForArrival) {
-      return trackedRemainingMinutes > 0 ? `Wait about ${trackedRemainingMinutes} min` : 'Waiting for Arc mint'
+      return trackedRemainingMinutes > 0 ? `Wait about ${trackedRemainingMinutes} min` : `Waiting for ${trackedDestinationChainName} mint`
+    }
+
+    if (canBurnAction) {
+      return 'Approval done, burn action required'
+    }
+
+    if (canApproveAction) {
+      return 'Waiting for USDC approval'
     }
 
     if (hasOnlyOffchainSignature) {
@@ -290,16 +737,60 @@ export function BridgeTab() {
       return
     }
 
-    if (pendingBridge.destinationChainId === ARC_CHAIN_ID && (pendingBridge.sourceChainId === OPTIMISM_CHAIN_ID || pendingBridge.sourceChainId === BASE_CHAIN_ID)) {
+    const nextKey = JSON.stringify(pendingBridge)
+    const currentKey = trackerSnapshot ? JSON.stringify(trackerSnapshot) : null
+    if (nextKey !== currentKey) {
       setTrackerSnapshot(pendingBridge)
     }
-  }, [pendingBridge])
+  }, [pendingBridge, trackerSnapshot])
 
   useEffect(() => {
-    if (pendingBridge && pendingBridge.destinationChainId === ARC_CHAIN_ID && (pendingBridge.sourceChainId === OPTIMISM_CHAIN_ID || pendingBridge.sourceChainId === BASE_CHAIN_ID)) {
-      setIsBridgeTrackerOpen(true)
+    if (!isConnected || !address) {
+      return
     }
-  }, [pendingBridge])
+
+    void refreshTrackedTransfers()
+    const intervalId = window.setInterval(() => {
+      void refreshTrackedTransfers()
+    }, 15000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [isConnected, address, refreshTrackedTransfers])
+
+  useEffect(() => {
+    const checkKey = trackedBridge?.sourceTxHash ? `${trackedBridge.sourceChainId}:${trackedBridge.sourceTxHash}:${trackedStatus}` : null
+    if (!trackedBridge?.sourceTxHash || trackedStatus !== 'ready_to_mint' || hasBridgeReachedArc) {
+      lastMintReadyCheckKeyRef.current = null
+      setIsCheckingMintReady(false)
+      if (isMintReadyValidated) {
+        setIsMintReadyValidated(false)
+      }
+      return
+    }
+
+    if (lastMintReadyCheckKeyRef.current === checkKey) {
+      return
+    }
+
+    lastMintReadyCheckKeyRef.current = checkKey
+
+    let isCancelled = false
+    setIsCheckingMintReady(true)
+
+    void isTransferReadyToMint(trackedBridge.sourceChainId, trackedBridge.sourceTxHash, trackedBridge.destinationChainId).then((ready) => {
+      if (isCancelled) {
+        return
+      }
+      setIsMintReadyValidated((previous) => (previous === ready ? previous : ready))
+      setIsCheckingMintReady(false)
+    })
+
+    return () => {
+      isCancelled = true
+    }
+  }, [trackedBridge?.sourceChainId, trackedBridge?.sourceTxHash, trackedStatus, hasBridgeReachedArc, isTransferReadyToMint, isMintReadyValidated])
 
   useEffect(() => {
     if (!trackedBridge || !isBridgeTrackerOpen) {
@@ -315,6 +806,18 @@ export function BridgeTab() {
       window.clearInterval(intervalId)
     }
   }, [trackedBridge, isBridgeTrackerOpen])
+
+  useEffect(() => {
+    if (isBridgeTrackerOpen || pendingBridge?.status !== 'minted') {
+      return
+    }
+
+    localStorage.removeItem(PENDING_BRIDGE_KEY)
+    lastPendingBridgeJsonRef.current = null
+    setPendingBridge(null)
+    setTrackerSnapshot(null)
+    setSelectedTrackerKey(null)
+  }, [isBridgeTrackerOpen, pendingBridge])
 
   useEffect(() => {
     if (!isSolanaMode || SOLANA_FORWARD_CHAIN_IDS.includes(sourceEvmChainId)) {
@@ -404,7 +907,7 @@ export function BridgeTab() {
           estimatedFee: null,
           feeBuffer: null,
           totalRequired: null,
-          error: error instanceof Error ? error.message : 'Could not estimate the forwarding fee right now.',
+          error: error instanceof Error ? error.message : 'Could not estimate the send fee right now.',
         })
       }
     }, 350)
@@ -452,7 +955,7 @@ export function BridgeTab() {
       }
 
       if (gatewayQuote.isLoading) {
-        alert('Checking the current forwarding fee. Please wait a moment and try again.')
+        alert('Checking the current send fee. Please wait a moment and try again.')
         return
       }
 
@@ -461,23 +964,69 @@ export function BridgeTab() {
         return
       }
 
-      if (hasQuotedShortfall) {
-        alert(`This send needs ${gatewayQuote.totalRequired} USDC in total including fee, but only ${walletState.availableBalance} USDC is currently available in Gateway.`)
+      if (estimatedRecipientAmount <= 0) {
+        alert('This amount is too low after fees. Please increase the amount.')
         return
       }
 
+      // Approve + Send: top-up if needed, then forward
+      const originalAmount = enteredAmount
+      const totalFeeForSummary = estimatedFeeAmount + feeBufferAmount
+      const netAmountToForward = Math.max(0, originalAmount - totalFeeForSummary)
+      if (netAmountToForward <= 0) {
+        alert('After fees, nothing left to send. Please increase the amount.')
+        return
+      }
+
+      setLastSolanaSummary({
+        sentBudget: originalAmount,
+        totalFee: totalFeeForSummary,
+        estimatedRecipient: netAmountToForward,
+      })
+
+      const topUpAmount = Math.max(0, originalAmount - numericGatewayBalance)
+      
+      if (topUpAmount > 0) {
+        if (topUpAmount > numericWalletBalance) {
+          alert(`Wallet USDC balance is too low. You need ${topUpAmount.toFixed(6)} USDC to continue.`)
+          return
+        }
+        // Deposit first, wait for it to complete 
+        await depositToGateway({
+          amount: topUpAmount.toFixed(6),
+          sourceChainId,
+        })
+        // After deposit completes, fetch fresh balances
+        await fetchGatewayBalances(sourceChainId)
+        // Clear the input—deposit is done, now forwarding automatically
+        setAmount('')
+      }
+
+      // Forward the net amount that will arrive at recipient
       await forwardToSolana({
-        amount,
+        amount: netAmountToForward.toFixed(6),
         sourceChainId,
         recipientWalletAddress: solanaRecipient,
       })
       return
     }
 
+    // Starting a new EVM bridge should reset any previous tracker selection.
+    setTrackerSnapshot(null)
+    setSelectedTrackerKey(null)
+
+    // Auto-open tracker for tracked EVM routes so the user can
+    // follow progress immediately without having to click Open tracker.
+    if (isTrackedBridgeRoute) {
+      setIsBridgeTrackerOpen(true)
+    }
+
     await bridge(selectedToken, amount, {
       sourceChainId,
       destinationChainId: destinationEvmChainId,
     })
+
+    refreshPendingBridge()
   }
 
   const handleGatewayDeposit = async () => {
@@ -651,11 +1200,15 @@ export function BridgeTab() {
       return
     }
 
-    setTrackerSnapshot(pendingBridge)
+    const nextKey = JSON.stringify(pendingBridge)
+    const currentKey = trackerSnapshot ? JSON.stringify(trackerSnapshot) : null
+    if (nextKey !== currentKey) {
+      setTrackerSnapshot(pendingBridge)
+    }
     localStorage.removeItem(PENDING_BRIDGE_KEY)
     lastPendingBridgeJsonRef.current = null
     setPendingBridge(null)
-  }, [pendingBridge])
+  }, [pendingBridge, trackerSnapshot])
 
   useEffect(() => {
     if (bridgeMode !== 'solana' || gatewayState.step !== 'success' || !amount || !gatewayState.transferId) {
@@ -709,6 +1262,148 @@ export function BridgeTab() {
     }
   }, [bridgeMode, solanaBridgeState.step, solanaBridgeState.sourceTxHash, solanaBridgeState.receiveTxHash, solanaBridgeState.status, amount])
 
+  const buildPendingFromTrackedTransfer = useCallback((transfer: TrackedTransfer): PendingBridgeRecord => {
+    return {
+      sourceChainId: transfer.sourceChainId,
+      destinationChainId: transfer.destinationChainId,
+      amount: transfer.amount,
+      token: transfer.token,
+      walletAddress: address ?? transfer.walletAddress,
+      startedAt: transfer.createdAt,
+      step: transfer.status === 'minted' ? 'success' : 'waiting-receive-message',
+      sourceTxHash: transfer.sourceTxHash,
+      receiveTxHash: transfer.destinationTxHash ?? undefined,
+      txHashes: transfer.destinationTxHash
+        ? [transfer.sourceTxHash, transfer.destinationTxHash]
+        : [transfer.sourceTxHash],
+    }
+  }, [address])
+
+  const handleApprovePendingBridge = useCallback(async () => {
+    if (!pendingBridge) {
+      return
+    }
+
+    await approvePendingBridge(pendingBridge)
+    refreshPendingBridge()
+    void refreshTrackedTransfers()
+  }, [approvePendingBridge, pendingBridge, refreshTrackedTransfers])
+
+  const handleStartPendingBridge = useCallback(async () => {
+    if (!pendingBridge) {
+      return
+    }
+
+    await startPendingBridge(pendingBridge)
+    refreshPendingBridge()
+    void refreshTrackedTransfers()
+  }, [pendingBridge, refreshTrackedTransfers, startPendingBridge])
+
+  const handleOpenTransferInTracker = useCallback((transfer: TrackedTransfer) => {
+    const requestedKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    const matchedActivity = activityRecords.find((item) => {
+      if (getTransferKey(item.sourceTxHash, item.id) === requestedKey) {
+        return true
+      }
+
+      if (transfer.sourceTxHash && item.sourceTxHash) {
+        return item.sourceTxHash.toLowerCase() === transfer.sourceTxHash.toLowerCase()
+      }
+
+      return false
+    })
+
+    const pending = matchedActivity
+      ? {
+          id: matchedActivity.id,
+          sourceChainId: matchedActivity.sourceChainId,
+          destinationChainId: matchedActivity.destinationChainId,
+          amount: matchedActivity.amount,
+          token: matchedActivity.token,
+          walletAddress: matchedActivity.walletAddress,
+          startedAt: matchedActivity.startedAt,
+          status: matchedActivity.status,
+          step: matchedActivity.step,
+          approvalTxHash: matchedActivity.approvalTxHash,
+          sourceTxHash: matchedActivity.sourceTxHash,
+          receiveTxHash: matchedActivity.receiveTxHash,
+          txHashes: matchedActivity.txHashes,
+        }
+      : buildPendingFromTrackedTransfer(transfer)
+
+    if (!matchedActivity) {
+      pending.status = transfer.status === 'ready_to_mint'
+        ? 'ready_to_mint'
+        : transfer.status === 'minted'
+          ? 'minted'
+          : 'pending_attestation'
+    }
+
+    localStorage.setItem(PENDING_BRIDGE_KEY, JSON.stringify(pending))
+    lastPendingBridgeJsonRef.current = JSON.stringify(pending)
+    setPendingBridge(pending)
+    setTrackerSnapshot(pending)
+    setSelectedTrackerKey(getTransferKey(transfer.sourceTxHash, transfer.id))
+    setIsActivityOpen(false)
+    setIsBridgeTrackerOpen(true)
+  }, [activityRecords, buildPendingFromTrackedTransfer])
+
+  const handleResumeTrackedTransfer = useCallback(async (transfer: TrackedTransfer) => {
+    const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    if (!validatedReadyKeys[transferKey]) {
+      return
+    }
+
+    await claimBridgedTransfer(
+      transfer.sourceChainId,
+      transfer.destinationChainId,
+      transfer.sourceTxHash,
+    )
+    void refreshTrackedTransfers()
+  }, [claimBridgedTransfer, refreshTrackedTransfers, validatedReadyKeys])
+
+  const handleDismissTrackedTransfer = useCallback(async (transfer: TrackedTransfer) => {
+    if (transfer.id.startsWith('local-')) {
+      localStorage.removeItem(PENDING_BRIDGE_KEY)
+      lastPendingBridgeJsonRef.current = null
+      setPendingBridge(null)
+      setTrackerSnapshot(null)
+      setSelectedTrackerKey(null)
+      return
+    }
+
+    const results = await Promise.all([
+      dismissTrackedTransfer(transfer.id),
+      dismissServerBridgeActivity(transfer.id),
+      transfer.sourceTxHash ? dismissTrackedTransferBySourceTxHash(transfer.sourceTxHash) : Promise.resolve(false),
+    ])
+
+    const ok = results.some(Boolean)
+    if (ok) {
+      void refreshTrackedTransfers()
+      return
+    }
+
+    logger.warn('Dismiss failed for transfer', transfer)
+  }, [refreshTrackedTransfers])
+
+  useEffect(() => {
+    if (!isActivityOpen) {
+      return
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsActivityOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [isActivityOpen])
+
   const getLoadingMessage = () => {
     if (isSolanaSourceMode) {
       switch (solanaBridgeState.step) {
@@ -730,15 +1425,15 @@ export function BridgeTab() {
         case 'validating-recipient':
           return 'Validating Solana recipient...'
         case 'estimating':
-          return 'Estimating forwarding fees...'
+          return 'Calculating send fee...'
         case 'signing-burn-intent':
-          return 'Sign the Gateway burn intent...'
+          return 'Sign to send from Gateway...'
         case 'submitting-transfer':
-          return 'Submitting forwarding request...'
+          return 'Submitting send request...'
         case 'waiting-finality':
           return 'Waiting for Gateway finality...'
         default:
-          return 'Processing forwarding request...'
+          return 'Processing send request...'
       }
     }
 
@@ -765,7 +1460,18 @@ export function BridgeTab() {
     (!isSolanaMode && !isSolanaSourceMode && !isRouteEnabled) ||
     (isSolanaSourceMode && (!phantomSolanaProvider || !isPhantomConnected || isLoadingSolanaBalance || (!solanaBalanceError && parseFloat(amount) > numericSolanaBalance))) ||
     (!isSolanaMode && !isSolanaSourceMode && parseFloat(amount) > numericBalance) ||
-    (isSolanaMode && (walletState.isLoadingBalances || gatewayQuote.isLoading || !isSolanaRecipientValid || Boolean(gatewayQuote.error) || hasQuotedShortfall))
+    (isSolanaMode && (walletState.isLoadingBalances || walletState.isDepositing || walletState.isPollingDeposit || gatewayQuote.isLoading || !isSolanaRecipientValid || Boolean(gatewayQuote.error)))
+  const gatewayResultTxHash = findFirstStringMatch(gatewayState.result, /^0x[a-fA-F0-9]{64}$/)
+  const solanaResultTxHash = findFirstStringMatch(gatewayState.result, /^[1-9A-HJ-NP-Za-km-z]{87,88}$/)
+  const gatewayTxHash = walletState.depositTxHash ?? gatewayResultTxHash
+  const gatewayTxUrl = gatewayTxHash
+    ? sourceChainId === SEPOLIA_CHAIN_ID
+      ? `https://sepolia.etherscan.io/tx/${gatewayTxHash}`
+      : `https://testnet.arcscan.app/tx/${gatewayTxHash}`
+    : undefined
+  const solanaTxUrl = solanaResultTxHash
+    ? `https://explorer.solana.com/tx/${solanaResultTxHash}?cluster=devnet`
+    : undefined
   const trackedSourceTxUrl = trackedBridge && trackedSourceTxHash
     ? getTxExplorerUrl(trackedBridge.sourceChainId, trackedSourceTxHash)
     : undefined
@@ -778,7 +1484,22 @@ export function BridgeTab() {
       <Container className="py-12">
         <div className="max-w-xl mx-auto">
         <Card>
-          <h2 className="text-2xl font-bold mb-2">Bridge USDC</h2>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h2 className="text-2xl font-bold">Bridge USDC</h2>
+            <button
+              type="button"
+              onClick={() => setIsActivityOpen(true)}
+              className="relative inline-flex items-center justify-center rounded-xl border border-slate-200 bg-white p-2 text-slate-600 transition-colors hover:bg-slate-50"
+              title="Open activity"
+            >
+              <Bell size={16} />
+              {actionNeededCount > 0 && (
+                <span className="absolute -right-1 -top-1 inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[11px] font-semibold text-white">
+                  {actionNeededCount}
+                </span>
+              )}
+            </button>
+          </div>
           <p className="mb-6 text-sm text-slate-500">Choose the route, review balances, then follow the guided confirmations.</p>
 
           {!isConnected && (
@@ -788,7 +1509,7 @@ export function BridgeTab() {
             </div>
           )}
 
-          {trackedBridge && (isTrackedOptimismToArc || isTrackedBaseToArc) && (
+          {trackedBridge && trackedStatus !== 'minted' && (
             <div className="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-3">
@@ -804,7 +1525,10 @@ export function BridgeTab() {
                   </div>
                 </div>
                 <button
-                  onClick={() => setIsBridgeTrackerOpen(true)}
+                  onClick={() => {
+                    setSelectedTrackerKey(getTransferKey(trackedBridge.sourceTxHash, trackedBridge.id))
+                    setIsBridgeTrackerOpen(true)
+                  }}
                   className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-100"
                 >
                   Open tracker
@@ -835,7 +1559,7 @@ export function BridgeTab() {
                 }`}
                 disabled={activeState.isLoading}
               >
-                Solana Forwarding
+                Send to Solana
               </button>
               <button
                 onClick={() => setBridgeMode('solana-source')}
@@ -912,7 +1636,7 @@ export function BridgeTab() {
               </div>
               {isSolanaMode && (
                 <p className="mt-3 text-xs text-slate-500">
-                  This path forwards to Solana using Circle Gateway and currently supports Arc as the source chain only.
+                  This flow sends USDC to Solana through Circle Gateway. The source chain is currently Arc only.
                 </p>
               )}
               {isSolanaSourceMode && (
@@ -986,9 +1710,9 @@ export function BridgeTab() {
               <div className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
                 <div className="flex items-center justify-between gap-2">
                   <div>
-                    <p className="font-semibold">Forwarding balance</p>
+                    <p className="font-semibold">Send balance</p>
                     <p className="mt-1 text-xs text-amber-900/70">
-                      Your deposit has to finish processing before it can be sent to Solana.
+                      Enter a total budget, then one click handles top-up and send.
                     </p>
                   </div>
                   <button
@@ -1006,23 +1730,23 @@ export function BridgeTab() {
                     <span>{walletState.walletBalance} USDC</span>
                   </div>
                   <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                    <span>Available in Gateway</span>
+                    <span>Ready in Gateway</span>
                     <span>{walletState.availableBalance} USDC</span>
                   </div>
                   {processingGatewayBalance > 0 && (
                     <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                      <span>Still processing</span>
+                      <span>Processing deposit</span>
                       <span>{processingGatewayBalance.toFixed(6)} USDC</span>
                     </div>
                   )}
                 </div>
                 {processingGatewayBalance > 0 ? (
                   <p className="text-xs text-amber-900/80">
-                    Circle has your deposit, but it is not sendable yet. There is no exact ETA from the API. Refresh until `Available in Gateway` increases.
+                    Your deposit is still being processed by Circle. Refresh until the amount moves into Ready in Gateway.
                   </p>
                 ) : (
                   <p className="text-xs text-amber-900/80">
-                    This is your current Gateway balance before the forwarding fee is deducted.
+                    The send fee is deducted from your Gateway balance, so the full deposited amount is not sent.
                   </p>
                 )}
               </div>
@@ -1067,7 +1791,19 @@ export function BridgeTab() {
 
             {/* Amount Input */}
             <div>
-              <label className="mb-2 block text-sm font-medium text-slate-700">Amount</label>
+              <div className="mb-2 flex items-center justify-between">
+                <label className="text-sm font-medium text-slate-700">{isSolanaMode ? 'Total budget to use' : 'Amount'}</label>
+                {isSolanaMode && approxMaxSendable > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setAmount(approxMaxSendable.toFixed(6))}
+                    disabled={activeState.isLoading || walletState.isDepositing}
+                    className="text-xs font-medium text-[#2F6E0C] hover:underline disabled:opacity-50"
+                  >
+                    Max
+                  </button>
+                )}
+              </div>
               <Input
                 type="number"
                 placeholder="0.00"
@@ -1083,133 +1819,53 @@ export function BridgeTab() {
                 <p className="text-xs text-red-400 mt-1">Amount exceeds Solana Devnet balance</p>
               )}
               {isSolanaMode && hasAmount && gatewayQuote.isLoading && (
-                <p className="mt-1 text-xs text-slate-500">Checking the current forwarding fee...</p>
+                <p className="mt-1 text-xs text-slate-500">Calculating the current send fee...</p>
               )}
               {isSolanaMode && hasAmount && gatewayQuote.error && (
                 <p className="text-xs text-red-400 mt-1">{gatewayQuote.error}</p>
               )}
               {isSolanaMode && hasGatewayQuote && (
-                <div className="mt-3 space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                  <div className="flex items-center justify-between gap-3">
-                    <span>Estimated fee</span>
-                    <span>{gatewayQuote.estimatedFee} USDC</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span>Safety buffer</span>
-                    <span>{gatewayQuote.feeBuffer} USDC</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span>Total needed now</span>
-                    <span>{gatewayQuote.totalRequired} USDC</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-3">
-                    <span>Approx. max you can send now</span>
-                    <span>{approxMaxSendable.toFixed(6)} USDC</span>
-                  </div>
+                <div className="mt-2">
+                  <p className="text-xs text-slate-600">
+                    Estimated to Solana: ~{estimatedRecipientAmount.toFixed(6)} USDC
+                  </p>
+                  {hasQuotedShortfall ? (
+                    <p className="text-xs text-amber-600 font-medium">
+                      ~{gatewayQuote.estimatedFee} USDC send fee · Approve & Send handles top-up
+                    </p>
+                  ) : (
+                    <p className="text-xs text-slate-500">~{gatewayQuote.estimatedFee} USDC send fee</p>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowFeeDetails((v) => !v)}
+                    className="mt-1 text-xs text-slate-400 hover:text-slate-600"
+                  >
+                    {showFeeDetails ? 'Hide details' : 'Show details'}
+                  </button>
+                  {showFeeDetails && (
+                    <div className="mt-2 space-y-1 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                      <div className="flex items-center justify-between gap-3">
+                        <span>Total budget</span>
+                        <span>{amount || '0'} USDC</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span>Network fee</span>
+                        <span>{gatewayQuote.estimatedFee} USDC</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span>Safety buffer</span>
+                        <span>{gatewayQuote.feeBuffer} USDC</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span>Estimated to recipient</span>
+                        <span>{estimatedRecipientAmount.toFixed(6)} USDC</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
-              {isSolanaMode && hasGatewayQuote && hasQuotedShortfall && (
-                <p className="text-xs text-amber-300 mt-1">
-                  This send needs {gatewayQuote.totalRequired} USDC in total. Top up about {topUpNeeded.toFixed(6)} more USDC in Gateway, or lower the amount.
-                </p>
-              )}
-              {isSolanaMode && hasGatewayQuote && !hasQuotedShortfall && (
-                <p className="mt-1 text-xs text-slate-500">
-                  The fee is estimated by Circle and can change slightly with route and amount. `Total needed now` includes a small safety buffer.
-                </p>
-              )}
             </div>
-
-            {isSolanaMode && (
-              <div className="space-y-2 rounded-2xl border border-slate-200 bg-[#f8faf7] p-4">
-                <p className="text-sm font-medium">Gateway Deposit</p>
-                <p className="text-xs text-slate-500">
-                  Move USDC from your wallet into Gateway on {sourceChainName} if the total needed is higher than your available Gateway balance.
-                </p>
-                <p className="text-xs text-slate-500">
-                  This usually needs 2 wallet confirmations: first `Approve`, then `Deposit`.
-                </p>
-                <Button
-                  variant="secondary"
-                  onClick={handleGatewayDeposit}
-                  disabled={
-                    walletState.isDepositing ||
-                    walletState.isPollingDeposit ||
-                    activeState.isLoading ||
-                    !hasAmount ||
-                    walletState.isLoadingBalances ||
-                    parseFloat(amount) > numericWalletBalance
-                  }
-                  loading={walletState.isDepositing}
-                  className="w-full"
-                >
-                  Deposit {amount || '0'} USDC to Gateway
-                </Button>
-                {hasAmount && parseFloat(amount) > numericWalletBalance && (
-                  <p className="text-xs text-red-400">Wallet USDC balance is too low for this Gateway deposit</p>
-                )}
-                {walletState.depositStatus && (
-                  <div className="flex items-start gap-2 text-xs text-slate-600">
-                    {(walletState.isDepositing || walletState.isPollingDeposit) && <Loader2 size={12} className="mt-0.5 animate-spin flex-shrink-0" />}
-                    <p>{walletState.depositStatus}</p>
-                  </div>
-                )}
-                {walletState.approvalTxHash && !walletState.depositTxHash && (
-                  <a
-                    href={
-                      sourceChainId === SEPOLIA_CHAIN_ID
-                        ? `https://sepolia.etherscan.io/tx/${walletState.approvalTxHash}`
-                        : `https://testnet.arcscan.app/tx/${walletState.approvalTxHash}`
-                    }
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 text-xs text-[#2F6E0C] transition-colors hover:text-[#25580A]"
-                  >
-                    <span>View approval tx</span>
-                    <ExternalLink size={12} />
-                  </a>
-                )}
-                {!walletState.isDepositing && !walletState.isPollingDeposit && walletState.error && (
-                  <p className="text-xs text-amber-700">
-                    If you only confirmed `Approve`, the deposit has not been sent yet. Start the deposit again and confirm the second wallet popup.
-                  </p>
-                )}
-                {walletState.depositTxHash && (
-                  <a
-                    href={
-                      sourceChainId === SEPOLIA_CHAIN_ID
-                        ? `https://sepolia.etherscan.io/tx/${walletState.depositTxHash}`
-                        : `https://testnet.arcscan.app/tx/${walletState.depositTxHash}`
-                    }
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 text-xs text-[#2F6E0C] transition-colors hover:text-[#25580A]"
-                  >
-                    <span>View Gateway deposit tx</span>
-                    <ExternalLink size={12} />
-                  </a>
-                )}
-                {walletState.pendingDeposits.length > 0 && (
-                  <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
-                    <p className="font-semibold">Deposits being processed</p>
-                    <div className="mt-2 space-y-2">
-                      {walletState.pendingDeposits.slice(0, 3).map((deposit) => (
-                        <div key={`${deposit.transactionHash}-${deposit.blockHeight ?? 'pending'}`} className="rounded-lg border border-sky-100 bg-white p-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span>Status: {deposit.status}</span>
-                            <span>{formatPendingDepositAmount(deposit.amount)} USDC</span>
-                          </div>
-                          <p className="mt-1 break-all text-sky-700">Tx: {deposit.transactionHash}</p>
-                          {deposit.blockTimestamp && (
-                            <p className="mt-1 text-sky-700/80">Seen: {new Date(deposit.blockTimestamp).toLocaleString()}</p>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
 
             {(isSolanaMode || isSolanaSourceMode) && (
               <div className="space-y-3 rounded-2xl border border-[#2F6E0C]/15 bg-[#eef7e8] p-4 text-sm text-slate-700">
@@ -1429,37 +2085,61 @@ export function BridgeTab() {
                 <div className="flex items-start gap-2">
                   <CheckCircle size={16} className="mt-0.5 flex-shrink-0" />
                   <div className="text-sm">
-                    <p className="font-semibold">Forwarding Successful! 🎉</p>
-                    <p className="text-xs mt-1">USDC forwarding from {sourceChainName} to {destinationChainName} was confirmed by Gateway.</p>
+                    <p className="font-semibold">Sent to Solana! 🎉</p>
                   </div>
                 </div>
-                <div className="space-y-1 mt-3 pt-3 border-t border-green-400/20 text-xs text-[#25580A]">
-                  {gatewayState.transferId && <p className="break-all">Transfer ID: {gatewayState.transferId}</p>}
-                  {gatewayState.status && <p>Gateway status: {gatewayState.status}</p>}
-                  {gatewayState.recipientAta && <p className="break-all">Recipient ATA: {gatewayState.recipientAta}</p>}
-                  {gatewayState.destinationBalanceBefore && (
-                    <p>Recipient balance before: {gatewayState.destinationBalanceBefore} USDC</p>
-                  )}
-                  {gatewayState.destinationBalanceAfter && (
-                    <p>Recipient balance latest: {gatewayState.destinationBalanceAfter} USDC</p>
-                  )}
-                  {gatewayState.fundsArrivalChecked && (
-                    <p>
-                      {gatewayState.fundsArrived
-                        ? 'Funds arrival confirmed by Solana balance increase.'
-                        : 'Gateway finalized, but expected recipient balance increase is not observed yet. Refresh and check again shortly.'}
-                    </p>
-                  )}
+                <div className="space-y-1 mt-2 pt-2 border-t border-green-400/20 text-xs text-[#25580A]">
+                  {(() => {
+                    const arrivedAmount = parseFloat(gatewayState.destinationBalanceAfter || '0') - parseFloat(gatewayState.destinationBalanceBefore || '0')
+                    const summarySent = lastSolanaSummary?.sentBudget
+                    const summaryFee = lastSolanaSummary?.totalFee
+                    const summaryArrived = lastSolanaSummary?.estimatedRecipient
+                    const sentAmount = summarySent ?? Math.max(0, arrivedAmount)
+                    const feeAmount = summaryFee ?? Math.max(0, sentAmount - Math.max(0, arrivedAmount))
+                    const arrivedForDisplay = summaryArrived ?? Math.max(0, arrivedAmount)
+                    return (
+                      <>
+                        <p>Sent: ~{sentAmount.toFixed(2)} USDC</p>
+                        <p>Fee: ~{feeAmount.toFixed(2)} USDC</p>
+                        <p>Arrived: ~{arrivedForDisplay.toFixed(2)} USDC</p>
+                        {gatewayTxUrl && (
+                          <a
+                            href={gatewayTxUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center gap-2 text-[#25580A] transition-colors hover:text-[#1E4608]"
+                          >
+                            <span>View Gateway tx</span>
+                            <ExternalLink size={12} />
+                          </a>
+                        )}
+                        {solanaTxUrl && (
+                          <a
+                            href={solanaTxUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center gap-2 text-[#25580A] transition-colors hover:text-[#1E4608]"
+                          >
+                            <span>View Solana tx</span>
+                            <ExternalLink size={12} />
+                          </a>
+                        )}
+                        {gatewayState.fundsArrived && (
+                          <p className="text-[11px] text-green-700">✓ Confirmed by Solana balance increase</p>
+                        )}
+                      </>
+                    )
+                  })()}
                 </div>
               </div>
             )}
 
             {/* EVM bridge wait-time notice */}
-            {isTrackedBridgeRoute && state.step !== 'success' && (
+            {showTrackedEtaWarning && state.step !== 'success' && (
               <div className="flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
                 <Clock size={13} className="mt-0.5 flex-shrink-0 text-blue-500" />
                 <p>
-                  {isBaseToArcRoute ? 'Base (CCTP Bridge)' : 'Optimism (CCTP Bridge)'} typically takes <strong>{trackedEtaLabel}</strong> on testnet. Three wallet confirmations
+                  {sourceChainName} to {destinationChainName} typically takes <strong>{trackedEtaLabel}</strong> on testnet. Three wallet confirmations
                   are required. <strong>Keep this tab open</strong> — if it closes mid-flight, an &quot;Incomplete bridge
                   detected&quot; notice will appear when you return.
                 </p>
@@ -1491,28 +2171,84 @@ export function BridgeTab() {
                     : isSolanaMode
                     ? gatewayState.step === 'switching-network'
                       ? 'Switching Network...'
-                      : 'Forwarding...'
+                      : 'Sending...'
                     : state.step === 'switching-network'
                       ? 'Switching Network...'
                       : 'Bridging...'}
                 </>
               ) : activeState.step === 'success' ? (
-                isSolanaMode ? 'Forwarding Complete' : 'Bridge Complete'
+                isSolanaMode ? 'Send Complete' : 'Bridge Complete'
               ) : (
                 isSolanaSourceMode
                   ? `Bridge ${amount || '0'} ${selectedToken} from Solana`
                   : isSolanaMode
-                  ? `Forward ${amount || '0'} ${selectedToken} to Solana`
+                  ? hasQuotedShortfall
+                    ? `Approve + Send`
+                    : `Send ~${estimatedRecipientAmount.toFixed(2)} ${selectedToken} to Solana`
                   : `Bridge ${amount || '0'} ${selectedToken}`
               )}
             </Button>
 
             {/* Reset Button (after success) */}
+            {/* Gateway deposit status (isSolanaMode shortfall flow) */}
+            {isSolanaMode && (walletState.isDepositing || walletState.isPollingDeposit || walletState.depositStatus) && (
+              <div className="space-y-1">
+                {walletState.depositStatus && (
+                  <div className="flex items-start gap-2 text-xs text-slate-600">
+                    {(walletState.isDepositing || walletState.isPollingDeposit) && <Loader2 size={12} className="mt-0.5 animate-spin flex-shrink-0" />}
+                    <p>{walletState.depositStatus}</p>
+                  </div>
+                )}
+                {walletState.approvalTxHash && !walletState.depositTxHash && (
+                  <a
+                    href={sourceChainId === SEPOLIA_CHAIN_ID ? `https://sepolia.etherscan.io/tx/${walletState.approvalTxHash}` : `https://testnet.arcscan.app/tx/${walletState.approvalTxHash}`}
+                    target="_blank" rel="noopener noreferrer"
+                    className="flex items-center gap-2 text-xs text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                  >
+                    <span>View approval tx</span><ExternalLink size={12} />
+                  </a>
+                )}
+                {walletState.depositTxHash && (
+                  <a
+                    href={sourceChainId === SEPOLIA_CHAIN_ID ? `https://sepolia.etherscan.io/tx/${walletState.depositTxHash}` : `https://testnet.arcscan.app/tx/${walletState.depositTxHash}`}
+                    target="_blank" rel="noopener noreferrer"
+                    className="flex items-center gap-2 text-xs text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                  >
+                    <span>View Gateway deposit tx</span><ExternalLink size={12} />
+                  </a>
+                )}
+                {!walletState.isDepositing && !walletState.isPollingDeposit && walletState.error && (
+                  <p className="text-xs text-amber-700">
+                    If you only confirmed Approve, the deposit was not sent yet. Try again and confirm the second wallet popup.
+                  </p>
+                )}
+              </div>
+            )}
+            {isSolanaMode && walletState.pendingDeposits.length > 0 && (
+              <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+                <p className="font-semibold">Deposits being processed</p>
+                <div className="mt-2 space-y-2">
+                  {walletState.pendingDeposits.slice(0, 3).map((deposit) => (
+                    <div key={`${deposit.transactionHash}-${deposit.blockHeight ?? 'pending'}`} className="rounded-lg border border-sky-100 bg-white p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Status: {deposit.status}</span>
+                        <span>{formatPendingDepositAmount(deposit.amount)} USDC</span>
+                      </div>
+                      <p className="mt-1 break-all text-sky-700">Tx: {deposit.transactionHash}</p>
+                      {deposit.blockTimestamp && (
+                        <p className="mt-1 text-sky-700/80">Seen: {new Date(deposit.blockTimestamp).toLocaleString()}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {activeState.step === 'success' && (
               <button
                 onClick={() => {
                   if (isSolanaMode) {
                     resetGateway()
+                    setLastSolanaSummary(null)
                     setSolanaRecipient(phantomSolanaAddress ?? '')
                     fetchGatewayBalances(sourceChainId)
                   } else if (isSolanaSourceMode) {
@@ -1525,7 +2261,7 @@ export function BridgeTab() {
                 }}
                 className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-50"
               >
-                {isSolanaMode ? 'Forward Again' : 'Bridge Again'}
+                {isSolanaMode ? 'Send Again' : 'Bridge Again'}
               </button>
             )}
           </div>
@@ -1544,11 +2280,11 @@ export function BridgeTab() {
               </>
             ) : isSolanaMode ? (
               <>
-                <p><strong>Solana Forwarding Process:</strong></p>
-                <p>1. <strong>Deposit</strong>: Move USDC from your connected wallet into Gateway on the selected source chain</p>
-                <p>2. <strong>Finalize</strong>: Wait until Gateway marks that deposit as available balance</p>
-                <p>3. <strong>Estimate</strong>: The app derives the recipient ATA and estimates forwarding fees</p>
-                <p>4. <strong>Sign and Forward</strong>: You sign the Gateway burn intent and Circle forwards the destination mint to Solana</p>
+                <p><strong>Send to Solana Process:</strong></p>
+                <p>1. <strong>Add funds</strong>: Add USDC from your wallet to Gateway on the source chain</p>
+                <p>2. <strong>Wait for ready balance</strong>: Refresh until the funds appear as Ready in Gateway</p>
+                <p>3. <strong>Review fee</strong>: Check total required and Max sendable</p>
+                <p>4. <strong>Send</strong>: Sign once to send USDC from Gateway to your Solana recipient</p>
               </>
             ) : (
               <>
@@ -1563,13 +2299,13 @@ export function BridgeTab() {
         </div>
       </Container>
 
-      {trackedBridge && (isTrackedOptimismToArc || isTrackedBaseToArc) && isBridgeTrackerOpen && (
+      {isBridgeTrackerOpen && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
           <div
             role="dialog"
             aria-modal="true"
             aria-labelledby="bridge-tracker-title"
-            className="relative w-full max-w-lg rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            className="relative w-full max-w-2xl rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
           >
             <button
               type="button"
@@ -1585,11 +2321,17 @@ export function BridgeTab() {
             </div>
 
             <h2 id="bridge-tracker-title" className="text-2xl font-semibold tracking-tight text-slate-900">
-              Bridge {trackedBridge.amount} {trackedBridge.token}
+              Bridge Tracker
             </h2>
-            <p className="mt-2 text-sm text-slate-500">{isTrackedBaseToArc ? 'Via Base (CCTP Bridge)' : isTrackedOptimismToArc ? 'Via Optimism (CCTP Bridge)' : 'Bridge status tracker'}</p>
+            <p className="mt-2 text-sm text-slate-500">
+              Follow this bridge step by step and complete required signatures.
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              Verification: {isMintReadyValidated ? 'Circle readiness confirmed' : isCheckingMintReady ? 'Checking Circle readiness...' : 'Waiting Circle readiness'}
+            </p>
 
-            <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            {hasAnyTrackerData ? (
+              <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Network</p>
@@ -1600,114 +2342,220 @@ export function BridgeTab() {
                   <p className="mt-2 text-sm font-semibold text-slate-900">{getBridgeTrackerHeadline()}</p>
                 </div>
               </div>
-            </div>
+              </div>
+            ) : (
+              <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
+                No transfers for this wallet yet.
+              </div>
+            )}
 
-            <div className="mt-4 space-y-3">
-              {hasBridgeReachedArc && (
-                <div className="rounded-2xl border border-[#66D121]/25 bg-[#eef7e8] p-4 text-[#25580A]">
-                  <div className="flex items-start gap-3">
-                    <CheckCircle size={18} className="mt-0.5 flex-shrink-0" />
-                    <div>
-                      <p className="text-sm font-semibold">Funds received on Arc</p>
-                      <p className="mt-1 text-xs text-[#25580A]">{trackedBridge.amount} {trackedBridge.token} arrived on {trackedDestinationChainName}. {trackedCompletionLabel}.</p>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="mt-4 space-y-2">
+              {/* Step 1: Approve */}
+              <div className={`rounded-2xl border p-4 ${
+                hasApproveCompleted
+                  ? 'border-[#66D121]/30 bg-[#eef7e8]'
+                  : 'border-slate-200 bg-white'
+              }`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    <div className={`rounded-full p-1 ${hasBridgeStartedOnSource ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
-                      <CheckCircle size={16} />
+                    <div className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${
+                      hasApproveCompleted ? 'bg-[#2F6E0C] text-white' : 'bg-slate-100 text-slate-400'
+                    }`}>
+                      {hasApproveCompleted ? <CheckCircle size={15} /> : <span className="text-xs font-bold">1</span>}
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">Start on {trackedSourceChainName}</p>
-                      <p className="text-xs text-slate-500">
-                        {hasOnlyOffchainSignature
-                          ? 'Wallet signature captured. No on-chain transaction has been submitted yet.'
-                          : hasBridgeStartedOnSource
-                            ? 'Source-chain transaction submitted.'
-                            : 'Waiting for source-chain transaction.'}
+                      <p className={`text-sm font-semibold ${
+                        hasApproveCompleted ? 'text-[#1e4d07]' : 'text-slate-900'
+                      }`}>Approve</p>
+                      <p className={`text-xs ${
+                        hasApproveCompleted ? 'text-[#2F6E0C]' : 'text-slate-500'
+                      }`}>
+                        {hasApproveCompleted ? 'USDC spend approved.' : 'Waiting for USDC approval.'}
+                        {hasApproveCompleted && trackedApprovalTxHash && trackedBridge && (
+                          <>
+                            {' '}
+                            <a
+                              href={getTxExplorerUrl(trackedBridge.sourceChainId, trackedApprovalTxHash)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="font-medium text-[#2F6E0C] underline-offset-2 hover:underline"
+                            >
+                              View tx
+                            </a>
+                          </>
+                        )}
                       </p>
                     </div>
                   </div>
-                  {trackedSourceTxUrl && (
-                    <a
-                      href={trackedSourceTxUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 text-xs font-medium text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                  {!hasApproveCompleted && (
+                    <button
+                      type="button"
+                      onClick={() => void handleApprovePendingBridge()}
+                      disabled={!canApproveAction || state.isLoading}
+                      className="rounded-lg bg-[#2F6E0C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      View tx
-                      <ExternalLink size={12} />
-                    </a>
+                      Approve
+                    </button>
                   )}
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              {/* Step 2: Burn */}
+              <div className={`rounded-2xl border p-4 ${
+                hasBurnCompleted
+                  ? 'border-[#66D121]/30 bg-[#eef7e8]'
+                  : 'border-slate-200 bg-white'
+              }`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    <div className={`rounded-full p-1 ${isWaitingForArrival ? 'bg-amber-100 text-amber-700' : hasBridgeReachedArc ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
-                      {isWaitingForArrival ? <Loader2 size={16} className="animate-spin" /> : <Clock size={16} />}
+                    <div className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${
+                      hasBurnCompleted ? 'bg-[#2F6E0C] text-white' : 'bg-slate-100 text-slate-400'
+                    }`}>
+                      {hasBurnCompleted ? <CheckCircle size={15} /> : <span className="text-xs font-bold">2</span>}
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">
-                        {hasBridgeReachedArc ? 'Bridge relayed to Arc' : `Wait ${trackedRemainingMinutes > 0 ? `${trackedRemainingMinutes} min` : 'for Arc mint'}`}
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        {isTrackedBaseToArc
-                          ? 'Base testnet transfers usually settle in 15-20 minutes.'
-                          : isTrackedOptimismToArc
-                            ? 'Optimism testnet transfers usually settle in 20-30 minutes.'
-                            : 'Waiting for the destination-chain mint to be confirmed.'}
+                      <p className={`text-sm font-semibold ${
+                        hasBurnCompleted ? 'text-[#1e4d07]' : 'text-slate-900'
+                      }`}>Burn on {trackedSourceChainName}</p>
+                      <p className={`text-xs ${
+                        hasBurnCompleted ? 'text-[#2F6E0C]' : 'text-slate-500'
+                      }`}>
+                        {hasBurnCompleted
+                          ? 'Burn transaction submitted on source chain.'
+                          : 'Waiting for burn transaction.'}
+                          {hasBurnCompleted && trackedSourceTxUrl && (
+                            <>
+                              {' '}
+                              <a
+                                href={trackedSourceTxUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="font-medium text-[#2F6E0C] underline-offset-2 hover:underline"
+                              >
+                                View tx
+                              </a>
+                            </>
+                          )}
                       </p>
                     </div>
                   </div>
-                  <p className="text-xs text-slate-500">Elapsed {trackedElapsedMinutes} min</p>
+                    {!hasBurnCompleted && (
+                    <button
+                      type="button"
+                      onClick={() => void handleStartPendingBridge()}
+                      disabled={!canBurnAction || state.isLoading}
+                      className="rounded-lg bg-[#2F6E0C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Bridge
+                    </button>
+                  )}
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              {/* Step 3: Attestation */}
+              <div className={`rounded-2xl border p-4 ${
+                isAttestationCompleted
+                  ? 'border-[#66D121]/30 bg-[#eef7e8]'
+                  : isWaitingForArrival
+                    ? 'border-amber-200 bg-amber-50'
+                    : 'border-slate-200 bg-white'
+              }`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    <div className={`rounded-full p-1 ${hasBridgeReachedArc ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-400'}`}>
-                      {hasBridgeReachedArc ? <CheckCircle size={16} /> : <AlertCircle size={16} />}
+                    <div className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${
+                      isAttestationCompleted
+                        ? 'bg-[#2F6E0C] text-white'
+                        : isWaitingForArrival
+                          ? 'bg-amber-400 text-white'
+                          : 'bg-slate-100 text-slate-400'
+                    }`}>
+                      {isAttestationCompleted
+                        ? <CheckCircle size={15} />
+                        : isWaitingForArrival
+                          ? <Loader2 size={15} className="animate-spin" />
+                          : <span className="text-xs font-bold">3</span>}
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">Get {trackedBridge.amount} {trackedBridge.token} on {trackedDestinationChainName}</p>
-                      <p className="text-xs text-slate-500">
-                        {hasBridgeReachedArc ? 'Destination mint confirmed.' : 'Destination mint has not been confirmed yet.'}
+                      <p className={`text-sm font-semibold ${
+                        isAttestationCompleted ? 'text-[#1e4d07]' : isWaitingForArrival ? 'text-amber-800' : 'text-slate-900'
+                      }`}>{isAttestationCompleted ? `Bridge relayed to ${trackedDestinationChainName}` : 'Attestation'}</p>
+                      <p className={`text-xs ${
+                        isAttestationCompleted ? 'text-[#2F6E0C]' : isWaitingForArrival ? 'text-amber-700' : 'text-slate-500'
+                      }`}>
+                        {isAttestationCompleted
+                          ? 'Circle attestation confirmed.'
+                          : `${trackedSourceChainName} transfers usually settle in ~${trackedEstimatedMinutes} min.`}
                       </p>
                     </div>
                   </div>
-                  {trackedReceiveTxUrl && (
-                    <a
-                      href={trackedReceiveTxUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 text-xs font-medium text-[#2F6E0C] transition-colors hover:text-[#25580A]"
+                  {isWaitingForArrival && !hasBridgeReachedArc && (
+                    <p className="flex-shrink-0 text-xs text-amber-600">{trackedElapsedMinutes} min elapsed</p>
+                  )}
+                </div>
+              </div>
+
+              {/* Step 4: Mint */}
+              <div className={`rounded-2xl border p-4 ${
+                hasBridgeReachedArc
+                  ? 'border-[#66D121]/30 bg-[#eef7e8]'
+                  : 'border-slate-200 bg-white'
+              }`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${
+                      hasBridgeReachedArc ? 'bg-[#2F6E0C] text-white' : 'bg-slate-100 text-slate-400'
+                    }`}>
+                      {hasBridgeReachedArc ? <CheckCircle size={15} /> : <span className="text-xs font-bold">4</span>}
+                    </div>
+                    <div>
+                      <p className={`text-sm font-semibold ${
+                        hasBridgeReachedArc ? 'text-[#1e4d07]' : 'text-slate-900'
+                      }`}>Mint on {trackedDestinationChainName}</p>
+                      <p className={`text-xs ${
+                        hasBridgeReachedArc ? 'text-[#2F6E0C]' : 'text-slate-500'
+                      }`}>
+                        {hasBridgeReachedArc
+                          ? `${trackedBridge?.amount ?? '-'} ${trackedBridge?.token ?? 'USDC'} received. ${trackedCompletionLabel}.`
+                          : 'USDC will be minted on destination chain.'}
+                        {hasBridgeReachedArc && trackedReceiveTxUrl && (
+                          <>
+                            {' '}
+                            <a
+                              href={trackedReceiveTxUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="font-medium text-[#2F6E0C] underline-offset-2 hover:underline"
+                            >
+                              View tx
+                            </a>
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                  {!hasBridgeReachedArc && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!pendingReadyToMintTransfer) return
+                        void claimBridgedTransfer(
+                          pendingReadyToMintTransfer.sourceChainId,
+                          pendingReadyToMintTransfer.destinationChainId,
+                          pendingReadyToMintTransfer.sourceTxHash,
+                        )
+                      }}
+                      disabled={!canMintAction || isCheckingMintReady || state.isLoading || !pendingReadyToMintTransfer}
+                      className="rounded-lg bg-[#2F6E0C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      View tx
-                      <ExternalLink size={12} />
-                    </a>
+                      {isCheckingMintReady ? 'Checking...' : 'Mint'}
+                    </button>
                   )}
                 </div>
               </div>
             </div>
 
             <div className="mt-5 flex flex-wrap gap-3">
-              {pendingBridge && !hasBridgeReachedArc && (
-                  <button
-                    onClick={() => void resumePendingBridge(pendingBridge)}
-                    disabled={state.isLoading}
-                    className="inline-flex items-center justify-center rounded-2xl bg-[#2F6E0C] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#25580A] disabled:opacity-60"
-                  >
-                    {state.isLoading ? 'Continuing...' : 'Continue pending bridge'}
-                  </button>
-              )}
-              {getAddressExplorerUrl(trackedBridge.sourceChainId, trackedBridge.walletAddress) && (
+              {trackedBridge && getAddressExplorerUrl(trackedBridge.sourceChainId, trackedBridge.walletAddress) && (
                 <a
                   href={getAddressExplorerUrl(trackedBridge.sourceChainId, trackedBridge.walletAddress)}
                   target="_blank"
@@ -1733,6 +2581,7 @@ export function BridgeTab() {
                     lastPendingBridgeJsonRef.current = null
                     setPendingBridge(null)
                     setTrackerSnapshot(null)
+                    setSelectedTrackerKey(null)
                     setIsBridgeTrackerOpen(false)
                   }}
                   className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
@@ -1740,6 +2589,201 @@ export function BridgeTab() {
                   Clear tracker
                 </button>
               )}
+            </div>
+
+            <div className="mt-6 border-t border-slate-200 pt-4">
+              <p className="text-xs text-slate-500">
+                Activity list is available from the bell icon. Use this tracker only for the currently selected bridge flow.
+              </p>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {isActivityOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm"
+          onClick={() => setIsActivityOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="activity-title"
+            className="relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setIsActivityOpen(false)}
+              className="absolute right-4 top-4 rounded-full border border-slate-200 p-2 text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
+              aria-label="Close activity"
+            >
+              <X size={16} />
+            </button>
+
+            <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef7e8] text-[#2F6E0C]">
+              <Bell size={22} />
+            </div>
+
+            <h2 id="activity-title" className="text-2xl font-semibold tracking-tight text-slate-900">
+              Activity
+            </h2>
+            <p className="mt-2 text-sm text-slate-500">
+              Completed bridges, ready-to-mint transfers, and pending items for this wallet.
+            </p>
+
+            <div className="mt-6 overflow-y-auto border-t border-slate-200 pt-5">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-slate-900">Action Needed</h3>
+                <button
+                  type="button"
+                  onClick={() => void refreshTrackedTransfers()}
+                  className="inline-flex items-center gap-1 text-xs font-medium text-[#2F6E0C] hover:text-[#25580A]"
+                >
+                  <RefreshCw size={12} className={isLoadingTrackedTransfers ? 'animate-spin' : ''} />
+                  Refresh
+                </button>
+              </div>
+
+              {nonMintedTransfers.length === 0 ? (
+                <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                  No active transfer right now.
+                </p>
+              ) : (
+                <div className="space-y-4 max-h-[55vh] overflow-y-auto pr-1">
+                  <div>
+                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">In Progress</h4>
+                    {inProgressTransfers.length === 0 ? (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                        No transfer waiting for approvals or attestation.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {inProgressTransfers.map((transfer) => {
+                          const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                          const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+                          const statusLabel = getTransferProgressLabel(transfer)
+
+                          return (
+                            <div key={`progress-${transfer.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
+                                  <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                                  <p className="mt-1 text-xs font-medium text-slate-700">{statusLabel}</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenTransferInTracker(transfer)}
+                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                  >
+                                    Open tracker
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleDismissTrackedTransfer(transfer)}
+                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-amber-700">Ready to Mint</h4>
+                    {actionNeededTransfers.length === 0 ? (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                        No ready-to-mint transfer right now.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {actionNeededTransfers.map((transfer) => {
+                          const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                          const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+                          const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+                          const isTransferReady = Boolean(validatedReadyKeys[transferKey])
+
+                          return (
+                            <div key={`ready-${transfer.id}`} className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
+                                  <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                                  <p className="mt-1 text-xs font-medium text-amber-700">Ready to mint</p>
+                                  <p className="mt-1 text-[11px] text-slate-500">
+                                    Verification: {isTransferReady ? 'confirmed' : 'not confirmed'}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleResumeTrackedTransfer(transfer)}
+                                    disabled={!isTransferReady || state.isLoading}
+                                    className="rounded-lg bg-[#2F6E0C] px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    Mint
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenTransferInTracker(transfer)}
+                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                                  >
+                                    Open tracker
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleDismissTrackedTransfer(transfer)}
+                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-5 border-t border-slate-200 pt-4">
+                <h4 className="mb-2 text-sm font-semibold text-slate-900">Completed</h4>
+                {completedTransfers.length === 0 ? (
+                  <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                    No completed transfer yet.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-[32vh] overflow-y-auto pr-1">
+                    {completedTransfers.slice(0, 20).map((transfer) => {
+                      const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                      const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+
+                      return (
+                        <div key={`completed-${transfer.id}`} className="rounded-xl border border-[#66D121]/30 bg-[#eef7e8] p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-semibold text-[#1e4d07]">{transfer.amount} {transfer.token}</p>
+                              <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                              <p className="mt-1 text-xs font-medium text-[#2F6E0C]">Complete</p>
+                            </div>
+                            <CheckCircle size={16} className="text-[#2F6E0C]" />
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
