@@ -1183,7 +1183,7 @@ export function useBridgeKit() {
         try {
           const domain = sourceChain?.cctp?.domain;
           const destinationDomain = destinationChain?.cctp?.domain;
-          if (!domain) {
+          if (domain == null) {
             return activity;
           }
 
@@ -1269,7 +1269,7 @@ export function useBridgeKit() {
       const domain = sourceChain?.cctp?.domain;
       const destinationDomain = destinationChain?.cctp?.domain;
 
-      if (!domain || !sourceTxHash) {
+      if (domain == null || !sourceTxHash) {
         return false;
       }
 
