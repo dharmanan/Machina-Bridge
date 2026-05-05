@@ -4,7 +4,14 @@ import { Card, Container } from './ui'
 import { Wallet, TrendingUp, Loader2, AlertCircle, RefreshCw } from 'lucide-react'
 import { useBridgeKit, SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID } from '../hooks/useBridgeKit'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
-import { getSupportedEvmChainName } from '../lib/chains'
+import {
+  ARC_EVM_CHAIN,
+  ARBITRUM_SEPOLIA_EVM_CHAIN,
+  BASE_SEPOLIA_EVM_CHAIN,
+  OPTIMISM_SEPOLIA_EVM_CHAIN,
+  SEPOLIA_EVM_CHAIN,
+  getSupportedEvmChainName,
+} from '../lib/chains'
 import { fetchSolanaUsdcBalance } from '../lib/solana'
 
 interface Transaction {
@@ -20,6 +27,35 @@ interface Transaction {
   transferId?: string;
   recipientAta?: string;
   status?: string;
+}
+
+const SOLANA_DEVNET_EXPLORER_BASE_URL = 'https://explorer.solana.com/tx'
+
+function getExplorerBaseUrl(network?: string) {
+  const normalized = (network || '').trim().toLowerCase()
+
+  if (!normalized) return undefined
+  if (normalized.includes('solana')) return SOLANA_DEVNET_EXPLORER_BASE_URL
+  if (normalized.includes('arc')) return ARC_EVM_CHAIN.blockExplorers?.default.url
+  if (normalized.includes('arbitrum')) return ARBITRUM_SEPOLIA_EVM_CHAIN.blockExplorers?.default.url
+  if (normalized.includes('optimism') || normalized.startsWith('op ')) return OPTIMISM_SEPOLIA_EVM_CHAIN.blockExplorers?.default.url
+  if (normalized.includes('base')) return BASE_SEPOLIA_EVM_CHAIN.blockExplorers?.default.url
+  if (normalized.includes('sepolia') || normalized.includes('ethereum')) return SEPOLIA_EVM_CHAIN.blockExplorers?.default.url
+
+  return undefined
+}
+
+function getTransactionExplorerUrl(txHash?: string, network?: string) {
+  if (!txHash) return undefined
+
+  const explorerBaseUrl = getExplorerBaseUrl(network)
+  if (!explorerBaseUrl) return undefined
+
+  if ((network || '').trim().toLowerCase().includes('solana')) {
+    return `${explorerBaseUrl}/${txHash}?cluster=devnet`
+  }
+
+  return `${explorerBaseUrl}/tx/${txHash}`
 }
 
 function formatNetworkLabel(network?: string) {
@@ -160,29 +196,24 @@ export function DashboardTab() {
 
   const getTransactionRoute = (transaction: Transaction) => {
     const parsedDirectionRoute = parseDirectionRoute(transaction.direction)
+    const fallbackFromNetwork = transaction.fromNetwork || parsedDirectionRoute.fromNetwork || 'Sepolia'
+    const fallbackToNetwork = transaction.toNetwork || parsedDirectionRoute.toNetwork || 'Arc Testnet'
 
     if (transaction.type === 'solana-bridge' || transaction.direction === 'solana-to-arc' || transaction.fromNetwork === 'Solana Devnet') {
       return {
         label: 'Bridge',
         fromNetwork: 'Solana Devnet',
         toNetwork: 'Arc Testnet',
-        sourceExplorerUrl: transaction.sourceTxHash
-          ? `https://explorer.solana.com/tx/${transaction.sourceTxHash}?cluster=devnet`
-          : undefined,
+        sourceExplorerUrl: getTransactionExplorerUrl(transaction.sourceTxHash, 'Solana Devnet'),
       }
     }
 
     if (transaction.type === 'solana-forward' || transaction.direction.includes('solana') || transaction.toNetwork === 'Solana Devnet') {
       return {
         label: 'Solana Forward',
-        fromNetwork: transaction.fromNetwork || (transaction.direction === 'arc-to-solana' ? 'Arc Testnet' : 'Sepolia'),
+        fromNetwork: fallbackFromNetwork,
         toNetwork: 'Solana Devnet',
-        sourceExplorerUrl:
-          transaction.sourceTxHash
-            ? transaction.fromNetwork === 'Arc Testnet' || transaction.direction === 'arc-to-solana'
-              ? `https://testnet.arcscan.app/tx/${transaction.sourceTxHash}`
-              : `https://sepolia.etherscan.io/tx/${transaction.sourceTxHash}`
-            : undefined,
+        sourceExplorerUrl: getTransactionExplorerUrl(transaction.sourceTxHash, fallbackFromNetwork),
       }
     }
 
@@ -191,22 +222,18 @@ export function DashboardTab() {
         label: 'Bridge',
         fromNetwork: 'Arc Testnet',
         toNetwork: 'Sepolia',
-        sourceExplorerUrl: transaction.sourceTxHash ? `https://testnet.arcscan.app/tx/${transaction.sourceTxHash}` : undefined,
+        sourceExplorerUrl: getTransactionExplorerUrl(transaction.sourceTxHash, 'Arc Testnet'),
       }
     }
 
-    const fromNetwork = transaction.fromNetwork || parsedDirectionRoute.fromNetwork || 'Sepolia'
-    const toNetwork = transaction.toNetwork || parsedDirectionRoute.toNetwork || 'Arc Testnet'
+    const fromNetwork = fallbackFromNetwork
+    const toNetwork = fallbackToNetwork
 
     return {
       label: 'Bridge',
       fromNetwork,
       toNetwork,
-      sourceExplorerUrl: transaction.sourceTxHash
-        ? fromNetwork.toLowerCase().includes('arc')
-          ? `https://testnet.arcscan.app/tx/${transaction.sourceTxHash}`
-          : `https://sepolia.etherscan.io/tx/${transaction.sourceTxHash}`
-        : undefined,
+      sourceExplorerUrl: getTransactionExplorerUrl(transaction.sourceTxHash, fromNetwork),
     }
   }
 
