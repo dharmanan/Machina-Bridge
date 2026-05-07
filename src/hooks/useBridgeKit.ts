@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useAccount, useSwitchChain, useWalletClient } from 'wagmi';
+import { getWalletClient } from 'wagmi/actions';
 import { createAdapterFromProvider } from '@circle-fin/adapter-viem-v2';
 import { BridgeKit, type BridgeResult } from '@circle-fin/bridge-kit';
 import { CCTPV2BridgingProvider } from '@circle-fin/provider-cctp-v2';
@@ -18,6 +19,7 @@ import {
   SEPOLIA_EVM_CHAIN_ID,
 } from '../lib/chains';
 import { logger } from '../lib/logger';
+import { wagmiConfig } from '../lib/wagmi.config';
 import { markTrackedTransferMinted, registerTrackedTransfer, upsertServerBridgeActivity } from '../lib/transferTrackerApi';
 
 export const SEPOLIA_CHAIN_ID = SEPOLIA_EVM_CHAIN_ID;
@@ -116,6 +118,13 @@ const SUPPORTED_BRIDGE_ROUTES = new Set<string>([
   `${ARBITRUM_CHAIN_ID}-${ARC_CHAIN_ID}`,
   `${ARC_CHAIN_ID}-${ARBITRUM_CHAIN_ID}`,
 ]);
+
+const WALLET_CLIENT_REFRESH_TIMEOUT_MS = 15_000;
+const WALLET_CLIENT_REFRESH_INTERVAL_MS = 500;
+
+type BridgeWalletClient = NonNullable<Awaited<ReturnType<typeof getWalletClient>>>;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function getChainName(chainId: number) {
   return CHAIN_NAMES[chainId as keyof typeof CHAIN_NAMES] ?? `Chain ${chainId}`;
@@ -356,6 +365,8 @@ interface Eip1193RequestArguments {
   params?: unknown[] | Record<string, unknown>;
 }
 
+type Eip1193RequestFn = (args: Eip1193RequestArguments) => Promise<unknown>;
+
 // Public clients for each chain with timeout
 const createClientWithTimeout = (url: string) => {
   return createPublicClient({
@@ -512,17 +523,86 @@ export function useBridgeKit() {
     [address, getWalletProvider]
   );
 
-  const getConnectedProvider = useCallback((): EIP1193Provider | null => {
-    if (!walletClient) {
-      return null;
-    }
+  const resolveWalletClientForChain = useCallback(
+    async (targetChainId?: number): Promise<BridgeWalletClient> => {
+      if (!isConnected) {
+        throw new Error('Wallet is not connected.');
+      }
 
-    return {
-      request: async ({ method, params }: Eip1193RequestArguments) => {
-        return walletClient.transport.request({ method, params } as never);
-      },
-    } as EIP1193Provider;
-  }, [walletClient]);
+      const preferredChainId = targetChainId ?? chainId ?? walletClient?.chain?.id;
+      if (walletClient && (!preferredChainId || walletClient.chain?.id === preferredChainId)) {
+        return walletClient as BridgeWalletClient;
+      }
+
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < WALLET_CLIENT_REFRESH_TIMEOUT_MS) {
+        try {
+          const refreshedWalletClient = preferredChainId
+            ? await getWalletClient(wagmiConfig, { chainId: preferredChainId })
+            : await getWalletClient(wagmiConfig);
+
+          if (refreshedWalletClient && (!preferredChainId || refreshedWalletClient.chain?.id === preferredChainId)) {
+            return refreshedWalletClient as BridgeWalletClient;
+          }
+        } catch {
+          // Wait for the wallet app to hand control back and refresh the active client.
+        }
+
+        await delay(WALLET_CLIENT_REFRESH_INTERVAL_MS);
+      }
+
+      if (targetChainId) {
+        throw new Error(`Wallet stayed on the previous network. Switch to ${getChainName(targetChainId)} in your wallet and try again.`);
+      }
+
+      throw new Error('Wallet client not ready yet. Reconnect your wallet and try again.');
+    },
+    [chainId, isConnected, walletClient],
+  );
+
+  const resolveInjectedRequest = useCallback(
+    async (targetChainId?: number): Promise<Eip1193RequestFn | null> => {
+      if (typeof window === 'undefined' || typeof window.ethereum?.request !== 'function') {
+        return null;
+      }
+
+      if (!targetChainId) {
+        return window.ethereum.request.bind(window.ethereum) as Eip1193RequestFn;
+      }
+
+      try {
+        const activeChainHex = await window.ethereum.request({ method: 'eth_chainId' }) as string;
+        const activeChainId = Number.parseInt(activeChainHex, 16);
+        if (activeChainId === targetChainId) {
+          return window.ethereum.request.bind(window.ethereum) as Eip1193RequestFn;
+        }
+      } catch {
+        return null;
+      }
+
+      return null;
+    },
+    [],
+  );
+
+  const getConnectedProvider = useCallback(
+    async (targetChainId?: number): Promise<EIP1193Provider> => {
+      const injectedRequest = await resolveInjectedRequest(targetChainId);
+      if (injectedRequest) {
+        return {
+          request: async ({ method, params }: Eip1193RequestArguments) => injectedRequest({ method, params }),
+        } as EIP1193Provider;
+      }
+
+      const activeWalletClient = await resolveWalletClientForChain(targetChainId);
+      return {
+        request: async ({ method, params }: Eip1193RequestArguments) => {
+          return activeWalletClient.transport.request({ method, params } as never);
+        },
+      } as EIP1193Provider;
+    },
+    [resolveInjectedRequest, resolveWalletClientForChain],
+  );
 
   // Reset state
   const reset = useCallback(() => {
@@ -640,10 +720,7 @@ export function useBridgeKit() {
           destinationChainId,
         }));
 
-        const provider = getConnectedProvider();
-        if (!provider) {
-          throw new Error('Connected wallet provider is not available. Reconnect your wallet and try again.');
-        }
+        const provider = await getConnectedProvider(sourceChainId);
 
         if (!bridgeKitInstance) {
           bridgeKitInstance = new BridgeKit();
@@ -719,7 +796,6 @@ export function useBridgeKit() {
 
           try {
             await switchChainAsync({ chainId: sourceChainId });
-            await new Promise(resolve => setTimeout(resolve, 1200));
           } catch (err: any) {
             throw new Error(
               err?.message?.includes('User rejected')
@@ -967,10 +1043,7 @@ export function useBridgeKit() {
           destinationChainId: pending.destinationChainId,
         }));
 
-        const provider = getConnectedProvider();
-        if (!provider) {
-          throw new Error('Connected wallet provider is not available. Reconnect your wallet and try again.');
-        }
+        const provider = await getConnectedProvider();
 
         const adapter = await createAdapterFromProvider({ provider });
         const supportedChains = bridgeKitInstance.getSupportedChains();
@@ -1064,13 +1137,9 @@ export function useBridgeKit() {
           throw new Error(`Please switch your wallet to ${getChainName(pending.sourceChainId)}.`);
         }
         await switchChainAsync({ chainId: pending.sourceChainId });
-        await new Promise((resolve) => setTimeout(resolve, 1200));
       }
 
-      const provider = getConnectedProvider();
-      if (!provider) {
-        throw new Error('Connected wallet provider is not available.');
-      }
+      const provider = await getConnectedProvider(pending.sourceChainId);
 
       const adapter = await createAdapterFromProvider({ provider });
       const amountInMinorUnits = ethers.parseUnits(pending.amount, 6).toString();
@@ -1123,13 +1192,9 @@ export function useBridgeKit() {
           throw new Error(`Please switch your wallet to ${getChainName(pending.sourceChainId)}.`);
         }
         await switchChainAsync({ chainId: pending.sourceChainId });
-        await new Promise((resolve) => setTimeout(resolve, 1200));
       }
 
-      const provider = getConnectedProvider();
-      if (!provider) {
-        throw new Error('Connected wallet provider is not available.');
-      }
+      const provider = await getConnectedProvider(pending.sourceChainId);
 
       const adapter = await createAdapterFromProvider({ provider });
       const amountInMinorUnits = ethers.parseUnits(pending.amount, 6).toString();
@@ -1379,13 +1444,9 @@ export function useBridgeKit() {
 
           setState((prev) => ({ ...prev, step: 'switching-network' }));
           await switchChainAsync({ chainId: destinationChainId });
-          await new Promise((resolve) => setTimeout(resolve, 1200));
         }
 
-        const provider = getConnectedProvider();
-        if (!provider) {
-          throw new Error('Connected wallet provider is not available. Reconnect and try again.');
-        }
+        const provider = await getConnectedProvider(destinationChainId);
 
         const adapter = await createAdapterFromProvider({ provider });
         const sourceContext = {

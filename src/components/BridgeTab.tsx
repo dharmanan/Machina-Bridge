@@ -110,6 +110,16 @@ function formatMaskedWalletAddress(address?: string | null, leading = 4, trailin
   return `${address.slice(0, leading)}...${address.slice(-trailing)}`
 }
 
+function isMobileWalletEnvironment() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  const userAgent = window.navigator.userAgent || ''
+  const isMobileUserAgent = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent)
+  return isMobileUserAgent || window.matchMedia('(max-width: 768px), (pointer: coarse)').matches
+}
+
 function findFirstStringMatch(value: unknown, pattern: RegExp, seen = new WeakSet<object>()): string | undefined {
   if (typeof value === 'string' && pattern.test(value)) {
     return value
@@ -322,6 +332,7 @@ export function BridgeTab() {
   const isTrackedBridgeRoute = bridgeMode === 'evm' && isRouteEnabled
   const showTrackedEtaWarning = isTrackedBridgeRoute && sourceEvmChainId !== ARC_CHAIN_ID
   const isTrackedBridgeActive = bridgeMode === 'evm' && state.isLoading && isTrackedBridgeRoute
+  const isMobileWalletFlow = isMobileWalletEnvironment()
 
   const selectedActivity = selectedTrackerKey
     ? activityRecords.find((activity) => getTransferKey(activity.sourceTxHash, activity.id) === selectedTrackerKey)
@@ -993,20 +1004,27 @@ export function BridgeTab() {
       })
 
       const topUpAmount = Math.max(0, originalAmount - numericGatewayBalance)
-      
+
       if (topUpAmount > 0) {
         if (topUpAmount > numericWalletBalance) {
           alert(`Wallet USDC balance is too low. You need ${topUpAmount.toFixed(6)} USDC to continue.`)
           return
         }
-        // Deposit first, wait for it to complete 
+        // Deposit first, wait for it to complete.
         await depositToGateway({
           amount: topUpAmount.toFixed(6),
           sourceChainId,
         })
-        // After deposit completes, fetch fresh balances
+
+        // After deposit completes, fetch fresh balances.
         await fetchGatewayBalances(sourceChainId)
-        // Clear the input—deposit is done, now forwarding automatically
+
+        if (isMobileWalletFlow) {
+          alert('Gateway top-up completed. Tap Send again to confirm the Solana transfer in your wallet.')
+          return
+        }
+
+        // Clear the input on desktop because forwarding continues immediately.
         setAmount('')
       }
 
@@ -1844,6 +1862,11 @@ export function BridgeTab() {
                   ) : (
                     <p className="text-xs text-slate-500">~{gatewayQuote.estimatedFee} USDC send fee</p>
                   )}
+                  {isMobileWalletFlow && topUpNeeded > 0 && (
+                    <p className="mt-1 text-xs text-amber-700">
+                      On mobile, the Gateway top-up and the Solana send run as two separate wallet confirmations. Finish the top-up first, then tap Send again.
+                    </p>
+                  )}
                   <button
                     type="button"
                     onClick={() => setShowFeeDetails((v) => !v)}
@@ -1883,7 +1906,7 @@ export function BridgeTab() {
                     <p className="mt-1 text-xs text-slate-500">
                       {isSolanaSourceMode
                         ? 'This connected Phantom account signs the source-side burn on Solana Devnet.'
-                        : 'RainbowKit already handles Phantom for EVM here. This also connects Phantom\'s Solana account, so the same wallet app can be reused for Solana flows.'}
+                        : 'You can use Phantom as the EVM wallet here as well. On mobile, Phantom\'s in-app browser is usually smoother than switching back and forth from Safari.'}
                     </p>
                   </div>
                   {isPhantomInstalled ? (
