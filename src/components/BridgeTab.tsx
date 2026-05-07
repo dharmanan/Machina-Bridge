@@ -2336,12 +2336,16 @@ export function BridgeTab() {
       </Container>
 
       {isBridgeTrackerOpen && (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
+        <div
+          className="fixed inset-0 z-[90] flex items-start justify-center overflow-y-auto bg-slate-950/70 px-4 py-6 backdrop-blur-sm sm:items-center"
+          onClick={() => setIsBridgeTrackerOpen(false)}
+        >
           <div
             role="dialog"
             aria-modal="true"
             aria-labelledby="bridge-tracker-title"
-            className="relative w-full max-w-2xl rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            className="relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            onClick={(event) => event.stopPropagation()}
           >
             <button
               type="button"
@@ -2365,6 +2369,8 @@ export function BridgeTab() {
             <p className="mt-1 text-xs text-slate-500">
               Verification: {isMintReadyValidated ? 'Circle readiness confirmed' : isCheckingMintReady ? 'Checking Circle readiness...' : 'Waiting Circle readiness'}
             </p>
+
+            <div className="mt-6 overflow-y-auto pr-1">
 
             {hasAnyTrackerData ? (
               <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -2631,6 +2637,8 @@ export function BridgeTab() {
               <p className="text-xs text-slate-500">
                 Activity list is available from the bell icon. Use this tracker only for the currently selected bridge flow.
               </p>
+            </div>
+
             </div>
 
           </div>

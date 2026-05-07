@@ -498,7 +498,7 @@ export function DashboardTab() {
         <Card>
           <h3 className="text-lg font-semibold mb-4">Transactions</h3>
           {transactions.length > 0 ? (
-            <div className="space-y-3">
+            <div className={transactions.length > 10 ? 'max-h-[42rem] space-y-3 overflow-y-auto pr-2' : 'space-y-3'}>
               {transactions.map((tx) => {
                 const route = getTransactionRoute(tx)
 

@@ -365,8 +365,6 @@ interface Eip1193RequestArguments {
   params?: unknown[] | Record<string, unknown>;
 }
 
-type Eip1193RequestFn = (args: Eip1193RequestArguments) => Promise<unknown>;
-
 // Public clients for each chain with timeout
 const createClientWithTimeout = (url: string) => {
   return createPublicClient({
@@ -560,40 +558,8 @@ export function useBridgeKit() {
     [chainId, isConnected, walletClient],
   );
 
-  const resolveInjectedRequest = useCallback(
-    async (targetChainId?: number): Promise<Eip1193RequestFn | null> => {
-      if (typeof window === 'undefined' || typeof window.ethereum?.request !== 'function') {
-        return null;
-      }
-
-      if (!targetChainId) {
-        return window.ethereum.request.bind(window.ethereum) as Eip1193RequestFn;
-      }
-
-      try {
-        const activeChainHex = await window.ethereum.request({ method: 'eth_chainId' }) as string;
-        const activeChainId = Number.parseInt(activeChainHex, 16);
-        if (activeChainId === targetChainId) {
-          return window.ethereum.request.bind(window.ethereum) as Eip1193RequestFn;
-        }
-      } catch {
-        return null;
-      }
-
-      return null;
-    },
-    [],
-  );
-
   const getConnectedProvider = useCallback(
     async (targetChainId?: number): Promise<EIP1193Provider> => {
-      const injectedRequest = await resolveInjectedRequest(targetChainId);
-      if (injectedRequest) {
-        return {
-          request: async ({ method, params }: Eip1193RequestArguments) => injectedRequest({ method, params }),
-        } as EIP1193Provider;
-      }
-
       const activeWalletClient = await resolveWalletClientForChain(targetChainId);
       return {
         request: async ({ method, params }: Eip1193RequestArguments) => {
@@ -601,7 +567,7 @@ export function useBridgeKit() {
         },
       } as EIP1193Provider;
     },
-    [resolveInjectedRequest, resolveWalletClientForChain],
+    [resolveWalletClientForChain],
   );
 
   // Reset state
