@@ -182,11 +182,7 @@ function createStrictSolanaProvider(
 function createStrictEvmProvider(
   walletClient: WalletClientLike,
 ): Parameters<typeof createEvmAdapterFromProvider>[0]['provider'] {
-  const providerSource = (
-    typeof window !== 'undefined' && window.ethereum
-      ? (window.ethereum as unknown as Eip1193LikeProvider)
-      : (walletClient.transport as unknown as Eip1193LikeProvider)
-  )
+  const providerSource = walletClient.transport as unknown as Eip1193LikeProvider
 
   return {
     on: ((event, listener) => {
@@ -320,10 +316,7 @@ export function useSolanaBridge() {
       const strictSolanaProvider = createStrictSolanaProvider(solanaProvider)
       const evmProvider = createStrictEvmProvider(walletClient as WalletClientLike)
 
-      const walletRequest =
-        typeof window !== 'undefined' && typeof window.ethereum?.request === 'function'
-          ? window.ethereum.request.bind(window.ethereum)
-          : async (args: { method: string; params?: unknown[] }) => walletClient.transport.request(args as never)
+      const walletRequest = async (args: { method: string; params?: unknown[] }) => walletClient.transport.request(args as never)
 
       try {
         await addChainToWallet(ARC_EVM_CHAIN, walletRequest)

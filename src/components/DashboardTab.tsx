@@ -177,7 +177,10 @@ export function DashboardTab() {
   // Load transactions from localStorage
   useEffect(() => {
     const savedTransactions = JSON.parse(localStorage.getItem('bridgeTransactions') || '[]')
-    setTransactions(savedTransactions)
+    const sortedTransactions = [...savedTransactions].sort(
+      (left: Transaction, right: Transaction) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime(),
+    )
+    setTransactions(sortedTransactions)
   }, [])
 
   // Dynamically compute bridge statistics grouped by route
@@ -491,12 +494,12 @@ export function DashboardTab() {
           )}
         </Card>
 
-        {/* Recent Transactions */}
+        {/* Transactions */}
         <Card>
-          <h3 className="text-lg font-semibold mb-4">Recent Transactions</h3>
+          <h3 className="text-lg font-semibold mb-4">Transactions</h3>
           {transactions.length > 0 ? (
             <div className="space-y-3">
-              {transactions.slice(0, 5).map((tx) => {
+              {transactions.map((tx) => {
                 const route = getTransactionRoute(tx)
 
                 return (
@@ -531,7 +534,7 @@ export function DashboardTab() {
             </div>
           ) : (
             <div className="py-8 text-center text-slate-500">
-              <p>No recent transactions</p>
+              <p>No transactions yet</p>
             </div>
           )}
         </Card>

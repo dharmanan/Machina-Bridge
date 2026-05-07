@@ -1,7 +1,7 @@
 import { fallback, http } from 'viem'
 import { createConfig } from 'wagmi'
 import { connectorsForWallets } from '@rainbow-me/rainbowkit'
-import { coinbaseWallet, injectedWallet, metaMaskWallet, phantomWallet, rabbyWallet, walletConnectWallet } from '@rainbow-me/rainbowkit/wallets'
+import { coinbaseWallet, injectedWallet, metaMaskWallet, rabbyWallet, walletConnectWallet } from '@rainbow-me/rainbowkit/wallets'
 import {
   ARBITRUM_SEPOLIA_EVM_CHAIN,
   ARC_EVM_CHAIN,
@@ -20,7 +20,6 @@ const connectors = connectorsForWallets(
       groupName: 'Recommended',
       wallets: [
         metaMaskWallet,
-        phantomWallet,
         rabbyWallet,
         coinbaseWallet,
         ...(hasWalletConnect ? [walletConnectWallet] : []),

@@ -43,6 +43,7 @@ export default function App() {
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
   const [isMobileExperience, setIsMobileExperience] = useState(false)
   const [hasDismissedMobileNotice, setHasDismissedMobileNotice] = useState(false)
+  const [mobileHelperMessage, setMobileHelperMessage] = useState<string | null>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const lendingDropdownRef = useRef<HTMLDivElement>(null)
 
@@ -140,6 +141,39 @@ export default function App() {
     }
   }
 
+  const handleOpenInMetaMaskBrowser = () => {
+    if (typeof window === 'undefined') {
+      return
+    }
+
+    const currentUrl = window.location.href
+    const metamaskUrl = `https://metamask.app.link/dapp/${currentUrl.replace(/^https?:\/\//, '')}`
+    setHasDismissedMobileNotice(true)
+    setMobileHelperMessage(null)
+    window.location.href = metamaskUrl
+  }
+
+  const handleCopyLinkForPhantomBrowser = async () => {
+    if (typeof window === 'undefined') {
+      return
+    }
+
+    const currentUrl = window.location.href
+
+    try {
+      if (window.navigator.clipboard?.writeText) {
+        await window.navigator.clipboard.writeText(currentUrl)
+        setMobileHelperMessage('Link copied. Open Phantom browser and paste this URL there.')
+        return
+      }
+    } catch (error) {
+      logger.warn('Unable to copy the mobile browser link for Phantom:', error)
+    }
+
+    window.prompt('Copy this URL into Phantom browser:', currentUrl)
+    setMobileHelperMessage('Open Phantom browser and paste the copied URL there.')
+  }
+
   const showMobileNotice = isMobileExperience && !hasDismissedMobileNotice
   return (
     <div className="min-h-screen bg-transparent text-slate-900">
@@ -173,11 +207,36 @@ export default function App() {
             <p className="mt-2 text-sm leading-6 text-slate-500">
               You can continue on mobile, but wallet connections and transaction flows may not work as expected.
             </p>
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-600">
+              Safari does not reliably switch back and forth with wallet apps on iPhone. MetaMask usually works best in its in-app browser. Use Phantom browser when you want the Solana-side Phantom connection to be detected more reliably.
+            </div>
 
             <div className="mt-6 flex flex-col gap-3">
               <button
                 type="button"
-                onClick={() => setHasDismissedMobileNotice(true)}
+                onClick={handleOpenInMetaMaskBrowser}
+                className="inline-flex w-full items-center justify-center rounded-2xl border border-[#2F6E0C]/20 bg-[#eef7e8] px-4 py-3 text-sm font-semibold text-[#2F6E0C] transition-colors hover:bg-[#e4f1db]"
+              >
+                Open In MetaMask Browser
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCopyLinkForPhantomBrowser()}
+                className="inline-flex w-full items-center justify-center rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+              >
+                Copy Link For Phantom Browser
+              </button>
+              {mobileHelperMessage && (
+                <p className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-xs leading-5 text-sky-900">
+                  {mobileHelperMessage}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setHasDismissedMobileNotice(true)
+                  setMobileHelperMessage(null)
+                }}
                 className="inline-flex w-full items-center justify-center rounded-2xl bg-[#2F6E0C] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#25580A]"
               >
                 Continue on mobile

@@ -1216,7 +1216,7 @@ export function BridgeTab() {
           receiveTxHash: state.receiveTxHash,
         }
         existingTransactions.unshift(transaction)
-        localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 10)))
+        localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 100)))
       }
     }
   }, [bridgeMode, state.step, state.sourceChainId, state.destinationChainId, amount, state.sourceTxHash, state.receiveTxHash, pendingBridge])
@@ -1258,7 +1258,7 @@ export function BridgeTab() {
     const isAlreadySaved = existingTransactions.some((entry: any) => entry.id === transaction.id)
     if (!isAlreadySaved) {
       existingTransactions.unshift(transaction)
-      localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 10)))
+      localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 100)))
     }
   }, [bridgeMode, gatewayState.step, gatewayState.transferId, gatewayState.recipientAta, gatewayState.status, amount, sourceChainName, destinationChainName])
 
@@ -1284,7 +1284,7 @@ export function BridgeTab() {
     const isAlreadySaved = existingTransactions.some((entry: any) => entry.id === transaction.id)
     if (!isAlreadySaved) {
       existingTransactions.unshift(transaction)
-      localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 10)))
+      localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 100)))
     }
   }, [bridgeMode, solanaBridgeState.step, solanaBridgeState.sourceTxHash, solanaBridgeState.receiveTxHash, solanaBridgeState.status, amount])
 
@@ -1531,7 +1531,11 @@ export function BridgeTab() {
           {!isConnected && (
             <div className="mb-4 flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
               <AlertCircle size={16} className="shrink-0" />
-              Connect your wallet to bridge USDC across supported EVM routes.
+              {isSolanaSourceMode
+                ? 'Connect an EVM wallet for the Arc destination mint. Phantom Solana stays the source signer in this flow.'
+                : isSolanaMode
+                  ? 'Connect an EVM wallet to add funds on Arc before sending USDC to Solana.'
+                  : 'Connect your wallet to bridge USDC across supported EVM routes.'}
             </div>
           )}
 
@@ -1906,7 +1910,7 @@ export function BridgeTab() {
                     <p className="mt-1 text-xs text-slate-500">
                       {isSolanaSourceMode
                         ? 'This connected Phantom account signs the source-side burn on Solana Devnet.'
-                        : 'You can use Phantom as the EVM wallet here as well. On mobile, Phantom\'s in-app browser is usually smoother than switching back and forth from Safari.'}
+                        : 'Use this Phantom connection for Solana-only actions. Arc-side funding and minting still use your connected EVM wallet.'}
                     </p>
                   </div>
                   {isPhantomInstalled ? (
