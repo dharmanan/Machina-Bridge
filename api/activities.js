@@ -10,7 +10,7 @@ import {
 import { applyCors, enforceIdempotency, enforceRateLimit, enforceRequestBodySize } from './_lib/security.js';
 import { isValidEvmAddress, isValidTxHash, toPositiveNumber } from './_lib/validate.js';
 
-const MAX_LIMIT = 100;
+const MAX_LIMIT = 20;
 const WRITE_RATE_LIMIT = { windowSeconds: 60, maxRequests: 20 };
 const READ_RATE_LIMIT = { windowSeconds: 60, maxRequests: 90 };
 const BODY_LIMIT = { maxBytes: 12 * 1024 };
@@ -193,7 +193,7 @@ async function handleListActivities(req, res) {
     return badRequest(res, 'Invalid wallet query param');
   }
 
-  const requestedLimit = Number(req.query?.limit || 100);
+  const requestedLimit = Number(req.query?.limit || MAX_LIMIT);
   const limit = Number.isInteger(requestedLimit)
     ? Math.min(Math.max(requestedLimit, 1), MAX_LIMIT)
     : MAX_LIMIT;
