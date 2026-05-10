@@ -2,6 +2,8 @@
 
 Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and includes the latest tracker, persistence, and reliability improvements in v2.3.
 
+[![Watch the demo on YouTube](https://img.youtube.com/vi/pdldO1BlC-k/maxresdefault.jpg)](https://www.youtube.com/watch?v=pdldO1BlC-k)
+
 ## v2.3 Update
 
 This v2.3 release focuses on practical bridge usability, activity persistence across devices, and safer long running flow handling.
@@ -23,6 +25,7 @@ This v2.3 release focuses on practical bridge usability, activity persistence ac
 2. Minted transfers are moved to Completed with better edge case handling.
 3. Dismiss and Clear actions now behave consistently for older and mixed source records.
 4. Bridge history no longer disappears when you switch browser, profile, or device with the same wallet.
+5. App now works on mobile via the in-app browsers of MetaMask, Rabby, and Phantom — swap, bridge, and activity tracking all function without issues on mobile.
 
 ## v2.2 Update
 
