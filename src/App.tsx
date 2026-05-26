@@ -395,15 +395,15 @@ export default function App() {
               </button>
               {showLendingDropdown && (
                 <div className="absolute left-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
-                  <span
-                    className="block cursor-not-allowed rounded-lg px-3 py-2 text-sm text-slate-400"
+                  <a
+                    href="https://arcmachina.xyz/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block rounded-lg px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 hover:text-slate-900"
                     onClick={() => setShowLendingDropdown(false)}
                   >
-                    Arc Lending
-                    <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700">
-                      Soon
-                    </span>
-                  </span>
+                    Arc Machina
+                  </a>
                 </div>
               )}
             </div>
