@@ -1451,7 +1451,7 @@ export function BridgeTab() {
         case 'signing-destination':
           return 'Confirm the mint on Arc in your EVM wallet...'
         default:
-          return 'Processing Solana to Arc bridge...'
+          return 'Processing Solana to Machina Bridge...'
       }
     }
 
@@ -1965,7 +1965,7 @@ export function BridgeTab() {
                 ) : isPhantomInstalled ? (
                   <p className="text-xs text-slate-600">
                     {isSolanaSourceMode
-                      ? 'Connect Phantom on Solana to sign the source-chain burn for the Arc bridge.'
+                      ? 'Connect Phantom on Solana to sign the source-chain burn for Machina Bridge.'
                       : 'Connect once and the app can reuse that Solana address right now. The same provider can be used later for Solana-side signing too.'}
                   </p>
                 ) : (
@@ -2319,7 +2319,7 @@ export function BridgeTab() {
           <div className="space-y-1 text-xs text-slate-600">
             {isSolanaSourceMode ? (
               <>
-                <p><strong>Solana to Arc Bridge Process:</strong></p>
+                <p><strong>Solana to Machina Bridge Process:</strong></p>
                 <p>1. <strong>Connect Phantom</strong>: Connect the Solana account that holds Devnet USDC</p>
                 <p>2. <strong>Burn on Solana</strong>: Phantom signs the source-chain burn transaction</p>
                 <p>3. <strong>Wait for Attestation</strong>: Circle attests the crosschain burn</p>

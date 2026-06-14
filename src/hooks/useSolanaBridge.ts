@@ -209,7 +209,7 @@ function createStrictEvmProvider(
 
 function getReadableBridgeError(error: unknown, result?: BridgeKitResult | null) {
   const resultErrorMessage = result?.steps?.find((step) => step.state === 'error')?.errorMessage
-  const rawMessage = resultErrorMessage || (error instanceof Error ? error.message : 'Solana to Arc bridge failed.')
+  const rawMessage = resultErrorMessage || (error instanceof Error ? error.message : 'Solana to Machina Bridge failed.')
 
   if (rawMessage.includes('User rejected') || rawMessage.includes('user rejected')) {
     return 'You rejected the bridge request in one of your wallets.'
@@ -220,7 +220,7 @@ function getReadableBridgeError(error: unknown, result?: BridgeKitResult | null)
   }
 
   if (rawMessage.includes('insufficient') || rawMessage.includes('Insufficient')) {
-    return 'Insufficient funds to complete the Solana to Arc bridge.'
+    return 'Insufficient funds to complete the Solana to Machina Bridge.'
   }
 
   return rawMessage

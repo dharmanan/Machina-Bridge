@@ -250,7 +250,7 @@ export default function App() {
         <Container className="py-4">
           <div className="grid gap-4 lg:grid-cols-[minmax(380px,460px)_minmax(0,1fr)] lg:items-center lg:gap-8">
             <div className="flex items-start gap-4">
-              <img src={arcLogo} alt="Arc Logo" className="h-12 w-12 flex-shrink-0 rounded-2xl border border-slate-200 bg-white p-1 shadow-sm lg:h-14 lg:w-14" />
+              <img src={arcLogo} alt="Machina Bridge Logo" className="h-12 w-12 flex-shrink-0 rounded-2xl border border-slate-200 bg-white p-1 shadow-sm lg:h-14 lg:w-14" />
               <div className="min-w-0 pt-0.5">
                 <a
                   href="https://docs.arc.network/"
@@ -258,7 +258,7 @@ export default function App() {
                   rel="noopener noreferrer"
                   className="transition-colors hover:text-[#2F6E0C]"
                 >
-                  <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Arc Bridge</h1>
+                  <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Machina Bridge</h1>
                 </a>
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
                   Simple testnet swap and bridge flows for Arc, Sepolia, and Solana.

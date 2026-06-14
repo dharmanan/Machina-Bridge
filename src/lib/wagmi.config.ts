@@ -28,7 +28,7 @@ const connectors = connectorsForWallets(
     },
   ],
   {
-    appName: 'Arc Bridge',
+    appName: 'Machina Bridge',
     projectId: walletConnectProjectId,
   },
 )

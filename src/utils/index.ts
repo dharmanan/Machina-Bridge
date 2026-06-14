@@ -33,7 +33,7 @@ export function formatTokenAmount(
 /**
  * Parse token amount to wei
  */
-export function parseTokenAmount(amount: string, decimals: number): bigint {
+export function parseTokenAmount(amount: string, decimals: number) {
   try {
     return ethers.parseUnits(amount, decimals)
   } catch (error) {

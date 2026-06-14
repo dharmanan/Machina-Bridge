@@ -27,8 +27,8 @@
     "lucide-react": "^0.292.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "viem": "^2.48.4",
-    "wagmi": "^2.19.5"
+    "viem": "^2.52.2",
+    "wagmi": "^2.9.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
@@ -49,6 +49,8 @@
     "@coinbase/cdp-sdk": {
       "axios": "^1.15.0"
     },
+    "viem": "^2.52.2",
+    "ws": "^8.21.0",
     "@typescript-eslint/typescript-estree": {
       "minimatch": "^9.0.9"
     },

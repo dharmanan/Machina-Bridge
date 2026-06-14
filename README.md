@@ -1,6 +1,6 @@
-# Arc Bridge v2.3
+# Machina Bridge v2.3
 
-Arc Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and includes the latest tracker, persistence, and reliability improvements in v2.3.
+Machina Bridge is a testnet swap and bridge app for Sepolia, Arc Testnet, Base Sepolia, Optimism Sepolia, Arbitrum Sepolia, and Solana Devnet. It keeps the Sepolia ETH <-> USDC swap flow intact, adds multi-route USDC bridge paths, and includes the latest tracker, persistence, and reliability improvements in v2.3.
 
 [![Watch the demo on YouTube](https://img.youtube.com/vi/pdldO1BlC-k/maxresdefault.jpg)](https://www.youtube.com/watch?v=pdldO1BlC-k)
 
