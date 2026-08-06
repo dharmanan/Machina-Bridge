@@ -59,6 +59,9 @@ contract MachinaCountdown1155 is IERC1155MetadataURI {
         metadataUri = initialMetadataUri;
         startTime = campaignStartTime;
         testMode = enableTestMode;
+        if (enableTestMode) {
+            testDay = 1;
+        }
         emit OwnershipTransferred(address(0), msg.sender);
     }
 
