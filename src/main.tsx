@@ -1,4 +1,5 @@
-import { StrictMode } from 'react'
+import { StrictMode, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import { Buffer } from 'buffer'
 import App from './App'
@@ -19,10 +20,59 @@ globalScope.global ??= globalThis
 const pathname = window.location.pathname.replace(/\/+$/, '') || '/'
 const isCountdownRoute = pathname === '/countdown'
 
+function CountdownNavLink() {
+  const [navTarget, setNavTarget] = useState<HTMLElement | null>(null)
+
+  useEffect(() => {
+    const locateNavigation = () => {
+      const navigation = document.querySelector('nav') as HTMLElement | null
+      setNavTarget(navigation)
+    }
+
+    locateNavigation()
+    const observer = new MutationObserver(locateNavigation)
+    observer.observe(document.body, { childList: true, subtree: true })
+
+    return () => observer.disconnect()
+  }, [])
+
+  if (!navTarget) return null
+
+  return createPortal(
+    <a
+      href="/countdown?smoke=1"
+      className="inline-flex items-center gap-2 rounded-full border border-transparent px-4 py-2 text-sm font-medium text-slate-500 transition-colors hover:border-slate-200 hover:bg-white hover:text-slate-900"
+    >
+      <svg
+        aria-hidden="true"
+        viewBox="0 0 24 24"
+        className="h-5 w-5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+      Countdown
+    </a>,
+    navTarget,
+  )
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <Web3Provider>
-      {isCountdownRoute ? <CountdownPage /> : <App />}
+      {isCountdownRoute ? (
+        <CountdownPage />
+      ) : (
+        <>
+          <App />
+          <CountdownNavLink />
+        </>
+      )}
     </Web3Provider>
   </StrictMode>,
 )
