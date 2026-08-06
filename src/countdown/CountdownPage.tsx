@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useAccount, useSignMessage, useSwitchChain } from 'wagmi'
+import { useAccount, useSwitchChain } from 'wagmi'
 import {
   ArrowLeft,
   Check,
@@ -11,9 +11,7 @@ import {
   ExternalLink,
   FlaskConical,
   Lock,
-  LogOut,
   RotateCcw,
-  Twitter,
   Wallet,
 } from 'lucide-react'
 import arcLogo from '../assets/arc.png'
@@ -68,21 +66,7 @@ const DAY_TITLES = [
 ] as const
 
 type Phase = 'Signal' | 'Flow' | 'Settlement' | 'Ignition'
-
-type XSession = {
-  authenticated: boolean
-  wallet?: string
-  user?: {
-    id: string
-    username: string
-    name: string
-    profileImageUrl?: string
-  }
-}
-
-type WalletProgress = {
-  claimedDays: number[]
-}
+type WalletProgress = { claimedDays: number[] }
 
 function getPhase(day: number): Phase {
   if (day <= 10) return 'Signal'
@@ -145,18 +129,18 @@ function formatRemaining(milliseconds: number) {
 function CountdownCard({
   day,
   claimed,
-  username,
+  wallet,
 }: {
   day: number
   claimed: boolean
-  username?: string
+  wallet?: string
 }) {
   const phase = getPhase(day)
-  const activeSegments = day
 
   return (
     <div className="relative overflow-hidden rounded-[32px] border border-emerald-300/20 bg-[#07110b] p-5 text-white shadow-[0_30px_90px_rgba(8,35,17,0.35)] sm:p-7">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_35%,rgba(102,209,33,0.18),transparent_38%),linear-gradient(145deg,rgba(255,255,255,0.04),transparent_45%)]" />
+
       <div className="relative flex items-center justify-between gap-4">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.32em] text-emerald-300/80">Machina Countdown</p>
@@ -169,7 +153,7 @@ function CountdownCard({
 
       <div className="relative mx-auto my-5 aspect-square w-full max-w-[360px]">
         {Array.from({ length: TOTAL_DAYS }, (_, index) => {
-          const isActive = index < activeSegments
+          const isActive = index < day
           return (
             <span
               key={index}
@@ -200,10 +184,10 @@ function CountdownCard({
 
       <div className="relative text-center">
         <h3 className="text-2xl font-semibold tracking-tight sm:text-3xl">{DAY_TITLES[day - 1]}</h3>
-        <p className="mt-2 text-sm text-slate-300">Progress signal {day} of 40. Built for a consistent daily collection.</p>
-        {username && (
+        <p className="mt-2 text-sm text-slate-300">Progress signal {day} of 40. One record per connected wallet.</p>
+        {claimed && wallet && (
           <p className="mt-4 inline-flex rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-emerald-100">
-            Claimed by @{username}
+            Claimed by {shortenAddress(wallet)}
           </p>
         )}
         <div className="mt-5 flex items-center justify-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
@@ -217,13 +201,10 @@ function CountdownCard({
 
 export default function CountdownPage() {
   const { address, chainId, isConnected } = useAccount()
-  const { signMessageAsync } = useSignMessage()
   const { switchChainAsync } = useSwitchChain()
   const [now, setNow] = useState(Date.now())
   const [simulatedDay, setSimulatedDay] = useState(1)
   const [progress, setProgress] = useState<WalletProgress>({ claimedDays: [] })
-  const [xSession, setXSession] = useState<XSession>({ authenticated: false })
-  const [isConnectingX, setIsConnectingX] = useState(false)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
 
   const smokeMode = useMemo(() => {
@@ -240,14 +221,8 @@ export default function CountdownPage() {
     : Math.min(TOTAL_DAYS, Math.max(1, realCalendarDay || 1))
   const claimedDays = progress.claimedDays
   const hasClaimedActiveDay = claimedDays.includes(activeDay)
-  const xMatchesWallet = Boolean(
-    xSession.authenticated &&
-      xSession.wallet &&
-      address &&
-      xSession.wallet.toLowerCase() === address.toLowerCase(),
-  )
   const isArcTestnet = chainId === ARC_EVM_CHAIN_ID
-  const canClaim = smokeMode && isConnected && xMatchesWallet && isArcTestnet && !hasClaimedActiveDay
+  const canClaim = smokeMode && isConnected && isArcTestnet && !hasClaimedActiveDay
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -257,68 +232,6 @@ export default function CountdownPage() {
   useEffect(() => {
     setProgress(loadProgress(address))
   }, [address])
-
-  useEffect(() => {
-    let cancelled = false
-
-    const loadXSession = async () => {
-      try {
-        const response = await fetch('/api/auth/x/session', { credentials: 'include' })
-        const session = (await response.json()) as XSession
-        if (!cancelled) setXSession(session)
-      } catch {
-        if (!cancelled) setXSession({ authenticated: false })
-      }
-    }
-
-    void loadXSession()
-    return () => {
-      cancelled = true
-    }
-  }, [address])
-
-  const connectX = async () => {
-    if (!address) {
-      setStatusMessage('Connect the wallet that will own the countdown record first.')
-      return
-    }
-
-    setIsConnectingX(true)
-    setStatusMessage(null)
-
-    try {
-      const challengeResponse = await fetch(`/api/auth/x/challenge?wallet=${encodeURIComponent(address)}`, {
-        credentials: 'include',
-      })
-      const challenge = (await challengeResponse.json()) as { message?: string; error?: string }
-      if (!challengeResponse.ok || !challenge.message) {
-        throw new Error(challenge.error || 'Could not create the wallet-link challenge.')
-      }
-
-      const signature = await signMessageAsync({ message: challenge.message })
-      const startResponse = await fetch('/api/auth/x/start', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: address, message: challenge.message, signature }),
-      })
-      const start = (await startResponse.json()) as { authorizeUrl?: string; error?: string }
-      if (!startResponse.ok || !start.authorizeUrl) {
-        throw new Error(start.error || 'Could not start X authorization.')
-      }
-
-      window.location.assign(start.authorizeUrl)
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'X connection failed.')
-      setIsConnectingX(false)
-    }
-  }
-
-  const disconnectX = async () => {
-    await fetch('/api/auth/x/logout', { method: 'POST', credentials: 'include' })
-    setXSession({ authenticated: false })
-    setStatusMessage('X account disconnected from this browser session.')
-  }
 
   const claimActiveDay = () => {
     if (!address || !canClaim) return
@@ -338,7 +251,7 @@ export default function CountdownPage() {
   }
 
   const downloadPersonalizedCard = async () => {
-    if (!address || !xSession.user?.username || !hasClaimedActiveDay) return
+    if (!address || !hasClaimedActiveDay) return
 
     const canvas = document.createElement('canvas')
     canvas.width = 1200
@@ -390,17 +303,17 @@ export default function CountdownPage() {
     context.fillText(DAY_TITLES[activeDay - 1].toUpperCase(), 600, 958)
     context.fillStyle = '#b9c8bf'
     context.font = '500 31px Arial'
-    context.fillText(`Claimed by @${xSession.user.username}`, 600, 1030)
+    context.fillText(`Claimed by ${shortenAddress(address)}`, 600, 1030)
     context.fillStyle = '#7e9387'
     context.font = '500 25px Arial'
-    context.fillText(`Wallet ${shortenAddress(address)}`, 600, 1080)
+    context.fillText('Wallet-based participation record', 600, 1080)
 
     canvas.toBlob((blob) => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = `machina-countdown-day-${activeDay.toString().padStart(2, '0')}-${xSession.user?.username}.png`
+      anchor.download = `machina-countdown-day-${activeDay.toString().padStart(2, '0')}-${address.slice(2, 8)}.png`
       anchor.click()
       URL.revokeObjectURL(url)
     }, 'image/png')
@@ -422,7 +335,7 @@ export default function CountdownPage() {
             <img src={arcLogo} alt="Machina" className="h-11 w-11 rounded-xl border border-slate-200 bg-white object-contain p-1" />
             <div>
               <p className="text-lg font-semibold tracking-tight">Machina Countdown</p>
-              <p className="text-xs text-slate-500">Separate preview route. Existing bridge and swap flows remain unchanged.</p>
+              <p className="text-xs text-slate-500">Wallet-only preview route. Existing bridge and swap flows remain unchanged.</p>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -450,11 +363,12 @@ export default function CountdownPage() {
                 </span>
               )}
             </div>
+
             <h1 className="mt-5 max-w-3xl text-4xl font-semibold tracking-tight text-slate-950 sm:text-5xl">
               Build a 40-day onchain participation record.
             </h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600">
-              Wallet address is the canonical record. X is required for claim authorization and the personalized downloadable card. Neither requirement affects the normal Swap or Bridge pages.
+              The connected wallet is the only identity and the canonical record for all daily claims. No X account, paid social API or external login is required.
             </p>
 
             <div className="mt-7 grid gap-3 sm:grid-cols-3">
@@ -474,42 +388,14 @@ export default function CountdownPage() {
               </div>
             </div>
 
-            <div className="mt-6 grid gap-3 sm:grid-cols-2">
-              <div className={`rounded-2xl border p-4 ${isConnected ? 'border-emerald-200 bg-emerald-50' : 'border-slate-200 bg-white'}`}>
-                <div className="flex items-center gap-3">
-                  <span className="grid h-10 w-10 place-items-center rounded-xl bg-white text-slate-700 shadow-sm"><Wallet size={18} /></span>
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold">Wallet record</p>
-                    <p className="truncate text-xs text-slate-600">{shortenAddress(address)}</p>
-                  </div>
-                  {isConnected && <Check size={17} className="ml-auto text-emerald-700" />}
+            <div className={`mt-6 rounded-2xl border p-4 ${isConnected ? 'border-emerald-200 bg-emerald-50' : 'border-slate-200 bg-white'}`}>
+              <div className="flex items-center gap-3">
+                <span className="grid h-10 w-10 place-items-center rounded-xl bg-white text-slate-700 shadow-sm"><Wallet size={18} /></span>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold">Wallet participation record</p>
+                  <p className="truncate text-xs text-slate-600">{shortenAddress(address)}</p>
                 </div>
-              </div>
-
-              <div className={`rounded-2xl border p-4 ${xMatchesWallet ? 'border-sky-200 bg-sky-50' : 'border-slate-200 bg-white'}`}>
-                <div className="flex items-center gap-3">
-                  <span className="grid h-10 w-10 place-items-center rounded-xl bg-white text-slate-700 shadow-sm"><Twitter size={18} /></span>
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold">X authorization</p>
-                    <p className="truncate text-xs text-slate-600">
-                      {xMatchesWallet ? `@${xSession.user?.username}` : xSession.authenticated ? 'Connected to another wallet' : 'Not connected'}
-                    </p>
-                  </div>
-                  {xMatchesWallet ? (
-                    <button type="button" onClick={() => void disconnectX()} className="ml-auto rounded-lg p-2 text-slate-500 hover:bg-white" aria-label="Disconnect X">
-                      <LogOut size={16} />
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => void connectX()}
-                      disabled={!isConnected || isConnectingX}
-                      className="ml-auto rounded-xl bg-slate-950 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      {isConnectingX ? 'Connecting...' : 'Connect X'}
-                    </button>
-                  )}
-                </div>
+                {isConnected && <Check size={17} className="ml-auto text-emerald-700" />}
               </div>
             </div>
 
@@ -528,7 +414,7 @@ export default function CountdownPage() {
             )}
           </div>
 
-          <CountdownCard day={activeDay} claimed={hasClaimedActiveDay} username={hasClaimedActiveDay && xMatchesWallet ? xSession.user?.username : undefined} />
+          <CountdownCard day={activeDay} claimed={hasClaimedActiveDay} wallet={address} />
         </section>
 
         {smokeMode && (
@@ -553,7 +439,7 @@ export default function CountdownPage() {
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-xl font-semibold tracking-tight">Daily collection record</h2>
-                <p className="mt-1 text-sm text-slate-500">The connected wallet is the source of truth for all 40 daily claims.</p>
+                <p className="mt-1 text-sm text-slate-500">Each connected wallet maintains its own 40-day claim history.</p>
               </div>
               <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700">{claimedDays.length} claimed</span>
             </div>
@@ -588,7 +474,6 @@ export default function CountdownPage() {
             <h2 className="text-xl font-semibold tracking-tight">Claim Day {activeDay.toString().padStart(2, '0')}</h2>
             <div className="mt-4 space-y-2 text-sm text-slate-600">
               <p className="flex items-center gap-2">{isConnected ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Wallet connected</p>
-              <p className="flex items-center gap-2">{xMatchesWallet ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} X linked to this wallet</p>
               <p className="flex items-center gap-2">{isArcTestnet ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Arc Testnet selected</p>
               <p className="flex items-center gap-2">{!hasClaimedActiveDay ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Day not previously claimed</p>
             </div>
@@ -605,10 +490,10 @@ export default function CountdownPage() {
             <button
               type="button"
               onClick={() => void downloadPersonalizedCard()}
-              disabled={!hasClaimedActiveDay || !xMatchesWallet}
+              disabled={!hasClaimedActiveDay || !address}
               className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-45"
             >
-              <Download size={16} /> Download personalized PNG
+              <Download size={16} /> Download wallet card
             </button>
           </aside>
         </section>
