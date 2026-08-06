@@ -21,6 +21,7 @@ const TOTAL_DAYS = 40
 const DAY_MS = 24 * 60 * 60 * 1000
 const CAMPAIGN_START_UTC = Date.UTC(2026, 7, 7, 0, 0, 0)
 const MAINNET_TARGET_UTC = Date.UTC(2026, 8, 16, 0, 0, 0)
+const DEFAULT_SMOKE_TEST_WALLET = '0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321'
 
 const DAY_TITLES = [
   'First Signal',
@@ -205,6 +206,7 @@ export default function CountdownPage() {
   const [now, setNow] = useState(Date.now())
   const [simulatedDay, setSimulatedDay] = useState(1)
   const [progress, setProgress] = useState<WalletProgress>({ claimedDays: [] })
+  const [repeatAttempts, setRepeatAttempts] = useState<Record<number, number>>({})
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
 
   const smokeMode = useMemo(() => {
@@ -215,6 +217,9 @@ export default function CountdownPage() {
     return import.meta.env.DEV || import.meta.env.VITE_COUNTDOWN_SMOKE_TEST === 'true' || ((isLocal || isVercelPreview) && query.get('smoke') === '1')
   }, [])
 
+  const configuredSmokeWallet = (
+    import.meta.env.VITE_COUNTDOWN_TEST_WALLET?.trim() || DEFAULT_SMOKE_TEST_WALLET
+  ).toLowerCase()
   const realCalendarDay = getCalendarDay(now)
   const activeDay = smokeMode
     ? simulatedDay
@@ -222,7 +227,10 @@ export default function CountdownPage() {
   const claimedDays = progress.claimedDays
   const hasClaimedActiveDay = claimedDays.includes(activeDay)
   const isArcTestnet = chainId === ARC_EVM_CHAIN_ID
-  const canClaim = smokeMode && isConnected && isArcTestnet && !hasClaimedActiveDay
+  const isPrivilegedSmokeWallet = Boolean(
+    smokeMode && address && address.toLowerCase() === configuredSmokeWallet,
+  )
+  const canClaim = smokeMode && isConnected && isArcTestnet && (!hasClaimedActiveDay || isPrivilegedSmokeWallet)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -231,23 +239,51 @@ export default function CountdownPage() {
 
   useEffect(() => {
     setProgress(loadProgress(address))
+    setRepeatAttempts({})
   }, [address])
 
   const claimActiveDay = () => {
     if (!address || !canClaim) return
+
+    if (hasClaimedActiveDay && isPrivilegedSmokeWallet) {
+      const nextAttempt = (repeatAttempts[activeDay] || 1) + 1
+      setRepeatAttempts((current) => ({ ...current, [activeDay]: nextAttempt }))
+      setStatusMessage(
+        `Repeat smoke claim #${nextAttempt} completed for Day ${activeDay.toString().padStart(2, '0')}. The collection count remains unique at one record for this day.`,
+      )
+      return
+    }
+
     const next = {
       claimedDays: [...claimedDays, activeDay].sort((a, b) => a - b),
     }
     saveProgress(address, next)
     setProgress(next)
+    setRepeatAttempts((current) => ({ ...current, [activeDay]: 1 }))
     setStatusMessage(`Smoke claim recorded for Day ${activeDay.toString().padStart(2, '0')}. No blockchain transaction was sent.`)
   }
 
-  const resetSmokeProgress = () => {
+  const resetCurrentDay = () => {
+    if (!address) return
+    const next = {
+      claimedDays: claimedDays.filter((day) => day !== activeDay),
+    }
+    saveProgress(address, next)
+    setProgress(next)
+    setRepeatAttempts((current) => {
+      const updated = { ...current }
+      delete updated[activeDay]
+      return updated
+    })
+    setStatusMessage(`Day ${activeDay.toString().padStart(2, '0')} was reset for this smoke-test wallet.`)
+  }
+
+  const resetAllSmokeProgress = () => {
     if (!address) return
     window.localStorage.removeItem(getStorageKey(address))
     setProgress({ claimedDays: [] })
-    setStatusMessage('Smoke-test progress reset for the connected wallet.')
+    setRepeatAttempts({})
+    setStatusMessage('All smoke-test claims were reset for the connected wallet.')
   }
 
   const downloadPersonalizedCard = async () => {
@@ -362,6 +398,11 @@ export default function CountdownPage() {
                   <FlaskConical size={14} /> Smoke mode
                 </span>
               )}
+              {isPrivilegedSmokeWallet && (
+                <span className="inline-flex items-center gap-2 rounded-full bg-violet-50 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] text-violet-800">
+                  Unlimited test wallet
+                </span>
+              )}
             </div>
 
             <h1 className="mt-5 max-w-3xl text-4xl font-semibold tracking-tight text-slate-950 sm:text-5xl">
@@ -422,13 +463,16 @@ export default function CountdownPage() {
             <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="inline-flex items-center gap-2 text-sm font-semibold text-amber-950"><FlaskConical size={17} /> Preview smoke-test controls</p>
-                <p className="mt-1 text-sm text-amber-800">Local browser records only. No NFT contract call is made in this phase.</p>
+                <p className="mt-1 text-sm text-amber-800">
+                  These controls affect only local preview data. They cannot reset or bypass the production NFT contract.
+                </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <button type="button" onClick={() => setSimulatedDay((day) => Math.max(1, day - 1))} className="rounded-xl border border-amber-300 bg-white p-2.5 text-amber-950" aria-label="Previous day"><ChevronLeft size={17} /></button>
                 <span className="min-w-28 rounded-xl border border-amber-300 bg-white px-4 py-2.5 text-center text-sm font-semibold text-amber-950">Day {simulatedDay} / 40</span>
                 <button type="button" onClick={() => setSimulatedDay((day) => Math.min(TOTAL_DAYS, day + 1))} className="rounded-xl border border-amber-300 bg-white p-2.5 text-amber-950" aria-label="Next day"><ChevronRight size={17} /></button>
-                <button type="button" onClick={resetSmokeProgress} disabled={!address} className="inline-flex items-center gap-2 rounded-xl border border-amber-300 bg-white px-3 py-2.5 text-sm font-semibold text-amber-950 disabled:opacity-45"><RotateCcw size={16} /> Reset wallet</button>
+                <button type="button" onClick={resetCurrentDay} disabled={!address || !hasClaimedActiveDay} className="inline-flex items-center gap-2 rounded-xl border border-amber-300 bg-white px-3 py-2.5 text-sm font-semibold text-amber-950 disabled:opacity-45"><RotateCcw size={16} /> Reset this day</button>
+                <button type="button" onClick={resetAllSmokeProgress} disabled={!address || claimedDays.length === 0} className="inline-flex items-center gap-2 rounded-xl border border-amber-300 bg-white px-3 py-2.5 text-sm font-semibold text-amber-950 disabled:opacity-45"><RotateCcw size={16} /> Reset all claims</button>
               </div>
             </div>
           </section>
@@ -475,7 +519,13 @@ export default function CountdownPage() {
             <div className="mt-4 space-y-2 text-sm text-slate-600">
               <p className="flex items-center gap-2">{isConnected ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Wallet connected</p>
               <p className="flex items-center gap-2">{isArcTestnet ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Arc Testnet selected</p>
-              <p className="flex items-center gap-2">{!hasClaimedActiveDay ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Day not previously claimed</p>
+              <p className="flex items-center gap-2">
+                {!hasClaimedActiveDay || isPrivilegedSmokeWallet ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />}
+                {hasClaimedActiveDay && isPrivilegedSmokeWallet ? 'Owner repeat-test bypass active' : 'Day not previously claimed'}
+              </p>
+              {isPrivilegedSmokeWallet && hasClaimedActiveDay && (
+                <p className="text-xs text-violet-700">Repeat attempts this session: {repeatAttempts[activeDay] || 1}</p>
+              )}
             </div>
 
             <button
@@ -484,7 +534,13 @@ export default function CountdownPage() {
               disabled={!canClaim}
               className="mt-5 w-full rounded-2xl bg-[#2f6e0c] px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-[#25580a] disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
             >
-              {hasClaimedActiveDay ? 'Already claimed' : smokeMode ? 'Run smoke claim' : 'Onchain mint not deployed yet'}
+              {hasClaimedActiveDay
+                ? isPrivilegedSmokeWallet
+                  ? 'Repeat smoke claim'
+                  : 'Already claimed'
+                : smokeMode
+                  ? 'Run smoke claim'
+                  : 'Onchain mint not deployed yet'}
             </button>
 
             <button
