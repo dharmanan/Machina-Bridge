@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node scripts/compile-countdown-contract.mjs && tsc && vite build",
     "postinstall": "node scripts/fix-viem-tsconfig.mjs",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
@@ -27,6 +27,7 @@
     "lucide-react": "^0.292.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "solc": "^0.8.24",
     "viem": "^2.52.2",
     "wagmi": "^2.9.0"
   },
@@ -46,15 +47,11 @@
     "vite": "^8.0.16"
   },
   "overrides": {
-    "@coinbase/cdp-sdk": {
-      "axios": "1.18.1"
-    },
+    "@coinbase/cdp-sdk": { "axios": "1.18.1" },
     "axios": "1.18.1",
     "hono": "4.12.32",
     "valibot": "1.4.2",
-    "minimatch@^9.0.0": {
-      "brace-expansion": "2.1.2"
-    },
+    "minimatch@^9.0.0": { "brace-expansion": "2.1.2" },
     "js-yaml": "^4.3.0",
     "viem": "^2.52.2",
     "ws": "^8.21.0",
