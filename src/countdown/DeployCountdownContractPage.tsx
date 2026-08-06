@@ -53,17 +53,19 @@ export default function DeployCountdownContractPage() {
       <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
         <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-700">Arc Testnet setup</p>
-          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Metadata V5 Test Contract</h1>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Metadata V6 Test Contract</h1>
           <p className="mt-4 text-sm leading-6 text-slate-600">
-            V5 stores the collection metadata, NFT card SVG and the real Machina head artwork inside the smart contract. Explorer rendering no longer depends on Vercel, GitHub, IPFS or another external image server.
+            V6 keeps the collection metadata, NFT card SVG and real Machina head artwork onchain, but removes the full artwork payload from each claim transaction log so mint gas can be estimated normally.
           </p>
 
           <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
             <p><strong>Wallet:</strong> {address ?? 'Not connected'}</p>
             <p className="mt-1"><strong>Network:</strong> {chainId === ARC_EVM_CHAIN_ID ? 'Arc Testnet' : 'Switch to Arc Testnet'}</p>
+            <p className="mt-1"><strong>Gas asset:</strong> USDC</p>
             <p className="mt-1"><strong>Collection:</strong> Arc Mainnet Countdown</p>
             <p className="mt-1"><strong>Symbol:</strong> ARC40</p>
             <p className="mt-1"><strong>Artwork:</strong> Embedded onchain Machina head + SVG card</p>
+            <p className="mt-1"><strong>Claim path:</strong> Lightweight ERC-1155 mint, metadata read through uri(tokenId)</p>
             <p className="mt-1"><strong>Token IDs:</strong> Day 1 = #1 through Day 40 = #40</p>
             {previousAddress && !newAddress && (
               <p className="mt-3 break-all text-amber-700"><strong>Previous test contract:</strong> {previousAddress}</p>
@@ -72,9 +74,9 @@ export default function DeployCountdownContractPage() {
 
           {newAddress ? (
             <div className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> Metadata V5 contract deployed</p>
+              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> Metadata V6 contract deployed</p>
               <p className="mt-2 break-all text-sm text-emerald-800">{newAddress}</p>
-              <p className="mt-3 text-sm leading-6 text-emerald-800">Countdown preview is now connected to V5. Mint Day 1 and check the explorer artwork before continuing the smoke test.</p>
+              <p className="mt-3 text-sm leading-6 text-emerald-800">Countdown preview is now connected to V6. Mint only Day 1 first and confirm that MetaMask shows a calculable network fee before continuing.</p>
               <a href="/countdown?smoke=1" className="mt-4 inline-flex items-center gap-2 rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">
                 Open Countdown <ExternalLink size={15} />
               </a>
@@ -92,15 +94,15 @@ export default function DeployCountdownContractPage() {
                 : chainId !== ARC_EVM_CHAIN_ID
                   ? 'Switch to Arc Testnet'
                   : isPending
-                    ? 'Confirm V5 deployment in wallet'
+                    ? 'Confirm V6 deployment in wallet'
                     : receipt.isLoading
                       ? 'Waiting for Arc Testnet confirmation'
-                      : 'Deploy Metadata V5 Contract'}
+                      : 'Deploy Metadata V6 Contract'}
             </button>
           )}
 
           <p className="mt-4 text-xs leading-5 text-slate-500">
-            Previous test contracts remain on Arc Testnet. V5 creates a fresh test collection specifically to verify the final metadata and artwork path before the campaign contract is finalized.
+            Previous test contracts remain on Arc Testnet. Use V6 for the next fee and explorer test; do not continue minting on V5.
           </p>
 
           {error && <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error.message}</p>}
