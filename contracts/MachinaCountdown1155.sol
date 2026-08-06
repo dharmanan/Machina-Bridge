@@ -148,13 +148,13 @@ contract MachinaCountdown1155 is IERC1155MetadataURI {
         return 0;
     }
 
-    function claimedDays(address wallet) external view returns (uint8[] memory days) {
+    function claimedDays(address wallet) external view returns (uint8[] memory dayList) {
         uint8 count = claimedCount[wallet];
-        days = new uint8[](count);
+        dayList = new uint8[](count);
         uint256 cursor;
         for (uint8 day = 1; day <= TOTAL_DAYS; day++) {
             if (hasClaimed(wallet, day)) {
-                days[cursor] = day;
+                dayList[cursor] = day;
                 cursor++;
             }
         }
