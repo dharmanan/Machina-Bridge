@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useAccount, usePublicClient, useReadContract, useWriteContract } from 'wagmi'
 import { ARC_EVM_CHAIN_ID } from '../lib/chains'
 import { bitmapToDays, COUNTDOWN_ABI, COUNTDOWN_CONTRACT_ADDRESS, HAS_COUNTDOWN_CONTRACT } from './contract'
@@ -6,6 +6,9 @@ import { bitmapToDays, COUNTDOWN_ABI, COUNTDOWN_CONTRACT_ADDRESS, HAS_COUNTDOWN_
 export function useCountdownContract() {
   const { address, chainId } = useAccount()
   const publicClient = usePublicClient({ chainId: ARC_EVM_CHAIN_ID })
+  const [isConfirming, setIsConfirming] = useState(false)
+  const [confirmedHash, setConfirmedHash] = useState<`0x${string}` | undefined>(undefined)
+  const [receiptError, setReceiptError] = useState<Error | null>(null)
 
   const owner = useReadContract({
     abi: COUNTDOWN_ABI,
@@ -50,7 +53,7 @@ export function useCountdownContract() {
     query: { enabled: HAS_COUNTDOWN_CONTRACT },
   })
 
-  const { data: txHash, error: writeError, isPending: isWalletPending, writeContractAsync, reset: resetWrite } = useWriteContract()
+  const { data: txHash, error: writeError, isPending: isWalletPending, writeContractAsync, reset: resetWagmiWrite } = useWriteContract()
 
   const claimedDays = useMemo(
     () => bitmapToDays((claimedBitmap.data as bigint | undefined) ?? 0n),
@@ -67,13 +70,26 @@ export function useCountdownContract() {
     ])
   }
 
-  const submitAndWait = async (request: Parameters<typeof writeContractAsync>[0]) => {
+  const submitAndWait = async (request: any) => {
+    setConfirmedHash(undefined)
+    setReceiptError(null)
     const hash = await writeContractAsync(request)
     if (!publicClient) throw new Error('Arc Testnet RPC is not available.')
-    const receipt = await publicClient.waitForTransactionReceipt({ hash })
-    if (receipt.status !== 'success') throw new Error('Transaction reverted on Arc Testnet.')
-    await refetch()
-    return hash
+
+    setIsConfirming(true)
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') throw new Error('Transaction reverted on Arc Testnet.')
+      await refetch()
+      setConfirmedHash(hash)
+      return hash
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error('Transaction confirmation failed.')
+      setReceiptError(normalized)
+      throw normalized
+    } finally {
+      setIsConfirming(false)
+    }
   }
 
   const claim = async () => {
@@ -120,6 +136,12 @@ export function useCountdownContract() {
     })
   }
 
+  const resetWrite = () => {
+    resetWagmiWrite()
+    setConfirmedHash(undefined)
+    setReceiptError(null)
+  }
+
   return {
     address,
     chainId,
@@ -134,11 +156,11 @@ export function useCountdownContract() {
     isOwner: Boolean(address && owner.data && address.toLowerCase() === String(owner.data).toLowerCase()),
     isLoading: currentDay.isLoading || claimedBitmap.isLoading || claimedCount.isLoading,
     isWalletPending,
-    isConfirming: false,
-    isConfirmed: false,
+    isConfirming,
+    isConfirmed: Boolean(confirmedHash),
     txHash,
     writeError,
-    receiptError: null,
+    receiptError,
     onArcTestnet: chainId === ARC_EVM_CHAIN_ID,
     claim,
     setTestDay,
