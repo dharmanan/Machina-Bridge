@@ -4,6 +4,7 @@ import { useAccount, useDeployContract, useSwitchChain, useWaitForTransactionRec
 import { ArrowLeft, CheckCircle2, ExternalLink, Loader2 } from 'lucide-react'
 import { ARC_EVM_CHAIN_ID } from '../lib/chains'
 import { COUNTDOWN_DEPLOY_ABI, COUNTDOWN_DEPLOY_BYTECODE } from './contractArtifact.generated'
+import { MACHINA_HEAD_PNG_B64 } from './machinaHeadB64'
 
 const CAMPAIGN_START_SECONDS = BigInt(Math.floor(Date.UTC(2026, 7, 7, 0, 0, 0) / 1000))
 const STORAGE_KEY = 'machina-countdown-contract-address'
@@ -15,8 +16,6 @@ export default function DeployCountdownContractPage() {
   const receipt = useWaitForTransactionReceipt({ hash: deployHash, chainId: ARC_EVM_CHAIN_ID })
   const [previousAddress] = useState<string | null>(() => window.localStorage.getItem(STORAGE_KEY))
   const [newAddress, setNewAddress] = useState<string | null>(null)
-
-  const imageBaseUrl = `${window.location.origin}/api/countdown-image`
 
   useEffect(() => {
     const contractAddress = receipt.data?.contractAddress
@@ -35,7 +34,7 @@ export default function DeployCountdownContractPage() {
     await deployContractAsync({
       abi: COUNTDOWN_DEPLOY_ABI,
       bytecode: COUNTDOWN_DEPLOY_BYTECODE,
-      args: [imageBaseUrl, CAMPAIGN_START_SECONDS, true],
+      args: [MACHINA_HEAD_PNG_B64, CAMPAIGN_START_SECONDS, true],
       chainId: ARC_EVM_CHAIN_ID,
     })
   }
@@ -54,9 +53,9 @@ export default function DeployCountdownContractPage() {
       <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
         <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-700">Arc Testnet setup</p>
-          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Metadata V4 Test Contract</h1>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Metadata V5 Test Contract</h1>
           <p className="mt-4 text-sm leading-6 text-slate-600">
-            V4 keeps the collection name and NFT metadata in the smart contract, while the NFT artwork uses the same Machina head and card styling as the countdown page.
+            V5 stores the collection metadata, NFT card SVG and the real Machina head artwork inside the smart contract. Explorer rendering no longer depends on Vercel, GitHub, IPFS or another external image server.
           </p>
 
           <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -64,7 +63,7 @@ export default function DeployCountdownContractPage() {
             <p className="mt-1"><strong>Network:</strong> {chainId === ARC_EVM_CHAIN_ID ? 'Arc Testnet' : 'Switch to Arc Testnet'}</p>
             <p className="mt-1"><strong>Collection:</strong> Arc Mainnet Countdown</p>
             <p className="mt-1"><strong>Symbol:</strong> ARC40</p>
-            <p className="mt-1"><strong>Artwork renderer:</strong> {imageBaseUrl}</p>
+            <p className="mt-1"><strong>Artwork:</strong> Embedded onchain Machina head + SVG card</p>
             <p className="mt-1"><strong>Token IDs:</strong> Day 1 = #1 through Day 40 = #40</p>
             {previousAddress && !newAddress && (
               <p className="mt-3 break-all text-amber-700"><strong>Previous test contract:</strong> {previousAddress}</p>
@@ -73,9 +72,9 @@ export default function DeployCountdownContractPage() {
 
           {newAddress ? (
             <div className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> Metadata V4 contract deployed</p>
+              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> Metadata V5 contract deployed</p>
               <p className="mt-2 break-all text-sm text-emerald-800">{newAddress}</p>
-              <p className="mt-3 text-sm leading-6 text-emerald-800">Countdown preview is now connected to this V4 contract. Mint Day 1 and compare the explorer artwork with the countdown card.</p>
+              <p className="mt-3 text-sm leading-6 text-emerald-800">Countdown preview is now connected to V5. Mint Day 1 and check the explorer artwork before continuing the smoke test.</p>
               <a href="/countdown?smoke=1" className="mt-4 inline-flex items-center gap-2 rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">
                 Open Countdown <ExternalLink size={15} />
               </a>
@@ -93,15 +92,15 @@ export default function DeployCountdownContractPage() {
                 : chainId !== ARC_EVM_CHAIN_ID
                   ? 'Switch to Arc Testnet'
                   : isPending
-                    ? 'Confirm V4 deployment in wallet'
+                    ? 'Confirm V5 deployment in wallet'
                     : receipt.isLoading
                       ? 'Waiting for Arc Testnet confirmation'
-                      : 'Deploy Metadata V4 Contract'}
+                      : 'Deploy Metadata V5 Contract'}
             </button>
           )}
 
           <p className="mt-4 text-xs leading-5 text-slate-500">
-            Previous test contracts and test NFTs remain on Arc Testnet. V4 creates a fresh test collection so the explorer artwork can be checked against the real countdown design.
+            Previous test contracts remain on Arc Testnet. V5 creates a fresh test collection specifically to verify the final metadata and artwork path before the campaign contract is finalized.
           </p>
 
           {error && <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error.message}</p>}
