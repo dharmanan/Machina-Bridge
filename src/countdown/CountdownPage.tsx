@@ -192,7 +192,8 @@ function NftCard({
 
         <header className="relative flex items-start justify-between">
           <div>
-            <p className="text-xs font-medium uppercase tracking-[0.32em] text-slate-300">Day</p>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-[#8bf15a]">Arc Mainnet Countdown</p>
+            <p className="mt-3 text-xs font-medium uppercase tracking-[0.32em] text-slate-300">Day</p>
             <p className="mt-1 text-5xl font-light leading-none tracking-tight text-white">
               {day.toString().padStart(2, '0')}
             </p>
@@ -228,13 +229,11 @@ function NftCard({
               className="absolute h-[76%] w-[86%] border border-[#4eca23] bg-transparent"
               style={{ clipPath: 'polygon(50% 0%, 100% 100%, 0 100%)' }}
             />
-            <div className="relative z-10 h-[86%] w-[78%] overflow-hidden">
-              <img
-                src={arcLogo}
-                alt="Machina"
-                className="absolute left-1/2 top-[40%] h-[162%] w-[162%] max-w-none -translate-x-1/2 -translate-y-1/2 object-contain drop-shadow-[0_10px_18px_rgba(0,0,0,0.65)]"
-              />
-            </div>
+            <img
+              src={arcLogo}
+              alt="Machina robot head"
+              className="absolute left-1/2 top-[-24%] z-10 h-auto w-[190%] max-w-none -translate-x-1/2 object-contain drop-shadow-[0_10px_18px_rgba(0,0,0,0.65)]"
+            />
           </div>
         </div>
 
@@ -364,17 +363,20 @@ export default function CountdownPage() {
     context.strokeRect(36, 36, 1008, 1278)
 
     context.textAlign = 'center'
+    context.fillStyle = '#79ef3d'
+    context.font = '600 28px Arial'
+    context.fillText('ARC MAINNET COUNTDOWN', 540, 82)
     context.fillStyle = '#d8e2db'
     context.font = '500 34px Arial'
-    context.fillText('DAY', 540, 120)
+    context.fillText('DAY', 540, 140)
     context.fillStyle = '#ffffff'
     context.font = '300 96px Arial'
-    context.fillText(activeDay.toString().padStart(2, '0'), 540, 220)
+    context.fillText(activeDay.toString().padStart(2, '0'), 540, 240)
     context.font = '300 32px Arial'
-    context.fillText('/ 40', 540, 268)
+    context.fillText('/ 40', 540, 288)
 
     context.save()
-    context.translate(540, 600)
+    context.translate(540, 610)
     for (let index = 0; index < TOTAL_DAYS; index += 1) {
       context.save()
       context.rotate((Math.PI * 2 * index) / TOTAL_DAYS)
@@ -389,24 +391,34 @@ export default function CountdownPage() {
     const image = new Image()
     image.src = arcLogo
     await image.decode()
-    context.drawImage(image, 300, 365, 480, 480)
+    context.drawImage(
+      image,
+      image.naturalWidth * 0.24,
+      image.naturalHeight * 0.05,
+      image.naturalWidth * 0.52,
+      image.naturalHeight * 0.66,
+      335,
+      390,
+      410,
+      470,
+    )
 
     context.fillStyle = '#ffffff'
     context.font = '600 48px Arial'
-    context.fillText(DAY_TITLES[activeDay - 1].toUpperCase(), 540, 990)
+    context.fillText(DAY_TITLES[activeDay - 1].toUpperCase(), 540, 1010)
     context.fillStyle = '#aab7ae'
     context.font = '400 28px Arial'
-    context.fillText(DAY_SUBTITLES[activeDay - 1], 540, 1042)
+    context.fillText(DAY_SUBTITLES[activeDay - 1], 540, 1062)
     context.fillStyle = '#79ef3d'
     context.font = '600 28px Arial'
-    context.fillText(shortenAddress(address), 540, 1150)
+    context.fillText(shortenAddress(address), 540, 1170)
 
     canvas.toBlob((blob) => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = `machina-day-${activeDay.toString().padStart(2, '0')}-${address.slice(2, 8)}.png`
+      anchor.download = `arc-mainnet-countdown-day-${activeDay.toString().padStart(2, '0')}-${address.slice(2, 8)}.png`
       anchor.click()
       URL.revokeObjectURL(url)
     }, 'image/png')
@@ -418,7 +430,7 @@ export default function CountdownPage() {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-6 lg:px-8">
           <div className="flex items-center gap-3">
             <img src={arcLogo} alt="Machina" className="h-11 w-11 rounded-xl border border-slate-200 bg-white object-contain p-1" />
-            <strong className="text-lg tracking-tight">Machina Countdown</strong>
+            <strong className="text-lg tracking-tight">Machina</strong>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <a
@@ -434,30 +446,25 @@ export default function CountdownPage() {
 
       <main>
         <section className="relative overflow-hidden border-b border-[#203127] bg-[#06100a] text-white">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(91,211,35,0.22),transparent_46%)]" />
-          <div className="relative mx-auto max-w-7xl px-4 py-12 text-center sm:px-6 sm:py-16 lg:px-8">
-            <p className="text-xs font-semibold uppercase tracking-[0.38em] text-[#91f05d]">40 Days to Mainnet</p>
-            <h1 className="mt-4 text-4xl font-semibold tracking-tight sm:text-6xl">Machina Mainnet Countdown</h1>
-            <p className="mx-auto mt-4 max-w-2xl text-base text-slate-300 sm:text-lg">
-              Claim one daily NFT. Complete at least 20 days to unlock a mainnet badge.
-            </p>
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(91,211,35,0.2),transparent_46%)]" />
+          <div className="relative mx-auto max-w-7xl px-4 py-7 text-center sm:px-6 sm:py-9 lg:px-8">
+            <h1 className="text-3xl font-semibold tracking-tight sm:text-5xl">Countdown to Arc Mainnet</h1>
 
-            <div className="mx-auto mt-8 grid max-w-4xl grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="mx-auto mt-6 grid max-w-3xl grid-cols-4 gap-2 sm:gap-3">
               {[
                 ['DAYS', countdown.days],
                 ['HOURS', countdown.hours],
                 ['MINUTES', countdown.minutes],
                 ['SECONDS', countdown.seconds],
               ].map(([label, value]) => (
-                <div key={label} className="rounded-2xl border border-[#3a5644] bg-black/25 px-3 py-5 shadow-[inset_0_0_28px_rgba(89,211,35,0.07)]">
-                  <div className="text-4xl font-light tabular-nums sm:text-5xl">
+                <div key={label} className="rounded-xl border border-[#3a5644] bg-black/25 px-2 py-3 shadow-[inset_0_0_24px_rgba(89,211,35,0.06)] sm:rounded-2xl sm:px-3 sm:py-4">
+                  <div className="text-2xl font-light tabular-nums sm:text-4xl">
                     {String(value).padStart(2, '0')}
                   </div>
-                  <div className="mt-2 text-[10px] font-semibold tracking-[0.25em] text-slate-400">{label}</div>
+                  <div className="mt-1 text-[8px] font-semibold tracking-[0.2em] text-slate-400 sm:text-[10px]">{label}</div>
                 </div>
               ))}
             </div>
-            <p className="mt-5 text-xs uppercase tracking-[0.2em] text-slate-500">Target: 16 September 2026</p>
           </div>
         </section>
 
@@ -592,6 +599,10 @@ export default function CountdownPage() {
             <div className="rounded-2xl border border-slate-200 bg-white p-4"><strong>30–39</strong><p className="mt-1 text-sm text-slate-500">Machina Pioneer.</p></div>
             <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4"><strong>40 / 40</strong><p className="mt-1 text-sm text-emerald-800">Genesis 40 and 0% Machina fee during the first mainnet week. Network and protocol fees still apply.</p></div>
           </section>
+
+          <p className="mt-6 text-center text-[11px] text-slate-400">
+            Independent community countdown by Machina. Not affiliated with or endorsed by Circle or Arc.
+          </p>
         </div>
       </main>
     </div>
