@@ -1,3 +1,21 @@
+/* Shared header mark: use the existing source art, but visually crop away the ARC MACHINA text. */
+.machina-brand-logo,
+img[alt="Machina Bridge Logo"] {
+  width: 72px !important;
+  height: 64px !important;
+  flex: 0 0 72px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+  object-fit: cover !important;
+  object-position: 50% 15% !important;
+  clip-path: inset(0 0 31% 0) !important;
+  transform: scale(1.18);
+  transform-origin: center top;
+  margin-bottom: -18px;
+}
+
 @media (min-width: 1024px) {
   main > section.grid > article {
     align-self: start;
