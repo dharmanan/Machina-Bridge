@@ -20,7 +20,7 @@ export default function DeployCountdownContractPage() {
   const [metadataMessage, setMetadataMessage] = useState<string | null>(null)
   const [metadataBusy, setMetadataBusy] = useState(false)
 
-  const metadataUri = `${window.location.origin}/api/countdown-metadata?id={id}`
+  const metadataUri = `${window.location.origin}/api/countdown-metadata?id={id}&v=2`
 
   useEffect(() => {
     const contractAddress = receipt.data?.contractAddress
@@ -63,7 +63,7 @@ export default function DeployCountdownContractPage() {
       })
       const metadataReceipt = await publicClient.waitForTransactionReceipt({ hash })
       if (metadataReceipt.status !== 'success') throw new Error('Metadata transaction reverted.')
-      setMetadataMessage('NFT metadata is now connected. Existing token IDs will use the new names and images once the explorer refreshes its metadata cache.')
+      setMetadataMessage('NFT metadata URI updated. The explorer will now fetch the new v2 metadata endpoint for existing and future token IDs.')
     } catch (metadataError) {
       setMetadataMessage(metadataError instanceof Error ? metadataError.message : 'Metadata update failed.')
     } finally {
@@ -109,7 +109,7 @@ export default function DeployCountdownContractPage() {
                   className="inline-flex items-center gap-2 rounded-xl bg-[#2f6e0c] px-4 py-2.5 text-sm font-semibold text-white disabled:bg-slate-300"
                 >
                   {(metadataBusy || isMetadataWalletPending) && <Loader2 size={16} className="animate-spin" />}
-                  {metadataBusy ? 'Waiting for Arc confirmation' : 'Set NFT metadata'}
+                  {metadataBusy ? 'Waiting for Arc confirmation' : 'Set NFT metadata v2'}
                 </button>
                 <a href="/countdown?smoke=1" className="inline-flex items-center gap-2 rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">
                   Open Countdown <ExternalLink size={15} />
