@@ -1,0 +1,6 @@
+@media (min-width: 1024px) {
+  main > section.grid > article {
+    align-self: start;
+    height: max-content;
+  }
+}
