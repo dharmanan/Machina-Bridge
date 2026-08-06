@@ -17,6 +17,8 @@ export const COUNTDOWN_ABI = [
   { type: 'function', name: 'eligibilityTier', stateMutability: 'view', inputs: [{ name: 'wallet', type: 'address' }], outputs: [{ name: '', type: 'uint8' }] },
   { type: 'function', name: 'setTestDay', stateMutability: 'nonpayable', inputs: [{ name: 'day', type: 'uint8' }], outputs: [] },
   { type: 'function', name: 'resetSmokeDay', stateMutability: 'nonpayable', inputs: [{ name: 'wallet', type: 'address' }, { name: 'day', type: 'uint8' }], outputs: [] },
+  { type: 'function', name: 'setMetadataUri', stateMutability: 'nonpayable', inputs: [{ name: 'newUri', type: 'string' }], outputs: [] },
+  { type: 'function', name: 'uri', stateMutability: 'view', inputs: [{ name: 'id', type: 'uint256' }], outputs: [{ name: '', type: 'string' }] },
   { type: 'function', name: 'owner', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
   { type: 'event', name: 'DailyClaim', anonymous: false, inputs: [{ indexed: true, name: 'wallet', type: 'address' }, { indexed: true, name: 'day', type: 'uint8' }, { indexed: true, name: 'tokenId', type: 'uint256' }] },
 ] as const
