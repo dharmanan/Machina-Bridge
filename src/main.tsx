@@ -9,6 +9,7 @@ import '@rainbow-me/rainbowkit/styles.css'
 import '@mysten/dapp-kit/dist/index.css'
 import { Web3Provider } from './lib/web3'
 import './index.css'
+import './countdown/countdown-layout.css'
 
 const globalScope = globalThis as typeof globalThis & {
   Buffer?: typeof Buffer
