@@ -15,7 +15,7 @@ const SEPOLIA_DEFAULT_RPC_URLS = [
 ]
 
 const ARC_DEFAULT_RPC_URLS = [
-  'https://rpc.testnet.arc.network',
+  'https://rpc.testnet.arc.io',
 ]
 
 const BASE_SEPOLIA_DEFAULT_RPC_URLS = [
@@ -47,12 +47,25 @@ export const SEPOLIA_EVM_CHAIN: Chain = {
   },
 }
 
+// Do not rely on a possibly stale viem Arc native-currency label here.
+// Arc Testnet uses USDC as the native gas asset.
 export const ARC_EVM_CHAIN: Chain = {
   ...arcTestnet,
+  id: 5042002,
+  name: 'Arc Testnet',
+  nativeCurrency: {
+    name: 'USDC',
+    symbol: 'USDC',
+    decimals: 18,
+  },
   rpcUrls: {
     default: { http: arcEnvRpc ? [arcEnvRpc] : ARC_DEFAULT_RPC_URLS },
     public: { http: arcEnvRpc ? [arcEnvRpc] : ARC_DEFAULT_RPC_URLS },
   },
+  blockExplorers: {
+    default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' },
+  },
+  testnet: true,
 }
 
 export const BASE_SEPOLIA_EVM_CHAIN: Chain = {
