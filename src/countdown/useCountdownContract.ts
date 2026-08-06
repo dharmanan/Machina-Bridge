@@ -1,10 +1,11 @@
 import { useMemo } from 'react'
-import { useAccount, useReadContract, useWaitForTransactionReceipt, useWriteContract } from 'wagmi'
+import { useAccount, usePublicClient, useReadContract, useWriteContract } from 'wagmi'
 import { ARC_EVM_CHAIN_ID } from '../lib/chains'
 import { bitmapToDays, COUNTDOWN_ABI, COUNTDOWN_CONTRACT_ADDRESS, HAS_COUNTDOWN_CONTRACT } from './contract'
 
 export function useCountdownContract() {
   const { address, chainId } = useAccount()
+  const publicClient = usePublicClient({ chainId: ARC_EVM_CHAIN_ID })
 
   const owner = useReadContract({
     abi: COUNTDOWN_ABI,
@@ -40,8 +41,16 @@ export function useCountdownContract() {
     query: { enabled: HAS_COUNTDOWN_CONTRACT && Boolean(address) },
   })
 
+  const tokenUri = useReadContract({
+    abi: COUNTDOWN_ABI,
+    address: COUNTDOWN_CONTRACT_ADDRESS,
+    functionName: 'uri',
+    args: [1n],
+    chainId: ARC_EVM_CHAIN_ID,
+    query: { enabled: HAS_COUNTDOWN_CONTRACT },
+  })
+
   const { data: txHash, error: writeError, isPending: isWalletPending, writeContractAsync, reset: resetWrite } = useWriteContract()
-  const receipt = useWaitForTransactionReceipt({ hash: txHash, chainId: ARC_EVM_CHAIN_ID })
 
   const claimedDays = useMemo(
     () => bitmapToDays((claimedBitmap.data as bigint | undefined) ?? 0n),
@@ -54,43 +63,61 @@ export function useCountdownContract() {
       claimedBitmap.refetch(),
       claimedCount.refetch(),
       owner.refetch(),
+      tokenUri.refetch(),
     ])
+  }
+
+  const submitAndWait = async (request: Parameters<typeof writeContractAsync>[0]) => {
+    const hash = await writeContractAsync(request)
+    if (!publicClient) throw new Error('Arc Testnet RPC is not available.')
+    const receipt = await publicClient.waitForTransactionReceipt({ hash })
+    if (receipt.status !== 'success') throw new Error('Transaction reverted on Arc Testnet.')
+    await refetch()
+    return hash
   }
 
   const claim = async () => {
     if (!HAS_COUNTDOWN_CONTRACT) throw new Error('Countdown contract is not configured.')
-    const hash = await writeContractAsync({
+    return submitAndWait({
       abi: COUNTDOWN_ABI,
       address: COUNTDOWN_CONTRACT_ADDRESS,
       functionName: 'claim',
       chainId: ARC_EVM_CHAIN_ID,
     })
-    return hash
   }
 
   const setTestDay = async (day: number) => {
     if (!HAS_COUNTDOWN_CONTRACT) throw new Error('Countdown contract is not configured.')
-    const hash = await writeContractAsync({
+    return submitAndWait({
       abi: COUNTDOWN_ABI,
       address: COUNTDOWN_CONTRACT_ADDRESS,
       functionName: 'setTestDay',
       args: [day],
       chainId: ARC_EVM_CHAIN_ID,
     })
-    return hash
   }
 
   const resetSmokeDay = async (day: number) => {
     if (!address) throw new Error('Wallet not connected.')
     if (!HAS_COUNTDOWN_CONTRACT) throw new Error('Countdown contract is not configured.')
-    const hash = await writeContractAsync({
+    return submitAndWait({
       abi: COUNTDOWN_ABI,
       address: COUNTDOWN_CONTRACT_ADDRESS,
       functionName: 'resetSmokeDay',
       args: [address, day],
       chainId: ARC_EVM_CHAIN_ID,
     })
-    return hash
+  }
+
+  const setMetadataUri = async (newUri: string) => {
+    if (!HAS_COUNTDOWN_CONTRACT) throw new Error('Countdown contract is not configured.')
+    return submitAndWait({
+      abi: COUNTDOWN_ABI,
+      address: COUNTDOWN_CONTRACT_ADDRESS,
+      functionName: 'setMetadataUri',
+      args: [newUri],
+      chainId: ARC_EVM_CHAIN_ID,
+    })
   }
 
   return {
@@ -102,19 +129,21 @@ export function useCountdownContract() {
     claimedBitmap: (claimedBitmap.data as bigint | undefined) ?? 0n,
     claimedCount: Number(claimedCount.data ?? 0),
     claimedDays,
+    metadataUri: String(tokenUri.data ?? ''),
     owner: owner.data as `0x${string}` | undefined,
     isOwner: Boolean(address && owner.data && address.toLowerCase() === String(owner.data).toLowerCase()),
     isLoading: currentDay.isLoading || claimedBitmap.isLoading || claimedCount.isLoading,
     isWalletPending,
-    isConfirming: receipt.isLoading,
-    isConfirmed: receipt.isSuccess,
+    isConfirming: false,
+    isConfirmed: false,
     txHash,
     writeError,
-    receiptError: receipt.error,
+    receiptError: null,
     onArcTestnet: chainId === ARC_EVM_CHAIN_ID,
     claim,
     setTestDay,
     resetSmokeDay,
+    setMetadataUri,
     refetch,
     resetWrite,
   }
