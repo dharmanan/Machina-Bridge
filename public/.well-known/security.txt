@@ -1,5 +1,5 @@
 Contact: https://github.com/dharmanan/Arc-Testnet-Bridge-Swap/security/policy
-Canonical: https://arcbridge.vercel.app/.well-known/security.txt
+Canonical: https://machinabridge.vercel.app/.well-known/security.txt
 Policy: https://github.com/dharmanan/Arc-Testnet-Bridge-Swap/security/policy
 Preferred-Languages: en
 Expires: 2027-05-05T00:00:00.000Z
