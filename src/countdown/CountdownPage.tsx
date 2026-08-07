@@ -6,7 +6,6 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Download,
   ExternalLink,
   FlaskConical,
   Lock,
@@ -203,59 +202,6 @@ export default function CountdownPage() {
     }
   }
 
-  const download = async () => {
-    if (!address || !displayDayClaimed) return
-    const canvas = document.createElement('canvas')
-    canvas.width = 1080
-    canvas.height = 1350
-    const context = canvas.getContext('2d')
-    if (!context) return
-
-    const gradient = context.createLinearGradient(0, 0, 1080, 1350)
-    gradient.addColorStop(0, '#07120b')
-    gradient.addColorStop(1, '#020604')
-    context.fillStyle = gradient
-    context.fillRect(0, 0, 1080, 1350)
-    context.textAlign = 'center'
-    context.fillStyle = '#79ef3d'
-    context.font = '600 28px Arial'
-    context.fillText('ARC MAINNET COUNTDOWN', 540, 82)
-    context.fillStyle = '#fff'
-    context.font = '300 96px Arial'
-    context.fillText(String(displayDay).padStart(2, '0'), 540, 210)
-
-    const image = new Image()
-    image.src = arcLogo
-    await image.decode()
-    context.drawImage(
-      image,
-      image.naturalWidth * 0.18,
-      image.naturalHeight * 0.07,
-      image.naturalWidth * 0.64,
-      image.naturalHeight * 0.58,
-      350,
-      405,
-      380,
-      390,
-    )
-
-    context.font = '600 48px Arial'
-    context.fillText(TITLES[displayDay - 1].toUpperCase(), 540, 1010)
-    context.fillStyle = '#79ef3d'
-    context.font = '600 28px Arial'
-    context.fillText(short(address), 540, 1170)
-
-    canvas.toBlob((blob) => {
-      if (!blob) return
-      const url = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
-      anchor.href = url
-      anchor.download = `arc-mainnet-countdown-day-${String(displayDay).padStart(2, '0')}-${address.slice(2, 8)}.png`
-      anchor.click()
-      URL.revokeObjectURL(url)
-    }, 'image/png')
-  }
-
   const canClaim = contract.contractConfigured
     && isConnected
     && contract.onArcTestnet
@@ -389,12 +335,12 @@ export default function CountdownPage() {
                 <p className="flex items-center gap-2">{displayDayClaimed ? <Check size={16} className="text-emerald-600" /> : selectedIsOnchainDay ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />}{displayDayClaimed ? 'Already collected' : selectedIsOnchainDay ? 'Ready to claim' : 'Previewing another day'}</p>
               </div>
 
-              <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+              <div className="mt-5">
                 <button
                   type="button"
                   onClick={() => void doClaim()}
                   disabled={!canClaim}
-                  className="flex-1 rounded-2xl bg-[#2f6e0c] px-5 py-3.5 text-sm font-semibold text-white disabled:bg-slate-200 disabled:text-slate-500"
+                  className="w-full rounded-2xl bg-[#2f6e0c] px-5 py-3.5 text-sm font-semibold text-white disabled:bg-slate-200 disabled:text-slate-500"
                 >
                   {displayDayClaimed
                     ? 'Already claimed'
@@ -405,14 +351,6 @@ export default function CountdownPage() {
                         : contract.isConfirming
                           ? 'Confirming...'
                           : 'Claim NFT on Arc Testnet'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void download()}
-                  disabled={!displayDayClaimed || !address}
-                  className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-200 px-5 py-3.5 text-sm font-semibold disabled:opacity-40"
-                >
-                  <Download size={16} /> Download card
                 </button>
               </div>
 
