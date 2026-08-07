@@ -1,12 +1,10 @@
 import type { Address } from 'viem'
 
-const envAddress = import.meta.env.VITE_COUNTDOWN_CONTRACT_ADDRESS?.trim() || ''
-const storedPreviewAddress = typeof window !== 'undefined'
-  ? window.localStorage.getItem('machina-countdown-contract-address') || ''
-  : ''
-
-export const COUNTDOWN_CONTRACT_ADDRESS = (envAddress || storedPreviewAddress) as Address
-export const HAS_COUNTDOWN_CONTRACT = /^0x[a-fA-F0-9]{40}$/.test(COUNTDOWN_CONTRACT_ADDRESS)
+// Known-good Arc Testnet V3 contract whose NFT metadata renders correctly in ArcScan.
+// Keep the preview pinned to this address so older localStorage values or Vercel env vars
+// cannot silently switch the UI to one of the later broken test deployments.
+export const COUNTDOWN_CONTRACT_ADDRESS = '0xFe9b83F85dD68515a4c6512FEA445306a4B41F28' as Address
+export const HAS_COUNTDOWN_CONTRACT = true
 
 export const COUNTDOWN_ABI = [
   { type: 'function', name: 'claim', stateMutability: 'nonpayable', inputs: [], outputs: [] },
