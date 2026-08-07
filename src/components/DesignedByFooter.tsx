@@ -1,5 +1,3 @@
-import korayLogo from '../assets/koray-footer-logo.svg'
-
 export default function DesignedByFooter() {
   return (
     <a
@@ -10,7 +8,11 @@ export default function DesignedByFooter() {
       aria-label="Designed by Koray Cifci"
     >
       <span className="text-xs font-medium uppercase tracking-[0.18em]">Designed by</span>
-      <img src={korayLogo} alt="Koray Cifci" className="h-14 w-auto object-contain" />
+      <img
+        src="https://koraycifci.com/lightsvg.png"
+        alt="Koray Cifci"
+        className="h-14 w-auto object-contain"
+      />
     </a>
   )
 }
