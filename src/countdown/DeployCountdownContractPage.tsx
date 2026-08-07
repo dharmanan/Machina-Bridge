@@ -52,9 +52,9 @@ export default function DeployCountdownContractPage() {
       <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
         <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-700">Arc Testnet setup</p>
-          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Stable V3 Test Contract</h1>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">Deploy Metadata V3 Test Contract</h1>
           <p className="mt-4 text-sm leading-6 text-slate-600">
-            This restores the metadata V3 contract that already rendered correctly in ArcScan. No V4, V5 or V6 artwork experiment is used.
+            This version stores the collection name, symbol, NFT metadata and NFT artwork directly in the smart contract. It does not depend on a Vercel API or an external metadata server for explorers to identify the NFTs.
           </p>
 
           <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -62,17 +62,17 @@ export default function DeployCountdownContractPage() {
             <p className="mt-1"><strong>Network:</strong> {chainId === ARC_EVM_CHAIN_ID ? 'Arc Testnet' : 'Switch to Arc Testnet'}</p>
             <p className="mt-1"><strong>Collection:</strong> Arc Mainnet Countdown</p>
             <p className="mt-1"><strong>Symbol:</strong> ARC40</p>
-            <p className="mt-1"><strong>Metadata:</strong> Stable V3 onchain SVG</p>
             <p className="mt-1"><strong>Token IDs:</strong> Day 1 = #1 through Day 40 = #40</p>
             {previousAddress && !newAddress && (
-              <p className="mt-3 break-all text-amber-700"><strong>Current preview contract:</strong> {previousAddress}</p>
+              <p className="mt-3 break-all text-amber-700"><strong>Previous test contract:</strong> {previousAddress}</p>
             )}
           </div>
 
           {newAddress ? (
             <div className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> V3 contract deployed</p>
+              <p className="flex items-center gap-2 font-semibold text-emerald-900"><CheckCircle2 size={18} /> Metadata V3 contract deployed</p>
               <p className="mt-2 break-all text-sm text-emerald-800">{newAddress}</p>
+              <p className="mt-3 text-sm leading-6 text-emerald-800">Countdown preview is now connected to this new contract. Start with Day 1 and check the explorer after the first mint.</p>
               <a href="/countdown?smoke=1" className="mt-4 inline-flex items-center gap-2 rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">
                 Open Countdown <ExternalLink size={15} />
               </a>
@@ -93,9 +93,13 @@ export default function DeployCountdownContractPage() {
                     ? 'Confirm V3 deployment in wallet'
                     : receipt.isLoading
                       ? 'Waiting for Arc Testnet confirmation'
-                      : 'Deploy Stable V3 Contract'}
+                      : 'Deploy Metadata V3 Contract'}
             </button>
           )}
+
+          <p className="mt-4 text-xs leading-5 text-slate-500">
+            The previous test contract and its already minted test NFTs remain on Arc Testnet. This deployment creates a fresh test collection so we can verify Blockscout naming and artwork correctly before using the design for the final campaign.
+          </p>
 
           {error && <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error.message}</p>}
           {receipt.error && <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{receipt.error.message}</p>}
