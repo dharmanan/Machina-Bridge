@@ -62,6 +62,7 @@
     "@metamask/rpc-errors": "^7.0.3",
     "@metamask/sdk": "^0.34.0",
     "uuid": "^14.0.0",
-    "socket.io-parser": "4.2.7"
+    "socket.io-parser": "4.2.7",
+    "tmp": "0.2.7"
   }
 }
