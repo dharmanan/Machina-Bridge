@@ -5,6 +5,7 @@ import { Buffer } from 'buffer'
 import App from './App'
 import CountdownPage from './countdown/CountdownPage'
 import FinalizeProductionCountdownPage from './countdown/FinalizeProductionCountdownPage'
+import DesignedByFooter from './components/DesignedByFooter'
 import '@rainbow-me/rainbowkit/styles.css'
 import '@mysten/dapp-kit/dist/index.css'
 import { Web3Provider } from './lib/web3'
@@ -21,7 +22,7 @@ globalScope.global ??= globalThis
 
 const pathname = window.location.pathname.replace(/\/+$/, '') || '/'
 const isCountdownRoute = pathname === '/countdown'
-const isFinalizeProductionRoute = pathname === '/countdown/finalize-production'
+const isFinalizeProductionRoute = pathname === '/countdown/deploy'
 
 function CountdownNavLink() {
   const [navTarget, setNavTarget] = useState<HTMLElement | null>(null)
@@ -65,17 +66,31 @@ function CountdownNavLink() {
   )
 }
 
+function PublicDesignedByFooter() {
+  return (
+    <div className="border-t border-slate-200 bg-white/70 py-4">
+      <div className="mx-auto flex max-w-7xl justify-center px-4 sm:px-6 lg:px-8">
+        <DesignedByFooter />
+      </div>
+    </div>
+  )
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <Web3Provider>
       {isFinalizeProductionRoute ? (
         <FinalizeProductionCountdownPage />
       ) : isCountdownRoute ? (
-        <CountdownPage />
+        <>
+          <CountdownPage />
+          <PublicDesignedByFooter />
+        </>
       ) : (
         <>
           <App />
           <CountdownNavLink />
+          <PublicDesignedByFooter />
         </>
       )}
     </Web3Provider>
