@@ -1,15 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { useAccount, useSwitchChain } from 'wagmi'
 import {
   ArrowLeft,
   Check,
-  ChevronLeft,
-  ChevronRight,
   ExternalLink,
-  FlaskConical,
   Lock,
-  RotateCcw,
   Wallet,
 } from 'lucide-react'
 import arcLogo from '../assets/arc.png'
@@ -33,10 +29,8 @@ const SUBTITLES = [
   'The launch sequence starts.','Mainnet is in sight.','The window is opening.','The final orbit begins.','All systems are ready.','Six signals remain.','Five signals remain.','Four signals remain.','One final orbit.','The future is onchain.',
 ] as const
 
-type PendingAction = 'claim' | 'activate' | 'reset' | null
-
 const short = (address?: string) => address ? `${address.slice(0, 6)}...${address.slice(-4)}` : 'Wallet not connected'
-const tier = (count: number) => count >= 40 ? 'Genesis 40' : count >= 30 ? 'Pioneer' : count >= 20 ? 'Initiate' : 'Not eligible'
+const tier = (count: number) => count >= 40 ? 'Genesis 40' : count >= 35 ? 'Degen' : count >= 30 ? 'Pioneer' : count >= 20 ? 'Initiate' : 'Not eligible'
 
 function countdown(now: number) {
   const seconds = Math.max(0, Math.floor((TARGET - now) / 1000))
@@ -130,85 +124,50 @@ export default function CountdownPage() {
   const contract = useCountdownContract()
 
   const [now, setNow] = useState(Date.now())
-  const [previewDay, setPreviewDay] = useState<number | null>(null)
   const [message, setMessage] = useState<string | null>(null)
-  const [pendingAction, setPendingAction] = useState<PendingAction>(null)
-
-  const smoke = useMemo(() => {
-    const query = new URLSearchParams(location.search)
-    return import.meta.env.DEV
-      || import.meta.env.VITE_COUNTDOWN_SMOKE_TEST === 'true'
-      || (location.hostname.endsWith('.vercel.app') && query.get('smoke') === '1')
-  }, [])
 
   const [days, hours, minutes, seconds] = countdown(now)
-  const chainDay = contract.currentDay >= 1 && contract.currentDay <= 40 ? contract.currentDay : 1
-  const displayDay = smoke ? (previewDay ?? chainDay) : chainDay
+  const rawCurrentDay = contract.currentDay
+  const campaignNotStarted = rawCurrentDay === 0
+  const campaignEnded = rawCurrentDay > TOTAL_DAYS
+  const campaignActive = rawCurrentDay >= 1 && rawCurrentDay <= TOTAL_DAYS
+  const displayDay = campaignNotStarted ? 1 : campaignEnded ? TOTAL_DAYS : rawCurrentDay
   const displayDayClaimed = contract.claimedDays.includes(displayDay)
-  const selectedIsOnchainDay = displayDay === chainDay
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(id)
   }, [])
 
-  useEffect(() => {
-    if (!contract.isConfirmed || !pendingAction) return
-
-    void contract.refetch().then(() => {
-      if (pendingAction === 'claim') setMessage(`Day ${displayDay} NFT claimed successfully on Arc Testnet.`)
-      if (pendingAction === 'activate') setMessage(`Day ${displayDay} is now the active smoke-test day.`)
-      if (pendingAction === 'reset') setMessage(`Day ${displayDay} test claim was reset onchain.`)
-      setPendingAction(null)
-      contract.resetWrite()
-    })
-  }, [contract.isConfirmed, pendingAction, displayDay])
-
   const doClaim = async () => {
     try {
       setMessage(null)
-      setPendingAction('claim')
       await contract.claim()
-      setMessage('Claim submitted. Confirm it in your wallet and wait for completion.')
+      setMessage(`Day ${displayDay} NFT claimed successfully on Arc Testnet.`)
     } catch (error) {
-      setPendingAction(null)
       setMessage(error instanceof Error ? error.message : 'Claim failed.')
     }
   }
 
-  const activatePreviewDay = async () => {
-    if (!contract.isOwner || selectedIsOnchainDay) return
-    try {
-      setMessage(null)
-      setPendingAction('activate')
-      await contract.setTestDay(displayDay)
-      setMessage(`Day ${displayDay} activation submitted. Confirm it in your wallet.`)
-    } catch (error) {
-      setPendingAction(null)
-      setMessage(error instanceof Error ? error.message : 'Unable to activate selected day.')
-    }
-  }
-
-  const resetSelectedDay = async () => {
-    if (!displayDayClaimed || !contract.isOwner) return
-    try {
-      setMessage(null)
-      setPendingAction('reset')
-      await contract.resetSmokeDay(displayDay)
-      setMessage(`Day ${displayDay} reset submitted. Confirm it in your wallet.`)
-    } catch (error) {
-      setPendingAction(null)
-      setMessage(error instanceof Error ? error.message : 'Reset failed.')
-    }
-  }
-
   const canClaim = contract.contractConfigured
+    && campaignActive
     && isConnected
     && contract.onArcTestnet
-    && selectedIsOnchainDay
     && !displayDayClaimed
     && !contract.isWalletPending
     && !contract.isConfirming
+
+  const claimButtonLabel = campaignNotStarted
+    ? 'Countdown has not started yet'
+    : campaignEnded
+      ? 'Countdown complete'
+      : displayDayClaimed
+        ? 'Already claimed'
+        : contract.isWalletPending
+          ? 'Confirm in wallet'
+          : contract.isConfirming
+            ? 'Confirming...'
+            : 'Claim NFT on Arc Testnet'
 
   return (
     <div className="min-h-screen bg-[#f3f7f2] text-slate-950">
@@ -267,12 +226,12 @@ export default function CountdownPage() {
               </div>
 
               <div className="mt-5 border-t border-slate-100 pt-4 text-sm leading-6 text-slate-600">
-                Claim one NFT each day during the 40-day countdown. Every NFT you collect is linked to your wallet and adds to your progress. Collect <strong>20</strong> to unlock Initiate, <strong>30</strong> to unlock Pioneer, or all <strong>40</strong> to unlock Genesis 40 and pay <strong className="text-emerald-700">0% Machina service fee</strong> during the first week of mainnet.
-                <p className="mt-2 text-xs text-slate-400">Network and protocol fees still apply.</p>
+                Claim one NFT each day during the 40-day countdown. Collect <strong>20</strong> to reach Initiate, <strong>30</strong> to reach Pioneer, and <strong>35</strong> to reach <strong>Degen</strong>. Degen wallets unlock <strong className="text-emerald-700">0% Machina service fee</strong> for the first 7 days after Arc Mainnet launches.
+                <p className="mt-2 text-xs text-slate-400">The 0% benefit applies only to the Machina service fee. Network and protocol fees still apply. Collect all 40 for Genesis 40 completion status.</p>
               </div>
 
               {!contract.contractConfigured && (
-                <p className="mt-4 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-900">Countdown setup is not complete yet. Claiming will open once the test contract is ready.</p>
+                <p className="mt-4 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-900">Claiming is temporarily unavailable.</p>
               )}
 
               {isConnected && !contract.onArcTestnet && (
@@ -299,40 +258,36 @@ export default function CountdownPage() {
                 {Array.from({ length: TOTAL_DAYS }, (_, index) => {
                   const day = index + 1
                   const got = contract.claimedDays.includes(day)
-                  const selected = day === displayDay
+                  const active = campaignActive && day === rawCurrentDay
                   return (
-                    <button
+                    <div
                       key={day}
-                      type="button"
-                      disabled={!smoke}
-                      onClick={() => setPreviewDay(day)}
-                      className={`aspect-square rounded-xl border text-xs font-semibold transition ${
+                      aria-label={`Day ${day}${got ? ', collected' : active ? ', current day' : ''}`}
+                      className={`flex aspect-square items-center justify-center rounded-xl border text-xs font-semibold ${
                         got
                           ? 'border-lime-400 bg-lime-50 text-green-800'
-                          : selected
+                          : active
                             ? 'border-slate-950 bg-slate-950 text-white'
                             : 'border-slate-200 bg-slate-50 text-slate-500'
                       }`}
                     >
                       {String(day).padStart(2, '0')}
-                    </button>
+                    </div>
                   )
                 })}
               </div>
             </div>
 
             <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-xl font-semibold">{displayDayClaimed ? 'Collected' : 'Claim'} Day {String(displayDay).padStart(2, '0')}</h2>
-                {smoke && !selectedIsOnchainDay && (
-                  <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">Preview only · active onchain day is {chainDay}</span>
-                )}
-              </div>
+              <h2 className="text-xl font-semibold">{displayDayClaimed ? 'Collected' : 'Claim'} Day {String(displayDay).padStart(2, '0')}</h2>
 
               <div className="mt-4 grid gap-2 text-sm text-slate-600 sm:grid-cols-3">
                 <p className="flex items-center gap-2">{isConnected ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Wallet connected</p>
                 <p className="flex items-center gap-2">{contract.onArcTestnet ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />} Arc Testnet selected</p>
-                <p className="flex items-center gap-2">{displayDayClaimed ? <Check size={16} className="text-emerald-600" /> : selectedIsOnchainDay ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />}{displayDayClaimed ? 'Already collected' : selectedIsOnchainDay ? 'Ready to claim' : 'Previewing another day'}</p>
+                <p className="flex items-center gap-2">
+                  {displayDayClaimed ? <Check size={16} className="text-emerald-600" /> : campaignActive ? <Check size={16} className="text-emerald-600" /> : <Lock size={16} />}
+                  {displayDayClaimed ? 'Already collected' : campaignNotStarted ? 'Not started yet' : campaignEnded ? 'Countdown complete' : 'Ready to claim'}
+                </p>
               </div>
 
               <div className="mt-5">
@@ -342,15 +297,7 @@ export default function CountdownPage() {
                   disabled={!canClaim}
                   className="w-full rounded-2xl bg-[#2f6e0c] px-5 py-3.5 text-sm font-semibold text-white disabled:bg-slate-200 disabled:text-slate-500"
                 >
-                  {displayDayClaimed
-                    ? 'Already claimed'
-                    : !selectedIsOnchainDay
-                      ? `Activate Day ${displayDay} below to claim`
-                      : contract.isWalletPending
-                        ? 'Confirm in wallet'
-                        : contract.isConfirming
-                          ? 'Confirming...'
-                          : 'Claim NFT on Arc Testnet'}
+                  {claimButtonLabel}
                 </button>
               </div>
 
@@ -360,44 +307,6 @@ export default function CountdownPage() {
 
           <NftCard day={displayDay} claimed={displayDayClaimed} wallet={address} />
         </section>
-
-        {smoke && contract.isOwner && (
-          <section className="mt-7 rounded-[24px] border border-amber-200 bg-amber-50 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="inline-flex items-center gap-2 text-sm font-semibold text-amber-950"><FlaskConical size={17} /> Smoke-test controls</p>
-                <p className="mt-1 text-xs text-amber-800">Browsing days does not send a transaction. Activate a day only when you want to test claiming it.</p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <button type="button" onClick={() => setPreviewDay(Math.max(1, displayDay - 1))} className="rounded-xl border border-amber-300 bg-white p-2.5"><ChevronLeft size={17} /></button>
-                <span className="rounded-xl border border-amber-300 bg-white px-4 py-2.5 text-sm font-semibold">Preview Day {displayDay} / 40</span>
-                <button type="button" onClick={() => setPreviewDay(Math.min(40, displayDay + 1))} className="rounded-xl border border-amber-300 bg-white p-2.5"><ChevronRight size={17} /></button>
-
-                {!selectedIsOnchainDay ? (
-                  <button
-                    type="button"
-                    onClick={() => void activatePreviewDay()}
-                    disabled={contract.isWalletPending || contract.isConfirming}
-                    className="rounded-xl border border-emerald-400 bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
-                  >
-                    Activate Day {displayDay} onchain
-                  </button>
-                ) : (
-                  <span className="rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-800">Active onchain day: {chainDay}</span>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => void resetSelectedDay()}
-                  disabled={!displayDayClaimed || contract.isWalletPending || contract.isConfirming}
-                  className="inline-flex items-center gap-2 rounded-xl border border-amber-300 bg-white px-3 py-2.5 text-sm font-semibold disabled:opacity-40"
-                >
-                  <RotateCcw size={16} /> Reset selected claim
-                </button>
-              </div>
-            </div>
-          </section>
-        )}
       </main>
     </div>
   )
