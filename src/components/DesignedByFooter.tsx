@@ -4,14 +4,17 @@ export default function DesignedByFooter() {
       href="https://koraycifci.com"
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex items-center gap-3 rounded-2xl px-3 py-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-900"
       aria-label="Designed by Koray Cifci"
+      className="inline-flex items-center gap-2 text-slate-500 transition-colors hover:text-slate-900 focus:outline-none"
     >
-      <span className="text-xs font-medium uppercase tracking-[0.18em]">Designed by</span>
+      <span className="text-xs font-medium uppercase tracking-[0.18em]">
+        Designed by
+      </span>
+
       <img
-        src="https://koraycifci.com/lightsvg.png"
+        src="/koray-logo.png"
         alt="Koray Cifci"
-        className="h-14 w-auto object-contain"
+        className="h-14 w-14 -my-4 object-contain"
       />
     </a>
   )

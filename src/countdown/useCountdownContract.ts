@@ -1,17 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useAccount, usePublicClient, useReadContract, useWriteContract } from 'wagmi'
-import type { Address } from 'viem'
 import { ARC_EVM_CHAIN_ID } from '../lib/chains'
 import { bitmapToDays, COUNTDOWN_ABI, COUNTDOWN_CONTRACT_ADDRESS, HAS_COUNTDOWN_CONTRACT } from './contract'
-
-function getPreviewContractOverride(): Address | undefined {
-  if (typeof window === 'undefined') return undefined
-  if (!window.location.hostname.includes('-git-feature-')) return undefined
-
-  const value = new URLSearchParams(window.location.search).get('contract')
-  if (!value || !/^0x[a-fA-F0-9]{40}$/.test(value)) return undefined
-  return value as Address
-}
 
 export function useCountdownContract() {
   const { address, chainId } = useAccount()
@@ -20,10 +10,7 @@ export function useCountdownContract() {
   const [confirmedHash, setConfirmedHash] = useState<`0x${string}` | undefined>(undefined)
   const [receiptError, setReceiptError] = useState<Error | null>(null)
 
-  const activeContractAddress = useMemo(
-    () => getPreviewContractOverride() ?? COUNTDOWN_CONTRACT_ADDRESS,
-    [],
-  )
+  const activeContractAddress = COUNTDOWN_CONTRACT_ADDRESS
   const contractConfigured = Boolean(activeContractAddress) && HAS_COUNTDOWN_CONTRACT
 
   const owner = useReadContract({

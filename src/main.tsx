@@ -4,7 +4,6 @@ import { createRoot } from 'react-dom/client'
 import { Buffer } from 'buffer'
 import App from './App'
 import CountdownPage from './countdown/CountdownPage'
-import FinalizeProductionCountdownPage from './countdown/FinalizeProductionCountdownPage'
 import DesignedByFooter from './components/DesignedByFooter'
 import '@rainbow-me/rainbowkit/styles.css'
 import '@mysten/dapp-kit/dist/index.css'
@@ -22,7 +21,6 @@ globalScope.global ??= globalThis
 
 const pathname = window.location.pathname.replace(/\/+$/, '') || '/'
 const isCountdownRoute = pathname === '/countdown'
-const isFinalizeProductionRoute = pathname === '/countdown/deploy'
 
 function CountdownNavLink() {
   const [navTarget, setNavTarget] = useState<HTMLElement | null>(null)
@@ -79,9 +77,7 @@ function PublicDesignedByFooter() {
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <Web3Provider>
-      {isFinalizeProductionRoute ? (
-        <FinalizeProductionCountdownPage />
-      ) : isCountdownRoute ? (
+      {isCountdownRoute ? (
         <>
           <CountdownPage />
           <PublicDesignedByFooter />
