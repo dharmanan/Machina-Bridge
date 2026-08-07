@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node scripts/prepare-countdown-ui.mjs && node scripts/compile-countdown-contract.mjs && tsc && vite build",
+    "build": "node scripts/compile-countdown-contract.mjs && tsc && vite build",
     "postinstall": "node scripts/fix-viem-tsconfig.mjs",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
