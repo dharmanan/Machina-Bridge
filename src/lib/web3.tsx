@@ -25,7 +25,7 @@ export function Web3Provider({ children }: { children: ReactNode }) {
             slushWallet={{ name: 'Slush' }}
             preferredWallets={['Slush', 'Phantom']}
           >
-            <RainbowKitProvider>
+            <RainbowKitProvider locale="en-US">
               {children}
             </RainbowKitProvider>
           </WalletProvider>
