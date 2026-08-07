@@ -17,3 +17,6 @@ dist/
 *.pdf
 .vercel
 .env*.local
+
+# Auto-generated countdown deployment artifact
+src/countdown/contractArtifact.generated.ts
