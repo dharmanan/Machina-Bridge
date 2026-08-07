@@ -32,7 +32,6 @@
   ],
   "rewrites": [
     { "source": "/graphql", "destination": "/api/graphql" },
-    { "source": "/countdown", "destination": "/index.html" },
-    { "source": "/countdown/deploy", "destination": "/index.html" }
+    { "source": "/countdown", "destination": "/index.html" }
   ]
 }
