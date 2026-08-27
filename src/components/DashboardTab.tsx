@@ -2,7 +2,16 @@ import { useAccount } from 'wagmi'
 import { useEffect, useState, useCallback } from 'react'
 import { Card, Container } from './ui'
 import { Wallet, TrendingUp, Loader2, AlertCircle, RefreshCw } from 'lucide-react'
-import { useBridgeKit, SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID } from '../hooks/useBridgeKit'
+import {
+  useBridgeKit,
+  SEPOLIA_CHAIN_ID,
+  ARC_CHAIN_ID,
+  BASE_CHAIN_ID,
+  OPTIMISM_CHAIN_ID,
+  ARBITRUM_CHAIN_ID,
+  readBridgeActivitiesForWallet,
+  type BridgeActivityRecord,
+} from '../hooks/useBridgeKit'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import {
   ARC_EVM_CHAIN,
@@ -13,6 +22,7 @@ import {
   getSupportedEvmChainName,
 } from '../lib/chains'
 import { fetchSolanaUsdcBalance } from '../lib/solana'
+import { fetchServerBridgeActivities, type ServerBridgeActivity } from '../lib/transferTrackerApi'
 
 interface Transaction {
   id: string;
@@ -22,6 +32,7 @@ interface Transaction {
   fromNetwork: string;
   toNetwork: string;
   timestamp: string;
+  updatedAt?: number;
   sourceTxHash?: string;
   receiveTxHash?: string;
   transferId?: string;
@@ -89,6 +100,69 @@ function parseDirectionRoute(direction?: string) {
   return {
     fromNetwork: toTitle(fromRaw),
     toNetwork: toTitle(toRaw),
+  }
+}
+
+function getTransactionKey(transaction: Transaction) {
+  return (transaction.sourceTxHash || transaction.id).toLowerCase()
+}
+
+function isLegacySolanaTransaction(transaction: Transaction) {
+  return transaction.type === 'solana-forward'
+    || transaction.type === 'solana-bridge'
+    || transaction.direction?.includes('solana')
+    || transaction.fromNetwork?.toLowerCase().includes('solana')
+    || transaction.toNetwork?.toLowerCase().includes('solana')
+}
+
+function activityToTransaction(activity: BridgeActivityRecord | ServerBridgeActivity): Transaction {
+  const fromNetwork = getSupportedEvmChainName(activity.sourceChainId)
+  const toNetwork = getSupportedEvmChainName(activity.destinationChainId)
+  const direction = `${fromNetwork.toLowerCase().replace(/\s+/g, '-')}-to-${toNetwork.toLowerCase().replace(/\s+/g, '-')}`
+
+  return {
+    id: activity.sourceTxHash || activity.id,
+    type: 'bridge',
+    direction,
+    amount: activity.amount,
+    fromNetwork,
+    toNetwork,
+    timestamp: new Date(activity.startedAt).toISOString(),
+    updatedAt: activity.updatedAt,
+    sourceTxHash: activity.sourceTxHash,
+    receiveTxHash: activity.receiveTxHash,
+    status: activity.status,
+  }
+}
+
+function getStatusPresentation(status?: string) {
+  const normalized = (status || '').trim().toLowerCase()
+
+  if (normalized === 'minted' || normalized === 'success' || normalized === 'completed') {
+    return { label: 'Completed', className: 'bg-[#eef7e8] text-[#2F6E0C]' }
+  }
+  if (normalized === 'ready_to_mint') {
+    return { label: 'Ready to mint', className: 'bg-amber-100 text-amber-700' }
+  }
+  if (normalized === 'awaiting_approve') {
+    return { label: 'Awaiting approval', className: 'bg-amber-100 text-amber-700' }
+  }
+  if (normalized === 'awaiting_burn') {
+    return { label: 'Awaiting burn', className: 'bg-amber-100 text-amber-700' }
+  }
+  if (normalized === 'failed' || normalized === 'error') {
+    return { label: 'Failed', className: 'bg-red-100 text-red-700' }
+  }
+  if (normalized === 'pending_attestation' || normalized.includes('pending') || normalized.includes('waiting')) {
+    return { label: 'In progress', className: 'bg-sky-100 text-sky-700' }
+  }
+  if (!normalized) {
+    return null
+  }
+
+  return {
+    label: normalized.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()),
+    className: 'bg-slate-100 text-slate-600',
   }
 }
 
@@ -174,14 +248,63 @@ export function DashboardTab() {
     }
   }, [phantomSolanaAddress, loadSolanaBalance])
 
-  // Load transactions from localStorage
+  // EVM history uses the same local + server activity sources as the Bridge tracker.
+  // Solana entries still use their existing browser-local records until they have a server tracker.
   useEffect(() => {
-    const savedTransactions = JSON.parse(localStorage.getItem('bridgeTransactions') || '[]')
-    const sortedTransactions = [...savedTransactions].sort(
-      (left: Transaction, right: Transaction) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime(),
-    )
-    setTransactions(sortedTransactions)
-  }, [])
+    let isCancelled = false
+
+    if (!address) {
+      setTransactions([])
+      return undefined
+    }
+
+    const loadActivity = async () => {
+      const localActivities = readBridgeActivitiesForWallet(address).filter((activity) => activity.status !== 'dismissed')
+      const serverActivities = (await fetchServerBridgeActivities(address)).filter((activity) => activity.status !== 'dismissed')
+
+      let legacyTransactions: Transaction[] = []
+      try {
+        const parsed = JSON.parse(localStorage.getItem('bridgeTransactions') || '[]')
+        if (Array.isArray(parsed)) {
+          legacyTransactions = parsed.filter(isLegacySolanaTransaction)
+        }
+      } catch {
+        legacyTransactions = []
+      }
+
+      const byKey = new Map<string, Transaction>()
+
+      // Local activity gives Vite/dev an immediate fallback. Server activity then wins for the same transfer.
+      localActivities.map(activityToTransaction).forEach((transaction) => {
+        byKey.set(getTransactionKey(transaction), transaction)
+      })
+      serverActivities.map(activityToTransaction).forEach((transaction) => {
+        byKey.set(getTransactionKey(transaction), transaction)
+      })
+      legacyTransactions.forEach((transaction) => {
+        const key = getTransactionKey(transaction)
+        if (!byKey.has(key)) {
+          byKey.set(key, transaction)
+        }
+      })
+
+      const sortedTransactions = [...byKey.values()].sort((left, right) => {
+        const leftTime = left.updatedAt ?? new Date(left.timestamp).getTime()
+        const rightTime = right.updatedAt ?? new Date(right.timestamp).getTime()
+        return rightTime - leftTime
+      })
+
+      if (!isCancelled) {
+        setTransactions(sortedTransactions)
+      }
+    }
+
+    void loadActivity()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [address])
 
   // Dynamically compute bridge statistics grouped by route
   const bridgeRouteStats = transactions.reduce<Record<string, { from: string; to: string; count: number }>>(
@@ -496,45 +619,57 @@ export function DashboardTab() {
 
         {/* Transactions */}
         <Card>
-          <h3 className="text-lg font-semibold mb-4">Transactions</h3>
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-semibold">Bridge Activity</h3>
+              <p className="mt-1 text-xs text-slate-500">EVM transfers use the same local and server tracker as Bridge. Solana history remains browser-local for now.</p>
+            </div>
+          </div>
           {transactions.length > 0 ? (
             <div className={transactions.length > 10 ? 'max-h-[42rem] space-y-3 overflow-y-auto pr-2' : 'space-y-3'}>
               {transactions.map((tx) => {
                 const route = getTransactionRoute(tx)
+                const status = getStatusPresentation(tx.status)
 
                 return (
-                <div key={tx.id} className="rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <p className="font-semibold text-sm">
-                        {route.label} {tx.amount} USDC
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        {formatNetworkLabel(route.fromNetwork)} → {formatNetworkLabel(route.toNetwork)}
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        {new Date(tx.timestamp).toLocaleString()}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      {route.sourceExplorerUrl && (
-                        <a
-                          href={route.sourceExplorerUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-400 hover:text-blue-300 text-xs"
-                        >
-                          View Tx
-                        </a>
-                      )}
+                  <div key={getTransactionKey(tx)} className="rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
+                    <div className="flex justify-between items-start gap-4">
+                      <div>
+                        <p className="font-semibold text-sm">
+                          {route.label} {tx.amount} USDC
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {formatNetworkLabel(route.fromNetwork)} → {formatNetworkLabel(route.toNetwork)}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {new Date(tx.timestamp).toLocaleString()}
+                        </p>
+                      </div>
+                      <div className="flex flex-col items-end gap-2 text-right">
+                        {status && (
+                          <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${status.className}`}>
+                            {status.label}
+                          </span>
+                        )}
+                        {route.sourceExplorerUrl && (
+                          <a
+                            href={route.sourceExplorerUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-500 hover:text-blue-700 text-xs"
+                          >
+                            View Tx
+                          </a>
+                        )}
+                      </div>
                     </div>
                   </div>
-                </div>
-              )})}
+                )
+              })}
             </div>
           ) : (
             <div className="py-8 text-center text-slate-500">
-              <p>No transactions yet</p>
+              <p>No bridge activity yet</p>
             </div>
           )}
         </Card>
