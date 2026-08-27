@@ -104,7 +104,7 @@ function parseDirectionRoute(direction?: string) {
 }
 
 function getTransactionKey(transaction: Transaction) {
-  return (transaction.sourceTxHash || transaction.id).toLowerCase()
+  return transaction.id.toLowerCase()
 }
 
 function getTransactionUpdatedAt(transaction: Transaction) {
@@ -130,8 +130,12 @@ function isCompletedTransaction(transaction: Transaction) {
     return true
   }
 
-  // Legacy Solana records are only written after the Solana flow reaches success.
-  return isLegacySolanaTransaction(transaction)
+  if (isLegacySolanaTransaction(transaction)) {
+    return true
+  }
+
+  // Legacy EVM entries are written only after a successful bridge and do not have tracker timestamps.
+  return transaction.type === 'bridge' && transaction.updatedAt == null
 }
 
 function activityToTransaction(activity: BridgeActivityRecord | ServerBridgeActivity): Transaction {
@@ -140,7 +144,7 @@ function activityToTransaction(activity: BridgeActivityRecord | ServerBridgeActi
   const direction = `${fromNetwork.toLowerCase().replace(/\s+/g, '-')}-to-${toNetwork.toLowerCase().replace(/\s+/g, '-')}`
 
   return {
-    id: activity.sourceTxHash || activity.id,
+    id: activity.id,
     type: 'bridge',
     direction,
     amount: activity.amount,
@@ -241,19 +245,12 @@ export function DashboardTab() {
     }
   }, [])
 
-  // Fetch balances on mount and when address changes
   useEffect(() => {
     if (isConnected && address) {
-      // Fetch Sepolia balance
       fetchTokenBalance('USDC', SEPOLIA_CHAIN_ID)
-      
-      // Fetch Arc balance
       fetchArcBalance('USDC', ARC_CHAIN_ID)
-      // Fetch Base Sepolia balance
       fetchBaseBalance('USDC', BASE_CHAIN_ID)
-      // Fetch Optimism Sepolia balance
       fetchOptimismBalance('USDC', OPTIMISM_CHAIN_ID)
-      // Fetch Arbitrum Sepolia balance
       fetchArbitrumBalance('USDC', ARBITRUM_CHAIN_ID)
     }
   }, [address, isConnected, fetchTokenBalance, fetchArcBalance, fetchBaseBalance, fetchOptimismBalance, fetchArbitrumBalance])
@@ -267,8 +264,6 @@ export function DashboardTab() {
     }
   }, [phantomSolanaAddress, loadSolanaBalance])
 
-  // EVM history uses the same local + server activity sources as the Bridge tracker.
-  // Solana entries still use their existing browser-local records until they have a server tracker.
   useEffect(() => {
     let isCancelled = false
 
@@ -285,32 +280,46 @@ export function DashboardTab() {
       try {
         const parsed = JSON.parse(localStorage.getItem('bridgeTransactions') || '[]')
         if (Array.isArray(parsed)) {
-          legacyTransactions = parsed.filter(isLegacySolanaTransaction)
+          legacyTransactions = parsed.filter((entry): entry is Transaction => (
+            Boolean(entry)
+            && typeof entry === 'object'
+            && typeof entry.id === 'string'
+            && typeof entry.type === 'string'
+            && typeof entry.timestamp === 'string'
+          ))
         }
       } catch {
         legacyTransactions = []
       }
 
-      const byKey = new Map<string, Transaction>()
-      const keepNewest = (transaction: Transaction) => {
-        const key = getTransactionKey(transaction)
-        const existing = byKey.get(key)
+      const byId = new Map<string, Transaction>()
+      const idBySourceHash = new Map<string, string>()
 
-        if (!existing || getTransactionUpdatedAt(transaction) >= getTransactionUpdatedAt(existing)) {
-          byKey.set(key, transaction)
+      const keepNewest = (transaction: Transaction) => {
+        const stableId = transaction.id.toLowerCase()
+        const sourceHash = transaction.sourceTxHash?.toLowerCase()
+        const existingIdForHash = sourceHash ? idBySourceHash.get(sourceHash) : undefined
+        const existing = byId.get(stableId) ?? (existingIdForHash ? byId.get(existingIdForHash) : undefined)
+
+        if (existing && getTransactionUpdatedAt(existing) > getTransactionUpdatedAt(transaction)) {
+          return
+        }
+
+        if (existingIdForHash && existingIdForHash !== stableId) {
+          byId.delete(existingIdForHash)
+        }
+
+        byId.set(stableId, transaction)
+        if (sourceHash) {
+          idBySourceHash.set(sourceHash, stableId)
         }
       }
 
       localActivities.map(activityToTransaction).forEach(keepNewest)
       serverActivities.map(activityToTransaction).forEach(keepNewest)
-      legacyTransactions.forEach((transaction) => {
-        const key = getTransactionKey(transaction)
-        if (!byKey.has(key)) {
-          byKey.set(key, transaction)
-        }
-      })
+      legacyTransactions.forEach(keepNewest)
 
-      const sortedTransactions = [...byKey.values()].sort((left, right) => {
+      const sortedTransactions = [...byId.values()].sort((left, right) => {
         return getTransactionUpdatedAt(right) - getTransactionUpdatedAt(left)
       })
 
@@ -326,7 +335,6 @@ export function DashboardTab() {
     }
   }, [address])
 
-  // Statistics count only completed bridge transfers. Pending and failed records stay in Activity.
   const bridgeRouteStats = transactions
     .filter(isCompletedTransaction)
     .reduce<Record<string, { from: string; to: string; count: number }>>(
@@ -405,7 +413,6 @@ export function DashboardTab() {
           <p className="mt-2 text-sm text-slate-500">A simpler view of balances, wallet readiness, and recent bridge activity.</p>
         </div>
 
-        {/* Account Info */}
         <Card>
           <h3 className="text-lg font-semibold mb-4">Account</h3>
           <div className="space-y-2">
@@ -429,7 +436,7 @@ export function DashboardTab() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="font-semibold">EVM Wallet</p>
-                  <p className="text-sm text-slate-500">Used for Sepolia, Arc, and Arc-side mint signing.</p>
+                  <p className="text-sm text-slate-500">Used for Sepolia, Arc, and Arc mint signing.</p>
                 </div>
                 <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${isConnected ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-100 text-slate-500'}`}>
                   {isConnected ? 'Connected' : 'Disconnected'}
@@ -444,7 +451,7 @@ export function DashboardTab() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="font-semibold">Phantom Solana</p>
-                  <p className="text-sm text-slate-500">Used for Solana Devnet source burns and Solana-side signing.</p>
+                  <p className="text-sm text-slate-500">Used for Solana Devnet source burns and Solana signing.</p>
                 </div>
                 <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${isPhantomConnected ? 'bg-[#eef7e8] text-[#2F6E0C]' : isPhantomInstalled ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>
                   {isPhantomConnected ? 'Connected' : isPhantomInstalled ? 'Ready' : 'Not Installed'}
@@ -457,24 +464,22 @@ export function DashboardTab() {
 
             <div className="rounded-xl border border-[#2F6E0C]/15 bg-[#eef7e8] p-4 text-sm text-slate-700">
               {isConnected && isPhantomConnected
-                ? 'Dual-wallet mode is ready: EVM wallet handles Arc-side actions, Phantom handles Solana-side signing.'
+                ? 'Both wallets are ready: the EVM wallet handles Arc actions and Phantom handles Solana signing.'
                 : isConnected
                   ? 'EVM wallet is ready. Connect Phantom as well if you want to use Solana as the source chain.'
                   : isPhantomConnected
                     ? 'Phantom is ready. Connect an EVM wallet too so Arc can receive the destination mint.'
-                    : 'Connect both wallets to use the Solana → Arc flow end-to-end.'}
+                    : 'Connect both wallets to use the complete Solana → Arc flow.'}
             </div>
           </div>
         </Card>
 
-        {/* Balances */}
         <Card>
           <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
             <TrendingUp size={20} />
             Balances
           </h3>
           <div className="space-y-3">
-            {/* Sepolia USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Sepolia)</p>
@@ -501,7 +506,6 @@ export function DashboardTab() {
               </div>
             </div>
 
-            {/* Arc USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Arc)</p>
@@ -528,7 +532,6 @@ export function DashboardTab() {
               </div>
             </div>
 
-            {/* Solana Devnet USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Solana)</p>
@@ -557,7 +560,6 @@ export function DashboardTab() {
               </div>
             </div>
 
-            {/* Base Sepolia USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Base)</p>
@@ -578,7 +580,6 @@ export function DashboardTab() {
               </div>
             </div>
 
-            {/* Optimism Sepolia USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Optimism)</p>
@@ -599,7 +600,6 @@ export function DashboardTab() {
               </div>
             </div>
 
-            {/* Arbitrum Sepolia USDC */}
             <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
               <div>
                 <p className="font-semibold">USDC (Arbitrum)</p>
@@ -622,11 +622,10 @@ export function DashboardTab() {
           </div>
         </Card>
 
-        {/* Bridge Statistics */}
         <Card>
           <h3 className="text-lg font-semibold mb-4">Bridge Transactions</h3>
           {bridgeRoutes.length === 0 ? (
-            <p className="text-sm text-slate-500">No bridge transactions recorded yet.</p>
+            <p className="text-sm text-slate-500">No completed bridge transactions recorded yet.</p>
           ) : (
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               {bridgeRoutes.map((route) => (
@@ -639,12 +638,11 @@ export function DashboardTab() {
           )}
         </Card>
 
-        {/* Transactions */}
         <Card>
           <div className="mb-4 flex items-start justify-between gap-4">
             <div>
               <h3 className="text-lg font-semibold">Bridge Activity</h3>
-              <p className="mt-1 text-xs text-slate-500">EVM transfers use the same local and server tracker as Bridge. Solana history remains browser-local for now.</p>
+              <p className="mt-1 text-xs text-slate-500">EVM transfers use the same activity tracker as Bridge. Solana history is stored in this browser for now.</p>
             </div>
           </div>
           {transactions.length > 0 ? (
