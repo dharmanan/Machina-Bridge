@@ -6,7 +6,6 @@ import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
-import { useSuiWallet } from './hooks/useSuiWallet'
 import { SUPPORTED_EVM_CHAIN_OPTIONS, addChainToWallet, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X } from 'lucide-react'
@@ -28,24 +27,12 @@ export default function App() {
     isConnecting: isConnectingPhantomSolana,
     isPhantomInstalled,
   } = usePhantomSolana()
-  const {
-    connect: connectSuiWallet,
-    currentWalletName: suiCurrentWalletName,
-    defaultWalletName: defaultSuiWalletName,
-    disconnect: disconnectSuiWallet,
-    error: suiWalletError,
-    isConnected: isSuiWalletConnected,
-    isConnecting: isConnectingSuiWallet,
-    isWalletAvailable: isSuiWalletAvailable,
-  } = useSuiWallet()
   const [activeTab, setActiveTab] = useState<Tab>('swap')
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
-  const [showLendingDropdown, setShowLendingDropdown] = useState(false)
   const [isMobileExperience, setIsMobileExperience] = useState(false)
   const [hasDismissedMobileNotice, setHasDismissedMobileNotice] = useState(false)
   const [mobileHelperMessage, setMobileHelperMessage] = useState<string | null>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const lendingDropdownRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -69,14 +56,11 @@ export default function App() {
     }
   }, [])
 
-  // Close dropdowns when clicking outside
+  // Close network dropdown when clicking outside.
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setShowNetworkDropdown(false)
-      }
-      if (lendingDropdownRef.current && !lendingDropdownRef.current.contains(event.target as Node)) {
-        setShowLendingDropdown(false)
       }
     }
 
@@ -125,19 +109,6 @@ export default function App() {
       await connectPhantomSolana()
     } catch (error) {
       logger.warn('Unable to change Phantom Solana connection state:', error)
-    }
-  }
-
-  const handleSuiWalletAction = async () => {
-    try {
-      if (isSuiWalletConnected) {
-        await disconnectSuiWallet()
-        return
-      }
-
-      await connectSuiWallet(defaultSuiWalletName)
-    } catch (error) {
-      logger.warn('Unable to change Sui wallet connection state:', error)
     }
   }
 
@@ -261,30 +232,29 @@ export default function App() {
                   <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Machina Bridge</h1>
                 </a>
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
-                  Simple testnet swap and bridge flows for Arc, Sepolia, and Solana.
+                  Testnet swaps and cross-chain USDC flows across Arc, EVM testnets, and Solana.
                 </p>
               </div>
             </div>
 
             <div className="flex min-w-0 flex-col gap-2 lg:items-end">
-                {/* Row 1 — Social icons + EVM network switcher + wallet */}
-                <div className="flex items-center gap-2 lg:justify-end">
-                  <a
-                    href="https://x.com/KohenEric"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
-                  >
-                    <Twitter size={16} />
-                  </a>
-                  <a
-                    href="https://github.com/dharmanan"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
-                  >
-                    <Github size={16} />
-                  </a>
+              <div className="flex items-center gap-2 lg:justify-end">
+                <a
+                  href="https://x.com/KohenEric"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
+                >
+                  <Twitter size={16} />
+                </a>
+                <a
+                  href="https://github.com/dharmanan/Machina-Bridge"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
+                >
+                  <Github size={16} />
+                </a>
                 {isConnected && (
                   <div className="relative" ref={dropdownRef}>
                     <button
@@ -314,52 +284,27 @@ export default function App() {
                 <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
               </div>
 
-              {/* Row 2 — Solana + Sui side by side */}
-              <div className="flex items-center gap-3 lg:justify-end">
-                {/* Solana */}
-                <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
-                  <span className="text-xs text-slate-600">
-                    {isPhantomConnected ? 'Connected Solana' : 'Solana'}
-                  </span>
-                  <button
-                    onClick={handlePhantomAction}
-                    disabled={!isPhantomInstalled || isConnectingPhantomSolana}
-                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
-                  </button>
-                </div>
-
-                <div className="h-4 w-px bg-slate-200" />
-
-                {/* Sui */}
-                <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isSuiWalletConnected ? 'bg-sky-500' : 'bg-slate-300'}`} />
-                  <span className="text-xs text-slate-600">
-                    {isSuiWalletConnected ? 'Connected Sui' : 'Sui'}
-                  </span>
-                  <button
-                    onClick={handleSuiWalletAction}
-                    disabled={(!isSuiWalletAvailable && !isSuiWalletConnected) || isConnectingSuiWallet}
-                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isConnectingSuiWallet ? '...' : isSuiWalletConnected ? 'Disconnect' : 'Connect'}
-                  </button>
-                </div>
+              <div className="flex items-center gap-1.5 lg:justify-end">
+                <span className={`h-2 w-2 flex-shrink-0 rounded-full ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
+                <span className="text-xs text-slate-600">
+                  {isPhantomConnected ? 'Connected Solana' : 'Solana'}
+                </span>
+                <button
+                  onClick={handlePhantomAction}
+                  disabled={!isPhantomInstalled || isConnectingPhantomSolana}
+                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
+                </button>
               </div>
 
-              {/* Row 3 — wallet name status */}
               <p className="text-[11px] text-slate-400 lg:text-right">
-                Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
-                {' · '}
-                Sui wallet: {isSuiWalletConnected ? (suiCurrentWalletName || 'Connected') : '—'}
+                Solana wallet: {isPhantomConnected ? `Phantom ${phantomSolanaAddress ? `${phantomSolanaAddress.slice(0, 4)}...${phantomSolanaAddress.slice(-4)}` : ''}` : '—'}
               </p>
 
-              {(phantomSolanaError || suiWalletError) && (
+              {phantomSolanaError && (
                 <div className="text-[11px] text-red-500 lg:text-right">
-                  {phantomSolanaError && <p>{phantomSolanaError}</p>}
-                  {suiWalletError && <p>{suiWalletError}</p>}
+                  <p>{phantomSolanaError}</p>
                 </div>
               )}
             </div>
@@ -385,29 +330,6 @@ export default function App() {
               </button>
             ))}
 
-            <div className="relative" ref={lendingDropdownRef}>
-              <button
-                onClick={() => setShowLendingDropdown(!showLendingDropdown)}
-                className="inline-flex items-center gap-2 rounded-full border border-transparent px-4 py-2 text-sm font-medium text-slate-500 transition-colors hover:border-slate-200 hover:bg-white hover:text-slate-900"
-              >
-                Lending
-                <ChevronDown size={14} className={`transition-transform ${showLendingDropdown ? 'rotate-180' : ''}`} />
-              </button>
-              {showLendingDropdown && (
-                <div className="absolute left-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
-                  <a
-                    href="https://arcmachina.xyz/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="block rounded-lg px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 hover:text-slate-900"
-                    onClick={() => setShowLendingDropdown(false)}
-                  >
-                    Arc Machina
-                  </a>
-                </div>
-              )}
-            </div>
-
             <a
               href="https://faucet.circle.com/"
               target="_blank"
@@ -432,17 +354,19 @@ export default function App() {
           <div className="text-center text-sm text-slate-500">
             <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
               <p className="mb-2 font-semibold text-[#2F6E0C]">
-                MVP Testnet Application - Educational v2.2 for{' '}
+                Independent testnet application for Arc ecosystem experimentation.
+              </p>
+              <p>
+                Uses test tokens only. Not for production or real-value transfers.{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[#2F6E0C] underline transition-colors hover:text-[#25580A]"
                 >
-                  ARC Protocol
+                  Arc documentation
                 </a>
               </p>
-              <p>This is a testnet demo application for learning and testing ARC Protocol features. Not for production use. All transactions use test tokens with no real value.</p>
             </div>
           </div>
         </Container>
