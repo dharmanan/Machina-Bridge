@@ -2187,8 +2187,7 @@ export function BridgeTab() {
                 <Clock size={13} className="mt-0.5 flex-shrink-0 text-blue-500" />
                 <p>
                   {sourceChainName} to {destinationChainName} typically takes <strong>{trackedEtaLabel}</strong> on testnet. Three wallet confirmations
-                  are required. <strong>Keep this tab open</strong> — if it closes mid-flight, an &quot;Incomplete bridge
-                  detected&quot; notice will appear when you return.
+                  are required. You do not need to keep this tab open. Progress is saved in Activity. Return when another wallet confirmation or mint action is required.
                 </p>
               </div>
             )}
