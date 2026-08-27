@@ -107,12 +107,31 @@ function getTransactionKey(transaction: Transaction) {
   return (transaction.sourceTxHash || transaction.id).toLowerCase()
 }
 
+function getTransactionUpdatedAt(transaction: Transaction) {
+  return transaction.updatedAt ?? new Date(transaction.timestamp).getTime()
+}
+
 function isLegacySolanaTransaction(transaction: Transaction) {
   return transaction.type === 'solana-forward'
     || transaction.type === 'solana-bridge'
     || transaction.direction?.includes('solana')
     || transaction.fromNetwork?.toLowerCase().includes('solana')
     || transaction.toNetwork?.toLowerCase().includes('solana')
+}
+
+function isCompletedTransaction(transaction: Transaction) {
+  const normalizedStatus = (transaction.status || '').trim().toLowerCase()
+
+  if (transaction.receiveTxHash) {
+    return true
+  }
+
+  if (normalizedStatus === 'minted' || normalizedStatus === 'success' || normalizedStatus === 'completed') {
+    return true
+  }
+
+  // Legacy Solana records are only written after the Solana flow reaches success.
+  return isLegacySolanaTransaction(transaction)
 }
 
 function activityToTransaction(activity: BridgeActivityRecord | ServerBridgeActivity): Transaction {
@@ -273,14 +292,17 @@ export function DashboardTab() {
       }
 
       const byKey = new Map<string, Transaction>()
+      const keepNewest = (transaction: Transaction) => {
+        const key = getTransactionKey(transaction)
+        const existing = byKey.get(key)
 
-      // Local activity gives Vite/dev an immediate fallback. Server activity then wins for the same transfer.
-      localActivities.map(activityToTransaction).forEach((transaction) => {
-        byKey.set(getTransactionKey(transaction), transaction)
-      })
-      serverActivities.map(activityToTransaction).forEach((transaction) => {
-        byKey.set(getTransactionKey(transaction), transaction)
-      })
+        if (!existing || getTransactionUpdatedAt(transaction) >= getTransactionUpdatedAt(existing)) {
+          byKey.set(key, transaction)
+        }
+      }
+
+      localActivities.map(activityToTransaction).forEach(keepNewest)
+      serverActivities.map(activityToTransaction).forEach(keepNewest)
       legacyTransactions.forEach((transaction) => {
         const key = getTransactionKey(transaction)
         if (!byKey.has(key)) {
@@ -289,9 +311,7 @@ export function DashboardTab() {
       })
 
       const sortedTransactions = [...byKey.values()].sort((left, right) => {
-        const leftTime = left.updatedAt ?? new Date(left.timestamp).getTime()
-        const rightTime = right.updatedAt ?? new Date(right.timestamp).getTime()
-        return rightTime - leftTime
+        return getTransactionUpdatedAt(right) - getTransactionUpdatedAt(left)
       })
 
       if (!isCancelled) {
@@ -306,18 +326,20 @@ export function DashboardTab() {
     }
   }, [address])
 
-  // Dynamically compute bridge statistics grouped by route
-  const bridgeRouteStats = transactions.reduce<Record<string, { from: string; to: string; count: number }>>(
-    (acc, tx) => {
-      const from = tx.fromNetwork || 'Unknown'
-      const to = tx.toNetwork || 'Unknown'
-      const key = `${from}→${to}`
-      if (!acc[key]) acc[key] = { from, to, count: 0 }
-      acc[key].count++
-      return acc
-    },
-    {}
-  )
+  // Statistics count only completed bridge transfers. Pending and failed records stay in Activity.
+  const bridgeRouteStats = transactions
+    .filter(isCompletedTransaction)
+    .reduce<Record<string, { from: string; to: string; count: number }>>(
+      (acc, tx) => {
+        const from = tx.fromNetwork || 'Unknown'
+        const to = tx.toNetwork || 'Unknown'
+        const key = `${from}→${to}`
+        if (!acc[key]) acc[key] = { from, to, count: 0 }
+        acc[key].count++
+        return acc
+      },
+      {}
+    )
   const bridgeRoutes = Object.values(bridgeRouteStats)
 
   const getTransactionRoute = (transaction: Transaction) => {
