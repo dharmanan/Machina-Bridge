@@ -1,4 +1,5 @@
 import { logger } from './logger';
+import { dismissLocalBridgeActivity } from './localBridgeActivity';
 
 interface CreateTransferPayload {
   walletAddress: string;
@@ -199,6 +200,9 @@ export async function dismissTrackedTransfer(id: string): Promise<boolean> {
       return false;
     }
 
+    if (response.ok) {
+      dismissLocalBridgeActivity(id);
+    }
     return response.ok;
   } catch (error) {
     logger.warn('Failed to dismiss tracked transfer:', error);
@@ -222,6 +226,9 @@ export async function dismissTrackedTransferBySourceTxHash(sourceTxHash: string)
       return false;
     }
 
+    if (response.ok) {
+      dismissLocalBridgeActivity(undefined, sourceTxHash);
+    }
     return response.ok;
   } catch (error) {
     logger.warn('Failed to dismiss tracked transfer by source hash:', error);
@@ -245,6 +252,9 @@ export async function dismissServerBridgeActivity(id: string): Promise<boolean> 
       return false;
     }
 
+    if (response.ok) {
+      dismissLocalBridgeActivity(id);
+    }
     return response.ok;
   } catch (error) {
     logger.warn('Failed to dismiss server bridge activity:', error);
