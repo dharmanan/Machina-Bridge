@@ -418,21 +418,7 @@ export function BridgeTab() {
     return acc
   }, {})
   const activityTransfers: TrackedTransfer[] = activityRecords
-    .filter((activity) => {
-      if (activity.status === 'dismissed') {
-        return false
-      }
-
-      if (activity.receiveTxHash) {
-        return true
-      }
-
-      if (activity.sourceTxHash) {
-        return true
-      }
-
-      return activity.status !== 'awaiting_approve' && activity.status !== 'awaiting_burn'
-    })
+    .filter((activity) => activity.status !== 'dismissed')
     .map((activity) => ({
       id: activity.id,
       walletAddress: activity.walletAddress,
@@ -454,7 +440,7 @@ export function BridgeTab() {
     }))
   const localFallbackTransfer: TrackedTransfer | null = trackedBridge
     ? {
-        id: `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
+        id: trackedBridge.id ?? `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
         walletAddress: trackedBridge.walletAddress,
         sourceChainId: trackedBridge.sourceChainId,
         destinationChainId: trackedBridge.destinationChainId,
@@ -777,6 +763,8 @@ export function BridgeTab() {
 
   const hasPendingActivity = trackedTransfers.some(
     (t) => t.status !== 'minted' && t.status !== 'dismissed',
+  ) || activityRecords.some(
+    (activity) => activity.status !== 'minted' && activity.status !== 'dismissed',
   ) || Boolean(pendingBridge)
 
   useEffect(() => {
