@@ -146,7 +146,7 @@ export function SwapTab() {
                   Daily Limit: <span className={state.ethSwapLimitReached ? 'text-red-500' : 'text-[#2F6E0C]'}>
                     {state.ethSwapUsedToday}/0.1 ETH
                   </span>
-                  <span className="ml-1 text-[11px] text-slate-400">(browser-side testnet guard)</span>
+                  <span className="ml-1 text-[11px] text-slate-400">(browser testnet guard)</span>
                 </p>
               )}
             </div>
