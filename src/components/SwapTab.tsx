@@ -12,12 +12,10 @@ export function SwapTab() {
   const [localInputAmount, setLocalInputAmount] = useState('')
   const isOnSepolia = chainId === SEPOLIA_EVM_CHAIN_ID
 
-  // Update parent state when user changes input
   useEffect(() => {
     setInputAmount(localInputAmount)
   }, [localInputAmount, setInputAmount])
 
-  // Auto-fetch balances when component mounts and wallet is connected
   useEffect(() => {
     if (isConnected && isOnSepolia) {
       fetchBalances()
@@ -39,7 +37,6 @@ export function SwapTab() {
           )}
 
           <div className="space-y-4">
-            {/* Input Amount */}
             <div>
               <label className="text-sm font-medium text-slate-700 mb-2 block">From</label>
               <div className="flex gap-2">
@@ -55,7 +52,6 @@ export function SwapTab() {
                   {state.isEthToUsdc ? 'ETH' : 'USDC'}
                 </button>
               </div>
-              {/* Balance Display */}
               <div className="flex justify-between items-center mt-2">
                 <span className="text-xs text-slate-500">
                   Balance: {state.isLoadingBalance ? (
@@ -64,7 +60,7 @@ export function SwapTab() {
                       Loading...
                     </span>
                   ) : (
-                    (state.isEthToUsdc ? 
+                    (state.isEthToUsdc ?
                       (state.ethBalance ? `${parseFloat(state.ethBalance).toFixed(4)} ETH` : '0 ETH') :
                       (state.usdcBalance ? `${parseFloat(state.usdcBalance).toFixed(2)} USDC` : '0 USDC')
                     )
@@ -82,10 +78,14 @@ export function SwapTab() {
                   <button
                     onClick={() => {
                       const balance = state.isEthToUsdc ? state.ethBalance : state.usdcBalance
-                      if (balance && parseFloat(balance) > 0) {
-                        const maxAmount = Math.max(0, parseFloat(balance) - 0.01) // Leave some for gas
-                        setLocalInputAmount(maxAmount.toString())
-                      }
+                      if (!balance || parseFloat(balance) <= 0) return
+
+                      const numericBalance = parseFloat(balance)
+                      const maxAmount = state.isEthToUsdc
+                        ? Math.max(0, numericBalance - 0.01)
+                        : numericBalance
+
+                      setLocalInputAmount(maxAmount.toString())
                     }}
                     className="text-xs text-[#2F6E0C] transition-colors hover:text-[#25580A]"
                     disabled={state.isLoadingBalance || !(state.isEthToUsdc ? state.ethBalance : state.usdcBalance)}
@@ -96,7 +96,6 @@ export function SwapTab() {
               </div>
             </div>
 
-            {/* Swap Arrow */}
             <div className="flex justify-center">
               <button
                 onClick={toggleDirection}
@@ -107,7 +106,6 @@ export function SwapTab() {
               </button>
             </div>
 
-            {/* Output Amount */}
             <div>
               <label className="text-sm font-medium text-slate-700 mb-2 block">To (Estimated)</label>
               <div className="flex gap-2">
@@ -128,9 +126,9 @@ export function SwapTab() {
               )}
             </div>
 
-            {/* Network Info */}
             <div className="rounded-2xl border border-slate-200 bg-[#f8faf7] p-4 text-sm">
               <p className="text-slate-500">Network: <span className="font-semibold text-slate-900">Ethereum Sepolia</span></p>
+              <p className="mt-1 text-slate-500">Slippage tolerance: <span className="font-semibold text-slate-900">5%</span></p>
               {!isOnSepolia && (
                 <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
                   <p className="text-xs text-amber-900">Switch your wallet to Sepolia to read swap balances and quotes.</p>
@@ -148,11 +146,11 @@ export function SwapTab() {
                   Daily Limit: <span className={state.ethSwapLimitReached ? 'text-red-500' : 'text-[#2F6E0C]'}>
                     {state.ethSwapUsedToday}/0.1 ETH
                   </span>
+                  <span className="ml-1 text-[11px] text-slate-400">(browser testnet guard)</span>
                 </p>
               )}
             </div>
 
-            {/* Error Display */}
             {state.error && (
               <div className="flex items-start rounded-xl border border-red-200 bg-red-50 p-3 text-red-700">
                 <AlertCircle size={16} className="mr-2 mt-0.5 flex-shrink-0" />
@@ -160,28 +158,24 @@ export function SwapTab() {
               </div>
             )}
 
-            {/* Success Display */}
             {state.txHash && !state.isLoading && !state.error && (
               <div className="flex items-start rounded-xl border border-[#66D121]/25 bg-[#eef7e8] p-3 text-[#25580A]">
                 <CheckCircle size={16} className="mr-2 mt-0.5 flex-shrink-0" />
                 <div className="text-sm">
                   <p className="font-semibold">Latest Successful Swap</p>
-                  {state.txHash && (
-                    <a
-                      href={`https://sepolia.etherscan.io/tx/${state.txHash}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs mt-1 flex items-center gap-1 hover:underline"
-                    >
-                      View on Etherscan
-                      <ExternalLink size={12} />
-                    </a>
-                  )}
+                  <a
+                    href={`https://sepolia.etherscan.io/tx/${state.txHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs mt-1 flex items-center gap-1 hover:underline"
+                  >
+                    View on Etherscan
+                    <ExternalLink size={12} />
+                  </a>
                 </div>
               </div>
             )}
 
-            {/* Status Display */}
             {state.status && !state.status.includes('successful') && (
               <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
                 <Loader2 size={16} className="animate-spin" />
@@ -189,16 +183,15 @@ export function SwapTab() {
               </div>
             )}
 
-            {/* Swap Button */}
             <Button
               onClick={executeSwap}
               loading={state.isLoading}
               disabled={
                 !isConnected ||
-                state.isLoading || 
-                !localInputAmount || 
-                parseFloat(localInputAmount) <= 0 || 
-                !state.outputAmount || 
+                state.isLoading ||
+                !localInputAmount ||
+                parseFloat(localInputAmount) <= 0 ||
+                !state.outputAmount ||
                 parseFloat(state.outputAmount) <= 0 ||
                 (state.isEthToUsdc && (state.ethSwapLimitReached || (parseFloat(state.ethSwapUsedToday) + parseFloat(localInputAmount || '0')) > 0.1))
               }
@@ -217,7 +210,7 @@ export function SwapTab() {
 
           <div className="mt-6 rounded-2xl border border-slate-200 bg-[#f8faf7] p-4">
             <p className="text-xs text-slate-500">
-              ℹ️ <strong>Real swap on Sepolia testnet</strong> using Uniswap V2 Protocol. Requires MetaMask connected to Sepolia with ETH or USDC.
+              ℹ️ <strong>Real swap on Sepolia testnet</strong> using Uniswap V2 Protocol. Requires an EVM wallet connected to Sepolia with ETH or USDC.
             </p>
           </div>
         </Card>

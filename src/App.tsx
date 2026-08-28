@@ -278,7 +278,7 @@ export default function App() {
                     <Twitter size={16} />
                   </a>
                   <a
-                    href="https://github.com/dharmanan"
+                    href="https://github.com/dharmanan/Machina-Bridge"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:border-[#66D121]/40 hover:text-[#2F6E0C]"
@@ -432,17 +432,19 @@ export default function App() {
           <div className="text-center text-sm text-slate-500">
             <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
               <p className="mb-2 font-semibold text-[#2F6E0C]">
-                MVP Testnet Application - Educational v2.2 for{' '}
+                Independent testnet application for Arc ecosystem experimentation.
+              </p>
+              <p>
+                Uses test tokens only. Not for production or real value transfers.{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[#2F6E0C] underline transition-colors hover:text-[#25580A]"
                 >
-                  ARC Protocol
+                  Arc documentation
                 </a>
               </p>
-              <p>This is a testnet demo application for learning and testing ARC Protocol features. Not for production use. All transactions use test tokens with no real value.</p>
             </div>
           </div>
         </Container>

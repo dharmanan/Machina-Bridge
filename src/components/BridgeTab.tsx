@@ -158,30 +158,28 @@ function mergeLocalAndServerActivities(
   localActivities: BridgeActivityRecord[],
   serverActivities: ServerBridgeActivity[],
 ): BridgeActivityRecord[] {
-  const byKey = new Map<string, BridgeActivityRecord>()
+  const byId = new Map<string, BridgeActivityRecord>()
 
   const ingest = (activity: BridgeActivityRecord) => {
-    const key = activity.sourceTxHash
-      ? `source:${activity.sourceTxHash.toLowerCase()}`
-      : `id:${String(activity.id).toLowerCase()}`
-    const previous = byKey.get(key)
+    const key = String(activity.id).toLowerCase()
+    const previous = byId.get(key)
 
     if (!previous) {
-      byKey.set(key, activity)
+      byId.set(key, activity)
       return
     }
 
     const prevUpdated = Number(previous.updatedAt ?? previous.startedAt ?? 0)
     const nextUpdated = Number(activity.updatedAt ?? activity.startedAt ?? 0)
     if (nextUpdated >= prevUpdated) {
-      byKey.set(key, activity)
+      byId.set(key, activity)
     }
   }
 
   localActivities.forEach(ingest)
   serverActivities.forEach((serverActivity) => ingest(serverActivity as BridgeActivityRecord))
 
-  return [...byKey.values()].sort(
+  return [...byId.values()].sort(
     (a, b) => Number(b.updatedAt ?? b.startedAt ?? 0) - Number(a.updatedAt ?? a.startedAt ?? 0),
   )
 }
@@ -420,21 +418,7 @@ export function BridgeTab() {
     return acc
   }, {})
   const activityTransfers: TrackedTransfer[] = activityRecords
-    .filter((activity) => {
-      if (activity.status === 'dismissed') {
-        return false
-      }
-
-      if (activity.receiveTxHash) {
-        return true
-      }
-
-      if (activity.sourceTxHash) {
-        return true
-      }
-
-      return activity.status !== 'awaiting_approve' && activity.status !== 'awaiting_burn'
-    })
+    .filter((activity) => activity.status !== 'dismissed')
     .map((activity) => ({
       id: activity.id,
       walletAddress: activity.walletAddress,
@@ -456,7 +440,7 @@ export function BridgeTab() {
     }))
   const localFallbackTransfer: TrackedTransfer | null = trackedBridge
     ? {
-        id: `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
+        id: trackedBridge.id ?? `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
         walletAddress: trackedBridge.walletAddress,
         sourceChainId: trackedBridge.sourceChainId,
         destinationChainId: trackedBridge.destinationChainId,
@@ -493,14 +477,25 @@ export function BridgeTab() {
   const mergedTrackedTransfersList = Array.from(mergedTrackedTransfers.values())
     .sort((a, b) => b.updatedAt - a.updatedAt)
   const nonMintedTransfers = mergedTrackedTransfersList.filter((transfer) => transfer.status !== 'minted')
-  const actionNeededTransfers = nonMintedTransfers.filter(
-    (transfer) => transfer.status === 'ready_to_mint' || Boolean(validatedReadyKeys[getTransferKey(transfer.sourceTxHash, transfer.id)]),
+  const failedTransferKeys = new Set(
+    activityRecords
+      .filter((activity) => activity.status === 'failed')
+      .map((activity) => getTransferKey(activity.sourceTxHash, activity.id)),
   )
+  const actionNeededTransfers = nonMintedTransfers.filter((transfer) => {
+    const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    return transfer.status === 'ready_to_mint' || Boolean(validatedReadyKeys[transferKey])
+  })
+  const failedTransfers = nonMintedTransfers.filter((transfer) => {
+    const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    return failedTransferKeys.has(transferKey) && !validatedReadyKeys[transferKey]
+  })
   const inProgressTransfers = nonMintedTransfers.filter((transfer) => {
-    if (transfer.status === 'ready_to_mint') {
+    const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+    if (transfer.status === 'ready_to_mint' || validatedReadyKeys[transferKey]) {
       return false
     }
-    return !validatedReadyKeys[getTransferKey(transfer.sourceTxHash, transfer.id)]
+    return !failedTransferKeys.has(transferKey)
   })
   const completedTransfers = mergedTrackedTransfersList.filter((transfer) => transfer.status === 'minted')
   const actionNeededCount = actionNeededTransfers.length
@@ -554,6 +549,9 @@ export function BridgeTab() {
     }
     if (localStatus === 'pending_attestation') {
       return 'Waiting for Circle attestation'
+    }
+    if (localStatus === 'failed') {
+      return 'Failed'
     }
 
     if (transfer.status === 'ready_to_mint') {
@@ -765,6 +763,8 @@ export function BridgeTab() {
 
   const hasPendingActivity = trackedTransfers.some(
     (t) => t.status !== 'minted' && t.status !== 'dismissed',
+  ) || activityRecords.some(
+    (activity) => activity.status !== 'minted' && activity.status !== 'dismissed',
   ) || Boolean(pendingBridge)
 
   useEffect(() => {
@@ -2187,8 +2187,7 @@ export function BridgeTab() {
                 <Clock size={13} className="mt-0.5 flex-shrink-0 text-blue-500" />
                 <p>
                   {sourceChainName} to {destinationChainName} typically takes <strong>{trackedEtaLabel}</strong> on testnet. Three wallet confirmations
-                  are required. <strong>Keep this tab open</strong> — if it closes mid-flight, an &quot;Incomplete bridge
-                  detected&quot; notice will appear when you return.
+                  are required. You do not need to keep this tab open. Progress is saved in Activity. Return when another wallet confirmation or mint action is required.
                 </p>
               </div>
             )}
@@ -2685,12 +2684,11 @@ export function BridgeTab() {
               Activity
             </h2>
             <p className="mt-2 text-sm text-slate-500">
-              Completed bridges, ready-to-mint transfers, and pending items for this wallet.
+              Completed bridges, transfers ready to mint, pending items, and failed items for this wallet.
             </p>
 
             <div className="mt-6 overflow-y-auto border-t border-slate-200 pt-5">
-              <div className="mb-3 flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-slate-900">Action Needed</h3>
+              <div className="mb-3 flex justify-end">
                 <button
                   type="button"
                   onClick={() => void refreshTrackedTransfers()}
@@ -2701,115 +2699,152 @@ export function BridgeTab() {
                 </button>
               </div>
 
-              {nonMintedTransfers.length === 0 ? (
-                <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
-                  No active transfer right now.
-                </p>
-              ) : (
-                <div className="space-y-4 max-h-[55vh] overflow-y-auto pr-1">
-                  <div>
-                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">In Progress</h4>
-                    {inProgressTransfers.length === 0 ? (
-                      <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
-                        No transfer waiting for approvals or attestation.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {inProgressTransfers.map((transfer) => {
-                          const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
-                          const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
-                          const statusLabel = getTransferProgressLabel(transfer)
+              <div className="space-y-4 max-h-[55vh] overflow-y-auto pr-1">
+                <div>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">In Progress</h4>
+                  {inProgressTransfers.length === 0 ? (
+                    <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                      No transfer in progress.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {inProgressTransfers.map((transfer) => {
+                        const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                        const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+                        const statusLabel = getTransferProgressLabel(transfer)
 
-                          return (
-                            <div key={`progress-${transfer.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                              <div className="flex items-start justify-between gap-3">
-                                <div>
-                                  <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
-                                  <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
-                                  <p className="mt-1 text-xs font-medium text-slate-700">{statusLabel}</p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenTransferInTracker(transfer)}
-                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
-                                  >
-                                    Open tracker
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleDismissTrackedTransfer(transfer)}
-                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
-                                  >
-                                    Dismiss
-                                  </button>
-                                </div>
+                        return (
+                          <div key={`progress-${transfer.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
+                                <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                                <p className="mt-1 text-xs font-medium text-slate-700">{statusLabel}</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenTransferInTracker(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                >
+                                  Open tracker
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDismissTrackedTransfer(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                >
+                                  Dismiss
+                                </button>
                               </div>
                             </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                  </div>
-
-                  <div>
-                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-amber-700">Ready to Mint</h4>
-                    {actionNeededTransfers.length === 0 ? (
-                      <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
-                        No ready-to-mint transfer right now.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {actionNeededTransfers.map((transfer) => {
-                          const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
-                          const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
-                          const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
-                          const isTransferReady = Boolean(validatedReadyKeys[transferKey])
-
-                          return (
-                            <div key={`ready-${transfer.id}`} className="rounded-xl border border-amber-200 bg-amber-50 p-3">
-                              <div className="flex items-start justify-between gap-3">
-                                <div>
-                                  <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
-                                  <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
-                                  <p className="mt-1 text-xs font-medium text-amber-700">Ready to mint</p>
-                                  <p className="mt-1 text-[11px] text-slate-500">
-                                    Verification: {isTransferReady ? 'confirmed' : 'not confirmed'}
-                                  </p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleResumeTrackedTransfer(transfer)}
-                                    disabled={!isTransferReady || state.isLoading}
-                                    className="rounded-lg bg-[#2F6E0C] px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
-                                  >
-                                    Mint
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenTransferInTracker(transfer)}
-                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                                  >
-                                    Open tracker
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleDismissTrackedTransfer(transfer)}
-                                    className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
-                                  >
-                                    Dismiss
-                                  </button>
-                                </div>
-                              </div>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                  </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
-              )}
+
+                <div>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-amber-700">Ready to Mint</h4>
+                  {actionNeededTransfers.length === 0 ? (
+                    <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+                      No transfer is ready to mint.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {actionNeededTransfers.map((transfer) => {
+                        const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                        const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+                        const transferKey = getTransferKey(transfer.sourceTxHash, transfer.id)
+                        const isTransferReady = Boolean(validatedReadyKeys[transferKey])
+
+                        return (
+                          <div key={`ready-${transfer.id}`} className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
+                                <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                                <p className="mt-1 text-xs font-medium text-amber-700">Ready to mint</p>
+                                <p className="mt-1 text-[11px] text-slate-500">
+                                  Verification: {isTransferReady ? 'confirmed' : 'not confirmed'}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => void handleResumeTrackedTransfer(transfer)}
+                                  disabled={!isTransferReady || state.isLoading}
+                                  className="rounded-lg bg-[#2F6E0C] px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-[#25580A] disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  Mint
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenTransferInTracker(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                                >
+                                  Open tracker
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDismissTrackedTransfer(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                >
+                                  Dismiss
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {failedTransfers.length > 0 && (
+                  <div>
+                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-red-700">Failed</h4>
+                    <div className="space-y-2">
+                      {failedTransfers.map((transfer) => {
+                        const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
+                        const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+
+                        return (
+                          <div key={`failed-${transfer.id}`} className="rounded-xl border border-red-200 bg-red-50 p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">{transfer.amount} {transfer.token}</p>
+                                <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
+                                <p className="mt-1 text-xs font-medium text-red-700">Failed</p>
+                                <p className="mt-1 text-[11px] text-slate-500">
+                                  Open the tracker to review the transaction. If an attestation becomes available, this item moves to Ready to Mint.
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenTransferInTracker(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                >
+                                  Open tracker
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDismissTrackedTransfer(transfer)}
+                                  className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white"
+                                >
+                                  Dismiss
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
 
               <div className="mt-5 border-t border-slate-200 pt-4">
                 <h4 className="mb-2 text-sm font-semibold text-slate-900">Completed</h4>
@@ -2822,6 +2857,11 @@ export function BridgeTab() {
                     {completedTransfers.slice(0, 20).map((transfer) => {
                       const sourceName = getSupportedEvmChainName(transfer.sourceChainId)
                       const destinationName = getSupportedEvmChainName(transfer.destinationChainId)
+                      const completedTxUrl = transfer.destinationTxHash
+                        ? getTxExplorerUrl(transfer.destinationChainId, transfer.destinationTxHash)
+                        : transfer.sourceTxHash
+                          ? getTxExplorerUrl(transfer.sourceChainId, transfer.sourceTxHash)
+                          : undefined
 
                       return (
                         <div key={`completed-${transfer.id}`} className="rounded-xl border border-[#66D121]/30 bg-[#eef7e8] p-3">
@@ -2831,7 +2871,20 @@ export function BridgeTab() {
                               <p className="text-xs text-slate-500">{sourceName} → {destinationName}</p>
                               <p className="mt-1 text-xs font-medium text-[#2F6E0C]">Complete</p>
                             </div>
-                            <CheckCircle size={16} className="text-[#2F6E0C]" />
+                            <div className="flex flex-col items-end gap-2">
+                              <CheckCircle size={16} className="text-[#2F6E0C]" />
+                              {completedTxUrl && (
+                                <a
+                                  href={completedTxUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-xs font-medium text-[#2F6E0C] hover:underline"
+                                >
+                                  View Tx
+                                  <ExternalLink size={11} />
+                                </a>
+                              )}
+                            </div>
                           </div>
                         </div>
                       )
