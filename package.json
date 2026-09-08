@@ -63,6 +63,11 @@
     "@metamask/sdk": "^0.34.0",
     "uuid": "^14.0.0",
     "socket.io-parser": "4.2.7",
-    "tmp": "0.2.7"
+    "tmp": "0.2.7",
+    "toml": "^4.3.0",
+    "browserslist": "^4.28.7",
+    "decode-uri-component": "^0.5.0",
+    "stream-json": "^3.5.0",
+    "postcss-selector-parser": "^6.1.3"
   }
 }
