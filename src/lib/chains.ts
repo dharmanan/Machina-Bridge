@@ -1,49 +1,28 @@
 import type { Chain } from 'viem'
 import { arcTestnet, arbitrumSepolia, baseSepolia, optimismSepolia, sepolia } from 'viem/chains'
+import { TESTNET_ARC_NATIVE_CURRENCY, TESTNET_NETWORKS } from '../config/testnet'
 
 type WalletRequest = (args: { method: string; params?: unknown[] }) => Promise<unknown>
 
-const sepoliaEnvRpc = import.meta.env.VITE_SEPOLIA_RPC?.trim()
-const arcEnvRpc = import.meta.env.VITE_ARC_TESTNET_RPC?.trim()
-const baseSepoliaEnvRpc = import.meta.env.VITE_BASE_SEPOLIA_RPC?.trim()
-const optimismSepoliaEnvRpc = import.meta.env.VITE_OPTIMISM_SEPOLIA_RPC?.trim()
-const arbitrumSepoliaEnvRpc = import.meta.env.VITE_ARBITRUM_SEPOLIA_RPC?.trim()
+const SEPOLIA_DEFAULT_RPC_URLS = TESTNET_NETWORKS.ethereum.rpcUrls
+const ARC_DEFAULT_RPC_URLS = TESTNET_NETWORKS.arc.rpcUrls
+const BASE_SEPOLIA_DEFAULT_RPC_URLS = TESTNET_NETWORKS.base.rpcUrls
+const OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS = TESTNET_NETWORKS.optimism.rpcUrls
+const ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS = TESTNET_NETWORKS.arbitrum.rpcUrls
 
-const SEPOLIA_DEFAULT_RPC_URLS = [
-  'https://ethereum-sepolia-rpc.publicnode.com',
-  'https://rpc.sepolia.org',
-]
-
-const ARC_DEFAULT_RPC_URLS = [
-  'https://rpc.testnet.arc.io',
-]
-
-const BASE_SEPOLIA_DEFAULT_RPC_URLS = [
-  'https://base-sepolia-rpc.publicnode.com',
-  'https://sepolia.base.org',
-]
-
-const OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS = [
-  'https://sepolia.optimism.io',
-  'https://optimism-sepolia-rpc.publicnode.com',
-]
-
-const ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS = [
-  'https://sepolia-rollup.arbitrum.io/rpc',
-  'https://arbitrum-sepolia-rpc.publicnode.com',
-]
-
-export const SEPOLIA_EVM_RPC_URL = sepoliaEnvRpc || SEPOLIA_DEFAULT_RPC_URLS[0]
-export const ARC_EVM_RPC_URL = arcEnvRpc || ARC_DEFAULT_RPC_URLS[0]
-export const BASE_SEPOLIA_EVM_RPC_URL = baseSepoliaEnvRpc || BASE_SEPOLIA_DEFAULT_RPC_URLS[0]
-export const OPTIMISM_SEPOLIA_EVM_RPC_URL = optimismSepoliaEnvRpc || OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS[0]
-export const ARBITRUM_SEPOLIA_EVM_RPC_URL = arbitrumSepoliaEnvRpc || ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS[0]
+export const SEPOLIA_EVM_RPC_URL = SEPOLIA_DEFAULT_RPC_URLS[0]
+export const ARC_EVM_RPC_URL = ARC_DEFAULT_RPC_URLS[0]
+export const BASE_SEPOLIA_EVM_RPC_URL = BASE_SEPOLIA_DEFAULT_RPC_URLS[0]
+export const OPTIMISM_SEPOLIA_EVM_RPC_URL = OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS[0]
+export const ARBITRUM_SEPOLIA_EVM_RPC_URL = ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS[0]
 
 export const SEPOLIA_EVM_CHAIN: Chain = {
   ...sepolia,
+  id: TESTNET_NETWORKS.ethereum.chainId,
+  name: TESTNET_NETWORKS.ethereum.name,
   rpcUrls: {
-    default: { http: sepoliaEnvRpc ? [sepoliaEnvRpc] : SEPOLIA_DEFAULT_RPC_URLS },
-    public: { http: sepoliaEnvRpc ? [sepoliaEnvRpc] : SEPOLIA_DEFAULT_RPC_URLS },
+    default: { http: [...SEPOLIA_DEFAULT_RPC_URLS] },
+    public: { http: [...SEPOLIA_DEFAULT_RPC_URLS] },
   },
 }
 
@@ -51,44 +30,46 @@ export const SEPOLIA_EVM_CHAIN: Chain = {
 // Arc Testnet uses USDC as the native gas asset.
 export const ARC_EVM_CHAIN: Chain = {
   ...arcTestnet,
-  id: 5042002,
-  name: 'Arc Testnet',
-  nativeCurrency: {
-    name: 'USDC',
-    symbol: 'USDC',
-    decimals: 18,
-  },
+  id: TESTNET_NETWORKS.arc.chainId,
+  name: TESTNET_NETWORKS.arc.name,
+  nativeCurrency: TESTNET_ARC_NATIVE_CURRENCY,
   rpcUrls: {
-    default: { http: arcEnvRpc ? [arcEnvRpc] : ARC_DEFAULT_RPC_URLS },
-    public: { http: arcEnvRpc ? [arcEnvRpc] : ARC_DEFAULT_RPC_URLS },
+    default: { http: [...ARC_DEFAULT_RPC_URLS] },
+    public: { http: [...ARC_DEFAULT_RPC_URLS] },
   },
   blockExplorers: {
-    default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' },
+    default: { name: 'ArcScan', url: TESTNET_NETWORKS.arc.explorerUrl },
   },
   testnet: true,
 }
 
 export const BASE_SEPOLIA_EVM_CHAIN: Chain = {
   ...baseSepolia,
+  id: TESTNET_NETWORKS.base.chainId,
+  name: TESTNET_NETWORKS.base.name,
   rpcUrls: {
-    default: { http: baseSepoliaEnvRpc ? [baseSepoliaEnvRpc] : BASE_SEPOLIA_DEFAULT_RPC_URLS },
-    public: { http: baseSepoliaEnvRpc ? [baseSepoliaEnvRpc] : BASE_SEPOLIA_DEFAULT_RPC_URLS },
+    default: { http: [...BASE_SEPOLIA_DEFAULT_RPC_URLS] },
+    public: { http: [...BASE_SEPOLIA_DEFAULT_RPC_URLS] },
   },
 }
 
 export const OPTIMISM_SEPOLIA_EVM_CHAIN: Chain = {
   ...optimismSepolia,
+  id: TESTNET_NETWORKS.optimism.chainId,
+  name: TESTNET_NETWORKS.optimism.name,
   rpcUrls: {
-    default: { http: optimismSepoliaEnvRpc ? [optimismSepoliaEnvRpc] : OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS },
-    public: { http: optimismSepoliaEnvRpc ? [optimismSepoliaEnvRpc] : OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS },
+    default: { http: [...OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS] },
+    public: { http: [...OPTIMISM_SEPOLIA_DEFAULT_RPC_URLS] },
   },
 }
 
 export const ARBITRUM_SEPOLIA_EVM_CHAIN: Chain = {
   ...arbitrumSepolia,
+  id: TESTNET_NETWORKS.arbitrum.chainId,
+  name: TESTNET_NETWORKS.arbitrum.name,
   rpcUrls: {
-    default: { http: arbitrumSepoliaEnvRpc ? [arbitrumSepoliaEnvRpc] : ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS },
-    public: { http: arbitrumSepoliaEnvRpc ? [arbitrumSepoliaEnvRpc] : ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS },
+    default: { http: [...ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS] },
+    public: { http: [...ARBITRUM_SEPOLIA_DEFAULT_RPC_URLS] },
   },
 }
 
