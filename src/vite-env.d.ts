@@ -15,6 +15,10 @@ declare module 'vite/client' {
     readonly VITE_ARC_MAINNET_CHAIN_ID?: string
     readonly VITE_ARC_MAINNET_USDC?: string
     readonly VITE_ARC_MAINNET_CCTP_DOMAIN?: string
+    readonly VITE_ARC_MAINNET_CCTP_TOKEN_MESSENGER?: string
+    readonly VITE_ARC_MAINNET_CCTP_MESSAGE_TRANSMITTER?: string
+    readonly VITE_ARC_MAINNET_GATEWAY_WALLET?: string
+    readonly VITE_CIRCLE_MAINNET_GATEWAY_API_BASE?: string
     readonly VITE_SOLANA_DEVNET_RPC: string
     readonly VITE_CIRCLE_APP_ID: string
     readonly VITE_WALLETCONNECT_PROJECT_ID: string
