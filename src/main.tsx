@@ -117,27 +117,33 @@ function PublicDesignedByFooter() {
   )
 }
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <Web3Provider>
-      {shouldShowLockedMainnetPreview ? (
-        <>
-          <MainnetPreviewGate />
-          <PublicDesignedByFooter />
-        </>
-      ) : isCountdownRoute ? (
-        <>
-          <CountdownPage />
-          <PublicDesignedByFooter />
-        </>
-      ) : (
-        <>
-          <App />
-          <CountdownNavLink />
-          <MainnetPreviewNavLink />
-          <PublicDesignedByFooter />
-        </>
-      )}
-    </Web3Provider>
-  </StrictMode>,
-)
+const root = createRoot(document.getElementById('root')!)
+
+if (shouldShowLockedMainnetPreview) {
+  root.render(
+    <StrictMode>
+      <MainnetPreviewGate />
+      <PublicDesignedByFooter />
+    </StrictMode>,
+  )
+} else {
+  root.render(
+    <StrictMode>
+      <Web3Provider>
+        {isCountdownRoute ? (
+          <>
+            <CountdownPage />
+            <PublicDesignedByFooter />
+          </>
+        ) : (
+          <>
+            <App />
+            <CountdownNavLink />
+            <MainnetPreviewNavLink />
+            <PublicDesignedByFooter />
+          </>
+        )}
+      </Web3Provider>
+    </StrictMode>,
+  )
+}
