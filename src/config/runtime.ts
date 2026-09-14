@@ -13,7 +13,9 @@ export const IS_TESTNET_PROFILE = APP_NETWORK === 'testnet'
 // Deliberately false until the mainnet chain/Circle runtime has been fully
 // migrated and verified. A mainnet-profile deployment must remain read-only
 // until this code-level lock is intentionally removed in a reviewed change.
-export const MAINNET_RUNTIME_IMPLEMENTED = false as const
+// Keep the declared type boolean so capability code can compile while the
+// actual code-level lock remains explicitly false.
+export const MAINNET_RUNTIME_IMPLEMENTED: boolean = false
 
 // This flag only exposes the hidden/read-only mainnet preview. It does not
 // unlock transactions.
