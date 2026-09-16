@@ -1,5 +1,6 @@
 import { APP_NETWORK } from './runtime'
 import { MAINNET_CONFIG, getArcMainnetNetworkReadiness } from './mainnet'
+import { MAINNET_NETWORKS } from './mainnetNetworks'
 import { TESTNET_NETWORKS } from './testnet'
 
 export const CIRCLE_TESTNET = {
@@ -19,14 +20,17 @@ export const CIRCLE_TESTNET = {
     },
     base: {
       chainId: TESTNET_NETWORKS.base.chainId,
+      cctpDomain: 6,
       usdcAddress: TESTNET_NETWORKS.base.usdcAddress,
     },
     optimism: {
       chainId: TESTNET_NETWORKS.optimism.chainId,
+      cctpDomain: 2,
       usdcAddress: TESTNET_NETWORKS.optimism.usdcAddress,
     },
     arbitrum: {
       chainId: TESTNET_NETWORKS.arbitrum.chainId,
+      cctpDomain: 3,
       usdcAddress: TESTNET_NETWORKS.arbitrum.usdcAddress,
     },
   },
@@ -38,12 +42,32 @@ export const CIRCLE_MAINNET = {
   gatewayWalletAddress: MAINNET_CONFIG.arcGatewayWalletAddress,
   gatewayMinterAddress: MAINNET_CONFIG.arcGatewayMinterAddress,
   chains: {
+    ethereum: {
+      chainId: MAINNET_NETWORKS.ethereum.chainId,
+      cctpDomain: MAINNET_NETWORKS.ethereum.cctpDomain,
+      usdcAddress: MAINNET_NETWORKS.ethereum.usdcAddress,
+    },
     arc: {
       chainId: MAINNET_CONFIG.arcChainId,
       cctpDomain: MAINNET_CONFIG.arcCctpDomain,
       usdcAddress: MAINNET_CONFIG.arcUsdcAddress,
       tokenMessengerAddress: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
       messageTransmitterAddress: MAINNET_CONFIG.arcCctpMessageTransmitterAddress,
+    },
+    base: {
+      chainId: MAINNET_NETWORKS.base.chainId,
+      cctpDomain: MAINNET_NETWORKS.base.cctpDomain,
+      usdcAddress: MAINNET_NETWORKS.base.usdcAddress,
+    },
+    optimism: {
+      chainId: MAINNET_NETWORKS.optimism.chainId,
+      cctpDomain: MAINNET_NETWORKS.optimism.cctpDomain,
+      usdcAddress: MAINNET_NETWORKS.optimism.usdcAddress,
+    },
+    arbitrum: {
+      chainId: MAINNET_NETWORKS.arbitrum.chainId,
+      cctpDomain: MAINNET_NETWORKS.arbitrum.cctpDomain,
+      usdcAddress: MAINNET_NETWORKS.arbitrum.usdcAddress,
     },
   },
 } as const
