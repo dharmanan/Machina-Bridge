@@ -36,6 +36,7 @@ export const CIRCLE_MAINNET = {
   irisApiBase: 'https://iris-api.circle.com',
   gatewayApiBase: MAINNET_CONFIG.circleGatewayApiBase,
   gatewayWalletAddress: MAINNET_CONFIG.arcGatewayWalletAddress,
+  gatewayMinterAddress: MAINNET_CONFIG.arcGatewayMinterAddress,
   chains: {
     arc: {
       chainId: MAINNET_CONFIG.arcChainId,
@@ -82,6 +83,10 @@ export function getCircleMainnetReadiness(): CircleMainnetReadiness {
 
   if (!CIRCLE_MAINNET.gatewayWalletAddress) {
     gatewayMissing.push('Circle Gateway mainnet wallet contract for Arc')
+  }
+
+  if (!CIRCLE_MAINNET.gatewayMinterAddress) {
+    gatewayMissing.push('Circle Gateway mainnet minter contract for Arc')
   }
 
   const missing = Array.from(new Set([...cctpMissing, ...gatewayMissing]))
