@@ -121,6 +121,11 @@ export async function probeArcMainnetCapabilities(): Promise<MainnetCapabilityPr
       'Circle Gateway wallet',
       CIRCLE_MAINNET.gatewayWalletAddress,
     ),
+    checkContractCode(
+      'gateway-minter',
+      'Circle Gateway minter',
+      CIRCLE_MAINNET.gatewayMinterAddress,
+    ),
   ])
 
   checks.push(...contractChecks)
