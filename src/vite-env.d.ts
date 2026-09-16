@@ -10,8 +10,12 @@ declare module 'vite/client' {
     readonly VITE_BASE_SEPOLIA_RPC: string
     readonly VITE_OPTIMISM_SEPOLIA_RPC: string
     readonly VITE_ARBITRUM_SEPOLIA_RPC: string
+    readonly VITE_ETHEREUM_MAINNET_RPC?: string
     readonly VITE_ARC_MAINNET_RPC?: string
     readonly VITE_ARC_MAINNET_EXPLORER?: string
+    readonly VITE_BASE_MAINNET_RPC?: string
+    readonly VITE_OPTIMISM_MAINNET_RPC?: string
+    readonly VITE_ARBITRUM_MAINNET_RPC?: string
     readonly VITE_CIRCLE_MAINNET_GATEWAY_API_BASE?: string
     readonly VITE_SOLANA_DEVNET_RPC: string
     readonly VITE_CIRCLE_APP_ID: string
