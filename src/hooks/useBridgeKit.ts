@@ -6,6 +6,7 @@ import { BridgeKit, type BridgeResult } from '@circle-fin/bridge-kit';
 import { CCTPV2BridgingProvider } from '@circle-fin/provider-cctp-v2';
 import { type EIP1193Provider, createPublicClient, fallback, getAddress, http, parseAbi } from 'viem';
 import { ethers } from 'ethers';
+import { CIRCLE_TESTNET } from '../config/circle';
 import {
   ARBITRUM_SEPOLIA_EVM_CHAIN,
   ARBITRUM_SEPOLIA_EVM_CHAIN_ID,
@@ -63,7 +64,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', // Bridge Kit USDC on Sepolia
+      contractAddress: CIRCLE_TESTNET.chains.ethereum.usdcAddress, // Bridge Kit USDC on Sepolia
     },
   },
   [ARC_CHAIN_ID]: {
@@ -71,7 +72,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x3600000000000000000000000000000000000000', // Bridge Kit USDC on Arc Testnet
+      contractAddress: CIRCLE_TESTNET.chains.arc.usdcAddress, // Bridge Kit USDC on Arc Testnet
     },
   },
   [BASE_CHAIN_ID]: {
@@ -79,7 +80,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // Base Sepolia USDC
+      contractAddress: CIRCLE_TESTNET.chains.base.usdcAddress, // Base Sepolia USDC
     },
   },
   [OPTIMISM_CHAIN_ID]: {
@@ -87,7 +88,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x5fd84259d66cd46123540766be93dfe6d43130d7', // Optimism Sepolia USDC
+      contractAddress: CIRCLE_TESTNET.chains.optimism.usdcAddress, // Optimism Sepolia USDC
     },
   },
   [ARBITRUM_CHAIN_ID]: {
@@ -95,7 +96,7 @@ export const CHAIN_TOKENS: Record<number, Record<BridgeToken, TokenInfo>> = {
       symbol: 'USDC',
       name: 'USD Coin',
       decimals: 6,
-      contractAddress: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d', // Arbitrum Sepolia USDC
+      contractAddress: CIRCLE_TESTNET.chains.arbitrum.usdcAddress, // Arbitrum Sepolia USDC
     },
   },
 };
@@ -118,6 +119,9 @@ const SUPPORTED_BRIDGE_ROUTES = new Set<string>([
   `${ARBITRUM_CHAIN_ID}-${ARC_CHAIN_ID}`,
   `${ARC_CHAIN_ID}-${ARBITRUM_CHAIN_ID}`,
 ]);
+
+const CIRCLE_IRIS_API_BASE = CIRCLE_TESTNET.irisApiBase;
+const CIRCLE_IRIS_API_HOST = CIRCLE_IRIS_API_BASE.replace(/^https?:\/\//, '');
 
 const WALLET_CLIENT_REFRESH_TIMEOUT_MS = 15_000;
 const WALLET_CLIENT_REFRESH_INTERVAL_MS = 500;
@@ -964,7 +968,7 @@ export function useBridgeKit() {
 
         if (errorMessage.includes('User rejected') || errorMessage.includes('user rejected')) {
           errorMessage = 'You rejected the bridge request in your wallet';
-        } else if (errorMessage.includes('iris-api-sandbox.circle.com') && errorMessage.includes('404')) {
+        } else if (errorMessage.includes(CIRCLE_IRIS_API_HOST) && errorMessage.includes('404')) {
           errorMessage = 'Circle attestation is not indexed yet (404). Wait 2-5 minutes and try Continue pending bridge again.';
         } else if (errorMessage.includes('Insufficient funds')) {
           errorMessage = 'Insufficient balance for bridge transaction';
@@ -1237,7 +1241,7 @@ export function useBridgeKit() {
           }
 
           const response = await fetch(
-            `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${activity.sourceTxHash}`,
+            `${CIRCLE_IRIS_API_BASE}/v2/messages/${domain}?transactionHash=${activity.sourceTxHash}`,
           );
 
           if (response.ok) {
@@ -1336,7 +1340,7 @@ export function useBridgeKit() {
 
       try {
         const response = await fetch(
-          `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${sourceTxHash}`,
+          `${CIRCLE_IRIS_API_BASE}/v2/messages/${domain}?transactionHash=${sourceTxHash}`,
         );
 
         if (!response.ok) {
