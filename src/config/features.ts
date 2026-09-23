@@ -10,7 +10,6 @@ export type RuntimeCapabilities = {
   swap: boolean
   evmBridge: boolean
   gateway: boolean
-  countdown: boolean
   faucet: boolean
   realValueTransfers: boolean
 }
@@ -21,7 +20,6 @@ export function getRuntimeCapabilities(): RuntimeCapabilities {
       swap: true,
       evmBridge: true,
       gateway: true,
-      countdown: true,
       faucet: true,
       realValueTransfers: false,
     }
@@ -36,7 +34,6 @@ export function getRuntimeCapabilities(): RuntimeCapabilities {
     swap: false,
     evmBridge: runtimeUnlocked && arcReady && circleReady.cctpReady,
     gateway: gatewayRuntimeUnlocked && arcReady && circleReady.gatewayReady,
-    countdown: false,
     faucet: false,
     realValueTransfers: runtimeUnlocked && arcReady && circleReady.cctpReady,
   }
