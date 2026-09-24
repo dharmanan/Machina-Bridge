@@ -72,6 +72,55 @@ function transferStageLabel(stage: MainnetTransferStage) {
   return labels[stage]
 }
 
+function PreviewStep({
+  index,
+  title,
+  detail,
+  state,
+}: {
+  index: number
+  title: string
+  detail: string
+  state: 'complete' | 'current' | 'locked'
+}) {
+  return (
+    <div className="flex items-start gap-3">
+      <div
+        className={`mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold ${
+          state === 'complete'
+            ? 'bg-[#eef7e8] text-[#2F6E0C]'
+            : state === 'current'
+              ? 'bg-slate-900 text-white'
+              : 'bg-slate-100 text-slate-400'
+        }`}
+      >
+        {state === 'complete' ? '✓' : index}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-3">
+          <p className={`text-sm font-semibold ${state === 'locked' ? 'text-slate-400' : 'text-slate-900'}`}>
+            {title}
+          </p>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+              state === 'complete'
+                ? 'bg-[#eef7e8] text-[#2F6E0C]'
+                : state === 'current'
+                  ? 'bg-slate-900 text-white'
+                  : 'bg-slate-100 text-slate-400'
+            }`}
+          >
+            {state === 'complete' ? 'ready' : state === 'current' ? 'next' : 'locked'}
+          </span>
+        </div>
+        <p className={`mt-1 text-xs leading-5 ${state === 'locked' ? 'text-slate-400' : 'text-slate-500'}`}>
+          {detail}
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export default function MainnetPreviewGate() {
   const readiness = getMainnetReadiness()
   const circleReadiness = getCircleMainnetReadiness()
@@ -203,6 +252,23 @@ export default function MainnetPreviewGate() {
           ? 'Approval would be required'
           : 'Wallet is not ready for burn'
     : null
+
+  const preflightReady = Boolean(
+    quoteResult
+    && simulation
+    && arcStatus === 'ready'
+    && circleStatus === 'ready'
+    && routeStatus === 'ready',
+  )
+  const approvalIsNext = Boolean(preflightReady && simulation?.approvalRequired)
+  const burnIsNext = Boolean(preflightReady && simulation && !simulation.approvalRequired && simulation.readyForBurn)
+  const lockedActionLabel = !preflightReady
+    ? 'Run preflight checks'
+    : approvalIsNext
+      ? `Approve ${amount} USDC`
+      : burnIsNext
+        ? `Burn ${amount} USDC`
+        : 'Transfer not ready'
 
   return (
     <section className="bg-slate-50 px-4 py-5 text-slate-900">
@@ -470,18 +536,67 @@ export default function MainnetPreviewGate() {
             </div>
           )}
 
-          <button
-            type="button"
-            disabled
-            className="mt-5 inline-flex h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-2xl bg-[#9fbd90] px-4 text-sm font-semibold text-white opacity-90"
-          >
-            <LockKeyhole size={16} />
-            Bridge {amount && Number(amount) > 0 ? amount : '0'} USDC
-          </button>
+          <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Transfer flow</p>
+                <p className="mt-1 text-xs leading-5 text-slate-500">
+                  Each transaction stays explicit. Attestation is monitored automatically; destination mint remains manual.
+                </p>
+              </div>
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-500">
+                preview
+              </span>
+            </div>
 
-          <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-            Mainnet transfers remain unavailable until the production transaction runtime is deliberately unlocked.
-          </p>
+            <div className="space-y-4">
+              <PreviewStep
+                index={1}
+                title="Preflight"
+                detail="Route, Fast fee, balance, allowance and source simulation."
+                state={preflightReady ? 'complete' : 'current'}
+              />
+              <PreviewStep
+                index={2}
+                title="Approve USDC"
+                detail={simulation?.approvalRequired
+                  ? `Authorize exactly ${amount || '0'} USDC for Circle TokenMessenger.`
+                  : 'Skipped when the existing allowance is sufficient.'}
+                state={approvalIsNext ? 'current' : preflightReady && !simulation?.approvalRequired ? 'complete' : 'locked'}
+              />
+              <PreviewStep
+                index={3}
+                title="Burn on source"
+                detail={`Confirm the ${sourceName} CCTP burn and lock the destination caller to this wallet.`}
+                state={burnIsNext ? 'current' : 'locked'}
+              />
+              <PreviewStep
+                index={4}
+                title="Fast attestation"
+                detail="Circle attestation is monitored in the background while other transfers can continue."
+                state="locked"
+              />
+              <PreviewStep
+                index={5}
+                title={`Mint on ${destinationName}`}
+                detail={`Only ${maskAddress(address)} is configured to complete the destination receiveMessage call.`}
+                state="locked"
+              />
+            </div>
+
+            <button
+              type="button"
+              disabled
+              className="mt-5 inline-flex h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-2xl bg-[#9fbd90] px-4 text-sm font-semibold text-white opacity-90"
+            >
+              <LockKeyhole size={16} />
+              {lockedActionLabel}
+            </button>
+
+            <p className="mt-3 text-center text-xs leading-5 text-slate-500">
+              Preview only. Mainnet transaction writes remain code-locked until the production runtime is deliberately unlocked.
+            </p>
+          </div>
         </div>
       </div>
     </section>
