@@ -126,11 +126,13 @@ export async function fetchMainnetCctpFees(
   }
 
   const payload = await response.json()
-  const rawFees = Array.isArray(payload)
-    ? payload
-    : Array.isArray(payload?.data)
-      ? payload.data
-      : null
+  const rawFees = (
+    Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : null
+  ) as Array<{ finalityThreshold?: unknown; minimumFee?: unknown }> | null
 
   if (!rawFees) {
     throw new Error('Circle CCTP fee API returned an invalid payload')
