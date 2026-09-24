@@ -10,10 +10,10 @@ import {
   getMainnetCctpRoute,
 } from '../config/mainnetCctp'
 import {
-  MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID,
+  MAINNET_CCTP_CANARY_ARC_CHAIN_ID,
+  MAINNET_CCTP_CANARY_BASE_CHAIN_ID,
   MAINNET_CCTP_CANARY_ENABLED,
   MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
-  MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID,
   MAINNET_RUNTIME_IMPLEMENTED,
 } from '../config/runtime'
 import { wagmiConfig } from '../lib/wagmi.config'
@@ -75,6 +75,22 @@ function canaryReadinessPassed() {
     && getCircleMainnetReadiness().cctpReady
 }
 
+function isCanaryRoute(sourceChainId: number, destinationChainId: number) {
+  return (
+    sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
+    && destinationChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
+  ) || (
+    sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
+    && destinationChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
+  )
+}
+
+function expectedCanaryMode(sourceChainId: number): MainnetCctpTransferMode {
+  if (sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID) return 'standard'
+  if (sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID) return 'fast'
+  throw new Error('Unsupported mainnet canary source chain.')
+}
+
 function assertCanaryTransferRecord(input: {
   transferId?: string
   connectedAddress: string
@@ -92,16 +108,15 @@ function assertCanaryTransferRecord(input: {
   const amountRaw = parseUnits(record.amount, 6)
 
   if (
-    record.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
-    || record.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
-    || record.mode !== 'standard'
+    !isCanaryRoute(record.sourceChainId, record.destinationChainId)
+    || record.mode !== expectedCanaryMode(record.sourceChainId)
     || amountRaw <= 0n
     || amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
     || record.walletAddress.toLowerCase() !== connected
     || record.recipient.toLowerCase() !== connected
     || record.destinationCaller.toLowerCase() !== connected
   ) {
-    throw new Error('Transfer does not satisfy the Arc → Base 0.1 USDC canary guard.')
+    throw new Error('Transfer does not satisfy the Arc ↔ Base 0.1 USDC canary guard.')
   }
 
   return { record, amountRaw }
@@ -122,7 +137,7 @@ function assertCanaryApprovalAllowed(input: {
   const { record, amountRaw } = assertCanaryTransferRecord(input)
 
   if (
-    input.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
+    input.sourceChainId !== record.sourceChainId
     || input.amountRaw !== amountRaw
     || record.stage !== 'approval_required'
   ) {
@@ -147,9 +162,9 @@ function assertCanaryBurnAllowed(input: {
   const connected = input.connectedAddress.toLowerCase()
 
   if (
-    input.quote.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
-    || input.quote.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
-    || input.quote.mode !== 'standard'
+    input.quote.sourceChainId !== record.sourceChainId
+    || input.quote.destinationChainId !== record.destinationChainId
+    || input.quote.mode !== record.mode
     || input.quote.amountRaw !== amountRaw
     || input.quote.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
     || input.recipient.toLowerCase() !== connected
@@ -174,7 +189,7 @@ function assertCanaryMintAllowed(input: {
   const { record } = assertCanaryTransferRecord(input)
 
   if (
-    input.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+    input.destinationChainId !== record.destinationChainId
     || record.stage !== 'ready_to_mint'
     || !record.sourceTxHash
   ) {

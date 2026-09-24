@@ -12,9 +12,9 @@ import {
   type MainnetCctpRouteProbe,
 } from '../config/mainnetCctp'
 import {
-  MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID,
+  MAINNET_CCTP_CANARY_ARC_CHAIN_ID,
+  MAINNET_CCTP_CANARY_BASE_CHAIN_ID,
   MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
-  MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID,
   MAINNET_RUNTIME_IMPLEMENTED,
 } from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
@@ -281,14 +281,20 @@ export default function MainnetPreviewGate() {
   )
   const canaryAmountRaw = quoteResult?.amountRaw ?? 0n
   const canaryRouteSelected =
-    sourceChainId === MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
-    && destinationChainId === MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+    (
+      sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
+      && destinationChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
+    )
+    || (
+      sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
+      && destinationChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
+    )
 
   const canaryEligible =
     canaryRouteSelected
     && canaryAmountRaw > 0n
     && canaryAmountRaw <= MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
-    && quoteResult?.mode === 'standard'
+    && quoteResult?.mode === selectedMode
 
   const matchingTransfer =
     activeTransfers.find((transfer) =>
@@ -326,7 +332,7 @@ export default function MainnetPreviewGate() {
     || transferStage === 'minting'
 
   const actionLabel = !canaryRouteSelected
-    ? 'Canary available only for Arc → Base'
+    ? 'Canary available only for Arc ↔ Base'
     : quoteResult && quoteResult.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
       ? 'Canary maximum is 0.1 USDC'
       : !isConnected
@@ -342,7 +348,7 @@ export default function MainnetPreviewGate() {
               : transferStage === 'minting'
                 ? 'Mint pending...'
                 : transferStage === 'ready_to_mint'
-                  ? 'Mint on Base'
+                  ? `Mint on ${destinationName}`
                   : transferStage === 'approved' || transferStage === 'ready'
                     ? `Burn ${amount} USDC`
                     : !preflightReady
@@ -373,7 +379,7 @@ export default function MainnetPreviewGate() {
 
       if (!transfer) {
         if (!quoteResult || !simulation || !preflightReady || !canaryEligible) {
-          throw new Error('Arc → Base canary preflight is not ready.')
+          throw new Error(`${sourceName} → ${destinationName} canary preflight is not ready.`)
         }
 
         transfer = createTransferPlan({
@@ -583,7 +589,7 @@ export default function MainnetPreviewGate() {
           </div>
 
           <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-900">
-            Preflight checks use production RPCs and Circle services without signatures. The Arc → Base canary below can request real mainnet wallet signatures for transfers up to 0.1 USDC.
+            Preflight checks use production RPCs and Circle services without signatures. The Arc ↔ Base canary below can request real mainnet wallet signatures for transfers up to 0.1 USDC.
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -693,7 +699,7 @@ export default function MainnetPreviewGate() {
               <StatusRow label="Circle CCTP" state={circleStatus} />
               <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
               <StatusRow label="Global transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
-              <StatusRow label="Arc → Base canary ≤ 0.1 USDC" state={canaryWritesUnlocked ? 'ready' : 'locked'} />
+              <StatusRow label="Arc ↔ Base canary ≤ 0.1 USDC" state={canaryWritesUnlocked ? 'ready' : 'locked'} />
             </div>
           </div>
 
@@ -859,7 +865,7 @@ export default function MainnetPreviewGate() {
             </button>
 
             <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-              Real mainnet canary: Arc → Base only, maximum 0.1 USDC. Recipient and destination caller are locked to the connected wallet. Global mainnet and Gateway remain locked.
+              Real mainnet canary: Arc ↔ Base only, maximum 0.1 USDC. Recipient and destination caller are locked to the connected wallet. Global mainnet and Gateway remain locked.
             </p>
           </div>
         </div>

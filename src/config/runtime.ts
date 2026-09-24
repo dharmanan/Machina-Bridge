@@ -17,10 +17,10 @@ export const IS_TESTNET_PROFILE = APP_NETWORK === 'testnet'
 export const MAINNET_RUNTIME_IMPLEMENTED: boolean = false
 
 // Narrow production canary. This does not unlock the global mainnet runtime.
-// Only Arc -> Base CCTP transfers up to 0.1 USDC may be enabled by canary guards.
+// Only Arc <-> Base CCTP transfers up to 0.1 USDC may be enabled by canary guards.
 export const MAINNET_CCTP_CANARY_ENABLED: boolean = true
-export const MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID = 5042
-export const MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID = 8453
+export const MAINNET_CCTP_CANARY_ARC_CHAIN_ID = 5042
+export const MAINNET_CCTP_CANARY_BASE_CHAIN_ID = 8453
 export const MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW = 100_000n
 
 // Gateway has its own lock because the existing forwarding flow still includes
