@@ -143,7 +143,7 @@ export default function MainnetPreviewGate() {
     getAttestation,
     mint,
   } = useMainnetCctp()
-  const { activeTransfers, readyToMintCount } = useMainnetTransferQueue(address)
+  const { transfers, activeTransfers, readyToMintCount } = useMainnetTransferQueue(address)
 
   const [probe, setProbe] = useState<MainnetCapabilityProbeResult | null>(null)
   const [baseToArcProbe, setBaseToArcProbe] = useState<MainnetCctpRouteProbe | null>(null)
@@ -290,11 +290,18 @@ export default function MainnetPreviewGate() {
     && canaryAmountRaw <= MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
     && quoteResult?.mode === 'standard'
 
-  const matchingTransfer = activeTransfers.find((transfer) =>
-    transfer.sourceChainId === sourceChainId
-    && transfer.destinationChainId === destinationChainId
-    && Number(transfer.amount) === Number(amount),
-  )
+  const matchingTransfer =
+    activeTransfers.find((transfer) =>
+      transfer.sourceChainId === sourceChainId
+      && transfer.destinationChainId === destinationChainId
+      && Number(transfer.amount) === Number(amount),
+    )
+    ?? transfers.find((transfer) =>
+      transfer.stage === 'complete'
+      && transfer.sourceChainId === sourceChainId
+      && transfer.destinationChainId === destinationChainId
+      && Number(transfer.amount) === Number(amount),
+    )
 
   const transferStage = matchingTransfer?.stage
 
@@ -324,8 +331,10 @@ export default function MainnetPreviewGate() {
       ? 'Canary maximum is 0.1 USDC'
       : !isConnected
         ? 'Connect wallet'
-        : transferStage === 'approving'
-          ? 'Approval pending...'
+        : transferStage === 'complete'
+          ? 'Transfer complete'
+          : transferStage === 'approving'
+            ? 'Approval pending...'
           : transferStage === 'burning'
             ? 'Burn pending...'
             : transferStage === 'waiting_attestation'
@@ -351,6 +360,7 @@ export default function MainnetPreviewGate() {
     || transferStage === 'waiting_attestation'
     || transferStage === 'minting'
     || transferStage === 'failed'
+    || transferStage === 'complete'
     || cctpState.isLoading
 
   const runCanaryAction = useCallback(async () => {
@@ -763,7 +773,7 @@ export default function MainnetPreviewGate() {
                 index={1}
                 title="Preflight"
                 detail="Route, live fee, balance, allowance and source simulation."
-                state={preflightReady ? 'complete' : 'current'}
+                state={transferStage === 'complete' || preflightReady ? 'complete' : 'current'}
               />
               <PreviewStep
                 index={2}
@@ -788,7 +798,7 @@ export default function MainnetPreviewGate() {
                 detail={`Confirm the ${sourceName} CCTP burn and lock the destination caller to this wallet.`}
                 state={
                   transferStage
-                    && ['waiting_attestation', 'ready_to_mint', 'minting'].includes(transferStage)
+                    && ['waiting_attestation', 'ready_to_mint', 'minting', 'complete'].includes(transferStage)
                     ? 'complete'
                     : burnIsNext
                       ? 'current'
@@ -803,7 +813,7 @@ export default function MainnetPreviewGate() {
                   : 'Circle Standard attestation is monitored in the background; Arc source finality is already rapid.'}
                 state={
                   transferStage
-                    && ['ready_to_mint', 'minting'].includes(transferStage)
+                    && ['ready_to_mint', 'minting', 'complete'].includes(transferStage)
                     ? 'complete'
                     : attestationIsNext
                       ? 'current'
@@ -814,9 +824,23 @@ export default function MainnetPreviewGate() {
                 index={5}
                 title={`Mint on ${destinationName}`}
                 detail={`Only ${maskAddress(address)} is configured to complete the destination receiveMessage call.`}
-                state={mintIsNext ? 'current' : 'locked'}
+                state={transferStage === 'complete' ? 'complete' : mintIsNext ? 'current' : 'locked'}
               />
             </div>
+
+            {transferStage === 'complete' && (
+              <div className="mt-4 rounded-xl border border-[#cfe8bf] bg-[#eef7e8] px-3.5 py-3 text-sm text-[#2F6E0C]">
+                <p className="font-semibold">Transfer complete</p>
+                <p className="mt-1 text-xs leading-5">
+                  {amount} USDC was burned on ${sourceName} and minted on ${destinationName}.
+                </p>
+                {matchingTransfer?.destinationTxHash && (
+                  <p className="mt-1 text-[11px] opacity-80">
+                    Destination tx: {maskAddress(matchingTransfer.destinationTxHash)}
+                  </p>
+                )}
+              </div>
+            )}
 
             {actionError && (
               <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
