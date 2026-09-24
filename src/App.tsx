@@ -412,12 +412,10 @@ export default function App() {
         </Container>
       </header>
 
-      <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
-        <Container>
-          <nav className="flex flex-wrap gap-2 py-4">
-            {appNetwork === 'testnet' ? (
-              <>
-  
+      {appNetwork === 'testnet' && (
+        <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
+          <Container>
+            <nav className="flex flex-wrap gap-2 py-4">
               {tabs.map((tab) => (
                 <button
                   key={tab.id}
@@ -432,7 +430,7 @@ export default function App() {
                   {tab.label}
                 </button>
               ))}
-  
+
               <div className="relative" ref={lendingDropdownRef}>
                 <button
                   onClick={() => setShowLendingDropdown(!showLendingDropdown)}
@@ -455,7 +453,7 @@ export default function App() {
                   </div>
                 )}
               </div>
-  
+
               <a
                 href="https://faucet.circle.com/"
                 target="_blank"
@@ -465,22 +463,10 @@ export default function App() {
                 <Droplets size={18} />
                 Faucet
               </a>
-  
-              </>
-            ) : (
-              <>
-                <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-800">
-                  <GitBranch size={18} />
-                  Mainnet Bridge
-                </span>
-                <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-500">
-                  Locked
-                </span>
-              </>
-            )}
-          </nav>
-        </Container>
-      </div>
+            </nav>
+          </Container>
+        </div>
+      )}
 
       <main className="pb-10">
         {appNetwork === 'mainnet' ? (

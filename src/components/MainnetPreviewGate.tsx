@@ -94,7 +94,7 @@ export default function MainnetPreviewGate() {
   }
 
   return (
-    <section className="bg-slate-50 px-4 py-8 text-slate-900">
+    <section className="bg-slate-50 px-4 py-5 text-slate-900">
       <div className="mx-auto max-w-xl">
         <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-[0_16px_45px_rgba(15,23,42,0.08)]">
           <div className="flex items-start justify-between gap-4">
@@ -178,12 +178,12 @@ export default function MainnetPreviewGate() {
             Live readiness checks use production RPCs and Circle services in read-only mode. No wallet signature or transaction is submitted.
           </div>
 
-          <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="mb-3 flex items-center gap-2">
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3.5">
+            <div className="mb-2.5 flex items-center gap-2">
               <CheckCircle2 size={16} className="text-[#2F6E0C]" />
               <p className="text-sm font-semibold text-slate-900">Mainnet status</p>
             </div>
-            <div className="space-y-3">
+            <div className="space-y-2">
               <StatusRow label="Arc Mainnet" state={arcStatus} />
               <StatusRow label="Circle CCTP" state={circleStatus} />
               <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
