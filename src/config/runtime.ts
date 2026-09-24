@@ -30,3 +30,17 @@ export const MAINNET_APP_URL = import.meta.env.VITE_MAINNET_APP_URL?.trim() || '
 export function getAppNetworkLabel() {
   return IS_MAINNET_PROFILE ? 'Mainnet' : 'Testnet'
 }
+
+
+export const APP_NETWORK_STORAGE_KEY = 'machina_app_network'
+
+export function readStoredAppNetwork(): AppNetwork {
+  if (typeof window === 'undefined') return 'testnet'
+  return window.localStorage.getItem(APP_NETWORK_STORAGE_KEY) === 'mainnet' ? 'mainnet' : 'testnet'
+}
+
+export function storeAppNetwork(network: AppNetwork) {
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(APP_NETWORK_STORAGE_KEY, network)
+  }
+}

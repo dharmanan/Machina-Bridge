@@ -181,6 +181,11 @@ export const MAINNET_SUPPORTED_EVM_CHAINS = [
   ARBITRUM_MAINNET_EVM_CHAIN,
 ] as const
 
+export const ALL_SUPPORTED_EVM_CHAINS = [
+  ...TESTNET_SUPPORTED_EVM_CHAINS,
+  ...MAINNET_SUPPORTED_EVM_CHAINS,
+] as const
+
 export const SUPPORTED_EVM_CHAINS = APP_NETWORK === 'mainnet'
   ? MAINNET_SUPPORTED_EVM_CHAINS
   : TESTNET_SUPPORTED_EVM_CHAINS
@@ -190,8 +195,24 @@ export const SUPPORTED_EVM_CHAIN_OPTIONS = SUPPORTED_EVM_CHAINS.map((chain) => (
   name: chain.name,
 }))
 
+export const TESTNET_SUPPORTED_EVM_CHAIN_OPTIONS = TESTNET_SUPPORTED_EVM_CHAINS.map((chain) => ({
+  id: chain.id,
+  name: chain.name,
+}))
+
+export const MAINNET_SUPPORTED_EVM_CHAIN_OPTIONS = MAINNET_SUPPORTED_EVM_CHAINS.map((chain) => ({
+  id: chain.id,
+  name: chain.name,
+}))
+
+export function getEvmChainOptionsForNetwork(network: 'testnet' | 'mainnet') {
+  return network === 'mainnet'
+    ? MAINNET_SUPPORTED_EVM_CHAIN_OPTIONS
+    : TESTNET_SUPPORTED_EVM_CHAIN_OPTIONS
+}
+
 const supportedEvmChainsById = new Map<number, Chain>(
-  SUPPORTED_EVM_CHAINS.map((chain) => [chain.id, chain])
+  ALL_SUPPORTED_EVM_CHAINS.map((chain) => [chain.id, chain])
 )
 
 export function getSupportedEvmChain(chainId?: number) {
