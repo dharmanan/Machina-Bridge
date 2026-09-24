@@ -2,11 +2,21 @@
 
 declare module 'vite/client' {
   interface ImportMetaEnv {
+    readonly VITE_APP_NETWORK?: 'testnet' | 'mainnet'
+    readonly VITE_ENABLE_MAINNET_PREVIEW?: string
+    readonly VITE_MAINNET_APP_URL?: string
     readonly VITE_SEPOLIA_RPC: string
     readonly VITE_ARC_TESTNET_RPC: string
     readonly VITE_BASE_SEPOLIA_RPC: string
     readonly VITE_OPTIMISM_SEPOLIA_RPC: string
     readonly VITE_ARBITRUM_SEPOLIA_RPC: string
+    readonly VITE_ETHEREUM_MAINNET_RPC?: string
+    readonly VITE_ARC_MAINNET_RPC?: string
+    readonly VITE_ARC_MAINNET_EXPLORER?: string
+    readonly VITE_BASE_MAINNET_RPC?: string
+    readonly VITE_OPTIMISM_MAINNET_RPC?: string
+    readonly VITE_ARBITRUM_MAINNET_RPC?: string
+    readonly VITE_CIRCLE_MAINNET_GATEWAY_API_BASE?: string
     readonly VITE_SOLANA_DEVNET_RPC: string
     readonly VITE_CIRCLE_APP_ID: string
     readonly VITE_WALLETCONNECT_PROJECT_ID: string
