@@ -94,6 +94,14 @@ export default function App() {
   ]
 
   const networks = getEvmChainOptionsForNetwork(appNetwork)
+  const isCurrentChainInSelectedProfile = Boolean(
+    chainId && networks.some((network) => network.id === chainId),
+  )
+  const selectedNetworkLabel = isCurrentChainInSelectedProfile
+    ? getSupportedEvmChainName(chainId)
+    : appNetwork === 'mainnet'
+      ? 'Select mainnet'
+      : 'Select testnet'
 
   const handleAppNetworkChange = (network: AppNetwork) => {
     if (network === appNetwork) return
@@ -322,37 +330,33 @@ export default function App() {
                       </button>
                     ))}
                   </div>
-                {appNetwork === 'testnet' && (
-                  <>
-                  {isConnected && (
-                    <div className="relative" ref={dropdownRef}>
-                      <button
-                        onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
-                        className="flex h-9 flex-shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
-                      >
-                        <span>{getSupportedEvmChainName(chainId)}</span>
-                        <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
-                      </button>
-                      {showNetworkDropdown && (
-                        <div className="absolute right-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
-                          {networks.map((network) => (
-                            <button
-                              key={network.id}
-                              onClick={() => handleNetworkSwitch(network.id)}
-                              className={`w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 ${
-                                chainId === network.id ? 'text-[#2F6E0C]' : 'text-slate-700'
-                              }`}
-                            >
-                              {network.name}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
-                  </>
+                {isConnected && (
+                  <div className="relative" ref={dropdownRef}>
+                    <button
+                      onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
+                      className="flex h-9 flex-shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+                    >
+                      <span>{selectedNetworkLabel}</span>
+                      <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
+                    </button>
+                    {showNetworkDropdown && (
+                      <div className="absolute right-0 top-full z-50 mt-2 min-w-[170px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+                        {networks.map((network) => (
+                          <button
+                            key={network.id}
+                            onClick={() => handleNetworkSwitch(network.id)}
+                            className={`w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 ${
+                              chainId === network.id ? 'text-[#2F6E0C]' : 'text-slate-700'
+                            }`}
+                          >
+                            {network.name}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
+                <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
               </div>
 
               {appNetwork === 'testnet' && (

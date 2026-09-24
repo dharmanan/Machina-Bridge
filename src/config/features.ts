@@ -4,6 +4,7 @@ import {
   APP_NETWORK,
   MAINNET_GATEWAY_RUNTIME_IMPLEMENTED,
   MAINNET_RUNTIME_IMPLEMENTED,
+  type AppNetwork,
 } from './runtime'
 
 export type RuntimeCapabilities = {
@@ -14,8 +15,8 @@ export type RuntimeCapabilities = {
   realValueTransfers: boolean
 }
 
-export function getRuntimeCapabilities(): RuntimeCapabilities {
-  if (APP_NETWORK === 'testnet') {
+export function getRuntimeCapabilities(network: AppNetwork = APP_NETWORK): RuntimeCapabilities {
+  if (network === 'testnet') {
     return {
       swap: true,
       evmBridge: true,

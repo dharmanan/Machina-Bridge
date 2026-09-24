@@ -46,7 +46,7 @@ function makePublicClient(rpcUrls: readonly string[]) {
 }
 
 function assertMainnetWritesEnabled() {
-  const capabilities = getRuntimeCapabilities()
+  const capabilities = getRuntimeCapabilities('mainnet')
   if (!MAINNET_RUNTIME_IMPLEMENTED || !capabilities.evmBridge || !capabilities.realValueTransfers) {
     throw new Error('Mainnet CCTP transactions are locked until final readiness review and deliberate runtime unlock.')
   }
@@ -62,7 +62,7 @@ export function useMainnetCctp() {
   })
 
   const writesUnlocked = useMemo(() => {
-    const capabilities = getRuntimeCapabilities()
+    const capabilities = getRuntimeCapabilities('mainnet')
     return MAINNET_RUNTIME_IMPLEMENTED && capabilities.evmBridge && capabilities.realValueTransfers
   }, [])
 
