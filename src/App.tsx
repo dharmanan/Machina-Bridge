@@ -4,11 +4,13 @@ import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { SwapTab } from './components/SwapTab'
 import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
+import MainnetPreviewGate from './components/MainnetPreviewGate'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
 import { useSuiWallet } from './hooks/useSuiWallet'
-import { SUPPORTED_EVM_CHAIN_OPTIONS, addChainToWallet, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
+import { addChainToWallet, getEvmChainOptionsForNetwork, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
+import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
 import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import './index.css'
@@ -39,6 +41,7 @@ export default function App() {
     isWalletAvailable: isSuiWalletAvailable,
   } = useSuiWallet()
   const [activeTab, setActiveTab] = useState<Tab>('swap')
+  const [appNetwork, setAppNetwork] = useState<AppNetwork>(() => readStoredAppNetwork())
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
   const [isMobileExperience, setIsMobileExperience] = useState(false)
@@ -90,7 +93,19 @@ export default function App() {
     { id: 'dashboard', label: 'Dashboard', icon: <BarChart3 size={20} /> },
   ]
 
-  const networks = SUPPORTED_EVM_CHAIN_OPTIONS
+  const networks = getEvmChainOptionsForNetwork(appNetwork)
+
+  const handleAppNetworkChange = (network: AppNetwork) => {
+    if (network === appNetwork) return
+
+    setAppNetwork(network)
+    storeAppNetwork(network)
+    setShowNetworkDropdown(false)
+
+    if (network === 'mainnet') {
+      setActiveTab('bridge')
+    }
+  }
 
   const handleNetworkSwitch = async (networkId: number) => {
     const targetChain = getSupportedEvmChain(networkId)
@@ -261,8 +276,26 @@ export default function App() {
                   <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Machina Bridge</h1>
                 </a>
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
-                  Simple testnet swap and bridge flows for Arc, Sepolia, and Solana.
+                  {appNetwork === 'testnet'
+                    ? 'Testnet swap and bridge flows for Arc, Sepolia, and Solana.'
+                    : 'Arc mainnet readiness and live CCTP route verification.'}
                 </p>
+                <div className="mt-3 inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1">
+                  {(['testnet', 'mainnet'] as const).map((network) => (
+                    <button
+                      key={network}
+                      type="button"
+                      onClick={() => handleAppNetworkChange(network)}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                        appNetwork === network
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      {network === 'testnet' ? 'Testnet' : 'Mainnet'}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
@@ -285,82 +318,90 @@ export default function App() {
                   >
                     <Github size={16} />
                   </a>
-                {isConnected && (
-                  <div className="relative" ref={dropdownRef}>
+                {appNetwork === 'testnet' && (
+                  <>
+                  {isConnected && (
+                    <div className="relative" ref={dropdownRef}>
+                      <button
+                        onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
+                        className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+                      >
+                        <span>{getSupportedEvmChainName(chainId)}</span>
+                        <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
+                      </button>
+                      {showNetworkDropdown && (
+                        <div className="absolute right-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+                          {networks.map((network) => (
+                            <button
+                              key={network.id}
+                              onClick={() => handleNetworkSwitch(network.id)}
+                              className={`w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 ${
+                                chainId === network.id ? 'text-[#2F6E0C]' : 'text-slate-700'
+                              }`}
+                            >
+                              {network.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
+                  </>
+                )}
+              </div>
+
+              {appNetwork === 'testnet' && (
+                <>
+                {/* Row 2 — Solana + Sui side by side */}
+                <div className="flex items-center gap-3 lg:justify-end">
+                  {/* Solana */}
+                  <div className="flex items-center gap-1.5">
+                    <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
+                    <span className="text-xs text-slate-600">
+                      {isPhantomConnected ? 'Connected Solana' : 'Solana'}
+                    </span>
                     <button
-                      onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
-                      className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+                      onClick={handlePhantomAction}
+                      disabled={!isPhantomInstalled || isConnectingPhantomSolana}
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      <span>{getSupportedEvmChainName(chainId)}</span>
-                      <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
+                      {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
                     </button>
-                    {showNetworkDropdown && (
-                      <div className="absolute right-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
-                        {networks.map((network) => (
-                          <button
-                            key={network.id}
-                            onClick={() => handleNetworkSwitch(network.id)}
-                            className={`w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 ${
-                              chainId === network.id ? 'text-[#2F6E0C]' : 'text-slate-700'
-                            }`}
-                          >
-                            {network.name}
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                  </div>
+  
+                  <div className="h-4 w-px bg-slate-200" />
+  
+                  {/* Sui */}
+                  <div className="flex items-center gap-1.5">
+                    <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isSuiWalletConnected ? 'bg-sky-500' : 'bg-slate-300'}`} />
+                    <span className="text-xs text-slate-600">
+                      {isSuiWalletConnected ? 'Connected Sui' : 'Sui'}
+                    </span>
+                    <button
+                      onClick={handleSuiWalletAction}
+                      disabled={(!isSuiWalletAvailable && !isSuiWalletConnected) || isConnectingSuiWallet}
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isConnectingSuiWallet ? '...' : isSuiWalletConnected ? 'Disconnect' : 'Connect'}
+                    </button>
+                  </div>
+                </div>
+  
+                {/* Row 3 — wallet name status */}
+                <p className="text-[11px] text-slate-400 lg:text-right">
+                  Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
+                  {' · '}
+                  Sui wallet: {isSuiWalletConnected ? (suiCurrentWalletName || 'Connected') : '—'}
+                </p>
+  
+                {(phantomSolanaError || suiWalletError) && (
+                  <div className="text-[11px] text-red-500 lg:text-right">
+                    {phantomSolanaError && <p>{phantomSolanaError}</p>}
+                    {suiWalletError && <p>{suiWalletError}</p>}
                   </div>
                 )}
-                <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
-              </div>
-
-              {/* Row 2 — Solana + Sui side by side */}
-              <div className="flex items-center gap-3 lg:justify-end">
-                {/* Solana */}
-                <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
-                  <span className="text-xs text-slate-600">
-                    {isPhantomConnected ? 'Connected Solana' : 'Solana'}
-                  </span>
-                  <button
-                    onClick={handlePhantomAction}
-                    disabled={!isPhantomInstalled || isConnectingPhantomSolana}
-                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
-                  </button>
-                </div>
-
-                <div className="h-4 w-px bg-slate-200" />
-
-                {/* Sui */}
-                <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isSuiWalletConnected ? 'bg-sky-500' : 'bg-slate-300'}`} />
-                  <span className="text-xs text-slate-600">
-                    {isSuiWalletConnected ? 'Connected Sui' : 'Sui'}
-                  </span>
-                  <button
-                    onClick={handleSuiWalletAction}
-                    disabled={(!isSuiWalletAvailable && !isSuiWalletConnected) || isConnectingSuiWallet}
-                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isConnectingSuiWallet ? '...' : isSuiWalletConnected ? 'Disconnect' : 'Connect'}
-                  </button>
-                </div>
-              </div>
-
-              {/* Row 3 — wallet name status */}
-              <p className="text-[11px] text-slate-400 lg:text-right">
-                Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
-                {' · '}
-                Sui wallet: {isSuiWalletConnected ? (suiCurrentWalletName || 'Connected') : '—'}
-              </p>
-
-              {(phantomSolanaError || suiWalletError) && (
-                <div className="text-[11px] text-red-500 lg:text-right">
-                  {phantomSolanaError && <p>{phantomSolanaError}</p>}
-                  {suiWalletError && <p>{suiWalletError}</p>}
-                </div>
+                </>
               )}
             </div>
           </div>
@@ -370,61 +411,83 @@ export default function App() {
       <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
         <Container>
           <nav className="flex flex-wrap gap-2 py-4">
-            {tabs.map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors ${
-                  activeTab === tab.id
-                    ? 'border border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C] shadow-sm'
-                    : 'border border-transparent text-slate-500 hover:border-slate-200 hover:bg-white hover:text-slate-900'
-                }`}
-              >
-                {tab.icon}
-                {tab.label}
-              </button>
-            ))}
-
-            <div className="relative" ref={lendingDropdownRef}>
-              <button
-                onClick={() => setShowLendingDropdown(!showLendingDropdown)}
+            {appNetwork === 'testnet' ? (
+              <>
+  
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                    activeTab === tab.id
+                      ? 'border border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C] shadow-sm'
+                      : 'border border-transparent text-slate-500 hover:border-slate-200 hover:bg-white hover:text-slate-900'
+                  }`}
+                >
+                  {tab.icon}
+                  {tab.label}
+                </button>
+              ))}
+  
+              <div className="relative" ref={lendingDropdownRef}>
+                <button
+                  onClick={() => setShowLendingDropdown(!showLendingDropdown)}
+                  className="inline-flex items-center gap-2 rounded-full border border-transparent px-4 py-2 text-sm font-medium text-slate-500 transition-colors hover:border-slate-200 hover:bg-white hover:text-slate-900"
+                >
+                  Lending
+                  <ChevronDown size={14} className={`transition-transform ${showLendingDropdown ? 'rotate-180' : ''}`} />
+                </button>
+                {showLendingDropdown && (
+                  <div className="absolute left-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+                    <a
+                      href="https://arcmachina.xyz/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block rounded-lg px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                      onClick={() => setShowLendingDropdown(false)}
+                    >
+                      Arc Machina
+                    </a>
+                  </div>
+                )}
+              </div>
+  
+              <a
+                href="https://faucet.circle.com/"
+                target="_blank"
+                rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 rounded-full border border-transparent px-4 py-2 text-sm font-medium text-slate-500 transition-colors hover:border-slate-200 hover:bg-white hover:text-slate-900"
               >
-                Lending
-                <ChevronDown size={14} className={`transition-transform ${showLendingDropdown ? 'rotate-180' : ''}`} />
-              </button>
-              {showLendingDropdown && (
-                <div className="absolute left-0 top-full z-50 mt-2 min-w-[160px] rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
-                  <a
-                    href="https://arcmachina.xyz/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="block rounded-lg px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 hover:text-slate-900"
-                    onClick={() => setShowLendingDropdown(false)}
-                  >
-                    Arc Machina
-                  </a>
-                </div>
-              )}
-            </div>
-
-            <a
-              href="https://faucet.circle.com/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 rounded-full border border-transparent px-4 py-2 text-sm font-medium text-slate-500 transition-colors hover:border-slate-200 hover:bg-white hover:text-slate-900"
-            >
-              <Droplets size={18} />
-              Faucet
-            </a>
+                <Droplets size={18} />
+                Faucet
+              </a>
+  
+              </>
+            ) : (
+              <>
+                <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-800">
+                  <GitBranch size={18} />
+                  Mainnet Bridge
+                </span>
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-500">
+                  Transactions locked
+                </span>
+              </>
+            )}
           </nav>
         </Container>
       </div>
 
       <main className="pb-10">
-        {activeTab === 'swap' && <SwapTab />}
-        {activeTab === 'bridge' && <BridgeTab />}
-        {activeTab === 'dashboard' && <DashboardTab />}
+        {appNetwork === 'mainnet' ? (
+          <MainnetPreviewGate />
+        ) : (
+          <>
+            {activeTab === 'swap' && <SwapTab />}
+            {activeTab === 'bridge' && <BridgeTab />}
+            {activeTab === 'dashboard' && <DashboardTab />}
+          </>
+        )}
       </main>
 
       <footer className="mt-12 border-t border-slate-200 py-8">
@@ -432,10 +495,14 @@ export default function App() {
           <div className="text-center text-sm text-slate-500">
             <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
               <p className="mb-2 font-semibold text-[#2F6E0C]">
-                Independent testnet application for Arc ecosystem experimentation.
+                {appNetwork === 'testnet'
+                  ? 'Independent testnet application for Arc ecosystem experimentation.'
+                  : 'Independent Arc ecosystem application — mainnet verification mode.'}
               </p>
               <p>
-                Uses test tokens only. Not for production or real value transfers.{' '}
+                {appNetwork === 'testnet'
+                  ? 'Uses test tokens only. Not for production or real value transfers.'
+                  : 'Mainnet transaction execution remains locked. No real-value transfer can be initiated from this mode.'}{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"

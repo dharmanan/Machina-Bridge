@@ -69,10 +69,10 @@ export default function MainnetPreviewGate() {
   }, [])
 
   return (
-    <main className="min-h-screen bg-slate-50 px-4 py-12 text-slate-900">
+    <section className="bg-slate-50 px-4 py-8 text-slate-900">
       <div className="mx-auto max-w-3xl rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
         <div className="inline-flex rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-amber-800">
-          Hidden mainnet preview
+          Mainnet preview
         </div>
 
         <h1 className="mt-5 text-3xl font-semibold tracking-tight">Machina Bridge Mainnet</h1>
@@ -164,6 +164,6 @@ export default function MainnetPreviewGate() {
           No bridge, swap, Gateway, wallet signature, approval, burn, mint, or other real-fund transaction can be initiated from this preview.
         </div>
       </div>
-    </main>
+    </section>
   )
 }
