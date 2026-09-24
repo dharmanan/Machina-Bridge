@@ -218,7 +218,6 @@ export default function MainnetPreviewGate() {
         sourceChainId,
         destinationChainId,
         amount,
-        mode: 'fast',
       })
       setQuoteResult(result)
     } catch (error) {

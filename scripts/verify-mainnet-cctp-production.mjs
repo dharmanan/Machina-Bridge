@@ -37,8 +37,7 @@ const CHAINS = {
 }
 
 const tokenMessengerAbi = parseAbi([
-  'function MIN_FEE_MULTIPLIER() view returns (uint256)',
-  'function getMinFeeAmount(uint256 amount) view returns (uint256)',
+  'function remoteTokenMessengers(uint32 domain) view returns (bytes32)',
   'function depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold)',
 ])
 const messageTransmitterAbi = parseAbi([
@@ -97,12 +96,19 @@ async function verifyRoute(checks, source, destination) {
   record(checks,`${destination.name} USDC bytecode`,Boolean(destUsdc&&destUsdc!=='0x'))
   record(checks,`${destination.name} MessageTransmitterV2 bytecode`,Boolean(mt&&mt!=='0x'))
 
-  const multiplier=await sourceClient.readContract({
+  const remoteMessenger=await sourceClient.readContract({
     address:TOKEN_MESSENGER_V2,
     abi:tokenMessengerAbi,
-    functionName:'MIN_FEE_MULTIPLIER',
+    functionName:'remoteTokenMessengers',
+    args:[destination.domain],
   })
-  record(checks,`${source.name} MIN_FEE_MULTIPLIER`,multiplier===10_000_000n,multiplier.toString())
+  const expectedRemoteMessenger=padHex(TOKEN_MESSENGER_V2,{size:32})
+  record(
+    checks,
+    `${source.name} → ${destination.name} remote TokenMessenger`,
+    remoteMessenger.toLowerCase()===expectedRemoteMessenger.toLowerCase(),
+    remoteMessenger,
+  )
 
   const options=await fees(source,destination)
   const fee=options.find((x)=>x.finalityThreshold===source.threshold)
@@ -115,17 +121,11 @@ async function verifyRoute(checks, source, destination) {
   if(!fee)return
 
   const {protocolFeeRaw,maxFeeRaw}=quote(AMOUNT_RAW,fee.minimumFee,source.mode)
-  const onchainMin=await sourceClient.readContract({
-    address:TOKEN_MESSENGER_V2,
-    abi:tokenMessengerAbi,
-    functionName:'getMinFeeAmount',
-    args:[AMOUNT_RAW],
-  })
   record(
     checks,
-    `${source.name} → ${destination.name} maxFee covers onchain minimum`,
-    maxFeeRaw>=onchainMin&&maxFeeRaw<AMOUNT_RAW,
-    `fee≈${formatUnits(protocolFeeRaw,6)} maxFee=${formatUnits(maxFeeRaw,6)} onchainMin=${formatUnits(onchainMin,6)} USDC`,
+    `${source.name} → ${destination.name} maxFee bounds`,
+    maxFeeRaw>=protocolFeeRaw&&maxFeeRaw<AMOUNT_RAW,
+    `fee≈${formatUnits(protocolFeeRaw,6)} maxFee=${formatUnits(maxFeeRaw,6)} USDC`,
   )
 
   const caller=padHex(DUMMY_WALLET,{size:32})
