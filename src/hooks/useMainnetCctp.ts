@@ -3,7 +3,10 @@ import { useAccount, useSwitchChain } from 'wagmi'
 import { getWalletClient } from 'wagmi/actions'
 import { createPublicClient, fallback, http, type Hex } from 'viem'
 import { getRuntimeCapabilities } from '../config/features'
-import { getMainnetCctpRoute } from '../config/mainnetCctp'
+import {
+  getDefaultMainnetCctpTransferMode,
+  getMainnetCctpRoute,
+} from '../config/mainnetCctp'
 import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
@@ -85,6 +88,7 @@ export function useMainnetCctp() {
     destinationChainId: number
     amount: string
     approvalRequired: boolean
+    mode?: MainnetCctpTransferMode
     recipient?: string
     destinationCaller?: string
   }) => {
@@ -100,6 +104,7 @@ export function useMainnetCctp() {
       recipient: input.recipient ?? address,
       destinationCaller: input.destinationCaller ?? address,
       approvalRequired: input.approvalRequired,
+      mode: input.mode ?? getDefaultMainnetCctpTransferMode(input.sourceChainId),
     })
   }, [address])
 

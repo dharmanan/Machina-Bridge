@@ -1,3 +1,5 @@
+import type { MainnetCctpTransferMode } from '../config/mainnetCctp'
+
 export const MAINNET_TRANSFER_QUEUE_KEY = 'machina_mainnet_transfers_v1'
 export const MAINNET_TRANSFER_QUEUE_EVENT = 'machina:mainnet-transfer-queue'
 
@@ -20,7 +22,7 @@ export type MainnetTransferRecord = {
   destinationChainId: number
   amount: string
   token: 'USDC'
-  mode: 'fast'
+  mode: MainnetCctpTransferMode
   recipient: string
   destinationCaller: string
   stage: MainnetTransferStage
@@ -42,6 +44,7 @@ export type CreateMainnetTransferInput = {
   recipient: string
   destinationCaller: string
   approvalRequired: boolean
+  mode: MainnetCctpTransferMode
 }
 
 const COMPLETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
@@ -133,7 +136,7 @@ export function createMainnetTransferRecord(
     destinationChainId: input.destinationChainId,
     amount: input.amount,
     token: 'USDC',
-    mode: 'fast',
+    mode: input.mode,
     recipient: input.recipient,
     destinationCaller: input.destinationCaller,
     stage: input.approvalRequired ? 'approval_required' : 'ready',
