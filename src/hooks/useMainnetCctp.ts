@@ -1,13 +1,21 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { getWalletClient } from 'wagmi/actions'
-import { createPublicClient, fallback, http, type Hex } from 'viem'
+import { createPublicClient, fallback, http, parseUnits, type Hex } from 'viem'
+import { getCircleMainnetReadiness } from '../config/circle'
 import { getRuntimeCapabilities } from '../config/features'
+import { getMainnetReadiness } from '../config/mainnet'
 import {
   getDefaultMainnetCctpTransferMode,
   getMainnetCctpRoute,
 } from '../config/mainnetCctp'
-import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
+import {
+  MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID,
+  MAINNET_CCTP_CANARY_ENABLED,
+  MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
+  MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID,
+  MAINNET_RUNTIME_IMPLEMENTED,
+} from '../config/runtime'
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
   fetchMainnetCctpAttestation,
@@ -54,10 +62,123 @@ function makePublicClient(rpcUrls: readonly string[]) {
   })
 }
 
-function assertMainnetWritesEnabled() {
+function globalMainnetWritesEnabled() {
   const capabilities = getRuntimeCapabilities('mainnet')
-  if (!MAINNET_RUNTIME_IMPLEMENTED || !capabilities.evmBridge || !capabilities.realValueTransfers) {
-    throw new Error('Mainnet CCTP transactions are locked until final readiness review and deliberate runtime unlock.')
+  return MAINNET_RUNTIME_IMPLEMENTED
+    && capabilities.evmBridge
+    && capabilities.realValueTransfers
+}
+
+function canaryReadinessPassed() {
+  return MAINNET_CCTP_CANARY_ENABLED
+    && getMainnetReadiness().ready
+    && getCircleMainnetReadiness().cctpReady
+}
+
+function assertCanaryTransferRecord(input: {
+  transferId?: string
+  connectedAddress: string
+}) {
+  if (!input.transferId) {
+    throw new Error('Mainnet canary requires a persistent transfer record.')
+  }
+
+  const record = getMainnetTransfer(input.transferId)
+  if (!record) {
+    throw new Error('Mainnet canary transfer record was not found.')
+  }
+
+  const connected = input.connectedAddress.toLowerCase()
+  const amountRaw = parseUnits(record.amount, 6)
+
+  if (
+    record.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
+    || record.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+    || record.mode !== 'standard'
+    || amountRaw <= 0n
+    || amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    || record.walletAddress.toLowerCase() !== connected
+    || record.recipient.toLowerCase() !== connected
+    || record.destinationCaller.toLowerCase() !== connected
+  ) {
+    throw new Error('Transfer does not satisfy the Arc → Base 0.1 USDC canary guard.')
+  }
+
+  return { record, amountRaw }
+}
+
+function assertCanaryApprovalAllowed(input: {
+  sourceChainId: number
+  amountRaw: bigint
+  transferId?: string
+  connectedAddress: string
+}) {
+  if (globalMainnetWritesEnabled()) return
+
+  if (!canaryReadinessPassed()) {
+    throw new Error('Mainnet CCTP canary is not ready.')
+  }
+
+  const { record, amountRaw } = assertCanaryTransferRecord(input)
+
+  if (
+    input.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
+    || input.amountRaw !== amountRaw
+    || record.stage !== 'approval_required'
+  ) {
+    throw new Error('Approval does not satisfy the mainnet canary guard.')
+  }
+}
+
+function assertCanaryBurnAllowed(input: {
+  quote: MainnetCctpQuote
+  transferId?: string
+  connectedAddress: string
+  recipient: string
+  destinationCaller: string
+}) {
+  if (globalMainnetWritesEnabled()) return
+
+  if (!canaryReadinessPassed()) {
+    throw new Error('Mainnet CCTP canary is not ready.')
+  }
+
+  const { record, amountRaw } = assertCanaryTransferRecord(input)
+  const connected = input.connectedAddress.toLowerCase()
+
+  if (
+    input.quote.sourceChainId !== MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
+    || input.quote.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+    || input.quote.mode !== 'standard'
+    || input.quote.amountRaw !== amountRaw
+    || input.quote.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    || input.recipient.toLowerCase() !== connected
+    || input.destinationCaller.toLowerCase() !== connected
+    || (record.stage !== 'ready' && record.stage !== 'approved')
+  ) {
+    throw new Error('Burn does not satisfy the mainnet canary guard.')
+  }
+}
+
+function assertCanaryMintAllowed(input: {
+  destinationChainId: number
+  transferId?: string
+  connectedAddress: string
+}) {
+  if (globalMainnetWritesEnabled()) return
+
+  if (!canaryReadinessPassed()) {
+    throw new Error('Mainnet CCTP canary is not ready.')
+  }
+
+  const { record } = assertCanaryTransferRecord(input)
+
+  if (
+    input.destinationChainId !== MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+    || record.stage !== 'ready_to_mint'
+    || !record.sourceTxHash
+  ) {
+    throw new Error('Mint does not satisfy the mainnet canary guard.')
   }
 }
 
@@ -70,10 +191,8 @@ export function useMainnetCctp() {
     isLoading: false,
   })
 
-  const writesUnlocked = useMemo(() => {
-    const capabilities = getRuntimeCapabilities('mainnet')
-    return MAINNET_RUNTIME_IMPLEMENTED && capabilities.evmBridge && capabilities.realValueTransfers
-  }, [])
+  const writesUnlocked = useMemo(() => globalMainnetWritesEnabled(), [])
+  const canaryWritesUnlocked = useMemo(() => canaryReadinessPassed(), [])
 
   const reset = useCallback(() => {
     setState({
@@ -178,7 +297,15 @@ export function useMainnetCctp() {
     amountRaw: bigint
     transferId?: string
   }): Promise<Hex> => {
-    assertMainnetWritesEnabled()
+    if (!address) {
+      throw new Error('Connect a wallet before submitting a mainnet approval.')
+    }
+
+    assertCanaryApprovalAllowed({
+      ...input,
+      connectedAddress: address,
+    })
+
     const route = getMainnetCctpRoute(input.sourceChainId, 5042)
       ?? getMainnetCctpRoute(input.sourceChainId, 1)
       ?? getMainnetCctpRoute(input.sourceChainId, 8453)
@@ -244,10 +371,20 @@ export function useMainnetCctp() {
     destinationCaller?: string
     transferId?: string
   }): Promise<Hex> => {
-    assertMainnetWritesEnabled()
     if (!address) {
       throw new Error('Connect a wallet before submitting a burn transaction.')
     }
+
+    const recipient = input.recipient ?? address
+    const destinationCaller = input.destinationCaller ?? address
+
+    assertCanaryBurnAllowed({
+      quote: input.quote,
+      transferId: input.transferId,
+      connectedAddress: address,
+      recipient,
+      destinationCaller,
+    })
 
     const route = getMainnetCctpRoute(input.quote.sourceChainId, input.quote.destinationChainId)
     if (!route) {
@@ -265,8 +402,8 @@ export function useMainnetCctp() {
       const walletClient = await ensureWalletOnChain(input.quote.sourceChainId)
       const call = prepareMainnetCctpBurn({
         quote: input.quote,
-        recipient: input.recipient ?? address,
-        destinationCaller: input.destinationCaller ?? address,
+        recipient,
+        destinationCaller,
       })
       hash = await walletClient.sendTransaction({
         account: address,
@@ -351,10 +488,15 @@ export function useMainnetCctp() {
     attestation: Hex
     transferId?: string
   }): Promise<Hex> => {
-    assertMainnetWritesEnabled()
     if (!address) {
       throw new Error('Connect a wallet before submitting the mint transaction.')
     }
+
+    assertCanaryMintAllowed({
+      destinationChainId: input.destinationChainId,
+      transferId: input.transferId,
+      connectedAddress: address,
+    })
 
     const route = getMainnetCctpRoute(8453, input.destinationChainId)
       ?? getMainnetCctpRoute(1, input.destinationChainId)
@@ -423,6 +565,7 @@ export function useMainnetCctp() {
   return {
     state,
     writesUnlocked,
+    canaryWritesUnlocked,
     createTransferPlan,
     quote,
     simulateSource,

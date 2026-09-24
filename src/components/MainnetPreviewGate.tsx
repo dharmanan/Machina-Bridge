@@ -11,7 +11,12 @@ import {
   probeMainnetCctpRoute,
   type MainnetCctpRouteProbe,
 } from '../config/mainnetCctp'
-import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
+import {
+  MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID,
+  MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
+  MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID,
+  MAINNET_RUNTIME_IMPLEMENTED,
+} from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
@@ -126,17 +131,29 @@ export default function MainnetPreviewGate() {
   const readiness = getMainnetReadiness()
   const circleReadiness = getCircleMainnetReadiness()
   const { address, isConnected } = useAccount()
-  const { state: cctpState, quote, simulateSource, writesUnlocked } = useMainnetCctp()
+  const {
+    state: cctpState,
+    quote,
+    simulateSource,
+    writesUnlocked,
+    canaryWritesUnlocked,
+    createTransferPlan,
+    approve,
+    burn,
+    getAttestation,
+    mint,
+  } = useMainnetCctp()
   const { activeTransfers, readyToMintCount } = useMainnetTransferQueue(address)
 
   const [probe, setProbe] = useState<MainnetCapabilityProbeResult | null>(null)
   const [baseToArcProbe, setBaseToArcProbe] = useState<MainnetCctpRouteProbe | null>(null)
   const [arcToBaseProbe, setArcToBaseProbe] = useState<MainnetCctpRouteProbe | null>(null)
-  const [source, setSource] = useState<RouteEndpoint>('base')
-  const [amount, setAmount] = useState('')
+  const [source, setSource] = useState<RouteEndpoint>('arc')
+  const [amount, setAmount] = useState('0.1')
   const [quoteResult, setQuoteResult] = useState<MainnetCctpQuote | null>(null)
   const [simulation, setSimulation] = useState<MainnetCctpSourceSimulation | null>(null)
   const [readOnlyError, setReadOnlyError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
 
   const destination: RouteEndpoint = source === 'base' ? 'arc' : 'base'
   const sourceName = source === 'base' ? 'Base' : 'Arc'
@@ -176,6 +193,7 @@ export default function MainnetPreviewGate() {
     setQuoteResult(null)
     setSimulation(null)
     setReadOnlyError(null)
+    setActionError(null)
   }, [source, amount, address])
 
   const arcStatus = useMemo<'ready' | 'checking' | 'blocked'>(() => {
@@ -261,15 +279,202 @@ export default function MainnetPreviewGate() {
     && circleStatus === 'ready'
     && routeStatus === 'ready',
   )
-  const approvalIsNext = Boolean(preflightReady && simulation?.approvalRequired)
-  const burnIsNext = Boolean(preflightReady && simulation && !simulation.approvalRequired && simulation.readyForBurn)
-  const lockedActionLabel = !preflightReady
-    ? 'Run preflight checks'
-    : approvalIsNext
-      ? `Approve ${amount} USDC`
-      : burnIsNext
-        ? `Burn ${amount} USDC`
-        : 'Transfer not ready'
+  const canaryAmountRaw = quoteResult?.amountRaw ?? 0n
+  const canaryRouteSelected =
+    sourceChainId === MAINNET_CCTP_CANARY_SOURCE_CHAIN_ID
+    && destinationChainId === MAINNET_CCTP_CANARY_DESTINATION_CHAIN_ID
+
+  const canaryEligible =
+    canaryRouteSelected
+    && canaryAmountRaw > 0n
+    && canaryAmountRaw <= MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    && quoteResult?.mode === 'standard'
+
+  const matchingTransfer = activeTransfers.find((transfer) =>
+    transfer.sourceChainId === sourceChainId
+    && transfer.destinationChainId === destinationChainId
+    && Number(transfer.amount) === Number(amount),
+  )
+
+  const transferStage = matchingTransfer?.stage
+
+  const approvalIsNext = transferStage
+    ? transferStage === 'approval_required' || transferStage === 'approving'
+    : Boolean(preflightReady && simulation?.approvalRequired)
+
+  const burnIsNext = transferStage
+    ? transferStage === 'ready'
+      || transferStage === 'approved'
+      || transferStage === 'burning'
+    : Boolean(
+        preflightReady
+        && simulation
+        && !simulation.approvalRequired
+        && simulation.readyForBurn,
+      )
+
+  const attestationIsNext = transferStage === 'waiting_attestation'
+  const mintIsNext =
+    transferStage === 'ready_to_mint'
+    || transferStage === 'minting'
+
+  const actionLabel = !canaryRouteSelected
+    ? 'Canary available only for Arc → Base'
+    : quoteResult && quoteResult.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+      ? 'Canary maximum is 0.1 USDC'
+      : !isConnected
+        ? 'Connect wallet'
+        : transferStage === 'approving'
+          ? 'Approval pending...'
+          : transferStage === 'burning'
+            ? 'Burn pending...'
+            : transferStage === 'waiting_attestation'
+              ? 'Waiting for attestation...'
+              : transferStage === 'minting'
+                ? 'Mint pending...'
+                : transferStage === 'ready_to_mint'
+                  ? 'Mint on Base'
+                  : transferStage === 'approved' || transferStage === 'ready'
+                    ? `Burn ${amount} USDC`
+                    : !preflightReady
+                      ? 'Run preflight checks'
+                      : simulation?.approvalRequired
+                        ? `Approve ${amount} USDC`
+                        : `Burn ${amount} USDC`
+
+  const actionDisabled =
+    !canaryWritesUnlocked
+    || !isConnected
+    || (!matchingTransfer && (!preflightReady || !canaryEligible))
+    || transferStage === 'approving'
+    || transferStage === 'burning'
+    || transferStage === 'waiting_attestation'
+    || transferStage === 'minting'
+    || transferStage === 'failed'
+    || cctpState.isLoading
+
+  const runCanaryAction = useCallback(async () => {
+    if (!address) return
+
+    setActionError(null)
+
+    try {
+      let transfer = matchingTransfer
+
+      if (!transfer) {
+        if (!quoteResult || !simulation || !preflightReady || !canaryEligible) {
+          throw new Error('Arc → Base canary preflight is not ready.')
+        }
+
+        transfer = createTransferPlan({
+          sourceChainId,
+          destinationChainId,
+          amount,
+          approvalRequired: simulation.approvalRequired,
+          mode: quoteResult.mode,
+          recipient: address,
+          destinationCaller: address,
+        })
+      }
+
+      if (transfer.stage === 'approval_required') {
+        if (!quoteResult || !simulation?.readyForApproval) {
+          throw new Error(
+            'Approval simulation must pass before requesting a signature.',
+          )
+        }
+
+        await approve({
+          sourceChainId: transfer.sourceChainId,
+          amountRaw: quoteResult.amountRaw,
+          transferId: transfer.id,
+        })
+
+        await runReadOnlyCheck()
+        return
+      }
+
+      if (transfer.stage === 'ready' || transfer.stage === 'approved') {
+        const freshSimulation = await simulateSource({
+          sourceChainId: transfer.sourceChainId,
+          destinationChainId: transfer.destinationChainId,
+          amount: transfer.amount,
+          recipient: address,
+          mode: transfer.mode,
+        })
+
+        setSimulation(freshSimulation)
+        setQuoteResult(freshSimulation.quote)
+
+        if (!freshSimulation.readyForBurn) {
+          throw new Error(
+            'Fresh burn simulation did not pass. No transaction was submitted.',
+          )
+        }
+
+        await burn({
+          quote: freshSimulation.quote,
+          recipient: address,
+          destinationCaller: address,
+          transferId: transfer.id,
+        })
+
+        return
+      }
+
+      if (transfer.stage === 'ready_to_mint') {
+        if (!transfer.sourceTxHash) {
+          throw new Error(
+            'Source transaction hash is missing from the transfer record.',
+          )
+        }
+
+        const attestation = await getAttestation({
+          sourceChainId: transfer.sourceChainId,
+          sourceTxHash: transfer.sourceTxHash as `0x${string}`,
+          transferId: transfer.id,
+        })
+
+        if (
+          attestation.status !== 'complete'
+          || !attestation.message
+          || !attestation.attestation
+        ) {
+          throw new Error('Circle attestation is not complete yet.')
+        }
+
+        await mint({
+          destinationChainId: transfer.destinationChainId,
+          message: attestation.message,
+          attestation: attestation.attestation,
+          transferId: transfer.id,
+        })
+      }
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : 'Mainnet canary action failed.',
+      )
+    }
+  }, [
+    address,
+    amount,
+    approve,
+    burn,
+    canaryEligible,
+    createTransferPlan,
+    destinationChainId,
+    getAttestation,
+    matchingTransfer,
+    mint,
+    preflightReady,
+    quoteResult,
+    runReadOnlyCheck,
+    simulateSource,
+    simulation,
+    sourceChainId,
+  ])
 
   return (
     <section className="bg-slate-50 px-4 py-5 text-slate-900">
@@ -368,7 +573,7 @@ export default function MainnetPreviewGate() {
           </div>
 
           <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-900">
-            Read-only checks use production RPCs and Circle services. Wallet balance, allowance and transaction simulation are read without requesting a signature or broadcasting a transaction.
+            Preflight checks use production RPCs and Circle services without signatures. The Arc → Base canary below can request real mainnet wallet signatures for transfers up to 0.1 USDC.
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -477,7 +682,8 @@ export default function MainnetPreviewGate() {
               <StatusRow label="Arc Mainnet" state={arcStatus} />
               <StatusRow label="Circle CCTP" state={circleStatus} />
               <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
-              <StatusRow label="Transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
+              <StatusRow label="Global transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
+              <StatusRow label="Arc → Base canary ≤ 0.1 USDC" state={canaryWritesUnlocked ? 'ready' : 'locked'} />
             </div>
           </div>
 
@@ -547,8 +753,8 @@ export default function MainnetPreviewGate() {
                   Each transaction stays explicit. Attestation is monitored automatically; destination mint remains manual.
                 </p>
               </div>
-              <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-500">
-                preview
+              <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
+                canary
               </span>
             </div>
 
@@ -565,13 +771,29 @@ export default function MainnetPreviewGate() {
                 detail={simulation?.approvalRequired
                   ? `Authorize exactly ${amount || '0'} USDC for Circle TokenMessenger.`
                   : 'Skipped when the existing allowance is sufficient.'}
-                state={approvalIsNext ? 'current' : preflightReady && !simulation?.approvalRequired ? 'complete' : 'locked'}
+                state={
+                  transferStage
+                    && !['approval_required', 'approving'].includes(transferStage)
+                    ? 'complete'
+                    : approvalIsNext
+                      ? 'current'
+                      : preflightReady && !simulation?.approvalRequired
+                        ? 'complete'
+                        : 'locked'
+                }
               />
               <PreviewStep
                 index={3}
                 title="Burn on source"
                 detail={`Confirm the ${sourceName} CCTP burn and lock the destination caller to this wallet.`}
-                state={burnIsNext ? 'current' : 'locked'}
+                state={
+                  transferStage
+                    && ['waiting_attestation', 'ready_to_mint', 'minting'].includes(transferStage)
+                    ? 'complete'
+                    : burnIsNext
+                      ? 'current'
+                      : 'locked'
+                }
               />
               <PreviewStep
                 index={4}
@@ -579,27 +801,41 @@ export default function MainnetPreviewGate() {
                 detail={selectedMode === 'fast'
                   ? 'Circle Fast attestation is monitored in the background while other transfers can continue.'
                   : 'Circle Standard attestation is monitored in the background; Arc source finality is already rapid.'}
-                state="locked"
+                state={
+                  transferStage
+                    && ['ready_to_mint', 'minting'].includes(transferStage)
+                    ? 'complete'
+                    : attestationIsNext
+                      ? 'current'
+                      : 'locked'
+                }
               />
               <PreviewStep
                 index={5}
                 title={`Mint on ${destinationName}`}
                 detail={`Only ${maskAddress(address)} is configured to complete the destination receiveMessage call.`}
-                state="locked"
+                state={mintIsNext ? 'current' : 'locked'}
               />
             </div>
 
+            {actionError && (
+              <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                {actionError}
+              </p>
+            )}
+
             <button
               type="button"
-              disabled
-              className="mt-5 inline-flex h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-2xl bg-[#9fbd90] px-4 text-sm font-semibold text-white opacity-90"
+              onClick={() => void runCanaryAction()}
+              disabled={actionDisabled}
+              className="mt-5 inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-[#66D121] px-4 text-sm font-semibold text-slate-950 transition-colors hover:bg-[#5bc11c] disabled:cursor-not-allowed disabled:bg-[#9fbd90] disabled:text-white"
             >
-              <LockKeyhole size={16} />
-              {lockedActionLabel}
+              {actionDisabled ? <LockKeyhole size={16} /> : <Wallet size={16} />}
+              {actionLabel}
             </button>
 
             <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-              Preview only. Mainnet transaction writes remain code-locked until the production runtime is deliberately unlocked.
+              Real mainnet canary: Arc → Base only, maximum 0.1 USDC. Recipient and destination caller are locked to the connected wallet. Global mainnet and Gateway remain locked.
             </p>
           </div>
         </div>
