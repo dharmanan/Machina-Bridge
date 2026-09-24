@@ -17,6 +17,12 @@ import {
   type MainnetCctpTransferMode,
 } from '../lib/mainnetCctpTransfer'
 import { simulateMainnetCctpSource } from '../lib/mainnetCctpSimulation'
+import {
+  createMainnetTransferRecord,
+  getMainnetTransfer,
+  transitionMainnetTransfer,
+  updateMainnetTransferRecord,
+} from '../lib/mainnetTransferQueue'
 
 export type MainnetCctpStep =
   | 'idle'
@@ -73,6 +79,29 @@ export function useMainnetCctp() {
       isLoading: false,
     })
   }, [])
+
+  const createTransferPlan = useCallback((input: {
+    sourceChainId: number
+    destinationChainId: number
+    amount: string
+    approvalRequired: boolean
+    recipient?: string
+    destinationCaller?: string
+  }) => {
+    if (!address) {
+      throw new Error('Connect a wallet before creating a mainnet transfer plan.')
+    }
+
+    return createMainnetTransferRecord({
+      walletAddress: address,
+      sourceChainId: input.sourceChainId,
+      destinationChainId: input.destinationChainId,
+      amount: input.amount,
+      recipient: input.recipient ?? address,
+      destinationCaller: input.destinationCaller ?? address,
+      approvalRequired: input.approvalRequired,
+    })
+  }, [address])
 
   const quote = useCallback(async (input: {
     sourceChainId: number
@@ -142,6 +171,7 @@ export function useMainnetCctp() {
   const approve = useCallback(async (input: {
     sourceChainId: number
     amountRaw: bigint
+    transferId?: string
   }): Promise<Hex> => {
     assertMainnetWritesEnabled()
     const route = getMainnetCctpRoute(input.sourceChainId, 5042)
@@ -155,22 +185,49 @@ export function useMainnetCctp() {
     }
 
     setState((current) => ({ ...current, step: 'approving', error: null, isLoading: true }))
+    if (input.transferId) {
+      transitionMainnetTransfer(input.transferId, 'approving', { lastError: undefined })
+    }
+
+    let hash: Hex | undefined
     try {
       const walletClient = await ensureWalletOnChain(input.sourceChainId)
       const call = prepareMainnetCctpApproval(input)
-      const hash = await walletClient.sendTransaction({
+      hash = await walletClient.sendTransaction({
         account: address!,
         to: call.to,
         data: call.data,
         value: call.value,
       })
 
+      if (input.transferId) {
+        updateMainnetTransferRecord(input.transferId, { approvalTxHash: hash })
+      }
+
       const publicClient = makePublicClient(route.source.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
+
+      if (input.transferId) {
+        transitionMainnetTransfer(input.transferId, 'approved', {
+          approvalTxHash: hash,
+          lastError: undefined,
+        })
+      }
+
       setState((current) => ({ ...current, step: 'idle', isLoading: false }))
       return hash
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Mainnet USDC approval failed.'
+      if (input.transferId) {
+        if (hash) {
+          updateMainnetTransferRecord(input.transferId, {
+            approvalTxHash: hash,
+            lastError: message,
+          })
+        } else {
+          transitionMainnetTransfer(input.transferId, 'approval_required', { lastError: message })
+        }
+      }
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
@@ -180,6 +237,7 @@ export function useMainnetCctp() {
     quote: MainnetCctpQuote
     recipient?: string
     destinationCaller?: string
+    transferId?: string
   }): Promise<Hex> => {
     assertMainnetWritesEnabled()
     if (!address) {
@@ -192,6 +250,12 @@ export function useMainnetCctp() {
     }
 
     setState((current) => ({ ...current, step: 'burning', error: null, isLoading: true }))
+    const transferBeforeBurn = input.transferId ? getMainnetTransfer(input.transferId) : undefined
+    if (input.transferId) {
+      transitionMainnetTransfer(input.transferId, 'burning', { lastError: undefined })
+    }
+
+    let hash: Hex | undefined
     try {
       const walletClient = await ensureWalletOnChain(input.quote.sourceChainId)
       const call = prepareMainnetCctpBurn({
@@ -199,15 +263,27 @@ export function useMainnetCctp() {
         recipient: input.recipient ?? address,
         destinationCaller: input.destinationCaller ?? address,
       })
-      const hash = await walletClient.sendTransaction({
+      hash = await walletClient.sendTransaction({
         account: address,
         to: call.to,
         data: call.data,
         value: call.value,
       })
 
+      if (input.transferId) {
+        updateMainnetTransferRecord(input.transferId, { sourceTxHash: hash })
+      }
+
       const publicClient = makePublicClient(route.source.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
+
+      if (input.transferId) {
+        transitionMainnetTransfer(input.transferId, 'waiting_attestation', {
+          sourceTxHash: hash,
+          lastError: undefined,
+        })
+      }
+
       setState((current) => ({
         ...current,
         step: 'waiting-attestation',
@@ -217,6 +293,20 @@ export function useMainnetCctp() {
       return hash
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Mainnet CCTP burn failed.'
+      if (input.transferId) {
+        if (hash) {
+          updateMainnetTransferRecord(input.transferId, {
+            sourceTxHash: hash,
+            lastError: message,
+          })
+        } else {
+          transitionMainnetTransfer(
+            input.transferId,
+            transferBeforeBurn?.approvalTxHash ? 'approved' : 'ready',
+            { lastError: message },
+          )
+        }
+      }
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
@@ -225,6 +315,7 @@ export function useMainnetCctp() {
   const getAttestation = useCallback(async (input: {
     sourceChainId: number
     sourceTxHash: Hex
+    transferId?: string
   }): Promise<MainnetCctpAttestation> => {
     setState((current) => ({ ...current, step: 'waiting-attestation', error: null, isLoading: true }))
     try {
@@ -232,6 +323,14 @@ export function useMainnetCctp() {
         sourceChainId: input.sourceChainId,
         transactionHash: input.sourceTxHash,
       })
+
+      if (input.transferId && result.status === 'complete') {
+        transitionMainnetTransfer(input.transferId, 'ready_to_mint', {
+          attestationReadyAt: Date.now(),
+          lastError: undefined,
+        })
+      }
+
       setState((current) => ({ ...current, step: 'waiting-attestation', isLoading: false }))
       return result
     } catch (error) {
@@ -245,6 +344,7 @@ export function useMainnetCctp() {
     destinationChainId: number
     message: Hex
     attestation: Hex
+    transferId?: string
   }): Promise<Hex> => {
     assertMainnetWritesEnabled()
     if (!address) {
@@ -262,18 +362,35 @@ export function useMainnetCctp() {
     }
 
     setState((current) => ({ ...current, step: 'minting', error: null, isLoading: true }))
+    if (input.transferId) {
+      transitionMainnetTransfer(input.transferId, 'minting', { lastError: undefined })
+    }
+
+    let hash: Hex | undefined
     try {
       const walletClient = await ensureWalletOnChain(input.destinationChainId)
       const call = prepareMainnetCctpMint(input)
-      const hash = await walletClient.sendTransaction({
+      hash = await walletClient.sendTransaction({
         account: address,
         to: call.to,
         data: call.data,
         value: call.value,
       })
 
+      if (input.transferId) {
+        updateMainnetTransferRecord(input.transferId, { destinationTxHash: hash })
+      }
+
       const publicClient = makePublicClient(route.destination.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
+
+      if (input.transferId) {
+        transitionMainnetTransfer(input.transferId, 'complete', {
+          destinationTxHash: hash,
+          lastError: undefined,
+        })
+      }
+
       setState((current) => ({
         ...current,
         step: 'success',
@@ -283,6 +400,16 @@ export function useMainnetCctp() {
       return hash
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Mainnet CCTP mint failed.'
+      if (input.transferId) {
+        if (hash) {
+          updateMainnetTransferRecord(input.transferId, {
+            destinationTxHash: hash,
+            lastError: message,
+          })
+        } else {
+          transitionMainnetTransfer(input.transferId, 'ready_to_mint', { lastError: message })
+        }
+      }
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
@@ -291,6 +418,7 @@ export function useMainnetCctp() {
   return {
     state,
     writesUnlocked,
+    createTransferPlan,
     quote,
     simulateSource,
     approve,

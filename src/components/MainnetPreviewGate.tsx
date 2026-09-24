@@ -12,6 +12,8 @@ import {
 } from '../config/mainnetCctp'
 import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
+import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
+import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
 import type { MainnetCctpSourceSimulation } from '../lib/mainnetCctpSimulation'
 
@@ -49,11 +51,33 @@ function maskAddress(address?: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
+function chainName(chainId: number) {
+  return Object.values(MAINNET_NETWORKS).find((network) => network.chainId === chainId)?.name
+    ?? `Chain ${chainId}`
+}
+
+function transferStageLabel(stage: MainnetTransferStage) {
+  const labels: Record<MainnetTransferStage, string> = {
+    ready: 'Ready to burn',
+    approval_required: 'Approval required',
+    approving: 'Approving',
+    approved: 'Approved',
+    burning: 'Burning',
+    waiting_attestation: 'Waiting attestation',
+    ready_to_mint: 'Ready to mint',
+    minting: 'Minting',
+    complete: 'Complete',
+    failed: 'Needs attention',
+  }
+  return labels[stage]
+}
+
 export default function MainnetPreviewGate() {
   const readiness = getMainnetReadiness()
   const circleReadiness = getCircleMainnetReadiness()
   const { address, isConnected } = useAccount()
   const { state: cctpState, quote, simulateSource, writesUnlocked } = useMainnetCctp()
+  const { activeTransfers, readyToMintCount } = useMainnetTransferQueue(address)
 
   const [probe, setProbe] = useState<MainnetCapabilityProbeResult | null>(null)
   const [baseToArcProbe, setBaseToArcProbe] = useState<MainnetCctpRouteProbe | null>(null)
@@ -387,6 +411,64 @@ export default function MainnetPreviewGate() {
               <StatusRow label="Transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
             </div>
           </div>
+
+          {activeTransfers.length > 0 && (
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Pending transfers</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Transfers continue to be tracked independently while other transfers can start.
+                  </p>
+                </div>
+                {readyToMintCount > 0 && (
+                  <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-xs font-semibold text-[#2F6E0C]">
+                    {readyToMintCount} ready to mint
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-2.5">
+                {activeTransfers.slice(0, 5).map((transfer) => (
+                  <div
+                    key={transfer.id}
+                    className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">
+                          {transfer.amount} USDC
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {chainName(transfer.sourceChainId)} → {chainName(transfer.destinationChainId)}
+                        </p>
+                      </div>
+                      <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                        transfer.stage === 'ready_to_mint'
+                          ? 'bg-[#eef7e8] text-[#2F6E0C]'
+                          : transfer.stage === 'failed'
+                            ? 'bg-amber-100 text-amber-800'
+                            : 'bg-sky-100 text-sky-700'
+                      }`}>
+                        {transferStageLabel(transfer.stage)}
+                      </span>
+                    </div>
+
+                    {transfer.sourceTxHash && (
+                      <p className="mt-2 text-[11px] text-slate-400">
+                        Source tx: {maskAddress(transfer.sourceTxHash)}
+                      </p>
+                    )}
+                    {transfer.lastError && (
+                      <p className="mt-2 text-xs leading-5 text-amber-700">
+                        {transfer.lastError}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <button
             type="button"
