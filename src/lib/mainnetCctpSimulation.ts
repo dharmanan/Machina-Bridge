@@ -245,7 +245,11 @@ export async function simulateMainnetCctpSource(input: {
       detail: 'approval must exist onchain before an accurate burn simulation can pass',
     })
   } else {
-    const burnCall = prepareMainnetCctpBurn({ quote, recipient })
+    const burnCall = prepareMainnetCctpBurn({
+      quote,
+      recipient,
+      destinationCaller: account,
+    })
     burn = await simulatePreparedCall({
       client,
       account,

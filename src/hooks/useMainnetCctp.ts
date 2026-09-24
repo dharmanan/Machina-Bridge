@@ -197,7 +197,7 @@ export function useMainnetCctp() {
       const call = prepareMainnetCctpBurn({
         quote: input.quote,
         recipient: input.recipient ?? address,
-        destinationCaller: input.destinationCaller,
+        destinationCaller: input.destinationCaller ?? address,
       })
       const hash = await walletClient.sendTransaction({
         account: address,

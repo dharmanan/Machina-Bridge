@@ -74,7 +74,7 @@ export async function quoteMainnetCctpTransfer(input: {
   amount: string
   mode?: MainnetCctpTransferMode
 }): Promise<MainnetCctpQuote> {
-  const mode = input.mode ?? 'standard'
+  const mode = input.mode ?? 'fast'
   const route = getMainnetCctpRoute(input.sourceChainId, input.destinationChainId)
 
   if (!route) {

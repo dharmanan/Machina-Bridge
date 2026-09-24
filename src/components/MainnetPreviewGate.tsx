@@ -132,7 +132,7 @@ export default function MainnetPreviewGate() {
           destinationChainId,
           amount,
           recipient: address,
-          mode: 'standard',
+          mode: 'fast',
         })
         setSimulation(result)
         setQuoteResult(result.quote)
@@ -143,7 +143,7 @@ export default function MainnetPreviewGate() {
         sourceChainId,
         destinationChainId,
         amount,
-        mode: 'standard',
+        mode: 'fast',
       })
       setQuoteResult(result)
     } catch (error) {
@@ -261,6 +261,23 @@ export default function MainnetPreviewGate() {
             Read-only checks use production RPCs and Circle services. Wallet balance, allowance and transaction simulation are read without requesting a signature or broadcasting a transaction.
           </div>
 
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+              <p className="text-xs font-medium text-slate-500">Transfer speed</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">Fast CCTP</p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">
+                Fast is the default for mainnet Arc routes. Supported Arc routes target sub-10-second transfer attestation.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+              <p className="text-xs font-medium text-slate-500">Destination completion</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">Manual mint</p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">
+                Forwarding is off. The connected wallet remains the authorized destination caller.
+              </p>
+            </div>
+          </div>
+
           <button
             type="button"
             onClick={() => void runReadOnlyCheck()}
@@ -277,10 +294,33 @@ export default function MainnetPreviewGate() {
 
           {(quoteResult || simulation || readOnlyError || cctpState.error) && (
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3.5">
-              <p className="mb-2.5 text-sm font-semibold text-slate-900">Read-only result</p>
+              <div className="mb-2.5 flex items-center justify-between gap-3">
+                <p className="text-sm font-semibold text-slate-900">Read-only result</p>
+                <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-[11px] font-semibold text-[#2F6E0C]">
+                  Fast
+                </span>
+              </div>
 
               {quoteResult && (
-                <StatusRow label="Circle route quote" state="ready" />
+                <div className="space-y-2">
+                  <StatusRow label="Circle Fast route quote" state="ready" />
+                  <div className="flex items-center justify-between gap-4 text-sm">
+                    <span className="text-slate-600">Fast fee quote</span>
+                    <span className="font-semibold text-slate-800">
+                      {formatUnits(quoteResult.estimatedProtocolFeeRaw, 6)} USDC
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-4 text-sm">
+                    <span className="text-slate-600">Fee rate</span>
+                    <span className="font-semibold text-slate-800">
+                      {quoteResult.minimumFeeBps} bps
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-4 text-sm">
+                    <span className="text-slate-600">Mint delivery</span>
+                    <span className="font-semibold text-slate-800">manual · forwarding off</span>
+                  </div>
+                </div>
               )}
 
               {simulation && (
