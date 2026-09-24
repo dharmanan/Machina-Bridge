@@ -9,6 +9,8 @@ export const MAINNET_CCTP_MESSAGE_TRANSMITTER = MAINNET_CONFIG.arcCctpMessageTra
 export const CCTP_V2_CONFIRMED_FINALITY = 1000
 export const CCTP_V2_FINALIZED_FINALITY = 2000
 
+export type MainnetCctpTransferMode = 'standard' | 'fast'
+
 export const CCTP_V2_ERC20_ABI = parseAbi([
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -28,6 +30,7 @@ type MainnetCctpChain = {
   name: string
   chainId: number
   cctpDomain: number
+  fastTransferSource: boolean
   usdcAddress: `0x${string}`
   rpcUrls: readonly string[]
   tokenMessengerAddress: `0x${string}`
@@ -42,6 +45,7 @@ const MAINNET_CCTP_CHAINS = Object.fromEntries(
       name: network.name,
       chainId: network.chainId,
       cctpDomain: network.cctpDomain,
+      fastTransferSource: network.fastTransferSource,
       usdcAddress: network.usdcAddress,
       rpcUrls: network.rpcUrls,
       tokenMessengerAddress: MAINNET_CCTP_TOKEN_MESSENGER,
@@ -85,6 +89,20 @@ export function getMainnetCctpRoute(sourceChainId: number, destinationChainId: n
   return { source, destination }
 }
 
+export function isMainnetCctpFastTransferSupported(sourceChainId: number) {
+  return Boolean(getMainnetCctpChain(sourceChainId)?.fastTransferSource)
+}
+
+export function getDefaultMainnetCctpTransferMode(
+  sourceChainId: number,
+): MainnetCctpTransferMode {
+  const source = getMainnetCctpChain(sourceChainId)
+  if (!source) {
+    throw new Error('Unsupported CCTP mainnet source chain')
+  }
+  return source.fastTransferSource ? 'fast' : 'standard'
+}
+
 export async function fetchMainnetCctpFees(
   sourceChainId: number,
   destinationChainId: number,
@@ -108,11 +126,17 @@ export async function fetchMainnetCctpFees(
   }
 
   const payload = await response.json()
-  if (!Array.isArray(payload)) {
+  const rawFees = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.data)
+      ? payload.data
+      : null
+
+  if (!rawFees) {
     throw new Error('Circle CCTP fee API returned an invalid payload')
   }
 
-  const fees = payload
+  const fees = rawFees
     .map((item) => ({
       finalityThreshold: Number(item?.finalityThreshold),
       minimumFee: Number(item?.minimumFee),

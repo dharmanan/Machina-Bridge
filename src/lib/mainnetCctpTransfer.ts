@@ -13,13 +13,14 @@ import {
   CCTP_V2_FINALIZED_FINALITY,
   CCTP_V2_MESSAGE_TRANSMITTER_ABI,
   CCTP_V2_TOKEN_MESSENGER_ABI,
-  MAINNET_CCTP_MESSAGE_TRANSMITTER,
-  MAINNET_CCTP_TOKEN_MESSENGER,
   fetchMainnetCctpFees,
+  getDefaultMainnetCctpTransferMode,
   getMainnetCctpRoute,
+  isMainnetCctpFastTransferSupported,
+  type MainnetCctpTransferMode,
 } from '../config/mainnetCctp'
 
-export type MainnetCctpTransferMode = 'standard' | 'fast'
+export type { MainnetCctpTransferMode } from '../config/mainnetCctp'
 
 export type MainnetCctpQuote = {
   mode: MainnetCctpTransferMode
@@ -52,9 +53,8 @@ export type MainnetCctpAttestation = {
 }
 
 const ZERO_BYTES32 = `0x${'00'.repeat(32)}` as Hex
-const FEE_RATE_SCALE = 1_000_000n
-const FAST_FEE_BUFFER_NUMERATOR = 120n
-const FAST_FEE_BUFFER_DENOMINATOR = 100n
+const FEE_RATE_SCALE = 10_000_000n
+const MILLI_BPS_PER_BPS = 1_000n
 
 function ceilDiv(value: bigint, divisor: bigint) {
   return (value + divisor - 1n) / divisor
@@ -74,11 +74,15 @@ export async function quoteMainnetCctpTransfer(input: {
   amount: string
   mode?: MainnetCctpTransferMode
 }): Promise<MainnetCctpQuote> {
-  const mode = input.mode ?? 'fast'
   const route = getMainnetCctpRoute(input.sourceChainId, input.destinationChainId)
 
   if (!route) {
     throw new Error('Unsupported CCTP mainnet route')
+  }
+
+  const mode = input.mode ?? getDefaultMainnetCctpTransferMode(input.sourceChainId)
+  if (mode === 'fast' && !isMainnetCctpFastTransferSupported(input.sourceChainId)) {
+    throw new Error(`${route.source.name} does not support CCTP Fast Transfer as a source chain`)
   }
 
   const amountRaw = parseUnits(input.amount, 6)
@@ -97,17 +101,16 @@ export async function quoteMainnetCctpTransfer(input: {
     throw new Error(`Circle did not return a ${mode} CCTP fee option for this route`)
   }
 
-  // Circle's fee API expresses minimumFee in basis points and may return
-  // fractional bps. Convert to hundredths of a basis point and round upward so
-  // we never understate the protocol fee before applying the safety buffer.
-  const hundredthBps = BigInt(Math.ceil(fee.minimumFee * 100))
-  const estimatedProtocolFeeRaw = ceilDiv(amountRaw * hundredthBps, FEE_RATE_SCALE)
-  const maxFeeRaw = mode === 'fast'
-    ? ceilDiv(
-        estimatedProtocolFeeRaw * FAST_FEE_BUFFER_NUMERATOR,
-        FAST_FEE_BUFFER_DENOMINATOR,
-      )
-    : estimatedProtocolFeeRaw
+  const milliBps = BigInt(Math.ceil(fee.minimumFee * 1_000))
+  const estimatedProtocolFeeRaw = milliBps === 0n
+    ? 0n
+    : ceilDiv(amountRaw * milliBps, FEE_RATE_SCALE)
+
+  const maxFeeRaw = mode === 'fast' && milliBps > 0n
+    ? ceilDiv(amountRaw * (milliBps + MILLI_BPS_PER_BPS), FEE_RATE_SCALE)
+    : estimatedProtocolFeeRaw > 0n
+      ? estimatedProtocolFeeRaw
+      : 1n
 
   if (maxFeeRaw >= amountRaw) {
     throw new Error('Calculated CCTP max fee must be less than the transfer amount')
@@ -154,7 +157,7 @@ export function prepareMainnetCctpApproval(input: {
     data: encodeFunctionData({
       abi: CCTP_V2_ERC20_ABI,
       functionName: 'approve',
-      args: [MAINNET_CCTP_TOKEN_MESSENGER, input.amountRaw],
+      args: [route.source.tokenMessengerAddress, input.amountRaw],
     }),
     value: 0n,
     description: `Approve ${route.source.name} USDC for CCTP V2 TokenMessenger`,
@@ -178,7 +181,7 @@ export function prepareMainnetCctpBurn(input: {
 
   return {
     chainId: route.source.chainId,
-    to: MAINNET_CCTP_TOKEN_MESSENGER,
+    to: route.source.tokenMessengerAddress,
     data: encodeFunctionData({
       abi: CCTP_V2_TOKEN_MESSENGER_ABI,
       functionName: 'depositForBurn',
@@ -261,7 +264,7 @@ export function prepareMainnetCctpMint(input: {
 
   return {
     chainId: destinationRoute.destination.chainId,
-    to: MAINNET_CCTP_MESSAGE_TRANSMITTER,
+    to: destinationRoute.destination.messageTransmitterAddress,
     data: encodeFunctionData({
       abi: CCTP_V2_MESSAGE_TRANSMITTER_ABI,
       functionName: 'receiveMessage',

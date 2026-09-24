@@ -7,6 +7,7 @@ import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import {
+  getDefaultMainnetCctpTransferMode,
   probeMainnetCctpRoute,
   type MainnetCctpRouteProbe,
 } from '../config/mainnetCctp'
@@ -143,6 +144,8 @@ export default function MainnetPreviewGate() {
   const sourceChainId = source === 'base' ? MAINNET_NETWORKS.base.chainId : MAINNET_NETWORKS.arc.chainId
   const destinationChainId = destination === 'base' ? MAINNET_NETWORKS.base.chainId : MAINNET_NETWORKS.arc.chainId
   const activeRouteProbe = source === 'base' ? baseToArcProbe : arcToBaseProbe
+  const selectedMode = getDefaultMainnetCctpTransferMode(sourceChainId)
+  const transferModeLabel = selectedMode === 'fast' ? 'Fast' : 'Standard'
   const hasValidAmount = Boolean(amount) && Number.isFinite(Number(amount)) && Number(amount) > 0
 
   useEffect(() => {
@@ -205,7 +208,6 @@ export default function MainnetPreviewGate() {
           destinationChainId,
           amount,
           recipient: address,
-          mode: 'fast',
         })
         setSimulation(result)
         setQuoteResult(result.quote)
@@ -373,9 +375,11 @@ export default function MainnetPreviewGate() {
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
               <p className="text-xs font-medium text-slate-500">Transfer speed</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">Fast CCTP</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{transferModeLabel} CCTP</p>
               <p className="mt-1 text-xs leading-5 text-slate-500">
-                Fast is the default for mainnet Arc routes. Supported Arc routes target sub-10-second transfer attestation.
+                {selectedMode === 'fast'
+                  ? `Fast Transfer is selected for ${sourceName} as the source chain.`
+                  : 'Arc uses the Standard CCTP source path; Fast Transfer is not required for Arc source transfers.'}
               </p>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
@@ -406,15 +410,15 @@ export default function MainnetPreviewGate() {
               <div className="mb-2.5 flex items-center justify-between gap-3">
                 <p className="text-sm font-semibold text-slate-900">Read-only result</p>
                 <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-[11px] font-semibold text-[#2F6E0C]">
-                  Fast
+                  {quoteResult?.mode === 'fast' ? 'Fast' : 'Standard'}
                 </span>
               </div>
 
               {quoteResult && (
                 <div className="space-y-2">
-                  <StatusRow label="Circle Fast route quote" state="ready" />
+                  <StatusRow label={`Circle ${transferModeLabel} route quote`} state="ready" />
                   <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">Fast fee quote</span>
+                    <span className="text-slate-600">{transferModeLabel} fee quote</span>
                     <span className="font-semibold text-slate-800">
                       {formatUnits(quoteResult.estimatedProtocolFeeRaw, 6)} USDC
                     </span>
@@ -553,7 +557,7 @@ export default function MainnetPreviewGate() {
               <PreviewStep
                 index={1}
                 title="Preflight"
-                detail="Route, Fast fee, balance, allowance and source simulation."
+                detail="Route, live fee, balance, allowance and source simulation."
                 state={preflightReady ? 'complete' : 'current'}
               />
               <PreviewStep
@@ -572,8 +576,10 @@ export default function MainnetPreviewGate() {
               />
               <PreviewStep
                 index={4}
-                title="Fast attestation"
-                detail="Circle attestation is monitored in the background while other transfers can continue."
+                title={`${transferModeLabel} attestation`}
+                detail={selectedMode === 'fast'
+                  ? 'Circle Fast attestation is monitored in the background while other transfers can continue.'
+                  : 'Circle Standard attestation is monitored in the background; Arc source finality is already rapid.'}
                 state="locked"
               />
               <PreviewStep

@@ -8,6 +8,7 @@ type EvmMainnetConfig = {
   rpcUrls: readonly string[]
   usdcAddress: `0x${string}`
   cctpDomain: number
+  fastTransferSource: boolean
   explorerUrl?: string
 }
 
@@ -24,6 +25,7 @@ export const MAINNET_NETWORKS = {
     rpcUrls: withRpcOverride(import.meta.env.VITE_ETHEREUM_MAINNET_RPC, mainnet.rpcUrls.default.http),
     usdcAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     cctpDomain: 0,
+    fastTransferSource: true,
     explorerUrl: mainnet.blockExplorers.default.url,
   },
   arc: {
@@ -33,6 +35,7 @@ export const MAINNET_NETWORKS = {
     rpcUrls: [MAINNET_CONFIG.arcRpcUrl],
     usdcAddress: MAINNET_CONFIG.arcUsdcAddress,
     cctpDomain: MAINNET_CONFIG.arcCctpDomain,
+    fastTransferSource: false,
     explorerUrl: MAINNET_CONFIG.arcExplorerUrl,
   },
   base: {
@@ -42,6 +45,7 @@ export const MAINNET_NETWORKS = {
     rpcUrls: withRpcOverride(import.meta.env.VITE_BASE_MAINNET_RPC, base.rpcUrls.default.http),
     usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
     cctpDomain: 6,
+    fastTransferSource: true,
     explorerUrl: base.blockExplorers.default.url,
   },
   optimism: {
@@ -51,6 +55,7 @@ export const MAINNET_NETWORKS = {
     rpcUrls: withRpcOverride(import.meta.env.VITE_OPTIMISM_MAINNET_RPC, optimism.rpcUrls.default.http),
     usdcAddress: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
     cctpDomain: 2,
+    fastTransferSource: true,
     explorerUrl: optimism.blockExplorers.default.url,
   },
   arbitrum: {
@@ -60,6 +65,7 @@ export const MAINNET_NETWORKS = {
     rpcUrls: withRpcOverride(import.meta.env.VITE_ARBITRUM_MAINNET_RPC, arbitrum.rpcUrls.default.http),
     usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
     cctpDomain: 3,
+    fastTransferSource: true,
     explorerUrl: arbitrum.blockExplorers.default.url,
   },
 } satisfies Record<string, EvmMainnetConfig>
