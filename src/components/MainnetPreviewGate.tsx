@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { formatUnits } from 'viem'
 import { useAccount } from 'wagmi'
 import { ArrowLeftRight, CheckCircle2, LockKeyhole, RefreshCw, Wallet } from 'lucide-react'
@@ -118,7 +118,7 @@ export default function MainnetPreviewGate() {
     setSource((current) => (current === 'base' ? 'arc' : 'base'))
   }
 
-  const runReadOnlyCheck = async () => {
+  const runReadOnlyCheck = useCallback(async () => {
     if (!hasValidAmount) return
 
     setReadOnlyError(null)
@@ -149,7 +149,26 @@ export default function MainnetPreviewGate() {
     } catch (error) {
       setReadOnlyError(error instanceof Error ? error.message : 'Read-only mainnet check failed.')
     }
-  }
+  }, [
+    address,
+    amount,
+    destinationChainId,
+    hasValidAmount,
+    isConnected,
+    quote,
+    simulateSource,
+    sourceChainId,
+  ])
+
+  useEffect(() => {
+    if (!hasValidAmount) return
+
+    const timer = window.setTimeout(() => {
+      void runReadOnlyCheck()
+    }, 500)
+
+    return () => window.clearTimeout(timer)
+  }, [runReadOnlyCheck, hasValidAmount])
 
   const simulationSummary = simulation
     ? simulation.readyForBurn
@@ -287,9 +306,9 @@ export default function MainnetPreviewGate() {
             <RefreshCw size={15} className={cctpState.isLoading ? 'animate-spin' : ''} />
             {cctpState.isLoading
               ? 'Checking...'
-              : isConnected
-                ? 'Check wallet readiness'
-                : 'Check route quote'}
+              : hasValidAmount
+                ? 'Refresh checks'
+                : 'Enter an amount'}
           </button>
 
           {(quoteResult || simulation || readOnlyError || cctpState.error) && (
