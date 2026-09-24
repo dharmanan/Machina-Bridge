@@ -69,8 +69,8 @@ export default function MainnetPreviewGate() {
   }, [])
 
   return (
-    <section className="bg-slate-50 px-4 py-8 text-slate-900">
-      <div className="mx-auto max-w-3xl rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+    <section className="bg-slate-50 px-4 py-6 text-slate-900">
+      <div className="mx-auto max-w-3xl rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:p-7">
         <div className="inline-flex rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-amber-800">
           Mainnet preview
         </div>

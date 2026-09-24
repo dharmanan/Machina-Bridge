@@ -280,28 +280,12 @@ export default function App() {
                     ? 'Testnet swap and bridge flows for Arc, Sepolia, and Solana.'
                     : 'Arc mainnet readiness and live CCTP route verification.'}
                 </p>
-                <div className="mt-3 inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1">
-                  {(['testnet', 'mainnet'] as const).map((network) => (
-                    <button
-                      key={network}
-                      type="button"
-                      onClick={() => handleAppNetworkChange(network)}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
-                        appNetwork === network
-                          ? 'bg-white text-slate-900 shadow-sm'
-                          : 'text-slate-500 hover:text-slate-800'
-                      }`}
-                    >
-                      {network === 'testnet' ? 'Testnet' : 'Mainnet'}
-                    </button>
-                  ))}
-                </div>
               </div>
             </div>
 
             <div className="flex min-w-0 flex-col gap-2 lg:items-end">
                 {/* Row 1 — Social icons + EVM network switcher + wallet */}
-                <div className="flex items-center gap-2 lg:justify-end">
+                <div className="flex flex-wrap items-center gap-2 lg:flex-nowrap lg:justify-end">
                   <a
                     href="https://x.com/KohenEric"
                     target="_blank"
@@ -318,13 +302,33 @@ export default function App() {
                   >
                     <Github size={16} />
                   </a>
+                  <div
+                    className="inline-flex h-9 flex-shrink-0 items-center rounded-xl border border-slate-200 bg-slate-50 p-0.5 shadow-sm"
+                    aria-label="Network environment"
+                  >
+                    {(['testnet', 'mainnet'] as const).map((network) => (
+                      <button
+                        key={network}
+                        type="button"
+                        onClick={() => handleAppNetworkChange(network)}
+                        aria-pressed={appNetwork === network}
+                        className={`h-8 whitespace-nowrap rounded-[9px] px-3 text-xs font-semibold transition-colors ${
+                          appNetwork === network
+                            ? 'bg-white text-slate-900 shadow-sm ring-1 ring-[#66D121]/30'
+                            : 'text-slate-500 hover:bg-white/70 hover:text-slate-800'
+                        }`}
+                      >
+                        {network === 'testnet' ? 'Testnet' : 'Mainnet'}
+                      </button>
+                    ))}
+                  </div>
                 {appNetwork === 'testnet' && (
                   <>
                   {isConnected && (
                     <div className="relative" ref={dropdownRef}>
                       <button
                         onClick={() => setShowNetworkDropdown(!showNetworkDropdown)}
-                        className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+                        className="flex h-9 flex-shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
                       >
                         <span>{getSupportedEvmChainName(chainId)}</span>
                         <ChevronDown size={13} className={`transition-transform ${showNetworkDropdown ? 'rotate-180' : ''}`} />
@@ -470,7 +474,7 @@ export default function App() {
                   Mainnet Bridge
                 </span>
                 <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-500">
-                  Transactions locked
+                  Locked
                 </span>
               </>
             )}
