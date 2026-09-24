@@ -832,7 +832,7 @@ export default function MainnetPreviewGate() {
               <div className="mt-4 rounded-xl border border-[#cfe8bf] bg-[#eef7e8] px-3.5 py-3 text-sm text-[#2F6E0C]">
                 <p className="font-semibold">Transfer complete</p>
                 <p className="mt-1 text-xs leading-5">
-                  {amount} USDC was burned on ${sourceName} and minted on ${destinationName}.
+                  {amount} USDC was burned on {sourceName} and minted on {destinationName}.
                 </p>
                 {matchingTransfer?.destinationTxHash && (
                   <p className="mt-1 text-[11px] opacity-80">
