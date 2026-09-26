@@ -6,6 +6,10 @@ type EvmMainnetConfig = {
   name: string
   chainId: number
   rpcUrls: readonly string[]
+  nativeCurrency: {
+    symbol: string
+    decimals: number
+  }
   usdcAddress: `0x${string}`
   cctpDomain: number
   fastTransferSource: boolean
@@ -29,6 +33,7 @@ export const MAINNET_NETWORKS = {
         ...mainnet.rpcUrls.default.http,
       ],
     ),
+    nativeCurrency: { symbol: 'ETH', decimals: 18 },
     usdcAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     cctpDomain: 0,
     fastTransferSource: true,
@@ -39,6 +44,7 @@ export const MAINNET_NETWORKS = {
     name: 'Arc',
     chainId: MAINNET_CONFIG.arcChainId,
     rpcUrls: [MAINNET_CONFIG.arcRpcUrl],
+    nativeCurrency: { symbol: 'USDC', decimals: 18 },
     usdcAddress: MAINNET_CONFIG.arcUsdcAddress,
     cctpDomain: MAINNET_CONFIG.arcCctpDomain,
     fastTransferSource: false,
@@ -49,6 +55,7 @@ export const MAINNET_NETWORKS = {
     name: 'Base',
     chainId: base.id,
     rpcUrls: withRpcOverride(import.meta.env.VITE_BASE_MAINNET_RPC, base.rpcUrls.default.http),
+    nativeCurrency: { symbol: 'ETH', decimals: 18 },
     usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
     cctpDomain: 6,
     fastTransferSource: true,
@@ -59,6 +66,7 @@ export const MAINNET_NETWORKS = {
     name: 'OP Mainnet',
     chainId: optimism.id,
     rpcUrls: withRpcOverride(import.meta.env.VITE_OPTIMISM_MAINNET_RPC, optimism.rpcUrls.default.http),
+    nativeCurrency: { symbol: 'ETH', decimals: 18 },
     usdcAddress: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
     cctpDomain: 2,
     fastTransferSource: true,
@@ -69,6 +77,7 @@ export const MAINNET_NETWORKS = {
     name: 'Arbitrum One',
     chainId: arbitrum.id,
     rpcUrls: withRpcOverride(import.meta.env.VITE_ARBITRUM_MAINNET_RPC, arbitrum.rpcUrls.default.http),
+    nativeCurrency: { symbol: 'ETH', decimals: 18 },
     usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
     cctpDomain: 3,
     fastTransferSource: true,
