@@ -7,13 +7,16 @@ import { getRuntimeCapabilities } from '../config/features'
 import { getMainnetReadiness } from '../config/mainnet'
 import {
   getDefaultMainnetCctpTransferMode,
+  getMainnetCctpChain,
   getMainnetCctpRoute,
 } from '../config/mainnetCctp'
 import {
-  MAINNET_CCTP_CANARY_ARC_CHAIN_ID,
-  MAINNET_CCTP_CANARY_BASE_CHAIN_ID,
+  getMainnetCanaryMaxAmountRaw,
+  getMainnetCanaryRoute,
+  isMainnetCanaryRouteWriteEnabled,
+} from '../config/mainnetCanary'
+import {
   MAINNET_CCTP_CANARY_ENABLED,
-  MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
   MAINNET_RUNTIME_IMPLEMENTED,
 } from '../config/runtime'
 import { wagmiConfig } from '../lib/wagmi.config'
@@ -75,22 +78,6 @@ function canaryReadinessPassed() {
     && getCircleMainnetReadiness().cctpReady
 }
 
-function isCanaryRoute(sourceChainId: number, destinationChainId: number) {
-  return (
-    sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
-    && destinationChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
-  ) || (
-    sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
-    && destinationChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
-  )
-}
-
-function expectedCanaryMode(sourceChainId: number): MainnetCctpTransferMode {
-  if (sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID) return 'standard'
-  if (sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID) return 'fast'
-  throw new Error('Unsupported mainnet canary source chain.')
-}
-
 function assertCanaryTransferRecord(input: {
   transferId?: string
   connectedAddress: string
@@ -107,16 +94,27 @@ function assertCanaryTransferRecord(input: {
   const connected = input.connectedAddress.toLowerCase()
   const amountRaw = parseUnits(record.amount, 6)
 
+  const policy = getMainnetCanaryRoute(
+    record.sourceChainId,
+    record.destinationChainId,
+  )
+
   if (
-    !isCanaryRoute(record.sourceChainId, record.destinationChainId)
-    || record.mode !== expectedCanaryMode(record.sourceChainId)
+    !policy
+    || !isMainnetCanaryRouteWriteEnabled(
+      record.sourceChainId,
+      record.destinationChainId,
+    )
+    || record.mode !== getDefaultMainnetCctpTransferMode(record.sourceChainId)
     || amountRaw <= 0n
-    || amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    || amountRaw > getMainnetCanaryMaxAmountRaw()
     || record.walletAddress.toLowerCase() !== connected
     || record.recipient.toLowerCase() !== connected
     || record.destinationCaller.toLowerCase() !== connected
   ) {
-    throw new Error('Transfer does not satisfy the Arc ↔ Base 0.1 USDC canary guard.')
+    throw new Error(
+      'Transfer does not satisfy the enabled mainnet canary route policy.',
+    )
   }
 
   return { record, amountRaw }
@@ -166,7 +164,7 @@ function assertCanaryBurnAllowed(input: {
     || input.quote.destinationChainId !== record.destinationChainId
     || input.quote.mode !== record.mode
     || input.quote.amountRaw !== amountRaw
-    || input.quote.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    || input.quote.amountRaw > getMainnetCanaryMaxAmountRaw()
     || input.recipient.toLowerCase() !== connected
     || input.destinationCaller.toLowerCase() !== connected
     || (record.stage !== 'ready' && record.stage !== 'approved')
@@ -321,13 +319,9 @@ export function useMainnetCctp() {
       connectedAddress: address,
     })
 
-    const route = getMainnetCctpRoute(input.sourceChainId, 5042)
-      ?? getMainnetCctpRoute(input.sourceChainId, 1)
-      ?? getMainnetCctpRoute(input.sourceChainId, 8453)
-      ?? getMainnetCctpRoute(input.sourceChainId, 10)
-      ?? getMainnetCctpRoute(input.sourceChainId, 42161)
+    const source = getMainnetCctpChain(input.sourceChainId)
 
-    if (!route) {
+    if (!source) {
       throw new Error('Unsupported mainnet CCTP source chain.')
     }
 
@@ -351,7 +345,7 @@ export function useMainnetCctp() {
         updateMainnetTransferRecord(input.transferId, { approvalTxHash: hash })
       }
 
-      const publicClient = makePublicClient(route.source.rpcUrls)
+      const publicClient = makePublicClient(source.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
 
       if (input.transferId) {
@@ -513,13 +507,9 @@ export function useMainnetCctp() {
       connectedAddress: address,
     })
 
-    const route = getMainnetCctpRoute(8453, input.destinationChainId)
-      ?? getMainnetCctpRoute(1, input.destinationChainId)
-      ?? getMainnetCctpRoute(10, input.destinationChainId)
-      ?? getMainnetCctpRoute(42161, input.destinationChainId)
-      ?? getMainnetCctpRoute(5042, input.destinationChainId)
+    const destination = getMainnetCctpChain(input.destinationChainId)
 
-    if (!route) {
+    if (!destination) {
       throw new Error('Unsupported mainnet CCTP destination chain.')
     }
 
@@ -543,7 +533,7 @@ export function useMainnetCctp() {
         updateMainnetTransferRecord(input.transferId, { destinationTxHash: hash })
       }
 
-      const publicClient = makePublicClient(route.destination.rpcUrls)
+      const publicClient = makePublicClient(destination.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
 
       if (input.transferId) {

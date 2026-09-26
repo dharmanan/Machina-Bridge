@@ -15,6 +15,7 @@ import {
   CCTP_V2_TOKEN_MESSENGER_ABI,
   fetchMainnetCctpFees,
   getDefaultMainnetCctpTransferMode,
+  getMainnetCctpChain,
   getMainnetCctpRoute,
   isMainnetCctpFastTransferSupported,
   type MainnetCctpTransferMode,
@@ -135,15 +136,9 @@ export function prepareMainnetCctpApproval(input: {
   sourceChainId: number
   amountRaw: bigint
 }): MainnetCctpPreparedCall {
-  const route = getMainnetCctpRoute(input.sourceChainId, 5042)
-    ?? Object.values([
-      getMainnetCctpRoute(input.sourceChainId, 1),
-      getMainnetCctpRoute(input.sourceChainId, 8453),
-      getMainnetCctpRoute(input.sourceChainId, 10),
-      getMainnetCctpRoute(input.sourceChainId, 42161),
-    ]).find(Boolean)
+  const source = getMainnetCctpChain(input.sourceChainId)
 
-  if (!route) {
+  if (!source) {
     throw new Error('Unsupported CCTP mainnet source chain')
   }
 
@@ -152,15 +147,15 @@ export function prepareMainnetCctpApproval(input: {
   }
 
   return {
-    chainId: route.source.chainId,
-    to: route.source.usdcAddress,
+    chainId: source.chainId,
+    to: source.usdcAddress,
     data: encodeFunctionData({
       abi: CCTP_V2_ERC20_ABI,
       functionName: 'approve',
-      args: [route.source.tokenMessengerAddress, input.amountRaw],
+      args: [source.tokenMessengerAddress, input.amountRaw],
     }),
     value: 0n,
-    description: `Approve ${route.source.name} USDC for CCTP V2 TokenMessenger`,
+    description: `Approve ${source.name} USDC for CCTP V2 TokenMessenger`,
   }
 }
 
@@ -204,20 +199,14 @@ export async function fetchMainnetCctpAttestation(input: {
   sourceChainId: number
   transactionHash: Hex
 }): Promise<MainnetCctpAttestation> {
-  const sourceRoute = getMainnetCctpRoute(input.sourceChainId, 5042)
-    ?? Object.values([
-      getMainnetCctpRoute(input.sourceChainId, 1),
-      getMainnetCctpRoute(input.sourceChainId, 8453),
-      getMainnetCctpRoute(input.sourceChainId, 10),
-      getMainnetCctpRoute(input.sourceChainId, 42161),
-    ]).find(Boolean)
+  const source = getMainnetCctpChain(input.sourceChainId)
 
-  if (!sourceRoute) {
+  if (!source) {
     throw new Error('Unsupported CCTP mainnet source chain')
   }
 
   const response = await fetch(
-    `${CIRCLE_MAINNET.irisApiBase}/v2/messages/${sourceRoute.source.cctpDomain}?transactionHash=${encodeURIComponent(input.transactionHash)}`,
+    `${CIRCLE_MAINNET.irisApiBase}/v2/messages/${source.cctpDomain}?transactionHash=${encodeURIComponent(input.transactionHash)}`,
     { headers: { Accept: 'application/json' } },
   )
 
@@ -250,27 +239,21 @@ export function prepareMainnetCctpMint(input: {
   message: Hex
   attestation: Hex
 }): MainnetCctpPreparedCall {
-  const destinationRoute = getMainnetCctpRoute(8453, input.destinationChainId)
-    ?? Object.values([
-      getMainnetCctpRoute(1, input.destinationChainId),
-      getMainnetCctpRoute(10, input.destinationChainId),
-      getMainnetCctpRoute(42161, input.destinationChainId),
-      getMainnetCctpRoute(5042, input.destinationChainId),
-    ]).find(Boolean)
+  const destination = getMainnetCctpChain(input.destinationChainId)
 
-  if (!destinationRoute) {
+  if (!destination) {
     throw new Error('Unsupported CCTP mainnet destination chain')
   }
 
   return {
-    chainId: destinationRoute.destination.chainId,
-    to: destinationRoute.destination.messageTransmitterAddress,
+    chainId: destination.chainId,
+    to: destination.messageTransmitterAddress,
     data: encodeFunctionData({
       abi: CCTP_V2_MESSAGE_TRANSMITTER_ABI,
       functionName: 'receiveMessage',
       args: [input.message, input.attestation],
     }),
     value: 0n,
-    description: `Submit CCTP V2 attestation on ${destinationRoute.destination.name}`,
+    description: `Submit CCTP V2 attestation on ${destination.name}`,
   }
 }

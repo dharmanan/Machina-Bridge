@@ -7,23 +7,24 @@ import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import {
+  getMainnetCanaryMaxAmountRaw,
+  getMainnetCanaryRoute,
+  isMainnetCanaryRouteWriteEnabled,
+  MAINNET_ARC_BRIDGE_NETWORK_KEYS,
+} from '../config/mainnetCanary'
+import {
   getDefaultMainnetCctpTransferMode,
   probeMainnetCctpRoute,
   type MainnetCctpRouteProbe,
 } from '../config/mainnetCctp'
-import {
-  MAINNET_CCTP_CANARY_ARC_CHAIN_ID,
-  MAINNET_CCTP_CANARY_BASE_CHAIN_ID,
-  MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
-  MAINNET_RUNTIME_IMPLEMENTED,
-} from '../config/runtime'
+import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
 import type { MainnetCctpSourceSimulation } from '../lib/mainnetCctpSimulation'
 
-type RouteEndpoint = 'base' | 'arc'
+type RouteEndpoint = (typeof MAINNET_ARC_BRIDGE_NETWORK_KEYS)[number]
 
 function StatusRow({
   label,
@@ -146,21 +147,21 @@ export default function MainnetPreviewGate() {
   const { transfers, activeTransfers, readyToMintCount } = useMainnetTransferQueue(address)
 
   const [probe, setProbe] = useState<MainnetCapabilityProbeResult | null>(null)
-  const [baseToArcProbe, setBaseToArcProbe] = useState<MainnetCctpRouteProbe | null>(null)
-  const [arcToBaseProbe, setArcToBaseProbe] = useState<MainnetCctpRouteProbe | null>(null)
+  const [routeProbe, setRouteProbe] = useState<MainnetCctpRouteProbe | null>(null)
   const [source, setSource] = useState<RouteEndpoint>('arc')
+  const [destination, setDestination] = useState<RouteEndpoint>('base')
   const [amount, setAmount] = useState('0.1')
   const [quoteResult, setQuoteResult] = useState<MainnetCctpQuote | null>(null)
   const [simulation, setSimulation] = useState<MainnetCctpSourceSimulation | null>(null)
   const [readOnlyError, setReadOnlyError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
-  const destination: RouteEndpoint = source === 'base' ? 'arc' : 'base'
-  const sourceName = source === 'base' ? 'Base' : 'Arc'
-  const destinationName = destination === 'base' ? 'Base' : 'Arc'
-  const sourceChainId = source === 'base' ? MAINNET_NETWORKS.base.chainId : MAINNET_NETWORKS.arc.chainId
-  const destinationChainId = destination === 'base' ? MAINNET_NETWORKS.base.chainId : MAINNET_NETWORKS.arc.chainId
-  const activeRouteProbe = source === 'base' ? baseToArcProbe : arcToBaseProbe
+  const sourceNetwork = MAINNET_NETWORKS[source]
+  const destinationNetwork = MAINNET_NETWORKS[destination]
+  const sourceName = sourceNetwork.name
+  const destinationName = destinationNetwork.name
+  const sourceChainId = sourceNetwork.chainId
+  const destinationChainId = destinationNetwork.chainId
   const selectedMode = getDefaultMainnetCctpTransferMode(sourceChainId)
   const transferModeLabel = selectedMode === 'fast' ? 'Fast' : 'Standard'
   const hasValidAmount = Boolean(amount) && Number.isFinite(Number(amount)) && Number(amount) > 0
@@ -169,17 +170,8 @@ export default function MainnetPreviewGate() {
     let cancelled = false
 
     const run = async () => {
-      const [arcResult, baseToArcResult, arcToBaseResult] = await Promise.allSettled([
-        probeArcMainnetCapabilities(),
-        probeMainnetCctpRoute(MAINNET_NETWORKS.base.chainId, MAINNET_NETWORKS.arc.chainId),
-        probeMainnetCctpRoute(MAINNET_NETWORKS.arc.chainId, MAINNET_NETWORKS.base.chainId),
-      ])
-
-      if (cancelled) return
-
-      if (arcResult.status === 'fulfilled') setProbe(arcResult.value)
-      if (baseToArcResult.status === 'fulfilled') setBaseToArcProbe(baseToArcResult.value)
-      if (arcToBaseResult.status === 'fulfilled') setArcToBaseProbe(arcToBaseResult.value)
+      const result = await probeArcMainnetCapabilities()
+      if (!cancelled) setProbe(result)
     }
 
     void run()
@@ -190,11 +182,31 @@ export default function MainnetPreviewGate() {
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+    setRouteProbe(null)
+
+    const run = async () => {
+      const result = await probeMainnetCctpRoute(
+        sourceChainId,
+        destinationChainId,
+      )
+
+      if (!cancelled) setRouteProbe(result)
+    }
+
+    void run()
+
+    return () => {
+      cancelled = true
+    }
+  }, [sourceChainId, destinationChainId])
+
+  useEffect(() => {
     setQuoteResult(null)
     setSimulation(null)
     setReadOnlyError(null)
     setActionError(null)
-  }, [source, amount, address])
+  }, [source, destination, amount, address])
 
   const arcStatus = useMemo<'ready' | 'checking' | 'blocked'>(() => {
     if (!probe) return 'checking'
@@ -202,14 +214,37 @@ export default function MainnetPreviewGate() {
   }, [probe, readiness.ready])
 
   const circleStatus: 'ready' | 'blocked' = circleReadiness.cctpReady ? 'ready' : 'blocked'
-  const routeStatus: 'ready' | 'checking' | 'blocked' = !activeRouteProbe
+  const routeStatus: 'ready' | 'checking' | 'blocked' = !routeProbe
     ? 'checking'
-    : activeRouteProbe.ready
+    : routeProbe.ready
       ? 'ready'
       : 'blocked'
 
   const swapRoute = () => {
-    setSource((current) => (current === 'base' ? 'arc' : 'base'))
+    setSource(destination)
+    setDestination(source)
+  }
+
+  const selectSource = (nextSource: RouteEndpoint) => {
+    setSource(nextSource)
+
+    if (nextSource === 'arc') {
+      if (destination === 'arc') setDestination('base')
+      return
+    }
+
+    setDestination('arc')
+  }
+
+  const selectDestination = (nextDestination: RouteEndpoint) => {
+    setDestination(nextDestination)
+
+    if (nextDestination === 'arc') {
+      if (source === 'arc') setSource('base')
+      return
+    }
+
+    setSource('arc')
   }
 
   const runReadOnlyCheck = useCallback(async () => {
@@ -280,20 +315,26 @@ export default function MainnetPreviewGate() {
     && routeStatus === 'ready',
   )
   const canaryAmountRaw = quoteResult?.amountRaw ?? 0n
-  const canaryRouteSelected =
-    (
-      sourceChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
-      && destinationChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
-    )
-    || (
-      sourceChainId === MAINNET_CCTP_CANARY_BASE_CHAIN_ID
-      && destinationChainId === MAINNET_CCTP_CANARY_ARC_CHAIN_ID
-    )
+  const canaryMaxAmountRaw = getMainnetCanaryMaxAmountRaw()
+  const canaryMaxAmount = formatUnits(canaryMaxAmountRaw, 6)
+
+  const canaryPolicy = getMainnetCanaryRoute(
+    sourceChainId,
+    destinationChainId,
+  )
+
+  const canaryRouteSelected = Boolean(canaryPolicy)
+
+  const canaryWriteEnabled = isMainnetCanaryRouteWriteEnabled(
+    sourceChainId,
+    destinationChainId,
+  )
 
   const canaryEligible =
     canaryRouteSelected
+    && canaryWriteEnabled
     && canaryAmountRaw > 0n
-    && canaryAmountRaw <= MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
+    && canaryAmountRaw <= canaryMaxAmountRaw
     && quoteResult?.mode === selectedMode
 
   const matchingTransfer =
@@ -332,9 +373,11 @@ export default function MainnetPreviewGate() {
     || transferStage === 'minting'
 
   const actionLabel = !canaryRouteSelected
-    ? 'Canary available only for Arc ↔ Base'
-    : quoteResult && quoteResult.amountRaw > MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
-      ? 'Canary maximum is 0.1 USDC'
+    ? 'Select an Arc hub route'
+    : !canaryWriteEnabled
+      ? `${sourceName} → ${destinationName} canary is read-only`
+      : quoteResult && quoteResult.amountRaw > canaryMaxAmountRaw
+        ? `Canary maximum is ${canaryMaxAmount} USDC`
       : !isConnected
         ? 'Connect wallet'
         : transferStage === 'complete'
@@ -529,11 +572,14 @@ export default function MainnetPreviewGate() {
                 <span className="mb-2 block text-center text-xs font-medium text-slate-500">From</span>
                 <select
                   value={source}
-                  onChange={(event) => setSource(event.target.value as RouteEndpoint)}
+                  onChange={(event) => selectSource(event.target.value as RouteEndpoint)}
                   className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-900 outline-none transition-colors focus:border-[#66D121]"
                 >
-                  <option value="base">Base</option>
-                  <option value="arc">Arc</option>
+                  {MAINNET_ARC_BRIDGE_NETWORK_KEYS.map((key) => (
+                    <option key={key} value={key}>
+                      {MAINNET_NETWORKS[key].name}
+                    </option>
+                  ))}
                 </select>
               </label>
 
@@ -550,14 +596,16 @@ export default function MainnetPreviewGate() {
                 <span className="mb-2 block text-center text-xs font-medium text-slate-500">To</span>
                 <select
                   value={destination}
-                  onChange={(event) => {
-                    const nextDestination = event.target.value as RouteEndpoint
-                    setSource(nextDestination === 'arc' ? 'base' : 'arc')
-                  }}
+                  onChange={(event) =>
+                    selectDestination(event.target.value as RouteEndpoint)
+                  }
                   className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-900 outline-none transition-colors focus:border-[#66D121]"
                 >
-                  <option value="arc">Arc</option>
-                  <option value="base">Base</option>
+                  {MAINNET_ARC_BRIDGE_NETWORK_KEYS.map((key) => (
+                    <option key={key} value={key}>
+                      {MAINNET_NETWORKS[key].name}
+                    </option>
+                  ))}
                 </select>
               </label>
             </div>
@@ -589,7 +637,7 @@ export default function MainnetPreviewGate() {
           </div>
 
           <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-900">
-            Preflight checks use production RPCs and Circle services without signatures. The Arc ↔ Base canary below can request real mainnet wallet signatures for transfers up to 0.1 USDC.
+            Preflight checks use production RPCs and Circle services without signatures. Verified or testing routes can request real mainnet wallet signatures up to {canaryMaxAmount} USDC; candidate routes remain read-only.
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -699,7 +747,14 @@ export default function MainnetPreviewGate() {
               <StatusRow label="Circle CCTP" state={circleStatus} />
               <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
               <StatusRow label="Global transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
-              <StatusRow label="Arc ↔ Base canary ≤ 0.1 USDC" state={canaryWritesUnlocked ? 'ready' : 'locked'} />
+              <StatusRow
+                label={`${sourceName} → ${destinationName} canary ≤ ${canaryMaxAmount} USDC`}
+                state={
+                  canaryWritesUnlocked && canaryWriteEnabled
+                    ? 'ready'
+                    : 'locked'
+                }
+              />
             </div>
           </div>
 
@@ -865,7 +920,7 @@ export default function MainnetPreviewGate() {
             </button>
 
             <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-              Real mainnet canary: Arc ↔ Base only, maximum 0.1 USDC. Recipient and destination caller are locked to the connected wallet. Global mainnet and Gateway remain locked.
+              Real mainnet writes are enabled only for routes marked testing or verified, with a maximum of {canaryMaxAmount} USDC. Recipient and destination caller remain locked to the connected wallet. Global mainnet and Gateway remain locked.
             </p>
           </div>
         </div>
