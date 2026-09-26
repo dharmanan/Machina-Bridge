@@ -307,9 +307,26 @@ export default function MainnetPreviewGate() {
           : 'Wallet is not ready for burn'
     : null
 
+  const sourceHasEnoughUsdc = Boolean(
+    quoteResult
+    && simulation
+    && simulation.balanceRaw >= quoteResult.amountRaw
+  )
+
+  const sourceActionReady = Boolean(
+    simulation
+    && (
+      simulation.approvalRequired
+        ? simulation.readyForApproval
+        : simulation.readyForBurn
+    )
+  )
+
   const preflightReady = Boolean(
     quoteResult
     && simulation
+    && sourceHasEnoughUsdc
+    && sourceActionReady
     && arcStatus === 'ready'
     && circleStatus === 'ready'
     && routeStatus === 'ready',
