@@ -1,7 +1,14 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { getWalletClient } from 'wagmi/actions'
-import { createPublicClient, fallback, http, parseUnits, type Hex } from 'viem'
+import {
+  createPublicClient,
+  fallback,
+  formatUnits,
+  http,
+  parseUnits,
+  type Hex,
+} from 'viem'
 import { getCircleMainnetReadiness } from '../config/circle'
 import { getRuntimeCapabilities } from '../config/features'
 import { getMainnetReadiness } from '../config/mainnet'
@@ -520,8 +527,48 @@ export function useMainnetCctp() {
 
     let hash: Hex | undefined
     try {
-      const walletClient = await ensureWalletOnChain(input.destinationChainId)
       const call = prepareMainnetCctpMint(input)
+      const publicClient = makePublicClient(destination.rpcUrls)
+
+      const nativeBalanceRaw = await publicClient.getBalance({
+        address,
+      })
+
+      if (nativeBalanceRaw <= 0n) {
+        throw new Error(
+          `Destination wallet has no ${destination.nativeCurrency.symbol} for mint gas.`,
+        )
+      }
+
+      const [gasPrice, estimatedGas] = await Promise.all([
+        publicClient.getGasPrice(),
+        publicClient.estimateGas({
+          account: address,
+          to: call.to,
+          data: call.data,
+          value: call.value,
+        }),
+      ])
+
+      const estimatedGasCostRaw = estimatedGas * gasPrice
+
+      if (nativeBalanceRaw < estimatedGasCostRaw) {
+        throw new Error(
+          `Insufficient ${destination.nativeCurrency.symbol} for destination mint gas. `
+          + `Available ${formatUnits(
+            nativeBalanceRaw,
+            destination.nativeCurrency.decimals,
+          )}; estimated requirement ${formatUnits(
+            estimatedGasCostRaw,
+            destination.nativeCurrency.decimals,
+          )}.`,
+        )
+      }
+
+      const walletClient = await ensureWalletOnChain(
+        input.destinationChainId,
+      )
+
       hash = await walletClient.sendTransaction({
         account: address,
         to: call.to,
@@ -530,10 +577,11 @@ export function useMainnetCctp() {
       })
 
       if (input.transferId) {
-        updateMainnetTransferRecord(input.transferId, { destinationTxHash: hash })
+        updateMainnetTransferRecord(input.transferId, {
+          destinationTxHash: hash,
+        })
       }
 
-      const publicClient = makePublicClient(destination.rpcUrls)
       await publicClient.waitForTransactionReceipt({ hash })
 
       if (input.transferId) {

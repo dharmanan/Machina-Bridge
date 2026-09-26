@@ -34,7 +34,45 @@ const CHAINS = {
     mode: 'fast',
     threshold: 1000,
   },
+  ethereum: {
+    name: 'Ethereum',
+    chainId: 1,
+    domain: 0,
+    rpc: process.env.ETHEREUM_MAINNET_RPC || 'https://ethereum-rpc.publicnode.com',
+    usdc: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    mode: 'fast',
+    threshold: 1000,
+  },
+  optimism: {
+    name: 'OP Mainnet',
+    chainId: 10,
+    domain: 2,
+    rpc: process.env.OPTIMISM_MAINNET_RPC || 'https://mainnet.optimism.io',
+    usdc: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
+    mode: 'fast',
+    threshold: 1000,
+  },
+  arbitrum: {
+    name: 'Arbitrum One',
+    chainId: 42161,
+    domain: 3,
+    rpc: process.env.ARBITRUM_MAINNET_RPC || 'https://arb1.arbitrum.io/rpc',
+    usdc: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+    mode: 'fast',
+    threshold: 1000,
+  },
 }
+
+const ROUTES = [
+  ['arc', 'base'],
+  ['base', 'arc'],
+  ['arc', 'ethereum'],
+  ['ethereum', 'arc'],
+  ['arc', 'optimism'],
+  ['optimism', 'arc'],
+  ['arc', 'arbitrum'],
+  ['arbitrum', 'arc'],
+]
 
 const tokenMessengerAbi = parseAbi([
   'function remoteTokenMessengers(uint32 domain) view returns (bytes32)',
@@ -157,11 +195,30 @@ async function main(){
 
   const checks=[]
   record(checks,'Arc source mode',CHAINS.arc.mode==='standard','Standard / finality 2000')
-  record(checks,'Base source mode',CHAINS.base.mode==='fast','Fast / finality 1000')
+  record(checks,'EVM source mode',[
+    CHAINS.base,
+    CHAINS.ethereum,
+    CHAINS.optimism,
+    CHAINS.arbitrum,
+  ].every((chain)=>chain.mode==='fast'),'Fast / finality 1000')
 
-  await verifyRoute(checks,CHAINS.arc,CHAINS.base)
-  console.log('')
-  await verifyRoute(checks,CHAINS.base,CHAINS.arc)
+  for (const [sourceKey,destinationKey] of ROUTES) {
+    const source=CHAINS[sourceKey]
+    const destination=CHAINS[destinationKey]
+
+    try {
+      await verifyRoute(checks,source,destination)
+    } catch (error) {
+      record(
+        checks,
+        `${source.name} → ${destination.name} route verification`,
+        false,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+
+    console.log('')
+  }
 
   const mint=encodeFunctionData({
     abi:messageTransmitterAbi,
@@ -182,6 +239,7 @@ async function main(){
   console.log('\n=== RESULT ===')
   console.log(`checks=${checks.length} passed=${checks.length-failed.length} failed=${failed.length}`)
   console.log(failed.length===0?'MAINNET_CCTP_PRODUCTION_VERIFY=PASS':'MAINNET_CCTP_PRODUCTION_VERIFY=FAIL')
+  console.log(`ROUTES_CHECKED=${ROUTES.length}`)
   console.log('TRANSACTION_BROADCAST=NO')
   if(failed.length)process.exitCode=1
 }

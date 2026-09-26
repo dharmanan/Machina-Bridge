@@ -33,6 +33,10 @@ type MainnetCctpChain = {
   fastTransferSource: boolean
   usdcAddress: `0x${string}`
   rpcUrls: readonly string[]
+  nativeCurrency: {
+    symbol: string
+    decimals: number
+  }
   tokenMessengerAddress: `0x${string}`
   messageTransmitterAddress: `0x${string}`
 }
@@ -48,6 +52,7 @@ const MAINNET_CCTP_CHAINS = Object.fromEntries(
       fastTransferSource: network.fastTransferSource,
       usdcAddress: network.usdcAddress,
       rpcUrls: network.rpcUrls,
+      nativeCurrency: network.nativeCurrency,
       tokenMessengerAddress: MAINNET_CCTP_TOKEN_MESSENGER,
       messageTransmitterAddress: MAINNET_CCTP_MESSAGE_TRANSMITTER,
     } satisfies MainnetCctpChain,

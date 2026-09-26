@@ -22,7 +22,11 @@ import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
-import type { MainnetCctpSourceSimulation } from '../lib/mainnetCctpSimulation'
+import {
+  probeMainnetCctpDestinationGas,
+  type MainnetCctpDestinationGasProbe,
+  type MainnetCctpSourceSimulation,
+} from '../lib/mainnetCctpSimulation'
 
 type RouteEndpoint = (typeof MAINNET_ARC_BRIDGE_NETWORK_KEYS)[number]
 
@@ -153,6 +157,7 @@ export default function MainnetPreviewGate() {
   const [amount, setAmount] = useState('0.1')
   const [quoteResult, setQuoteResult] = useState<MainnetCctpQuote | null>(null)
   const [simulation, setSimulation] = useState<MainnetCctpSourceSimulation | null>(null)
+  const [destinationGas, setDestinationGas] = useState<MainnetCctpDestinationGasProbe | null>(null)
   const [readOnlyError, setReadOnlyError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -204,6 +209,7 @@ export default function MainnetPreviewGate() {
   useEffect(() => {
     setQuoteResult(null)
     setSimulation(null)
+    setDestinationGas(null)
     setReadOnlyError(null)
     setActionError(null)
   }, [source, destination, amount, address])
@@ -253,16 +259,25 @@ export default function MainnetPreviewGate() {
     setReadOnlyError(null)
     setQuoteResult(null)
     setSimulation(null)
+    setDestinationGas(null)
 
     try {
       if (isConnected && address) {
-        const result = await simulateSource({
-          sourceChainId,
-          destinationChainId,
-          amount,
-          recipient: address,
-        })
+        const [result, gasResult] = await Promise.all([
+          simulateSource({
+            sourceChainId,
+            destinationChainId,
+            amount,
+            recipient: address,
+          }),
+          probeMainnetCctpDestinationGas({
+            destinationChainId,
+            account: address,
+          }),
+        ])
+
         setSimulation(result)
+        setDestinationGas(gasResult)
         setQuoteResult(result.quote)
         return
       }
@@ -325,6 +340,7 @@ export default function MainnetPreviewGate() {
   const preflightReady = Boolean(
     quoteResult
     && simulation
+    && destinationGas?.ready
     && sourceHasEnoughUsdc
     && sourceActionReady
     && arcStatus === 'ready'
@@ -727,6 +743,38 @@ export default function MainnetPreviewGate() {
                     <span className="text-slate-600">{sourceName} USDC balance</span>
                     <span className="font-semibold text-slate-800">{formatUnits(simulation.balanceRaw, 6)} USDC</span>
                   </div>
+                  <div className="flex items-center justify-between gap-4 text-sm">
+                    <span className="text-slate-600">
+                      Source gas ({sourceNetwork.nativeCurrency.symbol})
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {formatUnits(
+                        simulation.nativeBalanceRaw,
+                        sourceNetwork.nativeCurrency.decimals,
+                      )} {sourceNetwork.nativeCurrency.symbol}
+                    </span>
+                  </div>
+
+                  {destinationGas && (
+                    <div className="flex items-center justify-between gap-4 text-sm">
+                      <span className="text-slate-600">
+                        Destination gas ({destinationGas.nativeSymbol})
+                      </span>
+                      <span
+                        className={`font-semibold ${
+                          destinationGas.ready
+                            ? 'text-slate-800'
+                            : 'text-amber-700'
+                        }`}
+                      >
+                        {formatUnits(
+                          destinationGas.nativeBalanceRaw,
+                          destinationGas.nativeDecimals,
+                        )} {destinationGas.nativeSymbol}
+                      </span>
+                    </div>
+                  )}
+
                   <div className="flex items-center justify-between gap-4 text-sm">
                     <span className="text-slate-600">Token allowance</span>
                     <span className="font-semibold text-slate-800">

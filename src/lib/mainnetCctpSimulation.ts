@@ -9,6 +9,7 @@ import {
 import {
   CCTP_V2_ERC20_ABI,
   MAINNET_CCTP_TOKEN_MESSENGER,
+  getMainnetCctpChain,
   getMainnetCctpRoute,
 } from '../config/mainnetCctp'
 import {
@@ -34,6 +35,16 @@ export type MainnetCctpSimulatedCall = {
   gasPrice?: bigint
   estimatedGasCostRaw?: bigint
   error?: string
+}
+
+export type MainnetCctpDestinationGasProbe = {
+  checkedAt: string
+  destinationChainId: number
+  account: `0x${string}`
+  nativeBalanceRaw: bigint
+  nativeSymbol: string
+  nativeDecimals: number
+  ready: boolean
 }
 
 export type MainnetCctpSourceSimulation = {
@@ -63,6 +74,35 @@ function makePublicClient(rpcUrls: readonly string[]) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+export async function probeMainnetCctpDestinationGas(input: {
+  destinationChainId: number
+  account: string
+}): Promise<MainnetCctpDestinationGasProbe> {
+  const destination = getMainnetCctpChain(input.destinationChainId)
+
+  if (!destination) {
+    throw new Error('Unsupported CCTP mainnet destination chain')
+  }
+
+  if (!isAddress(input.account)) {
+    throw new Error('Invalid destination wallet address')
+  }
+
+  const account = getAddress(input.account)
+  const client = makePublicClient(destination.rpcUrls)
+  const nativeBalanceRaw = await client.getBalance({ address: account })
+
+  return {
+    checkedAt: new Date().toISOString(),
+    destinationChainId: destination.chainId,
+    account,
+    nativeBalanceRaw,
+    nativeSymbol: destination.nativeCurrency.symbol,
+    nativeDecimals: destination.nativeCurrency.decimals,
+    ready: nativeBalanceRaw > 0n,
+  }
 }
 
 async function simulatePreparedCall(input: {
