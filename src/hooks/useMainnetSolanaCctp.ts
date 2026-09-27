@@ -5,6 +5,7 @@ import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circ
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
 import { formatUnits, parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
+import { deriveSolanaUsdcAta } from '../lib/solana'
 
 import {
   isMainnetSolanaCanaryWriteEnabled,
@@ -159,7 +160,7 @@ export function useMainnetSolanaCctp(
   }, [])
 
   const refreshSolanaBalance = useCallback(async () => {
-    if (!phantomAddress || !phantomProvider) {
+    if (!phantomAddress) {
       setSolanaBalance(null)
       setSolanaBalanceError(null)
       return null
@@ -168,28 +169,48 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const kit = new BridgeKit()
-      const { solana } = resolveChains(kit)
+      const { ata } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
 
-      const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
-        capabilities: {
-          addressContext: 'user-controlled',
-          supportedChains: [solana],
+      const response = await fetch('https://solana-rpc.publicnode.com', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
         },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getAccountInfo',
+          params: [
+            ata.toBase58(),
+            {
+              encoding: 'jsonParsed',
+              commitment: 'confirmed',
+            },
+          ],
+        }),
       })
 
-      const action = await solanaAdapter.prepareAction(
-        'usdc.balanceOf',
-        {},
-        {
-          chain: solana.name as any,
-          address: phantomAddress,
-        } as any,
-      )
+      if (!response.ok) {
+        throw new Error(`Solana RPC HTTP ${response.status}`)
+      }
 
-      const raw = await action.execute()
-      const formatted = formatUnits(BigInt(raw as any), 6)
+      const payload = await response.json()
+      if (payload?.error) {
+        throw new Error(payload.error.message || 'Solana RPC error')
+      }
+
+      const tokenAmount = payload?.result?.value?.data?.parsed?.info?.tokenAmount
+      const raw = tokenAmount?.amount
+
+      if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+        throw new Error('USDC associated token account balance was not returned.')
+      }
+
+      const formatted =
+        typeof tokenAmount?.uiAmountString === 'string'
+          ? tokenAmount.uiAmountString
+          : formatUnits(BigInt(raw), 6)
 
       setSolanaBalance(formatted)
       return formatted
@@ -201,7 +222,7 @@ export function useMainnetSolanaCctp(
       setSolanaBalanceError(message)
       throw error
     }
-  }, [phantomAddress, phantomProvider])
+  }, [phantomAddress])
 
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
