@@ -247,10 +247,18 @@ export default function MainnetSolanaCanary() {
 
         {transferResult?.sourceTxHash && transferResult?.destinationTxHash && (
           <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-900">
-            <p className="font-semibold">Arc → Solana transfer complete</p>
+            <p className="font-semibold">
+              {transferResult.direction === 'solana-to-arc'
+                ? 'Solana → Arc transfer complete'
+                : 'Arc → Solana transfer complete'}
+            </p>
             <div className="mt-2 flex flex-wrap gap-x-4 gap-y-2">
               <a
-                href={`${MAINNET_NETWORKS.arc.explorerUrl}/tx/${transferResult.sourceTxHash}`}
+                href={
+                  transferResult.direction === 'solana-to-arc'
+                    ? `${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${transferResult.sourceTxHash}`
+                    : `${MAINNET_NETWORKS.arc.explorerUrl}/tx/${transferResult.sourceTxHash}`
+                }
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 underline underline-offset-2"
@@ -259,7 +267,11 @@ export default function MainnetSolanaCanary() {
                 <ExternalLink size={12} />
               </a>
               <a
-                href={`${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${transferResult.destinationTxHash}`}
+                href={
+                  transferResult.direction === 'solana-to-arc'
+                    ? `${MAINNET_NETWORKS.arc.explorerUrl}/tx/${transferResult.destinationTxHash}`
+                    : `${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${transferResult.destinationTxHash}`
+                }
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 underline underline-offset-2"
