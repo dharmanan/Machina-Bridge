@@ -298,7 +298,10 @@ export type MainnetSolanaCanaryState = {
 export type MainnetSolanaFeeEstimate = {
   amount: string
   bridgeFee: string
+  networkFeeUsdc: string
+  totalUsdcFees: string
   receiveAmount: string
+  netUsdcAfterFees: string
   fees: Array<{
     type: string
     amount: string | null
@@ -343,16 +346,31 @@ function normalizeSolanaFeeEstimate(
       })
     : []
 
+  let networkUsdcFeeRaw = 0n
+
   const gasFees = Array.isArray(rawEstimate?.gasFees)
-    ? rawEstimate.gasFees.map((gasFee: any) => ({
-        name: String(gasFee?.name ?? 'Network fee'),
-        amount: typeof gasFee?.fees?.fee === 'string'
+    ? rawEstimate.gasFees.map((gasFee: any) => {
+        const amount = typeof gasFee?.fees?.fee === 'string'
           ? gasFee.fees.fee
           : gasFee?.fees?.fee != null
             ? String(gasFee.fees.fee)
-            : null,
-        token: String(gasFee?.token ?? ''),
-      }))
+            : null
+        const token = String(gasFee?.token ?? '')
+
+        if (amount && token.toUpperCase() === 'USDC') {
+          try {
+            networkUsdcFeeRaw += parseUnits(amount, 6)
+          } catch {
+            // Keep the SDK value visible even when it cannot be normalized.
+          }
+        }
+
+        return {
+          name: String(gasFee?.name ?? 'Network fee'),
+          amount,
+          token,
+        }
+      })
     : []
 
   let amountRaw = 0n
@@ -365,11 +383,18 @@ function normalizeSolanaFeeEstimate(
   const receiveRaw = amountRaw > totalUsdcFeeRaw
     ? amountRaw - totalUsdcFeeRaw
     : 0n
+  const totalUsdcFeesRaw = totalUsdcFeeRaw + networkUsdcFeeRaw
+  const netUsdcAfterFeesRaw = receiveRaw > networkUsdcFeeRaw
+    ? receiveRaw - networkUsdcFeeRaw
+    : 0n
 
   return {
     amount,
     bridgeFee: formatUnits(totalUsdcFeeRaw, 6),
+    networkFeeUsdc: formatUnits(networkUsdcFeeRaw, 6),
+    totalUsdcFees: formatUnits(totalUsdcFeesRaw, 6),
     receiveAmount: formatUnits(receiveRaw, 6),
+    netUsdcAfterFees: formatUnits(netUsdcAfterFeesRaw, 6),
     fees,
     gasFees,
   }
@@ -486,6 +511,24 @@ function getBridgeResultTxHashes(result: any) {
       (typeof result?.destinationTxHash === 'string' ? result.destinationTxHash : undefined)
       || (typeof result?.receiveTxHash === 'string' ? result.receiveTxHash : undefined)
       || extractBridgeStepTxHash(destinationStep),
+  }
+}
+
+function computeActualUsdcCost(
+  beforeArc: string | null,
+  beforeSolana: string | null,
+  afterArc: string | null,
+  afterSolana: string | null,
+) {
+  if (!beforeArc || !beforeSolana || !afterArc || !afterSolana) return undefined
+
+  try {
+    const beforeTotal = parseUnits(beforeArc, 6) + parseUnits(beforeSolana, 6)
+    const afterTotal = parseUnits(afterArc, 6) + parseUnits(afterSolana, 6)
+    const cost = beforeTotal > afterTotal ? beforeTotal - afterTotal : 0n
+    return formatUnits(cost, 6)
+  } catch {
+    return undefined
   }
 }
 
@@ -1096,6 +1139,11 @@ export function useMainnetSolanaCctp(
 
       await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
 
+      const [arcBalanceBefore, solanaBalanceBefore] = await Promise.all([
+        refreshArcBalance().catch(() => null),
+        refreshSolanaBalance().catch(() => null),
+      ])
+
       setState((previous) => ({
         ...previous,
         status: direction === 'solana-to-arc'
@@ -1175,10 +1223,21 @@ export function useMainnetSolanaCctp(
       }
 
       const txHashes = getBridgeResultTxHashes(finalResult)
+      const [arcBalanceAfter, solanaBalanceAfter] = await Promise.all([
+        refreshArcBalance().catch(() => null),
+        refreshSolanaBalance().catch(() => null),
+      ])
+      const actualUsdcCost = computeActualUsdcCost(
+        arcBalanceBefore,
+        solanaBalanceBefore,
+        arcBalanceAfter,
+        solanaBalanceAfter,
+      )
       const normalizedResult = {
         ...finalResult,
         ...txHashes,
         direction,
+        actualUsdcCost,
       }
 
       setState({
@@ -1188,8 +1247,6 @@ export function useMainnetSolanaCctp(
         result: normalizedResult,
       })
 
-      void refreshArcBalance().catch(() => undefined)
-      void refreshSolanaBalance().catch(() => undefined)
       return normalizedResult
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Solana mainnet canary failed.'
