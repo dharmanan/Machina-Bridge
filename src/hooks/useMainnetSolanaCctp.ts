@@ -424,8 +424,48 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const raw = await readSolanaUsdcRawBalance(phantomAddress)
-      const formatted = formatUnits(raw, 6)
+      const { ata } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
+
+      const response = await fetch('https://solana-rpc.publicnode.com', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getAccountInfo',
+          params: [
+            ata.toBase58(),
+            {
+              encoding: 'jsonParsed',
+              commitment: 'confirmed',
+            },
+          ],
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Solana RPC HTTP ${response.status}`)
+      }
+
+      const payload = await response.json()
+      if (payload?.error) {
+        throw new Error(payload.error.message || 'Solana RPC error')
+      }
+
+      const tokenAmount = payload?.result?.value?.data?.parsed?.info?.tokenAmount
+      const raw = tokenAmount?.amount
+
+      if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+        throw new Error('USDC associated token account balance was not returned.')
+      }
+
+      const formatted =
+        typeof tokenAmount?.uiAmountString === 'string'
+          ? tokenAmount.uiAmountString
+          : formatUnits(BigInt(raw), 6)
 
       setSolanaBalance(formatted)
       return formatted
@@ -433,6 +473,7 @@ export function useMainnetSolanaCctp(
       const message = error instanceof Error
         ? error.message
         : 'Unable to read Solana mainnet USDC balance.'
+      setSolanaBalance(null)
       setSolanaBalanceError(message)
       throw error
     }
