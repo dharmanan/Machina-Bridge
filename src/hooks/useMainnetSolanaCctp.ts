@@ -302,6 +302,10 @@ export type MainnetSolanaFeeEstimate = {
   totalUsdcFees: string
   receiveAmount: string
   netUsdcAfterFees: string
+  solanaTxFeeSol: string | null
+  solanaEventRentSol: string | null
+  solanaUpfrontSol: string | null
+  solanaEventRentRefundableAfterDays: number | null
   fees: Array<{
     type: string
     amount: string | null
@@ -388,6 +392,17 @@ function normalizeSolanaFeeEstimate(
     ? receiveRaw - networkUsdcFeeRaw
     : 0n
 
+  let solanaTxFeeRaw = 0n
+  for (const gasFee of gasFees) {
+    if (gasFee.amount && gasFee.token.toUpperCase() === 'SOL') {
+      try {
+        solanaTxFeeRaw += parseUnits(gasFee.amount, 9)
+      } catch {
+        // Keep the SDK value visible even when it cannot be normalized.
+      }
+    }
+  }
+
   return {
     amount,
     bridgeFee: formatUnits(totalUsdcFeeRaw, 6),
@@ -395,6 +410,10 @@ function normalizeSolanaFeeEstimate(
     totalUsdcFees: formatUnits(totalUsdcFeesRaw, 6),
     receiveAmount: formatUnits(receiveRaw, 6),
     netUsdcAfterFees: formatUnits(netUsdcAfterFeesRaw, 6),
+    solanaTxFeeSol: solanaTxFeeRaw > 0n ? formatUnits(solanaTxFeeRaw, 9) : null,
+    solanaEventRentSol: null,
+    solanaUpfrontSol: null,
+    solanaEventRentRefundableAfterDays: null,
     fees,
     gasFees,
   }
@@ -1064,6 +1083,41 @@ export function useMainnetSolanaCctp(
           } as any)
 
       const normalized = normalizeSolanaFeeEstimate(estimate, amount)
+
+      if (direction === 'solana-to-arc') {
+        // Circle CCTP V2 stores the source MessageSent event in a temporary
+        // Solana account. For a standard burn with empty hookData, the current
+        // MessageSent account layout is 428 bytes.
+        const rentResponse = await fetch('/api/solana-rpc', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getMinimumBalanceForRentExemption',
+            params: [428, { commitment: 'confirmed' }],
+          }),
+        })
+
+        const rentPayload = await rentResponse.json().catch(() => null)
+        const rentLamports =
+          rentResponse.ok && Number.isFinite(Number(rentPayload?.result))
+            ? BigInt(rentPayload.result)
+            : null
+
+        if (rentLamports !== null) {
+          const txFeeLamports = normalized.solanaTxFeeSol
+            ? parseUnits(normalized.solanaTxFeeSol, 9)
+            : 0n
+          normalized.solanaEventRentSol = formatUnits(rentLamports, 9)
+          normalized.solanaUpfrontSol = formatUnits(rentLamports + txFeeLamports, 9)
+          normalized.solanaEventRentRefundableAfterDays = 5
+        }
+      }
+
       setFeeEstimate(normalized)
       return normalized
     } catch (error) {
