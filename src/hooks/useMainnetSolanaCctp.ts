@@ -3,7 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { parseUnits } from 'viem'
+import { formatUnits, parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 
 import {
@@ -159,7 +159,7 @@ export function useMainnetSolanaCctp(
   }, [])
 
   const refreshSolanaBalance = useCallback(async () => {
-    if (!phantomAddress) {
+    if (!phantomAddress || !phantomProvider) {
       setSolanaBalance(null)
       setSolanaBalanceError(null)
       return null
@@ -168,23 +168,31 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const response = await fetch(
-        `/api/solana-balance?owner=${encodeURIComponent(phantomAddress)}`,
-        {
-          method: 'GET',
-          headers: { accept: 'application/json' },
-          cache: 'no-store',
+      const kit = new BridgeKit()
+      const { solana } = resolveChains(kit)
+
+      const solanaAdapter = await createSolanaAdapterFromProvider({
+        provider: createStrictSolanaProvider(phantomProvider),
+        capabilities: {
+          addressContext: 'user-controlled',
+          supportedChains: [solana],
         },
+      })
+
+      const action = await solanaAdapter.prepareAction(
+        'usdc.balanceOf',
+        {},
+        {
+          chain: solana.name as any,
+          address: phantomAddress,
+        } as any,
       )
 
-      const payload = await response.json().catch(() => null)
+      const raw = await action.execute()
+      const formatted = formatUnits(BigInt(raw as any), 6)
 
-      if (!response.ok || !payload?.ok || typeof payload?.balance !== 'string') {
-        throw new Error(payload?.error || `Balance API HTTP ${response.status}`)
-      }
-
-      setSolanaBalance(payload.balance)
-      return payload.balance
+      setSolanaBalance(formatted)
+      return formatted
     } catch (error) {
       const message = error instanceof Error
         ? error.message
@@ -193,7 +201,7 @@ export function useMainnetSolanaCctp(
       setSolanaBalanceError(message)
       throw error
     }
-  }, [phantomAddress])
+  }, [phantomAddress, phantomProvider])
 
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
