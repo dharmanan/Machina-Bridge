@@ -128,7 +128,7 @@ export default function MainnetSolanaCanary() {
           </p>
           {solanaBalanceError && (
             <p className="mt-2 text-[11px] leading-4 text-amber-700">
-              Balance read failed. Try Refresh or configure a dedicated Solana mainnet RPC.
+              Solana production RPC is unavailable. Configure the server-only SOLANA_MAINNET_RPC environment variable.
             </p>
           )}
         </div>
