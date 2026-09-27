@@ -1,7 +1,7 @@
 import { PublicKey } from '@solana/web3.js'
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-const DEFAULT_SOLANA_MAINNET_RPC = 'https://api.mainnet.solana.com'
+const DEFAULT_SOLANA_MAINNET_RPC = 'https://api.mainnet-beta.solana.com'
 
 async function rpcCall(rpcUrl, method, params) {
   const response = await fetch(rpcUrl, {
