@@ -1116,7 +1116,7 @@ export function useMainnetSolanaCctp(
         // Vite dev does not serve Vercel API routes. Fall back to the same
         // public Solana RPC already used by the primary balance reader so
         // local UI estimates remain complete without Vercel dev.
-        if (rentLamports === null) {
+        if (rentLamports === null && import.meta.env.DEV) {
           rentLamports = await readRentLamports('https://solana-rpc.publicnode.com')
         }
 
