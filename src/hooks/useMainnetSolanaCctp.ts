@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
@@ -26,6 +26,12 @@ const ERC20_BALANCE_ABI = parseAbi([
 const DEPOSIT_FOR_BURN_EVENT = parseAbiItem(
   'event DepositForBurn(address indexed burnToken,uint256 amount,address indexed depositor,bytes32 mintRecipient,uint32 destinationDomain,bytes32 destinationTokenMessenger,bytes32 destinationCaller,uint256 maxFee,uint32 indexed minFinalityThreshold,bytes hookData)',
 )
+
+const RECOVERED_ARC_SOLANA_TXS_KEY = 'machina_arc_solana_recovered_txs_v1'
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
 
 interface WalletClientLike {
   transport: {
@@ -183,6 +189,7 @@ export function useMainnetSolanaCctp(
   const [solanaBalanceError, setSolanaBalanceError] = useState<string | null>(null)
   const [pendingArcToSolanaTx, setPendingArcToSolanaTx] = useState<Hex | null>(null)
   const [pendingArcToSolanaError, setPendingArcToSolanaError] = useState<string | null>(null)
+  const pendingScanRef = useRef<Promise<Hex | null> | null>(null)
 
   const kitSupport = useMemo(() => {
     try {
@@ -304,63 +311,106 @@ export function useMainnetSolanaCctp(
 
   const findPendingArcToSolanaBurn = useCallback(async () => {
     if (!evmAddress || !phantomAddress) return null
+    if (pendingScanRef.current) return pendingScanRef.current
 
-    setPendingArcToSolanaError(null)
+    const scan = async () => {
+      setPendingArcToSolanaError(null)
 
-    try {
-      const arc = MAINNET_NETWORKS.arc
-      const client = createPublicClient({
-        transport: http(arc.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
-      })
-      const latestBlock = await client.getBlockNumber()
-      const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
-      const recipients = new Set([ownerHex.toLowerCase(), ataHex.toLowerCase()])
-
-      const chunkSize = 500n
-      const maxChunks = 40
-
-      for (let index = 0; index < maxChunks; index += 1) {
-        const chunkTo = latestBlock - (BigInt(index) * chunkSize)
-        if (chunkTo < 0n) break
-
-        const chunkFrom = chunkTo > chunkSize
-          ? chunkTo - chunkSize + 1n
-          : 0n
-
-        const logs = await client.getLogs({
-          address: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
-          event: DEPOSIT_FOR_BURN_EVENT,
-          args: {
-            burnToken: arc.usdcAddress,
-            depositor: evmAddress,
-          },
-          fromBlock: chunkFrom,
-          toBlock: chunkTo,
+      try {
+        const arc = MAINNET_NETWORKS.arc
+        const client = createPublicClient({
+          transport: http(arc.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
         })
+        const latestBlock = await client.getBlockNumber()
+        const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
+        const recipients = new Set([ownerHex.toLowerCase(), ataHex.toLowerCase()])
 
-        const match = [...logs].reverse().find((log: any) =>
-          Number(log.args?.destinationDomain) === 5
-          && recipients.has(String(log.args?.mintRecipient || '').toLowerCase())
-          && Boolean(log.transactionHash)
-        )
+        const recovered = (() => {
+          try {
+            const raw = window.localStorage.getItem(RECOVERED_ARC_SOLANA_TXS_KEY)
+            const values = raw ? JSON.parse(raw) : []
+            return new Set<string>(
+              Array.isArray(values)
+                ? values.map((value) => String(value).toLowerCase())
+                : [],
+            )
+          } catch {
+            return new Set<string>()
+          }
+        })()
 
-        const txHash = match?.transactionHash as Hex | undefined
-        if (txHash) {
-          setPendingArcToSolanaTx(txHash)
-          return txHash
+        const chunkSize = 500n
+        const maxChunks = 8
+
+        for (let index = 0; index < maxChunks; index += 1) {
+          const chunkTo = latestBlock - (BigInt(index) * chunkSize)
+          if (chunkTo < 0n) break
+          const chunkFrom = chunkTo >= chunkSize
+            ? chunkTo - chunkSize + 1n
+            : 0n
+
+          let logs
+          try {
+            logs = await client.getLogs({
+              address: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
+              event: DEPOSIT_FOR_BURN_EVENT,
+              args: { burnToken: arc.usdcAddress },
+              fromBlock: chunkFrom,
+              toBlock: chunkTo,
+            })
+          } catch (error) {
+            const message = error instanceof Error ? error.message.toLowerCase() : ''
+            if (!message.includes('rate limit') && !message.includes('defined limit')) {
+              throw error
+            }
+            await delay(1_000)
+            logs = await client.getLogs({
+              address: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
+              event: DEPOSIT_FOR_BURN_EVENT,
+              args: { burnToken: arc.usdcAddress },
+              fromBlock: chunkFrom,
+              toBlock: chunkTo,
+            })
+          }
+
+          const matches = [...logs].reverse().filter((log: any) => {
+            const txHash = String(log.transactionHash || '').toLowerCase()
+            return (
+              Number(log.args?.destinationDomain) === 5
+              && recipients.has(String(log.args?.mintRecipient || '').toLowerCase())
+              && Boolean(txHash)
+              && !recovered.has(txHash)
+            )
+          })
+
+          for (const match of matches as any[]) {
+            const txHash = match.transactionHash as Hex | undefined
+            if (!txHash) continue
+            const tx = await client.getTransaction({ hash: txHash })
+            if (tx.from.toLowerCase() === evmAddress.toLowerCase()) {
+              setPendingArcToSolanaTx(txHash)
+              return txHash
+            }
+          }
+
+          if (chunkFrom === 0n) break
+          await delay(650)
         }
 
-        if (chunkFrom === 0n) break
+        setPendingArcToSolanaTx(null)
+        return null
+      } catch {
+        setPendingArcToSolanaError('Pending burn scan temporarily failed.')
+        throw new Error('Pending Arc to Solana burn scan failed.')
       }
+    }
 
-      setPendingArcToSolanaTx(null)
-      return null
-    } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : 'Unable to detect the pending Arc to Solana burn.'
-      setPendingArcToSolanaError(message)
-      throw error
+    const promise = scan()
+    pendingScanRef.current = promise
+    try {
+      return await promise
+    } finally {
+      pendingScanRef.current = null
     }
   }, [evmAddress, phantomAddress])
 
@@ -432,6 +482,21 @@ export function useMainnetSolanaCctp(
       const destinationTxHash = await action.execute()
       if (destinationTxHash && (solanaAdapter as any).waitForTransaction) {
         await (solanaAdapter as any).waitForTransaction(destinationTxHash, {}, solanaBridgeChain)
+      }
+
+      try {
+        const raw = window.localStorage.getItem(RECOVERED_ARC_SOLANA_TXS_KEY)
+        const values = raw ? JSON.parse(raw) : []
+        const next = Array.from(new Set([
+          ...(Array.isArray(values) ? values.map(String) : []),
+          sourceTxHash,
+        ]))
+        window.localStorage.setItem(
+          RECOVERED_ARC_SOLANA_TXS_KEY,
+          JSON.stringify(next),
+        )
+      } catch {
+        // Recovery succeeded; persistence is best-effort only.
       }
 
       setPendingArcToSolanaTx(null)
