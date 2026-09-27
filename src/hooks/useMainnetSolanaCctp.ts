@@ -114,6 +114,31 @@ function createStrictEvmProvider(
   }
 }
 
+function getBridgeKitErrorMessage(result: any) {
+  const failedStep = Array.isArray(result?.steps)
+    ? result.steps.find((step: any) =>
+        step?.state === 'error'
+        || step?.status === 'error'
+        || step?.error
+      )
+    : null
+
+  const stepName =
+    failedStep?.name
+    || failedStep?.id
+    || failedStep?.type
+    || 'unknown step'
+
+  const message =
+    failedStep?.error?.message
+    || failedStep?.error
+    || result?.error?.message
+    || result?.error
+    || 'Bridge Kit returned an error state.'
+
+  return `${stepName}: ${String(message)}`
+}
+
 function resolveChains(kit: BridgeKit) {
   const chains = kit.getSupportedChains()
   const solana = chains.find(
@@ -339,20 +364,43 @@ export function useMainnetSolanaCctp(
             amount,
           } as any)
 
-      if ((result as any)?.state === 'error') {
-        throw new Error('Bridge Kit returned an error state.')
+      let finalResult = result as any
+
+      if (finalResult?.state === 'error') {
+        setState({
+          isLoading: true,
+          error: null,
+          status: 'Bridge source step completed. Resuming the failed destination step...',
+          result: finalResult,
+        })
+
+        finalResult = await kit.retry(finalResult, {
+          from: direction === 'solana-to-arc' ? solanaAdapter : evmAdapter,
+          to: direction === 'solana-to-arc' ? evmAdapter : solanaAdapter,
+        } as any)
+      }
+
+      if (finalResult?.state === 'error') {
+        const errorMessage = getBridgeKitErrorMessage(finalResult)
+        setState({
+          isLoading: false,
+          error: errorMessage,
+          status: null,
+          result: finalResult,
+        })
+        return finalResult
       }
 
       setState({
         isLoading: false,
         error: null,
         status: 'Solana mainnet canary completed.',
-        result,
+        result: finalResult,
       })
 
       void refreshArcBalance().catch(() => undefined)
       void refreshSolanaBalance().catch(() => undefined)
-      return result
+      return finalResult
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Solana mainnet canary failed.'
       setState({
