@@ -3,7 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { formatUnits, parseUnits } from 'viem'
+import { createPublicClient, formatUnits, http, parseAbi, parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
 
@@ -13,8 +13,13 @@ import {
   type MainnetSolanaCanaryDirection,
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
+import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
+
+const ERC20_BALANCE_ABI = parseAbi([
+  'function balanceOf(address account) view returns (uint256)',
+])
 
 interface WalletClientLike {
   transport: {
@@ -141,6 +146,8 @@ export function useMainnetSolanaCctp(
     status: null,
     result: null,
   })
+  const [arcBalance, setArcBalance] = useState<string | null>(null)
+  const [arcBalanceError, setArcBalanceError] = useState<string | null>(null)
   const [solanaBalance, setSolanaBalance] = useState<string | null>(null)
   const [solanaBalanceError, setSolanaBalanceError] = useState<string | null>(null)
 
@@ -158,6 +165,44 @@ export function useMainnetSolanaCctp(
       }
     }
   }, [])
+
+  const refreshArcBalance = useCallback(async () => {
+    if (!evmAddress) {
+      setArcBalance(null)
+      setArcBalanceError(null)
+      return null
+    }
+
+    setArcBalanceError(null)
+
+    try {
+      const arc = MAINNET_NETWORKS.arc
+      const client = createPublicClient({
+        transport: http(arc.rpcUrls[0], {
+          timeout: 10_000,
+          retryCount: 0,
+        }),
+      })
+
+      const raw = await client.readContract({
+        address: arc.usdcAddress,
+        abi: ERC20_BALANCE_ABI,
+        functionName: 'balanceOf',
+        args: [evmAddress],
+      })
+
+      const formatted = formatUnits(raw, 6)
+      setArcBalance(formatted)
+      return formatted
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : 'Unable to read Arc mainnet USDC balance.'
+      setArcBalance(null)
+      setArcBalanceError(message)
+      throw error
+    }
+  }, [evmAddress])
 
   const refreshSolanaBalance = useCallback(async () => {
     if (!phantomAddress) {
@@ -300,7 +345,8 @@ export function useMainnetSolanaCctp(
         result,
       })
 
-      void refreshSolanaBalance()
+      void refreshArcBalance().catch(() => undefined)
+      void refreshSolanaBalance().catch(() => undefined)
       return result
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Solana mainnet canary failed.'
@@ -316,6 +362,7 @@ export function useMainnetSolanaCctp(
     evmAddress,
     phantomAddress,
     phantomProvider,
+    refreshArcBalance,
     refreshSolanaBalance,
     walletClient,
   ])
@@ -323,6 +370,9 @@ export function useMainnetSolanaCctp(
   return {
     state,
     kitSupport,
+    arcBalance,
+    arcBalanceError,
+    refreshArcBalance,
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
