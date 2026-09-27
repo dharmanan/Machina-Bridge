@@ -271,7 +271,7 @@ export default function MainnetSolanaCanary() {
           </div>
         )}
 
-        {direction === 'arc-to-solana' && pendingArcToSolanaTx && (
+        {direction === 'arc-to-solana' && !state.isLoading && pendingArcToSolanaTx && (
           <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
             <p className="font-semibold">Pending Arc → Solana burn detected</p>
             <a
@@ -294,7 +294,7 @@ export default function MainnetSolanaCanary() {
           </div>
         )}
 
-        {direction === 'arc-to-solana' && !pendingArcToSolanaTx && pendingArcToSolanaError && (
+        {direction === 'arc-to-solana' && !state.isLoading && !pendingArcToSolanaTx && pendingArcToSolanaError && (
           <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
             Pending burn check failed: {pendingArcToSolanaError}
           </p>
