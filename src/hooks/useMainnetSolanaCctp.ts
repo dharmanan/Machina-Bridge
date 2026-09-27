@@ -313,30 +313,48 @@ export function useMainnetSolanaCctp(
         transport: http(arc.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
       })
       const latestBlock = await client.getBlockNumber()
-      const fromBlock = latestBlock > 10_000n ? latestBlock - 10_000n : 0n
       const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
       const recipients = new Set([ownerHex.toLowerCase(), ataHex.toLowerCase()])
 
-      const logs = await client.getLogs({
-        address: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
-        event: DEPOSIT_FOR_BURN_EVENT,
-        args: {
-          burnToken: arc.usdcAddress,
-          depositor: evmAddress,
-        },
-        fromBlock,
-        toBlock: 'latest',
-      })
+      const chunkSize = 500n
+      const maxChunks = 40
 
-      const match = [...logs].reverse().find((log: any) =>
-        Number(log.args?.destinationDomain) === 5
-        && recipients.has(String(log.args?.mintRecipient || '').toLowerCase())
-        && Boolean(log.transactionHash)
-      )
+      for (let index = 0; index < maxChunks; index += 1) {
+        const chunkTo = latestBlock - (BigInt(index) * chunkSize)
+        if (chunkTo < 0n) break
 
-      const txHash = match?.transactionHash as Hex | undefined
-      setPendingArcToSolanaTx(txHash || null)
-      return txHash || null
+        const chunkFrom = chunkTo > chunkSize
+          ? chunkTo - chunkSize + 1n
+          : 0n
+
+        const logs = await client.getLogs({
+          address: MAINNET_CONFIG.arcCctpTokenMessengerAddress,
+          event: DEPOSIT_FOR_BURN_EVENT,
+          args: {
+            burnToken: arc.usdcAddress,
+            depositor: evmAddress,
+          },
+          fromBlock: chunkFrom,
+          toBlock: chunkTo,
+        })
+
+        const match = [...logs].reverse().find((log: any) =>
+          Number(log.args?.destinationDomain) === 5
+          && recipients.has(String(log.args?.mintRecipient || '').toLowerCase())
+          && Boolean(log.transactionHash)
+        )
+
+        const txHash = match?.transactionHash as Hex | undefined
+        if (txHash) {
+          setPendingArcToSolanaTx(txHash)
+          return txHash
+        }
+
+        if (chunkFrom === 0n) break
+      }
+
+      setPendingArcToSolanaTx(null)
+      return null
     } catch (error) {
       const message = error instanceof Error
         ? error.message
