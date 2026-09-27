@@ -4,12 +4,10 @@ import { useAccount } from 'wagmi'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useMainnetSolanaCctp } from '../hooks/useMainnetSolanaCctp'
 import {
-  MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW,
   MAINNET_SOLANA_CCTP_CANARY_ROUTES,
   type MainnetSolanaCanaryDirection,
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
-import { formatUnits } from 'viem'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import { recordMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
@@ -70,11 +68,9 @@ export default function MainnetSolanaCanary() {
         }
       : null
 
-  const maxAmount = formatUnits(MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW, 6)
   const amountValid =
     Number.isFinite(Number(amount))
     && Number(amount) > 0
-    && Number(amount) <= Number(maxAmount)
 
   useEffect(() => {
     if (evmAddress) {
@@ -170,7 +166,7 @@ export default function MainnetSolanaCanary() {
           : !routeWriteEnabled
             ? 'Route unavailable'
             : !amountValid
-              ? `Maximum ${maxAmount} USDC`
+              ? 'Enter a valid amount'
               : state.isLoading
                 ? 'Transfer in progress...'
                 : direction === 'arc-to-solana'
@@ -185,7 +181,7 @@ export default function MainnetSolanaCanary() {
             Solana Bridge
           </h3>
           <p className="mt-1 text-sm leading-6 text-slate-500">
-            Bridge USDC between Arc and Solana. Maximum {maxAmount} USDC per transfer.
+            Bridge USDC between Arc and Solana.
           </p>
         </div>
         <span className="rounded-full border border-[#66D121]/30 bg-[#eef7e8] px-2.5 py-1 text-xs font-semibold text-[#2F6E0C]">
@@ -284,9 +280,8 @@ export default function MainnetSolanaCanary() {
           aria-label="Bridge amount"
         />
 
-        <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
-          <span>Amount</span>
-          <span>Max {maxAmount} USDC</span>
+        <div className="mt-3 text-xs text-slate-500">
+          Amount
         </div>
 
         <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-3.5">

@@ -7,7 +7,6 @@ import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import {
-  getMainnetCanaryMaxAmountRaw,
   getMainnetCanaryRoute,
   isMainnetCanaryRouteWriteEnabled,
   MAINNET_ARC_BRIDGE_NETWORK_KEYS,
@@ -360,8 +359,6 @@ export default function MainnetPreviewGate() {
     && routeStatus === 'ready',
   )
   const canaryAmountRaw = quoteResult?.amountRaw ?? 0n
-  const canaryMaxAmountRaw = getMainnetCanaryMaxAmountRaw()
-  const canaryMaxAmount = formatUnits(canaryMaxAmountRaw, 6)
 
   const estimatedSourceGasRaw = simulation?.approvalRequired
     ? simulation.approval?.estimatedGasCostRaw
@@ -402,7 +399,6 @@ export default function MainnetPreviewGate() {
     canaryRouteSelected
     && canaryWriteEnabled
     && canaryAmountRaw > 0n
-    && canaryAmountRaw <= canaryMaxAmountRaw
     && quoteResult?.mode === selectedMode
 
   const matchingTransfer =
@@ -458,8 +454,6 @@ export default function MainnetPreviewGate() {
     ? 'Select an Arc route'
     : !canaryWriteEnabled
       ? `${sourceName} → ${destinationName} is unavailable`
-      : quoteResult && quoteResult.amountRaw > canaryMaxAmountRaw
-        ? `Maximum transfer is ${canaryMaxAmount} USDC`
       : !isConnected
         ? 'Connect wallet'
         : transferStage === 'complete'
@@ -482,11 +476,9 @@ export default function MainnetPreviewGate() {
                         ? `Approve ${amount} USDC`
                         : `Send ${amount} USDC`
 
-  const amountExceedsLimit = hasValidAmount && Number(amount) > Number(canaryMaxAmount)
   const canOpenTracker =
     isConnected
     && hasValidAmount
-    && !amountExceedsLimit
     && canaryRouteSelected
     && canaryWriteEnabled
 
@@ -494,11 +486,9 @@ export default function MainnetPreviewGate() {
     ? 'Connect wallet'
     : !hasValidAmount
       ? 'Enter an amount'
-      : amountExceedsLimit
-        ? `Maximum ${canaryMaxAmount} USDC`
-        : matchingTransfer
-          ? 'Open bridge tracker'
-          : 'Review transfer'
+      : matchingTransfer
+        ? 'Open bridge tracker'
+        : 'Review transfer'
 
   const actionDisabled =
     !canaryWritesUnlocked

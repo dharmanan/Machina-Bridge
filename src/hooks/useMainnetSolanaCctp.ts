@@ -10,7 +10,6 @@ import { deriveSolanaUsdcAta } from '../lib/solana'
 
 import {
   isMainnetSolanaCanaryWriteEnabled,
-  MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW,
   type MainnetSolanaCanaryDirection,
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
@@ -1040,8 +1039,8 @@ export function useMainnetSolanaCctp(
 
     try {
       const amountRaw = parseUnits(amount, 6)
-      if (amountRaw <= 0n || amountRaw > MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW) {
-        throw new Error('Maximum transfer is 0.1 USDC.')
+      if (amountRaw <= 0n) {
+        throw new Error('Transfer amount must be greater than 0 USDC.')
       }
 
       if (!evmAddress || !walletClient) {
@@ -1170,8 +1169,8 @@ export function useMainnetSolanaCctp(
       }
 
       const amountRaw = parseUnits(amount, 6)
-      if (amountRaw <= 0n || amountRaw > MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW) {
-        throw new Error('Solana mainnet canary maximum is 0.1 USDC.')
+      if (amountRaw <= 0n) {
+        throw new Error('Transfer amount must be greater than 0 USDC.')
       }
 
       if (!evmAddress || !walletClient) {
