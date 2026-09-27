@@ -543,19 +543,12 @@ export default function App() {
         )}
       </main>
 
-      <footer className="mt-12 border-t border-slate-200 py-8">
+      <footer className="mt-12 border-t border-slate-200 py-6">
         <Container>
-          <div className="text-center text-sm text-slate-500">
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
-              <p className="mb-2 font-semibold text-[#2F6E0C]">
-                {appNetwork === 'testnet'
-                  ? 'Independent testnet application for Arc ecosystem experimentation.'
-                  : 'Independent Arc ecosystem application — mainnet bridge.'}
-              </p>
+          <div className="text-center text-xs text-slate-400">
+            {appNetwork === 'testnet' ? (
               <p>
-                {appNetwork === 'testnet'
-                  ? 'Uses test tokens only. Not for production or real value transfers.'
-                  : 'Real mainnet transfers are enabled only on verified routes with current safety limits. Unrestricted mainnet and Gateway remain disabled.'}{' '}
+                Independent testnet application for Arc ecosystem experimentation. Uses test tokens only.{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"
@@ -565,7 +558,19 @@ export default function App() {
                   Arc documentation
                 </a>
               </p>
-            </div>
+            ) : (
+              <p>
+                Independent Arc ecosystem application.{' '}
+                <a
+                  href="https://docs.arc.network/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[#2F6E0C] underline transition-colors hover:text-[#25580A]"
+                >
+                  Arc documentation
+                </a>
+              </p>
+            )}
           </div>
         </Container>
       </footer>
