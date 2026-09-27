@@ -97,15 +97,15 @@ export default function MainnetSolanaCanary() {
     && !state.isLoading
 
   const actionLabel = !kitSupport.ready
-    ? 'Bridge Kit not ready'
+    ? 'Bridge unavailable'
     : !evmConnected
       ? 'Connect EVM wallet'
       : !phantomConnected
         ? 'Connect Phantom'
         : !globalWriteEnabled
-          ? 'Solana canary globally locked'
+          ? 'Transfers temporarily unavailable'
           : !routeWriteEnabled
-            ? `${direction} is read-only`
+            ? 'Route unavailable'
             : !amountValid
               ? `Maximum ${maxAmount} USDC`
               : state.isLoading
@@ -119,20 +119,20 @@ export default function MainnetSolanaCanary() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">
-            Solana Mainnet Canary
+            Arc ↔ Solana
           </h3>
           <p className="mt-1 text-sm leading-6 text-slate-500">
-            Separate Arc ↔ Solana CCTP path. Maximum {maxAmount} USDC.
+            Bridge USDC between Arc and Solana. Maximum {maxAmount} USDC per transfer.
           </p>
         </div>
-        <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-semibold text-slate-600">
-          {phase}
+        <span className="rounded-full border border-[#66D121]/30 bg-[#eef7e8] px-2.5 py-1 text-xs font-semibold text-[#2F6E0C]">
+          {phase === 'verified' ? 'Verified' : 'Limited'}
         </span>
       </div>
 
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
         <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-          <p className="text-xs font-medium text-slate-500">EVM / Arc wallet</p>
+          <p className="text-xs font-medium text-slate-500">Arc wallet</p>
           <p className="mt-1 text-sm font-semibold text-slate-800">
             {mask(evmAddress)}
           </p>
@@ -149,7 +149,7 @@ export default function MainnetSolanaCanary() {
         <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <p className="text-xs font-medium text-slate-500">Phantom / Solana</p>
+              <p className="text-xs font-medium text-slate-500">Solana wallet</p>
               <p className="mt-1 text-sm font-semibold text-slate-800">
                 {mask(phantomAddress)}
               </p>
@@ -218,14 +218,12 @@ export default function MainnetSolanaCanary() {
           onChange={(event) => setAmount(event.target.value)}
           inputMode="decimal"
           className="mt-4 h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-          aria-label="Solana canary amount"
+          aria-label="Bridge amount"
         />
 
-        <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
-          <p>Bridge Kit: {kitSupport.ready ? 'ready' : 'blocked'}</p>
-          <p>Global write: {globalWriteEnabled ? 'enabled' : 'locked'}</p>
-          <p>Route phase: {phase}</p>
-          <p>Phantom: {phantomConnected ? 'connected' : 'not connected'}</p>
+        <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
+          <span>Amount</span>
+          <span>Max {maxAmount} USDC</span>
         </div>
 
         {kitSupport.error && (
@@ -286,7 +284,7 @@ export default function MainnetSolanaCanary() {
 
         {direction === 'arc-to-solana' && !state.isLoading && pendingArcToSolanaTx && (
           <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
-            <p className="font-semibold">Pending Arc → Solana burn detected</p>
+            <p className="font-semibold">Pending Arc → Solana transfer detected</p>
             <a
               href={`${MAINNET_NETWORKS.arc.explorerUrl}/tx/${pendingArcToSolanaTx}`}
               target="_blank"
@@ -302,14 +300,14 @@ export default function MainnetSolanaCanary() {
               onClick={() => void recoverPendingArcToSolana().catch(() => undefined)}
               className="mt-3 inline-flex h-11 w-full items-center justify-center rounded-2xl border border-amber-300 bg-white px-4 text-sm font-semibold text-amber-900 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Recover pending Arc → Solana mint
+              Complete pending Arc → Solana transfer
             </button>
           </div>
         )}
 
         {direction === 'arc-to-solana' && !state.isLoading && !pendingArcToSolanaTx && pendingArcToSolanaError && (
           <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-            Pending burn check failed: {pendingArcToSolanaError}
+            Pending transfer check failed: {pendingArcToSolanaError}
           </p>
         )}
 
