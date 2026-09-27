@@ -7,7 +7,7 @@ export const MAINNET_SOLANA_CCTP_CANARY_ROUTES: Record<
   MainnetSolanaCanaryDirection,
   MainnetSolanaCanaryPhase
 > = {
-  'arc-to-solana': 'testing',
+  'arc-to-solana': 'candidate',
   'solana-to-arc': 'candidate',
 }
 
