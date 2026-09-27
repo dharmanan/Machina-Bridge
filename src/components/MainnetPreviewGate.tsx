@@ -671,19 +671,30 @@ export default function MainnetPreviewGate() {
             </div>
           </div>
 
-          <div className="mt-5 flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-            <div className="flex min-w-0 items-center gap-2">
-              <Wallet size={16} className="flex-shrink-0 text-slate-500" />
-              <div className="min-w-0">
-                <p className="text-xs font-medium text-slate-500">EVM wallet</p>
-                <p className="truncate text-sm font-semibold text-slate-800">{maskAddress(address)}</p>
+          <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex min-w-0 items-center gap-2">
+                <Wallet size={16} className="flex-shrink-0 text-slate-500" />
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-slate-500">EVM wallet</p>
+                  <p className="truncate text-sm font-semibold text-slate-800">{maskAddress(address)}</p>
+                </div>
               </div>
+              <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                isConnected ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-200 text-slate-600'
+              }`}>
+                {isConnected ? 'connected' : 'connect above'}
+              </span>
             </div>
-            <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-              isConnected ? 'bg-[#eef7e8] text-[#2F6E0C]' : 'bg-slate-200 text-slate-600'
-            }`}>
-              {isConnected ? 'connected' : 'connect above'}
-            </span>
+
+            {isConnected && (
+              <div className="mt-3 flex items-center justify-between border-t border-slate-200 pt-3 text-sm">
+                <span className="text-slate-500">{sourceName} USDC balance</span>
+                <span className="font-semibold text-slate-900">
+                  {simulation ? `${formatUnits(simulation.balanceRaw, 6)} USDC` : 'Checking...'}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -813,9 +824,6 @@ export default function MainnetPreviewGate() {
             {mainActionLabel}
           </button>
 
-          <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-            Verified mainnet transfers are currently limited to {canaryMaxAmount} USDC.
-          </p>
         </div>
       </div>
       ) : (
