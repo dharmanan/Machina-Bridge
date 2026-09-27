@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { formatUnits } from 'viem'
+import { createPublicClient, fallback, formatUnits, http, parseAbi } from 'viem'
 import { useAccount } from 'wagmi'
 import { ArrowLeftRight, Bell, CheckCircle2, ChevronDown, ExternalLink, LockKeyhole, RefreshCw, Wallet, X } from 'lucide-react'
 import { getCircleMainnetReadiness } from '../config/circle'
@@ -29,6 +29,10 @@ import {
 } from '../lib/mainnetCctpSimulation'
 
 type RouteEndpoint = (typeof MAINNET_ARC_BRIDGE_NETWORK_KEYS)[number]
+
+const ERC20_BALANCE_ABI = parseAbi([
+  'function balanceOf(address account) view returns (uint256)',
+])
 
 function StatusRow({
   label,
@@ -172,6 +176,8 @@ export default function MainnetPreviewGate() {
   const [isTrackerOpen, setIsTrackerOpen] = useState(false)
   const [feeDetailsOpen, setFeeDetailsOpen] = useState(false)
   const [bridgeView, setBridgeView] = useState<'evm' | 'solana'>('evm')
+  const [sourceUsdcBalance, setSourceUsdcBalance] = useState<string | null>(null)
+  const [sourceUsdcBalanceError, setSourceUsdcBalanceError] = useState<string | null>(null)
 
   const sourceNetwork = MAINNET_NETWORKS[source]
   const destinationNetwork = MAINNET_NETWORKS[destination]
@@ -217,6 +223,57 @@ export default function MainnetPreviewGate() {
       cancelled = true
     }
   }, [sourceChainId, destinationChainId])
+
+  useEffect(() => {
+    let cancelled = false
+
+    if (!isConnected || !address) {
+      setSourceUsdcBalance(null)
+      setSourceUsdcBalanceError(null)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    setSourceUsdcBalance(null)
+    setSourceUsdcBalanceError(null)
+
+    const run = async () => {
+      try {
+        const client = createPublicClient({
+          transport: fallback(
+            sourceNetwork.rpcUrls.map((url) =>
+              http(url, { timeout: 10_000, retryCount: 0 }),
+            ),
+          ),
+        })
+
+        const raw = await client.readContract({
+          address: sourceNetwork.usdcAddress,
+          abi: ERC20_BALANCE_ABI,
+          functionName: 'balanceOf',
+          args: [address],
+        })
+
+        if (!cancelled) {
+          setSourceUsdcBalance(formatUnits(raw, 6))
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSourceUsdcBalance(null)
+          setSourceUsdcBalanceError(
+            error instanceof Error ? error.message : 'Unable to read source USDC balance.',
+          )
+        }
+      }
+    }
+
+    void run()
+
+    return () => {
+      cancelled = true
+    }
+  }, [address, isConnected, sourceNetwork])
 
   useEffect(() => {
     setQuoteResult(null)
@@ -700,8 +757,15 @@ export default function MainnetPreviewGate() {
             {isConnected && (
               <div className="mt-3 flex items-center justify-between border-t border-slate-200 pt-3 text-sm">
                 <span className="text-slate-500">{sourceName} USDC balance</span>
-                <span className="font-semibold text-slate-900">
-                  {simulation ? `${formatUnits(simulation.balanceRaw, 6)} USDC` : 'Checking...'}
+                <span
+                  className="font-semibold text-slate-900"
+                  title={sourceUsdcBalanceError ?? undefined}
+                >
+                  {sourceUsdcBalance !== null
+                    ? `${sourceUsdcBalance} USDC`
+                    : sourceUsdcBalanceError
+                      ? 'Unavailable'
+                      : 'Checking...'}
                 </span>
               </div>
             )}

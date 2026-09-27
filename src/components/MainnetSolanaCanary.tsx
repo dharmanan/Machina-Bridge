@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Wallet, RefreshCw, LockKeyhole, ExternalLink, ChevronDown } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Wallet, RefreshCw, RotateCcw, LockKeyhole, ExternalLink, ChevronDown } from 'lucide-react'
 import { useAccount } from 'wagmi'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useMainnetSolanaCctp } from '../hooks/useMainnetSolanaCctp'
@@ -11,10 +11,16 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import {
+  listMainnetSolanaActivity,
   recordMainnetSolanaActivity,
   updateMainnetSolanaActivity,
 } from '../lib/mainnetSolanaActivity'
-import { loadMainnetSolanaRefundMetadata } from '../lib/mainnetSolanaReclaim'
+import {
+  discoverMainnetSolanaRefunds,
+  loadMainnetSolanaRefundMetadata,
+  reclaimMainnetSolanaDeposit,
+  type MainnetSolanaDiscoveredRefund,
+} from '../lib/mainnetSolanaReclaim'
 
 function mask(address?: string | null) {
   if (!address) return 'Not connected'
@@ -24,6 +30,20 @@ function mask(address?: string | null) {
 function txMask(hash?: string | null) {
   if (!hash) return '—'
   return `${hash.slice(0, 8)}...${hash.slice(-6)}`
+}
+
+function refundTiming(timestamp: number) {
+  const diff = timestamp - Date.now()
+  if (diff <= 0) return 'Eligible now'
+
+  const hours = Math.ceil(diff / (60 * 60 * 1000))
+  if (hours < 24) return `Eligible in ${hours}h`
+
+  const days = Math.floor(hours / 24)
+  const remainingHours = hours % 24
+  return remainingHours > 0
+    ? `Eligible in ${days}d ${remainingHours}h`
+    : `Eligible in ${days}d`
 }
 
 export default function MainnetSolanaCanary() {
@@ -61,6 +81,13 @@ export default function MainnetSolanaCanary() {
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
   const [amount, setAmount] = useState('')
   const [costDetailsOpen, setCostDetailsOpen] = useState(false)
+  const [refunds, setRefunds] = useState<MainnetSolanaDiscoveredRefund[]>([])
+  const [refundsLoading, setRefundsLoading] = useState(false)
+  const [refundsError, setRefundsError] = useState<string | null>(null)
+  const [reclaimingRefund, setReclaimingRefund] = useState<string | null>(null)
+  const [reclaimError, setReclaimError] = useState<string | null>(null)
+  const [reclaimSuccessTx, setReclaimSuccessTx] = useState<string | null>(null)
+  const [, setRefundClock] = useState(() => Date.now())
 
   const transferResult =
     state.result && typeof state.result === 'object'
@@ -84,6 +111,90 @@ export default function MainnetSolanaCanary() {
       void refreshSolanaBalance().catch(() => undefined)
     }
   }, [evmAddress, phantomAddress, refreshArcBalance, refreshSolanaBalance])
+
+  const refreshRefunds = useCallback(async () => {
+    if (!phantomAddress) {
+      setRefunds([])
+      setRefundsError(null)
+      return
+    }
+
+    setRefundsLoading(true)
+    setRefundsError(null)
+
+    try {
+      const found = await discoverMainnetSolanaRefunds(phantomAddress)
+      setRefunds(found)
+    } catch (error) {
+      setRefundsError(
+        error instanceof Error
+          ? error.message
+          : 'Could not scan refundable Circle deposits.',
+      )
+    } finally {
+      setRefundsLoading(false)
+    }
+  }, [phantomAddress])
+
+  useEffect(() => {
+    if (direction !== 'solana-to-arc' || !phantomAddress) {
+      return
+    }
+    void refreshRefunds()
+  }, [direction, phantomAddress, refreshRefunds])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setRefundClock(Date.now()), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const handleReclaim = useCallback(async (
+    refund: MainnetSolanaDiscoveredRefund,
+  ) => {
+    if (!provider || !phantomAddress) {
+      setReclaimError('Connect Phantom before reclaiming SOL.')
+      return
+    }
+
+    setReclaimingRefund(refund.messageSentEventAccount)
+    setReclaimError(null)
+    setReclaimSuccessTx(null)
+
+    try {
+      const result = await reclaimMainnetSolanaDeposit({
+        provider,
+        connectedWallet: phantomAddress,
+        originalWallet: phantomAddress,
+        metadata: refund,
+      })
+
+      const localRecord = listMainnetSolanaActivity(
+        evmAddress,
+        phantomAddress,
+      ).find(
+        (item) =>
+          item.sourceTxHash?.toLowerCase() === refund.sourceTxHash.toLowerCase(),
+      )
+
+      if (localRecord) {
+        updateMainnetSolanaActivity(localRecord.id, {
+          ...refund,
+          refundStatus: 'reclaimed',
+          refundTxHash: result.txHash,
+          reclaimedAt: Date.now(),
+        })
+      }
+
+      setReclaimSuccessTx(result.txHash ?? 'already-closed')
+      await refreshRefunds()
+    } catch (error) {
+      setReclaimError(
+        error instanceof Error ? error.message : 'SOL reclaim failed.',
+      )
+    } finally {
+      setReclaimingRefund(null)
+    }
+  }, [evmAddress, phantomAddress, provider, refreshRefunds])
 
   useEffect(() => {
     if (!evmAddress || !phantomAddress || state.isLoading) return
@@ -170,9 +281,11 @@ export default function MainnetSolanaCanary() {
           refundStatus: 'pending',
         })
       } catch {
-        // Transfer is already complete. Dashboard can hydrate reclaim metadata
-        // later from the Solana source transaction and Circle API.
+        // Transfer is already complete. On-chain discovery below remains the
+        // source of truth even if metadata hydration is temporarily unavailable.
       }
+
+      void refreshRefunds()
     }
   }
 
@@ -284,6 +397,9 @@ export default function MainnetSolanaCanary() {
             onClick={() => {
               void refreshArcBalance().catch(() => undefined)
               void refreshSolanaBalance().catch(() => undefined)
+              if (direction === 'solana-to-arc') {
+                void refreshRefunds()
+              }
             }}
             disabled={!phantomConnected}
             className="ml-auto inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
@@ -467,6 +583,108 @@ export default function MainnetSolanaCanary() {
                 <ExternalLink size={12} />
               </a>
             </div>
+          </div>
+        )}
+
+        {direction === 'solana-to-arc' && phantomConnected && (
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Refundable SOL deposits</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  Open Circle deposits are discovered directly from Solana for this Phantom wallet.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void refreshRefunds()}
+                disabled={refundsLoading}
+                className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-semibold text-slate-600 disabled:opacity-50"
+              >
+                <RefreshCw size={12} className={refundsLoading ? 'animate-spin' : ''} />
+                Refresh
+              </button>
+            </div>
+
+            {refundsLoading && refunds.length === 0 ? (
+              <p className="mt-3 text-xs text-slate-500">
+                Scanning open Circle deposits...
+              </p>
+            ) : refunds.length === 0 ? (
+              <p className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">
+                No open refundable Circle deposit was found for this Phantom wallet.
+              </p>
+            ) : (
+              <div className="mt-3 space-y-3">
+                {refunds.map((refund) => {
+                  const eligible = Date.now() >= refund.refundAvailableAt
+                  const reclaiming =
+                    reclaimingRefund === refund.messageSentEventAccount
+
+                  return (
+                    <div
+                      key={refund.messageSentEventAccount}
+                      className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">
+                            {refund.refundableDepositSol} SOL refundable
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-600">
+                            {refundTiming(refund.refundAvailableAt)}
+                          </p>
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={!eligible || reclaiming}
+                          onClick={() => void handleReclaim(refund)}
+                          className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
+                        >
+                          <RotateCcw size={13} />
+                          {reclaiming
+                            ? 'Preparing reclaim...'
+                            : eligible
+                              ? `Reclaim ${refund.refundableDepositSol} SOL`
+                              : refundTiming(refund.refundAvailableAt)}
+                        </button>
+                      </div>
+
+                      <a
+                        href={`${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${refund.sourceTxHash}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-amber-900 hover:underline"
+                      >
+                        Source transaction: {txMask(refund.sourceTxHash)}
+                        <ExternalLink size={11} />
+                      </a>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            {refundsError && (
+              <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
+                Refund scan failed: {refundsError}
+              </p>
+            )}
+
+            {reclaimError && (
+              <p className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[11px] leading-5 text-red-700">
+                {reclaimError}
+              </p>
+            )}
+
+            {reclaimSuccessTx && (
+              <p className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] leading-5 text-emerald-800">
+                {reclaimSuccessTx === 'already-closed'
+                  ? 'This Circle deposit was already closed.'
+                  : 'SOL deposit reclaimed successfully.'}
+              </p>
+            )}
           </div>
         )}
 

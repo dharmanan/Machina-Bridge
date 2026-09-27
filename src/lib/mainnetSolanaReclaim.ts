@@ -33,6 +33,11 @@ export type MainnetSolanaReclaimResult = {
   alreadyClosed: boolean
 }
 
+export type MainnetSolanaDiscoveredRefund = MainnetSolanaRefundMetadata & {
+  sourceTxHash: string
+  createdAt: number
+}
+
 function formatLamports(lamports: number) {
   const whole = Math.floor(lamports / 1_000_000_000)
   const fraction = String(lamports % 1_000_000_000)
@@ -155,6 +160,168 @@ async function fetchSolanaSourceAttestation(sourceTxHash: string) {
     refundDestinationMessage: String(message.message),
     refundAttestation: String(message.attestation),
   }
+}
+
+function readU32Be(buffer: Buffer, offset: number) {
+  if (buffer.length < offset + 4) {
+    throw new Error('Circle MessageSent account is too short.')
+  }
+  return buffer.readUInt32BE(offset)
+}
+
+function parseOpenMessageSentAccount(input: {
+  pubkey: PublicKey
+  lamports: number
+  data: Buffer
+  payee: PublicKey
+}) {
+  const { pubkey, lamports, data, payee } = input
+
+  if (data.length < 64) return null
+  if (!data.subarray(0, 8).equals(MESSAGE_SENT_ACCOUNT_DISCRIMINATOR)) return null
+
+  const rentPayer = new PublicKey(data.subarray(8, 40))
+  if (!rentPayer.equals(payee)) return null
+
+  const createdAtSeconds = readI64Le(data, 40)
+  if (createdAtSeconds <= 0n) return null
+
+  // MessageSent layout:
+  // discriminator(8) + rent_payer(32) + created_at(8) + vec_len(4) + message(...)
+  // CCTP V2 message destinationDomain is bytes 8..12 within the message.
+  const messageOffset = 52
+  const destinationDomain = readU32Be(data, messageOffset + 8)
+
+  return {
+    messageSentEventAccount: pubkey.toBase58(),
+    refundableDepositSol: formatLamports(lamports),
+    refundAvailableAt: Number(createdAtSeconds) * 1000 + EVENT_ACCOUNT_WINDOW_MS,
+    createdAt: Number(createdAtSeconds) * 1000,
+    destinationDomain,
+  }
+}
+
+async function findSourceTransactionForEventAccount(
+  connection: Connection,
+  eventAccount: PublicKey,
+  createdAtMs: number,
+) {
+  const signatures = await connection.getSignaturesForAddress(
+    eventAccount,
+    { limit: 10 },
+    'confirmed',
+  )
+
+  const successful = signatures.filter((item) => !item.err)
+  if (successful.length === 0) return null
+
+  const targetSeconds = Math.floor(createdAtMs / 1000)
+  const withBlockTime = successful.filter(
+    (item): item is typeof item & { blockTime: number } =>
+      typeof item.blockTime === 'number',
+  )
+
+  if (withBlockTime.length > 0) {
+    withBlockTime.sort(
+      (a, b) =>
+        Math.abs(a.blockTime - targetSeconds)
+        - Math.abs(b.blockTime - targetSeconds),
+    )
+    return withBlockTime[0].signature
+  }
+
+  // getSignaturesForAddress is newest-first; creation is the oldest interaction.
+  return successful[successful.length - 1].signature
+}
+
+export async function discoverMainnetSolanaRefunds(
+  solanaWallet: string,
+): Promise<MainnetSolanaDiscoveredRefund[]> {
+  if (!solanaWallet) return []
+
+  const payee = new PublicKey(solanaWallet)
+  const programId = new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram)
+  let lastError: unknown = null
+  let emptyResult: MainnetSolanaDiscoveredRefund[] = []
+
+  for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
+    try {
+      const connection = new Connection(rpcUrl, 'confirmed')
+      const accounts = await connection.getProgramAccounts(programId, {
+        commitment: 'confirmed',
+        filters: [
+          {
+            memcmp: {
+              offset: 8,
+              bytes: payee.toBase58(),
+            },
+          },
+        ],
+      })
+
+      const candidates = accounts
+        .map(({ pubkey, account }) =>
+          parseOpenMessageSentAccount({
+            pubkey,
+            lamports: account.lamports,
+            data: Buffer.from(account.data),
+            payee,
+          }),
+        )
+        .filter((item): item is NonNullable<typeof item> => Boolean(item))
+        .filter(
+          (item) =>
+            item.destinationDomain === CIRCLE_MAINNET.chains.arc.cctpDomain,
+        )
+
+      if (candidates.length === 0) {
+        emptyResult = []
+        continue
+      }
+
+      const refunds: MainnetSolanaDiscoveredRefund[] = []
+
+      for (const candidate of candidates) {
+        try {
+          const sourceTxHash = await findSourceTransactionForEventAccount(
+            connection,
+            new PublicKey(candidate.messageSentEventAccount),
+            candidate.createdAt,
+          )
+          if (!sourceTxHash) continue
+
+          const attestation = await fetchSolanaSourceAttestation(sourceTxHash)
+
+          refunds.push({
+            sourceTxHash,
+            createdAt: candidate.createdAt,
+            messageSentEventAccount: candidate.messageSentEventAccount,
+            refundableDepositSol: candidate.refundableDepositSol,
+            refundAvailableAt: candidate.refundAvailableAt,
+            ...attestation,
+          })
+        } catch {
+          // A single stale/pending account must not hide other reclaimable deposits.
+        }
+      }
+
+      if (refunds.length > 0) {
+        return refunds.sort((a, b) => a.refundAvailableAt - b.refundAvailableAt)
+      }
+
+      emptyResult = refunds
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  if (lastError && emptyResult.length === 0) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('Unable to scan Solana refundable Circle deposits.')
+  }
+
+  return emptyResult
 }
 
 async function getReclaimConnection(eventAccount: PublicKey) {
