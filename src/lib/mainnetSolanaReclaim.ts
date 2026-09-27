@@ -234,6 +234,142 @@ async function findSourceTransactionForEventAccount(
   return successful[successful.length - 1].signature
 }
 
+async function callSameOriginSolanaRpc(
+  method: string,
+  params: unknown[],
+) {
+  const response = await fetch('/api/solana-rpc', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+      params,
+    }),
+  })
+
+  const payload = await response.json().catch(() => null)
+  if (!response.ok || payload?.error) {
+    throw new Error(
+      payload?.error?.message
+      || payload?.error
+      || `Solana RPC HTTP ${response.status}`,
+    )
+  }
+
+  return payload?.result
+}
+
+async function discoverProgramAccountsThroughProxy(
+  programId: PublicKey,
+  payee: PublicKey,
+) {
+  const result = await callSameOriginSolanaRpc('getProgramAccounts', [
+    programId.toBase58(),
+    {
+      commitment: 'confirmed',
+      encoding: 'base64',
+      filters: [
+        {
+          memcmp: {
+            offset: 8,
+            bytes: payee.toBase58(),
+          },
+        },
+      ],
+    },
+  ])
+
+  if (!Array.isArray(result)) return []
+
+  return result.map((item: any) => ({
+    pubkey: new PublicKey(String(item?.pubkey || '')),
+    lamports: Number(item?.account?.lamports ?? 0),
+    data: Buffer.from(String(item?.account?.data?.[0] || ''), 'base64'),
+  }))
+}
+
+async function findSourceTransactionThroughProxy(
+  eventAccount: PublicKey,
+  createdAtMs: number,
+) {
+  const result = await callSameOriginSolanaRpc('getSignaturesForAddress', [
+    eventAccount.toBase58(),
+    {
+      limit: 10,
+      commitment: 'confirmed',
+    },
+  ])
+
+  if (!Array.isArray(result)) return null
+
+  const successful = result.filter(
+    (item: any) => item && !item.err && typeof item.signature === 'string',
+  )
+  if (successful.length === 0) return null
+
+  const targetSeconds = Math.floor(createdAtMs / 1000)
+  const withBlockTime = successful.filter(
+    (item: any) => typeof item.blockTime === 'number',
+  )
+
+  if (withBlockTime.length > 0) {
+    withBlockTime.sort(
+      (a: any, b: any) =>
+        Math.abs(a.blockTime - targetSeconds)
+        - Math.abs(b.blockTime - targetSeconds),
+    )
+    return String(withBlockTime[0].signature)
+  }
+
+  return String(successful[successful.length - 1].signature)
+}
+
+async function hydrateRefundCandidates(
+  candidates: Array<{
+    messageSentEventAccount: string
+    refundableDepositSol: string
+    refundAvailableAt: number
+    createdAt: number
+    destinationDomain: number
+  }>,
+  findSourceTx: (
+    eventAccount: PublicKey,
+    createdAtMs: number,
+  ) => Promise<string | null>,
+) {
+  const refunds: MainnetSolanaDiscoveredRefund[] = []
+
+  for (const candidate of candidates) {
+    try {
+      const sourceTxHash = await findSourceTx(
+        new PublicKey(candidate.messageSentEventAccount),
+        candidate.createdAt,
+      )
+      if (!sourceTxHash) continue
+
+      const attestation = await fetchSolanaSourceAttestation(sourceTxHash)
+
+      refunds.push({
+        sourceTxHash,
+        createdAt: candidate.createdAt,
+        messageSentEventAccount: candidate.messageSentEventAccount,
+        refundableDepositSol: candidate.refundableDepositSol,
+        refundAvailableAt: candidate.refundAvailableAt,
+        ...attestation,
+      })
+    } catch {
+      // A single stale/pending account must not hide other deposits.
+    }
+  }
+
+  return refunds.sort((a, b) => a.refundAvailableAt - b.refundAvailableAt)
+}
+
 export async function discoverMainnetSolanaRefunds(
   solanaWallet: string,
 ): Promise<MainnetSolanaDiscoveredRefund[]> {
@@ -241,8 +377,38 @@ export async function discoverMainnetSolanaRefunds(
 
   const payee = new PublicKey(solanaWallet)
   const programId = new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram)
-  let lastError: unknown = null
-  let emptyResult: MainnetSolanaDiscoveredRefund[] = []
+  let proxyError: unknown = null
+
+  try {
+    const accounts = await discoverProgramAccountsThroughProxy(programId, payee)
+    const candidates = accounts
+      .map(({ pubkey, lamports, data }) =>
+        parseOpenMessageSentAccount({
+          pubkey,
+          lamports,
+          data,
+          payee,
+        }),
+      )
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .filter(
+        (item) =>
+          item.destinationDomain === CIRCLE_MAINNET.chains.arc.cctpDomain,
+      )
+
+    if (candidates.length === 0) {
+      return []
+    }
+
+    return await hydrateRefundCandidates(
+      candidates,
+      findSourceTransactionThroughProxy,
+    )
+  } catch (error) {
+    proxyError = error
+  }
+
+  let lastDirectError: unknown = null
 
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     try {
@@ -275,53 +441,27 @@ export async function discoverMainnetSolanaRefunds(
         )
 
       if (candidates.length === 0) {
-        emptyResult = []
-        continue
+        return []
       }
 
-      const refunds: MainnetSolanaDiscoveredRefund[] = []
-
-      for (const candidate of candidates) {
-        try {
-          const sourceTxHash = await findSourceTransactionForEventAccount(
+      return await hydrateRefundCandidates(
+        candidates,
+        (eventAccount, createdAtMs) =>
+          findSourceTransactionForEventAccount(
             connection,
-            new PublicKey(candidate.messageSentEventAccount),
-            candidate.createdAt,
-          )
-          if (!sourceTxHash) continue
-
-          const attestation = await fetchSolanaSourceAttestation(sourceTxHash)
-
-          refunds.push({
-            sourceTxHash,
-            createdAt: candidate.createdAt,
-            messageSentEventAccount: candidate.messageSentEventAccount,
-            refundableDepositSol: candidate.refundableDepositSol,
-            refundAvailableAt: candidate.refundAvailableAt,
-            ...attestation,
-          })
-        } catch {
-          // A single stale/pending account must not hide other reclaimable deposits.
-        }
-      }
-
-      if (refunds.length > 0) {
-        return refunds.sort((a, b) => a.refundAvailableAt - b.refundAvailableAt)
-      }
-
-      emptyResult = refunds
+            eventAccount,
+            createdAtMs,
+          ),
+      )
     } catch (error) {
-      lastError = error
+      lastDirectError = error
     }
   }
 
-  if (lastError && emptyResult.length === 0) {
-    throw lastError instanceof Error
-      ? lastError
-      : new Error('Unable to scan Solana refundable Circle deposits.')
-  }
-
-  return emptyResult
+  const error = lastDirectError ?? proxyError
+  throw error instanceof Error
+    ? error
+    : new Error('Unable to scan Solana refundable Circle deposits.')
 }
 
 async function getReclaimConnection(eventAccount: PublicKey) {

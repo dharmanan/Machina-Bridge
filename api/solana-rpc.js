@@ -1,9 +1,9 @@
 const DEFAULT_RPCS = [
-  'https://api.mainnet.solana.com',
-  'https://api.mainnet-beta.solana.com',
-  'https://rpc.ankr.com/solana',
-  'https://solana.drpc.org',
   'https://solana-rpc.publicnode.com',
+  'https://solana.drpc.org',
+  'https://api.mainnet-beta.solana.com',
+  'https://api.mainnet.solana.com',
+  'https://rpc.ankr.com/solana',
 ]
 
 const ALLOWED_METHODS = new Set([
@@ -17,6 +17,7 @@ const ALLOWED_METHODS = new Set([
   'getMinimumBalanceForRentExemption',
   'getMultipleAccounts',
   'getProgramAccounts',
+  'getSignaturesForAddress',
   'getRecentPrioritizationFees',
   'getSignatureStatuses',
   'getSlot',
@@ -76,6 +77,8 @@ function isRetryableRpcFailure(response, payload) {
   return (
     message.includes('access forbidden')
     || message.includes('personal token')
+    || message.includes('free plan')
+    || message.includes('chain is not available')
     || message.includes('rate limit')
     || message.includes('too many requests')
     || message.includes('node is unhealthy')

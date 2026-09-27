@@ -525,7 +525,11 @@ export default function MainnetSolanaCanary() {
             <p className="mt-2 text-xs leading-5 text-slate-500">
               {feeEstimateError
                 ? 'Fee estimate is temporarily unavailable.'
-                : 'Connect both wallets to see the current bridge and network fees.'}
+                : !evmConnected || !phantomConnected
+                  ? 'Connect both wallets to see the current bridge and network fees.'
+                  : !amountValid
+                    ? 'Enter an amount to calculate the current bridge and network fees.'
+                    : 'Calculating current bridge and network fees...'}
             </p>
           )}
         </div>
@@ -610,7 +614,7 @@ export default function MainnetSolanaCanary() {
               <p className="mt-3 text-xs text-slate-500">
                 Scanning open Circle deposits...
               </p>
-            ) : refunds.length === 0 ? (
+            ) : refundsError && refunds.length === 0 ? null : refunds.length === 0 ? (
               <p className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">
                 No open refundable Circle deposit was found for this Phantom wallet.
               </p>
@@ -667,8 +671,11 @@ export default function MainnetSolanaCanary() {
             )}
 
             {refundsError && (
-              <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
-                Refund scan failed: {refundsError}
+              <p
+                className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800"
+                title={refundsError}
+              >
+                Refundable deposit scan is temporarily unavailable. Please try Refresh again.
               </p>
             )}
 
