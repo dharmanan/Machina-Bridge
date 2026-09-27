@@ -1,4 +1,5 @@
 const RPCS = [
+  'https://api.mainnet.solana.com',
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
   'https://solana.drpc.org',
@@ -54,14 +55,29 @@ async function callRpc(url, method, params) {
   }
 }
 
+function parseBody(req) {
+  if (!req.body) return {}
+
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body)
+    } catch {
+      return {}
+    }
+  }
+
+  return req.body
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST')
     return send(res, 405, { error: 'Method not allowed' })
   }
 
-  const method = typeof req.body?.method === 'string' ? req.body.method : ''
-  const params = Array.isArray(req.body?.params) ? req.body.params : []
+  const body = parseBody(req)
+  const method = typeof body?.method === 'string' ? body.method : ''
+  const params = Array.isArray(body?.params) ? body.params : []
 
   if (!ALLOWED_METHODS.has(method)) {
     return send(res, 400, { error: 'Unsupported Solana RPC method' })
