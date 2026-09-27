@@ -73,9 +73,9 @@ export default function MainnetSolanaCanary() {
   }, [evmAddress, phantomAddress, refreshArcBalance, refreshSolanaBalance])
 
   useEffect(() => {
-    if (!evmAddress || !phantomAddress) return
+    if (!evmAddress || !phantomAddress || state.isLoading) return
     void findPendingArcToSolanaBurn().catch(() => undefined)
-  }, [evmAddress, phantomAddress, findPendingArcToSolanaBurn])
+  }, [evmAddress, phantomAddress, state.isLoading, findPendingArcToSolanaBurn])
 
   const phase = MAINNET_SOLANA_CCTP_CANARY_ROUTES[direction]
   const routeWriteEnabled = phase === 'testing' || phase === 'verified'
