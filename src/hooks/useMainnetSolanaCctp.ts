@@ -3,7 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { createPublicClient, formatUnits, http, parseAbi, parseUnits, type Hex } from 'viem'
+import { createPublicClient, formatUnits, http, parseAbi, parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
 
@@ -14,7 +14,6 @@ import {
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
-import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
 
@@ -270,134 +269,6 @@ export function useMainnetSolanaCctp(
     }
   }, [phantomAddress])
 
-  const recoverArcToSolana = useCallback(async (
-    sourceTxHash: Hex,
-  ) => {
-    setState({
-      isLoading: true,
-      error: null,
-      status: 'Checking Circle attestation for the existing Arc burn...',
-      result: null,
-    })
-
-    try {
-      if (!phantomProvider || !phantomAddress) {
-        throw new Error('Connect Phantom before recovering the Solana mint.')
-      }
-
-      const attestation = await fetchMainnetCctpAttestation({
-        sourceChainId: ARC_MAINNET_EVM_CHAIN_ID,
-        transactionHash: sourceTxHash,
-      })
-
-      if (
-        attestation.status !== 'complete'
-        || !attestation.message
-        || !attestation.attestation
-        || !attestation.eventNonce
-      ) {
-        throw new Error('Circle attestation is not complete yet. No new burn was submitted.')
-      }
-
-      const decodedMessage = attestation.decodedMessage as
-        | { recipient?: string }
-        | undefined
-
-      if (!decodedMessage?.recipient) {
-        throw new Error('Circle attestation is missing the mint recipient.')
-      }
-
-      const kit = new BridgeKit()
-      const { solana, arc } = resolveChains(kit)
-      const solanaRecoveryChain = {
-        ...(solana as any),
-        rpcEndpoints: ['https://solana-rpc.publicnode.com'],
-      } as BridgeKitChain
-
-      const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
-        capabilities: {
-          addressContext: 'user-controlled',
-          supportedChains: [solanaRecoveryChain],
-        },
-      })
-
-      setState({
-        isLoading: true,
-        error: null,
-        status: 'Attestation ready. Confirm the existing transfer mint in Phantom.',
-        result: null,
-      })
-
-      const action = await (solanaAdapter as any).actionRegistry.executeAction(
-        'cctp.v2.receiveMessage',
-        {
-          attestation: attestation.attestation,
-          message: attestation.message,
-          eventNonce: attestation.eventNonce,
-          mintRecipient: decodedMessage.recipient,
-          fromChain: arc,
-          toChain: solanaRecoveryChain,
-        },
-        {
-          chain: solanaRecoveryChain,
-          address: phantomAddress,
-        },
-      )
-
-      if (!action?.execute) {
-        throw new Error('Solana receiveMessage action could not be prepared.')
-      }
-
-      const destinationTxHash = await action.execute()
-
-      if (destinationTxHash && (solanaAdapter as any).waitForTransaction) {
-        await (solanaAdapter as any).waitForTransaction(
-          destinationTxHash,
-          {},
-          solanaRecoveryChain,
-        )
-      }
-
-      setState({
-        isLoading: false,
-        error: null,
-        status: 'Existing Arc burn was minted on Solana.',
-        result: {
-          sourceTxHash,
-          destinationTxHash,
-          recovered: true,
-        },
-      })
-
-      void refreshArcBalance().catch(() => undefined)
-      void refreshSolanaBalance().catch(() => undefined)
-
-      return destinationTxHash
-    } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : 'Arc to Solana recovery failed.'
-
-      setState({
-        isLoading: false,
-        error: message,
-        status: null,
-        result: {
-          sourceTxHash,
-          recovered: false,
-        },
-      })
-
-      throw error
-    }
-  }, [
-    phantomAddress,
-    phantomProvider,
-    refreshArcBalance,
-    refreshSolanaBalance,
-  ])
-
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
     amount: string,
@@ -428,11 +299,16 @@ export function useMainnetSolanaCctp(
 
       const kit = new BridgeKit()
       const { solana, arc } = resolveChains(kit)
+      const solanaBridgeChain = {
+        ...(solana as any),
+        rpcEndpoints: ['https://solana-rpc.publicnode.com'],
+      } as BridgeKitChain
+
       const solanaAdapter = await createSolanaAdapterFromProvider({
         provider: createStrictSolanaProvider(phantomProvider),
         capabilities: {
           addressContext: 'user-controlled',
-          supportedChains: [solana],
+          supportedChains: [solanaBridgeChain],
         },
       })
       const evmAdapter = await createEvmAdapterFromProvider({
@@ -453,13 +329,13 @@ export function useMainnetSolanaCctp(
 
       const result = direction === 'solana-to-arc'
         ? await kit.bridge({
-            from: { adapter: solanaAdapter, chain: solana },
+            from: { adapter: solanaAdapter, chain: solanaBridgeChain },
             to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
             amount,
           } as any)
         : await kit.bridge({
             from: { adapter: evmAdapter, chain: arc },
-            to: { adapter: solanaAdapter, chain: solana, recipientAddress: phantomAddress },
+            to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
             amount,
           } as any)
 
@@ -505,7 +381,6 @@ export function useMainnetSolanaCctp(
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
-    recoverArcToSolana,
     runCanary,
   }
 }
