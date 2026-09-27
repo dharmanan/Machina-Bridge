@@ -88,25 +88,52 @@ export function deriveSolanaUsdcAta(
 export async function fetchSolanaUsdcBalance(
   ownerAddress: string,
   network: SolanaNetworkProfile = 'testnet',
-  connection = createSolanaConnection(network),
+  connection?: Connection,
 ) {
   const owner = new PublicKey(ownerAddress.trim())
   const { usdcMint } = getSolanaNetworkConfig(network)
-  const response = await connection.getParsedTokenAccountsByOwner(owner, {
-    mint: usdcMint,
-  })
 
-  const totalBalance = response.value.reduce((runningTotal, accountInfo) => {
-    const parsedInfo = (accountInfo.account.data as any)?.parsed?.info?.tokenAmount
-    const uiAmountString = parsedInfo?.uiAmountString
-    const uiAmount = typeof uiAmountString === 'string' ? Number.parseFloat(uiAmountString) : Number(parsedInfo?.uiAmount || 0)
+  const readBalance = async (activeConnection: Connection) => {
+    const response = await activeConnection.getParsedTokenAccountsByOwner(owner, {
+      mint: usdcMint,
+    })
 
-    if (!Number.isFinite(uiAmount)) {
-      return runningTotal
+    const totalBalance = response.value.reduce((runningTotal, accountInfo) => {
+      const parsedInfo = (accountInfo.account.data as any)?.parsed?.info?.tokenAmount
+      const uiAmountString = parsedInfo?.uiAmountString
+      const uiAmount = typeof uiAmountString === 'string'
+        ? Number.parseFloat(uiAmountString)
+        : Number(parsedInfo?.uiAmount || 0)
+
+      if (!Number.isFinite(uiAmount)) {
+        return runningTotal
+      }
+
+      return runningTotal + uiAmount
+    }, 0)
+
+    return totalBalance.toFixed(6)
+  }
+
+  if (connection) {
+    return readBalance(connection)
+  }
+
+  if (network === 'testnet') {
+    return readBalance(createSolanaConnection('testnet'))
+  }
+
+  let lastError: unknown = null
+
+  for (const rpcUrl of SOLANA_MAINNET_CCTP.rpcUrls) {
+    try {
+      return await readBalance(new Connection(rpcUrl, 'confirmed'))
+    } catch (error) {
+      lastError = error
     }
+  }
 
-    return runningTotal + uiAmount
-  }, 0)
-
-  return totalBalance.toFixed(6)
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Unable to read Solana mainnet USDC balance from configured RPCs.')
 }
