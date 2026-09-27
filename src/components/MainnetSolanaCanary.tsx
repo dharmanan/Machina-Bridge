@@ -12,6 +12,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { formatUnits } from 'viem'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
+import { recordMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 
 function mask(address?: string | null) {
   if (!address) return 'Not connected'
@@ -125,6 +126,38 @@ export default function MainnetSolanaCanary() {
     && routeWriteEnabled
     && amountValid
     && !state.isLoading
+
+  const handleBridge = async () => {
+    const result = await runCanary(direction, amount) as {
+      sourceTxHash?: string
+      destinationTxHash?: string
+    } | null
+
+    if (!result?.sourceTxHash || !result?.destinationTxHash || !evmAddress || !phantomAddress) {
+      return
+    }
+
+    const refundableDepositSol =
+      direction === 'solana-to-arc'
+        ? feeEstimate?.solanaEventRentSol ?? undefined
+        : undefined
+    const refundAvailableAt =
+      direction === 'solana-to-arc'
+      && feeEstimate?.solanaEventRentRefundableAfterDays
+        ? Date.now() + (feeEstimate.solanaEventRentRefundableAfterDays * 24 * 60 * 60 * 1000)
+        : undefined
+
+    recordMainnetSolanaActivity({
+      evmWallet: evmAddress,
+      solanaWallet: phantomAddress,
+      direction,
+      amount,
+      sourceTxHash: result.sourceTxHash,
+      destinationTxHash: result.destinationTxHash,
+      refundableDepositSol,
+      refundAvailableAt,
+    })
+  }
 
   const actionLabel = !kitSupport.ready
     ? 'Bridge unavailable'
@@ -451,7 +484,7 @@ export default function MainnetSolanaCanary() {
         <button
           type="button"
           disabled={!canRun}
-          onClick={() => void runCanary(direction, amount)}
+          onClick={() => void handleBridge().catch(() => undefined)}
           className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl bg-[#66D121] px-4 text-sm font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-[#9fbd90] disabled:text-white"
         >
           {canRun ? <Wallet size={16} /> : <LockKeyhole size={16} />}
