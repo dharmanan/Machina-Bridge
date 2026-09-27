@@ -275,31 +275,40 @@ export default function MainnetSolanaCanary() {
               {direction === 'solana-to-arc' && feeEstimate.solanaUpfrontSol && (
                 <>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-500">Solana upfront SOL</span>
+                    <span className="text-slate-500">Required from Phantom now</span>
                     <span className="font-semibold text-slate-800">
                       {feeEstimate.solanaUpfrontSol} SOL
                     </span>
                   </div>
-                  {feeEstimate.solanaEventRentSol && (
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-slate-500">CCTP event-account rent</span>
-                      <span className="font-semibold text-slate-800">
-                        {feeEstimate.solanaEventRentSol} SOL
-                      </span>
-                    </div>
-                  )}
                   {feeEstimate.solanaTxFeeSol && (
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-slate-500">Solana transaction fee</span>
+                      <span className="text-slate-500">Permanent Solana network fee</span>
                       <span className="font-semibold text-slate-800">
                         {feeEstimate.solanaTxFeeSol} SOL
                       </span>
                     </div>
                   )}
+                  {feeEstimate.solanaEventRentSol && (
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Refundable CCTP deposit</span>
+                      <span className="font-semibold text-slate-800">
+                        {feeEstimate.solanaEventRentSol} SOL
+                      </span>
+                    </div>
+                  )}
                   {feeEstimate.solanaEventRentRefundableAfterDays && (
-                    <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] leading-5 text-slate-500">
-                      Most of the SOL charged at the source is temporary rent for Circle&apos;s MessageSent account, not a permanent bridge fee. It becomes reclaimable after {feeEstimate.solanaEventRentRefundableAfterDays} days.
-                    </p>
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-[11px] leading-5 text-amber-900">
+                      <p className="font-semibold">Why does Phantom need this much SOL?</p>
+                      <p className="mt-1">
+                        Circle creates a temporary Solana account for every Solana → Arc CCTP transfer. The refundable deposit above is locked in that account and is not paid to Machina.
+                      </p>
+                      <p className="mt-1">
+                        After {feeEstimate.solanaEventRentRefundableAfterDays} days, you can close that temporary account and return the deposit to the same Solana wallet. Until you do that, your Phantom balance will remain lower by that amount.
+                      </p>
+                      <p className="mt-1 font-medium">
+                        Machina does not cover this deposit. The user is responsible for returning it after the waiting period.
+                      </p>
+                    </div>
                   )}
                 </>
               )}
