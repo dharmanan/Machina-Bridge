@@ -21,6 +21,11 @@ export const MAINNET_RUNTIME_IMPLEMENTED: boolean = false
 export const MAINNET_CCTP_CANARY_ENABLED: boolean = true
 export const MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW = 100_000n
 
+// Solana mainnet CCTP has its own lock. The app may read Solana mainnet state
+// and discover Bridge Kit support while this remains false, but no Solana
+// mainnet bridge write may be requested.
+export const MAINNET_SOLANA_CCTP_CANARY_ENABLED: boolean = false
+
 // Gateway has its own lock because the existing forwarding flow still includes
 // Solana Devnet-specific behavior. Unlocking EVM CCTP must never implicitly
 // enable that flow on mainnet.
@@ -35,7 +40,6 @@ export const MAINNET_APP_URL = import.meta.env.VITE_MAINNET_APP_URL?.trim() || '
 export function getAppNetworkLabel() {
   return IS_MAINNET_PROFILE ? 'Mainnet' : 'Testnet'
 }
-
 
 export const APP_NETWORK_STORAGE_KEY = 'machina_app_network'
 
