@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Wallet, RefreshCw, LockKeyhole } from 'lucide-react'
+import { Wallet, RefreshCw, LockKeyhole, ExternalLink } from 'lucide-react'
 import { useAccount } from 'wagmi'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useMainnetSolanaCctp } from '../hooks/useMainnetSolanaCctp'
@@ -10,6 +10,7 @@ import {
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { formatUnits } from 'viem'
+import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 
 function mask(address?: string | null) {
   if (!address) return 'Not connected'
@@ -41,6 +42,10 @@ export default function MainnetSolanaCanary() {
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
+    pendingArcToSolanaTx,
+    pendingArcToSolanaError,
+    findPendingArcToSolanaBurn,
+    recoverPendingArcToSolana,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
 
@@ -56,6 +61,11 @@ export default function MainnetSolanaCanary() {
       void refreshSolanaBalance().catch(() => undefined)
     }
   }, [evmAddress, phantomAddress, refreshArcBalance, refreshSolanaBalance])
+
+  useEffect(() => {
+    if (!evmAddress || !phantomAddress) return
+    void findPendingArcToSolanaBurn().catch(() => undefined)
+  }, [evmAddress, phantomAddress, findPendingArcToSolanaBurn])
 
   const phase = MAINNET_SOLANA_CCTP_CANARY_ROUTES[direction]
   const routeWriteEnabled = phase === 'testing' || phase === 'verified'
@@ -222,6 +232,35 @@ export default function MainnetSolanaCanary() {
         {state.status && !state.error && (
           <p className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
             {state.status}
+          </p>
+        )}
+
+        {direction === 'arc-to-solana' && pendingArcToSolanaTx && (
+          <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+            <p className="font-semibold">Pending Arc → Solana burn detected</p>
+            <a
+              href={`${MAINNET_NETWORKS.arc.explorerUrl}/tx/${pendingArcToSolanaTx}`}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex items-center gap-1 underline underline-offset-2"
+            >
+              Source tx: {pendingArcToSolanaTx.slice(0, 10)}...{pendingArcToSolanaTx.slice(-6)}
+              <ExternalLink size={12} />
+            </a>
+            <button
+              type="button"
+              disabled={state.isLoading || !phantomConnected}
+              onClick={() => void recoverPendingArcToSolana().catch(() => undefined)}
+              className="mt-3 inline-flex h-11 w-full items-center justify-center rounded-2xl border border-amber-300 bg-white px-4 text-sm font-semibold text-amber-900 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Recover pending Arc → Solana mint
+            </button>
+          </div>
+        )}
+
+        {direction === 'arc-to-solana' && !pendingArcToSolanaTx && pendingArcToSolanaError && (
+          <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            Pending burn check failed: {pendingArcToSolanaError}
           </p>
         )}
 
