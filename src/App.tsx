@@ -359,6 +359,36 @@ export default function App() {
                 <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
               </div>
 
+              {appNetwork === 'mainnet' && (
+                <>
+                  <div className="flex items-center gap-3 lg:justify-end">
+                    <div className="flex items-center gap-1.5">
+                      <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
+                      <span className="text-xs text-slate-600">
+                        {isPhantomConnected ? 'Connected Solana' : 'Solana'}
+                      </span>
+                      <button
+                        onClick={handlePhantomAction}
+                        disabled={!isPhantomInstalled || isConnectingPhantomSolana}
+                        className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-400 lg:text-right">
+                    Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
+                  </p>
+
+                  {phantomSolanaError && (
+                    <div className="text-[11px] text-red-500 lg:text-right">
+                      <p>{phantomSolanaError}</p>
+                    </div>
+                  )}
+                </>
+              )}
+
               {appNetwork === 'testnet' && (
                 <>
                 {/* Row 2 — Solana + Sui side by side */}
