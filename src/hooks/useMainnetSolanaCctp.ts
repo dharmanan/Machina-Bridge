@@ -309,11 +309,16 @@ export function useMainnetSolanaCctp(
 
       const kit = new BridgeKit()
       const { solana, arc } = resolveChains(kit)
+      const solanaRecoveryChain = {
+        ...(solana as any),
+        rpcEndpoints: ['https://solana-rpc.publicnode.com'],
+      } as BridgeKitChain
+
       const solanaAdapter = await createSolanaAdapterFromProvider({
         provider: createStrictSolanaProvider(phantomProvider),
         capabilities: {
           addressContext: 'user-controlled',
-          supportedChains: [solana],
+          supportedChains: [solanaRecoveryChain],
         },
       })
 
@@ -331,12 +336,11 @@ export function useMainnetSolanaCctp(
           message: attestation.message,
           eventNonce: attestation.eventNonce,
           mintRecipient: decodedMessage.recipient,
-          destinationAddress: phantomAddress,
           fromChain: arc,
-          toChain: solana,
+          toChain: solanaRecoveryChain,
         },
         {
-          chain: solana,
+          chain: solanaRecoveryChain,
           address: phantomAddress,
         },
       )
@@ -351,7 +355,7 @@ export function useMainnetSolanaCctp(
         await (solanaAdapter as any).waitForTransaction(
           destinationTxHash,
           {},
-          solana,
+          solanaRecoveryChain,
         )
       }
 
