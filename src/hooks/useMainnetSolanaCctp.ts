@@ -33,6 +33,67 @@ function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+const SOLANA_BROWSER_RPC = 'https://solana-rpc.publicnode.com'
+
+async function readSolanaUsdcRawBalance(ownerAddress: string) {
+  const { ata } = deriveSolanaUsdcAta(ownerAddress, 'mainnet')
+  const response = await fetch(SOLANA_BROWSER_RPC, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getAccountInfo',
+      params: [
+        ata.toBase58(),
+        {
+          encoding: 'jsonParsed',
+          commitment: 'confirmed',
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Solana RPC HTTP ${response.status}`)
+  }
+
+  const payload = await response.json()
+  if (payload?.error) {
+    throw new Error(payload.error.message || 'Solana RPC error')
+  }
+
+  const raw = payload?.result?.value?.data?.parsed?.info?.tokenAmount?.amount
+  if (typeof raw !== 'string' || !/^\\d+$/.test(raw)) {
+    throw new Error('USDC associated token account balance was not returned.')
+  }
+
+  return BigInt(raw)
+}
+
+async function waitForSolanaUsdcCredit(
+  ownerAddress: string,
+  balanceBefore: bigint,
+  expectedCredit: bigint,
+) {
+  const deadline = Date.now() + 60_000
+
+  while (Date.now() < deadline) {
+    const current = await readSolanaUsdcRawBalance(ownerAddress)
+    if (current >= balanceBefore + expectedCredit) {
+      return current
+    }
+    await delay(1_000)
+  }
+
+  throw new Error(
+    'Solana mint transaction was submitted, but the expected USDC credit was not observed before timeout.',
+  )
+}
+
 interface WalletClientLike {
   transport: {
     request(args: { method: string; params?: unknown[] | Record<string, unknown> }): Promise<unknown>
@@ -254,48 +315,8 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const { ata } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
-
-      const response = await fetch('https://solana-rpc.publicnode.com', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getAccountInfo',
-          params: [
-            ata.toBase58(),
-            {
-              encoding: 'jsonParsed',
-              commitment: 'confirmed',
-            },
-          ],
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`Solana RPC HTTP ${response.status}`)
-      }
-
-      const payload = await response.json()
-      if (payload?.error) {
-        throw new Error(payload.error.message || 'Solana RPC error')
-      }
-
-      const tokenAmount = payload?.result?.value?.data?.parsed?.info?.tokenAmount
-      const raw = tokenAmount?.amount
-
-      if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
-        throw new Error('USDC associated token account balance was not returned.')
-      }
-
-      const formatted =
-        typeof tokenAmount?.uiAmountString === 'string'
-          ? tokenAmount.uiAmountString
-          : formatUnits(BigInt(raw), 6)
+      const raw = await readSolanaUsdcRawBalance(phantomAddress)
+      const formatted = formatUnits(raw, 6)
 
       setSolanaBalance(formatted)
       return formatted
@@ -450,6 +471,7 @@ export function useMainnetSolanaCctp(
       const receipt = await sourceClient.getTransactionReceipt({ hash: sourceTxHash })
 
       let mintRecipient: string | null = null
+      let burnAmountRaw: bigint | null = null
       for (const log of receipt.logs) {
         if (
           log.address.toLowerCase()
@@ -470,6 +492,7 @@ export function useMainnetSolanaCctp(
             && Number(decoded.args?.destinationDomain) === 5
           ) {
             mintRecipient = String(decoded.args?.mintRecipient || '')
+            burnAmountRaw = BigInt(decoded.args?.amount ?? 0)
             break
           }
         } catch {
@@ -477,8 +500,8 @@ export function useMainnetSolanaCctp(
         }
       }
 
-      if (!mintRecipient) {
-        throw new Error('DepositForBurn mintRecipient was not found in the source transaction.')
+      if (!mintRecipient || !burnAmountRaw || burnAmountRaw <= 0n) {
+        throw new Error('DepositForBurn mint recipient or amount was not found in the source transaction.')
       }
 
       const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
@@ -517,10 +540,14 @@ export function useMainnetSolanaCctp(
       )
       if (!action?.execute) throw new Error('Solana receiveMessage action could not be prepared.')
 
+      const balanceBefore = await readSolanaUsdcRawBalance(phantomAddress)
       const destinationTxHash = await action.execute()
-      if (destinationTxHash && (solanaAdapter as any).waitForTransaction) {
-        await (solanaAdapter as any).waitForTransaction(destinationTxHash, {}, solanaBridgeChain)
-      }
+
+      await waitForSolanaUsdcCredit(
+        phantomAddress,
+        balanceBefore,
+        burnAmountRaw,
+      )
 
       try {
         const raw = window.localStorage.getItem(RECOVERED_ARC_SOLANA_TXS_KEY)
