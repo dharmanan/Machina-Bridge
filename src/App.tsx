@@ -5,6 +5,7 @@ import { SwapTab } from './components/SwapTab'
 import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
 import MainnetPreviewGate from './components/MainnetPreviewGate'
+import MainnetDashboard from './components/MainnetDashboard'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
 import { useSuiWallet } from './hooks/useSuiWallet'
@@ -502,9 +503,37 @@ export default function App() {
         </div>
       )}
 
+      {appNetwork === 'mainnet' && (
+        <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
+          <Container>
+            <nav className="flex flex-wrap gap-2 py-4">
+              {[
+                { id: 'bridge' as const, label: 'Bridge', icon: <GitBranch size={20} /> },
+                { id: 'dashboard' as const, label: 'Dashboard', icon: <BarChart3 size={20} /> },
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                    (activeTab === tab.id || (activeTab === 'swap' && tab.id === 'bridge'))
+                      ? 'border border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C] shadow-sm'
+                      : 'border border-transparent text-slate-500 hover:border-slate-200 hover:bg-white hover:text-slate-900'
+                  }`}
+                >
+                  {tab.icon}
+                  {tab.label}
+                </button>
+              ))}
+            </nav>
+          </Container>
+        </div>
+      )}
+
       <main className="pb-10">
         {appNetwork === 'mainnet' ? (
-          <MainnetPreviewGate />
+          activeTab === 'dashboard'
+            ? <MainnetDashboard />
+            : <MainnetPreviewGate />
         ) : (
           <>
             {activeTab === 'swap' && <SwapTab />}
