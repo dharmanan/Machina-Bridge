@@ -45,6 +45,10 @@ export default function MainnetSolanaCanary() {
     refreshSolanaBalance,
     pendingArcToSolanaTx,
     pendingArcToSolanaError,
+    feeEstimate,
+    feeEstimateError,
+    isEstimatingFees,
+    estimateCanary,
     findPendingArcToSolanaBurn,
     recoverPendingArcToSolana,
     runCanary,
@@ -64,6 +68,12 @@ export default function MainnetSolanaCanary() {
         }
       : null
 
+  const maxAmount = formatUnits(MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW, 6)
+  const amountValid =
+    Number.isFinite(Number(amount))
+    && Number(amount) > 0
+    && Number(amount) <= Number(maxAmount)
+
   useEffect(() => {
     if (evmAddress) {
       void refreshArcBalance().catch(() => undefined)
@@ -78,15 +88,34 @@ export default function MainnetSolanaCanary() {
     void findPendingArcToSolanaBurn().catch(() => undefined)
   }, [evmAddress, phantomAddress, state.isLoading, findPendingArcToSolanaBurn])
 
+  useEffect(() => {
+    if (
+      !evmConnected
+      || !phantomConnected
+      || !amountValid
+      || state.isLoading
+    ) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      void estimateCanary(direction, amount).catch(() => undefined)
+    }, 450)
+
+    return () => window.clearTimeout(timer)
+  }, [
+    amount,
+    amountValid,
+    direction,
+    estimateCanary,
+    evmConnected,
+    phantomConnected,
+    state.isLoading,
+  ])
+
   const phase = MAINNET_SOLANA_CCTP_CANARY_ROUTES[direction]
   const routeWriteEnabled = phase === 'testing' || phase === 'verified'
   const globalWriteEnabled = MAINNET_SOLANA_CCTP_CANARY_ENABLED
-  const maxAmount = formatUnits(MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW, 6)
-  const amountValid =
-    Number.isFinite(Number(amount))
-    && Number(amount) > 0
-    && Number(amount) <= Number(maxAmount)
-
   const canRun =
     kitSupport.ready
     && evmConnected
@@ -119,7 +148,7 @@ export default function MainnetSolanaCanary() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">
-            Arc ↔ Solana
+            Solana Bridge
           </h3>
           <p className="mt-1 text-sm leading-6 text-slate-500">
             Bridge USDC between Arc and Solana. Maximum {maxAmount} USDC per transfer.
@@ -224,6 +253,55 @@ export default function MainnetSolanaCanary() {
         <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
           <span>Amount</span>
           <span>Max {maxAmount} USDC</span>
+        </div>
+
+        <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold text-slate-900">Estimated cost</p>
+            <span className="text-[11px] font-medium text-slate-400">
+              {isEstimatingFees ? 'Updating...' : 'Live estimate'}
+            </span>
+          </div>
+
+          {feeEstimate ? (
+            <div className="mt-3 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">Bridge fee</span>
+                <span className="font-semibold text-slate-800">
+                  {feeEstimate.bridgeFee} USDC
+                </span>
+              </div>
+
+              {feeEstimate.gasFees.map((fee, index) => (
+                <div
+                  key={`${fee.name}-${fee.token}-${index}`}
+                  className="flex items-center justify-between gap-3"
+                >
+                  <span className="text-slate-500">
+                    {fee.name || 'Network fee'}
+                  </span>
+                  <span className="font-semibold text-slate-800">
+                    {fee.amount ?? '—'} {fee.token}
+                  </span>
+                </div>
+              ))}
+
+              <div className="border-t border-slate-200 pt-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-600">Estimated received</span>
+                  <span className="font-semibold text-slate-900">
+                    {feeEstimate.receiveAmount} USDC
+                  </span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs leading-5 text-slate-500">
+              {feeEstimateError
+                ? 'Fee estimate is temporarily unavailable.'
+                : 'Connect both wallets to see the current bridge and network fees.'}
+            </p>
+          )}
         </div>
 
         {kitSupport.error && (
