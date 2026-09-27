@@ -272,19 +272,53 @@ export default function MainnetSolanaCanary() {
                 </span>
               </div>
 
-              {feeEstimate.gasFees.map((fee, index) => (
-                <div
-                  key={`${fee.name}-${fee.token}-${index}`}
-                  className="flex items-center justify-between gap-3"
-                >
-                  <span className="text-slate-500">
-                    {fee.name || 'Network fee'}
-                  </span>
-                  <span className="font-semibold text-slate-800">
-                    {fee.amount ?? '—'} {fee.token}
-                  </span>
-                </div>
-              ))}
+              {direction === 'solana-to-arc' && feeEstimate.solanaUpfrontSol && (
+                <>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-slate-500">Solana upfront SOL</span>
+                    <span className="font-semibold text-slate-800">
+                      {feeEstimate.solanaUpfrontSol} SOL
+                    </span>
+                  </div>
+                  {feeEstimate.solanaEventRentSol && (
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-slate-500">CCTP event-account rent</span>
+                      <span className="font-semibold text-slate-800">
+                        {feeEstimate.solanaEventRentSol} SOL
+                      </span>
+                    </div>
+                  )}
+                  {feeEstimate.solanaTxFeeSol && (
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Solana transaction fee</span>
+                      <span className="font-semibold text-slate-800">
+                        {feeEstimate.solanaTxFeeSol} SOL
+                      </span>
+                    </div>
+                  )}
+                  {feeEstimate.solanaEventRentRefundableAfterDays && (
+                    <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] leading-5 text-slate-500">
+                      Most of the SOL charged at the source is temporary rent for Circle&apos;s MessageSent account, not a permanent bridge fee. It becomes reclaimable after {feeEstimate.solanaEventRentRefundableAfterDays} days.
+                    </p>
+                  )}
+                </>
+              )}
+
+              {feeEstimate.gasFees
+                .filter((fee) => !(direction === 'solana-to-arc' && fee.token.toUpperCase() === 'SOL'))
+                .map((fee, index) => (
+                  <div
+                    key={`${fee.name}-${fee.token}-${index}`}
+                    className="flex items-center justify-between gap-3"
+                  >
+                    <span className="text-slate-500">
+                      {fee.name || 'Network fee'}
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {fee.amount ?? '—'} {fee.token}
+                    </span>
+                  </div>
+                ))}
 
               <div className="border-t border-slate-200 pt-2">
                 <div className="flex items-center justify-between gap-3">
