@@ -170,6 +170,7 @@ export default function MainnetPreviewGate() {
   const [readOnlyError, setReadOnlyError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActivityOpen, setIsActivityOpen] = useState(false)
+  const [isTrackerOpen, setIsTrackerOpen] = useState(false)
   const [bridgeView, setBridgeView] = useState<'evm' | 'solana'>('evm')
 
   const sourceNetwork = MAINNET_NETWORKS[source]
@@ -430,8 +431,8 @@ export default function MainnetPreviewGate() {
     transferStage === 'ready_to_mint'
     || transferStage === 'minting'
 
-  const actionLabel = !canaryRouteSelected
-    ? 'Select an Arc hub route'
+  const trackerActionLabel = !canaryRouteSelected
+    ? 'Select an Arc route'
     : !canaryWriteEnabled
       ? `${sourceName} → ${destinationName} is unavailable`
       : quoteResult && quoteResult.amountRaw > canaryMaxAmountRaw
@@ -443,20 +444,38 @@ export default function MainnetPreviewGate() {
           : transferStage === 'approving'
             ? 'Approval pending...'
           : transferStage === 'burning'
-            ? 'Burn pending...'
+            ? 'Sending...'
             : transferStage === 'waiting_attestation'
-              ? 'Waiting for attestation...'
+              ? 'Waiting for Circle...'
               : transferStage === 'minting'
-                ? 'Mint pending...'
+                ? 'Receiving...'
                 : transferStage === 'ready_to_mint'
-                  ? `Mint on ${destinationName}`
+                  ? `Receive on ${destinationName}`
                   : transferStage === 'approved' || transferStage === 'ready'
-                    ? `Burn ${amount} USDC`
+                    ? `Send ${amount} USDC`
                     : !preflightReady
-                      ? 'Run preflight checks'
+                      ? 'Checking transfer...'
                       : simulation?.approvalRequired
                         ? `Approve ${amount} USDC`
-                        : `Burn ${amount} USDC`
+                        : `Send ${amount} USDC`
+
+  const amountExceedsLimit = hasValidAmount && Number(amount) > Number(canaryMaxAmount)
+  const canOpenTracker =
+    isConnected
+    && hasValidAmount
+    && !amountExceedsLimit
+    && canaryRouteSelected
+    && canaryWriteEnabled
+
+  const mainActionLabel = !isConnected
+    ? 'Connect wallet'
+    : !hasValidAmount
+      ? 'Enter an amount'
+      : amountExceedsLimit
+        ? `Maximum ${canaryMaxAmount} USDC`
+        : matchingTransfer
+          ? 'Open bridge tracker'
+          : 'Review transfer'
 
   const actionDisabled =
     !canaryWritesUnlocked
@@ -737,381 +756,235 @@ export default function MainnetPreviewGate() {
             />
           </div>
 
-          <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-900">
-            Checks use live mainnet RPCs and Circle services before any signature is requested. Verified routes are currently limited to {canaryMaxAmount} USDC per transfer.
-          </div>
+          <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Transfer summary</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Network fees are shown by your wallet before each signature.
+                </p>
+              </div>
+              <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                routeStatus === 'ready' && circleStatus === 'ready'
+                  ? 'bg-[#eef7e8] text-[#2F6E0C]'
+                  : routeStatus === 'blocked' || circleStatus === 'blocked'
+                    ? 'bg-amber-100 text-amber-800'
+                    : 'bg-slate-100 text-slate-500'
+              }`}>
+                {routeStatus === 'ready' && circleStatus === 'ready'
+                  ? 'Route ready'
+                  : routeStatus === 'blocked' || circleStatus === 'blocked'
+                    ? 'Needs attention'
+                    : 'Checking'}
+              </span>
+            </div>
 
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
-            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
-              <p className="text-xs font-medium text-slate-500">Transfer speed</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">{transferModeLabel} CCTP</p>
-              <p className="mt-1 text-xs leading-5 text-slate-500">
-                {selectedMode === 'fast'
-                  ? `Fast Transfer is selected for ${sourceName} as the source chain.`
-                  : 'Arc uses the Standard CCTP source path; Fast Transfer is not required for Arc source transfers.'}
-              </p>
+            <div className="mt-4 space-y-2 text-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-500">Amount</span>
+                <span className="font-semibold text-slate-900">{amount || '0'} USDC</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-500">Circle fee</span>
+                <span className="font-semibold text-slate-900">
+                  {quoteResult ? `${formatUnits(quoteResult.estimatedProtocolFeeRaw, 6)} USDC` : 'Checking...'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-500">Current limit</span>
+                <span className="font-semibold text-slate-900">{canaryMaxAmount} USDC</span>
+              </div>
             </div>
-            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
-              <p className="text-xs font-medium text-slate-500">Destination completion</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">Manual mint</p>
-              <p className="mt-1 text-xs leading-5 text-slate-500">
-                Forwarding is off. The connected wallet remains the authorized destination caller.
+
+            {(readOnlyError || cctpState.error || actionError) && (
+              <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                {readOnlyError ?? cctpState.error ?? actionError}
               </p>
-            </div>
+            )}
           </div>
 
           <button
             type="button"
-            onClick={() => void runReadOnlyCheck()}
-            disabled={!hasValidAmount || cctpState.isLoading}
-            className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-[#66D121]/30 bg-[#eef7e8] px-4 text-sm font-semibold text-[#2F6E0C] transition-colors hover:bg-[#e4f1db] disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => setIsTrackerOpen(true)}
+            disabled={!canOpenTracker}
+            className="mt-5 inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-[#66D121] px-4 text-sm font-semibold text-slate-950 transition-colors hover:bg-[#5bc11c] disabled:cursor-not-allowed disabled:bg-[#9fbd90] disabled:text-white"
           >
-            <RefreshCw size={15} className={cctpState.isLoading ? 'animate-spin' : ''} />
-            {cctpState.isLoading
-              ? 'Checking...'
-              : hasValidAmount
-                ? 'Refresh checks'
-                : 'Enter an amount'}
+            {canOpenTracker ? <Wallet size={16} /> : <LockKeyhole size={16} />}
+            {mainActionLabel}
           </button>
 
-          {(quoteResult || simulation || readOnlyError || cctpState.error) && (
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3.5">
-              <div className="mb-2.5 flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold text-slate-900">Transfer checks</p>
-                <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-[11px] font-semibold text-[#2F6E0C]">
-                  {quoteResult?.mode === 'fast' ? 'Fast' : 'Standard'}
-                </span>
-              </div>
-
-              {quoteResult && (
-                <div className="space-y-2">
-                  <StatusRow label={`Circle ${transferModeLabel} route quote`} state="ready" />
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">{transferModeLabel} fee quote</span>
-                    <span className="font-semibold text-slate-800">
-                      {formatUnits(quoteResult.estimatedProtocolFeeRaw, 6)} USDC
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">Fee rate</span>
-                    <span className="font-semibold text-slate-800">
-                      {quoteResult.minimumFeeBps} bps
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">Mint delivery</span>
-                    <span className="font-semibold text-slate-800">manual · forwarding off</span>
-                  </div>
-                </div>
-              )}
-
-              {simulation && (
-                <div className="mt-2 space-y-2 border-t border-slate-200 pt-2.5">
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">{sourceName} USDC balance</span>
-                    <span className="font-semibold text-slate-800">{formatUnits(simulation.balanceRaw, 6)} USDC</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">
-                      Source gas ({sourceNetwork.nativeCurrency.symbol})
-                    </span>
-                    <span className="font-semibold text-slate-800">
-                      {formatUnits(
-                        simulation.nativeBalanceRaw,
-                        sourceNetwork.nativeCurrency.decimals,
-                      )} {sourceNetwork.nativeCurrency.symbol}
-                    </span>
-                  </div>
-
-                  {destinationGas && (
-                    <div className="flex items-center justify-between gap-4 text-sm">
-                      <span className="text-slate-600">
-                        Destination gas ({destinationGas.nativeSymbol})
-                      </span>
-                      <span
-                        className={`font-semibold ${
-                          destinationGas.ready
-                            ? 'text-slate-800'
-                            : 'text-amber-700'
-                        }`}
-                      >
-                        {formatUnits(
-                          destinationGas.nativeBalanceRaw,
-                          destinationGas.nativeDecimals,
-                        )} {destinationGas.nativeSymbol}
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">Token allowance</span>
-                    <span className="font-semibold text-slate-800">
-                      {simulation.approvalRequired ? 'approval required' : 'sufficient'}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="text-slate-600">Source simulation</span>
-                    <span className={`font-semibold ${
-                      simulation.readyForBurn || simulation.readyForApproval
-                        ? 'text-[#2F6E0C]'
-                        : 'text-amber-700'
-                    }`}>
-                      {simulationSummary}
-                    </span>
-                  </div>
-                </div>
-              )}
-
-              {(readOnlyError || cctpState.error) && (
-                <p className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-                  {readOnlyError ?? cctpState.error}
-                </p>
-              )}
-            </div>
-          )}
-
-          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3.5">
-            <div className="mb-2.5 flex items-center gap-2">
-              <CheckCircle2 size={16} className="text-[#2F6E0C]" />
-              <p className="text-sm font-semibold text-slate-900">Mainnet status</p>
-            </div>
-            <div className="space-y-2">
-              <StatusRow label="Arc Mainnet" state={arcStatus} />
-              <StatusRow label="Circle CCTP" state={circleStatus} />
-              <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
-              <StatusRow label="Full mainnet rollout" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
-              <StatusRow
-                label={`${sourceName} → ${destinationName} transfer ≤ ${canaryMaxAmount} USDC`}
-                state={
-                  canaryWritesUnlocked && canaryWriteEnabled
-                    ? 'ready'
-                    : 'locked'
-                }
-              />
-            </div>
-          </div>
-
-          {activeTransfers.length > 0 && (
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-slate-900">Pending transfers</p>
-                  <p className="mt-1 text-xs text-slate-500">
-                    Transfers continue to be tracked independently while other transfers can start.
-                  </p>
-                </div>
-                {readyToMintCount > 0 && (
-                  <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-xs font-semibold text-[#2F6E0C]">
-                    {readyToMintCount} ready to mint
-                  </span>
-                )}
-              </div>
-
-              <div className="space-y-2.5">
-                {activeTransfers.slice(0, 5).map((transfer) => (
-                  <div
-                    key={transfer.id}
-                    className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-900">
-                          {transfer.amount} USDC
-                        </p>
-                        <p className="mt-1 text-xs text-slate-500">
-                          {chainName(transfer.sourceChainId)} → {chainName(transfer.destinationChainId)}
-                        </p>
-                      </div>
-                      <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
-                        transfer.stage === 'ready_to_mint'
-                          ? 'bg-[#eef7e8] text-[#2F6E0C]'
-                          : transfer.stage === 'failed'
-                            ? 'bg-amber-100 text-amber-800'
-                            : 'bg-sky-100 text-sky-700'
-                      }`}>
-                        {transferStageLabel(transfer.stage)}
-                      </span>
-                    </div>
-
-                    {transfer.sourceTxHash && (() => {
-                      const sourceTxUrl = getMainnetTxExplorerUrl(
-                        transfer.sourceChainId,
-                        transfer.sourceTxHash,
-                      )
-
-                      return sourceTxUrl ? (
-                        <a
-                          href={sourceTxUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="mt-2 inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-800 hover:underline"
-                        >
-                          Source tx: {maskAddress(transfer.sourceTxHash)}
-                          <ExternalLink size={11} />
-                        </a>
-                      ) : (
-                        <p className="mt-2 text-[11px] text-slate-400">
-                          Source tx: {maskAddress(transfer.sourceTxHash)}
-                        </p>
-                      )
-                    })()}
-                    {transfer.lastError && (
-                      <p className="mt-2 text-xs leading-5 text-amber-700">
-                        {transfer.lastError}
-                      </p>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4">
-            <div className="mb-4 flex items-start justify-between gap-4">
-              <div>
-                <p className="text-sm font-semibold text-slate-900">Transfer flow</p>
-                <p className="mt-1 text-xs leading-5 text-slate-500">
-                  Each transaction stays explicit. Attestation is monitored automatically; destination mint remains manual.
-                </p>
-              </div>
-              <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
-                limited mainnet
-              </span>
-            </div>
-
-            <div className="space-y-4">
-              <PreviewStep
-                index={1}
-                title="Preflight"
-                detail="Route, live fee, balance, allowance and source simulation."
-                state={transferStage === 'complete' || preflightReady ? 'complete' : 'current'}
-              />
-              <PreviewStep
-                index={2}
-                title="Approve USDC"
-                detail={simulation?.approvalRequired
-                  ? `Authorize exactly ${amount || '0'} USDC for Circle TokenMessenger.`
-                  : 'Skipped when the existing allowance is sufficient.'}
-                state={
-                  transferStage
-                    && !['approval_required', 'approving'].includes(transferStage)
-                    ? 'complete'
-                    : approvalIsNext
-                      ? 'current'
-                      : preflightReady && !simulation?.approvalRequired
-                        ? 'complete'
-                        : 'locked'
-                }
-              />
-              <PreviewStep
-                index={3}
-                title="Burn on source"
-                detail={`Confirm the ${sourceName} CCTP burn and lock the destination caller to this wallet.`}
-                state={
-                  transferStage
-                    && ['waiting_attestation', 'ready_to_mint', 'minting', 'complete'].includes(transferStage)
-                    ? 'complete'
-                    : burnIsNext
-                      ? 'current'
-                      : 'locked'
-                }
-              />
-              <PreviewStep
-                index={4}
-                title={`${transferModeLabel} attestation`}
-                detail={selectedMode === 'fast'
-                  ? 'Circle Fast attestation is monitored in the background while other transfers can continue.'
-                  : 'Circle Standard attestation is monitored in the background; Arc source finality is already rapid.'}
-                state={
-                  transferStage
-                    && ['ready_to_mint', 'minting', 'complete'].includes(transferStage)
-                    ? 'complete'
-                    : attestationIsNext
-                      ? 'current'
-                      : 'locked'
-                }
-              />
-              <PreviewStep
-                index={5}
-                title={`Mint on ${destinationName}`}
-                detail={`Only ${maskAddress(address)} is configured to complete the destination receiveMessage call.`}
-                state={transferStage === 'complete' ? 'complete' : mintIsNext ? 'current' : 'locked'}
-              />
-            </div>
-
-            {transferStage === 'complete' && (
-              <div className="mt-4 rounded-xl border border-[#cfe8bf] bg-[#eef7e8] px-3.5 py-3 text-sm text-[#2F6E0C]">
-                <p className="font-semibold">Transfer complete</p>
-                <p className="mt-1 text-xs leading-5">
-                  {amount} USDC was burned on {sourceName} and minted on {destinationName}.
-                </p>
-                {(matchingTransfer?.sourceTxHash || matchingTransfer?.destinationTxHash) && (
-                  <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
-                    {matchingTransfer?.sourceTxHash && (() => {
-                      const sourceTxUrl = getMainnetTxExplorerUrl(
-                        matchingTransfer.sourceChainId,
-                        matchingTransfer.sourceTxHash,
-                      )
-                      return sourceTxUrl ? (
-                        <a
-                          href={sourceTxUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 opacity-80 hover:opacity-100 hover:underline"
-                        >
-                          Source tx: {maskAddress(matchingTransfer.sourceTxHash)}
-                          <ExternalLink size={11} />
-                        </a>
-                      ) : null
-                    })()}
-
-                    {matchingTransfer?.destinationTxHash && (() => {
-                      const destinationTxUrl = getMainnetTxExplorerUrl(
-                        matchingTransfer.destinationChainId,
-                        matchingTransfer.destinationTxHash,
-                      )
-                      return destinationTxUrl ? (
-                        <a
-                          href={destinationTxUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 opacity-80 hover:opacity-100 hover:underline"
-                        >
-                          Destination tx: {maskAddress(matchingTransfer.destinationTxHash)}
-                          <ExternalLink size={11} />
-                        </a>
-                      ) : null
-                    })()}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {actionError && (
-              <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-                {actionError}
-              </p>
-            )}
-
-            <button
-              type="button"
-              onClick={() => void runCanaryAction()}
-              disabled={actionDisabled}
-              className="mt-5 inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-[#66D121] px-4 text-sm font-semibold text-slate-950 transition-colors hover:bg-[#5bc11c] disabled:cursor-not-allowed disabled:bg-[#9fbd90] disabled:text-white"
-            >
-              {actionDisabled ? <LockKeyhole size={16} /> : <Wallet size={16} />}
-              {actionLabel}
-            </button>
-
-            <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-              Verified routes can submit real mainnet transfers up to {canaryMaxAmount} USDC. The recipient remains locked to the connected wallet. Gateway and the unrestricted rollout remain disabled.
-            </p>
-          </div>
+          <p className="mt-3 text-center text-xs leading-5 text-slate-500">
+            Verified mainnet transfers are currently limited to {canaryMaxAmount} USDC.
+          </p>
         </div>
       </div>
       ) : (
         <div className="mx-auto max-w-xl">
           <MainnetSolanaCanary />
+        </div>
+      )}
+
+      {isTrackerOpen && bridgeView === 'evm' && (
+        <div
+          className="fixed inset-0 z-[95] flex items-start justify-center overflow-y-auto bg-slate-950/70 px-4 py-6 backdrop-blur-sm sm:items-center"
+          onClick={() => setIsTrackerOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mainnet-bridge-tracker-title"
+            className="relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setIsTrackerOpen(false)}
+              className="absolute right-4 top-4 rounded-full border border-slate-200 p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"
+              aria-label="Close bridge tracker"
+            >
+              <X size={16} />
+            </button>
+
+            <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef7e8] text-[#2F6E0C]">
+              <CheckCircle2 size={22} />
+            </div>
+
+            <h2 id="mainnet-bridge-tracker-title" className="text-2xl font-semibold tracking-tight text-slate-900">
+              Bridge Tracker
+            </h2>
+            <p className="mt-2 text-sm text-slate-500">
+              {sourceName} → {destinationName} · {amount || '0'} USDC
+            </p>
+
+            <div className="mt-5 overflow-y-auto pr-1">
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Status</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">
+                      {transferStage === 'complete'
+                        ? 'Transfer complete'
+                        : transferStage === 'waiting_attestation'
+                          ? 'Waiting for Circle'
+                          : transferStage === 'ready_to_mint'
+                            ? `Ready to receive on ${destinationName}`
+                            : transferStage === 'approving'
+                              ? 'Approval pending'
+                              : transferStage === 'burning'
+                                ? 'Sending'
+                                : preflightReady
+                                  ? 'Ready for next step'
+                                  : 'Checking route'}
+                    </p>
+                  </div>
+                  <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600">
+                    Mainnet
+                  </span>
+                </div>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <PreviewStep
+                  index={1}
+                  title="Approve"
+                  detail={simulation?.approvalRequired
+                    ? `Allow Circle to move exactly ${amount || '0'} USDC.`
+                    : 'No approval is needed for this transfer.'}
+                  state={
+                    transferStage
+                      && !['approval_required', 'approving'].includes(transferStage)
+                      ? 'complete'
+                      : approvalIsNext
+                        ? 'current'
+                        : preflightReady && !simulation?.approvalRequired
+                          ? 'complete'
+                          : 'locked'
+                  }
+                />
+                <PreviewStep
+                  index={2}
+                  title={`Send from ${sourceName}`}
+                  detail="Confirm the source transaction in your wallet."
+                  state={
+                    transferStage
+                      && ['waiting_attestation', 'ready_to_mint', 'minting', 'complete'].includes(transferStage)
+                      ? 'complete'
+                      : burnIsNext
+                        ? 'current'
+                        : 'locked'
+                  }
+                />
+                <PreviewStep
+                  index={3}
+                  title="Circle confirmation"
+                  detail="Circle confirms the cross-chain transfer automatically in the background."
+                  state={
+                    transferStage
+                      && ['ready_to_mint', 'minting', 'complete'].includes(transferStage)
+                      ? 'complete'
+                      : attestationIsNext
+                        ? 'current'
+                        : 'locked'
+                  }
+                />
+                <PreviewStep
+                  index={4}
+                  title={`Receive on ${destinationName}`}
+                  detail="Confirm the destination transaction when it becomes ready."
+                  state={transferStage === 'complete' ? 'complete' : mintIsNext ? 'current' : 'locked'}
+                />
+              </div>
+
+              {transferStage === 'complete' && matchingTransfer && (
+                <div className="mt-4 rounded-2xl border border-[#cfe8bf] bg-[#eef7e8] p-4 text-sm text-[#2F6E0C]">
+                  <p className="font-semibold">Transfer complete</p>
+                  <div className="mt-2 flex flex-wrap gap-3 text-[11px]">
+                    {matchingTransfer.sourceTxHash && (() => {
+                      const url = getMainnetTxExplorerUrl(
+                        matchingTransfer.sourceChainId,
+                        matchingTransfer.sourceTxHash,
+                      )
+                      return url ? (
+                        <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 hover:underline">
+                          Source tx <ExternalLink size={11} />
+                        </a>
+                      ) : null
+                    })()}
+                    {matchingTransfer.destinationTxHash && (() => {
+                      const url = getMainnetTxExplorerUrl(
+                        matchingTransfer.destinationChainId,
+                        matchingTransfer.destinationTxHash,
+                      )
+                      return url ? (
+                        <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 hover:underline">
+                          Destination tx <ExternalLink size={11} />
+                        </a>
+                      ) : null
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {actionError && (
+                <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                  {actionError}
+                </p>
+              )}
+
+              <button
+                type="button"
+                onClick={() => void runCanaryAction()}
+                disabled={actionDisabled}
+                className="mt-5 inline-flex h-12 w-full items-center justify-center rounded-2xl bg-[#2F6E0C] px-4 text-sm font-semibold text-white transition-colors hover:bg-[#25580A] disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
+              >
+                {trackerActionLabel}
+              </button>
+
+              <p className="mt-3 text-center text-[11px] leading-5 text-slate-400">
+                Your wallet shows the transaction and network fee before every signature.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
