@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "verify:mainnet-cctp": "node scripts/verify-mainnet-cctp-production.mjs",
-    "verify:mainnet-solana-cctp": "node scripts/verify-mainnet-solana-cctp.mjs"
+    "verify:mainnet-solana-cctp": "node scripts/verify-mainnet-solana-cctp.mjs",
+    "verify:mainnet-solana-bridgekit": "node scripts/verify-mainnet-solana-bridgekit.mjs"
   },
   "dependencies": {
     "@circle-fin/adapter-solana": "^1.5.5",
