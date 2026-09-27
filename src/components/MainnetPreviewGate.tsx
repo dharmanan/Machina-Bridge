@@ -20,6 +20,7 @@ import {
 import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
+import MainnetSolanaCanary from './MainnetSolanaCanary'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
 import {
@@ -1080,6 +1081,10 @@ export default function MainnetPreviewGate() {
             </p>
           </div>
         </div>
+      </div>
+
+      <div className="mx-auto max-w-xl">
+        <MainnetSolanaCanary />
       </div>
 
       {isActivityOpen && (
