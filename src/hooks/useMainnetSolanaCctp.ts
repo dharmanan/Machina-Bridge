@@ -126,16 +126,38 @@ async function solanaReadRpc(
 
 async function readSolanaUsdcRawBalance(ownerAddress: string) {
   const { ata } = deriveSolanaUsdcAta(ownerAddress, 'mainnet')
-  const result = await solanaReadRpc('getAccountInfo', [
-    ata.toBase58(),
-    {
-      encoding: 'jsonParsed',
-      commitment: 'confirmed',
-    },
-  ])
 
-  const raw = result?.value?.data?.parsed?.info?.tokenAmount?.amount
-  if (typeof raw !== 'string' || !/^\\d+$/.test(raw)) {
+  const response = await fetch('https://solana-rpc.publicnode.com', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getAccountInfo',
+      params: [
+        ata.toBase58(),
+        {
+          encoding: 'jsonParsed',
+          commitment: 'confirmed',
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Solana RPC HTTP ${response.status}`)
+  }
+
+  const payload = await response.json()
+  if (payload?.error) {
+    throw new Error(payload.error.message || 'Solana RPC error')
+  }
+
+  const raw = payload?.result?.value?.data?.parsed?.info?.tokenAmount?.amount
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
     throw new Error('USDC associated token account balance was not returned.')
   }
 
@@ -189,13 +211,26 @@ async function waitForSolanaUsdcCredit(
   expectedCredit: bigint,
 ) {
   const deadline = Date.now() + 60_000
+  let lastError: unknown = null
 
   while (Date.now() < deadline) {
-    const current = await readSolanaUsdcRawBalance(ownerAddress)
-    if (current >= balanceBefore + expectedCredit) {
-      return current
+    try {
+      const current = await readSolanaUsdcRawBalance(ownerAddress)
+      if (current >= balanceBefore + expectedCredit) {
+        return current
+      }
+      lastError = null
+    } catch (error) {
+      lastError = error
     }
+
     await delay(1_000)
+  }
+
+  if (lastError instanceof Error) {
+    throw new Error(
+      `Solana mint confirmation timed out after transient balance-read errors: ${lastError.message}`,
+    )
   }
 
   throw new Error(
