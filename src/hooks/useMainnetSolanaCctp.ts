@@ -414,8 +414,11 @@ export function useMainnetSolanaCctp(
     }
   }, [evmAddress, phantomAddress])
 
-  const recoverPendingArcToSolana = useCallback(async () => {
-    const sourceTxHash = pendingArcToSolanaTx || await findPendingArcToSolanaBurn()
+  const recoverPendingArcToSolana = useCallback(async (sourceTxHashOverride?: Hex) => {
+    const sourceTxHash =
+      sourceTxHashOverride
+      || pendingArcToSolanaTx
+      || await findPendingArcToSolanaBurn()
     if (!sourceTxHash) throw new Error('No Arc to Solana burn was found for the connected wallets.')
     if (!phantomProvider || !phantomAddress) throw new Error('Connect Phantom first.')
 
@@ -543,7 +546,11 @@ export function useMainnetSolanaCctp(
       })
       void refreshArcBalance().catch(() => undefined)
       void refreshSolanaBalance().catch(() => undefined)
-      return destinationTxHash
+      return {
+        sourceTxHash,
+        destinationTxHash,
+        recovered: true,
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Arc to Solana recovery failed.'
       setState({
@@ -636,6 +643,29 @@ export function useMainnetSolanaCctp(
       let finalResult = result as any
 
       if (finalResult?.state === 'error') {
+        if (direction === 'arc-to-solana') {
+          setState({
+            isLoading: true,
+            error: null,
+            status: 'Arc burn completed. Recovering the fee-adjusted Solana mint...',
+            result: finalResult,
+          })
+
+          const sourceTxHash = await findPendingArcToSolanaBurn()
+          if (!sourceTxHash) {
+            const errorMessage = getBridgeKitErrorMessage(finalResult)
+            setState({
+              isLoading: false,
+              error: errorMessage,
+              status: null,
+              result: finalResult,
+            })
+            return finalResult
+          }
+
+          return await recoverPendingArcToSolana(sourceTxHash)
+        }
+
         setState({
           isLoading: true,
           error: null,
@@ -644,8 +674,8 @@ export function useMainnetSolanaCctp(
         })
 
         finalResult = await kit.retry(finalResult, {
-          from: direction === 'solana-to-arc' ? solanaAdapter : evmAdapter,
-          to: direction === 'solana-to-arc' ? evmAdapter : solanaAdapter,
+          from: solanaAdapter,
+          to: evmAdapter,
         } as any)
       }
 
@@ -684,6 +714,8 @@ export function useMainnetSolanaCctp(
     evmAddress,
     phantomAddress,
     phantomProvider,
+    findPendingArcToSolanaBurn,
+    recoverPendingArcToSolana,
     refreshArcBalance,
     refreshSolanaBalance,
     walletClient,
