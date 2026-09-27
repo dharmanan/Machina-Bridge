@@ -216,7 +216,7 @@ export default function MainnetDashboard() {
       timestamp: item.updatedAt,
       title: `${item.amount} USDC`,
       route: `${formatRouteName(item.sourceChainId)} → ${formatRouteName(item.destinationChainId)}`,
-      status: item.stage === 'complete' ? 'Complete' : item.stage.replaceAll('_', ' '),
+      status: item.stage === 'complete' ? 'Complete' : item.stage.replace(/_/g, ' '),
       sourceUrl: evmExplorer(item.sourceChainId, item.sourceTxHash),
       destinationUrl: evmExplorer(item.destinationChainId, item.destinationTxHash),
       refund: null as null | string,
