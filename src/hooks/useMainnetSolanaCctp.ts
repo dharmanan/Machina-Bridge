@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useAccount, useWalletClient } from 'wagmi'
-import { BridgeKit } from '@circle-fin/bridge-kit'
+import { BridgeKit, type EstimateResult } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
 import { PublicKey } from '@solana/web3.js'
@@ -295,6 +295,86 @@ export type MainnetSolanaCanaryState = {
   result: unknown | null
 }
 
+export type MainnetSolanaFeeEstimate = {
+  amount: string
+  bridgeFee: string
+  receiveAmount: string
+  fees: Array<{
+    type: string
+    amount: string | null
+    token: string
+  }>
+  gasFees: Array<{
+    name: string
+    amount: string | null
+    token: string
+  }>
+}
+
+function normalizeSolanaFeeEstimate(
+  estimate: EstimateResult,
+  fallbackAmount: string,
+): MainnetSolanaFeeEstimate {
+  const rawEstimate = estimate as any
+  const amount = typeof rawEstimate?.amount === 'string'
+    ? rawEstimate.amount
+    : fallbackAmount
+
+  let totalUsdcFeeRaw = 0n
+
+  const fees = Array.isArray(rawEstimate?.fees)
+    ? rawEstimate.fees.map((fee: any) => {
+        const token = String(fee?.token ?? '')
+        const feeAmount = typeof fee?.amount === 'string' ? fee.amount : null
+
+        if (feeAmount && token.toUpperCase() === 'USDC') {
+          try {
+            totalUsdcFeeRaw += parseUnits(feeAmount, 6)
+          } catch {
+            // Keep the raw SDK value visible even when it cannot be normalized.
+          }
+        }
+
+        return {
+          type: String(fee?.type ?? 'fee'),
+          amount: feeAmount,
+          token: token || 'USDC',
+        }
+      })
+    : []
+
+  const gasFees = Array.isArray(rawEstimate?.gasFees)
+    ? rawEstimate.gasFees.map((gasFee: any) => ({
+        name: String(gasFee?.name ?? 'Network fee'),
+        amount: typeof gasFee?.fees?.fee === 'string'
+          ? gasFee.fees.fee
+          : gasFee?.fees?.fee != null
+            ? String(gasFee.fees.fee)
+            : null,
+        token: String(gasFee?.token ?? ''),
+      }))
+    : []
+
+  let amountRaw = 0n
+  try {
+    amountRaw = parseUnits(amount, 6)
+  } catch {
+    amountRaw = parseUnits(fallbackAmount, 6)
+  }
+
+  const receiveRaw = amountRaw > totalUsdcFeeRaw
+    ? amountRaw - totalUsdcFeeRaw
+    : 0n
+
+  return {
+    amount,
+    bridgeFee: formatUnits(totalUsdcFeeRaw, 6),
+    receiveAmount: formatUnits(receiveRaw, 6),
+    fees,
+    gasFees,
+  }
+}
+
 function getSolanaAddress(provider: PhantomSolanaProvider) {
   const key = provider.publicKey
   if (!key) return null
@@ -472,6 +552,9 @@ export function useMainnetSolanaCctp(
   const [solanaBalanceError, setSolanaBalanceError] = useState<string | null>(null)
   const [pendingArcToSolanaTx, setPendingArcToSolanaTx] = useState<Hex | null>(null)
   const [pendingArcToSolanaError, setPendingArcToSolanaError] = useState<string | null>(null)
+  const [feeEstimate, setFeeEstimate] = useState<MainnetSolanaFeeEstimate | null>(null)
+  const [feeEstimateError, setFeeEstimateError] = useState<string | null>(null)
+  const [isEstimatingFees, setIsEstimatingFees] = useState(false)
   const pendingScanRef = useRef<Promise<Hex | null> | null>(null)
 
   const kitSupport = useMemo(() => {
@@ -886,6 +969,77 @@ export function useMainnetSolanaCctp(
     refreshSolanaBalance,
   ])
 
+  const estimateCanary = useCallback(async (
+    direction: MainnetSolanaCanaryDirection,
+    amount: string,
+  ) => {
+    setIsEstimatingFees(true)
+    setFeeEstimateError(null)
+
+    try {
+      const amountRaw = parseUnits(amount, 6)
+      if (amountRaw <= 0n || amountRaw > MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW) {
+        throw new Error('Maximum transfer is 0.1 USDC.')
+      }
+
+      if (!evmAddress || !walletClient) {
+        throw new Error('Connect the Arc wallet first.')
+      }
+
+      if (!phantomProvider || !phantomAddress) {
+        throw new Error('Connect Phantom first.')
+      }
+
+      const kit = new BridgeKit()
+      const { solana, arc } = resolveChains(kit)
+      const solanaBridgeChain = {
+        ...(solana as any),
+        rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
+      } as BridgeKitChain
+
+      const solanaAdapter = await createSolanaAdapterFromProvider({
+        provider: createStrictSolanaProvider(phantomProvider),
+        capabilities: {
+          addressContext: 'user-controlled',
+          supportedChains: [solanaBridgeChain],
+        },
+      })
+      const evmAdapter = await createEvmAdapterFromProvider({
+        provider: createStrictEvmProvider(walletClient as WalletClientLike),
+      })
+
+      const estimate = direction === 'solana-to-arc'
+        ? await kit.estimate({
+            from: { adapter: solanaAdapter, chain: solanaBridgeChain },
+            to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
+            amount,
+          } as any)
+        : await kit.estimate({
+            from: { adapter: evmAdapter, chain: arc },
+            to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
+            amount,
+          } as any)
+
+      const normalized = normalizeSolanaFeeEstimate(estimate, amount)
+      setFeeEstimate(normalized)
+      return normalized
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : 'Fee estimate is unavailable.'
+      setFeeEstimate(null)
+      setFeeEstimateError(message)
+      throw error
+    } finally {
+      setIsEstimatingFees(false)
+    }
+  }, [
+    evmAddress,
+    phantomAddress,
+    phantomProvider,
+    walletClient,
+  ])
+
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
     amount: string,
@@ -1069,6 +1223,10 @@ export function useMainnetSolanaCctp(
     refreshSolanaBalance,
     pendingArcToSolanaTx,
     pendingArcToSolanaError,
+    feeEstimate,
+    feeEstimateError,
+    isEstimatingFees,
+    estimateCanary,
     findPendingArcToSolanaBurn,
     recoverPendingArcToSolana,
     runCanary,
