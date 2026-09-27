@@ -36,6 +36,7 @@ export default function MainnetSolanaCanary() {
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
+    recoverArcToSolana,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
 
@@ -218,6 +219,21 @@ export default function MainnetSolanaCanary() {
           <p className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
             {state.status}
           </p>
+        )}
+
+        {direction === 'arc-to-solana' && (
+          <button
+            type="button"
+            disabled={!phantomConnected || state.isLoading}
+            onClick={() =>
+              void recoverArcToSolana(
+                '0x4ee1bd5933d0fe5968e191ceaa93b7588b0026e4ab365a631586eafb785e9940' as `0x${string}`,
+              ).catch(() => undefined)
+            }
+            className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-sky-300 bg-sky-50 px-4 text-sm font-semibold text-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Recover existing Arc → Solana mint
+          </button>
         )}
 
         <button
