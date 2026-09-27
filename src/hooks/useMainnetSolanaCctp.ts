@@ -5,7 +5,7 @@ import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circ
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
 import { parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
-import { createSolanaConnection } from '../lib/solana'
+import { createSolanaConnection, fetchSolanaUsdcBalance } from '../lib/solana'
 import {
   isMainnetSolanaCanaryWriteEnabled,
   MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW,
@@ -175,12 +175,14 @@ export function useMainnetSolanaCctp(
 
       const payload = await response.json().catch(() => null)
 
-      if (!response.ok || !payload?.ok || typeof payload?.balance !== 'string') {
-        throw new Error(payload?.error || `Balance API HTTP ${response.status}`)
+      if (response.ok && payload?.ok && typeof payload?.balance === 'string') {
+        setSolanaBalance(payload.balance)
+        return payload.balance
       }
 
-      setSolanaBalance(payload.balance)
-      return payload.balance
+      const directBalance = await fetchSolanaUsdcBalance(phantomAddress, 'mainnet')
+      setSolanaBalance(directBalance)
+      return directBalance
     } catch (error) {
       const message = error instanceof Error
         ? error.message
