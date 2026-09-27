@@ -25,7 +25,7 @@ export const MAINNET_CCTP_CANARY_ROUTES: readonly MainnetCanaryRoute[] = [
   { sourceKey: 'arc', destinationKey: 'optimism', phase: 'verified' },
   { sourceKey: 'optimism', destinationKey: 'arc', phase: 'verified' },
 
-  { sourceKey: 'arc', destinationKey: 'arbitrum', phase: 'testing' },
+  { sourceKey: 'arc', destinationKey: 'arbitrum', phase: 'verified' },
   { sourceKey: 'arbitrum', destinationKey: 'arc', phase: 'testing' },
 ] as const
 
