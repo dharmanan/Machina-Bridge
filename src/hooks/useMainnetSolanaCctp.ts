@@ -440,9 +440,9 @@ export function useMainnetSolanaCctp(
         throw new Error('Circle attestation is not complete yet.')
       }
 
-      const arc = MAINNET_NETWORKS.arc
+      const arcNetwork = MAINNET_NETWORKS.arc
       const sourceClient = createPublicClient({
-        transport: http(arc.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
+        transport: http(arcNetwork.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
       })
       const receipt = await sourceClient.getTransactionReceipt({ hash: sourceTxHash })
 
