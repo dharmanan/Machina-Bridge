@@ -12,6 +12,7 @@ const ALLOWED_METHODS = new Set([
   'getBlockHeight',
   'getEpochInfo',
   'getFeeForMessage',
+  'getGenesisHash',
   'getLatestBlockhash',
   'getMinimumBalanceForRentExemption',
   'getMultipleAccounts',
