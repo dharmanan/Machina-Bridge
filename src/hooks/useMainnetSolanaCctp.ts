@@ -140,7 +140,8 @@ export function useMainnetSolanaCctp(
     status: null,
     result: null,
   })
-  const [solanaBalance, setSolanaBalance] = useState('0.000000')
+  const [solanaBalance, setSolanaBalance] = useState<string | null>(null)
+  const [solanaBalanceError, setSolanaBalanceError] = useState<string | null>(null)
 
   const kitSupport = useMemo(() => {
     try {
@@ -159,13 +160,25 @@ export function useMainnetSolanaCctp(
 
   const refreshSolanaBalance = useCallback(async () => {
     if (!phantomAddress) {
-      setSolanaBalance('0.000000')
-      return '0.000000'
+      setSolanaBalance(null)
+      setSolanaBalanceError(null)
+      return null
     }
 
-    const next = await fetchSolanaUsdcBalance(phantomAddress, 'mainnet')
-    setSolanaBalance(next)
-    return next
+    setSolanaBalanceError(null)
+
+    try {
+      const next = await fetchSolanaUsdcBalance(phantomAddress, 'mainnet')
+      setSolanaBalance(next)
+      return next
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : 'Unable to read Solana mainnet USDC balance.'
+      setSolanaBalance(null)
+      setSolanaBalanceError(message)
+      throw error
+    }
   }, [phantomAddress])
 
   const runCanary = useCallback(async (
@@ -269,6 +282,7 @@ export function useMainnetSolanaCctp(
     state,
     kitSupport,
     solanaBalance,
+    solanaBalanceError,
     refreshSolanaBalance,
     runCanary,
   }
