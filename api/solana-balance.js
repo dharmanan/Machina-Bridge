@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js'
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+const DEFAULT_SOLANA_MAINNET_RPC = 'https://api.mainnet.solana.com'
 
 async function rpcCall(rpcUrl, method, params) {
   const response = await fetch(rpcUrl, {
@@ -77,24 +78,17 @@ export default async function handler(req, res) {
     if (!owner) {
       return res.status(400).json({ error: 'Missing owner address' })
     }
-
     new PublicKey(owner)
   } catch {
     return res.status(400).json({ error: 'Invalid Solana address' })
   }
 
-  const rpcUrl = process.env.SOLANA_MAINNET_RPC?.trim()
-  if (!rpcUrl) {
-    return res.status(503).json({
-      ok: false,
-      code: 'SOLANA_MAINNET_RPC_NOT_CONFIGURED',
-      error: 'Solana mainnet production RPC is not configured.',
-    })
-  }
+  const rpcUrl =
+    process.env.SOLANA_MAINNET_RPC?.trim()
+    || DEFAULT_SOLANA_MAINNET_RPC
 
   try {
     const balance = await readOwnerBalance(rpcUrl, owner)
-
     res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=30')
     return res.status(200).json({
       ok: true,
@@ -106,8 +100,7 @@ export default async function handler(req, res) {
   } catch {
     return res.status(502).json({
       ok: false,
-      code: 'SOLANA_MAINNET_RPC_FAILED',
-      error: 'Solana mainnet production RPC request failed.',
+      error: 'Unable to read Solana mainnet USDC balance.',
     })
   }
 }
