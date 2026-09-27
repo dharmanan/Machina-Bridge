@@ -363,6 +363,29 @@ export default function MainnetPreviewGate() {
   const canaryMaxAmountRaw = getMainnetCanaryMaxAmountRaw()
   const canaryMaxAmount = formatUnits(canaryMaxAmountRaw, 6)
 
+  const estimatedSourceGasRaw = simulation?.approvalRequired
+    ? simulation.approval?.estimatedGasCostRaw
+    : simulation?.burn?.estimatedGasCostRaw
+
+  const estimatedSourceGasLabel = simulation?.approvalRequired
+    ? 'Approval network fee'
+    : 'Source network fee'
+
+  const estimatedSourceGas = estimatedSourceGasRaw != null
+    ? `~${formatUnits(estimatedSourceGasRaw, sourceNetwork.nativeCurrency.decimals)} ${sourceNetwork.nativeCurrency.symbol}`
+    : simulation
+      ? 'Shown in wallet'
+      : 'Checking...'
+
+  const estimatedReceived = quoteResult
+    ? formatUnits(
+        quoteResult.amountRaw > quoteResult.estimatedProtocolFeeRaw
+          ? quoteResult.amountRaw - quoteResult.estimatedProtocolFeeRaw
+          : 0n,
+        6,
+      )
+    : null
+
   const canaryPolicy = getMainnetCanaryRoute(
     sourceChainId,
     destinationChainId,
@@ -772,7 +795,7 @@ export default function MainnetPreviewGate() {
               <div>
                 <p className="text-sm font-semibold text-slate-900">Transfer summary</p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Network fees are shown by your wallet before each signature.
+                  Estimated costs before you continue.
                 </p>
               </div>
               <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
@@ -792,7 +815,7 @@ export default function MainnetPreviewGate() {
 
             <div className="mt-4 space-y-2 text-sm">
               <div className="flex items-center justify-between gap-4">
-                <span className="text-slate-500">Amount</span>
+                <span className="text-slate-500">You send</span>
                 <span className="font-semibold text-slate-900">{amount || '0'} USDC</span>
               </div>
               <div className="flex items-center justify-between gap-4">
@@ -802,10 +825,22 @@ export default function MainnetPreviewGate() {
                 </span>
               </div>
               <div className="flex items-center justify-between gap-4">
-                <span className="text-slate-500">Current limit</span>
-                <span className="font-semibold text-slate-900">{canaryMaxAmount} USDC</span>
+                <span className="text-slate-500">{estimatedSourceGasLabel}</span>
+                <span className="font-semibold text-slate-900">{estimatedSourceGas}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4 border-t border-slate-200 pt-2">
+                <span className="text-slate-500">Estimated received</span>
+                <span className="font-semibold text-slate-900">
+                  {estimatedReceived != null ? `${estimatedReceived} USDC` : 'Checking...'}
+                </span>
               </div>
             </div>
+
+            <p className="mt-3 text-[11px] leading-5 text-slate-500">
+              {simulation?.approvalRequired
+                ? 'This is the estimated fee for the approval transaction. The source send and destination receive transactions have separate network fees, shown by your wallet before signing.'
+                : 'The destination receive transaction has a separate network fee, shown by your wallet before signing.'}
+            </p>
 
             {(readOnlyError || cctpState.error || actionError) && (
               <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
