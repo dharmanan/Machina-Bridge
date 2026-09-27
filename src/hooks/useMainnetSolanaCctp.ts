@@ -35,29 +35,93 @@ function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+const SOLANA_BROWSER_READ_RPCS = [
+  'https://solana-rpc.publicnode.com',
+  'https://solana.drpc.org',
+  'https://api.mainnet-beta.solana.com',
+]
+
+async function fetchSolanaRpc(
+  url: string,
+  method: 'getAccountInfo' | 'getSignatureStatuses',
+  params: unknown[],
+) {
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 6_000)
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method,
+        params,
+      }),
+      signal: controller.signal,
+    })
+
+    const payload = await response.json().catch(() => null)
+
+    if (!response.ok || payload?.error) {
+      throw new Error(
+        payload?.error?.message
+        || payload?.error
+        || `Solana RPC HTTP ${response.status}`,
+      )
+    }
+
+    return payload?.result
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
 async function solanaReadRpc(
   method: 'getAccountInfo' | 'getSignatureStatuses',
   params: unknown[],
 ) {
-  const response = await fetch('/api/solana-read', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json',
-    },
-    body: JSON.stringify({ method, params }),
-  })
+  let lastError: unknown = null
 
-  const payload = await response.json().catch(() => null)
-
-  if (!response.ok || payload?.error) {
-    throw new Error(
-      payload?.error
-      || `Solana read proxy HTTP ${response.status}`,
-    )
+  for (const rpc of SOLANA_BROWSER_READ_RPCS) {
+    try {
+      return await fetchSolanaRpc(rpc, method, params)
+    } catch (error) {
+      lastError = error
+    }
   }
 
-  return payload?.result
+  try {
+    const response = await fetch('/api/solana-read', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({ method, params }),
+    })
+
+    const payload = await response.json().catch(() => null)
+
+    if (!response.ok || payload?.error) {
+      throw new Error(
+        payload?.error
+        || `Solana read proxy HTTP ${response.status}`,
+      )
+    }
+
+    return payload?.result
+  } catch (error) {
+    lastError = error
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('All Solana balance RPCs failed.')
 }
 
 async function readSolanaUsdcRawBalance(ownerAddress: string) {
@@ -369,7 +433,6 @@ export function useMainnetSolanaCctp(
       const message = error instanceof Error
         ? error.message
         : 'Unable to read Solana mainnet USDC balance.'
-      setSolanaBalance(null)
       setSolanaBalanceError(message)
       throw error
     }
