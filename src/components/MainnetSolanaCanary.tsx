@@ -128,7 +128,7 @@ export default function MainnetSolanaCanary() {
           </p>
           {solanaBalanceError && (
             <p className="mt-2 text-[11px] leading-4 text-amber-700">
-              Solana production RPC is unavailable. Configure the server-only SOLANA_MAINNET_RPC environment variable.
+              Solana mainnet USDC balance could not be read.
             </p>
           )}
         </div>
