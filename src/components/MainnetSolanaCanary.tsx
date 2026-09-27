@@ -31,6 +31,7 @@ export default function MainnetSolanaCanary() {
     state,
     kitSupport,
     solanaBalance,
+    solanaBalanceError,
     refreshSolanaBalance,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
@@ -41,7 +42,7 @@ export default function MainnetSolanaCanary() {
 
   useEffect(() => {
     if (phantomAddress) {
-      void refreshSolanaBalance()
+      void refreshSolanaBalance().catch(() => undefined)
     }
   }, [phantomAddress, refreshSolanaBalance])
 
@@ -123,8 +124,13 @@ export default function MainnetSolanaCanary() {
             </button>
           </div>
           <p className="mt-2 text-xs text-slate-500">
-            USDC: {solanaBalance}
+            USDC: {solanaBalance ?? '—'}
           </p>
+          {solanaBalanceError && (
+            <p className="mt-2 text-[11px] leading-4 text-amber-700">
+              Balance read failed. Try Refresh or configure a dedicated Solana mainnet RPC.
+            </p>
+          )}
         </div>
       </div>
 
@@ -155,7 +161,7 @@ export default function MainnetSolanaCanary() {
 
           <button
             type="button"
-            onClick={() => void refreshSolanaBalance()}
+            onClick={() => void refreshSolanaBalance().catch(() => undefined)}
             disabled={!phantomConnected}
             className="ml-auto inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
           >
