@@ -168,64 +168,23 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const rpcEndpoints = [
-        'https://solana-rpc.publicnode.com',
-        'https://api.mainnet-beta.solana.com',
-      ]
+      const response = await fetch(
+        `/api/solana-balance?owner=${encodeURIComponent(phantomAddress)}`,
+        {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          cache: 'no-store',
+        },
+      )
 
-      let payload: any = null
-      let lastError: Error | null = null
+      const payload = await response.json().catch(() => null)
 
-      for (const rpcUrl of rpcEndpoints) {
-        try {
-          const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenAccountsByOwner',
-          params: [
-            phantomAddress,
-            { mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' },
-            { encoding: 'jsonParsed' },
-          ],
-        }),
-      })
-
-          if (!response.ok) {
-            throw new Error(`Solana RPC HTTP ${response.status}`)
-          }
-
-          const nextPayload = await response.json()
-          if (nextPayload?.error) {
-            throw new Error(nextPayload.error.message || 'Solana RPC error')
-          }
-
-          payload = nextPayload
-          break
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(String(error))
-        }
+      if (!response.ok || !payload?.ok || typeof payload?.balance !== 'string') {
+        throw new Error(payload?.error || `Balance API HTTP ${response.status}`)
       }
 
-      if (!payload) {
-        throw lastError || new Error('All Solana RPC balance reads failed.')
-      }
-
-      const accounts = Array.isArray(payload?.result?.value)
-        ? payload.result.value
-        : []
-
-      const totalBalance = accounts.reduce((total: number, account: any) => {
-        const tokenAmount = account?.account?.data?.parsed?.info?.tokenAmount
-        const value = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0)
-        return Number.isFinite(value) ? total + value : total
-      }, 0)
-
-      const formatted = totalBalance.toFixed(6)
-      setSolanaBalance(formatted)
-      return formatted
+      setSolanaBalance(payload.balance)
+      return payload.balance
     } catch (error) {
       const message = error instanceof Error
         ? error.message
