@@ -5,7 +5,7 @@ import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circ
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
 import { parseUnits } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
-import { createSolanaConnection, fetchSolanaUsdcBalance } from '../lib/solana'
+
 import {
   isMainnetSolanaCanaryWriteEnabled,
   MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW,
@@ -175,14 +175,16 @@ export function useMainnetSolanaCctp(
 
       const payload = await response.json().catch(() => null)
 
-      if (response.ok && payload?.ok && typeof payload?.balance === 'string') {
-        setSolanaBalance(payload.balance)
-        return payload.balance
+      if (!response.ok || !payload?.ok || typeof payload?.balance !== 'string') {
+        const code = typeof payload?.code === 'string' ? payload.code : null
+        if (code === 'SOLANA_MAINNET_RPC_NOT_CONFIGURED') {
+          throw new Error('SOLANA_MAINNET_RPC_NOT_CONFIGURED')
+        }
+        throw new Error(payload?.error || `Balance API HTTP ${response.status}`)
       }
 
-      const directBalance = await fetchSolanaUsdcBalance(phantomAddress, 'mainnet')
-      setSolanaBalance(directBalance)
-      return directBalance
+      setSolanaBalance(payload.balance)
+      return payload.balance
     } catch (error) {
       const message = error instanceof Error
         ? error.message
@@ -225,7 +227,6 @@ export function useMainnetSolanaCctp(
       const { solana, arc } = resolveChains(kit)
       const solanaAdapter = await createSolanaAdapterFromProvider({
         provider: createStrictSolanaProvider(phantomProvider),
-        connection: createSolanaConnection('mainnet'),
         capabilities: {
           addressContext: 'user-controlled',
           supportedChains: [solana],
