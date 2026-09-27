@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Wallet, RefreshCw, LockKeyhole, ExternalLink } from 'lucide-react'
+import { Wallet, RefreshCw, LockKeyhole, ExternalLink, ChevronDown } from 'lucide-react'
 import { useAccount } from 'wagmi'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useMainnetSolanaCctp } from '../hooks/useMainnetSolanaCctp'
@@ -57,6 +57,7 @@ export default function MainnetSolanaCanary() {
   const [direction, setDirection] =
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
   const [amount, setAmount] = useState('0.1')
+  const [costDetailsOpen, setCostDetailsOpen] = useState(false)
 
   const transferResult =
     state.result && typeof state.result === 'object'
@@ -272,41 +273,54 @@ export default function MainnetSolanaCanary() {
                 </span>
               </div>
 
-              {direction === 'solana-to-arc' && feeEstimate.solanaUpfrontSol && (
+              {direction === 'solana-to-arc' && feeEstimate.solanaEventRentSol && (
                 <>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-500">Required from Phantom now</span>
+                    <span className="text-slate-500">Expected Phantom debit</span>
                     <span className="font-semibold text-slate-800">
-                      {feeEstimate.solanaUpfrontSol} SOL
+                      ~0.003–0.004 SOL
                     </span>
                   </div>
-                  {feeEstimate.solanaTxFeeSol && (
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-slate-500">Permanent Solana network fee</span>
-                      <span className="font-semibold text-slate-800">
-                        {feeEstimate.solanaTxFeeSol} SOL
-                      </span>
-                    </div>
-                  )}
-                  {feeEstimate.solanaEventRentSol && (
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-slate-500">Refundable CCTP deposit</span>
-                      <span className="font-semibold text-slate-800">
-                        {feeEstimate.solanaEventRentSol} SOL
-                      </span>
-                    </div>
-                  )}
-                  {feeEstimate.solanaEventRentRefundableAfterDays && (
-                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-[11px] leading-5 text-amber-900">
-                      <p className="font-semibold">Why does Phantom need this much SOL?</p>
-                      <p className="mt-1">
-                        Circle creates a temporary Solana account for every Solana → Arc CCTP transfer. The refundable deposit above is locked in that account and is not paid to Machina.
+
+                  <button
+                    type="button"
+                    onClick={() => setCostDetailsOpen((open) => !open)}
+                    className="flex w-full items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5 text-left text-[11px] font-semibold text-slate-600 transition-colors hover:bg-slate-100"
+                  >
+                    <span>Why does Solana require this?</span>
+                    <ChevronDown
+                      size={15}
+                      className={`transition-transform ${costDetailsOpen ? 'rotate-180' : ''}`}
+                    />
+                  </button>
+
+                  {costDetailsOpen && (
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-[11px] leading-5 text-slate-600">
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <span>Refundable Circle deposit</span>
+                          <span className="font-semibold text-slate-800">
+                            {feeEstimate.solanaEventRentSol} SOL
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span>Solana network / priority fee</span>
+                          <span className="font-semibold text-slate-800">
+                            Variable
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="mt-3">
+                        Circle creates a temporary Solana account for each Solana → Arc transfer. The deposit funds that account and does not go to Machina.
                       </p>
-                      <p className="mt-1">
-                        After {feeEstimate.solanaEventRentRefundableAfterDays} days, you can close that temporary account and return the deposit to the same Solana wallet. Until you do that, your Phantom balance will remain lower by that amount.
-                      </p>
-                      <p className="mt-1 font-medium">
-                        Machina does not cover this deposit. The user is responsible for returning it after the waiting period.
+                      {feeEstimate.solanaEventRentRefundableAfterDays && (
+                        <p className="mt-1.5">
+                          After {feeEstimate.solanaEventRentRefundableAfterDays} days, the temporary account can be closed and its deposit returned to the same Phantom wallet.
+                        </p>
+                      )}
+                      <p className="mt-1.5">
+                        The final SOL amount shown by Phantom can be higher than this live estimate because Solana priority fees vary at signing time.
                       </p>
                     </div>
                   )}
@@ -321,7 +335,9 @@ export default function MainnetSolanaCanary() {
                     className="flex items-center justify-between gap-3"
                   >
                     <span className="text-slate-500">
-                      {fee.name || 'Network fee'}
+                      {fee.name?.toLowerCase() === 'mint'
+                        ? 'Arc receive gas'
+                        : fee.name || 'Network fee'}
                     </span>
                     <span className="font-semibold text-slate-800">
                       {fee.amount ?? '—'} {fee.token}
