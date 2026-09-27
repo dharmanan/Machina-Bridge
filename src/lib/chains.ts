@@ -224,20 +224,76 @@ export function getSupportedEvmChainName(chainId?: number) {
   return getSupportedEvmChain(chainId)?.name ?? 'Unknown Network'
 }
 
+function getWalletErrorCode(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+
+  const value = error as {
+    code?: unknown
+    cause?: { code?: unknown }
+    data?: { originalError?: { code?: unknown } }
+  }
+
+  const candidates = [
+    value.code,
+    value.cause?.code,
+    value.data?.originalError?.code,
+  ]
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number') return candidate
+    if (typeof candidate === 'string' && /^-?\\d+$/.test(candidate)) {
+      return Number(candidate)
+    }
+  }
+
+  return null
+}
+
 export async function addChainToWallet(chain: Chain, request?: WalletRequest | null) {
   if (!request) return false
+
+  const targetChainId = `0x${chain.id.toString(16)}`
+
+  try {
+    const currentChainId = await request({ method: 'eth_chainId' })
+    if (
+      typeof currentChainId === 'string'
+      && currentChainId.toLowerCase() === targetChainId.toLowerCase()
+    ) {
+      return true
+    }
+  } catch {
+    // Continue with the standard switch flow below.
+  }
+
+  try {
+    await request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: targetChainId }],
+    })
+    return true
+  } catch (error) {
+    if (getWalletErrorCode(error) !== 4902) {
+      throw error
+    }
+  }
 
   await request({
     method: 'wallet_addEthereumChain',
     params: [
       {
-        chainId: `0x${chain.id.toString(16)}`,
+        chainId: targetChainId,
         chainName: chain.name,
         nativeCurrency: chain.nativeCurrency,
         rpcUrls: chain.rpcUrls.default.http,
         blockExplorerUrls: chain.blockExplorers?.default?.url ? [chain.blockExplorers.default.url] : [],
       },
     ],
+  })
+
+  await request({
+    method: 'wallet_switchEthereumChain',
+    params: [{ chainId: targetChainId }],
   })
 
   return true
