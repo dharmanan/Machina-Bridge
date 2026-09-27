@@ -1,8 +1,5 @@
 import { MAINNET_NETWORKS, type MainnetNetworkKey } from './mainnetNetworks'
-import {
-  MAINNET_CCTP_CANARY_ENABLED,
-  MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW,
-} from './runtime'
+import { MAINNET_CCTP_CANARY_ENABLED } from './runtime'
 
 export type MainnetCanaryRoutePhase =
   | 'candidate'
@@ -62,6 +59,3 @@ export function isMainnetCanaryRouteWriteEnabled(
     || route?.phase === 'verified'
 }
 
-export function getMainnetCanaryMaxAmountRaw() {
-  return MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW
-}

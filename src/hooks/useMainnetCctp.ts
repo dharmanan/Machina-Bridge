@@ -18,7 +18,6 @@ import {
   getMainnetCctpRoute,
 } from '../config/mainnetCctp'
 import {
-  getMainnetCanaryMaxAmountRaw,
   getMainnetCanaryRoute,
   isMainnetCanaryRouteWriteEnabled,
 } from '../config/mainnetCanary'
@@ -90,12 +89,12 @@ function assertCanaryTransferRecord(input: {
   connectedAddress: string
 }) {
   if (!input.transferId) {
-    throw new Error('Mainnet canary requires a persistent transfer record.')
+    throw new Error('Mainnet transfer requires a persistent transfer record.')
   }
 
   const record = getMainnetTransfer(input.transferId)
   if (!record) {
-    throw new Error('Mainnet canary transfer record was not found.')
+    throw new Error('Mainnet transfer record was not found.')
   }
 
   const connected = input.connectedAddress.toLowerCase()
@@ -114,13 +113,12 @@ function assertCanaryTransferRecord(input: {
     )
     || record.mode !== getDefaultMainnetCctpTransferMode(record.sourceChainId)
     || amountRaw <= 0n
-    || amountRaw > getMainnetCanaryMaxAmountRaw()
     || record.walletAddress.toLowerCase() !== connected
     || record.recipient.toLowerCase() !== connected
     || record.destinationCaller.toLowerCase() !== connected
   ) {
     throw new Error(
-      'Transfer does not satisfy the enabled mainnet canary route policy.',
+      'Transfer does not match the selected verified route or connected wallet.',
     )
   }
 
@@ -136,7 +134,7 @@ function assertCanaryApprovalAllowed(input: {
   if (globalMainnetWritesEnabled()) return
 
   if (!canaryReadinessPassed()) {
-    throw new Error('Mainnet CCTP canary is not ready.')
+    throw new Error('Mainnet bridge services are not ready.')
   }
 
   const { record, amountRaw } = assertCanaryTransferRecord(input)
@@ -146,7 +144,7 @@ function assertCanaryApprovalAllowed(input: {
     || input.amountRaw !== amountRaw
     || record.stage !== 'approval_required'
   ) {
-    throw new Error('Approval does not satisfy the mainnet canary guard.')
+    throw new Error('Approval does not match the current transfer.')
   }
 }
 
@@ -160,7 +158,7 @@ function assertCanaryBurnAllowed(input: {
   if (globalMainnetWritesEnabled()) return
 
   if (!canaryReadinessPassed()) {
-    throw new Error('Mainnet CCTP canary is not ready.')
+    throw new Error('Mainnet bridge services are not ready.')
   }
 
   const { record, amountRaw } = assertCanaryTransferRecord(input)
@@ -171,12 +169,11 @@ function assertCanaryBurnAllowed(input: {
     || input.quote.destinationChainId !== record.destinationChainId
     || input.quote.mode !== record.mode
     || input.quote.amountRaw !== amountRaw
-    || input.quote.amountRaw > getMainnetCanaryMaxAmountRaw()
     || input.recipient.toLowerCase() !== connected
     || input.destinationCaller.toLowerCase() !== connected
     || (record.stage !== 'ready' && record.stage !== 'approved')
   ) {
-    throw new Error('Burn does not satisfy the mainnet canary guard.')
+    throw new Error('Source send does not match the current transfer.')
   }
 }
 
@@ -188,7 +185,7 @@ function assertCanaryMintAllowed(input: {
   if (globalMainnetWritesEnabled()) return
 
   if (!canaryReadinessPassed()) {
-    throw new Error('Mainnet CCTP canary is not ready.')
+    throw new Error('Mainnet bridge services are not ready.')
   }
 
   const { record } = assertCanaryTransferRecord(input)
@@ -198,7 +195,7 @@ function assertCanaryMintAllowed(input: {
     || record.stage !== 'ready_to_mint'
     || !record.sourceTxHash
   ) {
-    throw new Error('Mint does not satisfy the mainnet canary guard.')
+    throw new Error('Destination receive does not match the current transfer.')
   }
 }
 

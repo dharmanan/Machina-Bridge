@@ -55,7 +55,7 @@ export default function MainnetSolanaCanary() {
 
   const [direction, setDirection] =
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
-  const [amount, setAmount] = useState('0.1')
+  const [amount, setAmount] = useState('')
   const [costDetailsOpen, setCostDetailsOpen] = useState(false)
 
   const transferResult =

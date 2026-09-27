@@ -1157,11 +1157,11 @@ export function useMainnetSolanaCctp(
       setPendingArcToSolanaError(null)
     }
 
-    setState({ isLoading: true, error: null, status: 'Preparing canary...', result: null })
+    setState({ isLoading: true, error: null, status: 'Preparing transfer...', result: null })
 
     try {
       if (!MAINNET_SOLANA_CCTP_CANARY_ENABLED) {
-        throw new Error('Solana mainnet CCTP canary is globally locked.')
+        throw new Error('Solana mainnet bridge is currently unavailable.')
       }
 
       if (!isMainnetSolanaCanaryWriteEnabled(direction)) {
@@ -1308,13 +1308,13 @@ export function useMainnetSolanaCctp(
       setState({
         isLoading: false,
         error: null,
-        status: 'Solana mainnet canary completed.',
+        status: 'Solana mainnet transfer completed.',
         result: normalizedResult,
       })
 
       return normalizedResult
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Solana mainnet canary failed.'
+      const message = error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
       setState({
         isLoading: false,
         error: message,

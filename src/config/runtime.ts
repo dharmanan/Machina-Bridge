@@ -16,10 +16,8 @@ export const IS_TESTNET_PROFILE = APP_NETWORK === 'testnet'
 // reviewed change.
 export const MAINNET_RUNTIME_IMPLEMENTED: boolean = false
 
-// Narrow production canary. This does not unlock the global mainnet runtime.
-// Route-level write access lives in mainnetCanary.ts.
+// Verified mainnet EVM routes use the route-level write guard in mainnetCanary.ts.
 export const MAINNET_CCTP_CANARY_ENABLED: boolean = true
-export const MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW = 100_000n
 
 // Solana mainnet CCTP has its own lock. The app may read Solana mainnet state
 // and discover Bridge Kit support while this remains false, but no Solana

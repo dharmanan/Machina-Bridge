@@ -162,7 +162,7 @@ export default function MainnetPreviewGate() {
   const [routeProbe, setRouteProbe] = useState<MainnetCctpRouteProbe | null>(null)
   const [source, setSource] = useState<RouteEndpoint>('arc')
   const [destination, setDestination] = useState<RouteEndpoint>('base')
-  const [amount, setAmount] = useState('0.1')
+  const [amount, setAmount] = useState('')
   const [quoteResult, setQuoteResult] = useState<MainnetCctpQuote | null>(null)
   const [simulation, setSimulation] = useState<MainnetCctpSourceSimulation | null>(null)
   const [destinationGas, setDestinationGas] = useState<MainnetCctpDestinationGasProbe | null>(null)

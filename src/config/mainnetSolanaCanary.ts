@@ -1,8 +1,6 @@
 export type MainnetSolanaCanaryDirection = 'arc-to-solana' | 'solana-to-arc'
 export type MainnetSolanaCanaryPhase = 'candidate' | 'testing' | 'verified'
 
-export const MAINNET_SOLANA_CCTP_CANARY_MAX_AMOUNT_RAW = 100_000n
-
 export const MAINNET_SOLANA_CCTP_CANARY_ROUTES: Record<
   MainnetSolanaCanaryDirection,
   MainnetSolanaCanaryPhase
