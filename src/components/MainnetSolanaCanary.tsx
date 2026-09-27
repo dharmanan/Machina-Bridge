@@ -60,6 +60,7 @@ export default function MainnetSolanaCanary() {
           sourceTxHash?: string
           destinationTxHash?: string
           recovered?: boolean
+          direction?: MainnetSolanaCanaryDirection
         }
       : null
 
