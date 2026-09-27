@@ -369,6 +369,46 @@ function createStrictEvmProvider(
   }
 }
 
+function extractBridgeStepTxHash(step: any) {
+  if (!step || typeof step !== 'object') return undefined
+
+  const values = step.values && typeof step.values === 'object'
+    ? step.values as Record<string, unknown>
+    : undefined
+
+  return (
+    (typeof step.txHash === 'string' ? step.txHash : undefined)
+    || (typeof step.transactionHash === 'string' ? step.transactionHash : undefined)
+    || (typeof step.hash === 'string' ? step.hash : undefined)
+    || (typeof values?.txHash === 'string' ? values.txHash : undefined)
+    || (typeof values?.transactionHash === 'string' ? values.transactionHash : undefined)
+    || (typeof values?.signature === 'string' ? values.signature : undefined)
+  )
+}
+
+function getBridgeResultTxHashes(result: any) {
+  const steps = Array.isArray(result?.steps) ? result.steps : []
+
+  const findStep = (keywords: string[]) =>
+    steps.find((step: any) => {
+      const name = String(step?.name ?? step?.id ?? step?.type ?? '').toLowerCase()
+      return keywords.some((keyword) => name.includes(keyword))
+    })
+
+  const sourceStep = findStep(['burn', 'depositforburn'])
+  const destinationStep = findStep(['mint', 'receive', 'reclaim'])
+
+  return {
+    sourceTxHash:
+      (typeof result?.sourceTxHash === 'string' ? result.sourceTxHash : undefined)
+      || extractBridgeStepTxHash(sourceStep),
+    destinationTxHash:
+      (typeof result?.destinationTxHash === 'string' ? result.destinationTxHash : undefined)
+      || (typeof result?.receiveTxHash === 'string' ? result.receiveTxHash : undefined)
+      || extractBridgeStepTxHash(destinationStep),
+  }
+}
+
 function getBridgeKitErrorMessage(result: any) {
   const failedStep = Array.isArray(result?.steps)
     ? result.steps.find((step: any) =>
@@ -980,16 +1020,23 @@ export function useMainnetSolanaCctp(
         return finalResult
       }
 
+      const txHashes = getBridgeResultTxHashes(finalResult)
+      const normalizedResult = {
+        ...finalResult,
+        ...txHashes,
+        direction,
+      }
+
       setState({
         isLoading: false,
         error: null,
         status: 'Solana mainnet canary completed.',
-        result: finalResult,
+        result: normalizedResult,
       })
 
       void refreshArcBalance().catch(() => undefined)
       void refreshSolanaBalance().catch(() => undefined)
-      return finalResult
+      return normalizedResult
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Solana mainnet canary failed.'
       setState({
