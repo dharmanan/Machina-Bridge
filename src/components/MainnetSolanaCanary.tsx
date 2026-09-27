@@ -30,6 +30,9 @@ export default function MainnetSolanaCanary() {
   const {
     state,
     kitSupport,
+    arcBalance,
+    arcBalanceError,
+    refreshArcBalance,
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
@@ -41,10 +44,13 @@ export default function MainnetSolanaCanary() {
   const [amount, setAmount] = useState('0.1')
 
   useEffect(() => {
+    if (evmAddress) {
+      void refreshArcBalance().catch(() => undefined)
+    }
     if (phantomAddress) {
       void refreshSolanaBalance().catch(() => undefined)
     }
-  }, [phantomAddress, refreshSolanaBalance])
+  }, [evmAddress, phantomAddress, refreshArcBalance, refreshSolanaBalance])
 
   const phase = MAINNET_SOLANA_CCTP_CANARY_ROUTES[direction]
   const routeWriteEnabled = phase === 'testing' || phase === 'verified'
@@ -104,6 +110,14 @@ export default function MainnetSolanaCanary() {
           <p className="mt-1 text-sm font-semibold text-slate-800">
             {mask(evmAddress)}
           </p>
+          <p className="mt-2 text-xs text-slate-500">
+            USDC: {arcBalance ?? '—'}
+          </p>
+          {arcBalanceError && (
+            <p className="mt-2 text-[11px] leading-4 text-amber-700">
+              Arc mainnet USDC balance could not be read.
+            </p>
+          )}
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
@@ -161,7 +175,10 @@ export default function MainnetSolanaCanary() {
 
           <button
             type="button"
-            onClick={() => void refreshSolanaBalance().catch(() => undefined)}
+            onClick={() => {
+              void refreshArcBalance().catch(() => undefined)
+              void refreshSolanaBalance().catch(() => undefined)
+            }}
             disabled={!phantomConnected}
             className="ml-auto inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
           >
