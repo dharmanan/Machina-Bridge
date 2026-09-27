@@ -3,7 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { Connection, PublicKey } from '@solana/web3.js'
+import { PublicKey } from '@solana/web3.js'
 import { createPublicClient, decodeEventLog, formatUnits, http, parseAbi, parseAbiItem, parseUnits, type Hex } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
@@ -881,13 +881,16 @@ export function useMainnetSolanaCctp(
 
       const kit = new BridgeKit()
       const { solana, arc } = resolveChains(kit)
+      const solanaBridgeChain = {
+        ...(solana as any),
+        rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
+      } as BridgeKitChain
 
       const solanaAdapter = await createSolanaAdapterFromProvider({
         provider: createStrictSolanaProvider(phantomProvider),
-        connection: new Connection(SOLANA_MAINNET_CCTP.rpcUrl, 'confirmed'),
         capabilities: {
           addressContext: 'user-controlled',
-          supportedChains: [solana],
+          supportedChains: [solanaBridgeChain],
         },
       })
       const evmAdapter = await createEvmAdapterFromProvider({
@@ -908,13 +911,13 @@ export function useMainnetSolanaCctp(
 
       const result = direction === 'solana-to-arc'
         ? await kit.bridge({
-            from: { adapter: solanaAdapter, chain: solana },
+            from: { adapter: solanaAdapter, chain: solanaBridgeChain },
             to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
             amount,
           } as any)
         : await kit.bridge({
             from: { adapter: evmAdapter, chain: arc },
-            to: { adapter: solanaAdapter, chain: solana, recipientAddress: phantomAddress },
+            to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
             amount,
           } as any)
 
