@@ -432,9 +432,9 @@ export default function MainnetPreviewGate() {
   const actionLabel = !canaryRouteSelected
     ? 'Select an Arc hub route'
     : !canaryWriteEnabled
-      ? `${sourceName} → ${destinationName} canary is read-only`
+      ? `${sourceName} → ${destinationName} is unavailable`
       : quoteResult && quoteResult.amountRaw > canaryMaxAmountRaw
-        ? `Canary maximum is ${canaryMaxAmount} USDC`
+        ? `Maximum transfer is ${canaryMaxAmount} USDC`
       : !isConnected
         ? 'Connect wallet'
         : transferStage === 'complete'
@@ -479,7 +479,7 @@ export default function MainnetPreviewGate() {
 
       if (!transfer) {
         if (!quoteResult || !simulation || !preflightReady || !canaryEligible) {
-          throw new Error(`${sourceName} → ${destinationName} canary preflight is not ready.`)
+          throw new Error(`${sourceName} → ${destinationName} transfer checks are not ready.`)
         }
 
         transfer = createTransferPlan({
@@ -570,7 +570,7 @@ export default function MainnetPreviewGate() {
       setActionError(
         error instanceof Error
           ? error.message
-          : 'Mainnet canary action failed.',
+          : 'Mainnet transfer failed.',
       )
     }
   }, [
@@ -600,7 +600,7 @@ export default function MainnetPreviewGate() {
             <div>
               <h2 className="text-2xl font-semibold tracking-tight text-slate-900">Bridge USDC</h2>
               <p className="mt-2 text-sm leading-6 text-slate-500">
-                Choose a mainnet route, connect a wallet, and run read-only checks before transfers are enabled.
+                Choose a verified mainnet route, review the transfer checks, and bridge USDC.
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -711,7 +711,7 @@ export default function MainnetPreviewGate() {
           </div>
 
           <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-900">
-            Preflight checks use production RPCs and Circle services without signatures. Verified or testing routes can request real mainnet wallet signatures up to {canaryMaxAmount} USDC; candidate routes remain read-only.
+            Checks use live mainnet RPCs and Circle services before any signature is requested. Verified routes are currently limited to {canaryMaxAmount} USDC per transfer.
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -750,7 +750,7 @@ export default function MainnetPreviewGate() {
           {(quoteResult || simulation || readOnlyError || cctpState.error) && (
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3.5">
               <div className="mb-2.5 flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold text-slate-900">Read-only result</p>
+                <p className="text-sm font-semibold text-slate-900">Transfer checks</p>
                 <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-[11px] font-semibold text-[#2F6E0C]">
                   {quoteResult?.mode === 'fast' ? 'Fast' : 'Standard'}
                 </span>
@@ -852,9 +852,9 @@ export default function MainnetPreviewGate() {
               <StatusRow label="Arc Mainnet" state={arcStatus} />
               <StatusRow label="Circle CCTP" state={circleStatus} />
               <StatusRow label={`${sourceName} → ${destinationName} route`} state={routeStatus} />
-              <StatusRow label="Global transactions" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
+              <StatusRow label="Full mainnet rollout" state={writesUnlocked && MAINNET_RUNTIME_IMPLEMENTED ? 'ready' : 'locked'} />
               <StatusRow
-                label={`${sourceName} → ${destinationName} canary ≤ ${canaryMaxAmount} USDC`}
+                label={`${sourceName} → ${destinationName} transfer ≤ ${canaryMaxAmount} USDC`}
                 state={
                   canaryWritesUnlocked && canaryWriteEnabled
                     ? 'ready'
@@ -948,7 +948,7 @@ export default function MainnetPreviewGate() {
                 </p>
               </div>
               <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
-                canary
+                limited mainnet
               </span>
             </div>
 
@@ -1077,7 +1077,7 @@ export default function MainnetPreviewGate() {
             </button>
 
             <p className="mt-3 text-center text-xs leading-5 text-slate-500">
-              Real mainnet writes are enabled only for routes marked testing or verified, with a maximum of {canaryMaxAmount} USDC. Recipient and destination caller remain locked to the connected wallet. Global mainnet and Gateway remain locked.
+              Verified routes can submit real mainnet transfers up to {canaryMaxAmount} USDC. The recipient remains locked to the connected wallet. Gateway and the unrestricted rollout remain disabled.
             </p>
           </div>
         </div>
