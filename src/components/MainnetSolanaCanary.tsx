@@ -10,7 +10,11 @@ import {
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
-import { recordMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
+import {
+  recordMainnetSolanaActivity,
+  updateMainnetSolanaActivity,
+} from '../lib/mainnetSolanaActivity'
+import { loadMainnetSolanaRefundMetadata } from '../lib/mainnetSolanaReclaim'
 
 function mask(address?: string | null) {
   if (!address) return 'Not connected'
@@ -143,7 +147,7 @@ export default function MainnetSolanaCanary() {
         ? Date.now() + (feeEstimate.solanaEventRentRefundableAfterDays * 24 * 60 * 60 * 1000)
         : undefined
 
-    recordMainnetSolanaActivity({
+    const activityRecord = recordMainnetSolanaActivity({
       evmWallet: evmAddress,
       solanaWallet: phantomAddress,
       direction,
@@ -152,7 +156,24 @@ export default function MainnetSolanaCanary() {
       destinationTxHash: result.destinationTxHash,
       refundableDepositSol,
       refundAvailableAt,
+      refundStatus: direction === 'solana-to-arc' ? 'pending' : undefined,
     })
+
+    if (direction === 'solana-to-arc') {
+      try {
+        const refundMetadata = await loadMainnetSolanaRefundMetadata(
+          result.sourceTxHash,
+          phantomAddress,
+        )
+        updateMainnetSolanaActivity(activityRecord.id, {
+          ...refundMetadata,
+          refundStatus: 'pending',
+        })
+      } catch {
+        // Transfer is already complete. Dashboard can hydrate reclaim metadata
+        // later from the Solana source transaction and Circle API.
+      }
+    }
   }
 
   const actionLabel = !kitSupport.ready

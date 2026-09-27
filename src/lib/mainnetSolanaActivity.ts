@@ -14,6 +14,12 @@ export type MainnetSolanaActivityRecord = {
   destinationTxHash?: string
   refundableDepositSol?: string
   refundAvailableAt?: number
+  messageSentEventAccount?: string
+  refundDestinationMessage?: string
+  refundAttestation?: string
+  refundStatus?: 'pending' | 'reclaimed'
+  refundTxHash?: string
+  reclaimedAt?: number
 }
 
 const MAX_RECORDS = 100
@@ -83,6 +89,25 @@ export function recordMainnetSolanaActivity(
 
   write([record, ...existing.filter((item) => item.id !== record.id)])
   return record
+}
+
+export function updateMainnetSolanaActivity(
+  id: string,
+  patch: Partial<Omit<MainnetSolanaActivityRecord, 'id' | 'createdAt'>>,
+) {
+  const existing = readMainnetSolanaActivity()
+  const current = existing.find((item) => item.id === id)
+  if (!current) return null
+
+  const updated: MainnetSolanaActivityRecord = {
+    ...current,
+    ...patch,
+    id: current.id,
+    createdAt: current.createdAt,
+  }
+
+  write([updated, ...existing.filter((item) => item.id !== id)])
+  return updated
 }
 
 export function listMainnetSolanaActivity(
