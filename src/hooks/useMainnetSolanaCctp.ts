@@ -168,23 +168,43 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const response = await fetch(`/api/solana-balance?owner=${encodeURIComponent(phantomAddress)}`, {
-        method: 'GET',
-        headers: { accept: 'application/json' },
+      const response = await fetch('https://api.mainnet-beta.solana.com', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTokenAccountsByOwner',
+          params: [
+            phantomAddress,
+            { mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' },
+            { encoding: 'jsonParsed' },
+          ],
+        }),
       })
 
-      const payload = await response.json().catch(() => null)
-
-      if (!response.ok || !payload?.ok || typeof payload?.balance !== 'string') {
-        const code = typeof payload?.code === 'string' ? payload.code : null
-        if (code === 'SOLANA_MAINNET_RPC_NOT_CONFIGURED') {
-          throw new Error('SOLANA_MAINNET_RPC_NOT_CONFIGURED')
-        }
-        throw new Error(payload?.error || `Balance API HTTP ${response.status}`)
+      if (!response.ok) {
+        throw new Error(`Solana RPC HTTP ${response.status}`)
       }
 
-      setSolanaBalance(payload.balance)
-      return payload.balance
+      const payload = await response.json()
+      if (payload?.error) {
+        throw new Error(payload.error.message || 'Solana RPC error')
+      }
+
+      const accounts = Array.isArray(payload?.result?.value)
+        ? payload.result.value
+        : []
+
+      const totalBalance = accounts.reduce((total: number, account: any) => {
+        const tokenAmount = account?.account?.data?.parsed?.info?.tokenAmount
+        const value = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0)
+        return Number.isFinite(value) ? total + value : total
+      }, 0)
+
+      const formatted = totalBalance.toFixed(6)
+      setSolanaBalance(formatted)
+      return formatted
     } catch (error) {
       const message = error instanceof Error
         ? error.message
