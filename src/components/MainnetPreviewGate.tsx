@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { formatUnits } from 'viem'
 import { useAccount } from 'wagmi'
-import { ArrowLeftRight, Bell, CheckCircle2, ExternalLink, LockKeyhole, RefreshCw, Wallet, X } from 'lucide-react'
+import { ArrowLeftRight, Bell, CheckCircle2, ChevronDown, ExternalLink, LockKeyhole, RefreshCw, Wallet, X } from 'lucide-react'
 import { getCircleMainnetReadiness } from '../config/circle'
 import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
@@ -170,6 +170,7 @@ export default function MainnetPreviewGate() {
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActivityOpen, setIsActivityOpen] = useState(false)
   const [isTrackerOpen, setIsTrackerOpen] = useState(false)
+  const [feeDetailsOpen, setFeeDetailsOpen] = useState(false)
   const [bridgeView, setBridgeView] = useState<'evm' | 'solana'>('evm')
 
   const sourceNetwork = MAINNET_NETWORKS[source]
@@ -363,10 +364,6 @@ export default function MainnetPreviewGate() {
   const estimatedSourceGasRaw = simulation?.approvalRequired
     ? simulation.approval?.estimatedGasCostRaw
     : simulation?.burn?.estimatedGasCostRaw
-
-  const estimatedSourceGasLabel = simulation?.approvalRequired
-    ? 'Approval network fee'
-    : 'Source network fee'
 
   const estimatedSourceGas = estimatedSourceGasRaw != null
     ? `~${formatUnits(estimatedSourceGasRaw, sourceNetwork.nativeCurrency.decimals)} ${sourceNetwork.nativeCurrency.symbol}`
@@ -815,11 +812,53 @@ export default function MainnetPreviewGate() {
                 </span>
               </div>
               <div className="flex items-center justify-between gap-4">
-                <span className="text-slate-500">{estimatedSourceGasLabel}</span>
-                <span className="font-semibold text-slate-900">{estimatedSourceGas}</span>
+                <span className="text-slate-500">Network fees</span>
+                <button
+                  type="button"
+                  onClick={() => setFeeDetailsOpen((open) => !open)}
+                  className="inline-flex items-center gap-1 font-semibold text-slate-900 hover:text-[#2F6E0C]"
+                >
+                  View details
+                  <ChevronDown
+                    size={14}
+                    className={`transition-transform ${feeDetailsOpen ? 'rotate-180' : ''}`}
+                  />
+                </button>
               </div>
+
+              {feeDetailsOpen && (
+                <div className="rounded-xl border border-slate-200 bg-white px-3 py-3 text-xs">
+                  <div className="space-y-2">
+                    {simulation?.approvalRequired && (
+                      <div className="flex items-center justify-between gap-4">
+                        <span className="text-slate-500">1. Approval transaction</span>
+                        <span className="font-semibold text-slate-900">{estimatedSourceGas}</span>
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-slate-500">
+                        {simulation?.approvalRequired ? '2. Source send transaction' : '1. Source send transaction'}
+                      </span>
+                      <span className="font-semibold text-slate-900">
+                        {simulation?.approvalRequired ? 'Shown before signing' : estimatedSourceGas}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-slate-500">
+                        {simulation?.approvalRequired ? '3. Destination receive transaction' : '2. Destination receive transaction'}
+                      </span>
+                      <span className="font-semibold text-slate-900">Shown before signing</span>
+                    </div>
+                  </div>
+
+                  <p className="mt-3 border-t border-slate-200 pt-3 leading-5 text-slate-600">
+                    Total network cost is not known yet. Each transaction has its own network fee, and your wallet shows the exact fee before you approve that transaction.
+                  </p>
+                </div>
+              )}
+
               <div className="flex items-center justify-between gap-4 border-t border-slate-200 pt-2">
-                <span className="text-slate-500">Estimated received</span>
+                <span className="text-slate-500">Estimated USDC received</span>
                 <span className="font-semibold text-slate-900">
                   {estimatedReceived != null ? `${estimatedReceived} USDC` : 'Checking...'}
                 </span>
@@ -827,9 +866,7 @@ export default function MainnetPreviewGate() {
             </div>
 
             <p className="mt-3 text-[11px] leading-5 text-slate-500">
-              {simulation?.approvalRequired
-                ? 'This is the estimated fee for the approval transaction. The source send and destination receive transactions have separate network fees, shown by your wallet before signing.'
-                : 'The destination receive transaction has a separate network fee, shown by your wallet before signing.'}
+              Network fees are paid separately in each chain&apos;s native token and are not included in the USDC received estimate.
             </p>
 
             {(readOnlyError || cctpState.error || actionError) && (
