@@ -3,6 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
+import { PublicKey } from '@solana/web3.js'
 import { createPublicClient, decodeEventLog, formatUnits, http, parseAbi, parseAbiItem, parseUnits, type Hex } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
@@ -16,6 +17,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { MAINNET_CONFIG } from '../config/mainnet'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
+import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
 
@@ -33,45 +35,88 @@ function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
-const SOLANA_BROWSER_RPC = 'https://solana-rpc.publicnode.com'
-
-async function readSolanaUsdcRawBalance(ownerAddress: string) {
-  const { ata } = deriveSolanaUsdcAta(ownerAddress, 'mainnet')
-  const response = await fetch(SOLANA_BROWSER_RPC, {
+async function solanaReadRpc(
+  method: 'getAccountInfo' | 'getSignatureStatuses',
+  params: unknown[],
+) {
+  const response = await fetch('/api/solana-read', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       accept: 'application/json',
     },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getAccountInfo',
-      params: [
-        ata.toBase58(),
-        {
-          encoding: 'jsonParsed',
-          commitment: 'confirmed',
-        },
-      ],
-    }),
+    body: JSON.stringify({ method, params }),
   })
 
-  if (!response.ok) {
-    throw new Error(`Solana RPC HTTP ${response.status}`)
+  const payload = await response.json().catch(() => null)
+
+  if (!response.ok || payload?.error) {
+    throw new Error(
+      payload?.error
+      || `Solana read proxy HTTP ${response.status}`,
+    )
   }
 
-  const payload = await response.json()
-  if (payload?.error) {
-    throw new Error(payload.error.message || 'Solana RPC error')
-  }
+  return payload?.result
+}
 
-  const raw = payload?.result?.value?.data?.parsed?.info?.tokenAmount?.amount
+async function readSolanaUsdcRawBalance(ownerAddress: string) {
+  const { ata } = deriveSolanaUsdcAta(ownerAddress, 'mainnet')
+  const result = await solanaReadRpc('getAccountInfo', [
+    ata.toBase58(),
+    {
+      encoding: 'jsonParsed',
+      commitment: 'confirmed',
+    },
+  ])
+
+  const raw = result?.value?.data?.parsed?.info?.tokenAmount?.amount
   if (typeof raw !== 'string' || !/^\\d+$/.test(raw)) {
     throw new Error('USDC associated token account balance was not returned.')
   }
 
   return BigInt(raw)
+}
+
+function decodeCctpV2Nonce(messageHex: string) {
+  const hex = messageHex.startsWith('0x') ? messageHex.slice(2) : messageHex
+  const nonceStart = 12 * 2
+  const nonceEnd = nonceStart + (32 * 2)
+
+  if (hex.length < nonceEnd) {
+    throw new Error('CCTP message is too short to contain the V2 nonce.')
+  }
+
+  const nonceHex = hex.slice(nonceStart, nonceEnd)
+  const bytes = new Uint8Array(32)
+
+  for (let index = 0; index < 32; index += 1) {
+    bytes[index] = Number.parseInt(nonceHex.slice(index * 2, index * 2 + 2), 16)
+  }
+
+  return bytes
+}
+
+async function isSolanaCctpMessageAlreadyMinted(messageHex: string) {
+  const nonce = decodeCctpV2Nonce(messageHex)
+  const programId = new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram)
+  const [usedNoncePda] = PublicKey.findProgramAddressSync(
+    [
+      new TextEncoder().encode('used_nonce'),
+      nonce,
+    ],
+    programId,
+  )
+
+  const result = await solanaReadRpc('getAccountInfo', [
+    usedNoncePda.toBase58(),
+    {
+      encoding: 'base64',
+      commitment: 'confirmed',
+    },
+  ])
+
+  return Boolean(result?.value)
 }
 
 async function waitForSolanaUsdcCredit(
@@ -407,11 +452,42 @@ export function useMainnetSolanaCctp(
           for (const match of matches as any[]) {
             const txHash = match.transactionHash as Hex | undefined
             if (!txHash) continue
+
             const tx = await client.getTransaction({ hash: txHash })
-            if (tx.from.toLowerCase() === evmAddress.toLowerCase()) {
-              setPendingArcToSolanaTx(txHash)
-              return txHash
+            if (tx.from.toLowerCase() !== evmAddress.toLowerCase()) {
+              continue
             }
+
+            try {
+              const attestation = await fetchMainnetCctpAttestation({
+                sourceChainId: ARC_MAINNET_EVM_CHAIN_ID,
+                transactionHash: txHash,
+              })
+
+              if (
+                attestation.status === 'complete'
+                && attestation.message
+                && await isSolanaCctpMessageAlreadyMinted(attestation.message)
+              ) {
+                recovered.add(txHash.toLowerCase())
+
+                try {
+                  window.localStorage.setItem(
+                    RECOVERED_ARC_SOLANA_TXS_KEY,
+                    JSON.stringify(Array.from(recovered)),
+                  )
+                } catch {
+                  // On-chain nonce proof is authoritative; local persistence is best-effort.
+                }
+
+                continue
+              }
+            } catch {
+              // If completion cannot be proven, keep the burn recoverable.
+            }
+
+            setPendingArcToSolanaTx(txHash)
+            return txHash
           }
 
           if (chunkFrom === 0n) break
