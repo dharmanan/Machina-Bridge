@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { formatUnits } from 'viem'
 import { useAccount } from 'wagmi'
-import { ArrowLeftRight, CheckCircle2, ExternalLink, LockKeyhole, RefreshCw, Wallet } from 'lucide-react'
+import { ArrowLeftRight, Bell, CheckCircle2, ExternalLink, LockKeyhole, RefreshCw, Wallet, X } from 'lucide-react'
 import { getCircleMainnetReadiness } from '../config/circle'
 import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
@@ -168,6 +168,7 @@ export default function MainnetPreviewGate() {
   const [destinationGas, setDestinationGas] = useState<MainnetCctpDestinationGasProbe | null>(null)
   const [readOnlyError, setReadOnlyError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [isActivityOpen, setIsActivityOpen] = useState(false)
 
   const sourceNetwork = MAINNET_NETWORKS[source]
   const destinationNetwork = MAINNET_NETWORKS[destination]
@@ -393,6 +394,20 @@ export default function MainnetPreviewGate() {
 
   const transferStage = matchingTransfer?.stage
 
+  const readyToMintTransfers = transfers.filter(
+    (transfer) => transfer.stage === 'ready_to_mint',
+  )
+
+  const completedTransfers = transfers.filter(
+    (transfer) => transfer.stage === 'complete',
+  )
+
+  const inProgressTransfers = transfers.filter(
+    (transfer) =>
+      transfer.stage !== 'complete'
+      && transfer.stage !== 'ready_to_mint',
+  )
+
   const approvalIsNext = transferStage
     ? transferStage === 'approval_required' || transferStage === 'approving'
     : Boolean(preflightReady && simulation?.approvalRequired)
@@ -587,9 +602,26 @@ export default function MainnetPreviewGate() {
                 Choose a mainnet route, connect a wallet, and run read-only checks before transfers are enabled.
               </p>
             </div>
-            <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
-              Mainnet
-            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setIsActivityOpen(true)}
+                className="relative inline-flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 transition-colors hover:bg-slate-50"
+                title="Open activity"
+                aria-label="Open activity"
+              >
+                <Bell size={16} />
+                {readyToMintCount > 0 && (
+                  <span className="absolute -right-1 -top-1 inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[11px] font-semibold text-white">
+                    {readyToMintCount}
+                  </span>
+                )}
+              </button>
+
+              <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
+                Mainnet
+              </span>
+            </div>
           </div>
 
           <div className="mt-5 flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
@@ -1049,6 +1081,253 @@ export default function MainnetPreviewGate() {
           </div>
         </div>
       </div>
+
+      {isActivityOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm"
+          onClick={() => setIsActivityOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mainnet-activity-title"
+            className="relative w-full max-w-2xl rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setIsActivityOpen(false)}
+              className="absolute right-4 top-4 rounded-full border border-slate-200 p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"
+              aria-label="Close activity"
+            >
+              <X size={16} />
+            </button>
+
+            <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef7e8] text-[#2F6E0C]">
+              <Bell size={22} />
+            </div>
+
+            <h2
+              id="mainnet-activity-title"
+              className="text-2xl font-semibold tracking-tight text-slate-900"
+            >
+              Mainnet Activity
+            </h2>
+
+            <p className="mt-2 text-sm leading-6 text-slate-500">
+              Pending, ready-to-mint and completed mainnet transfers for this wallet.
+            </p>
+
+            <div className="mt-6 max-h-[60vh] space-y-6 overflow-y-auto pr-1">
+              {readyToMintTransfers.length > 0 && (
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Ready to Mint
+                    </h3>
+                    <span className="text-xs text-slate-400">
+                      {readyToMintTransfers.length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {readyToMintTransfers.map((transfer) => (
+                      <div
+                        key={transfer.id}
+                        className="rounded-2xl border border-amber-200 bg-amber-50 p-4"
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">
+                              {transfer.amount} USDC
+                            </p>
+                            <p className="mt-1 text-xs text-slate-600">
+                              {chainName(transfer.sourceChainId)} → {chainName(transfer.destinationChainId)}
+                            </p>
+                          </div>
+
+                          <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
+                            Ready to mint
+                          </span>
+                        </div>
+
+                        {transfer.sourceTxHash && (() => {
+                          const sourceTxUrl = getMainnetTxExplorerUrl(
+                            transfer.sourceChainId,
+                            transfer.sourceTxHash,
+                          )
+
+                          return sourceTxUrl ? (
+                            <a
+                              href={sourceTxUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="mt-3 inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 hover:underline"
+                            >
+                              Source tx: {maskAddress(transfer.sourceTxHash)}
+                              <ExternalLink size={11} />
+                            </a>
+                          ) : null
+                        })()}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {completedTransfers.length > 0 && (
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Completed
+                    </h3>
+                    <span className="text-xs text-slate-400">
+                      {completedTransfers.length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {completedTransfers.map((transfer) => (
+                      <div
+                        key={transfer.id}
+                        className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4"
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">
+                              {transfer.amount} USDC
+                            </p>
+                            <p className="mt-1 text-xs text-slate-600">
+                              {chainName(transfer.sourceChainId)} → {chainName(transfer.destinationChainId)}
+                            </p>
+                          </div>
+
+                          <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
+                            Complete
+                          </span>
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1">
+                          {transfer.sourceTxHash && (() => {
+                            const sourceTxUrl = getMainnetTxExplorerUrl(
+                              transfer.sourceChainId,
+                              transfer.sourceTxHash,
+                            )
+
+                            return sourceTxUrl ? (
+                              <a
+                                href={sourceTxUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 hover:underline"
+                              >
+                                Source tx: {maskAddress(transfer.sourceTxHash)}
+                                <ExternalLink size={11} />
+                              </a>
+                            ) : null
+                          })()}
+
+                          {transfer.destinationTxHash && (() => {
+                            const destinationTxUrl = getMainnetTxExplorerUrl(
+                              transfer.destinationChainId,
+                              transfer.destinationTxHash,
+                            )
+
+                            return destinationTxUrl ? (
+                              <a
+                                href={destinationTxUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 hover:underline"
+                              >
+                                Destination tx: {maskAddress(transfer.destinationTxHash)}
+                                <ExternalLink size={11} />
+                              </a>
+                            ) : null
+                          })()}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {inProgressTransfers.length > 0 && (
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Pending / Failed
+                    </h3>
+                    <span className="text-xs text-slate-400">
+                      {inProgressTransfers.length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {inProgressTransfers.map((transfer) => (
+                      <div
+                        key={transfer.id}
+                        className="rounded-2xl border border-slate-200 bg-slate-50 p-4"
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">
+                              {transfer.amount} USDC
+                            </p>
+                            <p className="mt-1 text-xs text-slate-600">
+                              {chainName(transfer.sourceChainId)} → {chainName(transfer.destinationChainId)}
+                            </p>
+                          </div>
+
+                          <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600">
+                            {transferStageLabel(transfer.stage)}
+                          </span>
+                        </div>
+
+                        {transfer.sourceTxHash && (() => {
+                          const sourceTxUrl = getMainnetTxExplorerUrl(
+                            transfer.sourceChainId,
+                            transfer.sourceTxHash,
+                          )
+
+                          return sourceTxUrl ? (
+                            <a
+                              href={sourceTxUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="mt-3 inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-900 hover:underline"
+                            >
+                              Source tx: {maskAddress(transfer.sourceTxHash)}
+                              <ExternalLink size={11} />
+                            </a>
+                          ) : null
+                        })()}
+
+                        {transfer.lastError && (
+                          <p className="mt-2 text-xs leading-5 text-amber-700">
+                            {transfer.lastError}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {transfers.length === 0 && (
+                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-8 text-center">
+                  <p className="text-sm font-medium text-slate-700">
+                    No mainnet activity yet
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">
+                    Mainnet transfers for this wallet will appear here.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }
