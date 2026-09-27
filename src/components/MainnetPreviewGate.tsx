@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { formatUnits } from 'viem'
 import { useAccount } from 'wagmi'
-import { ArrowLeftRight, CheckCircle2, LockKeyhole, RefreshCw, Wallet } from 'lucide-react'
+import { ArrowLeftRight, CheckCircle2, ExternalLink, LockKeyhole, RefreshCw, Wallet } from 'lucide-react'
 import { getCircleMainnetReadiness } from '../config/circle'
 import { getMainnetReadiness } from '../config/mainnet'
 import { probeArcMainnetCapabilities, type MainnetCapabilityProbeResult } from '../config/mainnetProbe'
@@ -65,6 +65,14 @@ function maskAddress(address?: string) {
 function chainName(chainId: number) {
   return Object.values(MAINNET_NETWORKS).find((network) => network.chainId === chainId)?.name
     ?? `Chain ${chainId}`
+}
+
+function getMainnetTxExplorerUrl(chainId: number, txHash: string) {
+  const network = Object.values(MAINNET_NETWORKS).find(
+    (item) => item.chainId === chainId,
+  )
+  if (!network?.explorerUrl) return undefined
+  return `${network.explorerUrl.replace(/\/$/, '')}/tx/${txHash}`
 }
 
 function transferStageLabel(stage: MainnetTransferStage) {
@@ -865,11 +873,28 @@ export default function MainnetPreviewGate() {
                       </span>
                     </div>
 
-                    {transfer.sourceTxHash && (
-                      <p className="mt-2 text-[11px] text-slate-400">
-                        Source tx: {maskAddress(transfer.sourceTxHash)}
-                      </p>
-                    )}
+                    {transfer.sourceTxHash && (() => {
+                      const sourceTxUrl = getMainnetTxExplorerUrl(
+                        transfer.sourceChainId,
+                        transfer.sourceTxHash,
+                      )
+
+                      return sourceTxUrl ? (
+                        <a
+                          href={sourceTxUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-2 inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-800 hover:underline"
+                        >
+                          Source tx: {maskAddress(transfer.sourceTxHash)}
+                          <ExternalLink size={11} />
+                        </a>
+                      ) : (
+                        <p className="mt-2 text-[11px] text-slate-400">
+                          Source tx: {maskAddress(transfer.sourceTxHash)}
+                        </p>
+                      )
+                    })()}
                     {transfer.lastError && (
                       <p className="mt-2 text-xs leading-5 text-amber-700">
                         {transfer.lastError}
@@ -960,10 +985,44 @@ export default function MainnetPreviewGate() {
                 <p className="mt-1 text-xs leading-5">
                   {amount} USDC was burned on {sourceName} and minted on {destinationName}.
                 </p>
-                {matchingTransfer?.destinationTxHash && (
-                  <p className="mt-1 text-[11px] opacity-80">
-                    Destination tx: {maskAddress(matchingTransfer.destinationTxHash)}
-                  </p>
+                {(matchingTransfer?.sourceTxHash || matchingTransfer?.destinationTxHash) && (
+                  <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
+                    {matchingTransfer?.sourceTxHash && (() => {
+                      const sourceTxUrl = getMainnetTxExplorerUrl(
+                        matchingTransfer.sourceChainId,
+                        matchingTransfer.sourceTxHash,
+                      )
+                      return sourceTxUrl ? (
+                        <a
+                          href={sourceTxUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 opacity-80 hover:opacity-100 hover:underline"
+                        >
+                          Source tx: {maskAddress(matchingTransfer.sourceTxHash)}
+                          <ExternalLink size={11} />
+                        </a>
+                      ) : null
+                    })()}
+
+                    {matchingTransfer?.destinationTxHash && (() => {
+                      const destinationTxUrl = getMainnetTxExplorerUrl(
+                        matchingTransfer.destinationChainId,
+                        matchingTransfer.destinationTxHash,
+                      )
+                      return destinationTxUrl ? (
+                        <a
+                          href={destinationTxUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 opacity-80 hover:opacity-100 hover:underline"
+                        >
+                          Destination tx: {maskAddress(matchingTransfer.destinationTxHash)}
+                          <ExternalLink size={11} />
+                        </a>
+                      ) : null
+                    })()}
+                  </div>
                 )}
               </div>
             )}
