@@ -77,14 +77,14 @@ function getMainnetTxExplorerUrl(chainId: number, txHash: string) {
 
 function transferStageLabel(stage: MainnetTransferStage) {
   const labels: Record<MainnetTransferStage, string> = {
-    ready: 'Ready to burn',
+    ready: 'Ready to send',
     approval_required: 'Approval required',
     approving: 'Approving',
-    approved: 'Approved',
-    burning: 'Burning',
-    waiting_attestation: 'Waiting attestation',
-    ready_to_mint: 'Ready to mint',
-    minting: 'Minting',
+    approved: 'Ready to send',
+    burning: 'Sending',
+    waiting_attestation: 'Waiting for Circle',
+    ready_to_mint: 'Ready to receive',
+    minting: 'Receiving',
     complete: 'Complete',
     failed: 'Needs attention',
   }
@@ -1091,7 +1091,7 @@ export default function MainnetPreviewGate() {
             </h2>
 
             <p className="mt-2 text-sm leading-6 text-slate-500">
-              Pending, ready-to-mint and completed mainnet transfers for this wallet.
+              Pending and completed mainnet transfers for this wallet.
             </p>
 
             <div className="mt-6 max-h-[60vh] space-y-6 overflow-y-auto pr-1">
@@ -1099,7 +1099,7 @@ export default function MainnetPreviewGate() {
                 <div>
                   <div className="mb-2 flex items-center justify-between">
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      Ready to Mint
+                      Ready to Receive
                     </h3>
                     <span className="text-xs text-slate-400">
                       {readyToMintTransfers.length}
@@ -1123,7 +1123,7 @@ export default function MainnetPreviewGate() {
                           </div>
 
                           <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
-                            Ready to mint
+                            Ready to receive
                           </span>
                         </div>
 

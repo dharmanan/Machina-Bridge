@@ -45,16 +45,33 @@ function evmExplorer(chainId: number, txHash?: string) {
 
 function timeUntil(timestamp: number) {
   const diff = timestamp - Date.now()
-  if (diff <= 0) return 'Available now'
+  if (diff <= 0) return 'Eligible now'
 
   const hours = Math.ceil(diff / (60 * 60 * 1000))
-  if (hours < 24) return `Available in ${hours}h`
+  if (hours < 24) return `Eligible in ${hours}h`
 
   const days = Math.floor(hours / 24)
   const remainingHours = hours % 24
   return remainingHours > 0
-    ? `Available in ${days}d ${remainingHours}h`
-    : `Available in ${days}d`
+    ? `Eligible in ${days}d ${remainingHours}h`
+    : `Eligible in ${days}d`
+}
+
+function userTransferStatus(stage: string) {
+  const labels: Record<string, string> = {
+    ready: 'Ready to send',
+    approval_required: 'Approval required',
+    approving: 'Approving',
+    approved: 'Ready to send',
+    burning: 'Sending',
+    waiting_attestation: 'Waiting for Circle',
+    ready_to_mint: 'Ready to receive',
+    minting: 'Receiving',
+    complete: 'Complete',
+    failed: 'Needs attention',
+  }
+
+  return labels[stage] ?? 'In progress'
 }
 
 export default function MainnetDashboard() {
@@ -216,7 +233,7 @@ export default function MainnetDashboard() {
       timestamp: item.updatedAt,
       title: `${item.amount} USDC`,
       route: `${formatRouteName(item.sourceChainId)} → ${formatRouteName(item.destinationChainId)}`,
-      status: item.stage === 'complete' ? 'Complete' : item.stage.replace(/_/g, ' '),
+      status: userTransferStatus(item.stage),
       sourceUrl: evmExplorer(item.sourceChainId, item.sourceTxHash),
       destinationUrl: evmExplorer(item.destinationChainId, item.destinationTxHash),
       refund: null as null | string,
@@ -387,7 +404,7 @@ export default function MainnetDashboard() {
           <Card>
             <h3 className="text-lg font-semibold">Solana Refundable Deposits</h3>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              Circle CCTP deposits created by Solana → Arc transfers. These are not Machina fees.
+              Tracked from Solana → Arc transfers completed in this browser. These Circle deposits are not Machina fees and are not returned automatically by Machina.
             </p>
             <div className="mt-4 space-y-3">
               {pendingRefunds.map((item) => (
@@ -396,13 +413,16 @@ export default function MainnetDashboard() {
                     <div>
                       <p className="font-semibold text-slate-900">{item.refundableDepositSol} SOL refundable</p>
                       <p className="mt-1 text-xs text-slate-600">
-                        {item.refundAvailableAt ? timeUntil(item.refundAvailableAt) : 'Waiting period unknown'}
+                        {item.refundAvailableAt ? timeUntil(item.refundAvailableAt) : 'Eligibility time unknown'}
                       </p>
                     </div>
                     <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-800">
-                      User refund
+                      User-managed
                     </span>
                   </div>
+                  <p className="mt-3 text-[11px] leading-5 text-amber-900/80">
+                    Reclaim must be completed from the same Phantom wallet after the waiting period. This app tracks eligibility only; a reclaim action is not available here yet.
+                  </p>
                 </div>
               ))}
             </div>

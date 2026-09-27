@@ -364,7 +364,9 @@ export default function MainnetSolanaCanary() {
                   >
                     <span className="text-slate-500">
                       {fee.name?.toLowerCase() === 'mint'
-                        ? 'Arc receive gas'
+                        ? direction === 'solana-to-arc'
+                          ? 'Arc receive gas'
+                          : 'Solana receive gas'
                         : fee.name || 'Network fee'}
                     </span>
                     <span className="font-semibold text-slate-800">
