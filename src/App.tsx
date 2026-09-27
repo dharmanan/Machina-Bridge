@@ -286,7 +286,7 @@ export default function App() {
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
                   {appNetwork === 'testnet'
                     ? 'Testnet swap and bridge flows for Arc, Sepolia, and Solana.'
-                    : 'Arc mainnet readiness and live CCTP route verification.'}
+                    : 'Bridge USDC across verified Arc mainnet routes.'}
                 </p>
               </div>
             </div>
@@ -521,12 +521,12 @@ export default function App() {
               <p className="mb-2 font-semibold text-[#2F6E0C]">
                 {appNetwork === 'testnet'
                   ? 'Independent testnet application for Arc ecosystem experimentation.'
-                  : 'Independent Arc ecosystem application — mainnet verification mode.'}
+                  : 'Independent Arc ecosystem application — mainnet bridge.'}
               </p>
               <p>
                 {appNetwork === 'testnet'
                   ? 'Uses test tokens only. Not for production or real value transfers.'
-                  : 'Mainnet transaction execution remains locked. No real-value transfer can be initiated from this mode.'}{' '}
+                  : 'Real mainnet transfers are enabled only on verified routes with current safety limits. Unrestricted mainnet and Gateway remain disabled.'}{' '}
                 <a
                   href="https://docs.arc.network/"
                   target="_blank"
