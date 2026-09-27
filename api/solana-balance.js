@@ -11,7 +11,8 @@ function unique(values) {
 function getRpcUrls() {
   return unique([
     process.env.SOLANA_MAINNET_RPC?.trim(),
-    'https://api.mainnet-beta.solana.com',
+    'https://api.mainnet.solana.com',
+    'https://rpc.ankr.com/solana',
     'https://solana-rpc.publicnode.com',
     'https://solana.drpc.org',
   ])
