@@ -168,7 +168,17 @@ export function useMainnetSolanaCctp(
     setSolanaBalanceError(null)
 
     try {
-      const response = await fetch('https://api.mainnet-beta.solana.com', {
+      const rpcEndpoints = [
+        'https://solana-rpc.publicnode.com',
+        'https://api.mainnet-beta.solana.com',
+      ]
+
+      let payload: any = null
+      let lastError: Error | null = null
+
+      for (const rpcUrl of rpcEndpoints) {
+        try {
+          const response = await fetch(rpcUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -183,13 +193,24 @@ export function useMainnetSolanaCctp(
         }),
       })
 
-      if (!response.ok) {
-        throw new Error(`Solana RPC HTTP ${response.status}`)
+          if (!response.ok) {
+            throw new Error(`Solana RPC HTTP ${response.status}`)
+          }
+
+          const nextPayload = await response.json()
+          if (nextPayload?.error) {
+            throw new Error(nextPayload.error.message || 'Solana RPC error')
+          }
+
+          payload = nextPayload
+          break
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error))
+        }
       }
 
-      const payload = await response.json()
-      if (payload?.error) {
-        throw new Error(payload.error.message || 'Solana RPC error')
+      if (!payload) {
+        throw lastError || new Error('All Solana RPC balance reads failed.')
       }
 
       const accounts = Array.isArray(payload?.result?.value)
