@@ -3,7 +3,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { createPublicClient, formatUnits, http, parseAbi, parseAbiItem, parseUnits, type Hex } from 'viem'
+import { createPublicClient, decodeEventLog, formatUnits, http, parseAbi, parseAbiItem, parseUnits, type Hex } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
 
@@ -440,13 +440,48 @@ export function useMainnetSolanaCctp(
         throw new Error('Circle attestation is not complete yet.')
       }
 
-      const recipient = (attestation.decodedMessage as { recipient?: string } | undefined)?.recipient
-      if (!recipient) throw new Error('Circle attestation is missing the Solana mint recipient.')
+      const arc = MAINNET_NETWORKS.arc
+      const sourceClient = createPublicClient({
+        transport: http(arc.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
+      })
+      const receipt = await sourceClient.getTransactionReceipt({ hash: sourceTxHash })
+
+      let mintRecipient: string | null = null
+      for (const log of receipt.logs) {
+        if (
+          log.address.toLowerCase()
+          !== MAINNET_CONFIG.arcCctpTokenMessengerAddress.toLowerCase()
+        ) {
+          continue
+        }
+
+        try {
+          const decoded = decodeEventLog({
+            abi: [DEPOSIT_FOR_BURN_EVENT],
+            data: log.data,
+            topics: log.topics,
+          }) as any
+
+          if (
+            decoded.eventName === 'DepositForBurn'
+            && Number(decoded.args?.destinationDomain) === 5
+          ) {
+            mintRecipient = String(decoded.args?.mintRecipient || '')
+            break
+          }
+        } catch {
+          // Ignore unrelated TokenMessenger logs in the same transaction.
+        }
+      }
+
+      if (!mintRecipient) {
+        throw new Error('DepositForBurn mintRecipient was not found in the source transaction.')
+      }
 
       const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
       if (
-        recipient.toLowerCase() !== ownerHex.toLowerCase()
-        && recipient.toLowerCase() !== ataHex.toLowerCase()
+        mintRecipient.toLowerCase() !== ownerHex.toLowerCase()
+        && mintRecipient.toLowerCase() !== ataHex.toLowerCase()
       ) {
         throw new Error('This burn belongs to a different Solana destination wallet.')
       }
@@ -471,7 +506,7 @@ export function useMainnetSolanaCctp(
           attestation: attestation.attestation,
           message: attestation.message,
           eventNonce: attestation.eventNonce,
-          mintRecipient: recipient,
+          mintRecipient,
           fromChain: arc,
           toChain: solanaBridgeChain,
         },
