@@ -24,7 +24,7 @@ export const MAINNET_CCTP_CANARY_MAX_AMOUNT_RAW = 100_000n
 // Solana mainnet CCTP has its own lock. The app may read Solana mainnet state
 // and discover Bridge Kit support while this remains false, but no Solana
 // mainnet bridge write may be requested.
-export const MAINNET_SOLANA_CCTP_CANARY_ENABLED: boolean = false
+export const MAINNET_SOLANA_CCTP_CANARY_ENABLED: boolean = true
 
 // Gateway has its own lock because the existing forwarding flow still includes
 // Solana Devnet-specific behavior. Unlocking EVM CCTP must never implicitly
