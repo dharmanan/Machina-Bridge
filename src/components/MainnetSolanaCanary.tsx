@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Wallet, RefreshCw, LockKeyhole, ExternalLink } from 'lucide-react'
+import { Wallet, RefreshCw, LockKeyhole } from 'lucide-react'
 import { useAccount } from 'wagmi'
 import { usePhantomSolana } from '../hooks/usePhantomSolana'
 import { useMainnetSolanaCctp } from '../hooks/useMainnetSolanaCctp'
@@ -10,19 +10,6 @@ import {
 } from '../config/mainnetSolanaCanary'
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { formatUnits } from 'viem'
-import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
-import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
-
-const ARC_TO_SOLANA_RECOVERY_SOURCE_TX =
-  '0x4ee1bd5933d0fe5968e191ceaa93b7588b0026e4ab365a631586eafb785e9940'
-
-const RECOVERY_STORAGE_KEY = 'machina_arc_solana_recovery_v1'
-
-type RecoveryResult = {
-  sourceTxHash?: string
-  destinationTxHash?: string
-  recovered?: boolean
-}
 
 function mask(address?: string | null) {
   if (!address) return 'Not connected'
@@ -54,45 +41,12 @@ export default function MainnetSolanaCanary() {
     solanaBalance,
     solanaBalanceError,
     refreshSolanaBalance,
-    recoverArcToSolana,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
 
   const [direction, setDirection] =
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
   const [amount, setAmount] = useState('0.1')
-  const [savedRecovery, setSavedRecovery] = useState<RecoveryResult | null>(() => {
-    try {
-      const raw = window.localStorage.getItem(RECOVERY_STORAGE_KEY)
-      return raw ? JSON.parse(raw) as RecoveryResult : null
-    } catch {
-      return null
-    }
-  })
-
-  const liveRecovery =
-    state.result && typeof state.result === 'object'
-      ? state.result as RecoveryResult
-      : null
-
-  const recoveryResult =
-    liveRecovery?.recovered ? liveRecovery : savedRecovery
-
-  const recoverySucceeded = Boolean(recoveryResult?.recovered)
-
-  useEffect(() => {
-    if (!liveRecovery?.recovered || !liveRecovery.sourceTxHash) return
-
-    setSavedRecovery(liveRecovery)
-    try {
-      window.localStorage.setItem(
-        RECOVERY_STORAGE_KEY,
-        JSON.stringify(liveRecovery),
-      )
-    } catch {
-      // Persistence is best-effort; the in-memory result still remains visible.
-    }
-  }, [liveRecovery])
 
   useEffect(() => {
     if (evmAddress) {
@@ -269,51 +223,6 @@ export default function MainnetSolanaCanary() {
           <p className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
             {state.status}
           </p>
-        )}
-
-        {direction === 'arc-to-solana' && recoverySucceeded && (
-          <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-900">
-            <p className="font-semibold">Arc → Solana mint confirmed</p>
-            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-2">
-              <a
-                href={`${MAINNET_NETWORKS.arc.explorerUrl}/tx/${recoveryResult?.sourceTxHash}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 underline underline-offset-2"
-              >
-                Source tx: {txMask(recoveryResult?.sourceTxHash)}
-                <ExternalLink size={12} />
-              </a>
-              {recoveryResult?.destinationTxHash && (
-                <a
-                  href={`${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${recoveryResult.destinationTxHash}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 underline underline-offset-2"
-                >
-                  Destination tx: {txMask(recoveryResult.destinationTxHash)}
-                  <ExternalLink size={12} />
-                </a>
-              )}
-            </div>
-          </div>
-        )}
-
-        {direction === 'arc-to-solana' && (
-          <button
-            type="button"
-            disabled={!phantomConnected || state.isLoading || recoverySucceeded}
-            onClick={() =>
-              void recoverArcToSolana(
-                ARC_TO_SOLANA_RECOVERY_SOURCE_TX as `0x${string}`,
-              ).catch(() => undefined)
-            }
-            className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl border border-sky-300 bg-sky-50 px-4 text-sm font-semibold text-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {recoverySucceeded
-              ? 'Arc → Solana mint recovered'
-              : 'Recover existing Arc → Solana mint'}
-          </button>
         )}
 
         <button
