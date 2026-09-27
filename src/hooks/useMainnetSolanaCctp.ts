@@ -238,6 +238,44 @@ async function waitForSolanaUsdcCredit(
   )
 }
 
+async function waitForArcCctpAttestation(sourceTxHash: Hex) {
+  const deadline = Date.now() + 180_000
+  let lastError: unknown = null
+
+  while (Date.now() < deadline) {
+    try {
+      const attestation = await fetchMainnetCctpAttestation({
+        sourceChainId: ARC_MAINNET_EVM_CHAIN_ID,
+        transactionHash: sourceTxHash,
+      })
+
+      if (
+        attestation.status === 'complete'
+        && attestation.message
+        && attestation.attestation
+        && attestation.eventNonce
+      ) {
+        return attestation
+      }
+
+      lastError = null
+    } catch (error) {
+      lastError = error
+    }
+
+    await delay(2_000)
+  }
+
+  if (lastError instanceof Error) {
+    throw new Error(
+      `Circle attestation did not become ready before timeout: ${lastError.message}`,
+    )
+  }
+
+  throw new Error('Circle attestation did not become ready before timeout.')
+}
+
+
 interface WalletClientLike {
   transport: {
     request(args: { method: string; params?: unknown[] | Record<string, unknown> }): Promise<unknown>
@@ -666,18 +704,14 @@ export function useMainnetSolanaCctp(
     })
 
     try {
-      const attestation = await fetchMainnetCctpAttestation({
-        sourceChainId: ARC_MAINNET_EVM_CHAIN_ID,
-        transactionHash: sourceTxHash,
+      setState({
+        isLoading: true,
+        error: null,
+        status: 'Arc burn confirmed. Waiting for Circle attestation...',
+        result: { sourceTxHash },
       })
-      if (
-        attestation.status !== 'complete'
-        || !attestation.message
-        || !attestation.attestation
-        || !attestation.eventNonce
-      ) {
-        throw new Error('Circle attestation is not complete yet.')
-      }
+
+      const attestation = await waitForArcCctpAttestation(sourceTxHash)
 
       const arcNetwork = MAINNET_NETWORKS.arc
       const sourceClient = createPublicClient({
@@ -816,6 +850,11 @@ export function useMainnetSolanaCctp(
     direction: MainnetSolanaCanaryDirection,
     amount: string,
   ) => {
+    if (direction === 'arc-to-solana') {
+      setPendingArcToSolanaTx(null)
+      setPendingArcToSolanaError(null)
+    }
+
     setState({ isLoading: true, error: null, status: 'Preparing canary...', result: null })
 
     try {
@@ -893,7 +932,16 @@ export function useMainnetSolanaCctp(
             result: finalResult,
           })
 
-          const sourceTxHash = await findPendingArcToSolanaBurn()
+          let sourceTxHash: Hex | null = null
+          const sourceDeadline = Date.now() + 30_000
+
+          while (!sourceTxHash && Date.now() < sourceDeadline) {
+            sourceTxHash = await findPendingArcToSolanaBurn()
+            if (!sourceTxHash) {
+              await delay(1_500)
+            }
+          }
+
           if (!sourceTxHash) {
             const errorMessage = getBridgeKitErrorMessage(finalResult)
             setState({
