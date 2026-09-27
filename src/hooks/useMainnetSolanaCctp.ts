@@ -1088,25 +1088,37 @@ export function useMainnetSolanaCctp(
         // Circle CCTP V2 stores the source MessageSent event in a temporary
         // Solana account. For a standard burn with empty hookData, the current
         // MessageSent account layout is 428 bytes.
-        const rentResponse = await fetch('/api/solana-rpc', {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'application/json',
-          },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'getMinimumBalanceForRentExemption',
-            params: [428, { commitment: 'confirmed' }],
-          }),
+        const rentRequestBody = JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getMinimumBalanceForRentExemption',
+          params: [428, { commitment: 'confirmed' }],
         })
 
-        const rentPayload = await rentResponse.json().catch(() => null)
-        const rentLamports =
-          rentResponse.ok && Number.isFinite(Number(rentPayload?.result))
-            ? BigInt(rentPayload.result)
+        const readRentLamports = async (url: string) => {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              accept: 'application/json',
+            },
+            body: rentRequestBody,
+          })
+
+          const payload = await response.json().catch(() => null)
+          return response.ok && Number.isFinite(Number(payload?.result))
+            ? BigInt(payload.result)
             : null
+        }
+
+        let rentLamports = await readRentLamports('/api/solana-rpc')
+
+        // Vite dev does not serve Vercel API routes. Fall back to the same
+        // public Solana RPC already used by the primary balance reader so
+        // local UI estimates remain complete without Vercel dev.
+        if (rentLamports === null) {
+          rentLamports = await readRentLamports('https://solana-rpc.publicnode.com')
+        }
 
         if (rentLamports !== null) {
           const txFeeLamports = normalized.solanaTxFeeSol
