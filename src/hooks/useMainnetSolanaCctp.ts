@@ -15,7 +15,17 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
 
-type WalletClientLike = NonNullable<ReturnType<typeof useWalletClient>['data']>
+interface WalletClientLike {
+  transport: {
+    request(args: { method: string; params?: unknown[] | Record<string, unknown> }): Promise<unknown>
+  }
+}
+
+interface Eip1193LikeProvider {
+  request(args: { method: string; params?: unknown[] | Record<string, unknown> }): Promise<unknown>
+  on?(event: string, listener: (...args: unknown[]) => void): void
+  removeListener?(event: string, listener: (...args: unknown[]) => void): void
+}
 
 export type MainnetSolanaCanaryState = {
   isLoading: boolean
@@ -73,12 +83,28 @@ function createStrictSolanaProvider(
 function createStrictEvmProvider(
   walletClient: WalletClientLike,
 ): Parameters<typeof createEvmAdapterFromProvider>[0]['provider'] {
-  const source = walletClient.transport as any
+  const providerSource = walletClient.transport as unknown as Eip1193LikeProvider
 
   return {
-    on: ((event, listener) => source.on?.(event, listener)) as any,
-    removeListener: ((event, listener) => source.removeListener?.(event, listener)) as any,
-    request: ((args) => source.request(args)) as any,
+    on: ((event, listener) => {
+      providerSource.on?.(event as string, listener as (...args: unknown[]) => void)
+    }) as Parameters<typeof createEvmAdapterFromProvider>[0]['provider']['on'],
+    removeListener: ((event, listener) => {
+      providerSource.removeListener?.(event as string, listener as (...args: unknown[]) => void)
+    }) as Parameters<typeof createEvmAdapterFromProvider>[0]['provider']['removeListener'],
+    request: ((args) => {
+      if (providerSource.request) {
+        return providerSource.request({
+          method: args.method,
+          params: args.params as unknown[] | Record<string, unknown> | undefined,
+        })
+      }
+
+      return walletClient.transport.request({
+        method: args.method,
+        params: args.params as unknown[] | Record<string, unknown> | undefined,
+      })
+    }) as Parameters<typeof createEvmAdapterFromProvider>[0]['provider']['request'],
   }
 }
 
