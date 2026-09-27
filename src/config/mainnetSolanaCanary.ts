@@ -8,7 +8,7 @@ export const MAINNET_SOLANA_CCTP_CANARY_ROUTES: Record<
   MainnetSolanaCanaryPhase
 > = {
   'arc-to-solana': 'verified',
-  'solana-to-arc': 'testing',
+  'solana-to-arc': 'verified',
 }
 
 export function isMainnetSolanaCanaryWriteEnabled(
