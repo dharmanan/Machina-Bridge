@@ -438,6 +438,10 @@ export default function MainnetSolanaCanary() {
                   {feeEstimate.bridgeFee} USDC
                 </span>
               </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">Machina fee</span>
+                <span className="font-semibold text-emerald-700">0 USDC</span>
+              </div>
 
               {direction === 'solana-to-arc' && feeEstimate.solanaEventRentSol && (
                 <>
