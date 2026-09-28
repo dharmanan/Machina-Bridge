@@ -876,6 +876,10 @@ export default function MainnetPreviewGate() {
                 </span>
               </div>
               <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-500">Machina fee</span>
+                <span className="font-semibold text-emerald-700">0 USDC</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
                 <span className="text-slate-500">Network fees</span>
                 <button
                   type="button"
