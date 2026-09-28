@@ -543,34 +543,30 @@ export default function App() {
         )}
       </main>
 
-      <footer className="mt-12 border-t border-slate-200 py-6">
+      <footer className="mt-8 border-t border-slate-200 py-4">
         <Container>
-          <div className="text-center text-xs text-slate-400">
-            {appNetwork === 'testnet' ? (
-              <p>
-                Independent testnet application for Arc ecosystem experimentation. Uses test tokens only.{' '}
-                <a
-                  href="https://docs.arc.network/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[#2F6E0C] underline transition-colors hover:text-[#25580A]"
-                >
-                  Arc documentation
-                </a>
-              </p>
-            ) : (
-              <p>
-                Independent Arc ecosystem application.{' '}
-                <a
-                  href="https://docs.arc.network/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[#2F6E0C] underline transition-colors hover:text-[#25580A]"
-                >
-                  Arc documentation
-                </a>
-              </p>
-            )}
+          <div className="flex flex-col items-center justify-center gap-2 text-center text-xs text-slate-400 sm:flex-row sm:gap-4">
+            <span>
+              {appNetwork === 'testnet'
+                ? 'Independent Arc testnet application.'
+                : 'Independent Arc ecosystem application.'}
+            </span>
+            <a
+              href="https://docs.arc.network/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium text-slate-500 transition-colors hover:text-[#2F6E0C]"
+            >
+              Arc documentation
+            </a>
+            <a
+              href="https://koraycifci.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium text-slate-500 transition-colors hover:text-slate-900"
+            >
+              Designed by Koray Cifci
+            </a>
           </div>
         </Container>
       </footer>
