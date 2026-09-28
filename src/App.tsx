@@ -14,6 +14,7 @@ import { logger } from './lib/logger'
 import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
 import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X } from 'lucide-react'
 import arcLogo from './assets/arc.png'
+import DesignedByFooter from './components/DesignedByFooter'
 import './index.css'
 
 type Tab = 'swap' | 'bridge' | 'dashboard'
@@ -200,7 +201,7 @@ export default function App() {
 
   const showMobileNotice = isMobileExperience && !hasDismissedMobileNotice
   return (
-    <div className="min-h-screen bg-transparent text-slate-900">
+    <div className="min-h-screen bg-slate-50 text-slate-900">
       {showMobileNotice && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
           <div
@@ -529,7 +530,7 @@ export default function App() {
         </div>
       )}
 
-      <main className="pb-10">
+      <main>
         {appNetwork === 'mainnet' ? (
           activeTab === 'dashboard'
             ? <MainnetDashboard />
@@ -543,7 +544,7 @@ export default function App() {
         )}
       </main>
 
-      <footer className="mt-8 border-t border-slate-200 py-4">
+      <footer className="border-t border-slate-200 bg-white py-3">
         <Container>
           <div className="flex flex-col items-center justify-center gap-2 text-center text-xs text-slate-400 sm:flex-row sm:gap-4">
             <span>
@@ -559,14 +560,7 @@ export default function App() {
             >
               Arc documentation
             </a>
-            <a
-              href="https://koraycifci.com"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="font-medium text-slate-500 transition-colors hover:text-slate-900"
-            >
-              Designed by Koray Cifci
-            </a>
+            <DesignedByFooter />
           </div>
         </Container>
       </footer>
