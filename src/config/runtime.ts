@@ -42,8 +42,14 @@ export function getAppNetworkLabel() {
 export const APP_NETWORK_STORAGE_KEY = 'machina_app_network'
 
 export function readStoredAppNetwork(): AppNetwork {
-  if (typeof window === 'undefined') return 'testnet'
-  return window.localStorage.getItem(APP_NETWORK_STORAGE_KEY) === 'mainnet' ? 'mainnet' : 'testnet'
+  if (typeof window === 'undefined') return 'mainnet'
+
+  const stored = window.localStorage.getItem(APP_NETWORK_STORAGE_KEY)
+  if (stored === 'testnet' || stored === 'mainnet') {
+    return stored
+  }
+
+  return 'mainnet'
 }
 
 export function storeAppNetwork(network: AppNetwork) {
