@@ -1,6 +1,6 @@
 # Machina Bridge
 
-**Testnet swaps, cross-chain USDC bridging, persistent transfer tracking, and guarded Arc mainnet readiness work.**
+**USDC bridging between Arc, major EVM networks, and Solana, with verified mainnet routes and a separate testnet environment.**
 
 [Live App](https://machinabridge.vercel.app) · [Repository](https://github.com/dharmanan/Machina-Bridge)
 
@@ -8,23 +8,46 @@
 
 ## Overview
 
-Machina Bridge is an independent community-built testnet application centered on Arc.
+Machina Bridge is an independent community-built application centered on Arc.
+
+The app now opens on **Mainnet by default** for users without a saved network preference. Testnet remains available from the network selector.
 
 Current product surfaces include:
 
-- Sepolia ETH ↔ USDC swapping
-- USDC bridging between Arc Testnet and supported EVM testnets
-- Arc Testnet → Solana Devnet forwarding
-- Solana Devnet → Arc Testnet bridging
-- Persistent bridge activity and transfer tracking
+- Arc ↔ Base USDC bridging
+- Arc ↔ Ethereum USDC bridging
+- Arc ↔ Optimism USDC bridging
+- Arc ↔ Arbitrum USDC bridging
+- Arc ↔ Solana USDC bridging
+- Separate EVM Bridge and Solana Bridge views
+- Persistent transfer activity and recovery handling
 - Wallet-assisted EVM network switching
+- Solana refundable deposit tracking
+- A separate testnet environment for swap, bridge, Gateway, Solana, and development flows
 
-Machina Bridge's public transaction flows currently remain testnet-only. Test assets have no real monetary value. Mainnet support is being prepared behind explicit runtime locks.
-
+Mainnet Gateway forwarding remains disabled.
 
 ---
 
-## Supported Flows
+## Mainnet Routes
+
+The following routes are enabled and marked verified in the application:
+
+| Feature | Route | Asset | Status |
+| --- | --- | --- | --- |
+| EVM Bridge | Arc ↔ Base | USDC | Verified |
+| EVM Bridge | Arc ↔ Ethereum | USDC | Verified |
+| EVM Bridge | Arc ↔ Optimism | USDC | Verified |
+| EVM Bridge | Arc ↔ Arbitrum | USDC | Verified |
+| Solana Bridge | Arc ↔ Solana | USDC | Verified |
+
+Mainnet routes use Circle CCTP and have been validated with small real-value transfers in both directions.
+
+---
+
+## Testnet Routes
+
+Testnet remains available for experimentation and development.
 
 | Feature | Route | Asset | Status |
 | --- | --- | --- | --- |
@@ -36,23 +59,61 @@ Machina Bridge's public transaction flows currently remain testnet-only. Test as
 | Gateway Forwarding | Arc Testnet → Solana Devnet | USDC | Active |
 | Solana Bridge | Solana Devnet → Arc Testnet | USDC | Active |
 
+Testnet assets have no real monetary value.
+
 ---
 
 ## Bridge Experience
 
 Current bridge functionality includes:
 
-- Route-aware USDC bridging across supported EVM testnets and Arc Testnet
-- Wallet-assisted chain switching and Arc Testnet registration
+- Route-aware USDC bridging across verified Arc mainnet routes
+- Separate EVM and Solana bridge interfaces
+- Live fee estimation before signing
+- Source and destination transaction links
 - Circle attestation tracking
 - Pending-transfer recovery
-- Ready-to-mint detection
-- Source and destination transaction links
+- Ready-to-mint detection where applicable
 - Local and server-side activity persistence
-- 30-day activity retention
 - Deduplication between local and server records
 - In Progress, Ready to Mint, and Completed activity states
 - Retry and recovery handling for common wallet and transaction edge cases
+
+---
+
+## Fees
+
+Machina currently charges **no service commission**.
+
+The interface shows:
+
+- **Machina fee: 0 USDC**
+- Circle or protocol fees where applicable
+- Network fees paid to the source or destination blockchain
+- Solana refundable deposits where applicable
+
+A Machina fee of 0 USDC does **not** mean a transfer is free. Network and protocol costs may still apply.
+
+---
+
+## Solana Refundable Deposits
+
+For a **Solana → Arc** CCTP transfer, Circle creates a temporary Solana account for that transfer.
+
+Solana requires SOL to fund that temporary account. This amount is separate from the permanent Solana transaction fee and is not paid to Machina.
+
+Machina Bridge therefore shows:
+
+- the expected Phantom SOL debit
+- the refundable Circle deposit
+- network / priority fee information
+- open refundable deposits for the connected Phantom wallet
+- the remaining waiting period
+- a **Return SOL** action when the deposit becomes eligible
+
+Circle's event-account window is currently **5 days**. After that period, an eligible temporary account can be closed and its refundable SOL returned to the same Phantom wallet.
+
+The refundable deposit panel is collapsed by default. The return flow is implemented; final post-window mainnet validation for the first launch deposits is still pending as of 2026-09-28.
 
 ---
 
@@ -62,21 +123,75 @@ Current bridge functionality includes:
 
 EVM wallet connections use Wagmi and RainbowKit.
 
-Supported EVM networks:
+Mainnet EVM networks:
 
-- Ethereum Sepolia
+- Arc
+- Ethereum
+- Base
+- OP Mainnet
+- Arbitrum One
+
+Testnet EVM networks:
+
 - Arc Testnet
+- Ethereum Sepolia
 - Base Sepolia
 - Optimism Sepolia
 - Arbitrum Sepolia
 
 ### Solana
 
-Phantom is used for Solana Devnet connection and signing.
+Phantom is used for Solana connection and signing.
+
+Supported Solana environments:
+
+- Solana Mainnet
+- Solana Devnet
 
 ### Sui
 
-A Sui wallet connector is present in the current interface. There is currently no Sui bridge route exposed in the production bridge flow.
+A Sui wallet connector is present in the testnet interface. There is currently no Sui bridge route exposed in the production mainnet bridge flow.
+
+---
+
+## Arc Mainnet
+
+| Parameter | Value |
+| --- | --- |
+| Chain ID | `5042` |
+| RPC | `https://rpc.mainnet.arc.io` |
+| Gas asset | USDC |
+| Native USDC | `0x3600000000000000000000000000000000000000` |
+| CCTP Domain | `26` |
+| TokenMessenger | `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d` |
+| MessageTransmitter | `0x81D40F21F12A8F0E3252Bccb954D722d4c464B64` |
+| Explorer | `https://explorer.arc.io` |
+| Official docs | `https://docs.arc.network/` |
+
+---
+
+## Solana Mainnet
+
+| Parameter | Value |
+| --- | --- |
+| CCTP Domain | `5` |
+| USDC Mint | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` |
+| MessageTransmitterV2 | `CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC` |
+| TokenMessengerMinterV2 | `CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe` |
+| Explorer | `https://solscan.io` |
+
+---
+
+## Mainnet USDC Addresses
+
+| Network | USDC |
+| --- | --- |
+| Arc | `0x3600000000000000000000000000000000000000` |
+| Ethereum | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
+| Base | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+| OP Mainnet | `0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85` |
+| Arbitrum One | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` |
+| Solana | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` |
 
 ---
 
@@ -85,27 +200,10 @@ A Sui wallet connector is present in the current interface. There is currently n
 | Parameter | Value |
 | --- | --- |
 | Chain ID | `5042002` |
-| Default RPC in the app | `https://rpc.testnet.arc.io` |
+| Default RPC | `https://rpc.testnet.arc.io` |
 | Gas asset | USDC |
 | Explorer | `https://testnet.arcscan.app` |
 | Faucet | `https://faucet.circle.com` |
-| Official docs | `https://docs.arc.network/` |
-
----
-
-## Main Addresses
-
-| Item | Address / Value | Network |
-| --- | --- | --- |
-| Uniswap V2 Router | `0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008` | Ethereum Sepolia |
-| Sepolia USDC | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | Ethereum Sepolia |
-| Base Sepolia USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | Base Sepolia |
-| Optimism Sepolia USDC | `0x5fd84259d66Cd46123540766Be93DFE6D43130D7` | Optimism Sepolia |
-| Arbitrum Sepolia USDC | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | Arbitrum Sepolia |
-| Arc Native USDC | `0x3600000000000000000000000000000000000000` | Arc Testnet |
-| Gateway Wallet | `0x0077777d7EBA4688BDeF3E311b846F25870A19B9` | EVM |
-| Solana Devnet USDC Mint | `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` | Solana Devnet |
-| Solana Gateway Minter | `GATEmKK2ECL1brEngQZWCgMWPbvrEYqsV6u29dAaHavr` | Solana Devnet |
 
 ---
 
@@ -121,10 +219,10 @@ Machina Bridge uses:
 - RainbowKit
 - Ethers
 - Circle Bridge Kit
+- Circle Solana adapter
 - Solana Web3.js
 - Mysten dApp Kit
 - Vercel serverless APIs
-
 
 ---
 
@@ -141,6 +239,7 @@ Machina-Bridge/
 ├── scripts/
 ├── src/
 │   ├── components/
+│   ├── config/
 │   ├── hooks/
 │   ├── lib/
 │   ├── App.tsx
@@ -160,8 +259,8 @@ Machina-Bridge/
 - Node.js 18+
 - npm
 - An EVM wallet such as MetaMask or Rabby
-- Phantom for Solana Devnet flows
-- Testnet assets for the networks being used
+- Phantom for Solana flows
+- Native gas assets and USDC for the networks being used
 
 ### Clone and install
 
@@ -189,19 +288,28 @@ npm run build
 
 ## Environment
 
-The application has public RPC fallbacks for supported test networks and accepts environment overrides where configured.
+The application includes public RPC fallbacks and accepts environment overrides where configured.
 
-Relevant browser-side variables include:
+Common browser-side variables include:
 
 ```text
+VITE_WALLETCONNECT_PROJECT_ID
+VITE_CIRCLE_APP_ID
+
+VITE_ARC_MAINNET_RPC
+VITE_ARC_MAINNET_EXPLORER
+VITE_ETHEREUM_MAINNET_RPC
+VITE_BASE_MAINNET_RPC
+VITE_OPTIMISM_MAINNET_RPC
+VITE_ARBITRUM_MAINNET_RPC
+VITE_SOLANA_MAINNET_RPC
+
 VITE_SEPOLIA_RPC
 VITE_ARC_TESTNET_RPC
 VITE_BASE_SEPOLIA_RPC
 VITE_OPTIMISM_SEPOLIA_RPC
 VITE_ARBITRUM_SEPOLIA_RPC
 VITE_SOLANA_DEVNET_RPC
-VITE_WALLETCONNECT_PROJECT_ID
-VITE_CIRCLE_APP_ID
 ```
 
 Do not place private keys, wallet seed phrases, or backend secrets in `VITE_*` variables. Vite environment variables are exposed to the browser bundle.
@@ -210,24 +318,32 @@ Do not place private keys, wallet seed phrases, or backend secrets in `VITE_*` v
 
 ## Validation
 
-Useful local checks:
+Useful checks:
 
 ```bash
 npm audit
 npm audit --omit=dev
 npm run build
+npm run verify:mainnet-cctp
+npm run verify:mainnet-solana-cctp
+npm run verify:mainnet-solana-bridgekit
 ```
-
 
 ---
 
 ## Security
 
-Machina Bridge is intended for testnet experimentation.
+The application never requires wallet seed phrases or private keys.
 
-The production deployment includes security headers and a public `security.txt` file. The application never requires wallet seed phrases or private keys.
+Mainnet routes move real assets. Always verify:
 
-Security information:
+- source and destination networks
+- amount
+- recipient wallet
+- wallet transaction details
+- protocol and network fees
+
+The production deployment includes security headers and a public `security.txt` file:
 
 https://machinabridge.vercel.app/.well-known/security.txt
 
@@ -235,9 +351,11 @@ https://machinabridge.vercel.app/.well-known/security.txt
 
 ## Disclaimer
 
-Machina Bridge is an independent community-built project and is not an official Arc product.
+Machina Bridge is an independent community-built project and is not an official Arc or Circle product.
 
-All currently enabled swap and bridge transaction flows are testnet-only. Mainnet support remains locked until the guarded production flow is fully verified and deliberately enabled.
+Verified mainnet bridge routes transfer real USDC. Blockchain transactions are irreversible, and network or protocol fees may apply.
+
+Machina currently charges no service commission.
 
 ---
 
@@ -247,7 +365,8 @@ All currently enabled swap and bridge transaction flows are testnet-only. Mainne
 - Repository: https://github.com/dharmanan/Machina-Bridge
 - X: https://x.com/KohenEric
 - Arc docs: https://docs.arc.network/
-- ArcScan: https://testnet.arcscan.app
+- Arc Explorer: https://explorer.arc.io
+- Solscan: https://solscan.io
 
 ## License
 
