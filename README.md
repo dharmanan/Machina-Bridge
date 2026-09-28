@@ -1,8 +1,8 @@
 # Machina Bridge
 
-**Testnet swaps, cross-chain USDC bridging, persistent transfer tracking, and Machina's 40-day Arc Mainnet Countdown campaign.**
+**Testnet swaps, cross-chain USDC bridging, persistent transfer tracking, and guarded Arc mainnet readiness work.**
 
-[Live App](https://machinabridge.vercel.app) · [Arc Mainnet Countdown](https://machinabridge.vercel.app/countdown) · [Launch Post](https://x.com/KohenEric/status/2085693568929137095?s=20)
+[Live App](https://machinabridge.vercel.app) · [Repository](https://github.com/dharmanan/Machina-Bridge)
 
 ---
 
@@ -18,49 +18,9 @@ Current product surfaces include:
 - Solana Devnet → Arc Testnet bridging
 - Persistent bridge activity and transfer tracking
 - Wallet-assisted EVM network switching
-- A 40-day daily NFT countdown campaign on Arc Testnet
 
-Machina Bridge currently operates on testnets. Test assets have no real monetary value.
+Machina Bridge's public transaction flows currently remain testnet-only. Test assets have no real monetary value. Mainnet support is being prepared behind explicit runtime locks.
 
----
-
-## Arc Mainnet Countdown
-
-Machina Bridge includes a 40-day onchain participation campaign tied to a project-defined Arc Mainnet target date.
-
-Each wallet can claim one ERC-1155 NFT per campaign day on Arc Testnet. Claims are tied to the current campaign day, so missed days are not retroactively claimable.
-
-### App progress tiers
-
-| Claims | Tier |
-| ---: | --- |
-| 20 | Initiate |
-| 30 | Pioneer |
-| 35 | Degen |
-| 40 | Genesis 40 |
-
-The Degen tier is an app-level milestone derived from `claimedCount >= 35`.
-
-The planned Degen benefit is **0% Machina service fee for the first 7 days after Arc Mainnet launch**. Network and protocol fees remain user-paid. The current testnet app does not add a separate Machina service fee.
-
-Genesis 40 represents completion of all 40 daily claims.
-
-### Countdown contract
-
-| Item | Value |
-| --- | --- |
-| Network | Arc Testnet |
-| Contract | `0xe2AF77Ea3Af88dB62CbF3eb0509b91751437892A` |
-| Standard | ERC-1155 |
-| Collection | Arc Mainnet Countdown |
-| Symbol | `ARC40` |
-| Total campaign days | 40 |
-| Metadata | Fully onchain |
-| Artwork | Fully onchain SVG |
-
-[View the contract on ArcScan](https://testnet.arcscan.app/address/0xe2AF77Ea3Af88dB62CbF3eb0509b91751437892A)
-
-The production contract address is pinned in the frontend source. Token IDs run from `1` through `40`, and each token's metadata and SVG artwork are returned directly from the contract as data URIs.
 
 ---
 
@@ -75,7 +35,6 @@ The production contract address is pinned in the frontend source. Token IDs run 
 | EVM Bridge | Arbitrum Sepolia ↔ Arc Testnet | USDC | Active |
 | Gateway Forwarding | Arc Testnet → Solana Devnet | USDC | Active |
 | Solana Bridge | Solana Devnet → Arc Testnet | USDC | Active |
-| Countdown | Daily Arc Testnet NFT claim | ARC40 | Active |
 
 ---
 
@@ -138,7 +97,6 @@ A Sui wallet connector is present in the current interface. There is currently n
 
 | Item | Address / Value | Network |
 | --- | --- | --- |
-| Arc Mainnet Countdown | `0xe2AF77Ea3Af88dB62CbF3eb0509b91751437892A` | Arc Testnet |
 | Uniswap V2 Router | `0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008` | Ethereum Sepolia |
 | Sepolia USDC | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | Ethereum Sepolia |
 | Base Sepolia USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | Base Sepolia |
@@ -165,10 +123,8 @@ Machina Bridge uses:
 - Circle Bridge Kit
 - Solana Web3.js
 - Mysten dApp Kit
-- Solidity
 - Vercel serverless APIs
 
-The countdown Solidity source is compiled as part of `npm run build`.
 
 ---
 
@@ -177,8 +133,6 @@ The countdown Solidity source is compiled as part of `npm run build`.
 ```text
 Machina-Bridge/
 ├── api/
-├── contracts/
-│   └── MachinaCountdown1155.sol
 ├── public/
 │   ├── .well-known/
 │   │   └── security.txt
@@ -187,7 +141,6 @@ Machina-Bridge/
 ├── scripts/
 ├── src/
 │   ├── components/
-│   ├── countdown/
 │   ├── hooks/
 │   ├── lib/
 │   ├── App.tsx
@@ -265,7 +218,6 @@ npm audit --omit=dev
 npm run build
 ```
 
-A successful build also compiles the countdown contract artifact used by the project.
 
 ---
 
@@ -285,19 +237,15 @@ https://machinabridge.vercel.app/.well-known/security.txt
 
 Machina Bridge is an independent community-built project and is not an official Arc product.
 
-Arc is currently on public testnet. The Machina countdown uses a project-defined campaign target and should not be interpreted as an official Arc mainnet launch-date announcement.
-
-All current swap and bridge functionality is for testnet use.
+All currently enabled swap and bridge transaction flows are testnet-only. Mainnet support remains locked until the guarded production flow is fully verified and deliberately enabled.
 
 ---
 
 ## Links
 
 - Live app: https://machinabridge.vercel.app
-- Countdown: https://machinabridge.vercel.app/countdown
 - Repository: https://github.com/dharmanan/Machina-Bridge
 - X: https://x.com/KohenEric
-- Countdown launch post: https://x.com/KohenEric/status/2085693568929137095?s=20
 - Arc docs: https://docs.arc.network/
 - ArcScan: https://testnet.arcscan.app
 

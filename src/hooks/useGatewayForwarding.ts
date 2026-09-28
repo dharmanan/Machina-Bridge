@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import { createPublicClient, formatUnits, http, pad, parseAbi, parseUnits, zeroAddress } from 'viem'
 import { useAccount, useSwitchChain, useWalletClient } from 'wagmi'
 import { getWalletClient } from 'wagmi/actions'
+import { CIRCLE_TESTNET } from '../config/circle'
 import { ARC_EVM_CHAIN, ARC_EVM_CHAIN_ID, SEPOLIA_EVM_CHAIN, SEPOLIA_EVM_CHAIN_ID } from '../lib/chains'
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
@@ -14,8 +15,8 @@ import {
   toSolanaBytes32Hex,
 } from '../lib/solana'
 
-const GATEWAY_API_BASE = 'https://gateway-api-testnet.circle.com'
-const GATEWAY_WALLET_ADDRESS = '0x0077777d7EBA4688BDeF3E311b846F25870A19B9'
+const GATEWAY_API_BASE = CIRCLE_TESTNET.gatewayApiBase
+const GATEWAY_WALLET_ADDRESS = CIRCLE_TESTNET.gatewayWalletAddress
 const TRANSFER_POLL_INTERVAL_MS = 5_000
 const TRANSFER_POLL_TIMEOUT_MS = 300_000
 const DESTINATION_BALANCE_POLL_INTERVAL_MS = 5_000
@@ -66,16 +67,16 @@ const BURN_INTENT_TYPES = [
 const GATEWAY_SOURCE_CHAINS = {
   [SEPOLIA_EVM_CHAIN_ID]: {
     chainId: SEPOLIA_EVM_CHAIN_ID,
-    name: 'Sepolia',
-    domainId: 0,
-    usdcAddress: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
+    name: SEPOLIA_EVM_CHAIN.name,
+    domainId: CIRCLE_TESTNET.chains.ethereum.cctpDomain,
+    usdcAddress: CIRCLE_TESTNET.chains.ethereum.usdcAddress,
     chain: SEPOLIA_EVM_CHAIN,
   },
   [ARC_EVM_CHAIN_ID]: {
     chainId: ARC_EVM_CHAIN_ID,
-    name: 'Arc Testnet',
-    domainId: 26,
-    usdcAddress: '0x3600000000000000000000000000000000000000',
+    name: ARC_EVM_CHAIN.name,
+    domainId: CIRCLE_TESTNET.chains.arc.cctpDomain,
+    usdcAddress: CIRCLE_TESTNET.chains.arc.usdcAddress,
     chain: ARC_EVM_CHAIN,
   },
 } as const
@@ -83,11 +84,11 @@ const GATEWAY_SOURCE_CHAINS = {
 const gatewayPublicClients = {
   [SEPOLIA_EVM_CHAIN_ID]: createPublicClient({
     chain: SEPOLIA_EVM_CHAIN,
-    transport: http(import.meta.env.VITE_SEPOLIA_RPC?.trim() || SEPOLIA_EVM_CHAIN.rpcUrls.default.http[0]),
+    transport: http(SEPOLIA_EVM_CHAIN.rpcUrls.default.http[0]),
   }),
   [ARC_EVM_CHAIN_ID]: createPublicClient({
     chain: ARC_EVM_CHAIN,
-    transport: http(import.meta.env.VITE_ARC_TESTNET_RPC?.trim() || ARC_EVM_CHAIN.rpcUrls.default.http[0]),
+    transport: http(ARC_EVM_CHAIN.rpcUrls.default.http[0]),
   }),
 } as const
 
