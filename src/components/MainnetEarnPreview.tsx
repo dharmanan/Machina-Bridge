@@ -58,6 +58,8 @@ const MORPHO_GRAPHQL_ENDPOINT = 'https://api.morpho.org/graphql'
 
 const GALAXY_USDC_ADDRESS =
   '0x8E357432CC12ff425c36432F312968aEb16112AF'
+const GAUNTLET_USDC_PRIME_ADDRESS =
+  '0xdECcd53BE5453215821184824B519E04C7e00bC7'
 
 const GALAXY_USDC_FALLBACK: EarnVault = {
   vaultAddress: GALAXY_USDC_ADDRESS,
@@ -74,6 +76,18 @@ const GALAXY_USDC_FALLBACK: EarnVault = {
     management: null,
   },
 }
+
+const CONFIGURED_LAUNCH_VAULTS: readonly EarnVault[] = [
+  GALAXY_USDC_FALLBACK,
+  {
+    vaultAddress: GAUNTLET_USDC_PRIME_ADDRESS,
+    name: 'Gauntlet USDC Prime',
+    protocol: 'MORPHO',
+    asset: 'USDC',
+    status: 'active',
+    circleGuarded: true,
+  },
+]
 
 const selectedVaultAddresses = new Set(
   MAINNET_EARN_SELECTED_VAULT_ADDRESSES.map((address) => address.toLowerCase()),
@@ -149,6 +163,21 @@ function collectSelectedVaults(vaults: readonly EarnVault[]) {
   }
 
   return selected
+}
+
+function mergeConfiguredLaunchVaults(selectedVaults: Map<string, EarnVault>) {
+  for (const configuredVault of CONFIGURED_LAUNCH_VAULTS) {
+    const configuredAddress = vaultAddress(configuredVault)
+    const address = configuredAddress.toLowerCase()
+    const liveVault = selectedVaults.get(address)
+
+    selectedVaults.set(address, {
+      ...configuredVault,
+      ...liveVault,
+      vaultAddress: configuredAddress,
+      name: liveVault?.name ?? configuredVault.name,
+    })
+  }
 }
 
 type MorphoVaultResponse = {
@@ -366,14 +395,7 @@ export default function MainnetEarnPreview() {
         }
       }
 
-      const galaxyAddress = GALAXY_USDC_ADDRESS.toLowerCase()
-
-      if (!selectedVaults.has(galaxyAddress)) {
-        selectedVaults.set(
-          galaxyAddress,
-          GALAXY_USDC_FALLBACK,
-        )
-      }
+      mergeConfiguredLaunchVaults(selectedVaults)
 
       const orderedVaults = [...selectedVaults.values()].sort((left, right) => {
         const leftOrder =
@@ -385,7 +407,7 @@ export default function MainnetEarnPreview() {
 
       setVaults(orderedVaults)
     } catch (cause) {
-      setVaults([GALAXY_USDC_FALLBACK])
+      setVaults([...CONFIGURED_LAUNCH_VAULTS])
       setError(
         cause instanceof Error
           ? cause.message
