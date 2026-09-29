@@ -61,9 +61,9 @@ function metadataCall(to, data) {
   return { to, data };
 }
 
-async function readField(rpc, address, method) {
+async function readField(rpc, address, method, blockTag = 'latest') {
   try {
-    const result = await rpc.request('eth_call', [metadataCall(address, ERC20_SELECTORS[method]), 'latest']);
+    const result = await rpc.request('eth_call', [metadataCall(address, ERC20_SELECTORS[method]), blockTag]);
     if (method === 'name' || method === 'symbol') return decodeAbiString(result);
     const uint = decodeUint(result);
     if (uint === null) return null;
@@ -77,7 +77,7 @@ async function readField(rpc, address, method) {
   }
 }
 
-export async function verifyErc20Metadata(rpc, inputAddress) {
+export async function verifyErc20Metadata(rpc, inputAddress, { blockTag = 'latest' } = {}) {
   let address;
   try {
     address = normalizeAddress(inputAddress);
@@ -85,15 +85,15 @@ export async function verifyErc20Metadata(rpc, inputAddress) {
     return { address: null, status: 'unknown/unverified', codePresent: false, name: null, symbol: null, decimals: null, totalSupplyRaw: null };
   }
 
-  const codePromise = rpc.request('eth_getCode', [address, 'latest'])
+  const codePromise = rpc.request('eth_getCode', [address, blockTag])
     .then((code) => typeof code === 'string' && /^0x(?!0*$)[0-9a-f]+$/i.test(code))
     .catch(() => false);
   const [codePresent, name, symbol, decimals, totalSupplyRaw] = await Promise.all([
     codePromise,
-    readField(rpc, address, 'name'),
-    readField(rpc, address, 'symbol'),
-    readField(rpc, address, 'decimals'),
-    readField(rpc, address, 'totalSupply'),
+    readField(rpc, address, 'name', blockTag),
+    readField(rpc, address, 'symbol', blockTag),
+    readField(rpc, address, 'decimals', blockTag),
+    readField(rpc, address, 'totalSupply', blockTag),
   ]);
 
   const valid = codePresent
@@ -135,13 +135,13 @@ function transferLogs(logs) {
   return logs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
 }
 
-export async function discoverTransferEmitters(rpc, logs, { maxCandidates = 50, concurrency = 3 } = {}) {
+export async function discoverTransferEmitters(rpc, logs, { maxCandidates = 50, concurrency = 3, blockTag = 'latest' } = {}) {
   const emitters = [...new Set(transferLogs(logs)
     .map((log) => log.address.toLowerCase())
     .filter((address) => address !== USDC_SYSTEM_EMITTER))]
     .sort();
   const selected = emitters.slice(0, maxCandidates);
-  const records = await mapConcurrent(selected, concurrency, (address) => verifyErc20Metadata(rpc, address));
+  const records = await mapConcurrent(selected, concurrency, (address) => verifyErc20Metadata(rpc, address, { blockTag }));
   const byAddress = new Map(records.map((record) => [record.address, record]));
 
   return {
@@ -233,9 +233,9 @@ export function summarizeVerifiedAssetTransfers(logs, { complete = true } = {}) 
   });
 }
 
-export async function inspectMajorAssets(rpc, { concurrency = 3 } = {}) {
+export async function inspectMajorAssets(rpc, { concurrency = 3, blockTag = 'latest' } = {}) {
   return mapConcurrent(ARC_VERIFIED_ASSETS, concurrency, async (asset) => {
-    const observed = await verifyErc20Metadata(rpc, asset.address);
+    const observed = await verifyErc20Metadata(rpc, asset.address, { blockTag });
     const matchesRegistry = observed.status === 'verified'
       && observed.symbol.toUpperCase() === asset.symbol.toUpperCase()
       && observed.decimals === asset.decimals;

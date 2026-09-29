@@ -4,6 +4,8 @@ import { buildBoundedSnapshot, buildLatestSnapshot, MAX_WINDOW_SIZE } from '../a
 import { normalizeBlock, normalizeReceipt, normalizeTransaction, quantityToSafeNumber } from '../api/_lib/arc-intelligence/normalize.js';
 import { ARC_CHAIN_ID } from '../api/_lib/arc-intelligence/rpc.js';
 import {
+  discoverTransferEmitters,
+  inspectMajorAssets,
   summarizeVerifiedAssetTransfers,
   verifyErc20Metadata,
 } from '../api/_lib/arc-intelligence/tokens.js';
@@ -20,6 +22,12 @@ function indexedAddressTopic(address) {
 
 function word(value) {
   return BigInt(value).toString(16).padStart(64, '0');
+}
+
+function bytes32(value) {
+  const encoded = Array.from(new TextEncoder().encode(value), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  assert.ok(encoded.length <= 64);
+  return `0x${encoded.padEnd(64, '0')}`;
 }
 
 async function verifyDeterministicFixtures() {
@@ -94,7 +102,7 @@ async function verifyDeterministicFixtures() {
     {
       address: USDC_SYSTEM_EMITTER,
       topics: [TRANSFER_TOPIC, indexedAddressTopic(sharedFrom), indexedAddressTopic(sharedTo)],
-      data: `0x${word(1_000_000)}`,
+      data: `0x${word(1_000_000_000_000_000_000n)}`,
     },
     {
       address: USDC_ERC20_ADDRESS,
@@ -106,11 +114,11 @@ async function verifyDeterministicFixtures() {
   const assetTotals = summarizeVerifiedAssetTransfers(duplicateUsdcMovement);
   const usdcTotal = assetTotals.find((asset) => asset.symbol === 'USDC');
   assert.equal(canonicalUsdc.transferCount, 1);
-  assert.equal(canonicalUsdc.amountRaw, '1000000');
+  assert.equal(canonicalUsdc.amountRaw, '1000000000000000000');
   assert.equal(canonicalUsdc.erc20InterfaceActivity.transferCount, 1);
+  assert.equal(canonicalUsdc.erc20InterfaceActivity.amountRaw, '1000000');
   assert.equal(canonicalUsdc.erc20InterfaceActivity.includedInCanonicalAmount, false);
-  assert.equal(usdcTotal.amountRaw, '1000000');
-  assert.notEqual(usdcTotal.amountRaw, '2000000');
+  assert.equal(usdcTotal.amountRaw, '1000000000000000000');
   const malformedCanonicalUsdc = summarizeUsdcTransfers([{
     address: USDC_SYSTEM_EMITTER,
     topics: [TRANSFER_TOPIC],
@@ -119,8 +127,10 @@ async function verifyDeterministicFixtures() {
   assert.equal(malformedCanonicalUsdc.complete, false);
   assert.equal(malformedCanonicalUsdc.amountRaw, null);
 
+  const defaultMetadataCalls = [];
   const malformedMetadataRpc = {
     async request(method, params) {
+      defaultMetadataCalls.push({ method, params });
       if (method === 'eth_getCode') return '0x6000';
       if (method === 'eth_call') {
         const selector = params[0]?.data;
@@ -139,6 +149,143 @@ async function verifyDeterministicFixtures() {
   assert.equal(unverifiedMetadata.symbol, null);
   assert.equal(unverifiedMetadata.decimals, null);
   assert.equal(unverifiedMetadata.totalSupplyRaw, null);
+  assert.ok(defaultMetadataCalls.every(({ method, params }) => params[1] === 'latest'));
+
+  const historicalBlockTag = '0xabc123';
+  const historicalMetadataCalls = [];
+  const historicalMetadataRpc = {
+    async request(method, params) {
+      historicalMetadataCalls.push({ method, params });
+      if (method === 'eth_getCode') return '0x6000';
+      if (method !== 'eth_call') throw new Error(`Unexpected historical metadata RPC method: ${method}`);
+      const selector = params[0]?.data;
+      if (selector === '0x06fdde03') return bytes32('Fixture Token');
+      if (selector === '0x95d89b41') return bytes32('FIX');
+      if (selector === '0x313ce567') return `0x${word(18)}`;
+      if (selector === '0x18160ddd') return `0x${word(123456)}`;
+      throw new Error(`Unexpected metadata selector: ${selector}`);
+    },
+  };
+  const historicalAddress = '0x3333333333333333333333333333333333333333';
+  const historicalMetadata = await verifyErc20Metadata(historicalMetadataRpc, historicalAddress, { blockTag: historicalBlockTag });
+  assert.equal(historicalMetadata.status, 'verified');
+  assert.ok(historicalMetadataCalls.some(({ method }) => method === 'eth_getCode'));
+  assert.ok(historicalMetadataCalls.some(({ method }) => method === 'eth_call'));
+  assert.ok(historicalMetadataCalls.every(({ params }) => params[1] === historicalBlockTag));
+
+  historicalMetadataCalls.length = 0;
+  const candidateLog = {
+    address: historicalAddress,
+    topics: [TRANSFER_TOPIC, indexedAddressTopic(sharedFrom), indexedAddressTopic(sharedTo)],
+    data: `0x${word(1)}`,
+    blockNumber: 10,
+    transactionHash: `0x${'41'.repeat(32)}`,
+    logIndex: 0,
+  };
+  const discovered = await discoverTransferEmitters(historicalMetadataRpc, [candidateLog], { blockTag: historicalBlockTag });
+  assert.equal(discovered.records[0].status, 'verified');
+  assert.ok(historicalMetadataCalls.every(({ params }) => params[1] === historicalBlockTag));
+
+  historicalMetadataCalls.length = 0;
+  const majorAssetObservations = await inspectMajorAssets(historicalMetadataRpc, { blockTag: historicalBlockTag });
+  assert.equal(majorAssetObservations.length, ARC_VERIFIED_ASSETS.length);
+  assert.ok(historicalMetadataCalls.every(({ params }) => params[1] === historicalBlockTag));
+
+  const reconciliationTransactionHash = `0x${'31'.repeat(32)}`;
+  const reconciliationLog = {
+    address: USDC_SYSTEM_EMITTER,
+    topics: [TRANSFER_TOPIC, indexedAddressTopic(sharedFrom), indexedAddressTopic(sharedTo)],
+    data: `0x${word(1_000_000_000_000_000_000n)}`,
+    blockNumber: '0xa',
+    transactionIndex: '0x0',
+    logIndex: '0x0',
+  };
+  const reconciliationEmitterLog = {
+    address: historicalAddress,
+    topics: [TRANSFER_TOPIC, indexedAddressTopic(sharedFrom), indexedAddressTopic(sharedTo)],
+    data: `0x${word(2)}`,
+    blockNumber: '0xa',
+    transactionIndex: '0x0',
+    logIndex: '0x1',
+  };
+  const reconciliationMetadataCalls = [];
+  let returnMatchingTransferLogs = false;
+  const reconciliationRpc = {
+    url: 'fixture://transfer-log-reconciliation',
+    async request(method, params) {
+      if (method === 'eth_chainId') return '0x13b2';
+      if (method === 'eth_blockNumber') return '0xa';
+      if (method === 'eth_getBlockByNumber') return {
+        number: '0xa',
+        hash: `0x${'22'.repeat(32)}`,
+        parentHash: `0x${'21'.repeat(32)}`,
+        timestamp: '0x64',
+        transactions: [{
+          hash: reconciliationTransactionHash,
+          blockNumber: '0xa',
+          transactionIndex: '0x0',
+          from: sharedFrom,
+          to: sharedTo,
+          value: '0x0',
+          input: '0x',
+        }],
+      };
+      if (method === 'eth_getBlockReceipts') return [{
+        transactionHash: reconciliationTransactionHash,
+        blockNumber: '0xa',
+        transactionIndex: '0x0',
+        status: '0x1',
+        gasUsed: '0x5208',
+        effectiveGasPrice: '0x1',
+        contractAddress: null,
+        logs: [reconciliationLog, reconciliationEmitterLog],
+      }];
+      if (method === 'eth_getLogs') return returnMatchingTransferLogs ? [
+        { ...reconciliationLog, transactionHash: reconciliationTransactionHash },
+        { ...reconciliationEmitterLog, transactionHash: reconciliationTransactionHash },
+      ] : [];
+      if (method === 'eth_getCode') {
+        reconciliationMetadataCalls.push({ method, params });
+        return '0x6000';
+      }
+      if (method === 'eth_call') {
+        reconciliationMetadataCalls.push({ method, params });
+        const selector = params[0]?.data;
+        if (selector === '0x06fdde03') return bytes32('Fixture Token');
+        if (selector === '0x95d89b41') return bytes32('FIX');
+        if (selector === '0x313ce567') return `0x${word(18)}`;
+        if (selector === '0x18160ddd') return `0x${word(123456)}`;
+      }
+      throw new Error(`Unexpected reconciliation fixture RPC method: ${method}`);
+    },
+  };
+  const missingTransferSnapshot = await buildBoundedSnapshot({
+    rpc: reconciliationRpc,
+    startBlock: 10,
+    endBlock: 10,
+  });
+  assert.equal(missingTransferSnapshot.transferLogReconciliation.receiptSetComplete, true);
+  assert.equal(missingTransferSnapshot.transferLogReconciliation.queryComplete, true);
+  assert.equal(missingTransferSnapshot.transferLogReconciliation.missingLogCount, 2);
+  assert.equal(missingTransferSnapshot.transferScanComplete, false);
+  assert.equal(missingTransferSnapshot.complete, false);
+  assert.ok(missingTransferSnapshot.warnings.some((warning) => warning.includes('Transfer log reconciliation mismatch')));
+  assert.equal(missingTransferSnapshot.canonicalUsdc.complete, false);
+  assert.equal(missingTransferSnapshot.canonicalUsdc.amountRaw, null);
+  assert.ok(missingTransferSnapshot.verifiedAssetTransfers.every((asset) => !asset.complete && asset.amountRaw === null));
+
+  returnMatchingTransferLogs = true;
+  const matchingTransferSnapshot = await buildBoundedSnapshot({
+    rpc: reconciliationRpc,
+    startBlock: 10,
+    endBlock: 10,
+  });
+  assert.equal(matchingTransferSnapshot.transferLogReconciliation.complete, true);
+  assert.equal(matchingTransferSnapshot.transferScanComplete, true);
+  assert.equal(matchingTransferSnapshot.complete, true);
+  assert.ok(reconciliationMetadataCalls.some(({ method }) => method === 'eth_getCode'));
+  assert.ok(reconciliationMetadataCalls.some(({ method }) => method === 'eth_call'));
+  assert.ok(reconciliationMetadataCalls.every(({ params }) => params[1] === '0xa'));
 
   const failingRpc = {
     url: 'fixture://unavailable',
@@ -168,6 +315,8 @@ function printLiveSnapshot(snapshot) {
   console.log(`Chain ID: ${snapshot.chainId}`);
   console.log(`Bounded window: ${snapshot.startBlock}..${snapshot.endBlock} (${snapshot.blockCount} blocks)`);
   console.log(`Completeness: ${snapshot.complete ? 'complete' : 'incomplete'}; last indexed block: ${snapshot.lastIndexedBlock}`);
+  const reconciliation = snapshot.transferLogReconciliation;
+  console.log(`Transfer log reconciliation: ${reconciliation.complete ? 'complete' : 'incomplete'}; receipts ${reconciliation.receiptTransferLogCount}; eth_getLogs ${reconciliation.queriedTransferLogCount ?? 'unavailable'}; missing ${reconciliation.missingLogCount ?? 'unavailable'}; extra ${reconciliation.extraLogCount ?? 'unavailable'}; duplicates receipt/query ${reconciliation.duplicateReceiptLogCount}/${reconciliation.duplicateQueryLogCount}; identityless receipt/query ${reconciliation.identitylessReceiptLogCount}/${reconciliation.identitylessQueryLogCount}`);
   console.log(`Transactions: ${snapshot.totalTransactions}; receipts: ${snapshot.receiptCount}; success: ${snapshot.successfulTransactions}; failed: ${snapshot.failedTransactions}`);
   console.log(`Top level addresses: senders ${snapshot.uniqueTopLevelSenders}; recipients ${snapshot.uniqueTopLevelRecipients}; active ${snapshot.uniqueTopLevelActiveAddresses}`);
   console.log(`Gas used raw: ${snapshot.totalGasUsedRaw}; transaction fees raw: ${snapshot.totalTransactionFeesRaw ?? 'unavailable'}`);

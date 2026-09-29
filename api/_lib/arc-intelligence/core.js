@@ -52,6 +52,19 @@ function emptySnapshot({ startBlock = null, endBlock = null, source = ARC_RPC_UR
     verifiedAssetTransfers: [],
     canonicalUsdc: summarizeUsdcTransfers([], { complete: false }),
     transferScanComplete: false,
+    transferLogReconciliation: {
+      complete: false,
+      receiptSetComplete: false,
+      queryComplete: false,
+      receiptTransferLogCount: 0,
+      queriedTransferLogCount: null,
+      missingLogCount: null,
+      extraLogCount: null,
+      duplicateReceiptLogCount: null,
+      duplicateQueryLogCount: null,
+      identitylessReceiptLogCount: null,
+      identitylessQueryLogCount: null,
+    },
     complete: false,
     source,
     definitionVersion: DEFINITION_VERSION,
@@ -136,6 +149,72 @@ async function readBlockReceipts(rpc, entry, warnings) {
 
 function sortedUniqueCount(values) {
   return new Set(values.filter(Boolean)).size;
+}
+
+function transferLogIdentity(log) {
+  if (!Number.isSafeInteger(log.blockNumber)
+    || !Number.isSafeInteger(log.logIndex)
+    || typeof log.transactionHash !== 'string'
+    || typeof log.address !== 'string') return null;
+  return `${log.blockNumber}:${log.transactionHash.toLowerCase()}:${log.logIndex}:${log.address.toLowerCase()}`;
+}
+
+function countTransferLogIdentities(logs) {
+  const counts = new Map();
+  let identitylessCount = 0;
+  for (const log of logs) {
+    if (log.topics?.[0] !== TRANSFER_TOPIC) continue;
+    const identity = transferLogIdentity(log);
+    if (identity === null) {
+      identitylessCount += 1;
+      continue;
+    }
+    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+  }
+  const duplicateCount = [...counts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+  return { counts, identitylessCount, duplicateCount };
+}
+
+function reconcileTransferLogs(receiptLogs, queriedLogs, { receiptSetComplete, queryComplete }) {
+  const receiptTransfers = receiptLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
+  const queriedTransfers = queriedLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
+  const receiptIdentities = countTransferLogIdentities(receiptTransfers);
+  const queryIdentities = countTransferLogIdentities(queriedTransfers);
+  const canCompareSets = receiptSetComplete && queryComplete;
+  let missingLogCount = null;
+  let extraLogCount = null;
+  if (canCompareSets) {
+    const identities = new Set([...receiptIdentities.counts.keys(), ...queryIdentities.counts.keys()]);
+    missingLogCount = 0;
+    extraLogCount = 0;
+    for (const identity of identities) {
+      const receiptCount = receiptIdentities.counts.get(identity) ?? 0;
+      const queryCount = queryIdentities.counts.get(identity) ?? 0;
+      missingLogCount += Math.max(0, receiptCount - queryCount);
+      extraLogCount += Math.max(0, queryCount - receiptCount);
+    }
+  }
+  const exactMatch = canCompareSets
+    && missingLogCount === 0
+    && extraLogCount === 0
+    && receiptIdentities.duplicateCount === 0
+    && queryIdentities.duplicateCount === 0
+    && receiptIdentities.identitylessCount === 0
+    && queryIdentities.identitylessCount === 0;
+
+  return {
+    complete: exactMatch,
+    receiptSetComplete,
+    queryComplete,
+    receiptTransferLogCount: receiptTransfers.length,
+    queriedTransferLogCount: queryComplete ? queriedTransfers.length : null,
+    missingLogCount,
+    extraLogCount,
+    duplicateReceiptLogCount: receiptIdentities.duplicateCount,
+    duplicateQueryLogCount: queryIdentities.duplicateCount,
+    identitylessReceiptLogCount: receiptIdentities.identitylessCount,
+    identitylessQueryLogCount: queryIdentities.identitylessCount,
+  };
 }
 
 function aggregateBlockResults(blockResults, warnings) {
@@ -304,8 +383,15 @@ export async function buildBoundedSnapshot({
   snapshot.endTimestamp = aggregate.endTimestamp;
   snapshot.lastIndexedBlock = aggregate.lastIndexedBlock;
 
+  const receiptSetComplete = aggregate.blockCount === expectedBlockCount
+    && blockResults.every((result) => result.block
+      && Array.isArray(result.receipts)
+      && validateReceiptSet(result.receipts, result.block))
+    && aggregate.transactions.length === aggregate.receipts.length
+    && aggregate.lastIndexedBlock === requestedEnd;
+  const receiptTransferLogs = snapshot.logs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
   let transferLogs = [];
-  let transferScanComplete = false;
+  let transferQueryComplete = false;
   try {
     const rawLogs = await rpc.request('eth_getLogs', [{
       fromBlock: blockTag(requestedStart),
@@ -317,13 +403,27 @@ export async function buildBoundedSnapshot({
     }
     transferLogs = rawLogs.map((log) => normalizeLog(log))
       .sort((left, right) => left.blockNumber - right.blockNumber || left.logIndex - right.logIndex);
-    transferScanComplete = true;
+    transferQueryComplete = true;
   } catch (error) {
     warnings.push(error?.message ?? 'Transfer log query or normalization failed.');
   }
 
+  const reconciliation = reconcileTransferLogs(receiptTransferLogs, transferLogs, {
+    receiptSetComplete,
+    queryComplete: transferQueryComplete,
+  });
+  snapshot.transferLogReconciliation = reconciliation;
+  const transferScanComplete = reconciliation.complete;
+  if (!receiptSetComplete) {
+    warnings.push('Transfer log reconciliation incomplete because block or receipt coverage is incomplete.');
+  } else if (!transferQueryComplete) {
+    warnings.push('Transfer log reconciliation incomplete because the eth_getLogs response was unavailable or malformed.');
+  } else if (!reconciliation.complete) {
+    warnings.push(`Transfer log reconciliation mismatch: missing ${reconciliation.missingLogCount}, extra ${reconciliation.extraLogCount}, duplicate receipt ${reconciliation.duplicateReceiptLogCount}, duplicate query ${reconciliation.duplicateQueryLogCount}, identityless receipt ${reconciliation.identitylessReceiptLogCount}, identityless query ${reconciliation.identitylessQueryLogCount}.`);
+  }
+
   snapshot.transferScanComplete = transferScanComplete;
-  snapshot.transferLogs = transferScanComplete ? transferLogs : [];
+  snapshot.transferLogs = transferQueryComplete ? transferLogs : [];
   snapshot.canonicalUsdc = summarizeUsdcTransfers(transferLogs, { complete: transferScanComplete });
   snapshot.verifiedAssetTransfers = summarizeVerifiedAssetTransfers(transferLogs, { complete: transferScanComplete });
 
@@ -332,6 +432,7 @@ export async function buildBoundedSnapshot({
       const discovery = await discoverTransferEmitters(rpc, transferLogs, {
         maxCandidates: maxMetadataCandidates,
         concurrency: 3,
+        blockTag: blockTag(requestedEnd),
       });
       snapshot.discoveredTransferEmitters = discovery.emitters.length;
       snapshot.discoveredTransferEmitterAddresses = discovery.emitters;
@@ -348,7 +449,7 @@ export async function buildBoundedSnapshot({
     }
 
     try {
-      snapshot.verifiedAssetObservations = await inspectMajorAssets(rpc, { concurrency: 3 });
+      snapshot.verifiedAssetObservations = await inspectMajorAssets(rpc, { concurrency: 3, blockTag: blockTag(requestedEnd) });
     } catch {
       warnings.push('Live major-asset metadata observations are unavailable.');
     }
@@ -365,8 +466,7 @@ export async function buildBoundedSnapshot({
     warnings.push('Canonical USDC transfer totals are incomplete because one or more transfer logs were malformed.');
   }
 
-  const blocksComplete = aggregate.blockCount === expectedBlockCount
-    && blockResults.every((result) => result.block && result.receipts !== null && result.receipts !== undefined)
+  const blocksComplete = receiptSetComplete
     && aggregate.transactions.length === aggregate.receipts.length
     && aggregate.statusComplete;
   const transferMetricsComplete = transferScanComplete

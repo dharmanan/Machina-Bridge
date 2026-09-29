@@ -87,6 +87,7 @@ export function normalizeLog(raw, defaults = {}) {
   const blockNumber = raw.blockNumber ?? defaults.blockNumber;
   const transactionIndex = raw.transactionIndex ?? defaults.transactionIndex;
   const logIndex = raw.logIndex ?? defaults.logIndex;
+  const transactionHash = raw.transactionHash ?? defaults.transactionHash;
   if (blockNumber === undefined || logIndex === undefined) throw new TypeError('Log is missing block position');
 
   return {
@@ -96,7 +97,7 @@ export function normalizeLog(raw, defaults = {}) {
     blockNumber: quantityToSafeNumber(blockNumber, 'log block number'),
     transactionIndex: transactionIndex === undefined ? null : quantityToSafeNumber(transactionIndex, 'log transaction index'),
     logIndex: quantityToSafeNumber(logIndex, 'log index'),
-    transactionHash: raw.transactionHash ? normalizeHash(raw.transactionHash, 'log transaction hash') : null,
+    transactionHash: transactionHash ? normalizeHash(transactionHash, 'log transaction hash') : null,
     blockHash: raw.blockHash ? normalizeHash(raw.blockHash, 'log block hash') : null,
     removed: raw.removed === true,
   };
@@ -126,6 +127,7 @@ export function normalizeReceipt(raw, defaults = {}) {
     logs: raw.logs.map((log) => normalizeLog(log, {
       blockNumber,
       transactionIndex,
+      transactionHash: hash,
     })).sort((left, right) => left.blockNumber - right.blockNumber || left.logIndex - right.logIndex),
   };
 }
