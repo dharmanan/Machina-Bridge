@@ -146,7 +146,7 @@ function isUsdcVault(vault: EarnVault) {
 
 function isActiveVault(vault: EarnVault) {
   const status = vault.status ?? vault.liquidityProfile?.status
-  return !status || status === 'active'
+  return !status || status === 'active' || status === 'low_liquidity'
 }
 
 function collectSelectedVaults(vaults: readonly EarnVault[]) {
