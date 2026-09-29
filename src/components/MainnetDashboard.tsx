@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPublicClient, formatUnits, http, parseAbi } from 'viem'
 import {
   AlertCircle,
@@ -127,18 +127,43 @@ export default function MainnetDashboard() {
   const [walletActivity, setWalletActivity] = useState<WalletActivity[]>([])
   const [walletActivityLoading, setWalletActivityLoading] = useState(false)
   const [walletActivityError, setWalletActivityError] = useState<string | null>(null)
+  const [walletActivityDataAddress, setWalletActivityDataAddress] = useState<string | null>(null)
+  const walletActivityDataAddressRef = useRef<string | null>(null)
+  const walletActivityRequestId = useRef(0)
+  const walletActivityController = useRef<AbortController | null>(null)
+  const walletActivityAddress = address?.toLowerCase() ?? null
+  const walletActivityAddressRef = useRef(walletActivityAddress)
+  walletActivityAddressRef.current = walletActivityAddress
 
-  const loadWalletActivity = useCallback(async (walletAddress: string, signal?: AbortSignal) => {
+  const loadWalletActivity = useCallback(async (walletAddress: string) => {
+    const requestId = ++walletActivityRequestId.current
+    const addressIdentity = walletAddress.toLowerCase()
+    walletActivityController.current?.abort()
+    const controller = new AbortController()
+    walletActivityController.current = controller
+
+    if (walletActivityDataAddressRef.current !== addressIdentity) {
+      setWalletActivity([])
+      walletActivityDataAddressRef.current = addressIdentity
+    }
+    setWalletActivityDataAddress(addressIdentity)
     setWalletActivityLoading(true)
     setWalletActivityError(null)
+
+    const isCurrentRequest = () =>
+      requestId === walletActivityRequestId.current
+      && walletActivityAddressRef.current === addressIdentity
+      && !controller.signal.aborted
+
     try {
-      const response = await fetchMainnetWalletActivity(walletAddress, signal)
+      const response = await fetchMainnetWalletActivity(walletAddress, controller.signal)
+      if (!isCurrentRequest()) return
       setWalletActivity(normalizeWalletActivity(walletAddress, response))
     } catch (error) {
-      if (signal?.aborted) return
+      if (!isCurrentRequest()) return
       setWalletActivityError(error instanceof Error ? error.message : 'Wallet activity is unavailable')
     } finally {
-      if (!signal?.aborted) setWalletActivityLoading(false)
+      if (isCurrentRequest()) setWalletActivityLoading(false)
     }
   }, [])
 
@@ -247,15 +272,35 @@ export default function MainnetDashboard() {
 
   useEffect(() => {
     if (!address) {
+      walletActivityRequestId.current += 1
+      walletActivityController.current?.abort()
+      walletActivityController.current = null
       setWalletActivity([])
+      setWalletActivityDataAddress(null)
+      walletActivityDataAddressRef.current = null
+      setWalletActivityLoading(false)
       setWalletActivityError(null)
       return
     }
 
-    const controller = new AbortController()
-    void loadWalletActivity(address, controller.signal)
-    return () => controller.abort()
+    void loadWalletActivity(address)
+    return () => {
+      if (walletActivityAddressRef.current === address.toLowerCase()) {
+        walletActivityRequestId.current += 1
+        walletActivityController.current?.abort()
+        walletActivityController.current = null
+      }
+    }
   }, [address, loadWalletActivity])
+
+  const visibleWalletActivity = walletActivityDataAddress === walletActivityAddress
+    ? walletActivity
+    : []
+  const visibleWalletActivityLoading = walletActivityAddress !== null
+    && (walletActivityDataAddress !== walletActivityAddress || walletActivityLoading)
+  const visibleWalletActivityError = walletActivityDataAddress === walletActivityAddress
+    ? walletActivityError
+    : null
 
   useEffect(() => {
     void loadSolanaBalance()
@@ -669,35 +714,35 @@ export default function MainnetDashboard() {
             <button
               type="button"
               onClick={() => address && void loadWalletActivity(address)}
-              disabled={walletActivityLoading}
+              disabled={visibleWalletActivityLoading}
               className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <RefreshCw size={13} className={walletActivityLoading ? 'animate-spin' : ''} />
+              <RefreshCw size={13} className={visibleWalletActivityLoading ? 'animate-spin' : ''} />
               Refresh
             </button>
           </div>
 
-          {walletActivityLoading && walletActivity.length === 0 ? (
+          {visibleWalletActivityLoading && visibleWalletActivity.length === 0 ? (
             <p className="py-8 text-center text-sm text-slate-500">Loading wallet activity...</p>
           ) : (
             <>
-              {walletActivityError && (
+              {visibleWalletActivityError && (
                 <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
                   <div className="flex items-center gap-2">
                     <AlertCircle size={15} />
-                    <span>{walletActivityError}</span>
+                    <span>{visibleWalletActivityError}</span>
                   </div>
-                  {walletActivity.length > 0 && (
+                  {visibleWalletActivity.length > 0 && (
                     <p className="mt-2 text-xs">Showing the last activity that loaded successfully.</p>
                   )}
                 </div>
               )}
 
-              {walletActivity.length === 0 && !walletActivityError ? (
+              {visibleWalletActivity.length === 0 && !visibleWalletActivityError ? (
                 <p className="py-8 text-center text-sm text-slate-500">No Arc wallet activity found.</p>
-              ) : walletActivity.length > 0 ? (
+              ) : visibleWalletActivity.length > 0 ? (
                 <div className="mt-4 divide-y divide-slate-100">
-                  {walletActivity.map((item) => {
+                  {visibleWalletActivity.map((item) => {
                     const Icon = item.type === 'send'
                       ? ArrowUpRight
                       : item.type === 'receive'

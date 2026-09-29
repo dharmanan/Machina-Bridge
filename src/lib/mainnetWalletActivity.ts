@@ -66,11 +66,6 @@ const ERC20_TRANSFER_SELECTORS = new Set<string>([
   toFunctionSelector('transfer(address,uint256)'),
   toFunctionSelector('transferFrom(address,address,uint256)'),
 ])
-const SWAP_SELECTORS = new Set([
-  '0x38ed1739', // swapExactTokensForTokens
-  '0x04e45aaf', // exactInputSingle
-  '0xb858183f', // exactInput
-])
 const ARC_NATIVE_DECIMALS = 18
 const ARC_NATIVE_SENTINEL = '0xfffffffffffffffffffffffffffffffffffffffe'
 
@@ -238,25 +233,6 @@ function classify(
         counterparty: movement.outgoing ? transaction.to : transaction.from,
         protocol: null,
       }
-    }
-  }
-
-  const hasIncoming = movements.some((movement) => !movement.outgoing)
-  const hasOutgoing = movements.some((movement) => movement.outgoing)
-  if (
-    hasIncoming
-    && hasOutgoing
-    && new Set(movements.map((movement) => movement.key)).size > 1
-    && SWAP_SELECTORS.has(selector)
-  ) {
-    return {
-      id: transaction.hash,
-      txHash: transaction.hash,
-      type: 'swap',
-      title: humanize('swap'),
-      amount: null,
-      counterparty: transaction.to,
-      protocol: null,
     }
   }
 

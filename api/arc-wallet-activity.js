@@ -22,6 +22,16 @@ function safeString(value, pattern) {
   return value
 }
 
+function parseTokenDecimals(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 36 ? value : null
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null
+
+  const decimals = Number(value)
+  return Number.isSafeInteger(decimals) && decimals <= 36 ? decimals : null
+}
+
 function normalizeTransaction(row) {
   const hash = safeString(row?.hash, HASH_PATTERN)
   if (!hash) return null
@@ -46,12 +56,12 @@ function normalizeTokenTransfer(row) {
   const from = safeString(row?.from, ADDRESS_PATTERN)
   const to = safeString(row?.to, ADDRESS_PATTERN)
   const value = /^\d+$/.test(String(row?.value ?? '')) ? String(row.value) : null
-  const decimals = Number(row?.tokenDecimal)
+  const decimals = parseTokenDecimals(row?.tokenDecimal)
   const symbol = typeof row?.tokenSymbol === 'string' ? row.tokenSymbol.trim().slice(0, 16) : ''
 
   if (
     !hash || !contractAddress || contractAddress.toLowerCase() === ARC_NATIVE_SENTINEL
-    || !from || !to || !value || !Number.isInteger(decimals) || decimals < 0 || decimals > 36
+    || !from || !to || !value || decimals === null
     || !symbol || !/^[\w.$-]+$/.test(symbol)
   ) return null
 
