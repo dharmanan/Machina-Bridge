@@ -37,6 +37,11 @@ function normalizeTimestamp(value) {
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
 }
 
+function normalizeConfirmations(value) {
+  if (typeof value === 'string') return /^\d+$/.test(value) ? value : null
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
+}
+
 function normalizeApproval(input) {
   if (typeof input !== 'string' || input.length !== 138 || !/^0x[\da-f]{136}$/i.test(input)) return null
   if (input.slice(0, 10).toLowerCase() !== '0x095ea7b3') return null
@@ -92,6 +97,7 @@ function normalizeTokenTransfer(row) {
     to,
     value,
     timeStamp: normalizeTimestamp(row?.timeStamp),
+    confirmations: normalizeConfirmations(row?.confirmations),
     symbol,
     decimals,
   }

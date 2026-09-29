@@ -10,6 +10,58 @@ const ts = require('typescript')
 const originalRequire = Module.prototype.require
 const { toFunctionSelector } = await import('viem')
 
+require.extensions['.ts'] = (loadedModule, filename) => {
+  const source = readFileSync(filename, 'utf8')
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: filename,
+  })
+  loadedModule._compile(outputText, filename)
+}
+
+const earnConfigPath = fileURLToPath(new URL('../src/config/mainnetEarn.ts', import.meta.url))
+const earnConfig = require(earnConfigPath)
+const earnVaults = earnConfig.MAINNET_EARN_SELECTED_VAULT_ADDRESSES
+const vaultMetadata = earnConfig.MAINNET_EARN_VAULT_METADATA
+const cctpMessenger = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
+const cctpTransmitter = '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64'
+
+function assertVaultMetadataInvariant(selectedAddresses, metadata) {
+  const byAddress = new Set()
+  for (const vault of metadata) {
+    const key = vault.address.toLowerCase()
+    if (byAddress.has(key)) throw new Error(`duplicate vault metadata address: ${vault.address}`)
+    byAddress.add(key)
+  }
+  for (const address of selectedAddresses) {
+    if (!byAddress.has(address.toLowerCase())) throw new Error(`missing selected vault metadata: ${address}`)
+  }
+}
+
+assert.doesNotThrow(() => assertVaultMetadataInvariant(earnVaults, vaultMetadata))
+assert.throws(
+  () => assertVaultMetadataInvariant(earnVaults, [...vaultMetadata, { ...vaultMetadata[0], address: vaultMetadata[0].address.toLowerCase() }]),
+  /duplicate vault metadata address/,
+)
+assert.throws(
+  () => assertVaultMetadataInvariant(earnVaults, vaultMetadata.slice(1)),
+  /missing selected vault metadata/,
+)
+const futureDropdownMetadata = [...vaultMetadata, {
+  address: '0x9999999999999999999999999999999999999999',
+  label: 'Future Curator USDC',
+}]
+assert.equal(
+  earnConfig.getMainnetEarnVaultLabel(futureDropdownMetadata[2].address, futureDropdownMetadata),
+  'Future Curator USDC',
+)
+assert.equal(earnConfig.getMainnetEarnVaultLabel('0x7777777777777777777777777777777777777777'), 'Earn vault')
+console.log('Earn metadata fixtures passed: case insensitive selected address coverage; duplicate and missing entries fail; future dropdown label resolves by address')
+
 const wallet = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const other = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 const txHash = `0x${'1'.repeat(64)}`
@@ -31,6 +83,7 @@ const tokenRows = decimalFixtures.map(([tokenDecimal], index) => ({
   to: other,
   value: '1000000',
   timeStamp: index === 0 ? '1700000100' : index === 1 ? '1700000100x' : undefined,
+  confirmations: index === 0 ? '3' : index === 1 ? 4 : Number.MAX_SAFE_INTEGER + 1,
   tokenSymbol: 'FIX',
   ...(tokenDecimal === undefined ? {} : { tokenDecimal }),
 }))
@@ -82,8 +135,10 @@ assert.deepEqual(apiPayload.tokenTransfers.map((row) => row.decimals), [0, 6, 18
 assert.equal(apiPayload.tokenTransfers[0].value, '1000000')
 assert.equal(apiPayload.tokenTransfers[0].timeStamp, '1700000100')
 assert.equal(apiPayload.tokenTransfers[1].timeStamp, null)
+assert.deepEqual(apiPayload.tokenTransfers.map((row) => row.confirmations), ['3', '4', null])
 console.log('tokenDecimal fixtures passed: valid 0/6/18 retained; empty/null/undefined/malformed/negative rejected')
 console.log('token timestamp fixtures passed: digits-only value preserved; malformed value normalized to null')
+console.log('token confirmations API fixtures passed: digit string and safe integer retained; unsafe integer normalized to null')
 
 async function normalizeApiTransactions(transactionRows) {
   const previousFetch = globalThis.fetch
@@ -110,17 +165,6 @@ async function normalizeApiTransactions(transactionRows) {
   return JSON.parse(apiResponse.body)
 }
 
-const earnVaults = [
-  '0x8E357432CC12ff425c36432F312968aEb16112AF',
-  '0xdECcd53BE5453215821184824B519E04C7e00bC7',
-]
-const vaultMetadata = [
-  { address: earnVaults[0], label: 'Galaxy USDC', shareSymbol: 'arcUSDC', shareDecimals: 18 },
-  { address: earnVaults[1], label: 'Gauntlet USDC Prime', shareSymbol: 'gtusdcp', shareDecimals: 18 },
-]
-const cctpMessenger = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
-const cctpTransmitter = '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64'
-
 Module.prototype.require = function (specifier) {
   if (this.filename.endsWith('/src/lib/mainnetWalletActivity.ts')) {
     if (specifier === 'viem') {
@@ -145,19 +189,6 @@ Module.prototype.require = function (specifier) {
   return originalRequire.call(this, specifier)
 }
 
-require.extensions['.ts'] = (loadedModule, filename) => {
-  const source = readFileSync(filename, 'utf8')
-  const { outputText } = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-      esModuleInterop: true,
-    },
-    fileName: filename,
-  })
-  loadedModule._compile(outputText, filename)
-}
-
 const modulePath = fileURLToPath(new URL('../src/lib/mainnetWalletActivity.ts', import.meta.url))
 const { normalizeWalletActivity } = require(modulePath)
 Module.prototype.require = originalRequire
@@ -168,13 +199,14 @@ const arcUsdc = '0x3600000000000000000000000000000000000000'
 const cctpDepositSelector = toFunctionSelector(
   'depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)',
 )
-const movement = (hash, contractAddress, from, to, decimals = 6, symbol = 'FIX', value = '1000000') => ({
+const movement = (hash, contractAddress, from, to, decimals = 6, symbol = 'FIX', value = '1000000', confirmations = null) => ({
   hash,
   contractAddress,
   from,
   to,
   value,
   timeStamp: '1700000100',
+  confirmations,
   symbol,
   decimals,
 })
@@ -207,7 +239,10 @@ const classificationFixtures = normalizeWalletActivity(wallet, {
     movement(`0x${'5'.repeat(64)}`, tokenA, wallet, other),
     movement(`0x${'6'.repeat(64)}`, tokenB, wallet, other, 0),
     movement(`0x${'7'.repeat(64)}`, tokenA, other, wallet),
-    movement(`0x${'9'.repeat(64)}`, tokenA, other, wallet),
+    movement(`0x${'9'.repeat(64)}`, tokenA, other, wallet, 6, 'FIX', '1000000', '0'),
+    movement(`0x${'9'.repeat(64)}`, tokenA, other, wallet, 6, 'FIX', '1000000', '2'),
+    movement(`0x${'c'.repeat(64)}`, tokenA, other, wallet, 6, 'FIX', '1000000', 'malformed'),
+    movement(`0x${'d'.repeat(64)}`, tokenA, other, wallet),
   ],
 })
 const orderedFixtures = normalizeWalletActivity(wallet, {
@@ -224,10 +259,13 @@ assert.equal(byHash.get(`0x${'6'.repeat(64)}`).amount, '−1,000,000 FIX', 'zero
 assert.equal(byHash.get(`0x${'7'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
 assert.equal(byHash.get(`0x${'9'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
 assert.equal(byHash.get(`0x${'9'.repeat(64)}`).timestamp, 1700000100 * 1000)
-assert.equal(byHash.get(`0x${'9'.repeat(64)}`).status, 'Unknown', 'token-only status must remain conservative')
+assert.equal(byHash.get(`0x${'9'.repeat(64)}`).status, 'Confirmed', 'any valid positive transfer confirmation confirms token-only activity')
+assert.equal(byHash.get(`0x${'c'.repeat(64)}`).status, 'Unknown', 'malformed confirmations must not change conservative token-only status')
+assert.equal(byHash.get(`0x${'d'.repeat(64)}`).status, 'Unknown', 'missing confirmations must not change conservative token-only status')
 assert.equal(orderedFixtures[0].txHash, `0x${'b'.repeat(64)}`, 'newer token-only activity must sort ahead of an older normal transaction')
 assert.equal(orderedFixtures[0].timestamp, 1700000100 * 1000)
-console.log('token-only ordering fixtures passed: newer incoming transfer sorts first with Receive and Unknown status')
+assert.equal(orderedFixtures[0].status, 'Unknown', 'missing token-only confirmations remain Unknown')
+console.log('token-only fixtures passed: newer incoming Receive sorts first; any related positive confirmation gives Confirmed; malformed/missing remain Unknown')
 
 const approvalSelector = toFunctionSelector('approve(address,uint256)')
 const spender = '0x7fb8c7260b63934d8da38af902f87ae6e284a845'
@@ -380,5 +418,30 @@ const mainnetDashboardSource = readFileSync(
   'utf8',
 )
 assert.doesNotMatch(mainnetDashboardSource, /Wallet Activity/)
+const earnActionsSource = readFileSync(
+  fileURLToPath(new URL('../src/components/MainnetEarnActions.tsx', import.meta.url)),
+  'utf8',
+)
+assert.match(earnActionsSource, /getMainnetEarnVaultLabel\(vaultAddress\)/)
+assert.match(earnActionsSource, /getMainnetEarnVaultLabel\(reviewed\.vaultAddress\)/)
+assert.doesNotMatch(earnActionsSource, /GALAXY_ADDRESS|Gauntlet USDC Prime/)
+const withdrawalReviewSource = earnActionsSource.slice(
+  earnActionsSource.indexOf('const reviewWithdrawal'),
+  earnActionsSource.indexOf('const executeWithdrawal'),
+)
+assert.ok(withdrawalReviewSource.indexOf('await readPosition()') < withdrawalReviewSource.indexOf('earnKit.getWithdrawalQuote'))
+const withdrawalExecutionSource = earnActionsSource.slice(earnActionsSource.indexOf('const executeWithdrawal'))
+assert.ok(withdrawalExecutionSource.indexOf('await readPosition()') < withdrawalExecutionSource.indexOf('earnKit.withdraw'))
+const earnPreviewSource = readFileSync(
+  fileURLToPath(new URL('../src/components/MainnetEarnPreview.tsx', import.meta.url)),
+  'utf8',
+)
+assert.match(earnPreviewSource, />Available liquidity<\/p>/)
+assert.match(earnPreviewSource, /Compare current rates and available liquidity across selected vaults\./)
+assert.doesNotMatch(earnPreviewSource, /withdrawable liquidity/i)
+assert.match(earnPreviewSource, /Withdrawal availability is checked when you review a withdrawal\./)
+assert.match(earnPreviewSource, /Liquidity is currently limited\. A withdrawal quote may be unavailable\./)
+assert.match(earnPreviewSource, /isZeroLiquidity\(vault\.liquidityProfile\?\.available \?\? vault\.liquidity\)/)
 console.log('request lifecycle guards passed: generation, wallet identity, abort, manual refresh, and address-scoped rendering')
 console.log('Activity navigation and UI fixtures passed: mainnet tab, no Dashboard card, hidden Unknown badge, normal page scrolling')
+console.log('Earn UI fixtures passed: metadata driven dropdown labels; withdrawal position, quote, and execution order unchanged; available liquidity copy and zero value warning')

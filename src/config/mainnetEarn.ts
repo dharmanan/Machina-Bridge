@@ -36,6 +36,14 @@ export const MAINNET_EARN_VAULT_METADATA: readonly MainnetEarnVaultMetadata[] = 
   },
 ]
 
+export function getMainnetEarnVaultLabel(
+  address: string,
+  metadata: readonly MainnetEarnVaultMetadata[] = MAINNET_EARN_VAULT_METADATA,
+) {
+  return metadata.find((vault) => vault.address.toLowerCase() === address.toLowerCase())?.label
+    ?? 'Earn vault'
+}
+
 // Verified Circle Guarded identity for the launch preview. The vault name,
 // APY, liquidity, fees, and status still come from live discovery data.
 export const MAINNET_EARN_VERIFIED_GUARDED_VAULT_ADDRESSES = [

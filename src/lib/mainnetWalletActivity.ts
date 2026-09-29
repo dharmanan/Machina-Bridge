@@ -42,6 +42,7 @@ type TokenTransfer = {
   to: string
   value: string
   timeStamp: string | null
+  confirmations: string | null
   symbol: string
   decimals: number
 }
@@ -116,6 +117,14 @@ function statusFor(transaction: Transaction): WalletActivityStatus {
   if (transaction.isError === '1' || transaction.receiptStatus === '0') return 'Failed'
   if (transaction.isError === '0' || transaction.receiptStatus === '1') return 'Confirmed'
   return 'Unknown'
+}
+
+function statusForTokenOnly(transfers: TokenTransfer[]): WalletActivityStatus {
+  return transfers.some((transfer) => (
+    typeof transfer.confirmations === 'string'
+    && /^\d+$/.test(transfer.confirmations)
+    && BigInt(transfer.confirmations) > 0n
+  )) ? 'Confirmed' : 'Unknown'
 }
 
 function humanize(type: WalletActivityType, verb?: string, vault?: string) {
@@ -348,10 +357,13 @@ export function normalizeWalletActivity(
         verifiedApprovalTokens,
       )
       const timestamp = Number(transaction.timeStamp)
+      const transactionTransfers = transfersByHash.get(transaction.hash.toLowerCase()) ?? []
       return {
         ...base,
         timestamp: Number.isFinite(timestamp) && timestamp > 0 ? timestamp * 1000 : null,
-        status: statusFor(transaction),
+        status: transaction.tokenOnly === true
+          ? statusForTokenOnly(transactionTransfers)
+          : statusFor(transaction),
       }
     })
     .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))

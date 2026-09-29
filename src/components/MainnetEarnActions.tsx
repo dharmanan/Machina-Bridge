@@ -10,6 +10,7 @@ import {
 import { EarnKit } from '@circle-fin/earn-kit'
 import { createViemAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import {
+  getMainnetEarnVaultLabel,
   MAINNET_EARN_CHAIN,
   MAINNET_EARN_SELECTED_VAULT_ADDRESSES,
 } from '../config/mainnetEarn'
@@ -49,20 +50,11 @@ const ERC20_BALANCE_ABI = parseAbi([
 
 const earnKit = new EarnKit()
 const DEFAULT_AMOUNT = '0.1'
-const GALAXY_ADDRESS = '0x8E357432CC12ff425c36432F312968aEb16112AF'
 
 function shortAddress(value?: string) {
   if (!value) return ''
   if (value.length <= 12) return value
   return value.slice(0, 6) + '...' + value.slice(-4)
-}
-
-function vaultName(address: string) {
-  if (address.toLowerCase() === GALAXY_ADDRESS.toLowerCase()) {
-    return 'Galaxy USDC'
-  }
-
-  return 'Gauntlet USDC Prime'
 }
 
 function validateAmount(value: string) {
@@ -475,7 +467,7 @@ export default function MainnetEarnActions() {
           >
             {MAINNET_EARN_SELECTED_VAULT_ADDRESSES.map((vaultAddress) => (
               <option key={vaultAddress} value={vaultAddress}>
-                {vaultName(vaultAddress)}
+                {getMainnetEarnVaultLabel(vaultAddress)}
               </option>
             ))}
           </select>
@@ -558,7 +550,7 @@ export default function MainnetEarnActions() {
             {reviewed.kind === 'deposit' ? 'Deposit ' : 'Withdraw '}
             {reviewed.amount} USDC
             {reviewed.kind === 'deposit' ? ' into ' : ' from '}
-            {vaultName(reviewed.vaultAddress)}
+            {getMainnetEarnVaultLabel(reviewed.vaultAddress)}
           </p>
           <p className="mt-1 text-[11px] leading-5 text-slate-500">
             Quote received. Your wallet will show the transaction and network fee before you sign.
