@@ -6,18 +6,19 @@ import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
 import MainnetPreviewGate from './components/MainnetPreviewGate'
 import MainnetDashboard from './components/MainnetDashboard'
+import MainnetEarnPreview from './components/MainnetEarnPreview'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
 import { useSuiWallet } from './hooks/useSuiWallet'
 import { addChainToWallet, getEvmChainOptionsForNetwork, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
-import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X } from 'lucide-react'
+import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import DesignedByFooter from './components/DesignedByFooter'
 import './index.css'
 
-type Tab = 'swap' | 'bridge' | 'dashboard'
+type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard'
 
 export default function App() {
   const { isConnected, chainId } = useAccount()
@@ -201,7 +202,7 @@ export default function App() {
 
   const showMobileNotice = isMobileExperience && !hasDismissedMobileNotice
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
+    <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900">
       {showMobileNotice && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
           <div
@@ -510,6 +511,7 @@ export default function App() {
             <nav className="flex flex-wrap gap-2 py-4">
               {[
                 { id: 'bridge' as const, label: 'Bridge', icon: <GitBranch size={20} /> },
+                { id: 'earn' as const, label: 'Earn', icon: <TrendingUp size={20} /> },
                 { id: 'dashboard' as const, label: 'Dashboard', icon: <BarChart3 size={20} /> },
               ].map((tab) => (
                 <button
@@ -530,11 +532,13 @@ export default function App() {
         </div>
       )}
 
-      <main>
+      <main className="flex-1">
         {appNetwork === 'mainnet' ? (
           activeTab === 'dashboard'
             ? <MainnetDashboard />
-            : <MainnetPreviewGate />
+            : activeTab === 'earn'
+              ? <MainnetEarnPreview />
+              : <MainnetPreviewGate />
         ) : (
           <>
             {activeTab === 'swap' && <SwapTab />}

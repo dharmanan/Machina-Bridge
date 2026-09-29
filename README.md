@@ -1,6 +1,6 @@
 # Machina Bridge
 
-**USDC bridging between Arc, major EVM networks, and Solana, with verified mainnet routes and a separate testnet environment.**
+**USDC bridging between Arc, major EVM networks, and Solana, plus Arc Mainnet USDC Earn.**
 
 [Live App](https://machinabridge.vercel.app) · [Repository](https://github.com/dharmanan/Machina-Bridge)
 
@@ -19,6 +19,7 @@ Current product surfaces include:
 - Arc ↔ Optimism USDC bridging
 - Arc ↔ Arbitrum USDC bridging
 - Arc ↔ Solana USDC bridging
+- Arc Mainnet USDC Earn with Galaxy USDC and Gauntlet USDC Prime
 - Separate EVM Bridge and Solana Bridge views
 - Persistent transfer activity and recovery handling
 - Wallet-assisted EVM network switching
@@ -68,6 +69,7 @@ Testnet assets have no real monetary value.
 Current bridge functionality includes:
 
 - Route-aware USDC bridging across verified Arc mainnet routes
+- Circle/CCTP flows with wallet-controlled transaction signing
 - Separate EVM and Solana bridge interfaces
 - Live fee estimation before signing
 - Source and destination transaction links
@@ -78,6 +80,16 @@ Current bridge functionality includes:
 - Deduplication between local and server records
 - In Progress, Ready to Mint, and Completed activity states
 - Retry and recovery handling for common wallet and transaction edge cases
+
+---
+
+## Arc Mainnet Earn
+
+Earn offers Arc Mainnet USDC deposits and withdrawals through Circle Earn Kit. The current launch vaults are **Galaxy USDC** and **Gauntlet USDC Prime**, with Morpho-backed vault exposure where applicable.
+
+Users review a quote before confirming each deposit or withdrawal in their own wallet. **Machina fee: 0 USDC.** Network and protocol costs may still apply.
+
+Vaults are operated by third parties. Yields vary, and DeFi, smart contract, protocol, and market risks remain. Circle Guarded does not guarantee returns or protect principal.
 
 ---
 
@@ -219,6 +231,8 @@ Machina Bridge uses:
 - RainbowKit
 - Ethers
 - Circle Bridge Kit
+- Circle Earn Kit
+- Morpho vault data
 - Circle Solana adapter
 - Solana Web3.js
 - Mysten dApp Kit
