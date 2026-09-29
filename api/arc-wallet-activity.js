@@ -32,13 +32,18 @@ function parseTokenDecimals(value) {
   return Number.isSafeInteger(decimals) && decimals <= 36 ? decimals : null
 }
 
+function normalizeTimestamp(value) {
+  if (typeof value === 'string') return /^\d+$/.test(value) ? value : null
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
+}
+
 function normalizeTransaction(row) {
   const hash = safeString(row?.hash, HASH_PATTERN)
   if (!hash) return null
 
   return {
     hash,
-    timeStamp: /^\d+$/.test(String(row?.timeStamp ?? '')) ? String(row.timeStamp) : null,
+    timeStamp: normalizeTimestamp(row?.timeStamp),
     from: safeString(row?.from, ADDRESS_PATTERN),
     to: safeString(row?.to, ADDRESS_PATTERN),
     value: /^\d+$/.test(String(row?.value ?? '')) ? String(row.value) : '0',
@@ -71,6 +76,7 @@ function normalizeTokenTransfer(row) {
     from,
     to,
     value,
+    timeStamp: normalizeTimestamp(row?.timeStamp),
     symbol,
     decimals,
   }

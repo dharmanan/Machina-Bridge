@@ -35,6 +35,7 @@ type TokenTransfer = {
   from: string
   to: string
   value: string
+  timeStamp: string | null
   symbol: string
   decimals: number
 }
@@ -263,9 +264,12 @@ export function normalizeWalletActivity(
   for (const transfer of response.tokenTransfers) {
     const hash = transfer.hash.toLowerCase()
     if (!rows.has(hash)) {
+      const timeStamp = transfersByHash.get(hash)
+        ?.map((item) => item.timeStamp)
+        .find((value): value is string => typeof value === 'string' && /^\d+$/.test(value)) ?? null
       rows.set(hash, {
         hash: transfer.hash,
-        timeStamp: null,
+        timeStamp,
         from: transfer.from,
         to: transfer.to,
         value: '0',

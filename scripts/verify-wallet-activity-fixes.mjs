@@ -30,6 +30,7 @@ const tokenRows = decimalFixtures.map(([tokenDecimal], index) => ({
   from: wallet,
   to: other,
   value: '1000000',
+  timeStamp: index === 0 ? '1700000100' : index === 1 ? '1700000100x' : undefined,
   tokenSymbol: 'FIX',
   ...(tokenDecimal === undefined ? {} : { tokenDecimal }),
 }))
@@ -79,7 +80,10 @@ assert.equal(response.statusCode, 200)
 const apiPayload = JSON.parse(response.body)
 assert.deepEqual(apiPayload.tokenTransfers.map((row) => row.decimals), [0, 6, 18])
 assert.equal(apiPayload.tokenTransfers[0].value, '1000000')
+assert.equal(apiPayload.tokenTransfers[0].timeStamp, '1700000100')
+assert.equal(apiPayload.tokenTransfers[1].timeStamp, null)
 console.log('tokenDecimal fixtures passed: valid 0/6/18 retained; empty/null/undefined/malformed/negative rejected')
+console.log('token timestamp fixtures passed: digits-only value preserved; malformed value normalized to null')
 
 const earnVaults = [
   '0x8E357432CC12ff425c36432F312968aEb16112AF',
@@ -134,6 +138,7 @@ const movement = (hash, contractAddress, from, to, decimals = 6) => ({
   from,
   to,
   value: '1000000',
+  timeStamp: '1700000100',
   symbol: 'FIX',
   decimals,
 })
@@ -155,6 +160,7 @@ const classificationFixtures = normalizeWalletActivity(wallet, {
     transaction(`0x${'4'.repeat(64)}`, cctpMessenger, cctpDepositSelector),
     transaction(`0x${'5'.repeat(64)}`, tokenA, '0xa9059cbb'),
     transaction(`0x${'6'.repeat(64)}`, tokenB, '0xa9059cbb'),
+    transaction(`0x${'8'.repeat(64)}`, other, '0x'),
   ],
   tokenTransfers: [
     movement(`0x${'2'.repeat(64)}`, tokenA, wallet, other),
@@ -164,7 +170,13 @@ const classificationFixtures = normalizeWalletActivity(wallet, {
     movement(`0x${'5'.repeat(64)}`, tokenA, wallet, other),
     movement(`0x${'6'.repeat(64)}`, tokenB, wallet, other, 0),
     movement(`0x${'7'.repeat(64)}`, tokenA, other, wallet),
+    movement(`0x${'9'.repeat(64)}`, tokenA, other, wallet),
   ],
+})
+const orderedFixtures = normalizeWalletActivity(wallet, {
+  limit: 2,
+  transactions: [transaction(`0x${'a'.repeat(64)}`, other, '0x')],
+  tokenTransfers: [movement(`0x${'b'.repeat(64)}`, tokenA, other, wallet)],
 })
 const byHash = new Map(classificationFixtures.map((item) => [item.txHash, item]))
 assert.equal(byHash.get(`0x${'2'.repeat(64)}`).type, 'interaction', 'unverified selector target must not be Swap')
@@ -173,7 +185,13 @@ assert.equal(byHash.get(`0x${'4'.repeat(64)}`).type, 'bridge', 'known CCTP class
 assert.equal(byHash.get(`0x${'5'.repeat(64)}`).type, 'send', 'outgoing token transfer must remain Send')
 assert.equal(byHash.get(`0x${'6'.repeat(64)}`).amount, '1,000,000 FIX', 'zero-decimal amount must remain unscaled')
 assert.equal(byHash.get(`0x${'7'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
+assert.equal(byHash.get(`0x${'9'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
+assert.equal(byHash.get(`0x${'9'.repeat(64)}`).timestamp, 1700000100 * 1000)
+assert.equal(byHash.get(`0x${'9'.repeat(64)}`).status, 'Unknown', 'token-only status must remain conservative')
+assert.equal(orderedFixtures[0].txHash, `0x${'b'.repeat(64)}`, 'newer token-only activity must sort ahead of an older normal transaction')
+assert.equal(orderedFixtures[0].timestamp, 1700000100 * 1000)
 console.log('classification fixtures passed: unknown swap target falls back; Earn, CCTP, Send, Receive, and zero-decimal formatting remain correct')
+console.log('token-only ordering fixtures passed: newer incoming transfer sorts first with Receive and Unknown status')
 
 const dashboardSource = readFileSync(
   fileURLToPath(new URL('../src/components/MainnetDashboard.tsx', import.meta.url)),
