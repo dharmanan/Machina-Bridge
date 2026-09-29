@@ -1,6 +1,6 @@
 import { toFunctionSelector } from 'viem'
 import { MAINNET_CCTP_MESSAGE_TRANSMITTER, MAINNET_CCTP_TOKEN_MESSENGER } from '../config/mainnetCctp'
-import { MAINNET_EARN_SELECTED_VAULT_ADDRESSES } from '../config/mainnetEarn'
+import { MAINNET_EARN_VAULT_METADATA, type MainnetEarnVaultMetadata } from '../config/mainnetEarn'
 import { MAINNET_CONFIG } from '../config/mainnet'
 
 export type WalletActivityType = 'send' | 'receive' | 'swap' | 'bridge' | 'earn' | 'approve' | 'interaction'
@@ -14,6 +14,7 @@ export type WalletActivity = {
   type: WalletActivityType
   title: string
   amount: string | null
+  approvalAmountRaw?: string | null
   counterparty: string | null
   protocol: string | null
 }
@@ -51,22 +52,12 @@ export type WalletActivityResponse = {
   limit: number
 }
 
-const VAULTS = new Map<string, string>([
-  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[0].toLowerCase(), 'Galaxy USDC'],
-  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[1].toLowerCase(), 'Gauntlet USDC Prime'],
-])
-
 const CCTP_DEPOSIT_SELECTOR = toFunctionSelector(
   'depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)',
 )
 const CCTP_RECEIVE_SELECTOR = toFunctionSelector('receiveMessage(bytes,bytes)')
 const APPROVE_SELECTOR = toFunctionSelector('approve(address,uint256)')
 const ARC_USDC_ADDRESS = MAINNET_CONFIG.arcUsdcAddress.toLowerCase()
-const VERIFIED_APPROVAL_TOKENS = new Map<string, { symbol: string; decimals: number }>([
-  [ARC_USDC_ADDRESS, { symbol: 'USDC', decimals: 6 }],
-  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[0].toLowerCase(), { symbol: 'arcUSDC', decimals: 18 }],
-  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[1].toLowerCase(), { symbol: 'gtusdcp', decimals: 18 }],
-])
 const ERC20_TRANSFER_SELECTORS = new Set<string>([
   toFunctionSelector('transfer(address,uint256)'),
   toFunctionSelector('transferFrom(address,address,uint256)'),
@@ -137,9 +128,34 @@ function humanize(type: WalletActivityType, verb?: string, vault?: string) {
   return vault ? `Contract interaction · ${vault}` : 'Contract interaction'
 }
 
-function classifyEarnMovement(movements: Movement[]) {
+function createVaultsByAddress(metadata: readonly MainnetEarnVaultMetadata[]) {
+  return new Map(metadata
+    .filter((vault) => /^0x[\da-f]{40}$/i.test(vault.address))
+    .map((vault) => [vault.address.toLowerCase(), vault]))
+}
+
+function createVerifiedApprovalTokens(vaults: Map<string, MainnetEarnVaultMetadata>) {
+  const tokens = new Map<string, { symbol: string; decimals: number }>([
+    [ARC_USDC_ADDRESS, { symbol: 'USDC', decimals: 6 }],
+  ])
+  for (const [address, vault] of vaults) {
+    if (
+      typeof vault.shareSymbol === 'string'
+      && /^[\w.$-]+$/.test(vault.shareSymbol)
+      && typeof vault.shareDecimals === 'number'
+      && Number.isSafeInteger(vault.shareDecimals)
+      && vault.shareDecimals >= 0
+      && vault.shareDecimals <= 36
+    ) {
+      tokens.set(address, { symbol: vault.shareSymbol, decimals: vault.shareDecimals })
+    }
+  }
+  return tokens
+}
+
+function classifyEarnMovement(movements: Movement[], vaults: Map<string, MainnetEarnVaultMetadata>) {
   const candidates: Array<{ vault: string; verb: 'deposit' | 'withdrawal'; movement: Movement; outgoing: boolean }> = []
-  for (const [address, label] of VAULTS) {
+  for (const [address, metadata] of vaults) {
     const usdcOut = movements.find((movement) => movement.key === ARC_USDC_ADDRESS && movement.outgoing)
     const usdcIn = movements.find((movement) => movement.key === ARC_USDC_ADDRESS && !movement.outgoing)
     const sharesIn = movements.find((movement) => movement.key === address && !movement.outgoing)
@@ -148,8 +164,8 @@ function classifyEarnMovement(movements: Movement[]) {
     const isWithdrawal = Boolean(sharesOut && usdcIn)
 
     if (isDeposit === isWithdrawal) continue
-    if (isDeposit && usdcOut) candidates.push({ vault: label, verb: 'deposit', movement: usdcOut, outgoing: true })
-    if (isWithdrawal && usdcIn) candidates.push({ vault: label, verb: 'withdrawal', movement: usdcIn, outgoing: false })
+    if (isDeposit && usdcOut) candidates.push({ vault: metadata.label, verb: 'deposit', movement: usdcOut, outgoing: true })
+    if (isWithdrawal && usdcIn) candidates.push({ vault: metadata.label, verb: 'withdrawal', movement: usdcIn, outgoing: false })
   }
   return candidates.length === 1 ? candidates[0] : null
 }
@@ -158,12 +174,14 @@ function classify(
   wallet: string,
   transaction: Transaction,
   transfers: TokenTransfer[],
+  vaults: Map<string, MainnetEarnVaultMetadata>,
+  verifiedApprovalTokens: Map<string, { symbol: string; decimals: number }>,
 ): Omit<WalletActivity, 'timestamp' | 'status'> {
   const recipient = transaction.to?.toLowerCase() ?? ''
   const from = transaction.from?.toLowerCase() ?? ''
   const selector = transaction.input.slice(0, 10).toLowerCase()
   const movements = getMovements(wallet, transfers)
-  const vault = VAULTS.get(recipient)
+  const vault = vaults.get(recipient)?.label
 
   if (transaction.isError === '1' || transaction.receiptStatus === '0') {
     return {
@@ -177,7 +195,7 @@ function classify(
     }
   }
 
-  const earnMovement = classifyEarnMovement(movements)
+  const earnMovement = classifyEarnMovement(movements, vaults)
   if (earnMovement) {
     return {
       id: transaction.hash,
@@ -211,18 +229,21 @@ function classify(
 
   if (selector === APPROVE_SELECTOR) {
     const tokenAddress = recipient
-    const token = VERIFIED_APPROVAL_TOKENS.get(tokenAddress)
+    const token = verifiedApprovalTokens.get(tokenAddress)
     const rawApprovalAmount = transaction.approval?.amount
     const approvalAmount = token && typeof rawApprovalAmount === 'string' && /^\d+$/.test(rawApprovalAmount)
-      ? formatAmount(BigInt(rawApprovalAmount), token.decimals, token.symbol, true, token.decimals)
+      ? formatAmount(BigInt(rawApprovalAmount), token.decimals, token.symbol, true, 6)
       : null
-    const approvalVault = VAULTS.get(tokenAddress)
+    const approvalVault = vaults.get(tokenAddress)?.label
     return {
       id: transaction.hash,
       txHash: transaction.hash,
       type: 'approve',
       title: approvalVault ? `Earn approval · ${approvalVault}` : humanize('approve'),
       amount: approvalAmount ? `Limit ${approvalAmount}` : null,
+      approvalAmountRaw: typeof rawApprovalAmount === 'string' && /^\d+$/.test(rawApprovalAmount)
+        ? rawApprovalAmount
+        : null,
       counterparty: transaction.to,
       protocol: approvalVault ?? null,
     }
@@ -284,8 +305,11 @@ function classify(
 export function normalizeWalletActivity(
   walletAddress: string,
   response: WalletActivityResponse,
+  vaultMetadata: readonly MainnetEarnVaultMetadata[] = MAINNET_EARN_VAULT_METADATA,
 ): WalletActivity[] {
   const wallet = walletAddress.toLowerCase()
+  const vaults = createVaultsByAddress(vaultMetadata)
+  const verifiedApprovalTokens = createVerifiedApprovalTokens(vaults)
   const transfersByHash = new Map<string, TokenTransfer[]>()
   for (const transfer of response.tokenTransfers) {
     const hash = transfer.hash.toLowerCase()
@@ -316,7 +340,13 @@ export function normalizeWalletActivity(
 
   return [...rows.values()]
     .map((transaction) => {
-      const base = classify(wallet, transaction, transfersByHash.get(transaction.hash.toLowerCase()) ?? [])
+      const base = classify(
+        wallet,
+        transaction,
+        transfersByHash.get(transaction.hash.toLowerCase()) ?? [],
+        vaults,
+        verifiedApprovalTokens,
+      )
       const timestamp = Number(transaction.timeStamp)
       return {
         ...base,

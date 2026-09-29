@@ -160,7 +160,7 @@ export default function MainnetWalletActivity() {
                           <p className="font-semibold text-sm text-slate-900">{item.title}</p>
                           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
                             {item.amount && <span className="font-medium text-slate-700">{item.amount}</span>}
-                            {item.protocol && <span>{item.protocol}</span>}
+                            {item.protocol && !item.title.includes(item.protocol) && <span>{item.protocol}</span>}
                             <span>{item.timestamp ? new Date(item.timestamp).toLocaleString() : 'Time unavailable'}</span>
                           </div>
                           <a

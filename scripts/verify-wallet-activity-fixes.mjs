@@ -114,6 +114,10 @@ const earnVaults = [
   '0x8E357432CC12ff425c36432F312968aEb16112AF',
   '0xdECcd53BE5453215821184824B519E04C7e00bC7',
 ]
+const vaultMetadata = [
+  { address: earnVaults[0], label: 'Galaxy USDC', shareSymbol: 'arcUSDC', shareDecimals: 18 },
+  { address: earnVaults[1], label: 'Gauntlet USDC Prime', shareSymbol: 'gtusdcp', shareDecimals: 18 },
+]
 const cctpMessenger = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
 const cctpTransmitter = '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64'
 
@@ -129,7 +133,10 @@ Module.prototype.require = function (specifier) {
       }
     }
     if (specifier === '../config/mainnetEarn') {
-      return { MAINNET_EARN_SELECTED_VAULT_ADDRESSES: earnVaults }
+      return {
+        MAINNET_EARN_SELECTED_VAULT_ADDRESSES: earnVaults,
+        MAINNET_EARN_VAULT_METADATA: vaultMetadata,
+      }
     }
     if (specifier === '../config/mainnet') {
       return { MAINNET_CONFIG: { arcUsdcAddress: '0x3600000000000000000000000000000000000000' } }
@@ -224,17 +231,24 @@ console.log('token-only ordering fixtures passed: newer incoming transfer sorts 
 
 const approvalSelector = toFunctionSelector('approve(address,uint256)')
 const spender = '0x7fb8c7260b63934d8da38af902f87ae6e284a845'
+const futureVaultAddress = '0x9999999999999999999999999999999999999999'
+const futureVault = { address: futureVaultAddress, label: 'Future Curator USDC', shareSymbol: 'fUSDC', shareDecimals: 18 }
+const unverifiedVaultAddress = '0x8888888888888888888888888888888888888888'
+const unverifiedVault = { address: unverifiedVaultAddress, label: 'Unverified Vault' }
+const extendedVaultMetadata = [...vaultMetadata, futureVault, unverifiedVault]
 const addressWord = (address) => address.slice(2).toLowerCase().padStart(64, '0')
 const amountWord = (amount) => BigInt(amount).toString(16).padStart(64, '0')
 const approveInput = (token, amount) => `${approvalSelector}${addressWord(token)}${amountWord(amount)}`
 const approvalCases = [
   { hash: `0x${'a'.repeat(64)}`, to: earnVaults[0], input: approveInput(spender, '100047248648048185') },
-  { hash: `0x${'b'.repeat(64)}`, to: earnVaults[1], input: approveInput(spender, '100000000000000000') },
+  { hash: `0x${'b'.repeat(64)}`, to: earnVaults[1], input: approveInput(spender, '99975421462314666') },
   { hash: `0x${'c'.repeat(64)}`, to: arcUsdc, input: approveInput(spender, '100000') },
   { hash: `0x${'d'.repeat(64)}`, to: tokenA, input: approveInput(spender, '1000000') },
   { hash: `0x${'e'.repeat(64)}`, to: earnVaults[0], input: `${approvalSelector}${'1'}${'0'.repeat(63)}${amountWord('1000000')}` },
   { hash: `0x${'f'.repeat(64)}`, to: arcUsdc, input: approveInput(spender, (2n ** 256n - 1n).toString()) },
   { hash: `0x${'0'.repeat(64)}`, to: arcUsdc, input: `${approvalSelector}${'a'.repeat(100_000)}` },
+  { hash: `0x${'9'.repeat(64)}`, to: futureVaultAddress, input: approveInput(spender, '250000000000000000') },
+  { hash: `0x${'8'.repeat(64)}`, to: unverifiedVaultAddress, input: approveInput(spender, '500000000000000000') },
 ]
 const normalizedApprovalPayload = await normalizeApiTransactions(approvalCases.map((item) => ({
   ...item,
@@ -255,12 +269,14 @@ const approvalActivities = normalizeWalletActivity(wallet, {
   transactions: normalizedApprovalPayload.transactions,
   tokenTransfers: [],
   limit: 20,
-})
+}, extendedVaultMetadata)
 const approvalsByHash = new Map(approvalActivities.map((item) => [item.txHash, item]))
 assert.equal(approvalsByHash.get(approvalCases[0].hash).title, 'Earn approval · Galaxy USDC')
-assert.equal(approvalsByHash.get(approvalCases[0].hash).amount, 'Limit 0.100047248648048185 arcUSDC')
+assert.equal(approvalsByHash.get(approvalCases[0].hash).amount, 'Limit 0.100047 arcUSDC')
+assert.equal(approvalsByHash.get(approvalCases[0].hash).approvalAmountRaw, '100047248648048185')
 assert.equal(approvalsByHash.get(approvalCases[1].hash).title, 'Earn approval · Gauntlet USDC Prime')
-assert.equal(approvalsByHash.get(approvalCases[1].hash).amount, 'Limit 0.1 gtusdcp')
+assert.equal(approvalsByHash.get(approvalCases[1].hash).amount, 'Limit 0.099975 gtusdcp')
+assert.equal(approvalsByHash.get(approvalCases[1].hash).approvalAmountRaw, '99975421462314666')
 assert.equal(approvalsByHash.get(approvalCases[2].hash).title, 'Token approval')
 assert.equal(approvalsByHash.get(approvalCases[2].hash).amount, 'Limit 0.1 USDC')
 assert.equal(approvalsByHash.get(approvalCases[3].hash).title, 'Token approval')
@@ -268,7 +284,12 @@ assert.equal(approvalsByHash.get(approvalCases[3].hash).amount, null, 'unknown a
 assert.equal(approvalsByHash.get(approvalCases[4].hash).amount, null, 'malformed approval calldata must not create an amount')
 assert.ok(approvalsByHash.get(approvalCases[5].hash).amount.startsWith('Limit 115,792,089'))
 assert.ok(approvalsByHash.get(approvalCases[5].hash).amount.endsWith('.639935 USDC'))
-console.log('approval fixtures passed: strict bounded decoding, vault and USDC limits, unknown/malformed omission, uint256 max stays bigint safe')
+assert.equal(approvalsByHash.get(approvalCases[7].hash).title, 'Earn approval · Future Curator USDC')
+assert.equal(approvalsByHash.get(approvalCases[7].hash).amount, 'Limit 0.25 fUSDC')
+assert.equal(approvalsByHash.get(approvalCases[7].hash).approvalAmountRaw, '250000000000000000')
+assert.equal(approvalsByHash.get(approvalCases[8].hash).title, 'Earn approval · Unverified Vault')
+assert.equal(approvalsByHash.get(approvalCases[8].hash).amount, null, 'unverified share metadata must not produce a formatted amount')
+console.log('approval fixtures passed: six digit display, exact raw preservation, metadata driven labels, unknown/malformed omission, uint256 max stays bigint safe')
 
 const earnAndDirectionHash = (digit) => `0x${digit.repeat(64)}`
 const earnScenarios = [
@@ -291,6 +312,24 @@ for (const scenario of earnScenarios) {
   assert.equal(activity.type, 'earn')
   assert.equal(activity.title, `Earn ${scenario.verb} · ${scenario.label}`)
   assert.equal(activity.amount, scenario.expected, `${scenario.label} ${scenario.verb} must display underlying USDC direction`)
+}
+const futureEarnScenarios = [
+  { hash: earnAndDirectionHash('a'), verb: 'deposit', walletUsdc: true, walletShares: false },
+  { hash: earnAndDirectionHash('b'), verb: 'withdrawal', walletUsdc: false, walletShares: true },
+]
+const futureEarnActivities = normalizeWalletActivity(wallet, {
+  limit: 20,
+  transactions: futureEarnScenarios.map(({ hash }) => transaction(hash, other, '0x12345678')),
+  tokenTransfers: futureEarnScenarios.flatMap((scenario) => [
+    movement(scenario.hash, arcUsdc, scenario.walletUsdc ? wallet : other, scenario.walletUsdc ? other : wallet, 6, 'USDC', '125000'),
+    movement(scenario.hash, futureVaultAddress, scenario.walletShares ? wallet : other, scenario.walletShares ? other : wallet, 18, 'fUSDC', '125000000000000000'),
+  ]),
+}, extendedVaultMetadata)
+for (const scenario of futureEarnScenarios) {
+  const activity = futureEarnActivities.find((item) => item.txHash === scenario.hash)
+  assert.equal(activity.type, 'earn')
+  assert.equal(activity.title, `Earn ${scenario.verb} · Future Curator USDC`)
+  assert.equal(activity.amount, scenario.verb === 'deposit' ? '−0.125 USDC' : '+0.125 USDC')
 }
 
 const cctpOutHash = earnAndDirectionHash('5')
@@ -331,6 +370,7 @@ assert.match(dashboardSource, /!controller\.signal\.aborted/)
 assert.match(dashboardSource, /onClick=\{\(\) => address && void loadWalletActivity\(address\)\}/)
 assert.match(dashboardSource, /const visibleWalletActivity = walletActivityDataAddress === walletActivityAddress/)
 assert.match(dashboardSource, /item\.status !== 'Unknown'/)
+assert.match(dashboardSource, /!item\.title\.includes\(item\.protocol\)/, 'a title that contains its protocol or vault label must not repeat it below')
 assert.doesNotMatch(dashboardSource, /max-h-\[|overflow-y-auto/)
 const appSource = readFileSync(fileURLToPath(new URL('../src/App.tsx', import.meta.url)), 'utf8')
 assert.match(appSource, /id: 'activity' as const, label: 'Activity'/)
