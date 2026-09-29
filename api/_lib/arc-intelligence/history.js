@@ -6,10 +6,12 @@ import { buildCctpV2Snapshot } from './cctp.js';
 import { buildGatewaySnapshot } from './gateway.js';
 import { buildDexP1Snapshot } from './dex-p1.js';
 import { buildLaunchpadSnapshot } from './launchpads.js';
+import { buildAcrossSnapshot } from './across.js';
+import { buildP1BRegistrySnapshot } from './p1b-registry.js';
 import { ARC_CHAIN_ID, ARC_RPC_URL, createArcRpcClient } from './rpc.js';
 import { quantityToSafeNumber } from './normalize.js';
 
-export const HISTORY_DEFINITION_VERSION = 'arc-intelligence-history-v1';
+export const HISTORY_DEFINITION_VERSION = 'arc-intelligence-history-v2';
 export const MAX_HISTORY_BLOCKS = 500;
 export const DEFAULT_CHUNK_SIZE = 25;
 
@@ -21,6 +23,8 @@ const DEFAULT_PROTOCOL_BUILDERS = Object.freeze({
   gateway: buildGatewaySnapshot,
   dexP1: buildDexP1Snapshot,
   launchpads: buildLaunchpadSnapshot,
+  across: buildAcrossSnapshot,
+  p1bRegistry: buildP1BRegistrySnapshot,
 });
 
 function tag(number) { return `0x${number.toString(16)}`; }
@@ -64,6 +68,7 @@ function coverageFrom(chunks, protocol, complete) {
         && results.every((result) => result.completeness?.verifiedVaultEventScanComplete === true),
       candidateCoverageComplete: results.length === chunks.length
         && results.every((result) => result.completeness?.candidateCoverageComplete === true),
+      protocolUniverseComplete: false,
       scope: 'verified_vault_subset',
     } : {}),
     ...(protocol === 'launchpads' ? {
@@ -74,6 +79,14 @@ function coverageFrom(chunks, protocol, complete) {
       scope: 'verified_launchpad_factory_subset',
     } : {}),
     ...(protocol === 'dexP1' ? { status: 'unavailable', scope: 'unverified_dex_aggregator_candidates' } : {}),
+    ...(protocol === 'across' ? {
+      deploymentVerified: results.length === chunks.length && results.every((result) => result.completeness?.deploymentVerified === true),
+      eventScanComplete: results.length === chunks.length && results.every((result) => result.completeness?.eventScanComplete === true),
+      registrySubsetComplete: results.length === chunks.length && results.every((result) => result.completeness?.registrySubsetComplete === true),
+      protocolUniverseComplete: false,
+      crossChainCompletionCoverage: { status: 'unavailable' },
+    } : {}),
+    ...(protocol === 'p1bRegistry' ? { status: 'partial', registrySubsetComplete: false, protocolUniverseComplete: false } : {}),
     ...(['cctp', 'gateway'].includes(protocol) ? { crossChainCompletionCoverage: { status: 'unavailable' } } : {}),
   };
 }

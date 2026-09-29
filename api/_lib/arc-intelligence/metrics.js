@@ -5,10 +5,11 @@ import { summarizeVerifiedAssetTransfers } from './tokens.js';
 import { summarizeUsdcTransfers } from './usdc.js';
 import { TRANSFER_TOPIC, USDC_SYSTEM_EMITTER } from './usdc.js';
 import { P1A_LAUNCHPAD_CANDIDATES } from './p1a-registry.js';
+import { P1B_DEFINITION_VERSION } from './p1b-registry.js';
 
-export const METRIC_DEFINITION_VERSION = 'arc-intelligence-metrics-v1';
+export const METRIC_DEFINITION_VERSION = 'arc-intelligence-metrics-v2';
 const PERIOD_SECONDS = Object.freeze({ hour: 3600, day: 86400 });
-const PROTOCOLS = ['uniswap', 'aave', 'morpho', 'cctp', 'gateway', 'dexP1', 'launchpads'];
+const PROTOCOLS = ['uniswap', 'aave', 'morpho', 'cctp', 'gateway', 'dexP1', 'launchpads', 'across', 'p1bRegistry'];
 
 function utc(seconds) { return new Date(seconds * 1000).toISOString(); }
 function sumRaw(values) { return values.reduce((sum, value) => sum + BigInt(value ?? '0'), 0n).toString(10); }
@@ -230,7 +231,10 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
     && protocolReady('morpho', (result) => result?.completeness?.verifiedVaultEventScanComplete === true);
   const mUniverse = protocolReady('morpho', (result) => result?.completeness?.candidateCoverageComplete === true);
   const mExtra = { verifiedVaults: stableVerifiedVaults,
-    stableVerifiedVaultCount: stableVerifiedVaults.length, protocolUniverseComplete: mUniverse };
+    stableVerifiedVaultCount: stableVerifiedVaults.length,
+    candidateCoverageComplete: mUniverse,
+    protocolUniverseComplete: false,
+    scope: 'verified_vault_subset' };
   for (const type of ['deposit', 'withdraw']) {
     eventMetric((id, value, options) => pAdd('morpho.v2', mReady, id, value, { ...options, extra: mExtra }),
       `morpho.v2.${type}EventCount`, mFlow, { predicate: (event) => event.type === type, scope: 'verified_vault_subset' });
@@ -298,6 +302,40 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
   }
   add('gateway.crossChainCompletedCount', null,
     { protocol: 'circle.gateway', scope: 'counterpart_chain_unobserved' });
+
+  const acrossReady = protocolReady('across', (result) => result?.completeness?.eventScanComplete === true);
+  const acrossEvents = ordered(selected.across.flatMap((result) => result.events ?? []).filter(range));
+  const acrossExtra = { scope: 'verified_arc_spoke_pool_subset', registrySubsetComplete: acrossReady,
+    protocolUniverseComplete: false, crossChainCompletionCoverage: 'unavailable',
+    routerEventsExcluded: true, peripheryEventsExcluded: true };
+  for (const [id, type] of [['sourceLegCount', 'source_deposit_leg'], ['destinationLegCount', 'destination_fill_leg']]) {
+    pAdd('across.v3', acrossReady, `across.v3.${id}`,
+      acrossReady ? countWhere(acrossEvents, (event) => event.type === type) : null,
+      { scope: 'verified_arc_spoke_pool_subset', extra: acrossExtra });
+  }
+  for (const [legType, amountField, tokenField] of [
+    ['source_deposit_leg', 'inputAmountRaw', 'inputToken'],
+    ['destination_fill_leg', 'outputAmountRaw', 'outputToken'],
+  ]) {
+    const legEvents = acrossEvents.filter((event) => event.type === legType);
+    for (const token of new Set(legEvents.map((event) => event[tokenField]).filter(Boolean))) {
+      pAdd('across.v3', acrossReady, `across.v3.${legType}.rawAmount`,
+        acrossReady ? sumRaw(legEvents.filter((event) => event[tokenField] === token).map((event) => event[amountField])) : null,
+        { unit: 'raw_event_token_units', asset: token, scope: 'verified_arc_spoke_pool_token', extra: acrossExtra });
+    }
+  }
+  add('across.v3.crossChainCompletedCount', null,
+    { protocol: 'across.v3', scope: 'counterpart_chain_unobserved', extra: acrossExtra });
+  for (const id of ['allBridgeVolume', 'feeRaw', 'crossChainCompletedVolume']) {
+    add(`across.v3.${id}`, null, { protocol: 'across.v3', scope: 'unavailable_unverified_semantics', extra: acrossExtra });
+  }
+  const registryReady = protocolReady('p1bRegistry', (result) => result?.definitionVersion === P1B_DEFINITION_VERSION);
+  add('arc.p1b.protocolUniverseComplete', false, { protocol: 'arc.p1b.registry', scope: 'investigated_candidates',
+    sourceComplete: false,
+    warnings: [registryReady ? 'Investigated candidates do not establish complete protocol universe coverage.' : 'P1B registry is unavailable.'] });
+  add('circle.stablefx.settlementEventCount', null, { protocol: 'circle.stablefx', scope: 'no_verified_arc_settlement_abi' });
+  add('rwa.totalAum', null, { protocol: 'rwa.registry', scope: 'accounting_unverified' });
+  add('rwa.subscriptionRedemptionVolume', null, { protocol: 'rwa.registry', scope: 'event_semantics_unverified' });
 
   // P1 launch counts are independent of Uniswap pool swaps and token Transfers.
   // An unverified factory yields unavailable, never a fabricated zero.
