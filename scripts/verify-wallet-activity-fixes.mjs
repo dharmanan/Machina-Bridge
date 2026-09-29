@@ -194,7 +194,7 @@ console.log('classification fixtures passed: unknown swap target falls back; Ear
 console.log('token-only ordering fixtures passed: newer incoming transfer sorts first with Receive and Unknown status')
 
 const dashboardSource = readFileSync(
-  fileURLToPath(new URL('../src/components/MainnetDashboard.tsx', import.meta.url)),
+  fileURLToPath(new URL('../src/components/MainnetWalletActivity.tsx', import.meta.url)),
   'utf8',
 )
 assert.match(dashboardSource, /requestId === walletActivityRequestId\.current/)
@@ -202,4 +202,15 @@ assert.match(dashboardSource, /walletActivityAddressRef\.current === addressIden
 assert.match(dashboardSource, /!controller\.signal\.aborted/)
 assert.match(dashboardSource, /onClick=\{\(\) => address && void loadWalletActivity\(address\)\}/)
 assert.match(dashboardSource, /const visibleWalletActivity = walletActivityDataAddress === walletActivityAddress/)
+assert.match(dashboardSource, /item\.status !== 'Unknown'/)
+assert.doesNotMatch(dashboardSource, /max-h-\[|overflow-y-auto/)
+const appSource = readFileSync(fileURLToPath(new URL('../src/App.tsx', import.meta.url)), 'utf8')
+assert.match(appSource, /id: 'activity' as const, label: 'Activity'/)
+assert.match(appSource, /activeTab === 'activity'\s*\? <MainnetWalletActivity \/>/)
+const mainnetDashboardSource = readFileSync(
+  fileURLToPath(new URL('../src/components/MainnetDashboard.tsx', import.meta.url)),
+  'utf8',
+)
+assert.doesNotMatch(mainnetDashboardSource, /Wallet Activity/)
 console.log('request lifecycle guards passed: generation, wallet identity, abort, manual refresh, and address-scoped rendering')
+console.log('Activity navigation and UI fixtures passed: mainnet tab, no Dashboard card, hidden Unknown badge, normal page scrolling')

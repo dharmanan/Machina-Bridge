@@ -7,18 +7,19 @@ import { DashboardTab } from './components/DashboardTab'
 import MainnetPreviewGate from './components/MainnetPreviewGate'
 import MainnetDashboard from './components/MainnetDashboard'
 import MainnetEarnPreview from './components/MainnetEarnPreview'
+import MainnetWalletActivity from './components/MainnetWalletActivity'
 import { Container } from './components/ui'
 import { usePhantomSolana } from './hooks/usePhantomSolana'
 import { useSuiWallet } from './hooks/useSuiWallet'
 import { addChainToWallet, getEvmChainOptionsForNetwork, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
-import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp } from 'lucide-react'
+import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp, Activity as ActivityIcon } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import DesignedByFooter from './components/DesignedByFooter'
 import './index.css'
 
-type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard'
+type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard' | 'activity'
 
 export default function App() {
   const { isConnected, chainId } = useAccount()
@@ -113,7 +114,7 @@ export default function App() {
     storeAppNetwork(network)
     setShowNetworkDropdown(false)
 
-    if (network === 'mainnet') {
+    if (network === 'mainnet' || activeTab === 'activity') {
       setActiveTab('bridge')
     }
   }
@@ -513,6 +514,7 @@ export default function App() {
                 { id: 'bridge' as const, label: 'Bridge', icon: <GitBranch size={20} /> },
                 { id: 'earn' as const, label: 'Earn', icon: <TrendingUp size={20} /> },
                 { id: 'dashboard' as const, label: 'Dashboard', icon: <BarChart3 size={20} /> },
+                { id: 'activity' as const, label: 'Activity', icon: <ActivityIcon size={20} /> },
               ].map((tab) => (
                 <button
                   key={tab.id}
@@ -538,7 +540,9 @@ export default function App() {
             ? <MainnetDashboard />
             : activeTab === 'earn'
               ? <MainnetEarnPreview />
-              : <MainnetPreviewGate />
+              : activeTab === 'activity'
+                ? <MainnetWalletActivity />
+                : <MainnetPreviewGate />
         ) : (
           <>
             {activeTab === 'swap' && <SwapTab />}
