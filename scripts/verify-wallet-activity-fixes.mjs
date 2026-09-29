@@ -85,6 +85,31 @@ assert.equal(apiPayload.tokenTransfers[1].timeStamp, null)
 console.log('tokenDecimal fixtures passed: valid 0/6/18 retained; empty/null/undefined/malformed/negative rejected')
 console.log('token timestamp fixtures passed: digits-only value preserved; malformed value normalized to null')
 
+async function normalizeApiTransactions(transactionRows) {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (input) => ({
+    ok: true,
+    json: async () => ({
+      status: '1',
+      result: new URL(String(input)).searchParams.get('action') === 'txlist' ? transactionRows : [],
+    }),
+  })
+  const apiResponse = {
+    statusCode: 200,
+    body: null,
+    setHeader() { return this },
+    status(code) { this.statusCode = code; return this },
+    send(body) { this.body = body; return this },
+  }
+  try {
+    await handler({ method: 'GET', query: { address: wallet, limit: 25 }, headers: { 'x-vercel-forwarded-for': '192.0.2.11' } }, apiResponse)
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+  assert.equal(apiResponse.statusCode, 200)
+  return JSON.parse(apiResponse.body)
+}
+
 const earnVaults = [
   '0x8E357432CC12ff425c36432F312968aEb16112AF',
   '0xdECcd53BE5453215821184824B519E04C7e00bC7',
@@ -105,6 +130,9 @@ Module.prototype.require = function (specifier) {
     }
     if (specifier === '../config/mainnetEarn') {
       return { MAINNET_EARN_SELECTED_VAULT_ADDRESSES: earnVaults }
+    }
+    if (specifier === '../config/mainnet') {
+      return { MAINNET_CONFIG: { arcUsdcAddress: '0x3600000000000000000000000000000000000000' } }
     }
   }
   return originalRequire.call(this, specifier)
@@ -129,17 +157,18 @@ Module.prototype.require = originalRequire
 
 const tokenA = '0xcccccccccccccccccccccccccccccccccccccccc'
 const tokenB = '0xdddddddddddddddddddddddddddddddddddddddd'
+const arcUsdc = '0x3600000000000000000000000000000000000000'
 const cctpDepositSelector = toFunctionSelector(
   'depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)',
 )
-const movement = (hash, contractAddress, from, to, decimals = 6) => ({
+const movement = (hash, contractAddress, from, to, decimals = 6, symbol = 'FIX', value = '1000000') => ({
   hash,
   contractAddress,
   from,
   to,
-  value: '1000000',
+  value,
   timeStamp: '1700000100',
-  symbol: 'FIX',
+  symbol,
   decimals,
 })
 const transaction = (hash, to, input, from = wallet) => ({
@@ -165,7 +194,8 @@ const classificationFixtures = normalizeWalletActivity(wallet, {
   tokenTransfers: [
     movement(`0x${'2'.repeat(64)}`, tokenA, wallet, other),
     movement(`0x${'2'.repeat(64)}`, tokenB, other, wallet),
-    movement(`0x${'3'.repeat(64)}`, tokenA, wallet, earnVaults[0]),
+    movement(`0x${'3'.repeat(64)}`, arcUsdc, wallet, other, 6, 'USDC', '100000'),
+    movement(`0x${'3'.repeat(64)}`, earnVaults[0], other, wallet, 18, 'arcUSDC', '100047248648048185'),
     movement(`0x${'4'.repeat(64)}`, tokenA, wallet, cctpMessenger),
     movement(`0x${'5'.repeat(64)}`, tokenA, wallet, other),
     movement(`0x${'6'.repeat(64)}`, tokenB, wallet, other, 0),
@@ -183,15 +213,113 @@ assert.equal(byHash.get(`0x${'2'.repeat(64)}`).type, 'interaction', 'unverified 
 assert.equal(byHash.get(`0x${'3'.repeat(64)}`).type, 'earn', 'configured vault classification must remain')
 assert.equal(byHash.get(`0x${'4'.repeat(64)}`).type, 'bridge', 'known CCTP classification must remain')
 assert.equal(byHash.get(`0x${'5'.repeat(64)}`).type, 'send', 'outgoing token transfer must remain Send')
-assert.equal(byHash.get(`0x${'6'.repeat(64)}`).amount, '1,000,000 FIX', 'zero-decimal amount must remain unscaled')
+assert.equal(byHash.get(`0x${'6'.repeat(64)}`).amount, '−1,000,000 FIX', 'zero-decimal amount must remain unscaled and directional')
 assert.equal(byHash.get(`0x${'7'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
 assert.equal(byHash.get(`0x${'9'.repeat(64)}`).type, 'receive', 'incoming-only token transfer must remain Receive')
 assert.equal(byHash.get(`0x${'9'.repeat(64)}`).timestamp, 1700000100 * 1000)
 assert.equal(byHash.get(`0x${'9'.repeat(64)}`).status, 'Unknown', 'token-only status must remain conservative')
 assert.equal(orderedFixtures[0].txHash, `0x${'b'.repeat(64)}`, 'newer token-only activity must sort ahead of an older normal transaction')
 assert.equal(orderedFixtures[0].timestamp, 1700000100 * 1000)
-console.log('classification fixtures passed: unknown swap target falls back; Earn, CCTP, Send, Receive, and zero-decimal formatting remain correct')
 console.log('token-only ordering fixtures passed: newer incoming transfer sorts first with Receive and Unknown status')
+
+const approvalSelector = toFunctionSelector('approve(address,uint256)')
+const spender = '0x7fb8c7260b63934d8da38af902f87ae6e284a845'
+const addressWord = (address) => address.slice(2).toLowerCase().padStart(64, '0')
+const amountWord = (amount) => BigInt(amount).toString(16).padStart(64, '0')
+const approveInput = (token, amount) => `${approvalSelector}${addressWord(token)}${amountWord(amount)}`
+const approvalCases = [
+  { hash: `0x${'a'.repeat(64)}`, to: earnVaults[0], input: approveInput(spender, '100047248648048185') },
+  { hash: `0x${'b'.repeat(64)}`, to: earnVaults[1], input: approveInput(spender, '100000000000000000') },
+  { hash: `0x${'c'.repeat(64)}`, to: arcUsdc, input: approveInput(spender, '100000') },
+  { hash: `0x${'d'.repeat(64)}`, to: tokenA, input: approveInput(spender, '1000000') },
+  { hash: `0x${'e'.repeat(64)}`, to: earnVaults[0], input: `${approvalSelector}${'1'}${'0'.repeat(63)}${amountWord('1000000')}` },
+  { hash: `0x${'f'.repeat(64)}`, to: arcUsdc, input: approveInput(spender, (2n ** 256n - 1n).toString()) },
+  { hash: `0x${'0'.repeat(64)}`, to: arcUsdc, input: `${approvalSelector}${'a'.repeat(100_000)}` },
+]
+const normalizedApprovalPayload = await normalizeApiTransactions(approvalCases.map((item) => ({
+  ...item,
+  from: wallet,
+  timeStamp: '1700000200',
+  value: '0',
+  isError: '0',
+  txreceipt_status: '1',
+})))
+assert.equal(normalizedApprovalPayload.transactions[0].approval.spender, spender)
+assert.equal(normalizedApprovalPayload.transactions[0].approval.amount, '100047248648048185')
+assert.equal(normalizedApprovalPayload.transactions[4].approval, null, 'malformed spender padding must not decode')
+assert.equal(normalizedApprovalPayload.transactions[5].approval.amount, (2n ** 256n - 1n).toString(), 'uint256 max must survive as a decimal string')
+assert.equal(normalizedApprovalPayload.transactions[6].input, approvalSelector)
+assert.equal(normalizedApprovalPayload.transactions[6].approval, null)
+assert.doesNotMatch(JSON.stringify(normalizedApprovalPayload.transactions[6]), /a{1000}/, 'large calldata must not reach the browser response')
+const approvalActivities = normalizeWalletActivity(wallet, {
+  transactions: normalizedApprovalPayload.transactions,
+  tokenTransfers: [],
+  limit: 20,
+})
+const approvalsByHash = new Map(approvalActivities.map((item) => [item.txHash, item]))
+assert.equal(approvalsByHash.get(approvalCases[0].hash).title, 'Earn approval · Galaxy USDC')
+assert.equal(approvalsByHash.get(approvalCases[0].hash).amount, 'Limit 0.100047248648048185 arcUSDC')
+assert.equal(approvalsByHash.get(approvalCases[1].hash).title, 'Earn approval · Gauntlet USDC Prime')
+assert.equal(approvalsByHash.get(approvalCases[1].hash).amount, 'Limit 0.1 gtusdcp')
+assert.equal(approvalsByHash.get(approvalCases[2].hash).title, 'Token approval')
+assert.equal(approvalsByHash.get(approvalCases[2].hash).amount, 'Limit 0.1 USDC')
+assert.equal(approvalsByHash.get(approvalCases[3].hash).title, 'Token approval')
+assert.equal(approvalsByHash.get(approvalCases[3].hash).amount, null, 'unknown approval token must not receive a fabricated amount')
+assert.equal(approvalsByHash.get(approvalCases[4].hash).amount, null, 'malformed approval calldata must not create an amount')
+assert.ok(approvalsByHash.get(approvalCases[5].hash).amount.startsWith('Limit 115,792,089'))
+assert.ok(approvalsByHash.get(approvalCases[5].hash).amount.endsWith('.639935 USDC'))
+console.log('approval fixtures passed: strict bounded decoding, vault and USDC limits, unknown/malformed omission, uint256 max stays bigint safe')
+
+const earnAndDirectionHash = (digit) => `0x${digit.repeat(64)}`
+const earnScenarios = [
+  { hash: earnAndDirectionHash('1'), vault: earnVaults[0], label: 'Galaxy USDC', verb: 'deposit', walletUsdc: true, walletShares: false, rawUsdc: '100000', rawShares: '100047248648048185', expected: '−0.1 USDC' },
+  { hash: earnAndDirectionHash('2'), vault: earnVaults[0], label: 'Galaxy USDC', verb: 'withdrawal', walletUsdc: false, walletShares: true, rawUsdc: '100000', rawShares: '100047248648048185', expected: '+0.1 USDC' },
+  { hash: earnAndDirectionHash('3'), vault: earnVaults[1], label: 'Gauntlet USDC Prime', verb: 'deposit', walletUsdc: true, walletShares: false, rawUsdc: '200000', rawShares: '200000000000000000', expected: '−0.2 USDC' },
+  { hash: earnAndDirectionHash('4'), vault: earnVaults[1], label: 'Gauntlet USDC Prime', verb: 'withdrawal', walletUsdc: false, walletShares: true, rawUsdc: '200000', rawShares: '200000000000000000', expected: '+0.2 USDC' },
+]
+const earnActivities = normalizeWalletActivity(wallet, {
+  limit: 20,
+  transactions: earnScenarios.map(({ hash }) => transaction(hash, other, '0x12345678')),
+  tokenTransfers: earnScenarios.flatMap((item) => [
+    movement(item.hash, arcUsdc, item.walletUsdc ? wallet : other, item.walletUsdc ? other : wallet, 6, 'USDC', item.rawUsdc),
+    movement(item.hash, item.vault, item.walletShares ? wallet : other, item.walletShares ? other : wallet, 18, item.vault === earnVaults[0] ? 'arcUSDC' : 'gtusdcp', item.rawShares),
+  ]),
+})
+const earnByHash = new Map(earnActivities.map((item) => [item.txHash, item]))
+for (const scenario of earnScenarios) {
+  const activity = earnByHash.get(scenario.hash)
+  assert.equal(activity.type, 'earn')
+  assert.equal(activity.title, `Earn ${scenario.verb} · ${scenario.label}`)
+  assert.equal(activity.amount, scenario.expected, `${scenario.label} ${scenario.verb} must display underlying USDC direction`)
+}
+
+const cctpOutHash = earnAndDirectionHash('5')
+const cctpInHash = earnAndDirectionHash('6')
+const sendHash = earnAndDirectionHash('7')
+const receiveHash = earnAndDirectionHash('8')
+const semanticActivities = normalizeWalletActivity(wallet, {
+  limit: 20,
+  transactions: [
+    transaction(cctpOutHash, cctpMessenger, cctpDepositSelector),
+    transaction(cctpInHash, cctpTransmitter, toFunctionSelector('receiveMessage(bytes,bytes)'), other),
+    transaction(sendHash, arcUsdc, '0xa9059cbb'),
+    transaction(receiveHash, arcUsdc, '0xa9059cbb', other),
+  ],
+  tokenTransfers: [
+    movement(cctpOutHash, arcUsdc, wallet, cctpMessenger, 6, 'USDC', '100000'),
+    movement(cctpInHash, arcUsdc, other, wallet, 6, 'USDC', '99997'),
+    movement(sendHash, arcUsdc, wallet, other, 6, 'USDC', '300000'),
+    movement(receiveHash, arcUsdc, other, wallet, 6, 'USDC', '531197'),
+  ],
+})
+const semanticByHash = new Map(semanticActivities.map((item) => [item.txHash, item]))
+assert.equal(semanticByHash.get(cctpOutHash).amount, '−0.1 USDC')
+assert.equal(semanticByHash.get(cctpInHash).amount, '+0.099997 USDC')
+assert.equal(semanticByHash.get(sendHash).amount, '−0.3 USDC')
+assert.equal(semanticByHash.get(receiveHash).amount, '+0.531197 USDC')
+assert.equal(earnByHash.get(earnScenarios[0].hash).type, 'earn', 'paired vault movements must never become Swap')
+console.log('Earn and amount fixtures passed: Galaxy/Gauntlet deposit and withdrawal, signed underlying USDC, CCTP direction, Send/Receive, no generic Swap')
+console.log('legacy classification fixtures passed: unknown swap target remains interaction; zero-decimal token amount remains unscaled')
 
 const dashboardSource = readFileSync(
   fileURLToPath(new URL('../src/components/MainnetWalletActivity.tsx', import.meta.url)),

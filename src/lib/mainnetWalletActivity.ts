@@ -1,6 +1,7 @@
 import { toFunctionSelector } from 'viem'
 import { MAINNET_CCTP_MESSAGE_TRANSMITTER, MAINNET_CCTP_TOKEN_MESSENGER } from '../config/mainnetCctp'
 import { MAINNET_EARN_SELECTED_VAULT_ADDRESSES } from '../config/mainnetEarn'
+import { MAINNET_CONFIG } from '../config/mainnet'
 
 export type WalletActivityType = 'send' | 'receive' | 'swap' | 'bridge' | 'earn' | 'approve' | 'interaction'
 export type WalletActivityStatus = 'Confirmed' | 'Failed' | 'Unknown'
@@ -27,6 +28,10 @@ type Transaction = {
   isError: string
   receiptStatus: string
   tokenOnly?: boolean
+  approval?: {
+    spender: string
+    amount: string
+  } | null
 }
 
 type TokenTransfer = {
@@ -51,18 +56,17 @@ const VAULTS = new Map<string, string>([
   [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[1].toLowerCase(), 'Gauntlet USDC Prime'],
 ])
 
-const ERC4626_SELECTORS = new Map<string, string>([
-  [toFunctionSelector('deposit(uint256,address)'), 'deposit'],
-  [toFunctionSelector('mint(uint256,address)'), 'mint'],
-  [toFunctionSelector('withdraw(uint256,address,address)'), 'withdraw'],
-  [toFunctionSelector('redeem(uint256,address,address)'), 'redeem'],
-])
-
 const CCTP_DEPOSIT_SELECTOR = toFunctionSelector(
   'depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)',
 )
 const CCTP_RECEIVE_SELECTOR = toFunctionSelector('receiveMessage(bytes,bytes)')
 const APPROVE_SELECTOR = toFunctionSelector('approve(address,uint256)')
+const ARC_USDC_ADDRESS = MAINNET_CONFIG.arcUsdcAddress.toLowerCase()
+const VERIFIED_APPROVAL_TOKENS = new Map<string, { symbol: string; decimals: number }>([
+  [ARC_USDC_ADDRESS, { symbol: 'USDC', decimals: 6 }],
+  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[0].toLowerCase(), { symbol: 'arcUSDC', decimals: 18 }],
+  [MAINNET_EARN_SELECTED_VAULT_ADDRESSES[1].toLowerCase(), { symbol: 'gtusdcp', decimals: 18 }],
+])
 const ERC20_TRANSFER_SELECTORS = new Set<string>([
   toFunctionSelector('transfer(address,uint256)'),
   toFunctionSelector('transferFrom(address,address,uint256)'),
@@ -100,16 +104,21 @@ function getMovements(wallet: string, transfers: TokenTransfer[]): Movement[] {
   return [...grouped.values()]
 }
 
-function formatAmount(value: bigint, decimals: number, symbol: string) {
-  if (value <= 0n || decimals < 0 || decimals > 36) return null
+function formatAmount(value: bigint, decimals: number, symbol: string, allowZero = false, maxFractionDigits = 6) {
+  if (value < 0n || (!allowZero && value === 0n) || decimals < 0 || decimals > 36) return null
   const base = 10n ** BigInt(decimals)
   const integer = value / base
   const fractional = value % base
   const integerText = new Intl.NumberFormat('en-US').format(integer)
   const fractionText = decimals > 0
-    ? fractional.toString().padStart(decimals, '0').slice(0, 6).replace(/0+$/, '')
+    ? fractional.toString().padStart(decimals, '0').slice(0, maxFractionDigits).replace(/0+$/, '')
     : ''
   return `${integerText}${fractionText ? `.${fractionText}` : ''} ${symbol}`
+}
+
+function formatDirectionalAmount(value: bigint, decimals: number, symbol: string, outgoing: boolean) {
+  const formatted = formatAmount(value, decimals, symbol)
+  return formatted ? `${outgoing ? '−' : '+'}${formatted}` : null
 }
 
 function statusFor(transaction: Transaction): WalletActivityStatus {
@@ -128,6 +137,23 @@ function humanize(type: WalletActivityType, verb?: string, vault?: string) {
   return vault ? `Contract interaction · ${vault}` : 'Contract interaction'
 }
 
+function classifyEarnMovement(movements: Movement[]) {
+  const candidates: Array<{ vault: string; verb: 'deposit' | 'withdrawal'; movement: Movement; outgoing: boolean }> = []
+  for (const [address, label] of VAULTS) {
+    const usdcOut = movements.find((movement) => movement.key === ARC_USDC_ADDRESS && movement.outgoing)
+    const usdcIn = movements.find((movement) => movement.key === ARC_USDC_ADDRESS && !movement.outgoing)
+    const sharesIn = movements.find((movement) => movement.key === address && !movement.outgoing)
+    const sharesOut = movements.find((movement) => movement.key === address && movement.outgoing)
+    const isDeposit = Boolean(usdcOut && sharesIn)
+    const isWithdrawal = Boolean(sharesOut && usdcIn)
+
+    if (isDeposit === isWithdrawal) continue
+    if (isDeposit && usdcOut) candidates.push({ vault: label, verb: 'deposit', movement: usdcOut, outgoing: true })
+    if (isWithdrawal && usdcIn) candidates.push({ vault: label, verb: 'withdrawal', movement: usdcIn, outgoing: false })
+  }
+  return candidates.length === 1 ? candidates[0] : null
+}
+
 function classify(
   wallet: string,
   transaction: Transaction,
@@ -137,9 +163,7 @@ function classify(
   const from = transaction.from?.toLowerCase() ?? ''
   const selector = transaction.input.slice(0, 10).toLowerCase()
   const movements = getMovements(wallet, transfers)
-  const hasMovementEvidence = movements.length > 0
   const vault = VAULTS.get(recipient)
-  const earnAction = ERC4626_SELECTORS.get(selector)
 
   if (transaction.isError === '1' || transaction.receiptStatus === '0') {
     return {
@@ -153,16 +177,16 @@ function classify(
     }
   }
 
-  if (vault && earnAction && hasMovementEvidence) {
-    const movement = movements.length === 1 ? movements[0] : null
+  const earnMovement = classifyEarnMovement(movements)
+  if (earnMovement) {
     return {
       id: transaction.hash,
       txHash: transaction.hash,
       type: 'earn',
-      title: humanize('earn', earnAction, vault),
-      amount: movement ? formatAmount(movement.value, movement.decimals, movement.symbol) : null,
+      title: humanize('earn', earnMovement.verb, earnMovement.vault),
+      amount: formatDirectionalAmount(earnMovement.movement.value, 6, 'USDC', earnMovement.outgoing),
       counterparty: null,
-      protocol: vault,
+      protocol: earnMovement.vault,
     }
   }
 
@@ -175,23 +199,32 @@ function classify(
       txHash: transaction.hash,
       type: 'bridge',
       title: humanize('bridge'),
-      amount: movements.length === 1
-        ? formatAmount(movements[0].value, movements[0].decimals, movements[0].symbol)
-        : null,
+      amount: (() => {
+        const outgoing = selector === CCTP_DEPOSIT_SELECTOR
+        const usdcMovement = movements.find((movement) => movement.key === ARC_USDC_ADDRESS && movement.outgoing === outgoing)
+        return usdcMovement ? formatDirectionalAmount(usdcMovement.value, 6, 'USDC', outgoing) : null
+      })(),
       counterparty: null,
       protocol: 'Circle CCTP',
     }
   }
 
   if (selector === APPROVE_SELECTOR) {
+    const tokenAddress = recipient
+    const token = VERIFIED_APPROVAL_TOKENS.get(tokenAddress)
+    const rawApprovalAmount = transaction.approval?.amount
+    const approvalAmount = token && typeof rawApprovalAmount === 'string' && /^\d+$/.test(rawApprovalAmount)
+      ? formatAmount(BigInt(rawApprovalAmount), token.decimals, token.symbol, true, token.decimals)
+      : null
+    const approvalVault = VAULTS.get(tokenAddress)
     return {
       id: transaction.hash,
       txHash: transaction.hash,
       type: 'approve',
-      title: humanize('approve'),
-      amount: null,
+      title: approvalVault ? `Earn approval · ${approvalVault}` : humanize('approve'),
+      amount: approvalAmount ? `Limit ${approvalAmount}` : null,
       counterparty: transaction.to,
-      protocol: null,
+      protocol: approvalVault ?? null,
     }
   }
 
@@ -202,7 +235,7 @@ function classify(
       txHash: transaction.hash,
       type: 'send',
       title: humanize('send'),
-      amount: formatAmount(nativeValue, ARC_NATIVE_DECIMALS, 'USDC'),
+      amount: formatDirectionalAmount(nativeValue, ARC_NATIVE_DECIMALS, 'USDC', true),
       counterparty: transaction.to,
       protocol: null,
     }
@@ -213,7 +246,7 @@ function classify(
       txHash: transaction.hash,
       type: 'receive',
       title: humanize('receive'),
-      amount: formatAmount(nativeValue, ARC_NATIVE_DECIMALS, 'USDC'),
+      amount: formatDirectionalAmount(nativeValue, ARC_NATIVE_DECIMALS, 'USDC', false),
       counterparty: transaction.from,
       protocol: null,
     }
@@ -230,7 +263,7 @@ function classify(
         txHash: transaction.hash,
         type: movement.outgoing ? 'send' : 'receive',
         title: humanize(movement.outgoing ? 'send' : 'receive'),
-        amount: formatAmount(movement.value, movement.decimals, movement.symbol),
+        amount: formatDirectionalAmount(movement.value, movement.decimals, movement.symbol, movement.outgoing),
         counterparty: movement.outgoing ? transaction.to : transaction.from,
         protocol: null,
       }

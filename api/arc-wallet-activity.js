@@ -37,9 +37,25 @@ function normalizeTimestamp(value) {
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
 }
 
+function normalizeApproval(input) {
+  if (typeof input !== 'string' || input.length !== 138 || !/^0x[\da-f]{136}$/i.test(input)) return null
+  if (input.slice(0, 10).toLowerCase() !== '0x095ea7b3') return null
+
+  const spenderWord = input.slice(10, 74)
+  const amountWord = input.slice(74, 138)
+  if (!/^0{24}[\da-f]{40}$/i.test(spenderWord) || !/^[\da-f]{64}$/i.test(amountWord)) return null
+
+  return {
+    spender: `0x${spenderWord.slice(24)}`,
+    amount: BigInt(`0x${amountWord}`).toString(),
+  }
+}
+
 function normalizeTransaction(row) {
   const hash = safeString(row?.hash, HASH_PATTERN)
   if (!hash) return null
+  const fullInput = typeof row?.input === 'string' ? row.input : null
+  const selector = fullInput && /^0x[\da-f]{8}/i.test(fullInput) ? fullInput.slice(0, 10) : '0x'
 
   return {
     hash,
@@ -47,9 +63,8 @@ function normalizeTransaction(row) {
     from: safeString(row?.from, ADDRESS_PATTERN),
     to: safeString(row?.to, ADDRESS_PATTERN),
     value: /^\d+$/.test(String(row?.value ?? '')) ? String(row.value) : '0',
-    input: typeof row?.input === 'string' && /^0x[\da-f]*$/i.test(row.input)
-      ? row.input.slice(0, 10)
-      : '0x',
+    input: selector,
+    approval: fullInput ? normalizeApproval(fullInput) : null,
     isError: String(row?.isError ?? ''),
     receiptStatus: String(row?.txreceipt_status ?? ''),
   }
