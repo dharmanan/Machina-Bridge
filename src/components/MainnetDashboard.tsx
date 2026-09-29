@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPublicClient, formatUnits, http, parseAbi } from 'viem'
-import { AlertCircle, ExternalLink, RefreshCw, RotateCcw, TrendingUp, Wallet } from 'lucide-react'
+import {
+  AlertCircle,
+  ExternalLink,
+  RefreshCw,
+  RotateCcw,
+  TrendingUp,
+  Wallet,
+} from 'lucide-react'
 import { useAccount } from 'wagmi'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
@@ -105,7 +112,6 @@ export default function MainnetDashboard() {
     error: string | null
   }>>({})
   const [, setRefundClock] = useState(() => Date.now())
-
   const loadEvmBalance = async (key: keyof typeof MAINNET_NETWORKS) => {
     if (!address) return
 

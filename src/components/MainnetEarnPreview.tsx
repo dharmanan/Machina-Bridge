@@ -120,6 +120,13 @@ function formatUsdc(value?: string | null) {
   return `${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC`
 }
 
+function isZeroLiquidity(value?: string | null) {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim()
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(normalized)) return false
+  return !/[1-9]/.test(normalized)
+}
+
 function vaultAddress(vault: EarnVault) {
   return vault.vaultAddress ?? vault.address ?? ''
 }
@@ -505,7 +512,7 @@ export default function MainnetEarnPreview() {
                 <div>
                   <h3 className="text-sm font-semibold">USDC vaults on Arc</h3>
                   <p className="mt-1 text-xs text-slate-500">
-                    Compare current rates and withdrawable liquidity across selected vaults.
+                    Compare current rates across selected vaults.
                   </p>
                   <p className="mt-1 text-[11px] leading-5 text-slate-400">
                     Circle Guarded adds protocol safeguards, but it does not remove smart contract or market risk.
@@ -575,10 +582,13 @@ export default function MainnetEarnPreview() {
                         </p>
                       </div>
                       <div>
-                        <p className="text-[11px] text-slate-500">Withdrawable liquidity</p>
-                        <p className="mt-1 text-sm font-semibold">
-                          {formatUsdc(vault.liquidityProfile?.available ?? vault.liquidity)}
-                        </p>
+                        <p className="text-[11px] text-slate-500">Withdrawal</p>
+                        <p className="mt-1 text-sm font-semibold">Checked at review</p>
+                        {isZeroLiquidity(vault.liquidityProfile?.available ?? vault.liquidity) && (
+                          <p className="mt-1 text-[11px] leading-4 text-amber-700">
+                            Liquidity may be limited
+                          </p>
+                        )}
                       </div>
                       {hasPerformanceFee && (
                         <div>
