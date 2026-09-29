@@ -8,7 +8,7 @@ Arc JSON-RPC blokları, tam işlemleri, receipt'leri, log'ları ve kontrat kodun
 
 Arc USDC'nin native ve ERC-20 yüzleri aynı ekonomik bakiyeye bağlıdır. [Arc indexing docs](https://docs.arc.io/integrate/infrastructure/indexing-events) uyarınca explicit USDC transferleri için canonical akış, EIP-7708 system emitter `0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE` `Transfer` olaylarıdır; ERC-20 arayüz olayları aynı hareketin hacmine ikinci kez eklenmez. Bu denetimde 10 blokta örtüşen işlem/log örnekleri görüldü. CCTP V2 için bilinen Arc kontratlarından inbound mint ve mesaj olayları okundu. Tam net köprü akışı için outbound burn olayları ile kaynak zincirdeki mint/burn olaylarını eşleştirmek, domain ve fee tanımlarını sabitlemek gerekir. DEX swap/hacim metrikleri için repoda doğrulanmış router/pool registry yoktur; swap sınıflandırması üretilemez.
 
-**Öneri:** Phase 1'de Arc public RPC ve kendi self-indexing hattını canonical kaynak ve tarihsel backfill'in primary yolu olarak kur. Önce blok/receipt tutarlılığı ve bilinen CCTP/vault kontratlarının olayları; DEX ve tüm zincir token hacmi kapsam dışı. Ücretsiz, anahtarsız ve kullanım şartları uygun bir public indexer varsa ileride yalnız discovery/reconciliation yardımcısı olabilir; zorunlu değildir. Böyle bir kaynak yoksa ilgili metrik `unavailable` kalır, operatörden provider satın alması veya signup yapması istenmez. Kalıcı depolama ileride ayrı bir Arc Intelligence domain'i olmalı; mevcut Bridge Upstash Redis'i bu amaçla kullanılmamalı. Database/altyapı seçimi bu fazda yapılmadı.
+**Öneri:** Phase 1 P0, Section 13.10 ile uyumlu genel Arc Intelligence çekirdeğidir: generic Arc block/receipt/log ingestion; generic token discovery ve metadata verification; verified major asset registry; USDC canonical EIP-7708 handling; Uniswap V3/V4; Aave V4; Morpho V2; CCTP V2; Gateway; bounded historical backfill; hourly/daily metric contracts; provenance/completeness. Historical backfill'in primary yolu Arc public RPC + self indexing'dir. Ücretsiz, anahtarsız ve kullanım şartları uygun bir public indexer varsa yalnız optional discovery/reconciliation olabilir; yoksa unsupported metrik `unavailable` kalır. Ücretli provider, yeni signup, API key veya trial istenmez. Kalıcı depolama ileride ayrı bir Arc Intelligence domain'i olmalı; mevcut Bridge Upstash Redis'i bu amaçla kullanılmamalı. Database/altyapı seçimi bu fazda yapılmadı.
 
 ## 2. Current Machina data architecture
 
@@ -131,7 +131,7 @@ Mevcut Circle EarnKit ve Morpho GraphQL vault discovery/finansal gösterim kayna
 
 ## 8. DEX limitations
 
-Repo'da Arc mainnet için doğrulanmış DEX router, factory, pool registry veya swap ABI bulunmadı. Tek tx'de in ve out token hareketleri; köprü, vault, transferFrom, fee, batch veya swap olabilir. Bunları swap diye etiketlemek yanlış pozitif üretir. Swap sayısı, hacim ve trader sayısı için önce resmi/verified pool registry, event semantiği, aggregator ayrıştırması, token metadata ve gerektiğinde fiyat yöntemi doğrulanmalı. Phase 0 DEX metriği üretmez.
+Bu paragraf ilk Phase 0 repo incelemesinin tarihsel bulgusudur: o aşamada repo içinde Arc mainnet için doğrulanmış DEX router, factory, pool registry veya swap ABI bulunmamıştı. Sonraki Section 13.3 incelemesi Uniswap V3/V4'ün official Arc deployment adreslerini doğruladı. Tek tx'de in ve out token hareketleri; köprü, vault, transferFrom, fee, batch veya swap olabilir. Bunları swap diye etiketlemek yanlış pozitif üretir. Swap sayısı, hacim ve trader sayısı için protocol-specific event semantiği, aggregator ayrıştırması, token metadata ve gerektiğinde fiyat yöntemi ayrıca doğrulanmalı; Section 13.3 dışındaki DEX'ler için registry kanıtı beklenir.
 
 ## 9. Recommended Intelligence architecture
 
@@ -141,7 +141,7 @@ Repo'da Arc mainnet için doğrulanmış DEX router, factory, pool registry veya
 | B. Uygun public indexer (optional) | Yalnız ücretsiz, anahtarsız ve kullanım şartları uygun olduğunda discovery/reconciliation yardımcısıdır; canonical kaynak RPC'dir. | Primary backfill değildir; RPC ile karşılaştırılır, kaynağın kesilmesi metrik erişimini bloke etmez. | Bulunmaması halinde operatör signup/satın alma yapmaz; desteklenmeyen metrik `unavailable` kalır. | İsteğe bağlı kalite kontrolü sağlar, ürünün çalışması buna bağlı değildir. |
 | C. Signup/key/trial/ücret isteyen hosted indexer | Kapsam dışı; production data source veya mimari bileşen olarak kullanılmaz. | Phase 1'de değerlendirilip seçilecek provider değildir. | Yeni hesap, credential veya ödeme talep edilmez. | Ürün bu kaynağa bağımlı tasarlanmaz. |
 
-**Önerilen Phase 1 sınırı:** Arc public RPC + self indexing üzerine küçük çekirdek: Arc blok/receipt işleme, bilinen CCTP V2 log decode ve iki vault için ABI/olay doğrulaması. Historical backfill RPC'den gelir. Ücretsiz, anahtarsız ve kullanım şartları uygun public indexer varsa yalnız optional discovery/reconciliation için değerlendirilebilir; böyle kaynak yoksa metrik `unavailable` kalır. Ücretli veya signup/key/trial gated provider seçimi Phase 1'de yapılmaz ve operatörden istenmez. Eksik veya tutarsız pencere “complete” sayılmamalı; her metrik tanımı, chain ID, block range, source, sync checkpoint ve doğrulama durumu taşımalı. UI, execution veya Bridge Redis üzerinde değişiklik yok.
+**Önerilen Phase 1 sınırı:** Section 13.10 P0 ile aynı genel kapsam: Arc public RPC + self indexing core; generic block/receipt/log ingestion ve normalization; generic token emitter discovery ve metadata verification; verified major asset registry; USDC canonical EIP-7708 handling; Uniswap V3/V4 registry + event decoder; Aave V4 Hub/Spoke decoder; Morpho V2 vault/market registry; CCTP V2 ve Gateway decoder'ları; bounded historical backfill; hourly/daily metric contracts; provenance/completeness. Historical backfill RPC'den gelir. Ücretsiz, anahtarsız ve kullanım şartları uygun public indexer varsa yalnız optional discovery/reconciliation olabilir; yoksa metrik `unavailable` kalır. Ücretli provider, yeni signup, API key veya trial istenmez. Eksik veya tutarsız pencere “complete” sayılmamalı; her metrik tanımı, chain ID, block range, source, sync checkpoint ve doğrulama durumu taşımalı. UI, execution veya Bridge Redis üzerinde değişiklik yok.
 
 ## 10. Proposed data domains/schema
 
@@ -164,12 +164,20 @@ Raw integer tutarlar string/decimal-safe biçimde tutulmalı; token/native decim
 
 ## 11. Phase 1 implementation plan
 
-1. **Metrik sözleşmesi:** “unique addresses”, CCTP minted/burned/net, USDC canonical transfer ve zaman sınırlarını açıkça tanımla; unsupported alanları `unavailable` tut.
-2. **RPC veri bütünlüğü:** Küçük, bounded blok ilerletici; block/tx/receipt sayısı eşleşmesi, retry/backoff, 429 gözlemi, resume/continuity ve missing block detection için checkpoint, provenance. Arc deterministic finality için reorg watcher, rollback veya confirmation depth ekleme. Tarihsel derinlik/limit testi ayrı kontrollü kapasite çalışması olsun.
-3. **USDC kanonikleştirme:** Explicit USDC transfer hacmini EIP-7708 system `Transfer` akışından çıkar; ERC-20 arayüz log'unu ayrı tut ve ikinci kez toplama. Gas deductions event değildir; Zero5 öncesi historical backfill için legacy `NativeCoin` olaylarını işle.
-4. **Bilinen protokol decoder'ları:** Resmi Circle V2 ABI'leri ve Arc contract doğrulamasıyla CCTP flow; Galaxy/Gauntlet deployed ABI ve gerçek deposit/withdraw receipt'leriyle vault flow. Önce unit fixture, sonra kısa canlı reconciliation.
-5. **Historical backfill ve optional reconciliation:** Primary yol Arc public RPC + self indexing'dir; aynı block/log aralıklarında completeness ve RPC limitlerini ölç. Ücretsiz, anahtarsız ve kullanım şartları uygun public indexer varsa yalnız optional discovery/reconciliation karşılaştırması yap. Uygun kaynak yoksa metrik `unavailable` kalır; signup, API key, trial veya satın alma talep edilmez.
-6. **Ayrı read model/API tasarımı:** Tamlık, kaynak, last indexed block ve tanım sürümünü içeren read response sözleşmesini yaz; storage/servis seçimi ve production endpoint sonraki onaya bırakılır.
+1. **RPC/self indexing core:** Arc public RPC canonical source ve historical backfill'in primary yolu olsun. Self-indexer blokları bounded aralıklarla işler; third-party provider bağımlılığı kurulmaz.
+2. **Block/tx/receipt/log normalization:** Chain id, block/transaction/log ordering, receipt status, timestamps ve raw values normalize edilir; retry/rate sınırları ve resume/continuity checkpoint'i tanımlanır.
+3. **Generic token emitter discovery:** Bounded Arc log ingestion ile `Transfer` emitter adaylarını keşfet; emitter'ı otomatik token kabul etme.
+4. **Metadata verification:** `symbol`, `name`, `decimals`, `totalSupply`, code/interface ve proxy provenance doğrula; başarısız metadata'yı `unknown/unverified` tut.
+5. **Verified major asset registry:** USDC, EURC, cirBTC, WETH, USYC ve doğrulanan diğer Arc mainnet varlıklarının adres, decimals, issuer/category ve source provenance registry'sini kur.
+6. **USDC special canonicalization:** Explicit transfers için EIP-7708 system `Transfer` stream'ini kullan; ERC-20 interface activity'yi ayrıca sakla, aynı hareketi hacme ikinci kez ekleme. Zero5 öncesi historical backfill'de legacy `NativeCoin` olaylarını işle.
+7. **Uniswap V3/V4 registry + event decoder:** V3 factory/pool ve V4 PoolManager/PoolId discovery ile doğrulanmış swap/liquidity olaylarını decode et.
+8. **Aave V4 Hub/Spoke decoder:** V4 Hub ve Main/Forex Spoke market/reserve view'ları ile doğrulanmış protocol event'lerini işle.
+9. **Morpho V2 vault/market registry:** Vault ve market discovery'yi RPC/onchain ile doğrula; public Morpho API yalnız optional discovery/reconciliation olabilir.
+10. **CCTP V2 decoder:** Resmi Arc kontrat/ABI'leriyle mint, burn, message/domain ve fee alanlarını işle.
+11. **Gateway decoder:** Gateway olaylarını CCTP'den ayrı contract/provenance modeliyle işle.
+12. **Bounded historical backfill:** RPC'den tarihsel block/log aralıklarını ölçülü tara; Zero5 öncesi legacy `NativeCoin` ve eksik aralıkları kapsa. Eksik dönemleri complete sayma.
+13. **Hourly/daily metric contracts:** Pencere sınırları, units, denominator, asset, protocol ve definition version'ı sabitle; üretilemeyen değer `unavailable` kalsın.
+14. **Provenance/completeness:** Her metrikte source, chain id, block range, last indexed block ve completeness state taşı. Optional public indexer ancak ücretsiz, anahtarsız ve kullanım şartları uygun ise discovery/reconciliation için eklenebilir; böyle kaynak yoksa operatörden signup, API key, trial veya ödeme istenmez.
 
 ## 12. Risks/open questions
 
