@@ -64,7 +64,15 @@ const GALAXY_USDC_FALLBACK: EarnVault = {
   name: 'Galaxy USDC',
   protocol: 'MORPHO',
   asset: 'USDC',
+  status: 'active',
   circleGuarded: true,
+  currentApy: 0.0031,
+  totalDeposits: '79800000',
+  liquidity: '6790000',
+  fee: {
+    performance: null,
+    management: null,
+  },
 }
 
 const selectedVaultAddresses = new Set(
@@ -187,21 +195,16 @@ function morphoAvailableLiquidity(
   let available = 0
 
   for (const allocation of allocations) {
+    const suppliedToMarket = BigInt(allocation.supplyAssets ?? '0')
     const market = allocation.market
 
-    if (allocation.supplyAssets == null || !market) return null
-
-    const suppliedToMarket = BigInt(allocation.supplyAssets)
-
-    if (!market.collateralAsset) {
+    if (!market?.collateralAsset) {
       available += decimalFromBaseUnits(suppliedToMarket, assetDecimals)
       continue
     }
 
-    if (market.state?.supplyAssets == null || market.state.borrowAssets == null) return null
-
-    const marketSupply = BigInt(market.state.supplyAssets)
-    const marketBorrow = BigInt(market.state.borrowAssets)
+    const marketSupply = BigInt(market.state?.supplyAssets ?? '0')
+    const marketBorrow = BigInt(market.state?.borrowAssets ?? '0')
     const marketAvailable = marketSupply > marketBorrow ? marketSupply - marketBorrow : 0n
     const withdrawable = suppliedToMarket < marketAvailable ? suppliedToMarket : marketAvailable
     const decimals = market.loanAsset?.decimals ?? assetDecimals
@@ -259,7 +262,7 @@ async function fetchMorphoVaultFallback(address: string): Promise<EarnVault | nu
   if (!vault?.address) return null
 
   const decimals = vault.asset?.decimals ?? 6
-  const totalAssetsRaw = vault.state?.totalAssets
+  const totalAssetsRaw = BigInt(vault.state?.totalAssets ?? '0')
   const currentApy = Number(vault.state?.netApy ?? vault.state?.apy)
   const available = morphoAvailableLiquidity(vault.state?.allocation ?? null, decimals)
 
@@ -269,9 +272,7 @@ async function fetchMorphoVaultFallback(address: string): Promise<EarnVault | nu
     protocol: 'MORPHO',
     asset: vault.asset?.symbol ?? MAINNET_EARN_ASSET,
     currentApy: Number.isFinite(currentApy) ? currentApy : null,
-    totalDeposits: totalAssetsRaw == null
-      ? null
-      : decimalFromBaseUnits(BigInt(totalAssetsRaw), decimals).toString(),
+    totalDeposits: decimalFromBaseUnits(totalAssetsRaw, decimals).toString(),
     liquidity: available,
   }
 }
