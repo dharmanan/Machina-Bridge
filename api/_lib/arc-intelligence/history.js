@@ -4,6 +4,8 @@ import { buildAaveV4Snapshot } from './aave.js';
 import { buildMorphoV2Snapshot } from './morpho.js';
 import { buildCctpV2Snapshot } from './cctp.js';
 import { buildGatewaySnapshot } from './gateway.js';
+import { buildDexP1Snapshot } from './dex-p1.js';
+import { buildLaunchpadSnapshot } from './launchpads.js';
 import { ARC_CHAIN_ID, ARC_RPC_URL, createArcRpcClient } from './rpc.js';
 import { quantityToSafeNumber } from './normalize.js';
 
@@ -17,6 +19,8 @@ const DEFAULT_PROTOCOL_BUILDERS = Object.freeze({
   morpho: buildMorphoV2Snapshot,
   cctp: buildCctpV2Snapshot,
   gateway: buildGatewaySnapshot,
+  dexP1: buildDexP1Snapshot,
+  launchpads: buildLaunchpadSnapshot,
 });
 
 function tag(number) { return `0x${number.toString(16)}`; }
@@ -62,6 +66,14 @@ function coverageFrom(chunks, protocol, complete) {
         && results.every((result) => result.completeness?.candidateCoverageComplete === true),
       scope: 'verified_vault_subset',
     } : {}),
+    ...(protocol === 'launchpads' ? {
+      verifiedFactoryEventScanComplete: results.length === chunks.length
+        && results.every((result) => result.verifiedFactoryEventScanComplete === true),
+      protocolUniverseComplete: results.length === chunks.length
+        && results.every((result) => result.protocolUniverseComplete === true),
+      scope: 'verified_launchpad_factory_subset',
+    } : {}),
+    ...(protocol === 'dexP1' ? { status: 'unavailable', scope: 'unverified_dex_aggregator_candidates' } : {}),
     ...(['cctp', 'gateway'].includes(protocol) ? { crossChainCompletionCoverage: { status: 'unavailable' } } : {}),
   };
 }

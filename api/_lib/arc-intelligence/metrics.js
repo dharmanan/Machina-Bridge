@@ -4,10 +4,11 @@ import { HISTORY_DEFINITION_VERSION } from './history.js';
 import { summarizeVerifiedAssetTransfers } from './tokens.js';
 import { summarizeUsdcTransfers } from './usdc.js';
 import { TRANSFER_TOPIC, USDC_SYSTEM_EMITTER } from './usdc.js';
+import { P1A_LAUNCHPAD_CANDIDATES } from './p1a-registry.js';
 
 export const METRIC_DEFINITION_VERSION = 'arc-intelligence-metrics-v1';
 const PERIOD_SECONDS = Object.freeze({ hour: 3600, day: 86400 });
-const PROTOCOLS = ['uniswap', 'aave', 'morpho', 'cctp', 'gateway'];
+const PROTOCOLS = ['uniswap', 'aave', 'morpho', 'cctp', 'gateway', 'dexP1', 'launchpads'];
 
 function utc(seconds) { return new Date(seconds * 1000).toISOString(); }
 function sumRaw(values) { return values.reduce((sum, value) => sum + BigInt(value ?? '0'), 0n).toString(10); }
@@ -145,7 +146,8 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
     return predicate(protocols[index]?.[name]);
   });
   const pAdd = (name, ready, id, value, options = {}) => {
-    const sourceName = name === 'circle.gateway' ? 'gateway' : name.split('.')[0];
+    const sourceName = name === 'circle.gateway' ? 'gateway'
+      : name === 'launchpad.p1' ? 'launchpads' : name.split('.')[0];
     const versions = sourceVersions[sourceName];
     const versionCompatible = versions.length === 1
       && relevantProtocols.every((entry) => entry[sourceName]?.definitionVersion === versions[0]);
@@ -296,6 +298,29 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
   }
   add('gateway.crossChainCompletedCount', null,
     { protocol: 'circle.gateway', scope: 'counterpart_chain_unobserved' });
+
+  // P1 launch counts are independent of Uniswap pool swaps and token Transfers.
+  // An unverified factory yields unavailable, never a fabricated zero.
+  const launchpadUniverseComplete = protocolReady('launchpads', (result) => result?.protocolUniverseComplete === true);
+  for (const candidate of P1A_LAUNCHPAD_CANDIDATES.filter((entry) => entry.verificationStatus === 'source_verified_candidate')) {
+    const factoryReady = protocolReady('launchpads', (result) => result?.factories?.some((factory) =>
+      factory.address === candidate.address && factory.status === 'verified' && factory.eventScanComplete === true));
+    const events = ordered(selected.launchpads.flatMap((result) => result.launchEvents ?? [])
+      .filter((event) => range(event) && event.emitter === candidate.address));
+    const extra = { factory: candidate.address, protocolUniverseComplete: launchpadUniverseComplete,
+      verifiedFactorySubset: factoryReady };
+    const prefix = `launchpad.${candidate.protocol.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+    pAdd('launchpad.p1', factoryReady, `${prefix}.launchEventCount`, factoryReady ? events.length : null,
+      { scope: 'verified_launchpad_factory_subset', extra });
+    pAdd('launchpad.p1', factoryReady, `${prefix}.createdTokenCount`,
+      factoryReady ? new Set(events.map((event) => event.token)).size : null,
+      { scope: 'verified_launchpad_factory_subset', extra });
+    if (candidate.protocol !== 'Openlaunch') {
+      pAdd('launchpad.p1', factoryReady, `${prefix}.creatorCount`,
+        factoryReady ? new Set(events.map((event) => event.creator).filter(Boolean)).size : null,
+        { scope: 'explicit_event_creator_field', extra });
+    }
+  }
 
   return {
     period, bucketStartUtc: utc(startUtc), bucketEndUtc: utc(endUtc),
