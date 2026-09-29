@@ -183,18 +183,37 @@ async function verifyCandidate(rpc, candidate, blockTag, factory) {
   try {
     codePresent = isCode(await rpc.request('eth_getCode', [address, blockTag]));
   } catch {
-    return { ...candidate, address, status: 'unverified', version: 'unavailable', codePresent: false, underlying: null, shareToken: null, factoryEvidence: 'unavailable' };
+    return { ...candidate, address, status: 'unverified', version: 'unavailable', codePresent: false, underlying: null, shareToken: null, factoryEvidence: 'unavailable', verificationReason: 'code_read_unavailable' };
   }
-  if (!codePresent) return { ...candidate, address, status: 'rejected', version: 'no_contract_code', codePresent: false, underlying: null, shareToken: null, factoryEvidence: 'no_code' };
+  if (!codePresent) return {
+    ...candidate,
+    address,
+    status: 'rejected',
+    version: 'no_contract_code',
+    codePresent: false,
+    underlying: null,
+    shareToken: null,
+    factoryEvidence: 'no_code',
+    rejectionEvidence: {
+      authoritative: true,
+      source: 'eth_getCode_at_requestedEnd',
+      reason: 'no_contract_code',
+      blockTag,
+    },
+    verificationReason: null,
+  };
 
   let factoryRegistered = null;
+  let factoryReadFailed = !factory.codePresent;
   if (factory.codePresent) {
     try {
       const result = await readWord(rpc, factory.address, `${SELECTORS.isVaultV2}${encodeAddress(address)}`, blockTag);
       const flag = parseWord(result);
       if (flag === 0n || flag === 1n) factoryRegistered = flag === 1n;
+      else factoryReadFailed = true;
     } catch {
       factoryRegistered = null;
+      factoryReadFailed = true;
     }
   }
   if (factoryRegistered !== true) {
@@ -221,6 +240,10 @@ async function verifyCandidate(rpc, candidate, blockTag, factory) {
       ...candidate, address, status: 'unverified', version: 'unverified', codePresent: true,
       underlying, shareToken: null, erc4626Interface,
       factoryEvidence: factoryRegistered === false ? 'official_v2_factory_false; version_not_established' : 'official_v2_factory_unavailable',
+      verificationReason: factoryRegistered === false ? 'version_not_established'
+        : factoryReadFailed ? 'factory_read_unavailable'
+          : underlying?.status !== 'verified' ? 'underlying_metadata_unavailable'
+            : 'required_v2_view_unavailable',
     };
   }
 
@@ -285,6 +308,9 @@ async function verifyCandidate(rpc, candidate, blockTag, factory) {
       adapterRegistry,
       adaptersLengthRaw: adaptersLength?.toString(10) ?? null,
     },
+    verificationReason: isVerified ? null
+      : unavailableV2Views.length > 0 || !shareDecimalsVerified ? 'required_v2_view_unavailable'
+        : 'underlying_metadata_unavailable',
   };
 }
 
@@ -320,8 +346,12 @@ function accountingMetrics() {
   };
 }
 
-function flowSummary(flows, allocationEvents) {
+function flowSummary(flows, allocationEvents, { verifiedVaultCount, candidateVaultCount, unresolvedCandidateCount }) {
   return {
+    scope: 'verified_vault_subset',
+    verifiedVaultCount,
+    candidateVaultCount,
+    unresolvedCandidateCount,
     depositEventCount: flows.filter((flow) => flow.type === 'deposit').length,
     withdrawEventCount: flows.filter((flow) => flow.type === 'withdraw').length,
     deposits: flows.filter((flow) => flow.type === 'deposit').map(({ emitter, assetsRaw, sharesRaw, sender, owner, blockNumber, transactionHash, logIndex }) => ({ emitter, assetsRaw, sharesRaw, sender, owner, blockNumber, transactionHash, logIndex })),
@@ -362,7 +392,6 @@ export async function buildMorphoV2Snapshot({ phase1aSnapshot, rpc = createArcRp
     }));
   const verifiedVaults = candidates.filter((candidate) => candidate.status === 'verified');
   const verifiedAddresses = new Set(verifiedVaults.map((candidate) => candidate.address));
-  if (verifiedVaults.length !== candidates.length) warnings.push(`${candidates.length - verifiedVaults.length} candidate vault(s) were not verified as Arc VaultV2 contracts with verified underlying metadata.`);
 
   const flows = [];
   const allocationEvents = [];
@@ -391,8 +420,19 @@ export async function buildMorphoV2Snapshot({ phase1aSnapshot, rpc = createArcRp
   }
   if (malformedEventCount > 0) warnings.push(`${malformedEventCount} recognized Morpho VaultV2 event log(s) failed strict ABI validation.`);
 
-  const complete = phase1aSnapshot?.complete === true && snapshotIsUsable && rpcAllowed
-    && factory.codePresent && candidates.length === MORPHO_ARC_CANDIDATE_VAULTS.length && malformedEventCount === 0;
+  const isAuthoritativelyRejected = (candidate) => candidate.status === 'rejected'
+    && candidate.rejectionEvidence?.authoritative === true;
+  const unresolvedCandidateCount = candidates.filter((candidate) => candidate.status !== 'verified'
+    && !isAuthoritativelyRejected(candidate)).length;
+  const rejectedCandidateCount = candidates.filter(isAuthoritativelyRejected).length;
+  if (unresolvedCandidateCount > 0) warnings.push(`${unresolvedCandidateCount} candidate vault(s) remain unresolved; candidate universe coverage is incomplete.`);
+  if (rejectedCandidateCount > 0) warnings.push(`${rejectedCandidateCount} candidate vault(s) were authoritatively rejected at requestedEnd.`);
+  const candidateCoverageComplete = candidates.length === MORPHO_ARC_CANDIDATE_VAULTS.length
+    && candidates.every((candidate) => candidate.status === 'verified' || isAuthoritativelyRejected(candidate));
+  const verifiedVaultEventScanComplete = snapshotIsUsable
+    && phase1aSnapshot.complete === true
+    && malformedEventCount === 0;
+  const complete = factory.codePresent && verifiedVaultEventScanComplete && candidateCoverageComplete;
   const rawFlows = flows.map((flow) => ({
     ...flow,
     amountUnits: {
@@ -418,8 +458,13 @@ export async function buildMorphoV2Snapshot({ phase1aSnapshot, rpc = createArcRp
       version: candidate.version,
       codePresent: candidate.codePresent,
       factoryEvidence: candidate.factoryEvidence,
+      rejectionEvidence: candidate.rejectionEvidence ?? null,
     })),
-    flows: flowSummary(rawFlows, allocationEvents),
+    flows: flowSummary(rawFlows, allocationEvents, {
+      verifiedVaultCount: verifiedVaults.length,
+      candidateVaultCount: candidates.length,
+      unresolvedCandidateCount,
+    }),
     rawFlows,
     allocationEvents,
     ignoredShareTransferCount,
@@ -434,8 +479,9 @@ export async function buildMorphoV2Snapshot({ phase1aSnapshot, rpc = createArcRp
     completeness: {
       phase1aSnapshotComplete: phase1aSnapshot?.complete === true,
       factoryVerified: factory.codePresent,
-      candidatesClassified: candidates.length === MORPHO_ARC_CANDIDATE_VAULTS.length,
-      flowsComplete: malformedEventCount === 0,
+      verifiedVaultEventScanComplete,
+      candidateCoverageComplete,
+      unresolvedCandidateCount,
       complete,
     },
     warnings: [...new Set(warnings)],
