@@ -75,10 +75,11 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
   const range = (event) => Number.isSafeInteger(event.blockNumber)
     && event.blockNumber >= first.number && event.blockNumber <= last.number;
   const relevantSnapshots = snapshots.filter((snapshot) => snapshot.endBlock >= first.number && snapshot.startBlock <= last.number);
+  const relevantProtocols = relevantSnapshots.map((snapshot) => protocols[snapshots.indexOf(snapshot)] ?? {});
   const sourceVersions = {
     core: CORE_VERSION, history: HISTORY_DEFINITION_VERSION, metrics: METRIC_DEFINITION_VERSION,
     ...Object.fromEntries(PROTOCOLS.map((name) => [name,
-      [...new Set(protocols.map((entry) => entry[name]?.definitionVersion).filter(Boolean))]])),
+      [...new Set(relevantProtocols.map((entry) => entry[name]?.definitionVersion).filter(Boolean))]])),
   };
   const records = [];
   const add = (id, value, options = {}) => records.push(metric({
@@ -138,13 +139,23 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
   add('asset.USDC.interface.rawTransferAmount', interfaceActivity.amountRaw,
     { protocol: 'asset.transfer', asset: 'USDC', scope: 'erc20_interface_activity_not_canonical', unit: 'raw_erc20_interface_units', sourceComplete: interfaceActivity.complete && metadataVerified('USDC') });
 
-  const selected = Object.fromEntries(PROTOCOLS.map((name) => [name, protocols.map((entry) => entry[name]).filter(Boolean)]));
+  const selected = Object.fromEntries(PROTOCOLS.map((name) => [name, relevantProtocols.map((entry) => entry[name]).filter(Boolean)]));
   const protocolReady = (name, predicate) => relevantSnapshots.every((snapshot) => {
     const index = snapshots.indexOf(snapshot);
     return predicate(protocols[index]?.[name]);
   });
-  const pAdd = (name, ready, id, value, options = {}) => add(id, value,
-    { ...options, protocol: name, sourceComplete: ready, warnings: ready ? options.warnings : [...(options.warnings ?? []), `${name} decoder coverage is incomplete.`] });
+  const pAdd = (name, ready, id, value, options = {}) => {
+    const sourceName = name === 'circle.gateway' ? 'gateway' : name.split('.')[0];
+    const versions = sourceVersions[sourceName];
+    const versionCompatible = versions.length === 1
+      && relevantProtocols.every((entry) => entry[sourceName]?.definitionVersion === versions[0]);
+    add(id, value, { ...options, protocol: name, sourceComplete: ready && versionCompatible,
+      warnings: [
+        ...(options.warnings ?? []),
+        ...(!ready ? [`${name} decoder coverage is incomplete.`] : []),
+        ...(!versionCompatible ? [`${name} definition versions are missing or mixed across contributing chunks.`] : []),
+      ] });
+  };
 
   const u = selected.uniswap;
   const v3 = ordered(u.flatMap((result) => result.v3?.rawPoolFlows ?? []).filter(range));
@@ -203,11 +214,21 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
   }
 
   const m = selected.morpho;
-  const mFlow = ordered(m.flatMap((result) => result.rawFlows ?? []).filter(range));
-  const mAlloc = ordered(m.flatMap((result) => result.allocationEvents ?? []).filter(range));
-  const mReady = protocolReady('morpho', (result) => result?.completeness?.verifiedVaultEventScanComplete === true);
+  const verifiedSets = relevantProtocols.map((entry) => new Set((entry.morpho?.candidates ?? [])
+    .filter((candidate) => candidate.status === 'verified' && typeof candidate.address === 'string')
+    .map((candidate) => candidate.address.toLowerCase())));
+  const stableVerifiedVaults = [...(verifiedSets[0] ?? new Set())]
+    .filter((address) => verifiedSets.every((set) => set.has(address))).sort();
+  const stableVaultSet = new Set(stableVerifiedVaults);
+  const mFlow = ordered(m.flatMap((result) => result.rawFlows ?? [])
+    .filter((event) => range(event) && stableVaultSet.has(event.emitter?.toLowerCase())));
+  const mAlloc = ordered(m.flatMap((result) => result.allocationEvents ?? [])
+    .filter((event) => range(event) && stableVaultSet.has(event.emitter?.toLowerCase())));
+  const mReady = stableVerifiedVaults.length > 0
+    && protocolReady('morpho', (result) => result?.completeness?.verifiedVaultEventScanComplete === true);
   const mUniverse = protocolReady('morpho', (result) => result?.completeness?.candidateCoverageComplete === true);
-  const mExtra = { protocolUniverseComplete: mUniverse };
+  const mExtra = { verifiedVaults: stableVerifiedVaults,
+    stableVerifiedVaultCount: stableVerifiedVaults.length, protocolUniverseComplete: mUniverse };
   for (const type of ['deposit', 'withdraw']) {
     eventMetric((id, value, options) => pAdd('morpho.v2', mReady, id, value, { ...options, extra: mExtra }),
       `morpho.v2.${type}EventCount`, mFlow, { predicate: (event) => event.type === type, scope: 'verified_vault_subset' });
@@ -280,7 +301,8 @@ function emitBucket({ period, startUtc, blocks, allBlocks, snapshots, protocols,
     period, bucketStartUtc: utc(startUtc), bucketEndUtc: utc(endUtc),
     startBlock: first.number, endBlock: last.number,
     leftBoundaryCovered, rightBoundaryCovered, blockHistoryContiguous,
-    complete: coreComplete, coverageStatus: coreComplete ? 'available' : 'partial',
+    complete: coreComplete, coreBoundaryComplete: coreComplete,
+    coverageStatus: coreComplete ? 'available' : 'partial',
     metricCount: records.length, records,
   };
 }

@@ -208,8 +208,17 @@ async function verifyDeterministicFixtures() {
     transactionIndex: '0x0',
     logIndex: '0x1',
   };
+  const independentProtocolLog = {
+    address: historicalAddress,
+    topics: [`0x${'42'.repeat(32)}`], data: '0x1234',
+    blockNumber: '0xa', transactionIndex: '0x0', logIndex: '0x2',
+    transactionHash: reconciliationTransactionHash,
+  };
   const reconciliationMetadataCalls = [];
   let returnMatchingTransferLogs = false;
+  let transferPayloadMismatch = false;
+  let allLogExtra = false;
+  let allLogPayloadMismatch = false;
   const reconciliationRpc = {
     url: 'fixture://transfer-log-reconciliation',
     async request(method, params) {
@@ -240,10 +249,16 @@ async function verifyDeterministicFixtures() {
         contractAddress: null,
         logs: [reconciliationLog, reconciliationEmitterLog],
       }];
-      if (method === 'eth_getLogs') return returnMatchingTransferLogs ? [
-        { ...reconciliationLog, transactionHash: reconciliationTransactionHash },
-        { ...reconciliationEmitterLog, transactionHash: reconciliationTransactionHash },
-      ] : [];
+      if (method === 'eth_getLogs') {
+        const transfers = [
+          { ...reconciliationLog, transactionHash: reconciliationTransactionHash },
+          { ...reconciliationEmitterLog, transactionHash: reconciliationTransactionHash },
+        ];
+        if (params[0]?.topics) return returnMatchingTransferLogs
+          ? (transferPayloadMismatch ? [{ ...transfers[0], data: `0x${word(2)}` }, transfers[1]] : transfers) : [];
+        if (allLogExtra) return [...transfers, independentProtocolLog];
+        return allLogPayloadMismatch ? [{ ...transfers[0], data: `0x${word(2)}` }, transfers[1]] : transfers;
+      }
       if (method === 'eth_getCode') {
         reconciliationMetadataCalls.push({ method, params });
         return '0x6000';
@@ -281,8 +296,29 @@ async function verifyDeterministicFixtures() {
     endBlock: 10,
   });
   assert.equal(matchingTransferSnapshot.transferLogReconciliation.complete, true);
+  assert.equal(matchingTransferSnapshot.allLogReconciliation.complete, true);
   assert.equal(matchingTransferSnapshot.transferScanComplete, true);
   assert.equal(matchingTransferSnapshot.complete, true);
+  transferPayloadMismatch = true;
+  const mismatchedPayloadSnapshot = await buildBoundedSnapshot({ rpc: reconciliationRpc, startBlock: 10, endBlock: 10 });
+  assert.equal(mismatchedPayloadSnapshot.transferLogReconciliation.payloadMismatchCount, 1);
+  assert.equal(mismatchedPayloadSnapshot.transferLogReconciliation.complete, false);
+  assert.equal(mismatchedPayloadSnapshot.complete, false);
+  transferPayloadMismatch = false;
+  allLogPayloadMismatch = true;
+  const mismatchedAllLogPayload = await buildBoundedSnapshot({ rpc: reconciliationRpc, startBlock: 10, endBlock: 10 });
+  assert.equal(mismatchedAllLogPayload.transferLogReconciliation.complete, true);
+  assert.equal(mismatchedAllLogPayload.allLogReconciliation.payloadMismatchCount, 1);
+  assert.equal(mismatchedAllLogPayload.complete, false);
+  allLogPayloadMismatch = false;
+  allLogExtra = true;
+  const missingReceiptProtocolLog = await buildBoundedSnapshot({ rpc: reconciliationRpc, startBlock: 10, endBlock: 10 });
+  assert.equal(missingReceiptProtocolLog.transferLogReconciliation.complete, true);
+  assert.equal(missingReceiptProtocolLog.allLogReconciliation.extraLogCount, 1);
+  assert.equal(missingReceiptProtocolLog.allLogReconciliation.complete, false);
+  assert.equal(missingReceiptProtocolLog.complete, false);
+  assert.ok(missingReceiptProtocolLog.warnings.some((warning) => warning.includes('All-log reconciliation incomplete')));
+  allLogExtra = false;
   assert.ok(reconciliationMetadataCalls.some(({ method }) => method === 'eth_getCode'));
   assert.ok(reconciliationMetadataCalls.some(({ method }) => method === 'eth_call'));
   assert.ok(reconciliationMetadataCalls.every(({ params }) => params[1] === '0xa'));
@@ -317,6 +353,8 @@ function printLiveSnapshot(snapshot) {
   console.log(`Completeness: ${snapshot.complete ? 'complete' : 'incomplete'}; last indexed block: ${snapshot.lastIndexedBlock}`);
   const reconciliation = snapshot.transferLogReconciliation;
   console.log(`Transfer log reconciliation: ${reconciliation.complete ? 'complete' : 'incomplete'}; receipts ${reconciliation.receiptTransferLogCount}; eth_getLogs ${reconciliation.queriedTransferLogCount ?? 'unavailable'}; missing ${reconciliation.missingLogCount ?? 'unavailable'}; extra ${reconciliation.extraLogCount ?? 'unavailable'}; duplicates receipt/query ${reconciliation.duplicateReceiptLogCount}/${reconciliation.duplicateQueryLogCount}; identityless receipt/query ${reconciliation.identitylessReceiptLogCount}/${reconciliation.identitylessQueryLogCount}`);
+  const allLogs = snapshot.allLogReconciliation;
+  console.log(`All-log reconciliation: ${allLogs.complete ? 'complete' : 'incomplete'}; receipts ${allLogs.receiptLogCount}; eth_getLogs ${allLogs.queriedLogCount ?? 'unavailable'}; missing ${allLogs.missingLogCount ?? 'unavailable'}; extra ${allLogs.extraLogCount ?? 'unavailable'}; payload mismatches ${allLogs.payloadMismatchCount ?? 'unavailable'}`);
   console.log(`Transactions: ${snapshot.totalTransactions}; receipts: ${snapshot.receiptCount}; success: ${snapshot.successfulTransactions}; failed: ${snapshot.failedTransactions}`);
   console.log(`Top level addresses: senders ${snapshot.uniqueTopLevelSenders}; recipients ${snapshot.uniqueTopLevelRecipients}; active ${snapshot.uniqueTopLevelActiveAddresses}`);
   console.log(`Gas used raw: ${snapshot.totalGasUsedRaw}; transaction fees raw: ${snapshot.totalTransactionFeesRaw ?? 'unavailable'}`);

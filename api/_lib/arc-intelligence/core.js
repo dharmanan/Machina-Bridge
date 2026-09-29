@@ -14,6 +14,7 @@ export const DEFAULT_WINDOW_SIZE = 25;
 export const MAX_WINDOW_SIZE = 50;
 export const MAX_BLOCK_CONCURRENCY = 8;
 export const MAX_TRANSFER_LOGS = 10_000;
+export const MAX_ALL_LOGS = 20_000;
 
 function blockTag(blockNumber) {
   return `0x${blockNumber.toString(16)}`;
@@ -64,6 +65,15 @@ function emptySnapshot({ startBlock = null, endBlock = null, source = ARC_RPC_UR
       duplicateQueryLogCount: null,
       identitylessReceiptLogCount: null,
       identitylessQueryLogCount: null,
+      payloadMismatchCount: null,
+    },
+    allLogReconciliation: {
+      complete: false, receiptSetComplete: false, queryComplete: false,
+      receiptLogCount: 0, queriedLogCount: null,
+      missingLogCount: null, extraLogCount: null,
+      duplicateReceiptLogCount: null, duplicateQueryLogCount: null,
+      identitylessReceiptLogCount: null, identitylessQueryLogCount: null,
+      payloadMismatchCount: null,
     },
     complete: false,
     source,
@@ -151,7 +161,7 @@ function sortedUniqueCount(values) {
   return new Set(values.filter(Boolean)).size;
 }
 
-function transferLogIdentity(log) {
+function logIdentity(log) {
   if (!Number.isSafeInteger(log.blockNumber)
     || !Number.isSafeInteger(log.logIndex)
     || typeof log.transactionHash !== 'string'
@@ -159,44 +169,50 @@ function transferLogIdentity(log) {
   return `${log.blockNumber}:${log.transactionHash.toLowerCase()}:${log.logIndex}:${log.address.toLowerCase()}`;
 }
 
-function countTransferLogIdentities(logs) {
+function countLogIdentities(logs) {
   const counts = new Map();
   let identitylessCount = 0;
   for (const log of logs) {
-    if (log.topics?.[0] !== TRANSFER_TOPIC) continue;
-    const identity = transferLogIdentity(log);
+    const identity = logIdentity(log);
     if (identity === null) {
       identitylessCount += 1;
       continue;
     }
-    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+    const entry = counts.get(identity) ?? { count: 0, payload: null };
+    entry.count += 1;
+    entry.payload = JSON.stringify([log.topics, log.data]);
+    counts.set(identity, entry);
   }
-  const duplicateCount = [...counts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+  const duplicateCount = [...counts.values()].reduce((sum, entry) => sum + Math.max(0, entry.count - 1), 0);
   return { counts, identitylessCount, duplicateCount };
 }
 
-function reconcileTransferLogs(receiptLogs, queriedLogs, { receiptSetComplete, queryComplete }) {
-  const receiptTransfers = receiptLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
-  const queriedTransfers = queriedLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
-  const receiptIdentities = countTransferLogIdentities(receiptTransfers);
-  const queryIdentities = countTransferLogIdentities(queriedTransfers);
+function reconcileLogs(receiptLogs, queriedLogs, { receiptSetComplete, queryComplete }, kind) {
+  const receiptIdentities = countLogIdentities(receiptLogs);
+  const queryIdentities = countLogIdentities(queriedLogs);
   const canCompareSets = receiptSetComplete && queryComplete;
   let missingLogCount = null;
   let extraLogCount = null;
+  let payloadMismatchCount = null;
   if (canCompareSets) {
     const identities = new Set([...receiptIdentities.counts.keys(), ...queryIdentities.counts.keys()]);
     missingLogCount = 0;
     extraLogCount = 0;
+    payloadMismatchCount = 0;
     for (const identity of identities) {
-      const receiptCount = receiptIdentities.counts.get(identity) ?? 0;
-      const queryCount = queryIdentities.counts.get(identity) ?? 0;
+      const receiptEntry = receiptIdentities.counts.get(identity);
+      const queryEntry = queryIdentities.counts.get(identity);
+      const receiptCount = receiptEntry?.count ?? 0;
+      const queryCount = queryEntry?.count ?? 0;
       missingLogCount += Math.max(0, receiptCount - queryCount);
       extraLogCount += Math.max(0, queryCount - receiptCount);
+      if (receiptEntry && queryEntry && receiptEntry.payload !== queryEntry.payload) payloadMismatchCount += 1;
     }
   }
   const exactMatch = canCompareSets
     && missingLogCount === 0
     && extraLogCount === 0
+    && payloadMismatchCount === 0
     && receiptIdentities.duplicateCount === 0
     && queryIdentities.duplicateCount === 0
     && receiptIdentities.identitylessCount === 0
@@ -206,15 +222,23 @@ function reconcileTransferLogs(receiptLogs, queriedLogs, { receiptSetComplete, q
     complete: exactMatch,
     receiptSetComplete,
     queryComplete,
-    receiptTransferLogCount: receiptTransfers.length,
-    queriedTransferLogCount: queryComplete ? queriedTransfers.length : null,
+    [kind === 'transfer' ? 'receiptTransferLogCount' : 'receiptLogCount']: receiptLogs.length,
+    [kind === 'transfer' ? 'queriedTransferLogCount' : 'queriedLogCount']: queryComplete ? queriedLogs.length : null,
     missingLogCount,
     extraLogCount,
     duplicateReceiptLogCount: receiptIdentities.duplicateCount,
     duplicateQueryLogCount: queryIdentities.duplicateCount,
     identitylessReceiptLogCount: receiptIdentities.identitylessCount,
     identitylessQueryLogCount: queryIdentities.identitylessCount,
+    payloadMismatchCount,
   };
+}
+
+function reconcileTransferLogs(receiptLogs, queriedLogs, options) {
+  return reconcileLogs(
+    receiptLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC),
+    queriedLogs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC), options, 'transfer',
+  );
 }
 
 function aggregateBlockResults(blockResults, warnings) {
@@ -390,6 +414,28 @@ export async function buildBoundedSnapshot({
     && aggregate.transactions.length === aggregate.receipts.length
     && aggregate.lastIndexedBlock === requestedEnd;
   const receiptTransferLogs = snapshot.logs.filter((log) => log.topics?.[0] === TRANSFER_TOPIC);
+  let allLogs = [];
+  let allLogQueryComplete = false;
+  try {
+    const rawLogs = await rpc.request('eth_getLogs', [{
+      fromBlock: blockTag(requestedStart), toBlock: blockTag(requestedEnd),
+    }]);
+    if (!Array.isArray(rawLogs) || rawLogs.length > MAX_ALL_LOGS) {
+      throw new Error('All-log response was malformed or exceeded the bounded response limit.');
+    }
+    allLogs = rawLogs.map((log) => normalizeLog(log))
+      .sort((left, right) => left.blockNumber - right.blockNumber || left.logIndex - right.logIndex);
+    allLogQueryComplete = true;
+  } catch (error) {
+    warnings.push(error?.message ?? 'All-log query or normalization failed.');
+  }
+  const allLogReconciliation = reconcileLogs(snapshot.logs, allLogs, {
+    receiptSetComplete, queryComplete: allLogQueryComplete,
+  }, 'all');
+  snapshot.allLogReconciliation = allLogReconciliation;
+  if (!allLogReconciliation.complete) {
+    warnings.push(`All-log reconciliation incomplete: missing ${allLogReconciliation.missingLogCount}, extra ${allLogReconciliation.extraLogCount}, duplicate receipt ${allLogReconciliation.duplicateReceiptLogCount}, duplicate query ${allLogReconciliation.duplicateQueryLogCount}, identityless receipt ${allLogReconciliation.identitylessReceiptLogCount}, identityless query ${allLogReconciliation.identitylessQueryLogCount}, payload mismatch ${allLogReconciliation.payloadMismatchCount}.`);
+  }
   let transferLogs = [];
   let transferQueryComplete = false;
   try {
@@ -419,7 +465,7 @@ export async function buildBoundedSnapshot({
   } else if (!transferQueryComplete) {
     warnings.push('Transfer log reconciliation incomplete because the eth_getLogs response was unavailable or malformed.');
   } else if (!reconciliation.complete) {
-    warnings.push(`Transfer log reconciliation mismatch: missing ${reconciliation.missingLogCount}, extra ${reconciliation.extraLogCount}, duplicate receipt ${reconciliation.duplicateReceiptLogCount}, duplicate query ${reconciliation.duplicateQueryLogCount}, identityless receipt ${reconciliation.identitylessReceiptLogCount}, identityless query ${reconciliation.identitylessQueryLogCount}.`);
+    warnings.push(`Transfer log reconciliation mismatch: missing ${reconciliation.missingLogCount}, extra ${reconciliation.extraLogCount}, duplicate receipt ${reconciliation.duplicateReceiptLogCount}, duplicate query ${reconciliation.duplicateQueryLogCount}, identityless receipt ${reconciliation.identitylessReceiptLogCount}, identityless query ${reconciliation.identitylessQueryLogCount}, payload mismatch ${reconciliation.payloadMismatchCount}.`);
   }
 
   snapshot.transferScanComplete = transferScanComplete;
@@ -473,7 +519,7 @@ export async function buildBoundedSnapshot({
     && snapshot.canonicalUsdc.complete
     && snapshot.canonicalUsdc.erc20InterfaceActivity.complete
     && snapshot.verifiedAssetTransfers.every((asset) => asset.complete);
-  snapshot.complete = blocksComplete && transferMetricsComplete;
+  snapshot.complete = blocksComplete && transferMetricsComplete && allLogReconciliation.complete;
   snapshot.warnings = [...new Set(warnings)];
 
   if (snapshot.complete && snapshot.lastIndexedBlock !== requestedEnd) {

@@ -101,11 +101,13 @@ export async function buildHistoricalRange({
   let nextBlock = checkpoint?.nextBlock ?? startBlock;
   let previousHash = checkpoint?.lastIndexedBlockHash ?? null;
   let continuityComplete = true;
+  let checkpointPrefixVerified = !checkpoint || nextBlock === startBlock;
   let missingRanges = [];
   if (checkpoint && nextBlock > startBlock) {
     try {
       const priorBlock = await rpc.request('eth_getBlockByNumber', [tag(nextBlock - 1), false]);
       if (hash(priorBlock?.hash) !== hash(previousHash)) fail('Checkpoint block hash does not match canonical historical block.');
+      checkpointPrefixVerified = true;
     } catch (error) {
       warnings.push(error?.message ?? 'Checkpoint block could not be verified.');
       continuityComplete = false;
@@ -167,9 +169,12 @@ export async function buildHistoricalRange({
     if (lastGap.endBlock < endBlock) missingRanges.push({ startBlock: lastGap.endBlock + 1, endBlock, reason: 'not_indexed_after_gap' });
   }
   const contiguousEndBlock = nextBlock - 1;
-  const complete = contiguousEndBlock === endBlock && continuityComplete;
+  const checkpointCoverageComplete = contiguousEndBlock === endBlock && continuityComplete && checkpointPrefixVerified;
   const indexedBlocks = chunkSnapshots.reduce((count, snapshot) => count + snapshot.blockCount, 0);
   const priorIndexedBlocks = checkpoint && !previousResult ? checkpoint.nextBlock - startBlock : 0;
+  const materializedCoverageComplete = checkpointCoverageComplete
+    && indexedBlocks === endBlock - startBlock + 1;
+  const complete = materializedCoverageComplete;
   const expectedReceipts = chunkSnapshots.reduce((count, snapshot) => count + snapshot.totalTransactions, 0);
   const observedReceipts = chunkSnapshots.reduce((count, snapshot) => count + snapshot.receiptCount, 0);
   const checkpointOut = {
@@ -178,23 +183,27 @@ export async function buildHistoricalRange({
     lastIndexedBlock: contiguousEndBlock >= startBlock ? contiguousEndBlock : null,
     lastIndexedBlockHash: previousHash,
     nextBlock, contiguousThroughBlock: contiguousEndBlock >= startBlock ? contiguousEndBlock : null,
-    complete, warnings: [...new Set(warnings)],
+    complete: checkpointCoverageComplete, warnings: [...new Set(warnings)],
   };
   const protocolCoverage = Object.fromEntries(Object.keys(protocolBuilders)
     .map((name) => [name, coverageFrom(chunks.filter((chunk) => chunk.complete), name,
-      complete && (!checkpoint || Boolean(previousResult)))]));
+      materializedCoverageComplete)]));
   return {
     chainId: ARC_CHAIN_ID, source: ARC_RPC_URL, definitionVersion: HISTORY_DEFINITION_VERSION,
     requestedStartBlock: startBlock, requestedEndBlock: endBlock,
     chunks, chunkSnapshots, protocolSnapshots,
     contiguousStartBlock: startBlock, contiguousEndBlock: contiguousEndBlock >= startBlock ? contiguousEndBlock : null,
-    missingRanges, continuityComplete, checkpoint: checkpointOut,
+    missingRanges, continuityComplete, checkpointPrefixVerified,
+    materializedCoverageComplete, checkpoint: checkpointOut,
     coreCoverage: {
-      complete, expectedBlocks: endBlock - startBlock + 1,
-      indexedBlocks: indexedBlocks + priorIndexedBlocks,
+      complete: materializedCoverageComplete, checkpointCoverageComplete,
+      checkpointPrefixVerified, materializedCoverageComplete,
+      expectedBlocks: endBlock - startBlock + 1,
+      indexedBlocks,
+      checkpointIndexedBlocks: indexedBlocks + priorIndexedBlocks,
       expectedReceipts: previousResult || !checkpoint ? expectedReceipts : null,
       observedReceipts: previousResult || !checkpoint ? observedReceipts : null,
-      metricSnapshotCoverageComplete: !checkpoint || Boolean(previousResult),
+      metricSnapshotCoverageComplete: materializedCoverageComplete,
     },
     protocolCoverage, complete,
     legacyUsdcCoverage: { status: 'unavailable', reason: 'Official mainnet legacy NativeCoin ABI/topic and Zero5 effective block range are not both verified.' },

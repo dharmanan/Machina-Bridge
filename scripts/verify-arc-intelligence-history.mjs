@@ -51,6 +51,7 @@ function protocolBuilders() {
       completeness: name === 'morpho' ? {
         verifiedVaultEventScanComplete: true, candidateCoverageComplete: false, complete: false,
       } : { complete: true },
+      candidates: name === 'morpho' ? [{ address: ADDRESS(900), status: 'verified' }] : [],
       rawFlows: [], outboundBurns: [], inboundMints: [], messageReceipts: [],
       deposits: [], burns: [], attestations: [], withdrawals: { initiated: [], completed: [] },
       v3: { complete: true, rawPoolFlows: [] }, v4: { eventScanComplete: true, swapEvents: [], modifyLiquidityEvents: [], poolKeys: [] },
@@ -116,10 +117,23 @@ async function fixtures() {
   const resumed = await buildHistoricalRange({ ...options, checkpoint: firstPart.checkpoint,
     previousResult: firstPart, snapshotBuilder: async ({ startBlock, endBlock }) => snapshot(startBlock, endBlock) });
   assert.equal(resumed.complete, true);
+  assert.equal(resumed.checkpointPrefixVerified, true);
+  assert.equal(resumed.materializedCoverageComplete, true);
   assert.deepEqual(resumed.chunkSnapshots.map((item) => item.startBlock), [10, 12, 14]);
   assert.equal(resumed.coreCoverage.indexedBlocks, 6);
   assert.equal(buildHistoricalMetrics(resumed).buckets.hour[0].records
     .find((record) => record.metricId === 'network.transactionCount').value, 6);
+  const checkpointOnly = await buildHistoricalRange({ ...options, checkpoint: firstPart.checkpoint,
+    snapshotBuilder: async ({ startBlock, endBlock }) => snapshot(startBlock, endBlock) });
+  assert.equal(checkpointOnly.checkpointPrefixVerified, true);
+  assert.equal(checkpointOnly.continuityComplete, true);
+  assert.equal(checkpointOnly.checkpoint.complete, true);
+  assert.equal(checkpointOnly.coreCoverage.checkpointCoverageComplete, true);
+  assert.equal(checkpointOnly.coreCoverage.materializedCoverageComplete, false);
+  assert.equal(checkpointOnly.coreCoverage.complete, false);
+  assert.equal(checkpointOnly.complete, false);
+  assert.equal(checkpointOnly.coreCoverage.indexedBlocks, 4);
+  assert.ok(buildHistoricalMetrics(checkpointOnly).records.every((record) => record.complete === false));
   await assert.rejects(buildHistoricalRange({ ...options, chunkSize: 51 }), /chunkSize/);
   await assert.rejects(buildHistoricalRange({ ...options, endBlock: 510 }), /Historical range/);
   const wrongHash = await buildHistoricalRange({ ...options, rpc: fakeRpc({ badHash: true }),
@@ -165,6 +179,7 @@ async function fixtures() {
   const metrics = buildHistoricalMetrics(bucketHistory);
   const closedHour = metrics.buckets.hour.find((item) => item.bucketStartUtc === new Date(midnight * 1000).toISOString());
   assert.equal(closedHour.complete, true);
+  assert.equal(closedHour.coreBoundaryComplete, true);
   assert.equal(closedHour.leftBoundaryCovered, true);
   assert.equal(closedHour.rightBoundaryCovered, true);
   const find = (bucket, id) => bucket.records.find((record) => record.metricId === id);
@@ -186,6 +201,9 @@ async function fixtures() {
   assert.equal(find(closedHour, 'gateway.crossDomainSourceLegCount').value, 0);
   assert.equal(find(closedHour, 'gateway.withdrawalInitiatedCount').value, 1);
   assert.equal(find(closedHour, 'morpho.v2.depositEventCount').value, 1);
+  assert.equal(find(closedHour, 'morpho.v2.depositEventCount').complete, true);
+  assert.deepEqual(find(closedHour, 'morpho.v2.depositEventCount').verifiedVaults, [ADDRESS(900)]);
+  assert.equal(find(closedHour, 'morpho.v2.depositEventCount').stableVerifiedVaultCount, 1);
   assert.equal(find(closedHour, 'morpho.v2.depositEventCount').protocolUniverseComplete, false);
   assert.equal(find(closedHour, 'morpho.v2.deposit.assetsRaw').value, '31');
   assert.equal(find(closedHour, 'morpho.v2.deposit.sharesRaw').value, '29');
@@ -198,6 +216,33 @@ async function fixtures() {
   assert.equal(day.rightBoundaryCovered, true);
   assert.equal(metrics.buckets.day.at(-1).complete, false);
   assert.deepEqual(find(day, 'network.transactionCount').sourceDefinitionVersions.core, 'arc-intelligence-core-v1');
+  const changingVaultHistory = structuredClone(bucketHistory);
+  changingVaultHistory.protocolSnapshots[1].morpho.candidates = [{ address: ADDRESS(901), status: 'verified' }];
+  changingVaultHistory.protocolSnapshots[1].morpho.rawFlows = [{ blockNumber: 22, transactionIndex: 0,
+    logIndex: 7, type: 'deposit', emitter: ADDRESS(901), assetsRaw: '17', sharesRaw: '16' }];
+  const changingHour = buildHistoricalMetrics(changingVaultHistory).buckets.hour
+    .find((item) => item.bucketStartUtc === new Date(midnight * 1000).toISOString());
+  const changingMorpho = find(changingHour, 'morpho.v2.depositEventCount');
+  assert.equal(changingMorpho.value, 0);
+  assert.equal(changingMorpho.complete, false);
+  assert.equal(changingMorpho.coverageStatus, 'partial');
+  assert.deepEqual(changingMorpho.verifiedVaults, []);
+  assert.equal(changingMorpho.stableVerifiedVaultCount, 0);
+  const mixedVersionHistory = structuredClone(bucketHistory);
+  mixedVersionHistory.protocolSnapshots[1].uniswap.definitionVersion = 'uniswap-fixture-v2';
+  const mixedHour = buildHistoricalMetrics(mixedVersionHistory).buckets.hour
+    .find((item) => item.bucketStartUtc === new Date(midnight * 1000).toISOString());
+  const mixedUniswap = find(mixedHour, 'uniswap.v3.verifiedPool.swapEventCount');
+  assert.equal(mixedUniswap.complete, false);
+  assert.equal(mixedUniswap.coverageStatus, 'partial');
+  assert.deepEqual(mixedUniswap.sourceDefinitionVersions.uniswap,
+    ['uniswap-fixture-v1', 'uniswap-fixture-v2']);
+  assert.equal(find(closedHour, 'uniswap.v3.verifiedPool.swapEventCount').complete, true);
+  mixedVersionHistory.protocolSnapshots[2].uniswap.definitionVersion = 'uniswap-fixture-v3';
+  const firstHour = buildHistoricalMetrics(mixedVersionHistory).buckets.hour
+    .find((item) => item.bucketStartUtc === new Date((midnight - 3600) * 1000).toISOString());
+  assert.deepEqual(find(firstHour, 'network.transactionCount').sourceDefinitionVersions.uniswap,
+    ['uniswap-fixture-v1']);
   assert.doesNotMatch(JSON.stringify(metrics.records), /"metricId":"(?:usdVolume|tvl|uniqueUsers|arcDexVolume|crossChainCompletedCount)"/);
   const accumulator = createMetricAccumulator();
   accumulator.addChunk(bucketHistory.chunkSnapshots[0], bucketHistory.protocolSnapshots[0]);
