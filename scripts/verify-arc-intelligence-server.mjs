@@ -20,7 +20,7 @@ async function test(name, work) { await work(); tests.push(name); console.log(`P
 // A narrow SQL client double exercises the real repository/session queries,
 // transaction boundaries, rollback, duplicate path, and advisory-lock lifecycle.
 function fixturePool() {
-  let store = { state: null, chunks: new Map(), latest: null, runs: new Map() };
+  let store = { state: null, chunks: new Map(), latest: null, runs: new Map(), migrations: new Map() };
   let nextId = 1;
   let locked = false;
   const calls = [];
@@ -42,6 +42,10 @@ function fixturePool() {
         }
         if (text.startsWith('SELECT pg_advisory_unlock')) { locked = false; return rows([{ pg_advisory_unlock: true }]); }
         if (text.startsWith('SELECT pg_advisory_xact_lock') || text.startsWith('CREATE TABLE') || text === 'SELECT 1') return rows();
+        if (text.startsWith('SELECT * FROM arc_intelligence_migrations')) return rows(store.migrations.has(values[0]) ? [store.migrations.get(values[0])] : []);
+        if (text.startsWith('INSERT INTO arc_intelligence_migrations')) {
+          store.migrations.set(values[0], { version: values[0], checksum: values[1], metadata: json(values[2]) }); return rows();
+        }
         if (text.startsWith('SELECT * FROM arc_intelligence_state')) return rows(store.state ? [store.state] : []);
         if (text.startsWith('INSERT INTO arc_intelligence_state')) {
           store.state ??= { id: 1, chain_id: values[0], source: values[1], next_block: null,
