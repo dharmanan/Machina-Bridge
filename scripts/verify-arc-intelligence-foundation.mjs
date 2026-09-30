@@ -7,119 +7,9 @@ import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
 import { createFoundationScheduler } from '../server/arc-intelligence/scheduler.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 
-const hash = (n) => `0x${n.toString(16).padStart(64,'0')}`;
-const block = (n) => ({ block_number:n,block_hash:hash(n+1),parent_hash:hash(n),timestamp:1700000000+n,transaction_count:1 });
-const laneKey = (values) => JSON.stringify(values.slice(0,5));
+import { fixturePool,hash,block,rawBlock } from './fixtures/arc-intelligence-a2.mjs';
 const names = ['arc_intelligence_state','arc_intelligence_chunks','arc_intelligence_latest','arc_intelligence_runs'];
 
-// SQL/state doubles follow the real repository calls. They do not certify a deployed Postgres instance.
-function fixturePool() {
-  let store = { a1:{ id:1,chain_id:5042,source:ARC_RPC_URL,last_indexed_block:'99',last_indexed_hash:hash(100),next_block:'100' },
-    migrations:new Map(),lanes:new Map(),blocks:new Map(),work:new Map(),coverage:new Map(),tables:new Set(names),nextId:1 };
-  let clock = 1000000;
-  let failure = null;
-  const calls = [];
-  function client() {
-    let backup = null;
-    let transactionOpen = false;
-    return {
-      async query(sql,values = []) {
-        const text = sql.replace(/\s+/g,' ').trim();
-        calls.push({text,values:structuredClone(values)});
-        if (failure && text.includes(failure)) { failure = null; throw new Error('Injected failure'); }
-        const rows = (value = []) => ({rows:structuredClone(value)});
-        if (text === 'BEGIN') { backup=structuredClone(store); transactionOpen=true; return rows(); }
-        if (text === 'COMMIT') { backup=null; transactionOpen=false; return rows(); }
-        if (text === 'ROLLBACK') { if (backup) store=backup; transactionOpen=false; return rows(); }
-        if (text.startsWith('SELECT pg_advisory_xact_lock')) { assert(transactionOpen); return rows(); }
-        if (text.startsWith('CREATE TABLE')) {
-          for (const match of text.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)) store.tables.add(match[1]);
-          return rows();
-        }
-        if (text.startsWith('SELECT * FROM arc_intelligence_migrations')) return rows(store.migrations.has(values[0]) ? [store.migrations.get(values[0])] : []);
-        if (text.startsWith('INSERT INTO arc_intelligence_migrations')) {
-          assert(!store.migrations.has(values[0]));
-          store.migrations.set(values[0],{version:values[0],checksum:values[1],metadata:JSON.parse(values[2])}); return rows();
-        }
-        if (text === 'SELECT * FROM arc_intelligence_state WHERE id = 1') return rows(store.a1 ? [store.a1] : []);
-        const operation = text.match(/^\/\* a2:(\w+) \*\//)?.[1];
-        const lane = store.lanes.get(laneKey(values));
-        switch (operation) {
-          case 'anchor': assert(text.endsWith('FOR UPDATE')); return rows(store.migrations.has(values[0]) ? [{metadata:store.migrations.get(values[0]).metadata}] : []);
-          case 'capture_anchor': {
-            assert(transactionOpen);
-            const migration=store.migrations.get(values[0]);
-            if (migration?.metadata.anchor === null) migration.metadata=JSON.parse(values[1]);
-            return rows();
-          }
-          case 'initialize': {
-            if (!lane) store.lanes.set(laneKey(values),{chain_id:values[0],lane:values[1],scope_id:values[2],epoch:values[3],definition_version:values[4],
-              origin_block:values[5],anchor_block:values[6],anchor_hash:values[7],anchor_next_block:values[5],processed_through:null,
-              contiguous_complete_through:null,checkpoint_hash:null,observed_head:null,status:'starting',current_error_code:null,last_success_at:null});
-            return rows();
-          }
-          case 'lane': return rows(lane ? [lane] : []);
-          case 'status': {
-            if (lane && lane.status !== 'continuity_error') Object.assign(lane,{status:values[5],current_error_code:values[6],observed_head:values[7] ?? lane.observed_head});
-            return rows();
-          }
-          case 'neighbors': return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1] && b.block_number <= values[2]).sort((a,b) => a.block_number-b.block_number));
-          case 'halt': Object.assign(lane,{status:'continuity_error',current_error_code:values[5]}); return rows();
-          case 'block': {
-            if (!store.blocks.has(values[1])) store.blocks.set(values[1],{chain_id:values[0],block_number:values[1],block_hash:values[2],parent_hash:values[3],
-              timestamp:values[4],transaction_count:values[5],receipt_count:null,receipt_complete:false,
-              all_log_reconciliation_complete:false,transfer_log_reconciliation_complete:false,core_complete:false});
-            return rows();
-          }
-          case 'advance': return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1]).sort((a,b) => a.block_number-b.block_number).slice(0,values[2]));
-          case 'coverage': {
-            assert.equal(values[9],'chain_manifest','Chain repository emits only chain manifest evidence');
-            store.coverage.set(JSON.stringify([...values.slice(0,7),values[9]]),{identity:values.slice(0,5),start:values[5],end:values[6],
-              startHash:values[7],endHash:values[8],dimension:values[9],digest:values[10],state:values[11]}); return rows();
-          }
-          case 'promote_coverage': {
-            for (const record of store.coverage.values()) if (laneKey(record.identity) === laneKey(values) && record.end <= values[5]) record.state='complete';
-            return rows();
-          }
-          case 'progress': Object.assign(lane,{processed_through:values[5],contiguous_complete_through:values[6],checkpoint_hash:values[7],
-            status:'indexing',current_error_code:null,last_success_at:clock}); return rows();
-          case 'work_existing': return rows([...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
-            && w.component === values[5] && w.logical_key === values[6]));
-          case 'work_count': return rows([{count:String(store.work.size)}]);
-          case 'enqueue': {
-            const id=String(store.nextId++);
-            const work={id,chain_id:values[0],lane:values[1],scope_id:values[2],epoch:values[3],definition_version:values[4],component:values[5],logical_key:values[6],
-              start_block:values[7],end_block:values[8],block_hash:values[9],state:'pending',attempts:0,not_before:clock,
-              lease_owner:null,lease_until:null,fencing_token:'0',reason_code:null};
-            store.work.set(id,work); return rows([work]);
-          }
-          case 'claim': {
-            assert(text.includes('FOR UPDATE SKIP LOCKED'));
-            const work=[...store.work.values()].find((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
-              && w.not_before <= clock && (['pending','retrying'].includes(w.state) || (w.state === 'leased' && w.lease_until <= clock)));
-            if (!work) return rows();
-            Object.assign(work,{state:'leased',attempts:work.attempts+1,fencing_token:(BigInt(work.fencing_token)+1n).toString(),lease_owner:values[5],lease_until:clock+values[6]});
-            return rows([work]);
-          }
-          case 'lease_guard': {
-            assert(transactionOpen); assert(text.endsWith('FOR UPDATE'));
-            const work=store.work.get(String(values[0]));
-            return rows(work?.state === 'leased' && work.lease_owner === values[1] && work.fencing_token === String(values[2]) && work.lease_until > clock ? [work] : []);
-          }
-          case 'finish': Object.assign(store.work.get(String(values[0])),{state:'complete',lease_owner:null,lease_until:null,reason_code:null}); return rows();
-          case 'result': {
-            const work=store.work.get(String(values[0]));
-            Object.assign(work,{state:values[1],reason_code:values[2],not_before:clock+values[3],lease_owner:null,lease_until:null}); return rows([work]);
-          }
-          default: throw new Error(`Unhandled SQL fixture: ${text}`);
-        }
-      },
-      release() { assert.equal(transactionOpen,false,'No transaction survives repository return'); },
-    };
-  }
-  return {calls,get store() {return store;},advance(ms) {clock+=ms;},fail(operation) {failure=operation;},
-    async connect() {return client();},async query(...args) {return client().query(...args);} };
-}
 async function setup() {
   const pool=fixturePool(); await migrate(pool);
   const repository=createFoundationRepository(pool); await repository.initializeChainLane();
@@ -132,8 +22,8 @@ const job = (key='blocks100') => ({component:'manifest',logicalKey:key,startBloc
 await test('versioned migrations are idempotent, additive, checksum protected and preserve A1',async () => {
   const pool=fixturePool(); const a1=structuredClone(pool.store.a1);
   await migrate(pool); const records=structuredClone(pool.store.migrations); await migrate(pool);
-  assert.equal(pool.store.migrations.size,2); assert.deepEqual(pool.store.migrations,records); assert.deepEqual(pool.store.a1,a1);
-  assert.equal(pool.store.tables.size,9); names.forEach((name) => assert(pool.store.tables.has(name)));
+  assert.equal(pool.store.migrations.size,3); assert.deepEqual(pool.store.migrations,records); assert.deepEqual(pool.store.a1,a1);
+  assert.equal(pool.store.tables.size,13); names.forEach((name) => assert(pool.store.tables.has(name)));
   const sql=await readFile(new URL('../server/arc-intelligence/sql/002_a2_foundation.sql',import.meta.url),'utf8');
   assert(!/\b(?:ALTER|DROP|TRUNCATE)\b/.test(sql));
   names.forEach((name) => assert(!sql.includes(name)));
@@ -156,7 +46,7 @@ await test('interrupted migration rolls back ledger and tables, retry applies ex
   const pool=fixturePool(); const a1=structuredClone(pool.store.a1);
   pool.fail('CREATE TABLE IF NOT EXISTS arc_intelligence_lanes');
   await assert.rejects(migrate(pool)); assert.equal(pool.store.migrations.size,0); assert.equal(pool.store.tables.size,4);
-  assert.deepEqual(pool.store.a1,a1); await migrate(pool); await migrate(pool); assert.equal(pool.store.migrations.size,2);
+  assert.deepEqual(pool.store.a1,a1); await migrate(pool); await migrate(pool); assert.equal(pool.store.migrations.size,3);
 });
 await test('missing A1 anchor never assumes genesis or prevents A1 migration',async () => {
   const pool=fixturePool(); pool.store.a1=null; await migrate(pool);
@@ -256,7 +146,7 @@ await test('out of order parent evidence and persisted anchor mismatch both fail
   const first=await setup(); await first.repository.persistManifest(identity,[{...block(102),parent_hash:hash(999)}]);
   await assert.rejects(first.repository.persistManifest(identity,[block(101)]),/checkpoint_parent_hash_mismatch/);
   assert.equal((await first.repository.getLane()).status,'continuity_error');
-  const second=await setup(); second.pool.store.blocks.set(100,{...block(100),parent_hash:hash(999)});
+  const second=await setup(); second.pool.store.blocks.set(100,{...block(100),parent_hash:hash(999),transactions_complete:true});
   await assert.rejects(second.repository.persistManifest(identity,[block(102)]),/checkpoint_parent_hash_mismatch/);
   assert.equal((await second.repository.getLane()).status,'continuity_error');
   assert(!second.pool.store.blocks.has(102));
@@ -333,15 +223,15 @@ await test('chain follower uses only canonical block reads and never writes A1',
     assert.notEqual(transactions.at(-1),'BEGIN','No database transaction may span an RPC call');
     calls.push(method);
     if (method === 'eth_chainId') return '0x13b2'; if (method === 'eth_blockNumber') return '0x68';
-    assert.equal(method,'eth_getBlockByNumber'); assert.equal(params[1],false);
-    const n=Number(BigInt(params[0])); return {number:params[0],hash:hash(n+1),parentHash:hash(n),timestamp:'0x6553f100',transactions:[hash(1000+n)]};
+    assert.equal(method,'eth_getBlockByNumber'); assert.equal(params[1],true);
+    const n=Number(BigInt(params[0])); return rawBlock(n);
   }};
-  const follower=createChainFollower({repository,rpc,maxBlocks:2});
+  const follower=createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),maxBlocks:2});
   assert.equal((await follower.tick()).status,'indexing'); const result=await follower.tick();
   assert.equal(result.status,'caught_up'); assert.equal(result.coreComplete,false); assert.equal(pool.store.blocks.size,3);
   assert.equal(result.observedHead,104); assert.equal(result.targetHead,102);
   assert.equal((await repository.getLane()).observed_head,104); assert.equal(Math.max(...pool.store.blocks.keys()),102);
-  const other=await setup(); const custom=await createChainFollower({repository:other.repository,rpc,finalityBlocks:3}).tick();
+  const other=await setup(); const custom=await createChainFollower({repository:other.repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks:3}).tick();
   assert.equal(custom.observedHead,104); assert.equal(custom.targetHead,101); assert.equal(Math.max(...other.pool.store.blocks.keys()),101);
   assert.deepEqual(pool.store.a1,a1); assert(!calls.some((m) => /Receipt|Logs/.test(m)));
   assert(!pool.calls.some(({text}) => /(?:INSERT INTO|UPDATE|DELETE FROM) arc_intelligence_(?:state|chunks|latest|runs)\b/.test(text)));
@@ -353,7 +243,7 @@ await test('chain read failure preserves checkpoint; retry resumes and shutdown 
     if (failing) throw new Error('arbitrary RPC body');
     return {number:'0x64',hash:hash(101),parentHash:hash(100),timestamp:'0x6553f100',transactions:[]};
   }};
-  const follower=createChainFollower({repository,rpc});
+  const follower=createChainFollower({repository,rpc:createRpcBudget().wrap(rpc)});
   assert.deepEqual(await follower.tick(),{status:'retrying',error:'block_unavailable',persistedBlocks:0});
   assert.equal((await repository.getLane()).contiguous_complete_through,null);
   failing=false; assert.equal((await follower.tick()).status,'caught_up');
@@ -365,12 +255,12 @@ await test('safe-head option is bounded; head below offset preserves raw head wi
     reads.push(method); if (method === 'eth_chainId') return '0x13b2'; if (method === 'eth_blockNumber') return '0x1';
     assert.fail('No block read is allowed below finality offset');
   }};
-  for (const finalityBlocks of [-1,10001,1.5]) assert.throws(() => createChainFollower({repository,rpc,finalityBlocks}),/invalid_chain_follower/);
-  const result=await createChainFollower({repository,rpc}).tick();
+  for (const finalityBlocks of [-1,10001,1.5]) assert.throws(() => createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks}),/invalid_chain_follower/);
+  const result=await createChainFollower({repository,rpc:createRpcBudget().wrap(rpc)}).tick();
   assert.equal(result.status,'retrying'); assert.equal(result.error,'rpc_head_unavailable'); assert.equal(result.persistedBlocks,0);
   const lane=await repository.getLane(); assert.equal(lane.observed_head,1); assert.equal(lane.contiguous_complete_through,null);
   assert.equal(pool.store.blocks.size,0); assert.deepEqual(reads,['eth_chainId','eth_blockNumber']);
-  const zero=await createChainFollower({repository,rpc,finalityBlocks:0}).tick(); assert.equal(zero.status,'caught_up'); assert.equal(zero.targetHead,1);
+  const zero=await createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks:0}).tick(); assert.equal(zero.status,'caught_up'); assert.equal(zero.targetHead,1);
 });
 await test('RPC budget is bounded, shared, and cancels queued work without freeing active slots early',async () => {
   assert.throws(() => createRpcBudget({maxConcurrency:5}),/invalid_rpc_budget/);

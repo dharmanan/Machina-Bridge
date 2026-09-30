@@ -41,7 +41,8 @@ function fixturePool() {
           const acquired = !locked; if (acquired) locked = true; return rows([{ locked: acquired }]);
         }
         if (text.startsWith('SELECT pg_advisory_unlock')) { locked = false; return rows([{ pg_advisory_unlock: true }]); }
-        if (text.startsWith('SELECT pg_advisory_xact_lock') || text.startsWith('CREATE TABLE') || text === 'SELECT 1') return rows();
+        if (text.startsWith('SELECT pg_advisory_xact_lock') || text.startsWith('CREATE TABLE')
+          || text.startsWith('ALTER TABLE arc_intelligence_blocks') || text === 'SELECT 1') return rows();
         if (text.startsWith('SELECT * FROM arc_intelligence_migrations')) return rows(store.migrations.has(values[0]) ? [store.migrations.get(values[0])] : []);
         if (text.startsWith('INSERT INTO arc_intelligence_migrations')) {
           store.migrations.set(values[0], { version: values[0], checksum: values[1], metadata: json(values[2]) }); return rows();

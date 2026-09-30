@@ -1,3 +1,6 @@
+import { pruneCompleteWork } from './work-retention.js';
+import { withTransaction, requireWorkLease } from './a2-db.js';
+import { blockTransactions, persistTransactions } from './transaction-facts.js';
 import { createHash } from 'node:crypto';
 import { ARC_CHAIN_ID, ARC_RPC_URL } from '../../api/_lib/arc-intelligence/rpc.js';
 import { MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
@@ -56,33 +59,13 @@ export function manifestCoverage(identity, blocks, state = 'partial', dimension 
 
 // This repository only writes A2 tables. Empty migration anchors may bootstrap via one read of A1 state.
 export function createFoundationRepository(pool) {
-  async function transaction(work) {
-    const client = await pool.connect();
-    let broken = false;
-    try {
-      await client.query('BEGIN');
-      const result = await work(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { broken = true; }
-      throw error;
-    } finally { client.release(broken); }
-  }
+  const transaction = (work) => withTransaction(pool,work);
   const laneWhere = 'chain_id=$1 AND lane=$2 AND scope_id=$3 AND epoch=$4 AND definition_version=$5';
   async function lane(client, identity, lock = false) {
     return (await client.query(`/* a2:lane */ SELECT * FROM arc_intelligence_lanes WHERE ${laneWhere}${lock ? ' FOR UPDATE' : ''}`,
       identityValues(identity))).rows[0] ?? null;
   }
-  async function leaseGuard(client, lease) {
-    if (!lease || !/^\d+$/.test(String(lease.id)) || !/^\d+$/.test(String(lease.fencing_token))) throw new Error('stale_lease');
-    label(lease.lease_owner);
-    const row = (await client.query(`/* a2:lease_guard */ SELECT * FROM arc_intelligence_work
-      WHERE id=$1 AND state='leased' AND lease_owner=$2 AND fencing_token=$3 AND lease_until > now() FOR UPDATE`,
-    [lease.id, lease.lease_owner, lease.fencing_token])).rows[0];
-    if (!row) throw new Error('stale_lease');
-    return row;
-  }
+  const leaseGuard = requireWorkLease;
   async function coverage(client, identity, value) {
     await client.query(`/* a2:coverage */ INSERT INTO arc_intelligence_coverage
       (chain_id,lane,scope_id,epoch,definition_version,start_block,end_block,start_hash,end_hash,coverage_dimension,evidence_digest,state)
@@ -95,6 +78,10 @@ export function createFoundationRepository(pool) {
   return {
     async initializeChainLane(identity = CHAIN_IDENTITY) {
       if (identity.lane !== 'chain' || identity.scopeId !== 'canonical_blocks') throw new Error('invalid_chain_lane');
+      return this.initializeLane(identity);
+    },
+    async initializeLane(identity = CHAIN_IDENTITY) {
+      identityValues(identity);
       return transaction(async (client) => {
         let metadata = (await client.query(`/* a2:anchor */ SELECT metadata FROM arc_intelligence_migrations WHERE version=$1 FOR UPDATE`,
           ['002_a2_foundation'])).rows[0]?.metadata;
@@ -135,6 +122,7 @@ export function createFoundationRepository(pool) {
     async persistManifest(identity, input, lease = null) {
       if (identity.lane !== 'chain' || identity.scopeId !== 'canonical_blocks') throw new Error('invalid_chain_lane');
       if (!input.length || input.length > MAX_WINDOW_SIZE) throw new Error('invalid_manifest_range');
+      const transactionSets = new Map(input.map((block) => [position(block.block_number),blockTransactions(block,manifestBlock(block))]));
       const blocks = input.map(manifestBlock).sort((a,b) => a.block_number-b.block_number);
       if (new Set(blocks.map((b) => b.block_number)).size !== blocks.length) throw new Error('duplicate_input_block');
       range(blocks[0].block_number, blocks.at(-1).block_number);
@@ -180,13 +168,14 @@ export function createFoundationRepository(pool) {
             ON CONFLICT (chain_id,block_number) DO NOTHING`, [ARC_CHAIN_ID, block.block_number, block.block_hash,
             block.parent_hash, block.timestamp, block.transaction_count]);
         }
+        for (const block of blocks) await persistTransactions(client,block,transactionSets.get(block.block_number));
         const start = state.contiguous_complete_through === null ? position(state.origin_block) : position(state.contiguous_complete_through)+1;
         const available = (await client.query(`/* a2:advance */ SELECT * FROM arc_intelligence_blocks
-          WHERE chain_id=$1 AND block_number >= $2 ORDER BY block_number LIMIT $3`, [ARC_CHAIN_ID,start,MAX_WINDOW_SIZE])).rows.map(manifestBlock);
+          WHERE chain_id=$1 AND block_number >= $2 ORDER BY block_number LIMIT $3`, [ARC_CHAIN_ID,start,MAX_WINDOW_SIZE])).rows.map((row) => ({ ...manifestBlock(row),transactions_complete:row.transactions_complete }));
         const contiguous = [];
         let previousHash = state.checkpoint_hash ?? state.anchor_hash;
         for (const block of available) {
-          if (block.block_number !== start+contiguous.length) break;
+          if (block.block_number !== start+contiguous.length || block.transactions_complete !== true) break;
           if (previousHash && block.parent_hash !== previousHash) throw new Error('persisted_continuity_invalid');
           contiguous.push(block); previousHash = block.block_hash;
         }
@@ -208,11 +197,13 @@ export function createFoundationRepository(pool) {
         [...identityValues(identity),processed,completeThrough,completeThrough === null ? null : previousHash]);
         if (lease) await client.query(`/* a2:finish */ UPDATE arc_intelligence_work SET state='complete',reason_code=NULL,
           lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE id=$1`, [job.id]);
+        if (lease) await pruneCompleteWork(client);
         return lane(client,identity);
       }); } catch (error) {
-        if (error.message === 'persisted_continuity_invalid') {
-          await this.setLaneStatus(identity,'continuity_error','checkpoint_parent_hash_mismatch');
-          throw new Error('checkpoint_parent_hash_mismatch');
+        if (['persisted_continuity_invalid','transaction_identity_conflict'].includes(error.message)) {
+          const code = error.message === 'transaction_identity_conflict' ? 'manifest_conflict' : 'checkpoint_parent_hash_mismatch';
+          await this.setLaneStatus(identity,'continuity_error',code);
+          throw new Error(code);
         }
         throw error;
       }
@@ -226,6 +217,7 @@ export function createFoundationRepository(pool) {
       const expected = [...bounds,blockHash === null ? null : hash(blockHash)];
       return transaction(async (client) => {
         await client.query('SELECT pg_advisory_xact_lock(5042,177004)');
+        await pruneCompleteWork(client);
         const existing = (await client.query(`/* a2:work_existing */ SELECT * FROM arc_intelligence_work
           WHERE ${laneWhere} AND component=$6 AND logical_key=$7`, key)).rows[0];
         if (existing) {
@@ -233,7 +225,7 @@ export function createFoundationRepository(pool) {
             || existing.block_hash !== expected[2]) throw new Error('work_identity_conflict');
           return existing;
         }
-        const count = (await client.query('/* a2:work_count */ SELECT count(*) AS count FROM arc_intelligence_work')).rows[0].count;
+        const count = (await client.query('/* a2:work_count */ SELECT count(*) AS count FROM arc_intelligence_work WHERE state <> \'complete\'')).rows[0].count;
         if (position(count) >= MAX_WORK_ROWS) throw new Error('work_capacity_reached');
         return (await client.query(`/* a2:enqueue */ INSERT INTO arc_intelligence_work
           (chain_id,lane,scope_id,epoch,definition_version,component,logical_key,start_block,end_block,block_hash)
@@ -259,9 +251,11 @@ export function createFoundationRepository(pool) {
       if (['failed','persistent_partial'].includes(state) && reason !== 'unsupported_scope') throw new Error('transient_failure_requires_retry');
       return transaction(async (client) => {
         const job = await leaseGuard(client,lease);
-        return (await client.query(`/* a2:result */ UPDATE arc_intelligence_work SET state=$2,reason_code=$3,
+        const result = (await client.query(`/* a2:result */ UPDATE arc_intelligence_work SET state=$2,reason_code=$3,
           not_before=now()+$4*interval '1 millisecond',lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 RETURNING *`,
         [job.id,state,reason,retryMs])).rows[0];
+        if (state === 'complete') await pruneCompleteWork(client);
+        return result;
       });
     },
   };

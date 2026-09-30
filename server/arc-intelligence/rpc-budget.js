@@ -27,7 +27,8 @@ export function createRpcBudget({ maxConcurrency = 4, maxPending = 100 } = {}) {
       pending.push(entry); drain();
     });
   }
-  return Object.freeze({ run, get active() { return active; }, get pending() { return pending.length; },
-    wrap(rpc) { return Object.freeze({ url:rpc.url,
+  const budget = Object.freeze({ run, get active() { return active; }, get pending() { return pending.length; },
+    wrap(rpc) { return Object.freeze({ url:rpc.url,budget,
       request(method,params = [],options = {}) { return run(() => rpc.request(method,params,options),options); } }); } });
+  return budget;
 }
