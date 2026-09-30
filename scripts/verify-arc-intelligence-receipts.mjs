@@ -349,8 +349,8 @@ await test('incremental live follower makes zero reads at same head, one at +1, 
   assert.equal((await follower.tick()).persistedBlocks,3);assert.deepEqual(reads,[996,997,998]);
   reads.length=0;assert.equal((await follower.tick()).persistedBlocks,0);assert.deepEqual(reads,[]);
   head++;assert.equal((await follower.tick()).persistedBlocks,1);assert.deepEqual(reads,[999]);
-  reads.length=0;head=1200;assert.equal((await follower.tick()).persistedBlocks,3);assert.deepEqual(reads,[1196,1197,1198]);
-  const lane=await ctx.chain.getLane();assert.equal(lane.processed_through,1198);assert.equal(lane.observed_head,1200);
+  reads.length=0;head=1200;assert.equal((await follower.tick()).persistedBlocks,3);assert.deepEqual(reads,[1000,1001,1002]);
+  const lane=await ctx.chain.getLane();assert.equal(lane.processed_through,1002);assert.equal(lane.observed_head,1200);
   assert.equal(lane.contiguous_complete_through,null);
 });
 await test('closing one gap advances across 120 certified blocks in bounded DB-only pages, with no island RPC reads',async () => {

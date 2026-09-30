@@ -232,16 +232,17 @@ export function createFoundationRepository(pool) {
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [...key,...expected])).rows[0];
       });
     },
-    async claim(identity, owner, leaseMs = 30000) {
+    async claim(identity, owner, leaseMs = 30000, { preferredComponent = null } = {}) {
       label(owner);
+      if (preferredComponent !== null) label(preferredComponent);
       if (!Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 300000) throw new Error('invalid_lease_duration');
       return transaction(async (client) => (await client.query(`/* a2:claim */ WITH candidate AS (
         SELECT id FROM arc_intelligence_work WHERE ${laneWhere} AND not_before <= now()
           AND (state IN ('pending','retrying') OR (state='leased' AND lease_until <= now()))
-        ORDER BY not_before,id LIMIT 1 FOR UPDATE SKIP LOCKED
+        ORDER BY CASE WHEN component=$8 THEN 0 ELSE 1 END,not_before,id LIMIT 1 FOR UPDATE SKIP LOCKED
       ) UPDATE arc_intelligence_work w SET state='leased',attempts=w.attempts+1,
         fencing_token=w.fencing_token+1,lease_owner=$6,lease_until=now()+$7*interval '1 millisecond',updated_at=now()
-        FROM candidate c WHERE w.id=c.id RETURNING w.*`, [...identityValues(identity),owner,leaseMs])).rows[0] ?? null);
+        FROM candidate c WHERE w.id=c.id RETURNING w.*`, [...identityValues(identity),owner,leaseMs,preferredComponent])).rows[0] ?? null);
     },
     async finishWork(lease, { state = 'complete', reason = null, retryMs = 1000 } = {}) {
       if (!['complete','retrying','failed','persistent_partial'].includes(state)

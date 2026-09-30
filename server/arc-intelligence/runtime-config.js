@@ -17,6 +17,7 @@ export function readRuntimeConfig(env = {}) {
     rpc429CooldownMs:integer(env,'INTELLIGENCE_A2_RPC_429_COOLDOWN_MS',15000,1000,3600000),
     liveMaxBlocks:integer(env,'INTELLIGENCE_A2_LIVE_MAX_BLOCKS',3,1,MAX_WINDOW_SIZE),
     receiptMaxReads:integer(env,'INTELLIGENCE_A2_RECEIPT_MAX_READS',4,1,64),
+    workBurst:integer(env,'INTELLIGENCE_A2_WORK_BURST',12,1,50),
     workerPollMs:integer(env,'INTELLIGENCE_A2_WORKER_POLL_MS',1000,100,3600000),
   });
 }

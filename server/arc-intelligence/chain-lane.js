@@ -8,12 +8,13 @@ export function normalizeManifest(raw, requestedBlock) {
   return normalizeChainBlock(raw,requestedBlock);
 }
 
-// Explicit opt-in only: production main.js continues to start just the A1 indexer.
+// Started only by the explicit A2 runtime; contiguous mode remains available to foundation callers.
 export function createChainFollower({ repository, rpc, identity = CHAIN_IDENTITY, maxBlocks = 25, finalityBlocks = 2, mode = 'contiguous' } = {}) {
   if (!repository || rpc?.url !== ARC_RPC_URL || !rpc.budget || !Number.isSafeInteger(maxBlocks)
     || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE || !Number.isSafeInteger(finalityBlocks)
     || finalityBlocks < 0 || finalityBlocks > 10000 || !['contiguous','live'].includes(mode)) throw new Error('invalid_chain_follower');
   let active = false;
+  let chainVerified = false;
   return {
     async tick({ signal } = {}) {
       if (active) return { skipped:true };
@@ -25,16 +26,20 @@ export function createChainFollower({ repository, rpc, identity = CHAIN_IDENTITY
         if (lane.status === 'continuity_error') return { status:'continuity_error',persistedBlocks };
         errorCode = 'rpc_head_unavailable';
         if (signal?.aborted) return { status:'aborted',persistedBlocks };
-        if (quantityToSafeNumber(await rpc.request('eth_chainId',[],{signal})) !== ARC_CHAIN_ID) throw new Error('noncanonical_chain');
+        if (!chainVerified) {
+          if (quantityToSafeNumber(await rpc.request('eth_chainId',[],{signal})) !== ARC_CHAIN_ID) throw new Error('noncanonical_chain');
+          chainVerified = true;
+        }
         const head = quantityToSafeNumber(await rpc.request('eth_blockNumber',[],{signal}));
         await repository.setLaneStatus(identity,'indexing',null,head);
         if (head < finalityBlocks) throw new Error('rpc_head_unavailable');
         const targetHead = head-finalityBlocks;
         let next = lane.contiguous_complete_through === null ? position(lane.origin_block) : position(lane.contiguous_complete_through)+1;
         if (mode === 'live') {
-          const liveFloor = targetHead-maxBlocks+1;
-          const afterProcessed = lane.processed_through === null ? liveFloor : position(lane.processed_through)+1;
-          next = Math.max(position(lane.origin_block),liveFloor,afterProcessed);
+          // A live-floor jump is bootstrap only. Once a live tail exists, never create another gap.
+          next = lane.processed_through === null
+            ? Math.max(position(lane.origin_block),targetHead-maxBlocks+1)
+            : position(lane.processed_through)+1;
         }
         while (next <= targetHead && persistedBlocks < maxBlocks) {
           if (signal?.aborted) return { status:'aborted',persistedBlocks };

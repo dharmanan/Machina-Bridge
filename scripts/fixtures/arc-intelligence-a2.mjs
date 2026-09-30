@@ -109,8 +109,10 @@ export function fixturePool() {
           }
           case 'claim': {
             assert(text.includes('FOR UPDATE SKIP LOCKED'));
-            const work=[...store.work.values()].find((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
-              && w.not_before <= clock && (['pending','retrying'].includes(w.state) || (w.state === 'leased' && w.lease_until <= clock)));
+            const work=[...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
+              && w.not_before <= clock && (['pending','retrying'].includes(w.state) || (w.state === 'leased' && w.lease_until <= clock)))
+              .sort((a,b) => Number(b.component === values[7])-Number(a.component === values[7])
+                || a.not_before-b.not_before || (BigInt(a.id)<BigInt(b.id) ? -1 : 1))[0];
             if (!work) return rows();
             Object.assign(work,{state:'leased',attempts:work.attempts+1,fencing_token:(BigInt(work.fencing_token)+1n).toString(),lease_owner:values[5],lease_until:clock+values[6]});
             return rows([work]);
@@ -124,6 +126,12 @@ export function fixturePool() {
           case 'result': {
             const work=store.work.get(String(values[0]));
             Object.assign(work,{state:values[1],reason_code:values[2],not_before:clock+values[3],lease_owner:null,lease_until:null}); return rows([work]);
+          }
+          case 'receipts_work_counts': {
+            assert(text.includes("state IN ('pending','retrying','leased')"));
+            const jobs=[...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values));
+            return rows([{pending:String(jobs.filter((w) => w.state==='pending').length),
+              retrying:String(jobs.filter((w) => w.state==='retrying').length),leased:String(jobs.filter((w) => w.state==='leased').length)}]);
           }
           case 'receipts_recent': return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1] && b.block_number <= values[2]
             && b.transactions_complete && !b.receipt_evidence_conflict

@@ -198,7 +198,19 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         return jobs;
       });
     },
-    async claim(owner,leaseMs=180000) { return foundation.claim(identity,owner,leaseMs); },
+    async claim(owner,leaseMs=180000, { preferredComponent = null } = {}) {
+      if (preferredComponent !== null && !Object.hasOwn(dimensions,preferredComponent)) throw new Error('invalid_receipt_component');
+      return foundation.claim(identity,owner,leaseMs,{preferredComponent});
+    },
+    async workCounts() {
+      // The ready-state predicate matches the existing partial work index; outstanding work is capped at 10000.
+      const counts = (await pool.query(`/* receipts:work_counts */ SELECT
+        count(*) FILTER (WHERE state='pending') AS pending,
+        count(*) FILTER (WHERE state='retrying') AS retrying,
+        count(*) FILTER (WHERE state='leased') AS leased
+        FROM arc_intelligence_work WHERE ${where} AND state IN ('pending','retrying','leased')`,values)).rows[0];
+      return {pending:position(counts.pending),retrying:position(counts.retrying),leased:position(counts.leased)};
+    },
     async markBulkAttempted(lease) {
       return transaction(async (client) => {
         const {job,view}=await guard(client,lease);

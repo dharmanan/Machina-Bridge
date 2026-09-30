@@ -12,14 +12,14 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
     || maxReceiptReads < 1 || maxReceiptReads > 64) throw new Error('invalid_receipt_worker');
   let active=false;
   return {
-    async runOnce({signal}={}) {
+    async runOnce({signal,preferredComponent=null}={}) {
       if (active) return {skipped:true};
       if (signal?.aborted) return {status:'aborted'};
       active=true;
       let lease;
       let retryMs=1000;
       try {
-        lease=await repository.claim(owner);
+        lease=await repository.claim(owner,180000,{preferredComponent});
         if (!lease) return {status:'idle'};
         retryMs=Math.min(60000,1000*(2**Math.min(position(lease.attempts)-1,6)));
         let view=await repository.getBlock(position(lease.start_block));
