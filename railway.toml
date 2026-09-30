@@ -1,0 +1,11 @@
+[build]
+builder = "RAILPACK"
+buildCommand = "npm run railway:intelligence:check"
+watchPatterns = ["server/arc-intelligence/**", "api/_lib/arc-intelligence/**", "scripts/check-arc-intelligence-server.mjs", "package.json", "package-lock.json", "railway.toml"]
+
+[deploy]
+startCommand = "npm run start:intelligence"
+healthcheckPath = "/health"
+healthcheckTimeout = 60
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
