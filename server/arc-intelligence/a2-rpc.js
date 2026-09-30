@@ -5,9 +5,15 @@ import { ARC_RPC_URL, createArcRpcClient } from '../../api/_lib/arc-intelligence
 export function createA2RpcClient({ budget, fetchImpl = globalThis.fetch, timeoutMs = 8000 } = {}) {
   if (!budget?.wrap || typeof fetchImpl !== 'function') throw new Error('invalid_a2_rpc');
   return budget.wrap({ url:ARC_RPC_URL,async request(method,params, { signal } = {}) {
-    const client = createArcRpcClient({ url:ARC_RPC_URL,timeoutMs,maxAttempts:1,fetchImpl:(url,init) => fetchImpl(url,
-      { ...init,signal:signal ? AbortSignal.any([signal,init.signal]) : init.signal }) });
+    const client = createArcRpcClient({ url:ARC_RPC_URL,timeoutMs,maxAttempts:1,fetchImpl:async (url,init) => {
+      if (signal?.aborted) throw new Error('operation_aborted');
+      const response = await fetchImpl(url,{ ...init,signal:signal ? AbortSignal.any([signal,init.signal]) : init.signal });
+      // Arm the shared cooldown before this invocation settles and releases its slot.
+      if (response.status === 429) budget.notifyRateLimit();
+      return response;
+    } });
     if (signal?.aborted) throw new Error('operation_aborted');
-    return client.request(method,params);
+    try { return await client.request(method,params); }
+    catch { throw new Error(signal?.aborted ? 'operation_aborted' : 'required_read_unavailable'); }
   } });
 }

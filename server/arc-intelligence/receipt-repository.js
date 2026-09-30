@@ -173,6 +173,16 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       const client=await pool.connect();
       try { return await load(client,position(number)); } finally { client.release(); }
     },
+    async recentIncompleteBlocks(through, tailSize = MAX_WINDOW_SIZE) {
+      const end = position(through);
+      if (!Number.isSafeInteger(tailSize) || tailSize < 1 || tailSize > MAX_WINDOW_SIZE) throw new Error('invalid_recent_tail');
+      // No anchor-to-head scan: both the numeric range and returned rows are bounded.
+      return (await pool.query(`/* receipts:recent */ SELECT block_number FROM arc_intelligence_blocks
+        WHERE chain_id=$1 AND block_number BETWEEN $2 AND $3 AND transactions_complete
+        AND NOT receipt_evidence_conflict
+        AND NOT (receipt_complete AND all_log_reconciliation_complete AND transfer_log_reconciliation_complete)
+        ORDER BY block_number LIMIT $4`,[ARC_CHAIN_ID,Math.max(0,end-tailSize+1),end,tailSize])).rows.map((b) => position(b.block_number));
+    },
     async scheduleBlock(number) {
       await this.initialize();
       return commitAndAdvance(async (client) => {

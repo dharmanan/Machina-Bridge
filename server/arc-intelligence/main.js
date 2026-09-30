@@ -5,6 +5,9 @@ import { migrate } from './migrate.js';
 import { createIndexer, readConfig } from './indexer.js';
 import { createHttpServer, parseAllowedOrigins } from './http.js';
 import { sanitizedErrorCode } from './read-model.js';
+import { readRuntimeConfig } from './runtime-config.js';
+import { createA2Runtime } from './a2-runtime.js';
+import { createArcRpcClient } from '../../api/_lib/arc-intelligence/rpc.js';
 
 export function tickDelayMs(result, pollMs) {
   return result.status === 'indexing' ? 500 : pollMs;
@@ -20,36 +23,50 @@ export function indexingFailureMessage(result) {
 export async function runIndexerLoop({ indexer, pollMs, signal, sleepImpl = sleep, log = console.error }) {
   while (!signal.aborted) {
     const result = await indexer.tick();
-    if (result.status === 'degraded') log(indexingFailureMessage(result));
     if (signal.aborted) break;
+    if (result.status === 'degraded') log(indexingFailureMessage(result));
     try { await sleepImpl(tickDelayMs(result, pollMs), undefined, { signal }); } catch { break; }
   }
 }
 
-export async function start(env = process.env) {
+export async function start(env = process.env, dependencies = {}) {
   const config = readConfig(env);
+  const runtimeConfig = readRuntimeConfig(env);
+  const deps = {createPool,createRepository,migrate,createIndexer,createHttpServer,createA2Runtime,
+    log:console.log,fetchImpl:globalThis.fetch,...dependencies};
   const allowedOrigins = parseAllowedOrigins(env.INTELLIGENCE_ALLOWED_ORIGINS);
-  const pool = createPool(env.DATABASE_URL);
+  const pool = deps.createPool(env.DATABASE_URL);
   const controller = new AbortController();
   let server;
   try {
-    await migrate(pool);
-    const repository = createRepository(pool);
-    const indexer = createIndexer({ repository, config });
-    server = createHttpServer({ repository, allowedOrigins });
+    await deps.migrate(pool);
+    const repository = deps.createRepository(pool);
+    server = deps.createHttpServer({ repository, allowedOrigins });
     await new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(config.port, '0.0.0.0', resolve);
     });
     server.on('error', () => { console.error('Intelligence HTTP server unavailable'); controller.abort(); });
-    console.log('Arc Intelligence backend listening');
-    const loop = runIndexerLoop({ indexer, pollMs: config.pollMs, signal: controller.signal });
-    const stop = async () => {
+    deps.log(`Arc Intelligence runtime mode: ${runtimeConfig.mode}`);
+    let loop;
+    if (runtimeConfig.mode === 'a1') {
+      // Preserve A1 retries/data semantics, but stop active transport and future starts on shutdown.
+      const rpc = createArcRpcClient({fetchImpl:(url,init) => {
+        if (controller.signal.aborted) throw new Error('operation_aborted');
+        return deps.fetchImpl(url,{...init,signal:AbortSignal.any([controller.signal,init.signal])});
+      }});
+      const indexer = deps.createIndexer({repository,config,rpc});
+      loop = runIndexerLoop({indexer,pollMs:config.pollMs,signal:controller.signal});
+    } else {
+      const runtime = deps.createA2Runtime({pool,config:runtimeConfig,finalityBlocks:config.finalityBlocks});
+      loop = runtime.run({signal:controller.signal});
+    }
+    let stopping;
+    const stop = () => stopping ??= (async () => {
       controller.abort();
       await new Promise((resolve) => server.close(resolve));
-      await loop;
-      await pool.end();
-    };
+      try { await loop; } finally { await pool.end(); }
+    })();
     return { server, stop };
   } catch (error) {
     server?.close();

@@ -329,12 +329,13 @@ await test('shared reconciliation rejects duplicate receipt identities and retai
   assert.equal(reconcileLogs([...logs,...logs],logs,{receiptSetComplete:true,queryComplete:true},'all').complete,false);
   assert.equal(reconcileLogs(logs,logs,{receiptSetComplete:false,queryComplete:true},'all').complete,false);
 });
-await test('A2 repositories never issue A1 writes; main remains A1 only and storage contains no raw response',async () => {
+await test('A2 repositories never issue A1 writes; default runtime remains A1 and storage contains no raw response',async () => {
   const ctx=await setup();const a1=structuredClone(ctx.pool.store.a1);const w=worker(ctx,fullHandler(100));await finish(ctx,w.instance,100);
   assert.deepEqual(ctx.pool.store.a1,a1);
   assert(!ctx.pool.calls.some((c) => /(?:INSERT INTO|UPDATE|DELETE FROM|ALTER TABLE) arc_intelligence_(?:state|chunks|latest|runs)\b/.test(c.text)));
   const main=await readFile(new URL('../server/arc-intelligence/main.js',import.meta.url),'utf8');
   assert(!/createChainFollower|createReceiptWorker|createA2RpcClient/.test(main));
+  assert(main.includes("runtimeConfig.mode === 'a1'"));
   const sql=await readFile(new URL('../server/arc-intelligence/sql/003_a2_receipts.sql',import.meta.url),'utf8');assert(!/jsonb|raw_payload|full_input/i.test(sql));
   assert.equal([...ctx.pool.store.logs.values()].map(normalizedLog).length,1);
 });

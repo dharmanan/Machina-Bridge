@@ -125,6 +125,10 @@ export function fixturePool() {
             const work=store.work.get(String(values[0]));
             Object.assign(work,{state:values[1],reason_code:values[2],not_before:clock+values[3],lease_owner:null,lease_until:null}); return rows([work]);
           }
+          case 'receipts_recent': return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1] && b.block_number <= values[2]
+            && b.transactions_complete && !b.receipt_evidence_conflict
+            && !(b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete))
+            .sort((a,b) => a.block_number-b.block_number).slice(0,values[3]).map((b) => ({block_number:b.block_number})));
           case 'receipts_block': return rows(store.blocks.has(values[1]) ? [store.blocks.get(values[1])] : []);
           case 'receipts_transactions': return rows([...store.transactions.values()].filter((t) => t.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
           case 'receipts_receipts': return rows([...store.receipts.values()].filter((r) => r.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
