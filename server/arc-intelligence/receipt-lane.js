@@ -12,7 +12,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
     || maxReceiptReads < 1 || maxReceiptReads > 64) throw new Error('invalid_receipt_worker');
   let active=false;
   return {
-    async runOnce({signal,preferredComponent=null}={}) {
+    async runOnce({signal,preferredComponent=null,enqueueFollowups=true}={}) {
       if (active) return {skipped:true};
       if (signal?.aborted) return {status:'aborted'};
       active=true;
@@ -49,7 +49,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
             // Conflicting rows in one untrusted response have no canonical winner: recover those hashes individually.
             const valid=[...seen.entries()].filter(([hash]) => !conflicts.has(hash)).map(([,entry]) => entry.raw);
             if (signal?.aborted) throw new Error('operation_aborted');
-            if (valid.length) await repository.saveReceipts(lease,valid,{retryMs,finalize:false});
+            if (valid.length) await repository.saveReceipts(lease,valid,{retryMs,finalize:false,enqueueFollowups});
             view=await repository.getBlock(position(lease.start_block));
           }
           const present=new Set(view.receipts.map((r) => r.transaction_hash));
@@ -61,7 +61,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
           }));
           if (signal?.aborted) throw new Error('operation_aborted');
           const raw=results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-          const result=await repository.saveReceipts(lease,raw,{retryMs});
+          const result=await repository.saveReceipts(lease,raw,{retryMs,enqueueFollowups});
           return {status:result.complete ? 'complete' : 'retrying',component:lease.component,...result};
         }
         if (!receiptSetComplete(view)) {
@@ -99,7 +99,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
           return {status:'persistent_partial',error:'manifest_conflict'};
         }
         if (lease) await repository.retry(lease,retryMs).catch(() => {});
-        return {status:signal?.aborted ? 'aborted' : 'retrying',error:'required_read_unavailable'};
+        return {status:signal?.aborted ? 'aborted' : 'retrying',error:error.message==='work_capacity_reached' ? 'work_capacity_reached' : 'required_read_unavailable'};
       } finally {active=false;}
     },
   };

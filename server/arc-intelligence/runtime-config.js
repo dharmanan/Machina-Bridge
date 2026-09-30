@@ -1,4 +1,5 @@
 import { MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
+import { MAX_WORK_ROWS } from './foundation.js';
 
 function integer(env, key, fallback, min, max) {
   const value = env[key] ?? String(fallback);
@@ -11,7 +12,10 @@ function integer(env, key, fallback, min, max) {
 export function readRuntimeConfig(env = {}) {
   const mode = env.INTELLIGENCE_RUNTIME_MODE ?? 'a1';
   if (!['a1','a2_shadow'].includes(mode)) throw new Error('Invalid INTELLIGENCE_RUNTIME_MODE');
-  return Object.freeze({ mode,
+  const workHighWater = integer(env,'INTELLIGENCE_A2_WORK_HIGH_WATER',9000,2,MAX_WORK_ROWS-1);
+  const workLowWater = integer(env,'INTELLIGENCE_A2_WORK_LOW_WATER',7000,1,MAX_WORK_ROWS-1);
+  if (workLowWater >= workHighWater) throw new Error('Invalid A2 work watermarks');
+  return Object.freeze({ mode,workHighWater,workLowWater,
     rpcConcurrency:integer(env,'INTELLIGENCE_A2_RPC_CONCURRENCY',1,1,4),
     rpcMinIntervalMs:integer(env,'INTELLIGENCE_A2_RPC_MIN_INTERVAL_MS',500,100,60000),
     rpc429CooldownMs:integer(env,'INTELLIGENCE_A2_RPC_429_COOLDOWN_MS',15000,1000,3600000),

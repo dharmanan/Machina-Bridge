@@ -8,7 +8,7 @@ import { createA2RpcClient } from '../server/arc-intelligence/a2-rpc.js';
 import { createA2Runtime, createWorkBurst } from '../server/arc-intelligence/a2-runtime.js';
 import { start } from '../server/arc-intelligence/main.js';
 import { createHttpServer } from '../server/arc-intelligence/http.js';
-import { createFoundationRepository, CHAIN_IDENTITY } from '../server/arc-intelligence/foundation.js';
+import { createFoundationRepository, CHAIN_IDENTITY, MAX_WORK_ROWS } from '../server/arc-intelligence/foundation.js';
 import { createChainFollower } from '../server/arc-intelligence/chain-lane.js';
 import { createReceiptRepository, RECEIPT_IDENTITY } from '../server/arc-intelligence/receipt-repository.js';
 import { createReceiptWorker } from '../server/arc-intelligence/receipt-lane.js';
@@ -40,7 +40,7 @@ function receipt(n) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionI
   status:'0x1',gasUsed:'0x1234',effectiveGasPrice:'0x1',contractAddress:null,logs:[]};}
 
 await test('runtime defaults and numeric defaults are explicit; invalid mode fails closed',async () => {
-  assert.deepEqual(readRuntimeConfig({}),{mode:'a1',rpcConcurrency:1,rpcMinIntervalMs:500,rpc429CooldownMs:15000,
+  assert.deepEqual(readRuntimeConfig({}),{mode:'a1',workHighWater:9000,workLowWater:7000,rpcConcurrency:1,rpcMinIntervalMs:500,rpc429CooldownMs:15000,
     liveMaxBlocks:3,receiptMaxReads:4,workBurst:12,workerPollMs:1000});
   for (const value of ['dual','A1','','a2','a1 ']) assert.throws(() => readRuntimeConfig({INTELLIGENCE_RUNTIME_MODE:value}));
   let opened=false;
@@ -55,6 +55,17 @@ await test('all A2 numbers enforce bounds and reject malformed numeric strings',
     for (const bad of [String(min-1),String(max+1),'1.5','+1',' 1','1ms','1e3','',1,'9007199254740993']) {
       assert.throws(() => readRuntimeConfig({[name]:bad}));
     }
+  }
+});
+await test('watermarks use capacity bounds, default to 9000/7000 and reject malformed/equal/reversed pairs',async () => {
+  const config=readRuntimeConfig({});assert.equal(config.workHighWater,9000);assert.equal(config.workLowWater,7000);
+  readRuntimeConfig({INTELLIGENCE_A2_WORK_HIGH_WATER:'2',INTELLIGENCE_A2_WORK_LOW_WATER:'1'});
+  readRuntimeConfig({INTELLIGENCE_A2_WORK_HIGH_WATER:String(MAX_WORK_ROWS-1),INTELLIGENCE_A2_WORK_LOW_WATER:String(MAX_WORK_ROWS-2)});
+  for (const [high,low] of [['9000','9000'],['7000','9000'],[String(MAX_WORK_ROWS),'7000'],['9000','0'],['1','1']]) {
+    assert.throws(() => readRuntimeConfig({INTELLIGENCE_A2_WORK_HIGH_WATER:high,INTELLIGENCE_A2_WORK_LOW_WATER:low}));
+  }
+  for (const name of ['INTELLIGENCE_A2_WORK_HIGH_WATER','INTELLIGENCE_A2_WORK_LOW_WATER']) {
+    for (const value of ['1.5','+9000',' 9000','9000rows','9e3','',9000,'9007199254740993']) assert.throws(() => readRuntimeConfig({[name]:value}));
   }
 });
 await test('global start spacing applies across chain and receipt callers',async () => {
@@ -191,6 +202,21 @@ async function setup() {
   const foundation=createFoundationRepository(pool);await foundation.initializeChainLane();
   return {pool,foundation};
 }
+await test('work pressure counts every non-complete state, including failed/conflict, with exact receipt lane scope',async () => {
+  const {pool,foundation}=await setup();const repository=createReceiptRepository(pool);await repository.initialize();
+  const states=['pending','retrying','leased','failed','persistent_partial','complete'];
+  for (const [i,state] of states.entries()) {
+    const row=await foundation.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:hash(i+100),startBlock:100+i,endBlock:100+i});
+    pool.store.work.get(row.id).state=state;
+  }
+  await foundation.enqueue(CHAIN_IDENTITY,{component:'manifest',logicalKey:'other_lane',startBlock:100,endBlock:100});
+  await foundation.initializeLane({...RECEIPT_IDENTITY,definitionVersion:'other-version'});
+  await foundation.enqueue({...RECEIPT_IDENTITY,definitionVersion:'other-version'},{component:'receipts',logicalKey:'other_version',startBlock:100,endBlock:100});
+  assert.deepEqual(await repository.workPressure(),{outstanding:5});
+  assert.deepEqual(await repository.workCounts(),{pending:1,retrying:1,leased:1});
+  const query=pool.calls.find((c) => c.text.includes('receipts:work_pressure'));
+  assert(query.text.includes("state <> 'complete'"));assert.deepEqual(query.values,[5042,'receipts_logs','canonical_receipts_logs',RECEIPT_IDENTITY.epoch,RECEIPT_IDENTITY.definitionVersion]);
+});
 await test('real A2 cycle uses shared paced RPC, persists before scheduling, recovers recent crash gap only',async () => {
   const {pool,foundation}=await setup();const a1=structuredClone(pool.store.a1);
   await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
@@ -431,7 +457,7 @@ await test('summary logs sanitized numbers at most once per minute and counts qu
       const {method}=JSON.parse(init.body);return response(method==='eth_chainId' ? hex(5042) : method==='eth_blockNumber' ? hex(102) : []);
     }});
   await runtime.run({signal:controller.signal});assert.equal(logs.length,2);assert(logs[0].time>=60000);assert(logs[1].time-logs[0].time>=60000);
-  for (const {text} of logs) assert.equal(text,'Arc Intelligence A2: head=102 chain=100 receipt=100 pending=0 retrying=0 leased=0');
+  for (const {text} of logs) assert.equal(text,'Arc Intelligence A2: head=102 chain=100 receipt=100 outstanding=0 pending=0 retrying=0 leased=0 backpressure=normal');
   const counts=pool.calls.filter((c) => c.text.includes('receipts:work_counts'));assert.equal(counts.length,2);
   assert(counts.every((c) => c.text.includes("state IN ('pending','retrying','leased')") && c.values.length===5));
 });
@@ -442,6 +468,148 @@ await test('periodic summary read failure prints only a fixed sanitized code',as
     sleepImpl:async (ms) => {time+=ms;pool.advance(ms);if (logs.length) {controller.abort();throw new Error('operation_aborted');}},
     fetchImpl:async (url,init) => {const {method}=JSON.parse(init.body);return response(method==='eth_chainId' ? hex(5042) : method==='eth_blockNumber' ? hex(102) : []);}});
   await runtime.run({signal:controller.signal});assert.deepEqual(logs,['Arc Intelligence A2: status=required_read_unavailable']);
+});
+await test('drain hysteresis creates zero chain/work rows; receipts complete without follow-ups; low watermark resumes chain first',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:5},(_,i) => block(100+i)));
+  await foundation.persistManifest(CHAIN_IDENTITY,[block(995)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<105;n++) await repository.scheduleBlock(n);
+  let time=0;const calls=[];const config={...readRuntimeConfig({}),workHighWater:5,workLowWater:2,workBurst:1,liveMaxBlocks:1};
+  const runtime=createA2Runtime({pool,config,now:() => time,sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+    const {method,params}=JSON.parse(init.body);calls.push(method);
+    if (method==='eth_chainId') return response(hex(5042));if (method==='eth_blockNumber') return response(hex(1002));
+    if (method==='eth_getBlockByNumber') return response(rawBlock(Number(BigInt(params[0]))));
+    if (method==='eth_getBlockReceipts') return response([receipt(Number(BigInt(params[0])))]);
+    return response([]);
+  }});
+  const blocks=pool.store.blocks.size;const work=pool.store.work.size;
+  for (let i=0;i<3;i++) {
+    const from=pool.calls.length;const result=await runtime.cycle();
+    assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');assert.equal(result.work[0].status,'complete');
+    assert.equal(result.continueImmediately,true);assert.equal(result.outstanding,4-i);
+    assert.deepEqual(result.scheduledBlocks,[]);assert.deepEqual(result.deferredBlocks,[]);
+    assert(!pool.calls.slice(from).some((c) => /a2:block|a2:enqueue|receipts:recent|receipts:deferred/.test(c.text)));
+    assert.equal(pool.store.blocks.size,blocks);assert.equal(pool.store.work.size,work);
+    assert.equal(pool.store.blocks.get(100+i).receipt_complete,true);
+    assert.equal([...pool.store.work.values()].find((w) => w.start_block===100+i).state,'complete');
+  }
+  assert.deepEqual(calls,['eth_getBlockReceipts','eth_getBlockReceipts','eth_getBlockReceipts']);
+  assert.equal(pool.store.receipts.size,3);assert.equal((await repository.workPressure()).outstanding,2);
+  const resume=await runtime.cycle();assert.equal(resume.chain.persistedBlocks,1);
+  assert.deepEqual(calls.slice(3,6),['eth_chainId','eth_blockNumber','eth_getBlockByNumber']);
+  assert(pool.store.blocks.has(996));assert(!pool.store.blocks.has(105));
+  assert.deepEqual(resume.deferredBlocks,[100,101]); // recovery returns to drain as soon as high watermark is reached
+  assert.equal([...pool.store.work.values()].filter((w) => ['all_logs','transfer_logs'].includes(w.component)).length,4);
+});
+await test('fresh runtime above high watermark enters drain immediately and productive bursts drain without idle poll',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:4},(_,i) => block(100+i)));
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<104;n++) await repository.scheduleBlock(n);
+  const controller=new AbortController();let time=0;let bulkCalls=0;let headCalls=0;const polls=[];
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:4,workLowWater:1,workBurst:1},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);if (ms===1000) polls.push(ms);},fetchImpl:async (url,init) => {
+      const {method,params}=JSON.parse(init.body);
+      if (method==='eth_chainId') {controller.abort();return response(hex(5042));}
+      if (method==='eth_blockNumber') {headCalls++;return response(hex(105));}
+      assert.equal(method,'eth_getBlockReceipts');bulkCalls++;return response([receipt(Number(BigInt(params[0])))]);
+    }});
+  await runtime.run({signal:controller.signal});assert.equal(bulkCalls,3);assert.equal(headCalls,0);assert.deepEqual(polls,[]);
+  assert.equal(pool.store.work.size,4);assert.equal((await repository.workPressure()).outstanding,1);
+});
+await test('deferred recovery pages at most 50 durable blocks, reaches old blocks, is idempotent and preserves existing certificates',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:50},(_,i) => block(100+i,0)));
+  await foundation.persistManifest(CHAIN_IDENTITY,[block(150,0)]);await foundation.persistManifest(CHAIN_IDENTITY,[block(1000,0)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<=150;n++) await repository.scheduleBlock(n);
+  const worker=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (let i=0;i<51;i++) assert.equal((await worker.runOnce({enqueueFollowups:false})).status,'complete');
+  assert.equal(pool.store.work.size,51);assert.equal((await repository.workPressure()).outstanding,0);
+  const recent=await repository.recentIncompleteBlocks(1000);assert(!recent.some((n) => n<=150));
+  const first=await repository.deferredFollowupBlocks();assert.equal(first.scanned,50);assert.equal(first.blocks.length,50);assert.equal(first.nextBlock,150);
+  for (const n of first.blocks) assert.equal((await repository.recoverDeferredFollowups(n)).length,2);
+  assert.deepEqual((await repository.deferredFollowupBlocks()).blocks,[]);
+  assert.deepEqual(await repository.recoverDeferredFollowups(100),[]);
+  const second=await repository.deferredFollowupBlocks(first.nextBlock);assert.equal(second.scanned,2);assert.deepEqual(second.blocks,[150]);assert.equal(second.nextBlock,0);
+  assert.equal((await repository.recoverDeferredFollowups(150)).length,2);assert.equal(pool.store.work.size,153);
+  const keys=[...pool.store.work.values()].map((w) => `${w.component}:${w.logical_key}`);assert.equal(new Set(keys).size,keys.length);
+  assert.equal((await worker.runOnce({preferredComponent:'all_logs'})).status,'complete');
+  const certificate=structuredClone(pool.store.reconciliation);assert.deepEqual(await repository.recoverDeferredFollowups(100),[]);
+  assert.deepEqual(pool.store.reconciliation,certificate);
+  for (const bad of [0,51,1.5]) await assert.rejects(repository.deferredFollowupBlocks(0,bad));
+});
+await test('deferred recovery cursor wraps so previously incomplete old receipts are eventually revisited',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:50},(_,i) => block(100+i,0)));
+  await foundation.persistManifest(CHAIN_IDENTITY,[block(1000,0)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();
+  const first=await repository.deferredFollowupBlocks();assert.deepEqual(first,{blocks:[],scanned:50,nextBlock:150});
+  await repository.scheduleBlock(100);
+  const worker=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  assert.equal((await worker.runOnce({enqueueFollowups:false})).status,'complete');
+  assert.equal(pool.store.blocks.get(100).receipt_complete,true);assert.equal(pool.store.work.size,1);
+  const tail=await repository.deferredFollowupBlocks(first.nextBlock);assert.deepEqual(tail,{blocks:[],scanned:1,nextBlock:0});
+  const wrapped=await repository.deferredFollowupBlocks(tail.nextBlock);assert.deepEqual(wrapped.blocks,[100]);
+  assert.equal((await repository.recoverDeferredFollowups(100)).length,2);
+  assert.deepEqual(await repository.recoverDeferredFollowups(100),[]);assert.equal(pool.store.work.size,3);
+});
+await test('deferred recovery excludes conflicts and incomplete facts and creates only the missing component',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:5},(_,i) => block(100+i,0)));
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<105;n++) await repository.scheduleBlock(n);
+  const worker=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (let i=0;i<5;i++) assert.equal((await worker.runOnce({enqueueFollowups:false})).status,'complete');
+  pool.store.blocks.get(101).receipt_evidence_conflict=true;
+  pool.store.blocks.get(102).transactions_complete=false;
+  pool.store.blocks.get(103).receipt_complete=false;
+  await foundation.enqueue(RECEIPT_IDENTITY,{component:'all_logs',logicalKey:hash(105),startBlock:104,endBlock:104,blockHash:hash(105)});
+  const page=await repository.deferredFollowupBlocks();assert.deepEqual(page.blocks,[100,104]);
+  assert.deepEqual(await repository.recoverDeferredFollowups(101),[]);
+  assert.deepEqual(await repository.recoverDeferredFollowups(103),[]);
+  const jobs=await repository.recoverDeferredFollowups(104);assert.equal(jobs.length,1);assert.equal(jobs[0].component,'transfer_logs');
+  assert.deepEqual(await repository.recoverDeferredFollowups(104),[]);
+  assert.equal([...pool.store.work.values()].filter((w) => w.start_block===104 && w.component==='all_logs').length,1);
+});
+await test('high-water drain keeps retrying durable and gives post-cooldown RPC to worker while chain is paused',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0),block(101,0)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();for (const n of [100,101]) await repository.scheduleBlock(n);
+  const preparer=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (let i=0;i<2;i++) await preparer.runOnce({preferredComponent:'receipts'});
+  const controller=new AbortController();let time=0;const calls=[];
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:4,workLowWater:1},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      const method=JSON.parse(init.body).method;calls.push({method,time});assert.equal(method,'eth_getLogs');
+      if (calls.length===1) return response(null,429);controller.abort();return response([]);
+    }});
+  const size=pool.store.work.size;const from=pool.calls.length;const first=await runtime.cycle({signal:controller.signal});
+  assert.equal(first.backpressure,'drain');assert.equal(first.work.length,1);assert.equal(first.work[0].status,'retrying');assert.equal(first.continueImmediately,false);
+  const retry=[...pool.store.work.values()].find((w) => w.state==='retrying');assert(retry);assert.equal(retry.attempts,1);assert(retry.not_before>1000000);
+  await runtime.cycle({signal:controller.signal});assert.deepEqual(calls,[{method:'eth_getLogs',time:0},{method:'eth_getLogs',time:15000}]);
+  assert.equal(pool.store.work.size,size);assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
+});
+await test('capacity race is explicit, pauses producers and sleeps safely while global capacity remains occupied',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
+  pool.fail('a2:enqueue','work_capacity_reached');let time=0;const logs=[];const methods=[];
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:() => time,log:(s) => logs.push(s),sleepImpl:async (ms) => {time+=ms;},
+    fetchImpl:async (url,init) => {const method=JSON.parse(init.body).method;methods.push(method);return response(method==='eth_chainId' ? hex(5042) : hex(102));}});
+  const result=await runtime.cycle();assert.equal(result.error,'work_capacity_reached');assert.equal(result.backpressure,'drain');assert.equal(result.continueImmediately,false);
+  assert.equal(pool.store.work.size,0);assert.deepEqual(logs,['Arc Intelligence A2: backpressure=drain error=work_capacity_reached']);
+  for (let i=0;i<MAX_WORK_ROWS;i++) pool.store.work.set(String(i+1),{id:String(i+1),chain_id:5042,lane:'other',scope_id:'other',epoch:'other',definition_version:'other',state:'failed'});
+  const from=pool.calls.length;const rpcCount=methods.length;const next=await runtime.cycle();
+  assert.equal(next.backpressure,'drain');assert.equal(next.chain.status,'paused');assert.equal(next.continueImmediately,false);
+  assert.equal(methods.length,rpcCount);assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
+});
+await test('pressure read failure fails closed before any chain or worker RPC',async () => {
+  const {pool}=await setup();pool.fail('receipts:work_pressure');let calls=0;
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),fetchImpl:async () => {calls++;return response([]);}});
+  await assert.rejects(runtime.cycle());assert.equal(calls,0);
+});
+await test('drain summary reports exact outstanding including terminal partial work without chain RPC',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
+  await foundation.setLaneStatus(CHAIN_IDENTITY,'caught_up',null,102);const repository=createReceiptRepository(pool);await repository.initialize();
+  for (let i=0;i<2;i++) {
+    await foundation.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:hash(100+i),startBlock:100+i,endBlock:100+i});
+    const lease=await repository.claim('setup');await foundation.finishWork(lease,{state:'persistent_partial',reason:'unsupported_scope'});
+  }
+  const controller=new AbortController();let time=0;const logs=[];let rpcCalls=0;
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:2,workLowWater:1},now:() => time,log:(s) => logs.push(s),
+    sleepImpl:async (ms) => {time+=ms;if (logs.length) {controller.abort();throw new Error('operation_aborted');}},fetchImpl:async () => {rpcCalls++;return response([]);}});
+  await runtime.run({signal:controller.signal});assert.equal(rpcCalls,0);
+  assert.deepEqual(logs,['Arc Intelligence A2: head=102 chain=100 receipt=unavailable outstanding=2 pending=0 retrying=0 leased=0 backpressure=drain']);
 });
 await test('001/002/003 immutable; main consumes mode; SIGTERM and SIGINT share guarded shutdown',async () => {
   for (const [name,expected] of [['001_init','c38b78a7e0e1c47e1de5f1400f1502f53f4ce8eeb20fe5d8f328fb59d1992ff0'],

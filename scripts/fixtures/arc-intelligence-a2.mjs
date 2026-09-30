@@ -25,7 +25,7 @@ export function fixturePool() {
       async query(sql,values = []) {
         const text = sql.replace(/\s+/g,' ').trim();
         calls.push({text,values:structuredClone(values)});
-        if (failure && text.includes(failure)) { failure = null; throw new Error('Injected failure'); }
+        if (failure && text.includes(failure.operation)) { const message=failure.message;failure=null;throw new Error(message); }
         const rows = (value = []) => ({rows:structuredClone(value)});
         if (text === 'BEGIN') { backup=structuredClone(store); transactionOpen=true; return rows(); }
         if (text === 'COMMIT') { backup=null; transactionOpen=false; return rows(); }
@@ -127,6 +127,22 @@ export function fixturePool() {
             const work=store.work.get(String(values[0]));
             Object.assign(work,{state:values[1],reason_code:values[2],not_before:clock+values[3],lease_owner:null,lease_until:null}); return rows([work]);
           }
+          case 'receipts_deferred': {
+            assert(text.includes('ORDER BY block_number LIMIT $7'));
+            return rows([...store.blocks.values()].filter((b) => b.block_number>=values[5]).sort((a,b) => a.block_number-b.block_number).slice(0,values[6]).map((b) => ({
+              block_number:b.block_number,needs_followups:b.transactions_complete && b.receipt_complete && !b.receipt_evidence_conflict
+                && ['all_logs','transfer_logs'].some((component) => ![...store.reconciliation.values()].some((r) => r.block_number===b.block_number
+                  && r.block_hash===b.block_hash && r.kind===component && r.definition_version===values[4] && r.complete)
+                  && ![...store.work.values()].some((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version])===laneKey(values)
+                    && w.component===component && w.logical_key===b.block_hash)),
+            })));
+          }
+          case 'receipts_work_pressure': {
+            assert(text.includes("state <> 'complete'"));assert.equal(values.length,5);
+            const jobs=[...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
+              && w.state !== 'complete');
+            return rows([{outstanding:String(jobs.length)}]);
+          }
           case 'receipts_work_counts': {
             assert(text.includes("state IN ('pending','retrying','leased')"));
             const jobs=[...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values));
@@ -202,6 +218,6 @@ export function fixturePool() {
       release() { assert.equal(transactionOpen,false,'No transaction survives repository return'); },
     };
   }
-  return {calls,get store() {return store;},advance(ms) {clock+=ms;},fail(operation) {failure=operation;},
+  return {calls,get store() {return store;},advance(ms) {clock+=ms;},fail(operation,message='Injected failure') {failure={operation,message};},
     async connect() {return client();},async query(...args) {return client().query(...args);} };
 }

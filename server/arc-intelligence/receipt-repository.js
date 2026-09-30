@@ -202,6 +202,47 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       if (preferredComponent !== null && !Object.hasOwn(dimensions,preferredComponent)) throw new Error('invalid_receipt_component');
       return foundation.claim(identity,owner,leaseMs,{preferredComponent});
     },
+    async deferredFollowupBlocks(startBlock=0,limit=MAX_WINDOW_SIZE) {
+      const start=position(startBlock);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_WINDOW_SIZE) throw new Error('invalid_deferred_limit');
+      // Page the canonical manifest PK, not just recent blocks. At most 50 rows and two components per row are examined.
+      const rows=(await pool.query(`/* receipts:deferred */ WITH bounded AS (
+        SELECT * FROM arc_intelligence_blocks WHERE chain_id=$1 AND block_number >= $6 ORDER BY block_number LIMIT $7
+      ) SELECT b.block_number,
+        (b.transactions_complete AND b.receipt_complete AND NOT b.receipt_evidence_conflict AND EXISTS (
+          SELECT 1 FROM (VALUES ('all_logs'),('transfer_logs')) AS component(kind)
+          WHERE NOT EXISTS (SELECT 1 FROM arc_intelligence_reconciliation r WHERE r.chain_id=b.chain_id AND r.block_number=b.block_number
+            AND r.block_hash=b.block_hash AND r.kind=component.kind AND r.definition_version=$5 AND r.complete)
+          AND NOT EXISTS (SELECT 1 FROM arc_intelligence_work w WHERE w.chain_id=$1 AND w.lane=$2 AND w.scope_id=$3 AND w.epoch=$4
+            AND w.definition_version=$5 AND w.component=component.kind AND w.logical_key=b.block_hash)
+        )) AS needs_followups FROM bounded b ORDER BY b.block_number`,[...values,start,limit])).rows;
+      return {blocks:rows.filter((b) => b.needs_followups).map((b) => position(b.block_number)),scanned:rows.length,
+        nextBlock:rows.length===limit ? position(rows.at(-1).block_number)+1 : 0};
+    },
+    async recoverDeferredFollowups(number) {
+      return transaction(async (client) => {
+        const view=await load(client,position(number),true);
+        if (!view.block.receipt_complete || !receiptSetComplete(view)) return [];
+        const jobs=[];
+        for (const component of ['all_logs','transfer_logs']) {
+          if (view.reconciliation.some((r) => r.kind===component && r.complete)) continue;
+          const existing=(await client.query(`/* a2:work_existing */ SELECT * FROM arc_intelligence_work
+            WHERE ${where} AND component=$6 AND logical_key=$7`,[...values,component,view.block.block_hash])).rows[0];
+          if (!existing) jobs.push(await enqueue(client,view.block,component));
+        }
+        return jobs;
+      });
+    },
+    async capacityBelow(highWater) {
+      const count=(await pool.query("/* a2:work_count */ SELECT count(*) AS count FROM arc_intelligence_work WHERE state <> 'complete'")).rows[0].count;
+      return position(count) < highWater;
+    },
+    async workPressure() {
+      // Same capacity predicate as enqueue, scoped to this exact receipt lane identity.
+      const result = (await pool.query(`/* receipts:work_pressure */ SELECT count(*) AS outstanding
+        FROM arc_intelligence_work WHERE ${where} AND state <> 'complete'`,values)).rows[0];
+      return {outstanding:position(result.outstanding)};
+    },
     async workCounts() {
       // The ready-state predicate matches the existing partial work index; outstanding work is capped at 10000.
       const counts = (await pool.query(`/* receipts:work_counts */ SELECT
@@ -221,7 +262,7 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         return true;
       });
     },
-    async saveReceipts(lease,rawReceipts,{ retryMs=1000,finalize=true }={}) {
+    async saveReceipts(lease,rawReceipts,{ retryMs=1000,finalize=true,enqueueFollowups=true }={}) {
       return commitAndAdvance(async (client) => {
         const {job,view,state}=await guard(client,lease);
         if (job.component !== 'receipts') throw new Error('work_identity_mismatch');
@@ -233,7 +274,7 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
           SET receipt_count=CASE WHEN $3 THEN $4 ELSE receipt_count END,receipt_complete=receipt_complete OR $3
           WHERE chain_id=$1 AND block_number=$2`,[ARC_CHAIN_ID,view.block.block_number,complete,view.receipts.length]);
         await coverage(client,view,'receipts',complete,view.receipts);
-        if (complete) for (const component of ['all_logs','transfer_logs']) {
+        if (complete && enqueueFollowups) for (const component of ['all_logs','transfer_logs']) {
           if (!view.reconciliation.some((r) => r.kind === component && r.complete)) await enqueue(client,view.block,component);
         }
         if (finalize) await finish(client,job,complete,retryMs);

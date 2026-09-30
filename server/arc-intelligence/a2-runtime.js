@@ -42,9 +42,35 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   const receipts = createReceiptRepository(pool);
   const chain = createChainFollower({repository:foundation,rpc,mode:'live',maxBlocks:config.liveMaxBlocks,finalityBlocks});
   const worker = createReceiptWorker({repository:receipts,rpc,maxReceiptReads:config.receiptMaxReads,owner:randomUUID()});
-  const burst = createWorkBurst({worker,maxCalls:config.workBurst});
+  let draining = false;
+  let capacityBlocked = false;
+  let capacityLogged = false;
+  let deferredNextBlock = 0;
+  let outstanding = 0;
+  const burst = createWorkBurst({worker:{async runOnce(options) {
+    await refreshPressure();
+    const result=await worker.runOnce({...options,enqueueFollowups:!draining});
+    if (result.error==='work_capacity_reached') capacityError();
+    return result;
+  }},maxCalls:config.workBurst});
   let active = false;
   let nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
+  async function refreshPressure(allowResume=false) {
+    outstanding=(await receipts.workPressure()).outstanding;
+    if (outstanding>=config.workHighWater) draining=true;
+    else if (draining && allowResume && outstanding<=config.workLowWater
+      && (!capacityBlocked || await receipts.capacityBelow(config.workHighWater))) {
+      draining=false;capacityBlocked=false;
+    }
+    return draining;
+  }
+  function capacityError() {
+    draining=true;capacityBlocked=true;
+    if (!capacityLogged || now()>=nextSummaryAt) {
+      log('Arc Intelligence A2: backpressure=drain error=work_capacity_reached');
+      nextSummaryAt=now()+SUMMARY_INTERVAL_MS;capacityLogged=true;
+    }
+  }
   async function summary() {
     if (now() < nextSummaryAt) return;
     nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
@@ -52,9 +78,11 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       const chainLane = await foundation.getLane(CHAIN_IDENTITY);
       const receiptLane = await receipts.getLane();
       const counts = await receipts.workCounts();
+      const pressure = await receipts.workPressure();
       const number = (value) => value === null || value === undefined ? 'unavailable' : position(value);
       log(`Arc Intelligence A2: head=${number(chainLane?.observed_head)} chain=${number(chainLane?.processed_through)}`
-        + ` receipt=${number(receiptLane?.processed_through)} pending=${counts.pending} retrying=${counts.retrying} leased=${counts.leased}`);
+        + ` receipt=${number(receiptLane?.processed_through)} outstanding=${pressure.outstanding} pending=${counts.pending} retrying=${counts.retrying} leased=${counts.leased}`
+        + ` backpressure=${draining ? 'drain' : 'normal'}${capacityBlocked ? ' error=work_capacity_reached' : ''}`);
     } catch { log('Arc Intelligence A2: status=required_read_unavailable'); }
   }
   async function cycle({signal} = {}) {
@@ -62,29 +90,49 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
     if (signal?.aborted) return {status:'aborted'};
     active = true;
     try {
-      const chainResult = await chain.tick({signal});
+      await refreshPressure(true);
       if (signal?.aborted) return {status:'aborted'};
-      const lane = await foundation.getLane(CHAIN_IDENTITY);
+      const chainResult = draining ? {status:'paused',persistedBlocks:0} : await chain.tick({signal});
+      if (signal?.aborted) return {status:'aborted'};
       const receiptLane = await receipts.getLane();
       const scheduledBlocks = [];
-      if (receiptLane?.status !== 'continuity_error' && lane?.processed_through !== null && lane?.processed_through !== undefined) {
-        const recent = await receipts.recentIncompleteBlocks(lane.processed_through);
-        for (const number of recent) {
+      const deferredBlocks = [];
+      if (!draining && receiptLane?.status !== 'continuity_error') {
+        const page=await receipts.deferredFollowupBlocks(deferredNextBlock);
+        for (const number of page.blocks) {
           if (signal?.aborted) return {status:'aborted'};
-          await receipts.scheduleBlock(number);
-          scheduledBlocks.push(number);
+          if (await refreshPressure()) break;
+          await receipts.recoverDeferredFollowups(number);
+          deferredBlocks.push(number);
+        }
+        if (!await refreshPressure()) deferredNextBlock=page.nextBlock;
+        const lane=await foundation.getLane(CHAIN_IDENTITY);
+        if (!draining && lane?.processed_through !== null && lane?.processed_through !== undefined) {
+          const recent=await receipts.recentIncompleteBlocks(lane.processed_through);
+          for (const number of recent) {
+            if (signal?.aborted) return {status:'aborted'};
+            if (await refreshPressure()) break;
+            await receipts.scheduleBlock(number);
+            scheduledBlocks.push(number);
+          }
         }
       }
       if (signal?.aborted) return {status:'aborted'};
       const work = receiptLane?.status === 'continuity_error' ? [{status:'continuity_error'}] : await burst({signal});
+      if (!signal?.aborted) await refreshPressure();
       const last = work.at(-1)?.status;
       const stopped = ['aborted','continuity_error','persistent_partial','stale_lease'].includes(last);
-      // Exhausting a burst yields to the next chain tick, without a full idle poll.
-      // Retrying jobs remain protected by their durable not_before deadlines.
-      // An idle worker sleeps unless chain backlog still needs bounded sequential catch-up.
-      const continueImmediately = !stopped && !signal?.aborted && !['retrying','continuity_error','aborted'].includes(chainResult.status)
-        && (chainResult.status === 'indexing' || (work.length === (config.workBurst ?? 12) && last !== 'idle'));
-      return {chain:chainResult,work,scheduledBlocks,continueImmediately};
+      const fullBurst=work.length===(config.workBurst ?? 12);
+      const continueImmediately = draining
+        ? !signal?.aborted && fullBurst && work.every((result) => result.status==='complete')
+        : !stopped && !signal?.aborted && !['retrying','continuity_error','aborted'].includes(chainResult.status)
+          && (chainResult.status==='indexing' || (fullBurst && last!=='idle'));
+      return {chain:chainResult,work,scheduledBlocks,deferredBlocks,continueImmediately,
+        backpressure:draining ? 'drain' : 'normal',outstanding};
+    } catch (error) {
+      if (error.message!=='work_capacity_reached') throw error;
+      capacityError();
+      return {status:'retrying',error:'work_capacity_reached',work:[],backpressure:'drain',continueImmediately:false};
     } finally { active = false; }
   }
   async function run({signal}) {
