@@ -4,6 +4,27 @@ import { createPool, createRepository } from './db.js';
 import { migrate } from './migrate.js';
 import { createIndexer, readConfig } from './indexer.js';
 import { createHttpServer, parseAllowedOrigins } from './http.js';
+import { sanitizedErrorCode } from './read-model.js';
+
+export function tickDelayMs(result, pollMs) {
+  return result.status === 'indexing' ? 500 : pollMs;
+}
+
+export function indexingFailureMessage(result) {
+  const range = Number.isSafeInteger(result.startBlock) && Number.isSafeInteger(result.endBlock)
+    && result.startBlock >= 0 && result.endBlock >= result.startBlock
+    ? `${result.startBlock}..${result.endBlock} ` : '';
+  return `Arc Intelligence indexing degraded: ${range}${sanitizedErrorCode(result.error) ?? 'core_incomplete'}`;
+}
+
+export async function runIndexerLoop({ indexer, pollMs, signal, sleepImpl = sleep, log = console.error }) {
+  while (!signal.aborted) {
+    const result = await indexer.tick();
+    if (result.status === 'degraded') log(indexingFailureMessage(result));
+    if (signal.aborted) break;
+    try { await sleepImpl(tickDelayMs(result, pollMs), undefined, { signal }); } catch { break; }
+  }
+}
 
 export async function start(env = process.env) {
   const config = readConfig(env);
@@ -22,14 +43,7 @@ export async function start(env = process.env) {
     });
     server.on('error', () => { console.error('Intelligence HTTP server unavailable'); controller.abort(); });
     console.log('Arc Intelligence backend listening');
-    const loop = (async () => {
-      while (!controller.signal.aborted) {
-        const result = await indexer.tick();
-        if (result.status === 'degraded') console.error('Arc Intelligence indexing degraded; checkpoint retained');
-        if (controller.signal.aborted) break;
-        try { await sleep(config.pollMs, undefined, { signal: controller.signal }); } catch { break; }
-      }
-    })();
+    const loop = runIndexerLoop({ indexer, pollMs: config.pollMs, signal: controller.signal });
     const stop = async () => {
       controller.abort();
       await new Promise((resolve) => server.close(resolve));

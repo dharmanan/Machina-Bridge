@@ -6,6 +6,41 @@ const pick = (object, keys) => Object.fromEntries(keys.map((key) => [key, object
 const warnings = (values = []) => [...new Set(values)].filter((value) => typeof value === 'string')
   .slice(0, 50).map((value) => value.slice(0, 500));
 
+const ERROR_CODES = new Set([
+  'rpc_head_unavailable', 'snapshot_unavailable', 'core_incomplete', 'receipt_coverage_incomplete',
+  'all_log_reconciliation_incomplete', 'transfer_log_reconciliation_incomplete',
+  'checkpoint_parent_hash_mismatch', 'database_unavailable',
+]);
+
+export function sanitizedErrorCode(value) {
+  if (ERROR_CODES.has(value)) return value;
+  // Rows written before this correction may contain the old stable codes.
+  const legacy = {
+    arc_rpc_head_unavailable: 'rpc_head_unavailable',
+    chunk_unavailable_or_incomplete: 'core_incomplete',
+    canonical_source_mismatch: 'core_incomplete',
+    intelligence_database_unavailable: 'database_unavailable',
+  };
+  return Object.hasOwn(legacy, value) ? legacy[value] : null;
+}
+
+export function chunkFailureCode(history, snapshot = history?.chunkSnapshots?.[0]) {
+  if (history?.missingRanges?.some((range) => range.reason === 'snapshot_unavailable')) return 'snapshot_unavailable';
+  if (!snapshot || (snapshot.chainId === null && snapshot.blockCount === 0)) return 'snapshot_unavailable';
+  if (snapshot.source !== ARC_RPC_URL || snapshot.chainId !== ARC_CHAIN_ID) return 'core_incomplete';
+  // Receipt failure makes both reconciliation sets incomplete as a consequence;
+  // report it before downstream log comparisons.
+  if (snapshot.allLogReconciliation?.receiptSetComplete === false
+    || snapshot.transferLogReconciliation?.receiptSetComplete === false
+    || (Number.isSafeInteger(snapshot.totalTransactions) && Number.isSafeInteger(snapshot.receiptCount)
+      && snapshot.totalTransactions !== snapshot.receiptCount)) return 'receipt_coverage_incomplete';
+  if (snapshot.allLogReconciliation?.complete === false) return 'all_log_reconciliation_incomplete';
+  if (snapshot.transferLogReconciliation?.complete === false || snapshot.transferScanComplete === false) {
+    return 'transfer_log_reconciliation_incomplete';
+  }
+  return history?.complete === true && snapshot.complete === true ? null : 'core_incomplete';
+}
+
 // Keep each emitter/market and each raw ABI field separate. No mixed assets,
 // shares-to-assets conversion, USD conversion, or protocol-to-protocol totals.
 function compactFlows(flows = []) {
@@ -130,5 +165,5 @@ export function statusReadModel(state) {
     nextBlock: state?.next_block ?? null,
     lagBlocks: state?.safe_head !== null && state?.safe_head !== undefined && state?.last_indexed_block !== null
       && state?.last_indexed_block !== undefined ? Math.max(0, state.safe_head - state.last_indexed_block) : null,
-    lastSuccess: state?.last_success_at ?? null, lastError: state?.last_error ?? null };
+    lastSuccess: state?.last_success_at ?? null, lastError: sanitizedErrorCode(state?.last_error) };
 }

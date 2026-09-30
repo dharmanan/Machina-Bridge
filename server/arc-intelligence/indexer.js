@@ -1,8 +1,8 @@
 import { buildHistoricalRange } from '../../api/_lib/arc-intelligence/history.js';
 import { ARC_CHAIN_ID, ARC_RPC_URL, createArcRpcClient } from '../../api/_lib/arc-intelligence/rpc.js';
-import { MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
+import { buildBoundedSnapshot, MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
 import { quantityToSafeNumber } from '../../api/_lib/arc-intelligence/normalize.js';
-import { buildReadModel, extractCompleteChunk } from './read-model.js';
+import { buildReadModel, chunkFailureCode, extractCompleteChunk } from './read-model.js';
 
 function integer(env, key, fallback, min, max) {
   const value = env[key] ?? String(fallback);
@@ -23,7 +23,7 @@ export function readConfig(env = process.env) {
 }
 
 export function createIndexer({ repository, rpc = createArcRpcClient(), config = readConfig({}),
-  historyBuilder = buildHistoricalRange } = {}) {
+  historyBuilder = buildHistoricalRange, snapshotBuilder = buildBoundedSnapshot } = {}) {
   // Config is also validated for injected callers; no path can exceed core bounds.
   if (!Number.isSafeInteger(config.chunkSize) || config.chunkSize < 1 || config.chunkSize > MAX_WINDOW_SIZE
     || !Number.isSafeInteger(config.maxChunksPerTick) || config.maxChunksPerTick < 1 || config.maxChunksPerTick > 16
@@ -33,13 +33,14 @@ export function createIndexer({ repository, rpc = createArcRpcClient(), config =
     async tick() {
       if (active) return { skipped: true };
       active = true;
+      let failingRange = {};
       try {
         return await repository.withIndexerLock(async (db) => {
           let state = await db.ensureState();
           if (state.status === 'continuity_error') return { status: 'continuity_error', stopped: true };
           if (state.chain_id !== ARC_CHAIN_ID || state.source !== ARC_RPC_URL || rpc.url !== ARC_RPC_URL) {
-            await db.setStatus('degraded', 'canonical_source_mismatch');
-            return { status: 'degraded' };
+            await db.setStatus('degraded', 'core_incomplete');
+            return { status: 'degraded', error: 'core_incomplete' };
           }
           let head;
           let safeHead;
@@ -49,8 +50,8 @@ export function createIndexer({ repository, rpc = createArcRpcClient(), config =
             safeHead = head - config.finalityBlocks;
           } catch {
             await db.attempt(null, null);
-            await db.setStatus('degraded', 'arc_rpc_head_unavailable');
-            return { status: 'degraded' };
+            await db.setStatus('degraded', 'rpc_head_unavailable');
+            return { status: 'degraded', error: 'rpc_head_unavailable' };
           }
           await db.attempt(head, safeHead);
           if (state.next_block === null) state = await db.initialize(Math.max(0, safeHead - config.chunkSize + 1));
@@ -58,28 +59,44 @@ export function createIndexer({ repository, rpc = createArcRpcClient(), config =
           while (state.next_block <= safeHead && indexedChunks < config.maxChunksPerTick) {
             const start = state.next_block;
             const end = Math.min(safeHead, start + config.chunkSize - 1);
+            failingRange = { startBlock: start, endBlock: end };
             const run = await db.startRun(start, end);
             let success = false;
             let errorCode = null;
             try {
-              const history = await historyBuilder({ rpc, startBlock: start, endBlock: end, chunkSize: config.chunkSize });
+              let observedSnapshot;
+              errorCode = 'snapshot_unavailable';
+              const history = await historyBuilder({ rpc, startBlock: start, endBlock: end, chunkSize: config.chunkSize,
+                // History keeps only complete snapshots. Observe the existing
+                // single core read in memory, including an incomplete result.
+                snapshotBuilder: async (args) => {
+                  observedSnapshot = await snapshotBuilder(args);
+                  return observedSnapshot;
+                },
+              });
+              const failure = chunkFailureCode(history, observedSnapshot ?? history?.chunkSnapshots?.[0]);
+              errorCode = failure ?? 'core_incomplete';
+              if (failure) throw new Error(failure);
               const chunk = extractCompleteChunk(history, start, end);
               if (state.last_indexed_hash !== null && state.last_indexed_hash !== chunk.firstParentHash) {
                 errorCode = 'checkpoint_parent_hash_mismatch';
                 await db.setStatus('continuity_error', errorCode);
-                return { status: 'continuity_error', indexedChunks };
+                return { status: 'continuity_error', indexedChunks, error: errorCode, ...failingRange };
               }
-              await db.saveChunk(chunk, buildReadModel(history, chunk));
+              const payload = buildReadModel(history, chunk);
+              errorCode = 'database_unavailable';
+              await db.saveChunk(chunk, payload);
               success = true;
               indexedChunks += 1;
               state = await db.getState();
+              errorCode = null;
             } catch {
-              errorCode = 'chunk_unavailable_or_incomplete';
               await db.setStatus('degraded', errorCode);
-              return { status: 'degraded', indexedChunks };
+              return { status: 'degraded', indexedChunks, error: errorCode, ...failingRange };
             } finally {
               await db.finishRun(run, success, errorCode);
             }
+            failingRange = {};
           }
           await db.pruneRuns();
           const status = state.next_block > safeHead ? 'caught_up' : 'indexing';
@@ -89,7 +106,7 @@ export function createIndexer({ repository, rpc = createArcRpcClient(), config =
       } catch {
         // Database/lock failures also leave the checkpoint untouched and retry.
         // Do not expose upstream connection strings or arbitrary error text.
-        return { status: 'degraded', error: 'intelligence_database_unavailable' };
+        return { status: 'degraded', error: 'database_unavailable', ...failingRange };
       } finally { active = false; }
     },
   };
