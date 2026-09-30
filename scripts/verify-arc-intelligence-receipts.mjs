@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { fixturePool,block,rawBlock,transaction,hash,address } from './fixtures/arc-intelligence-a2.mjs';
 import { migrate,MIGRATIONS } from '../server/arc-intelligence/migrate.js';
 import { createFoundationRepository,CHAIN_IDENTITY } from '../server/arc-intelligence/foundation.js';
-import { createReceiptRepository } from '../server/arc-intelligence/receipt-repository.js';
+import { createReceiptRepository,RECEIPT_IDENTITY } from '../server/arc-intelligence/receipt-repository.js';
 import { createReceiptWorker } from '../server/arc-intelligence/receipt-lane.js';
 import { createChainFollower } from '../server/arc-intelligence/chain-lane.js';
 import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
@@ -14,6 +14,8 @@ import { validateReceipt,normalizedLog } from '../server/arc-intelligence/receip
 import { reconcileLogs } from '../api/_lib/arc-intelligence/reconciliation.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 import { TRANSFER_TOPIC } from '../api/_lib/arc-intelligence/usdc.js';
+import { MAX_ALL_LOGS,MAX_TRANSFER_LOGS } from '../api/_lib/arc-intelligence/core.js';
+import { createWorkBurst } from '../server/arc-intelligence/a2-runtime.js';
 const hex=(n) => `0x${n.toString(16)}`;
 function log(n,i=0,index=i,transfer=true) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:hex(i),
   transactionHash:transaction(n,i).hash,logIndex:hex(index),address:address(50),topics:[transfer ? TRANSFER_TOPIC : hash(987)],data:hash(123),removed:false};}
@@ -27,13 +29,25 @@ async function setup(blocks=[block(100)]) {
   const repository=createReceiptRepository(pool);await repository.initialize();
   return {pool,chain,repository};
 }
-function worker(ctx,handler,budget=createRpcBudget()) {
+function worker(ctx,handler,budget=createRpcBudget(),options={}) {
   const calls=[];
   const rpc=budget.wrap({url:ARC_RPC_URL,async request(method,params,options) {
     let depth=0;for (const call of ctx.pool.calls) {if (call.text === 'BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(call.text)) depth--;}
     assert.equal(depth,0,'No DB transaction open during RPC');calls.push({method,params,options});return handler(method,params,options);
   }});
-  return {calls,instance:createReceiptWorker({repository:ctx.repository,rpc})};
+  return {calls,instance:createReceiptWorker({repository:ctx.repository,rpc,...options})};
+}
+async function readyLogs(size=10) {
+  const ctx=await setup(Array.from({length:size},(_,i) => block(100+i)));
+  for (let n=100;n<100+size;n++) {
+    await ctx.repository.scheduleBlock(n);
+    const lease=await ctx.repository.claim('range-preparation',180000,{preferredComponent:'receipts'});
+    await ctx.repository.saveReceipts(lease,[receipt(n,0,[log(n),log(n,0,1,false)])]);
+  }
+  return ctx;
+}
+function rangeLogs(start=100,size=10,transfer=false) {
+  return Array.from({length:size},(_,i) => [log(start+i),...(transfer ? [] : [log(start+i,0,1,false)])]).flat();
 }
 function fullHandler(n,count=1) {return (method,params) => {
   if (method === 'eth_getBlockReceipts') return Array.from({length:count},(_,i) => receipt(n,i));
@@ -234,7 +248,11 @@ for (const [name,modify,field] of [
   const ctx=await setup();const w=worker(ctx,(method) => method === 'eth_getBlockReceipts' ? [receipt(100)] : modify([log(100)]));
   await ctx.repository.scheduleBlock(100);assert.equal((await w.instance.runOnce()).status,'complete');
   assert.equal((await w.instance.runOnce()).status,'retrying');assert.equal((await w.instance.runOnce()).status,'retrying');
-  for (const e of ctx.pool.store.reconciliation.values()) {assert.equal(e.complete,false);assert(e[field] > 0);}
+  for (const e of ctx.pool.store.reconciliation.values()) {
+    assert.equal(e.complete,false);
+    if (name==='identityless') {assert.equal(e.query_complete,false);assert.equal(e.reason_code,'query_unavailable');}
+    else assert(e[field] > 0);
+  }
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,null);assert.equal(ctx.pool.store.blocks.get(100).core_complete,false);
 });
 await test('failed all-log query retries only all-log work, keeps complete Transfer certificate and receipts',async () => {
@@ -402,6 +420,180 @@ await test('canonical parent mismatch retains lane-wide fail-closed continuity b
   const w=worker(ctx,fullHandler(100));await ctx.repository.scheduleBlock(100);
   await w.instance.runOnce();await w.instance.runOnce();assert.equal((await w.instance.runOnce()).status,'continuity_error');
   assert.equal((await ctx.repository.getLane()).status,'continuity_error');
+});
+await test('ten all-log jobs use one RPC, ten Transfer jobs use a separate RPC, and each block certifies only its own logs',async () => {
+  const ctx=await readyLogs();const jobs=ctx.pool.store.work.size;
+  const w=worker(ctx,(method,[filter]) => {
+    assert.equal(method,'eth_getLogs');assert.equal(filter.fromBlock,hex(100));assert.equal(filter.toBlock,hex(109));
+    return rangeLogs(100,10,!!filter.topics);
+  });
+  const all=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(all.status,'complete');assert.equal(all.jobCount,10);assert.equal(all.completedJobs,10);assert.equal(w.calls.length,1);
+  assert(!Object.hasOwn(w.calls[0].params[0],'topics'));
+  assert.equal([...ctx.pool.store.reconciliation.values()].filter((r) => r.kind==='transfer_logs').length,0);
+  const transfers=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(transfers.status,'complete');assert.equal(transfers.jobCount,10);assert.equal(w.calls.length,2);
+  assert.deepEqual(w.calls[1].params[0].topics,[TRANSFER_TOPIC]);
+  for (let n=100;n<110;n++) {
+    for (const [kind,total] of [['all_logs',2],['transfer_logs',1]]) {
+      const r=ctx.pool.store.reconciliation.get(`${n}:${kind}:arc-receipts-logs-v1`);
+      assert(r.complete);assert.equal(r.receipt_log_count,total);assert.equal(r.queried_log_count,total);
+      assert.equal(r.block_hash,hash(n+1));
+    }
+  }
+  assert.equal(ctx.pool.store.work.size,jobs);assert.equal((await ctx.repository.workPressure()).outstanding,0);
+  console.log('LOG_BATCH_FIXTURE: 10 all_logs jobs = 1 RPC; 10 transfer_logs jobs = 1 independent RPC; zero enqueue');
+});
+await test('all-log success is never reused as Transfer proof when the independent Transfer range RPC fails',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,(method,[filter]) => {
+    if (filter.topics) throw new Error('private upstream error');return rangeLogs(100,3);
+  });
+  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,3);
+  const before=structuredClone([...ctx.pool.store.reconciliation.values()]);
+  const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(result.status,'retrying');assert.equal(result.completedJobs,0);assert.equal(w.calls.length,2);
+  for (const r of before) assert.deepEqual(ctx.pool.store.reconciliation.get(`${r.block_number}:${r.kind}:${r.definition_version}`),r);
+  for (let n=100;n<103;n++) assert.equal(ctx.pool.store.blocks.get(n).transfer_log_reconciliation_complete,false);
+  assert(result.results.every((r) => r.status==='retrying'));
+  assert([...ctx.pool.store.work.values()].filter((j) => j.component==='transfer_logs').every((j) => j.state==='retrying' && j.attempts===1 && j.lease_owner===null));
+});
+await test('log batch claims preserve exact identity, readiness, owner, fences and numeric span with SKIP LOCKED',async () => {
+  const ctx=await readyLogs(12);const all=[...ctx.pool.store.work.values()].filter((j) => j.component==='all_logs');
+  Object.assign(all[1],{state:'retrying',not_before:1001000});
+  Object.assign(all[2],{state:'leased',lease_owner:'held',lease_until:1001000});
+  Object.assign(all[3],{state:'leased',lease_owner:'expired',lease_until:999999,fencing_token:'7',attempts:2});
+  all[4].state='persistent_partial';all[5].state='failed';all[6].state='complete';all[7].locked=true;
+  all[8].lane='other';all[9].definition_version='other';
+  const first=await ctx.repository.claim('batch-owner',180000,{preferredComponent:'all_logs'});assert.equal(first.start_block,100);
+  const leases=await ctx.repository.claimLogBatch(first,10);
+  assert.deepEqual(leases.map((j) => j.start_block),[100,103]);
+  assert(leases.every((j) => j.component==='all_logs' && j.lease_owner==='batch-owner' && j.lease_until===1180000));
+  assert.equal(leases[1].fencing_token,'8');assert.equal(leases[1].attempts,3);
+  assert.equal(ctx.pool.store.work.get(all[10].id).state,'pending');
+  const sql=ctx.pool.calls.find((c) => c.text.includes('receipts:claim_logs'));
+  assert(sql.text.includes('FOR UPDATE SKIP LOCKED'));assert.deepEqual(sql.values.slice(7),['all_logs',100,109,9]);
+  for (const limit of [0,51,1.5]) await assert.rejects(ctx.repository.claimLogBatch(first,limit));
+  for (const duration of [0,300001,1.5]) await assert.rejects(ctx.repository.claimLogBatch(first,10,duration));
+  const receiptJob=[...ctx.pool.store.work.values()].find((j) => j.component==='receipts');receiptJob.state='pending';receiptJob.not_before=0;
+  const receiptLease=await ctx.repository.claim('receipt-owner',180000,{preferredComponent:'receipts'});
+  assert.equal(receiptLease.component,'receipts');
+  await assert.rejects(ctx.repository.claimLogBatch(receiptLease),/work_identity_mismatch/);
+});
+await test('range width bounds sparse claims, max job count and single-block mode, without claiming receipts or other components',async () => {
+  const ctx=await setup([block(100),block(105),block(106),block(115)]);
+  for (const n of [100,105,106,115]) {
+    await ctx.repository.scheduleBlock(n);
+    const lease=await ctx.repository.claim('prep',180000,{preferredComponent:'receipts'});await ctx.repository.saveReceipts(lease,[receipt(n)]);
+  }
+  const first=await ctx.repository.claim('range',180000,{preferredComponent:'all_logs'});
+  const batch=await ctx.repository.claimLogBatch(first,10);assert.deepEqual(batch.map((j) => j.start_block),[100,105,106]);
+  assert(batch.at(-1).start_block-batch[0].start_block+1<=10);
+  assert([...ctx.pool.store.work.values()].filter((j) => j.component==='transfer_logs').every((j) => j.state==='pending'));
+  const bounded=await readyLogs(12);const one=await bounded.repository.claim('one',180000,{preferredComponent:'all_logs'});
+  assert.equal((await bounded.repository.claimLogBatch(one,1)).length,1);
+  const next=await bounded.repository.claim('three',180000,{preferredComponent:'all_logs'});
+  assert.deepEqual((await bounded.repository.claimLogBatch(next,3)).map((j) => j.start_block),[101,102,103]);
+  for (const limit of [0,51,1.5]) assert.throws(() => createReceiptWorker({repository:ctx.repository,
+    rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}}),maxLogRangeBlocks:limit}));
+});
+await test('structurally invalid range responses certify zero blocks and never trigger same-attempt fallback RPC',async () => {
+  const cases=[null,{},[null],[{...log(100),address:'0x1'}],[{...log(100),blockNumber:undefined}],
+    [{...log(100),blockNumber:'0x'}],[log(103)],[{...log(100),transactionHash:undefined}],
+    [{...log(100),transactionIndex:undefined}],[{...log(100),topics:['0x1']}],
+    [log(100),{...log(101),data:'invalid'}],Array(MAX_ALL_LOGS+1).fill(log(100))];
+  for (const raw of cases) {
+    const ctx=await readyLogs(3);const w=worker(ctx,() => raw);
+    const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+    assert.equal(result.status,'retrying');assert.equal(result.completedJobs,0);assert.equal(w.calls.length,1);
+    assert([...ctx.pool.store.reconciliation.values()].every((r) => !r.complete && !r.query_complete));
+    assert([...ctx.pool.store.work.values()].filter((j) => j.component==='all_logs').every((j) => j.state==='retrying' && j.attempts===1));
+  }
+});
+await test('configured maximum batches exactly 50 blocks and leaves the 51st job unclaimed',async () => {
+  const ctx=await readyLogs(51);const w=worker(ctx,() => rangeLogs(100,50),undefined,{maxLogRangeBlocks:50});
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'complete');assert.equal(result.jobCount,50);assert.equal(result.completedJobs,50);assert.equal(w.calls.length,1);
+  assert.deepEqual(w.calls[0].params[0],{fromBlock:hex(100),toBlock:hex(149)});
+  assert.equal([...ctx.pool.store.work.values()].find((j) => j.component==='all_logs' && j.start_block===150).state,'pending');
+});
+await test('Transfer range enforces its independent topic and absolute total cap, without multiplying limits by block count',async () => {
+  for (const raw of [[log(100,0,1,false)],Array(MAX_TRANSFER_LOGS+1).fill(log(100))]) {
+    const ctx=await readyLogs(3);const w=worker(ctx,() => raw);
+    const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+    assert.equal(result.completedJobs,0);assert.equal(result.status,'retrying');assert.equal(w.calls.length,1);
+    assert.deepEqual(w.calls[0].params[0].topics,[TRANSFER_TOPIC]);
+    assert([...ctx.pool.store.reconciliation.values()].every((r) => !r.complete && !r.query_complete));
+  }
+});
+await test('eight matching blocks complete while missing logs and a hash mismatch retry independently and stop the burst',async () => {
+  const ctx=await readyLogs();const before=structuredClone(ctx.pool.store.blocks);
+  const w=worker(ctx,() => rangeLogs().filter((l) => l.blockNumber!==hex(104)).map((l) =>
+    l.blockNumber===hex(105) ? {...l,blockHash:hash(999)} : l));
+  const burst=await createWorkBurst({worker:w.instance})();assert.equal(burst.length,1);
+  assert.equal(burst[0].status,'retrying');assert.equal(burst[0].completedJobs,8);assert.equal(w.calls.length,1);
+  for (let n=100;n<110;n++) {
+    const b=ctx.pool.store.blocks.get(n);assert.equal(b.block_hash,before.get(n).block_hash);assert.equal(b.receipt_evidence_conflict,false);
+    assert.equal(b.all_log_reconciliation_complete,![104,105].includes(n));
+  }
+  assert.equal(ctx.pool.store.reconciliation.get('104:all_logs:arc-receipts-logs-v1').missing_count,2);
+  assert.equal(ctx.pool.store.reconciliation.get('105:all_logs:arc-receipts-logs-v1').query_complete,false);
+});
+await test('duplicate, payload, removed and transaction-position mismatches stay local to their assigned block',async () => {
+  for (const alter of [(logs) => [...logs,log(101)],
+    (logs) => logs.map((l) => l.blockNumber===hex(101) ? {...l,data:hash(999)} : l),
+    (logs) => logs.map((l) => l.blockNumber===hex(101) ? {...l,removed:true} : l),
+    (logs) => logs.map((l) => l.blockNumber===hex(101) ? {...l,transactionIndex:'0x1'} : l)]) {
+    const ctx=await readyLogs(3);const w=worker(ctx,() => alter(rangeLogs(100,3)));
+    const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+    assert.equal(result.status,'retrying');assert.equal(result.completedJobs,2);
+    assert.deepEqual(result.results.map((r) => r.status),['complete','retrying','complete']);
+  }
+});
+await test('one stale fenced lease cannot save or release newer work and does not prevent other blocks completing',async () => {
+  const ctx=await readyLogs(3);let replacement;
+  const w=worker(ctx,async () => {
+    const job=[...ctx.pool.store.work.values()].find((j) => j.component==='all_logs' && j.start_block===101);job.lease_until=0;
+    replacement=await ctx.repository.claim('replacement',180000,{preferredComponent:'all_logs'});
+    assert.equal(replacement.id,job.id);return rangeLogs(100,3);
+  });
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'stale_lease');assert.equal(result.completedJobs,2);
+  assert.deepEqual(result.results.map((r) => r.status),['complete','stale_lease','complete']);
+  assert(!ctx.pool.store.reconciliation.has('101:all_logs:arc-receipts-logs-v1'));
+  const job=ctx.pool.store.work.get(replacement.id);assert.equal(job.lease_owner,'replacement');assert.equal(job.state,'leased');assert.equal(job.fencing_token,'2');
+});
+await test('one per-block DB commit failure leaves that job retryable while unrelated certificates commit',async () => {
+  const ctx=await readyLogs(3);ctx.pool.fail('receipts:reconciliation');const w=worker(ctx,() => rangeLogs(100,3));
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'retrying');assert.equal(result.completedJobs,2);
+  assert.deepEqual(result.results.map((r) => r.status),['retrying','complete','complete']);
+  assert(!ctx.pool.store.reconciliation.has('100:all_logs:arc-receipts-logs-v1'));assert.equal(w.calls.length,1);
+});
+await test('range RPC abort releases all still-owned leases to durable retry and saves no unobserved success',async () => {
+  const ctx=await readyLogs(3);const controller=new AbortController();let started;
+  const begun=new Promise((resolve) => {started=resolve;});
+  const w=worker(ctx,(method,params,{signal}) => {
+    assert.equal(signal,controller.signal);started();return new Promise((resolve,reject) => signal.addEventListener('abort',() => reject(new Error('operation_aborted')),{once:true}));
+  });
+  const pending=w.instance.runOnce({preferredComponent:'all_logs',signal:controller.signal});await begun;controller.abort();
+  const result=await pending;assert.equal(result.status,'aborted');assert.equal(result.completedJobs,0);assert.equal(w.calls.length,1);
+  assert.equal(ctx.pool.store.reconciliation.size,0);
+  assert([...ctx.pool.store.work.values()].filter((j) => j.component==='all_logs').every((j) => j.state==='retrying' && j.lease_owner===null));
+});
+await test('abort between per-block commits retains observed successful evidence and retries only remaining leases',async () => {
+  const ctx=await readyLogs(3);const controller=new AbortController();const save=ctx.repository.saveReconciliation.bind(ctx.repository);
+  ctx.repository.saveReconciliation=async (...args) => {const result=await save(...args);controller.abort();return result;};
+  const w=worker(ctx,() => rangeLogs(100,3));const result=await w.instance.runOnce({preferredComponent:'all_logs',signal:controller.signal});
+  assert.equal(result.status,'aborted');assert.equal(result.completedJobs,1);
+  assert.deepEqual(result.results.map((r) => r.status),['complete','aborted','aborted']);
+  assert.equal(ctx.pool.store.reconciliation.size,1);assert.equal(w.calls.length,1);
+});
+await test('already complete per-block certificates remain immutable and require no repeated range RPC',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,() => rangeLogs(100,3));
+  await w.instance.runOnce({preferredComponent:'all_logs'});const certificates=structuredClone(ctx.pool.store.reconciliation);
+  for (const j of ctx.pool.store.work.values()) if (j.component==='all_logs') {j.state='pending';j.not_before=0;}
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.completedJobs,3);assert.equal(w.calls.length,1);assert.deepEqual(ctx.pool.store.reconciliation,certificates);
 });
 await test('over 10000 completed logical jobs cannot exhaust queue; pruning preserves active/persistent states and durable evidence',async () => {
   const ctx=await setup();const w=worker(ctx,fullHandler(100));await finish(ctx,w.instance,100);

@@ -202,6 +202,30 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       if (preferredComponent !== null && !Object.hasOwn(dimensions,preferredComponent)) throw new Error('invalid_receipt_component');
       return foundation.claim(identity,owner,leaseMs,{preferredComponent});
     },
+    async claimLogBatch(firstLease,maxBlocks=10,leaseMs=180000) {
+      if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE
+        || !Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 300000) throw new Error('invalid_log_batch');
+      return transaction(async (client) => {
+        const first=await requireWorkLease(client,firstLease);
+        if (values.some((v,i) => v !== [first.chain_id,first.lane,first.scope_id,first.epoch,first.definition_version][i])
+          || !['all_logs','transfer_logs'].includes(first.component)
+          || position(first.start_block) !== position(first.end_block)) throw new Error('work_identity_mismatch');
+        const start=position(first.start_block);
+        const end=start+Math.min(maxBlocks-1,Number.MAX_SAFE_INTEGER-start);
+        // The existing single claim selects priority/fallback. Extend only that component and bounded numeric span.
+        const jobs=maxBlocks===1 ? [] : (await client.query(`/* receipts:claim_logs */ WITH candidates AS (
+          SELECT id FROM arc_intelligence_work WHERE ${where} AND component=$8
+            AND start_block BETWEEN $9 AND $10 AND end_block=start_block AND not_before <= now()
+            AND (state IN ('pending','retrying') OR (state='leased' AND lease_until <= now()))
+          ORDER BY start_block,not_before,id LIMIT $11 FOR UPDATE SKIP LOCKED
+        ) UPDATE arc_intelligence_work w SET state='leased',attempts=w.attempts+1,
+          fencing_token=w.fencing_token+1,lease_owner=$6,lease_until=now()+$7*interval '1 millisecond',updated_at=now()
+          FROM candidates c WHERE w.id=c.id RETURNING w.*`,
+        [...values,first.lease_owner,leaseMs,first.component,start,end,maxBlocks-1])).rows;
+        return [first,...jobs].sort((a,b) => position(a.start_block)-position(b.start_block)
+          || (BigInt(a.id)<BigInt(b.id) ? -1 : 1));
+      });
+    },
     async deferredFollowupBlocks(startBlock=0,limit=MAX_WINDOW_SIZE) {
       const start=position(startBlock);
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_WINDOW_SIZE) throw new Error('invalid_deferred_limit');

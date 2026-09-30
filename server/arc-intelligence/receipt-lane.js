@@ -1,5 +1,5 @@
 import { ARC_RPC_URL } from '../../api/_lib/arc-intelligence/rpc.js';
-import { MAX_ALL_LOGS, MAX_TRANSFER_LOGS } from '../../api/_lib/arc-intelligence/core.js';
+import { MAX_ALL_LOGS, MAX_TRANSFER_LOGS, MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
 import { reconcileLogs, reconcileTransferLogs } from '../../api/_lib/arc-intelligence/reconciliation.js';
 import { TRANSFER_TOPIC } from '../../api/_lib/arc-intelligence/usdc.js';
@@ -7,10 +7,86 @@ import { position } from './foundation.js';
 import { validateReceipt, normalizedLog } from './receipt-facts.js';
 import { receiptSetComplete } from './receipt-repository.js';
 
-export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxReceiptReads=16 }={}) {
+export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxReceiptReads=16,maxLogRangeBlocks=10 }={}) {
   if (!repository || rpc?.url !== ARC_RPC_URL || !rpc.budget || !Number.isSafeInteger(maxReceiptReads)
-    || maxReceiptReads < 1 || maxReceiptReads > 64) throw new Error('invalid_receipt_worker');
+    || maxReceiptReads < 1 || maxReceiptReads > 64 || !Number.isSafeInteger(maxLogRangeBlocks)
+    || maxLogRangeBlocks < 1 || maxLogRangeBlocks > MAX_WINDOW_SIZE) throw new Error('invalid_receipt_worker');
   let active=false;
+  const retryDelay=(lease) => Math.min(60000,1000*(2**Math.min(position(lease.attempts)-1,6)));
+  async function handleFailure(lease,error,retryMs,signal) {
+    if (error.message === 'stale_lease') return {status:'stale_lease'};
+    if (error.message === 'lane_continuity_stopped') return {status:'continuity_error'};
+    if (error.message === 'checkpoint_parent_hash_mismatch') {
+      if (lease) await repository.recordContinuityError(lease);
+      return {status:'continuity_error',error:'checkpoint_parent_hash_mismatch'};
+    }
+    if (error.message === 'receipt_evidence_conflict') {
+      if (lease) await repository.recordConflict(lease);
+      return {status:'persistent_partial',error:'manifest_conflict'};
+    }
+    if (lease) await repository.retry(lease,retryMs).catch(() => {});
+    return {status:signal?.aborted ? 'aborted' : 'retrying',error:error.message==='work_capacity_reached' ? 'work_capacity_reached' : 'required_read_unavailable'};
+  }
+  async function runLogBatch(firstLease,firstView,signal) {
+    const leases=await repository.claimLogBatch(firstLease,maxLogRangeBlocks);
+    const component=firstLease.component;
+    const transfer=component==='transfer_logs';
+    const records=leases.map((lease) => ({lease,retryMs:retryDelay(lease),view:null,result:null}));
+    async function fail(record,error) {
+      try { record.result=await handleFailure(record.lease,error,record.retryMs,signal); }
+      catch (failure) { record.result={status:failure.message==='stale_lease' ? 'stale_lease' : 'retrying',error:'required_read_unavailable'}; }
+    }
+    // All durable facts are loaded outside a transaction, before the single range transport attempt.
+    for (const record of records) {
+      try {
+        if (signal?.aborted) throw new Error('operation_aborted');
+        record.view=record.lease.id===firstLease.id ? firstView : await repository.getBlock(position(record.lease.start_block));
+        if (!receiptSetComplete(record.view)) {
+          await repository.retry(record.lease,record.retryMs);record.result={status:'retrying'};
+        }
+      } catch (error) { await fail(record,error); }
+    }
+    const start=position(leases[0].start_block),end=position(leases.at(-1).start_block);
+    let partitions=new Map();
+    let queryComplete=false;
+    if (records.some((r) => !r.result && !r.view.reconciliation.some((e) => e.kind===component && e.complete))) {
+      try {
+        if (signal?.aborted) throw new Error('operation_aborted');
+        const filter={fromBlock:`0x${start.toString(16)}`,toBlock:`0x${end.toString(16)}`,
+          ...(transfer ? {topics:[TRANSFER_TOPIC]} : {})};
+        const raw=await rpc.request('eth_getLogs',[filter],{signal});
+        // Existing per-component limits are also absolute RANGE total limits, never multiplied by range width.
+        if (!Array.isArray(raw) || raw.length>(transfer ? MAX_TRANSFER_LOGS : MAX_ALL_LOGS)) throw new Error('invalid_query');
+        for (const entry of raw) {
+          const log=normalizeLog(entry);
+          if (log.blockNumber<start || log.blockNumber>end || log.transactionHash===null || log.transactionIndex===null
+            || (transfer && log.topics[0]!==TRANSFER_TOPIC)) throw new Error('invalid_query');
+          const logs=partitions.get(log.blockNumber) ?? [];
+          logs.push(log);partitions.set(log.blockNumber,logs);
+        }
+        queryComplete=true;
+      } catch { partitions=new Map(); }
+    }
+    for (const record of records) {
+      if (record.result) continue;
+      try {
+        if (signal?.aborted) throw new Error('operation_aborted');
+        const view=record.view;
+        const queried=partitions.get(position(view.block.block_number)) ?? [];
+        const blockQueryComplete=queryComplete && !queried.some((log) => log.removed
+          || (log.blockHash && log.blockHash!==view.block.block_hash)
+          || !view.transactions.some((t) => t.transaction_hash===log.transactionHash && position(t.transaction_index)===log.transactionIndex));
+        const options={receiptSetComplete:true,queryComplete:blockQueryComplete};
+        const logs=view.logs.map(normalizedLog);
+        const evidence=transfer ? reconcileTransferLogs(logs,queried,options) : reconcileLogs(logs,queried,options,'all');
+        const result=await repository.saveReconciliation(record.lease,evidence,record.retryMs);
+        record.result={status:result.complete ? 'complete' : 'retrying'};
+      } catch (error) { await fail(record,error); }
+    }
+    const results=records.map((r) => ({blockNumber:position(r.lease.start_block),...r.result}));
+    const status=['aborted','continuity_error','persistent_partial','stale_lease','retrying'].find((s) => results.some((r) => r.status===s)) ?? 'complete';
+    return {status,component,jobCount:leases.length,completedJobs:results.filter((r) => r.status==='complete').length,results};
+  }
   return {
     async runOnce({signal,preferredComponent=null,enqueueFollowups=true}={}) {
       if (active) return {skipped:true};
@@ -21,7 +97,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
       try {
         lease=await repository.claim(owner,180000,{preferredComponent});
         if (!lease) return {status:'idle'};
-        retryMs=Math.min(60000,1000*(2**Math.min(position(lease.attempts)-1,6)));
+        retryMs=retryDelay(lease);
         let view=await repository.getBlock(position(lease.start_block));
         const blockTag=`0x${position(view.block.block_number).toString(16)}`;
         if (lease.component === 'receipts') {
@@ -64,42 +140,9 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
           const result=await repository.saveReceipts(lease,raw,{retryMs,enqueueFollowups});
           return {status:result.complete ? 'complete' : 'retrying',component:lease.component,...result};
         }
-        if (!receiptSetComplete(view)) {
-          await repository.retry(lease,retryMs); return {status:'retrying',component:lease.component};
-        }
-        const transfer=lease.component === 'transfer_logs';
-        const old=view.reconciliation.find((r) => r.kind === lease.component);
-        let queried=[];
-        let queryComplete=false;
-        const logs=view.logs.map(normalizedLog);
-        if (!old?.complete) {
-          try {
-            const filter={fromBlock:blockTag,toBlock:blockTag,...(transfer ? {topics:[TRANSFER_TOPIC]} : {})};
-            const result=await rpc.request('eth_getLogs',[filter],{signal});
-            if (!Array.isArray(result) || result.length > (transfer ? MAX_TRANSFER_LOGS : MAX_ALL_LOGS)) throw new Error('invalid_query');
-            queried=result.map((log) => normalizeLog(log));
-            if (queried.some((log) => log.removed || (log.blockHash && log.blockHash !== view.block.block_hash))) throw new Error('invalid_query');
-            queryComplete=true;
-          } catch { if (signal?.aborted) throw new Error('operation_aborted'); }
-        }
-        const options={receiptSetComplete:true,queryComplete};
-        const evidence=transfer ? reconcileTransferLogs(logs,queried,options) : reconcileLogs(logs,queried,options,'all');
-        if (signal?.aborted) throw new Error('operation_aborted');
-        const result=await repository.saveReconciliation(lease,evidence,retryMs);
-        return {status:result.complete ? 'complete' : 'retrying',component:lease.component};
+        return await runLogBatch(lease,view,signal);
       } catch (error) {
-        if (error.message === 'stale_lease') return {status:'stale_lease'};
-        if (error.message === 'lane_continuity_stopped') return {status:'continuity_error'};
-        if (error.message === 'checkpoint_parent_hash_mismatch') {
-          if (lease) await repository.recordContinuityError(lease);
-          return {status:'continuity_error',error:'checkpoint_parent_hash_mismatch'};
-        }
-        if (error.message === 'receipt_evidence_conflict') {
-          if (lease) await repository.recordConflict(lease);
-          return {status:'persistent_partial',error:'manifest_conflict'};
-        }
-        if (lease) await repository.retry(lease,retryMs).catch(() => {});
-        return {status:signal?.aborted ? 'aborted' : 'retrying',error:error.message==='work_capacity_reached' ? 'work_capacity_reached' : 'required_read_unavailable'};
+        return await handleFailure(lease,error,retryMs,signal);
       } finally {active=false;}
     },
   };

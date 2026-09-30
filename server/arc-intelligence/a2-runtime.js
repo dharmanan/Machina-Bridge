@@ -41,7 +41,8 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   const foundation = createFoundationRepository(pool);
   const receipts = createReceiptRepository(pool);
   const chain = createChainFollower({repository:foundation,rpc,mode:'live',maxBlocks:config.liveMaxBlocks,finalityBlocks});
-  const worker = createReceiptWorker({repository:receipts,rpc,maxReceiptReads:config.receiptMaxReads,owner:randomUUID()});
+  const worker = createReceiptWorker({repository:receipts,rpc,maxReceiptReads:config.receiptMaxReads,
+    maxLogRangeBlocks:config.logRangeBlocks,owner:randomUUID()});
   let draining = false;
   let capacityBlocked = false;
   let capacityLogged = false;

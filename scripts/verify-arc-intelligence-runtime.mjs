@@ -14,6 +14,7 @@ import { createReceiptRepository, RECEIPT_IDENTITY } from '../server/arc-intelli
 import { createReceiptWorker } from '../server/arc-intelligence/receipt-lane.js';
 import { migrate } from '../server/arc-intelligence/migrate.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
+import { TRANSFER_TOPIC } from '../api/_lib/arc-intelligence/usdc.js';
 import { fixturePool, block, rawBlock, hash, transaction } from './fixtures/arc-intelligence-a2.mjs';
 let count = 0;
 async function test(name, work) { await work(); console.log(`PASS ${name}`); count++; }
@@ -41,7 +42,7 @@ function receipt(n) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionI
 
 await test('runtime defaults and numeric defaults are explicit; invalid mode fails closed',async () => {
   assert.deepEqual(readRuntimeConfig({}),{mode:'a1',workHighWater:9000,workLowWater:7000,rpcConcurrency:1,rpcMinIntervalMs:500,rpc429CooldownMs:15000,
-    liveMaxBlocks:3,receiptMaxReads:4,workBurst:12,workerPollMs:1000});
+    liveMaxBlocks:3,receiptMaxReads:4,logRangeBlocks:10,workBurst:12,workerPollMs:1000});
   for (const value of ['dual','A1','','a2','a1 ']) assert.throws(() => readRuntimeConfig({INTELLIGENCE_RUNTIME_MODE:value}));
   let opened=false;
   await assert.rejects(start({INTELLIGENCE_RUNTIME_MODE:'dual'},{createPool:() => {opened=true;}}));
@@ -49,7 +50,7 @@ await test('runtime defaults and numeric defaults are explicit; invalid mode fai
 });
 await test('all A2 numbers enforce bounds and reject malformed numeric strings',async () => {
   for (const [key,min,max] of [['RPC_CONCURRENCY',1,4],['RPC_MIN_INTERVAL_MS',100,60000],['RPC_429_COOLDOWN_MS',1000,3600000],
-    ['LIVE_MAX_BLOCKS',1,50],['RECEIPT_MAX_READS',1,64],['WORKER_POLL_MS',100,3600000],['WORK_BURST',1,50]]) {
+    ['LIVE_MAX_BLOCKS',1,50],['RECEIPT_MAX_READS',1,64],['LOG_RANGE_BLOCKS',1,50],['WORKER_POLL_MS',100,3600000],['WORK_BURST',1,50]]) {
     const name=`INTELLIGENCE_A2_${key}`;
     readRuntimeConfig({[name]:String(min)});readRuntimeConfig({[name]:String(max)});
     for (const bad of [String(min-1),String(max+1),'1.5','+1',' 1','1ms','1e3','',1,'9007199254740993']) {
@@ -237,8 +238,10 @@ await test('real A2 cycle uses shared paced RPC, persists before scheduling, rec
   }});
   const first=await runtime.cycle();
   assert.equal(first.chain.persistedBlocks,3);assert.equal(first.chain.targetHead,1000);assert.equal(first.chain.observedHead,1002);
-  assert.deepEqual(first.scheduledBlocks,[995,996,997,998]);assert.equal(first.work.length,12);
-  assert(first.work.every((result) => result.status==='complete'));assert.equal(first.continueImmediately,true);
+  assert.deepEqual(first.scheduledBlocks,[995,996,997,998]);assert.equal(first.work.length,7);
+  assert(first.work.slice(0,-1).every((result) => result.status==='complete'));assert.equal(first.work.at(-1).status,'idle');
+  assert.equal(first.work.filter((r) => r.component==='all_logs')[0].jobCount,4);
+  assert.equal(first.work.filter((r) => r.component==='transfer_logs')[0].jobCount,4);assert.equal(first.continueImmediately,true);
   assert(![...pool.store.work.values()].some((w) => w.start_block===100));assert(pool.store.work.size<=12);
   assert.deepEqual(calls.slice(0,6).map((c) => c.method),['eth_chainId','eth_blockNumber','eth_getBlockByNumber','eth_getBlockByNumber','eth_getBlockByNumber','eth_getBlockReceipts']);
   await runtime.cycle();await runtime.cycle();
@@ -370,7 +373,8 @@ await test('real runtime yields after 429; first post-cooldown RPC refreshes hea
           const retry=[...pool.store.work.values()].find((w) => w.state==='retrying');
           assert(retry);assert.equal(retry.attempts,1);assert(retry.not_before<=1000000+time);
           assert.equal(retry.reason_code,'required_read_unavailable');
-          assert.equal([...pool.store.work.values()].filter((w) => w.state==='pending').length,3);
+          assert.equal([...pool.store.work.values()].filter((w) => w.state==='retrying').length,2);
+          assert.equal([...pool.store.work.values()].filter((w) => w.state==='pending').length,2);
         }
         return response(hex(103));
       }
@@ -396,14 +400,17 @@ await test('idle, continuity, conflict and stale lease stop a burst; abort inter
   assert.deepEqual(await burst({signal:controller.signal}),[]);
 });
 await test('real worker/repository honors receipt priority and both log quotas despite a continuing receipt backlog',async () => {
-  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:20},(_,i) => block(100+i,0)));
-  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<120;n++) await repository.scheduleBlock(n);
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:50},(_,i) => block(100+i,0)));
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<150;n++) await repository.scheduleBlock(n);
   const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request() {return [];}});
-  const worker=createReceiptWorker({repository,rpc});const results=await createWorkBurst({worker})();
+  const worker=createReceiptWorker({repository,rpc});
+  for (let i=0;i<30;i++) assert.equal((await worker.runOnce({preferredComponent:'receipts'})).status,'complete');
+  const from=pool.calls.length;const results=await createWorkBurst({worker})();
   assert.deepEqual(results.map((r) => r.component),[...Array(6).fill('receipts'),...Array(3).fill('all_logs'),...Array(3).fill('transfer_logs')]);
   assert(results.every((r) => r.status==='complete'));
   assert.equal([...pool.store.work.values()].filter((w) => w.component==='receipts' && w.state==='pending').length,14);
-  const claims=pool.calls.filter((c) => c.text.includes('a2:claim'));assert(claims.every((c) => c.text.includes('FOR UPDATE SKIP LOCKED')));
+  assert(results.slice(6).every((r) => r.jobCount===10 && r.completedJobs===10));
+  const claims=pool.calls.slice(from).filter((c) => c.text.includes('a2:claim'));assert(claims.every((c) => c.text.includes('FOR UPDATE SKIP LOCKED')));
   assert.deepEqual(claims.map((c) => c.values[7]),results.map((r) => r.component));
 });
 await test('preferred claim falls back, respects not_before, excludes terminal work and preserves old callers',async () => {
@@ -433,9 +440,9 @@ await test('real cooperative run completes 12 jobs before one idle poll; refresh
       assert(['eth_getBlockReceipts','eth_getLogs'].includes(method));return response([]);
     }});
   await runtime.run({signal:controller.signal});
-  assert.deepEqual(frontiers,[0,3,6,9,12]);assert.deepEqual(polls,[12]);assert.equal(chainIdReads,1);
+  assert.deepEqual(frontiers,[0,3,12]);assert.deepEqual(polls,[12]);assert.equal(chainIdReads,1);
   assert.equal(completed(),12);assert(!pool.calls.some((c) => c.text.includes('receipts:work_counts')));
-  console.log('THROUGHPUT_FIXTURE: 12 completed jobs, 4 bounded productive bursts, 5 head refreshes, 1 idle poll');
+  console.log('THROUGHPUT_FIXTURE: 12 completed jobs, 2 bounded productive bursts, 3 head refreshes, 1 idle poll');
 });
 await test('stopped receipt lane does not schedule, claim or spin; reports no immediate continuation',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
@@ -580,6 +587,31 @@ await test('high-water drain keeps retrying durable and gives post-cooldown RPC 
   const retry=[...pool.store.work.values()].find((w) => w.state==='retrying');assert(retry);assert.equal(retry.attempts,1);assert(retry.not_before>1000000);
   await runtime.cycle({signal:controller.signal});assert.deepEqual(calls,[{method:'eth_getLogs',time:0},{method:'eth_getLogs',time:15000}]);
   assert.equal(pool.store.work.size,size);assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
+});
+await test('two ten-job log batches drain existing work with zero enqueue and resume chain only below low water',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:10},(_,i) => block(100+i,0)));
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<110;n++) await repository.scheduleBlock(n);
+  const preparer=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (let i=0;i<10;i++) assert.equal((await preparer.runOnce({preferredComponent:'receipts'})).status,'complete');
+  assert.equal((await repository.workPressure()).outstanding,20);const size=pool.store.work.size;
+  let time=0;const calls=[];const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:20,workLowWater:5,workBurst:1},
+    now:() => time,sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      const {method,params}=JSON.parse(init.body);calls.push({method,params});
+      if (method==='eth_chainId') return response(hex(5042));if (method==='eth_blockNumber') return response(hex(111));
+      assert.equal(method,'eth_getLogs');return response([]);
+    }});
+  const from=pool.calls.length;
+  for (const outstanding of [10,0]) {
+    const result=await runtime.cycle();assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');
+    assert.equal(result.work[0].jobCount,10);assert.equal(result.work[0].completedJobs,10);assert.equal(result.outstanding,outstanding);
+    assert(result.continueImmediately);assert.equal(pool.store.work.size,size);assert.equal(pool.store.blocks.size,10);
+  }
+  assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
+  assert.deepEqual(calls.map((c) => c.method),['eth_getLogs','eth_getLogs']);
+  assert(!calls[0].params[0].topics);assert.deepEqual(calls[1].params[0].topics,[TRANSFER_TOPIC]);
+  for (const call of calls) assert.deepEqual([call.params[0].fromBlock,call.params[0].toBlock],[hex(100),hex(109)]);
+  const normal=await runtime.cycle();assert.equal(normal.backpressure,'normal');assert.equal(normal.chain.status,'caught_up');
+  assert.deepEqual(calls.slice(2).map((c) => c.method),['eth_chainId','eth_blockNumber']);assert.equal(pool.store.work.size,size);
 });
 await test('capacity race is explicit, pauses producers and sleeps safely while global capacity remains occupied',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
