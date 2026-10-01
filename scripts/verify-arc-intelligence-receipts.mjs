@@ -59,6 +59,14 @@ async function readyLogs(size=10) {
 function rangeLogs(start=100,size=10,transfer=false) {
   return Array.from({length:size},(_,i) => [log(start+i),...(transfer ? [] : [log(start+i,0,1,false)])]).flat();
 }
+async function preparedLogRecords(ctx,maxBlocks=10) {
+  const first=await ctx.repository.claim('batch-persist-test',180000,{preferredComponent:'all_logs'});
+  const leases=await ctx.repository.claimLogBatch(first,maxBlocks);
+  return Promise.all(leases.map(async (lease) => {
+    const view=await ctx.repository.getBlock(lease.start_block),logs=view.logs.map(normalizedLog);
+    return {lease,retryMs:1000,evidence:reconcileLogs(logs,logs,{receiptSetComplete:true,queryComplete:true},'all')};
+  }));
+}
 function fullHandler(n,count=1) {return (method,params) => {
   if (method === 'eth_getBlockReceipts') return Array.from({length:count},(_,i) => receipt(n,i));
   if (method === 'eth_getLogs') return Array.from({length:count},(_,i) => log(n,i));
@@ -752,8 +760,13 @@ await test('range RPC abort releases all still-owned leases to durable retry and
   assert([...ctx.pool.store.work.values()].filter((j) => j.component==='all_logs').every((j) => j.state==='retrying' && j.lease_owner===null));
 });
 await test('abort between per-block commits retains observed successful evidence and retries only remaining leases',async () => {
-  const ctx=await readyLogs(3);const controller=new AbortController();const save=ctx.repository.saveReconciliation.bind(ctx.repository);
-  ctx.repository.saveReconciliation=async (...args) => {const result=await save(...args);controller.abort();return result;};
+  const ctx=await readyLogs(3);const controller=new AbortController();const connect=ctx.pool.connect.bind(ctx.pool);let stop=true;
+  ctx.pool.connect=async () => {const client=await connect(),query=client.query.bind(client);
+    client.query=async (...args) => {const result=await query(...args);
+      if (stop && args[0]==='COMMIT' && ctx.pool.store.reconciliation.size===1) {stop=false;controller.abort();}
+      return result;
+    };return client;
+  };
   const w=worker(ctx,() => rangeLogs(100,3));const result=await w.instance.runOnce({preferredComponent:'all_logs',signal:controller.signal});
   assert.equal(result.status,'aborted');assert.equal(result.completedJobs,1);
   assert.deepEqual(result.results.map((r) => r.status),['complete','aborted','aborted']);
@@ -765,6 +778,117 @@ await test('already complete per-block certificates remain immutable and require
   for (const j of ctx.pool.store.work.values()) if (j.component==='all_logs') {j.state='pending';j.not_before=0;}
   const result=await w.instance.runOnce({preferredComponent:'all_logs'});
   assert.equal(result.completedJobs,3);assert.equal(w.calls.length,1);assert.deepEqual(ctx.pool.store.reconciliation,certificates);
+});
+await test('bounded batch persistence preserves single-save truth while reducing ten progress/frontier passes',async () => {
+  const single=await readyLogs(),batch=await readyLogs();
+  const individual=await preparedLogRecords(single),records=await preparedLogRecords(batch);
+  single.pool.calls.length=0;batch.pool.calls.length=0;
+  for (const r of individual) assert.equal((await single.repository.saveReconciliation(r.lease,r.evidence,r.retryMs)).complete,true);
+  const result=await batch.repository.saveReconciliationBatch(records);
+  assert.equal(result.frontierError,undefined);assert.equal(result.results.length,10);
+  assert(result.results.every((r) => r.value?.complete===true));
+  for (const key of ['blocks','receipts','logs','reconciliation','coverage','work','lanes']) {
+    assert.deepEqual(batch.pool.store[key],single.pool.store[key],`${key} truth must match the unchanged single-job API`);
+  }
+  const totals=(ctx) => ({queries:ctx.pool.calls.length,transactions:ctx.pool.calls.filter((c) => c.text==='BEGIN').length,
+    frontierScans:ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length});
+  const before=totals(single),after=totals(batch);
+  assert.equal(before.transactions,20);assert.equal(after.transactions,11);
+  assert.equal(before.frontierScans,20);assert.equal(after.frontierScans,1);assert(after.queries<before.queries);
+  for (const r of records) {
+    const cert=batch.pool.store.reconciliation.get(`${r.lease.start_block}:all_logs:arc-receipts-logs-v1`);
+    assert.equal(cert.evidence_digest,createHash('sha256').update(JSON.stringify({blockHash:r.lease.block_hash,evidence:r.evidence})).digest('hex'));
+  }
+  console.log(`LOG_PERSISTENCE_FIXTURE: single=${JSON.stringify(before)} batch=${JSON.stringify(after)}; identical durable truth`);
+});
+await test('worker hands ten precomputed records to one batch call; no single saves or RPC inside transactions',async () => {
+  const ctx=await readyLogs();const save=ctx.repository.saveReconciliationBatch.bind(ctx.repository);const batches=[];
+  ctx.repository.saveReconciliation=async () => {throw new Error('Unexpected single-job persistence');};
+  ctx.repository.saveReconciliationBatch=async (records,options) => {
+    let depth=0;for (const c of ctx.pool.calls) {if (c.text==='BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(c.text)) depth--;}
+    assert.equal(depth,0);assert.equal(records.length,10);assert(records.every((r) => r.evidence.complete));
+    batches.push(records.map((r) => r.lease.component));return save(records,options);
+  };
+  const w=worker(ctx,(method,[filter]) => rangeLogs(100,10,!!filter.topics));
+  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,10);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).completedJobs,10);
+  assert.deepEqual(batches,[Array(10).fill('all_logs'),Array(10).fill('transfer_logs')]);assert.equal(w.calls.length,2);
+  const lane=await ctx.repository.getLane();assert.equal(lane.processed_through,109);assert.equal(lane.contiguous_complete_through,109);
+  assert.equal(lane.checkpoint_hash,hash(110));assert.equal(lane.status,'caught_up');
+  assert([...ctx.pool.store.blocks.values()].every((b) => b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete && !b.core_complete));
+  assert([...ctx.pool.store.coverage.values()].every((c) => c.state==='complete'));
+  assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));
+});
+await test('batch invalid evidence, stale lease and valid record remain isolated; error callbacks run outside transactions',async () => {
+  const ctx=await readyLogs(3),records=await preparedLogRecords(ctx);
+  records[0].evidence={...records[0].evidence,missingLogCount:1};
+  const stale=ctx.pool.store.work.get(records[1].lease.id);stale.lease_until=0;
+  const replacement=await ctx.repository.claim('new-owner',180000,{preferredComponent:'all_logs'});
+  assert.equal(replacement.id,stale.id);const errors=[];
+  const result=await ctx.repository.saveReconciliationBatch(records,{onError:async (r,error) => {
+    let depth=0;for (const c of ctx.pool.calls) {if (c.text==='BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(c.text)) depth--;}
+    assert.equal(depth,0);errors.push(error.message);
+    if (error.message!=='stale_lease') await ctx.repository.retry(r.lease,r.retryMs);
+  }});
+  assert.deepEqual(errors,['invalid_reconciliation_evidence','stale_lease']);assert.equal(result.results[2].value.complete,true);
+  assert(!ctx.pool.store.reconciliation.has('100:all_logs:arc-receipts-logs-v1'));
+  assert(!ctx.pool.store.reconciliation.has('101:all_logs:arc-receipts-logs-v1'));
+  assert.equal(ctx.pool.store.blocks.get(100).all_log_reconciliation_complete,false);
+  assert.equal(ctx.pool.store.blocks.get(101).all_log_reconciliation_complete,false);
+  assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,true);
+  assert.equal(ctx.pool.store.work.get(replacement.id).lease_owner,'new-owner');assert.equal(ctx.pool.store.work.get(replacement.id).state,'leased');
+  assert.equal(ctx.pool.store.work.get(records[0].lease.id).state,'retrying');
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,null);
+});
+await test('batch completed certificates and coverage are immutable even when handed invalid replacement evidence',async () => {
+  const ctx=await readyLogs(3);let records=await preparedLogRecords(ctx);await ctx.repository.saveReconciliationBatch(records);
+  const certificates=structuredClone(ctx.pool.store.reconciliation),coverage=structuredClone(ctx.pool.store.coverage);
+  for (const j of ctx.pool.store.work.values()) if (j.component==='all_logs') {j.state='pending';j.not_before=0;}
+  records=await preparedLogRecords(ctx);for (const r of records) r.evidence={complete:false};
+  const result=await ctx.repository.saveReconciliationBatch(records);
+  assert(result.results.every((r) => r.value?.complete));assert.deepEqual(ctx.pool.store.reconciliation,certificates);
+  assert.deepEqual(ctx.pool.store.coverage,coverage);
+});
+await test('batch bounds reject oversized ranges and duplicate jobs before any persistence',async () => {
+  const ctx=await readyLogs(11),records=await preparedLogRecords(ctx,50),before=structuredClone(ctx.pool.store);
+  for (const [rows,maxBlocks] of [[records,10],[[records[0],records[0]],10],[[records[0],records[10]],10],[[],10],[records,51]]) {
+    await assert.rejects(ctx.repository.saveReconciliationBatch(rows,{maxBlocks}),/invalid_log_batch/);
+    assert.deepEqual(ctx.pool.store,before);
+  }
+});
+await test('single-job worker uses bounded batch API and preserves certification/frontier',async () => {
+  const ctx=await readyLogs(1);const w=worker(ctx,(method,[filter]) => rangeLogs(100,1,!!filter.topics),undefined,{maxLogRangeBlocks:1});
+  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,1);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).completedJobs,1);
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);assert.equal(w.calls.length,2);
+});
+await test('receipt evidence revalidated after RPC cannot be falsely certified from the earlier worker view',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,() => {
+    ctx.pool.store.receipts.delete(transaction(101).hash);return rangeLogs(100,3);
+  });const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.deepEqual(result.results.map((r) => r.status),['complete','retrying','complete']);
+  assert.equal(ctx.pool.store.blocks.get(101).all_log_reconciliation_complete,false);
+  assert(!ctx.pool.store.reconciliation.has('101:all_logs:arc-receipts-logs-v1'));
+});
+await test('canonical lease hash mismatch halts the lane before later batch records are persisted',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,() => {
+    const job=[...ctx.pool.store.work.values()].find((j) => j.component==='all_logs' && j.start_block===101);
+    job.block_hash=hash(999);return rangeLogs(100,3);
+  });const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'continuity_error');assert.deepEqual(result.results.map((r) => r.status),['complete','continuity_error','continuity_error']);
+  assert.equal(ctx.pool.store.reconciliation.size,1);assert.equal((await ctx.repository.getLane()).status,'continuity_error');
+  assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,false);
+});
+await test('shared frontier failure reports retrying and retains durable processed ceiling for DB-only recovery',async () => {
+  const ctx=await readyLogs(3);let fail=false;const w=worker(ctx,(method,[filter]) => {
+    if (fail) ctx.pool.fail('receipts:advance');return rangeLogs(100,3,!!filter.topics);
+  });await w.instance.runOnce({preferredComponent:'all_logs'});fail=true;
+  const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(result.status,'retrying');assert.equal(result.error,'required_read_unavailable');assert.equal(result.completedJobs,3);
+  let lane=await ctx.repository.getLane();assert.equal(lane.processed_through,102);assert.equal(lane.contiguous_complete_through,null);
+  assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));const calls=w.calls.length;
+  await ctx.repository.advanceFrontier();lane=await ctx.repository.getLane();assert.equal(lane.contiguous_complete_through,102);
+  assert.equal(lane.checkpoint_hash,hash(103));assert.equal(w.calls.length,calls);
 });
 await test('over 10000 completed logical jobs cannot exhaust queue; pruning preserves active/persistent states and durable evidence',async () => {
   const ctx=await setup();const w=worker(ctx,fullHandler(100));await finish(ctx,w.instance,100);

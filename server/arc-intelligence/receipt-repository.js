@@ -106,10 +106,13 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
     const conflicts = (await client.query(`/* receipts:conflict_count */ SELECT count(*) AS count FROM arc_intelligence_work
       WHERE ${where} AND state='persistent_partial' AND reason_code='manifest_conflict'`,values)).rows[0].count;
     const status = position(conflicts) > 0 ? 'persistent_partial' : position(retry) > 0 ? 'retrying' : through === processed ? 'caught_up' : 'indexing';
+    await writeProgress(client,processed,through,checkpointHash,status);
+    return {more:advanced === MAX_WINDOW_SIZE && position(through) < ceiling,ceiling};
+  }
+  async function writeProgress(client,processed,through,checkpointHash,status) {
     await client.query(`/* receipts:progress */ UPDATE arc_intelligence_lanes SET processed_through=$6,
       contiguous_complete_through=$7,checkpoint_hash=$8,status=$9,current_error_code=$10,last_success_at=now(),updated_at=now() WHERE ${where}`,
     [...values,processed,through,checkpointHash,status,status === 'persistent_partial' ? 'manifest_conflict' : status === 'retrying' ? 'required_read_unavailable' : null]);
-    return {more:advanced === MAX_WINDOW_SIZE && position(through) < ceiling,ceiling};
   }
   async function finish(client, job, complete, retryMs) {
     await client.query(`/* a2:result */ UPDATE arc_intelligence_work SET state=$2,reason_code=$3,
@@ -163,6 +166,55 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
     const result = await transaction(work);
     await advanceFrontier();
     return result;
+  }
+  async function persistReconciliation(client,lease,evidence,retryMs,deferFrontier=false) {
+    const {job,view,state}=await guard(client,lease);
+    if (!['all_logs','transfer_logs'].includes(job.component) || !receiptSetComplete(view)) throw new Error('work_identity_mismatch');
+    const old=view.reconciliation.find((r) => r.kind === job.component);
+    // A completed certificate is immutable across retries; never overwrite it with a failed query.
+    let complete=old?.complete === true;
+    if (!complete) {
+      const transfer=job.component === 'transfer_logs';
+      const receiptCount=evidence[transfer ? 'receiptTransferLogCount' : 'receiptLogCount'];
+      const queriedCount=evidence[transfer ? 'queriedTransferLogCount' : 'queriedLogCount'];
+      const expected=view.logs.filter((l) => !transfer || l.topics[0] === TRANSFER_TOPIC).length;
+      if (receiptCount !== expected || evidence.receiptSetComplete !== true) throw new Error('invalid_reconciliation_evidence');
+      complete=evidence.complete === true;
+      if (complete && (!evidence.queryComplete || queriedCount !== receiptCount || [evidence.missingLogCount,evidence.extraLogCount,
+        evidence.duplicateReceiptLogCount,evidence.duplicateQueryLogCount,evidence.identitylessReceiptLogCount,
+        evidence.identitylessQueryLogCount,evidence.payloadMismatchCount].some((n) => n !== 0))) throw new Error('invalid_reconciliation_evidence');
+      await client.query(`/* receipts:reconciliation */ INSERT INTO arc_intelligence_reconciliation
+        (chain_id,block_number,block_hash,kind,definition_version,receipt_log_count,queried_log_count,missing_count,extra_count,
+         duplicate_receipt_count,duplicate_query_count,identityless_receipt_count,identityless_query_count,payload_mismatch_count,
+         query_complete,complete,evidence_digest,reason_code)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        ON CONFLICT (chain_id,block_number,kind,definition_version) DO UPDATE SET
+          queried_log_count=EXCLUDED.queried_log_count,missing_count=EXCLUDED.missing_count,extra_count=EXCLUDED.extra_count,
+          duplicate_query_count=EXCLUDED.duplicate_query_count,identityless_query_count=EXCLUDED.identityless_query_count,
+          payload_mismatch_count=EXCLUDED.payload_mismatch_count,query_complete=EXCLUDED.query_complete,
+          complete=EXCLUDED.complete,evidence_digest=EXCLUDED.evidence_digest,reason_code=EXCLUDED.reason_code,updated_at=now()
+        WHERE NOT arc_intelligence_reconciliation.complete`,
+      [ARC_CHAIN_ID,view.block.block_number,view.block.block_hash,job.component,identity.definitionVersion,receiptCount,queriedCount,
+        evidence.missingLogCount,evidence.extraLogCount,evidence.duplicateReceiptLogCount,evidence.duplicateQueryLogCount,
+        evidence.identitylessReceiptLogCount,evidence.identitylessQueryLogCount,evidence.payloadMismatchCount,
+        evidence.queryComplete,complete,digest({blockHash:view.block.block_hash,evidence}),
+        complete ? null : evidence.queryComplete ? 'log_reconciliation_incomplete' : 'query_unavailable']);
+      const column=job.component === 'all_logs' ? 'all_log_reconciliation_complete' : 'transfer_log_reconciliation_complete';
+      await client.query(`/* receipts:log_certify */ UPDATE arc_intelligence_blocks SET ${column}=${column} OR $3
+        WHERE chain_id=$1 AND block_number=$2`,[ARC_CHAIN_ID,view.block.block_number,complete]);
+      await coverage(client,view,job.component,complete,evidence);
+    }
+    await finish(client,job,complete,retryMs);
+    const number=position(view.block.block_number);
+    if (deferFrontier) {
+      // Persist the processed ceiling with each certificate: a crash before the batch sweep loses no progress.
+      // Contiguous progress is unchanged until the shared, evidence-checked frontier sweep succeeds.
+      const processed=Math.max(number,state.processed_through === null ? number : position(state.processed_through));
+      const status=state.status === 'persistent_partial' ? 'persistent_partial'
+        : !complete || state.status === 'retrying' ? 'retrying' : state.contiguous_complete_through === processed ? 'caught_up' : 'indexing';
+      await writeProgress(client,processed,state.contiguous_complete_through,state.checkpoint_hash,status);
+    } else await progress(client,state,number);
+    return {complete};
   }
   return {
     identity,
@@ -322,46 +374,32 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       });
     },
     async saveReconciliation(lease,evidence,retryMs=1000) {
-      return commitAndAdvance(async (client) => {
-        const {job,view,state}=await guard(client,lease);
-        if (!['all_logs','transfer_logs'].includes(job.component) || !receiptSetComplete(view)) throw new Error('work_identity_mismatch');
-        const old=view.reconciliation.find((r) => r.kind === job.component);
-        // A completed certificate is immutable across retries; never overwrite it with a failed query.
-        let complete=old?.complete === true;
-        if (!complete) {
-          const transfer=job.component === 'transfer_logs';
-          const receiptCount=evidence[transfer ? 'receiptTransferLogCount' : 'receiptLogCount'];
-          const queriedCount=evidence[transfer ? 'queriedTransferLogCount' : 'queriedLogCount'];
-          const expected=view.logs.filter((l) => !transfer || l.topics[0] === TRANSFER_TOPIC).length;
-          if (receiptCount !== expected || evidence.receiptSetComplete !== true) throw new Error('invalid_reconciliation_evidence');
-          complete=evidence.complete === true;
-          if (complete && (!evidence.queryComplete || queriedCount !== receiptCount || [evidence.missingLogCount,evidence.extraLogCount,
-            evidence.duplicateReceiptLogCount,evidence.duplicateQueryLogCount,evidence.identitylessReceiptLogCount,
-            evidence.identitylessQueryLogCount,evidence.payloadMismatchCount].some((n) => n !== 0))) throw new Error('invalid_reconciliation_evidence');
-          await client.query(`/* receipts:reconciliation */ INSERT INTO arc_intelligence_reconciliation
-            (chain_id,block_number,block_hash,kind,definition_version,receipt_log_count,queried_log_count,missing_count,extra_count,
-             duplicate_receipt_count,duplicate_query_count,identityless_receipt_count,identityless_query_count,payload_mismatch_count,
-             query_complete,complete,evidence_digest,reason_code)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-            ON CONFLICT (chain_id,block_number,kind,definition_version) DO UPDATE SET
-              queried_log_count=EXCLUDED.queried_log_count,missing_count=EXCLUDED.missing_count,extra_count=EXCLUDED.extra_count,
-              duplicate_query_count=EXCLUDED.duplicate_query_count,identityless_query_count=EXCLUDED.identityless_query_count,
-              payload_mismatch_count=EXCLUDED.payload_mismatch_count,query_complete=EXCLUDED.query_complete,
-              complete=EXCLUDED.complete,evidence_digest=EXCLUDED.evidence_digest,reason_code=EXCLUDED.reason_code,updated_at=now()
-            WHERE NOT arc_intelligence_reconciliation.complete`,
-          [ARC_CHAIN_ID,view.block.block_number,view.block.block_hash,job.component,identity.definitionVersion,receiptCount,queriedCount,
-            evidence.missingLogCount,evidence.extraLogCount,evidence.duplicateReceiptLogCount,evidence.duplicateQueryLogCount,
-            evidence.identitylessReceiptLogCount,evidence.identitylessQueryLogCount,evidence.payloadMismatchCount,
-            evidence.queryComplete,complete,digest({blockHash:view.block.block_hash,evidence}),
-            complete ? null : evidence.queryComplete ? 'log_reconciliation_incomplete' : 'query_unavailable']);
-          const column=job.component === 'all_logs' ? 'all_log_reconciliation_complete' : 'transfer_log_reconciliation_complete';
-          await client.query(`/* receipts:log_certify */ UPDATE arc_intelligence_blocks SET ${column}=${column} OR $3
-            WHERE chain_id=$1 AND block_number=$2`,[ARC_CHAIN_ID,view.block.block_number,complete]);
-          await coverage(client,view,job.component,complete,evidence);
+      return commitAndAdvance((client) => persistReconciliation(client,lease,evidence,retryMs));
+    },
+    async saveReconciliationBatch(records,{maxBlocks=10,signal,onError}={}) {
+      if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE
+        || !Array.isArray(records) || !records.length || records.length > maxBlocks
+        || (onError !== undefined && typeof onError !== 'function')) throw new Error('invalid_log_batch');
+      const numbers=records.map((r) => position(r.lease.start_block));
+      if (Math.max(...numbers)-Math.min(...numbers) >= maxBlocks
+        || new Set(records.map((r) => r.lease.id)).size !== records.length) throw new Error('invalid_log_batch');
+      const results=[];
+      for (const record of records) {
+        try {
+          if (signal?.aborted) throw new Error('operation_aborted');
+          // Separate short transactions retain per-job rollback/fencing; no RPC or error callback runs inside.
+          const value=await transaction((client) => persistReconciliation(client,record.lease,record.evidence,record.retryMs ?? 1000,true));
+          results.push({value});
+        } catch (error) {
+          results.push({error});
+          if (onError) await onError(record,error);
         }
-        await finish(client,job,complete,retryMs); await progress(client,state,position(view.block.block_number));
-        return {complete};
-      });
+      }
+      let frontierError;
+      if (results.some((r) => r.value)) {
+        try { await advanceFrontier(); } catch (error) { frontierError=error; }
+      }
+      return {results,frontierError};
     },
     async recordConflict(lease) {
       return transaction(async (client) => {

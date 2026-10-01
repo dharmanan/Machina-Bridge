@@ -78,14 +78,24 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
           || !view.transactions.some((t) => t.transaction_hash===log.transactionHash && position(t.transaction_index)===log.transactionIndex));
         const options={receiptSetComplete:true,queryComplete:blockQueryComplete};
         const logs=view.logs.map(normalizedLog);
-        const evidence=transfer ? reconcileTransferLogs(logs,queried,options) : reconcileLogs(logs,queried,options,'all');
-        const result=await repository.saveReconciliation(record.lease,evidence,record.retryMs);
-        record.result={status:result.complete ? 'complete' : 'retrying'};
+        record.evidence=transfer ? reconcileTransferLogs(logs,queried,options) : reconcileLogs(logs,queried,options,'all');
       } catch (error) { await fail(record,error); }
     }
+    let frontierError;
+    const pending=records.filter((r) => !r.result);
+    if (pending.length) {
+      const batch=await repository.saveReconciliationBatch(pending,{maxBlocks:maxLogRangeBlocks,signal,onError:fail});
+      for (let i=0;i<pending.length;i++) if (batch.results[i].value) {
+        pending[i].result={status:batch.results[i].value.complete ? 'complete' : 'retrying'};
+      }
+      frontierError=batch.frontierError;
+    }
     const results=records.map((r) => ({blockNumber:position(r.lease.start_block),...r.result}));
-    const status=['aborted','continuity_error','persistent_partial','stale_lease','retrying'].find((s) => results.some((r) => r.status===s)) ?? 'complete';
-    return {status,component,jobCount:leases.length,completedJobs:results.filter((r) => r.status==='complete').length,results};
+    const frontierStatus=frontierError ? frontierError.message==='lane_continuity_stopped' ? 'continuity_error' : 'retrying' : null;
+    const status=['aborted','continuity_error','persistent_partial','stale_lease','retrying'].find((s) =>
+      frontierStatus===s || results.some((r) => r.status===s)) ?? 'complete';
+    return {status,component,jobCount:leases.length,completedJobs:results.filter((r) => r.status==='complete').length,results,
+      ...(frontierError ? {error:frontierStatus==='continuity_error' ? 'checkpoint_parent_hash_mismatch' : 'required_read_unavailable'} : {})};
   }
   return {
     async runOnce({signal,preferredComponent=null,enqueueFollowups=true}={}) {
