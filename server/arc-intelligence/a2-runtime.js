@@ -60,22 +60,30 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   let capacityLogged = false;
   let deferredNextBlock = 0;
   let outstanding = 0;
+  let pressureRefresh = Promise.resolve();
   const burst = createWorkBurst({worker:{async runOnce(options) {
     await refreshPressure();
     const result=await worker.runOnce({...options,enqueueFollowups:!draining});
     if (result.error==='work_capacity_reached') capacityError();
     return result;
   }},maxCalls:config.workBurst,frontier:() => receipts.advanceFrontier()});
-  let active = false;
+  let cycleActive = false;
+  let chainActive = false;
+  let workActive = false;
+  let runActive = false;
   let nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
-  async function refreshPressure(allowResume=false) {
-    outstanding=(await receipts.workPressure()).outstanding;
-    if (outstanding>=config.workHighWater) draining=true;
-    else if (draining && allowResume && outstanding<=config.workLowWater
-      && (!capacityBlocked || await receipts.capacityBelow(config.workHighWater))) {
-      draining=false;capacityBlocked=false;
-    }
-    return draining;
+  function refreshPressure(allowResume=false) {
+    const task=pressureRefresh.then(async () => {
+      outstanding=(await receipts.workPressure()).outstanding;
+      if (outstanding>=config.workHighWater) draining=true;
+      else if (draining && allowResume && outstanding<=config.workLowWater
+        && (!capacityBlocked || await receipts.capacityBelow(config.workHighWater))) {
+        draining=false;capacityBlocked=false;
+      }
+      return draining;
+    });
+    pressureRefresh=task.catch(() => {});
+    return task;
   }
   function capacityError() {
     draining=true;capacityBlocked=true;
@@ -98,10 +106,10 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
         + ` backpressure=${draining ? 'drain' : 'normal'}${capacityBlocked ? ' error=work_capacity_reached' : ''}`);
     } catch { log('Arc Intelligence A2: status=required_read_unavailable'); }
   }
-  async function cycle({signal} = {}) {
-    if (active) return {skipped:true};
+  async function chainStep({signal} = {}) {
+    if (chainActive) return {skipped:true};
     if (signal?.aborted) return {status:'aborted'};
-    active = true;
+    chainActive = true;
     try {
       await refreshPressure(true);
       if (signal?.aborted) return {status:'aborted'};
@@ -130,7 +138,24 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
           }
         }
       }
-      if (signal?.aborted) return {status:'aborted'};
+      const continueImmediately = !draining && chainResult.status === 'indexing';
+      return {chain:chainResult,scheduledBlocks,deferredBlocks,continueImmediately,
+        backpressure:draining ? 'drain' : 'normal',outstanding};
+    } catch (error) {
+      if (error.message!=='work_capacity_reached') throw error;
+      capacityError();
+      return {chain:{status:'paused',persistedBlocks:0},status:'retrying',error:'work_capacity_reached',
+        work:[],scheduledBlocks:[],deferredBlocks:[],backpressure:'drain',outstanding,continueImmediately:false};
+    } finally { chainActive = false; }
+  }
+  async function workStep({signal} = {}) {
+    if (workActive) return {skipped:true};
+    if (signal?.aborted) return {status:'aborted',work:[]};
+    workActive = true;
+    try {
+      await refreshPressure(true);
+      if (signal?.aborted) return {status:'aborted',work:[]};
+      const receiptLane = await receipts.getLane();
       const work = receiptLane?.status === 'continuity_error' ? [{status:'continuity_error'}] : await burst({signal});
       if (!signal?.aborted) await refreshPressure();
       const last = work.at(-1)?.status;
@@ -139,20 +164,49 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       const fullBurst=work.length===(config.workBurst ?? 12);
       const continueImmediately = draining
         ? !signal?.aborted && fullBurst && work.every((result) => result.status==='complete')
-        : !stopped && !signal?.aborted && !['retrying','continuity_error','aborted'].includes(chainResult.status)
-          && (chainResult.status==='indexing' || (fullBurst && last!=='idle'));
-      return {chain:chainResult,work,scheduledBlocks,deferredBlocks,continueImmediately,
-        backpressure:draining ? 'drain' : 'normal',outstanding};
+        : !stopped && !signal?.aborted && !['retrying','aborted','continuity_error'].includes(last)
+          && fullBurst && last!=='idle';
+      return {work,continueImmediately,backpressure:draining ? 'drain' : 'normal',outstanding};
     } catch (error) {
       if (error.message!=='work_capacity_reached') throw error;
       capacityError();
-      return {status:'retrying',error:'work_capacity_reached',work:[],backpressure:'drain',continueImmediately:false};
-    } finally { active = false; }
+      return {status:'retrying',error:'work_capacity_reached',work:[],backpressure:'drain',outstanding,continueImmediately:false};
+    } finally { workActive = false; }
   }
-  async function run({signal}) {
+  async function cycle({signal} = {}) {
+    if (cycleActive || runActive) return {skipped:true};
+    if (signal?.aborted) return {status:'aborted'};
+    cycleActive = true;
+    try {
+      const chainResult=await chainStep({signal});
+      if (signal?.aborted) return {status:'aborted'};
+      const workResult=chainResult.error==='work_capacity_reached'
+        ? {work:[],continueImmediately:false,backpressure:'drain',outstanding}
+        : await workStep({signal});
+      const chainStatus=chainResult.chain?.status ?? chainResult.status;
+      const lastWorkStatus = workResult.work?.at(-1)?.status;
+      const workStopped = workResult.work?.at(-1)?.frontierFlush === true
+        || ['retrying','aborted','continuity_error','persistent_partial','stale_lease'].includes(lastWorkStatus);
+      const continueImmediately = Boolean(workResult.continueImmediately)
+        || (!workStopped && !draining && !signal?.aborted && chainStatus === 'indexing');
+      return {...chainResult,...workResult,continueImmediately,backpressure:draining ? 'drain' : 'normal',outstanding};
+    } finally { cycleActive = false; }
+  }
+  async function chainLoop({signal}) {
     while (!signal.aborted) {
       let result;
-      try { result = await cycle({signal}); } catch { /* periodic sanitized summary owns runtime logging */ }
+      try { result=await chainStep({signal}); } catch { result=null; }
+      if (signal.aborted) break;
+      await summary();
+      if (signal.aborted) break;
+      if (result?.chain?.status === 'indexing' && !draining) continue;
+      try { await sleepImpl(config.workerPollMs,undefined,{signal}); } catch { break; }
+    }
+  }
+  async function workLoop({signal}) {
+    while (!signal.aborted) {
+      let result;
+      try { result=await workStep({signal}); } catch { result=null; }
       if (signal.aborted) break;
       await summary();
       if (signal.aborted) break;
@@ -160,5 +214,11 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       try { await sleepImpl(config.workerPollMs,undefined,{signal}); } catch { break; }
     }
   }
-  return Object.freeze({cycle,run});
+  async function run({signal}) {
+    if (runActive) return;
+    runActive = true;
+    try { await Promise.allSettled([chainLoop({signal}),workLoop({signal})]); }
+    finally { runActive = false; }
+  }
+  return Object.freeze({cycle,run,chainStep,workStep});
 }

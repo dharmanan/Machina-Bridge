@@ -22,6 +22,10 @@ async function test(name, work) {
   await work(); console.log(`PASS ${name}`); count++;
 }
 async function flush() { for (let i=0;i<40;i++) await Promise.resolve(); }
+async function waitFor(predicate) {
+  for (let i=0;i<80;i++) { if (predicate()) return; await flush(); }
+  assert.fail('timed out waiting for deterministic fixture condition');
+}
 function clock() {
   let time = 0;
   const timers = new Set();
@@ -439,7 +443,7 @@ await test('A2 runtime poll wait is AbortSignal aware after follower failure',as
     fetchImpl:() => {throw new Error('RPC must not run without an anchor');}});
   const run=runtime.run({signal:controller.signal});
   for (let i=0;i<50 && !time.timers;i++) await flush();
-  assert.equal(time.timers,1);assert.deepEqual(logs,[]); // follower stores its sanitized failure; no raw exception is logged
+  assert.equal(time.timers,2);assert.deepEqual(logs,[]); // independent loops sleep cancellably; no raw exception is logged
   controller.abort();await run;assert.equal(time.timers,0);
 });
 await test('cycle database failure enters cancellable idle poll without arbitrary exception logging',async () => {
@@ -452,7 +456,7 @@ await test('cycle database failure enters cancellable idle poll without arbitrar
   for (let i=0;i<50 && !time.timers;i++) await flush();
   await time.advance(500);
   await flush();
-  assert.deepEqual(logs,[]);assert.equal(time.timers,1); // failures are visible through bounded periodic summaries, not per-cycle logs
+  assert.deepEqual(logs,[]);assert.equal(time.timers,2); // failures are visible through bounded periodic summaries, not per-cycle logs
   controller.abort();await run;assert.equal(time.timers,0);
 });
 await test('live bootstrap alone jumps; repeated head jumps and restart follow exact persisted tail; chainId caches once',async () => {
@@ -602,6 +606,52 @@ await test('A2.5H actual restarted idle runtime repairs durable deferred frontie
   assert.equal((await repository.getLane()).contiguous_complete_through,100);
   assert.deepEqual(methods,['eth_chainId','eth_blockNumber']);assert.deepEqual(pool.store.a1,before);
 });
+await test('A2.5J chain RPC wait does not block independent worker DB progress',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();await repository.scheduleBlock(100);
+  const controller=new AbortController();let chainStarted=false;let activeSignal;
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),fetchImpl:async (url,init) => {
+    const {method}=JSON.parse(init.body);assert.equal(method,'eth_chainId');
+    chainStarted=true;activeSignal=init.signal;
+    return new Promise((resolve,reject) => init.signal.addEventListener('abort',() => reject(new Error('aborted')),{once:true}));
+  }});
+  const run=runtime.run({signal:controller.signal});
+  await waitFor(() => chainStarted && pool.store.blocks.get(100).receipt_bulk_attempted);
+  assert.equal(pool.store.blocks.get(100).receipt_bulk_attempted,true);
+  assert([...pool.store.work.values()].some((w) => w.state==='leased' && w.component==='receipts'));
+  assert(pool.calls.some((c) => c.text.includes('a2:claim')),'worker claimed durable work while chain transport was active');
+  assert(activeSignal && !activeSignal.aborted);
+  controller.abort();await run;assert.equal(activeSignal.aborted,true);
+  console.log('A2_5J_OVERLAP_FIXTURE: chain transport blocked; worker reached durable receipt DB work before chain transport completed');
+});
+await test('A2.5J worker RPC wait yields the shared slot to chain after release without overlapping transports',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();await repository.scheduleBlock(100);
+  let active=0,peak=0,releaseReceipt;const calls=[];
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),liveMaxBlocks:3},fetchImpl:async (url,init) => {
+    active++;peak=Math.max(peak,active);
+    try {
+      const body=JSON.parse(init.body);const method=Array.isArray(body) ? 'block_batch' : body.method;calls.push(method);
+      if (method==='eth_getBlockReceipts') return await new Promise((resolve) => {releaseReceipt=() => resolve(response([receipt(100)]));});
+      if (method==='eth_chainId') return response(hex(5042));
+      if (method==='eth_blockNumber') return response(hex(105));
+      if (method==='block_batch') return blockBatchResponse(body);
+      if (method==='eth_getLogs') return response([]);
+      throw new Error(`unexpected method ${method}`);
+    } finally { active--; }
+  }});
+  const work=runtime.workStep();await waitFor(() => calls.includes('eth_getBlockReceipts'));
+  assert.deepEqual(await runtime.workStep(),{skipped:true});
+  const chain=runtime.chainStep();await flush();
+  assert.deepEqual(await runtime.chainStep(),{skipped:true});
+  assert(!calls.includes('eth_chainId'),'chain RPC waits behind the active worker transport');
+  releaseReceipt();
+  const [workResult,chainResult]=await Promise.all([work,chain]);
+  assert.equal(workResult.work[0].status,'complete');assert.equal(chainResult.chain.persistedBlocks,3);
+  assert.equal(peak,1);assert(calls.indexOf('eth_chainId') > calls.indexOf('eth_getBlockReceipts'));
+  assert(pool.store.blocks.has(101) && pool.store.blocks.has(103));
+  console.log('A2_5J_RPC_FIXTURE: worker transport released; chain advanced next with peak active RPC transport = 1');
+});
 await test('real runtime yields after 429; first post-cooldown RPC refreshes head before another worker RPC',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0),block(101,0)]);
   const repository=createReceiptRepository(pool);await repository.initialize();
@@ -633,10 +683,12 @@ await test('real runtime yields after 429; first post-cooldown RPC refreshes hea
       controller.abort();return response([]);
     }});
   await runtime.run({signal:controller.signal});
-  assert.equal(headRefreshes,2);
-  assert.deepEqual(calls.map((c) => c.method),['eth_chainId','eth_blockNumber','eth_getLogs','eth_blockNumber','eth_getLogs']);
+  assert(headRefreshes>=2);
+  assert.deepEqual(calls.slice(0,4).map((c) => c.method),['eth_chainId','eth_blockNumber','eth_getLogs','eth_blockNumber']);
   assert.equal(calls[3].time,calls[2].time+15000,'The first RPC opportunity after cooldown belongs to chain tracking');
-  assert(calls[4].time>=calls[3].time+500);
+  const nextWorker=calls.findIndex((call,index) => index>3 && call.method==='eth_getLogs');
+  assert(nextWorker>3);assert(calls.slice(3,nextWorker).every((call) => call.method==='eth_blockNumber'));
+  assert(calls[nextWorker].time>=calls[3].time+500);
   assert([...pool.store.work.values()].some((w) => w.state==='retrying'));
 });
 await test('idle, continuity, conflict and stale lease stop a burst; abort interrupts before another job',async () => {
@@ -705,14 +757,17 @@ await test('preferred claim falls back, respects not_before, excludes terminal w
   pool.advance(1001);const ready=await repository.claim('test');assert.equal(ready.id,r.id);assert.equal(ready.attempts,2);
   await assert.rejects(repository.claim('test',180000,{preferredComponent:'unknown'}));
 });
-await test('real cooperative run completes 12 jobs before one idle poll; refreshes chain between every bounded burst',async () => {
+await test('real cooperative run completes 12 jobs while the chain loop idles independently',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:4},(_,i) => block(100+i,0)));
   const controller=new AbortController();let time=0;let chainIdReads=0;const frontiers=[];const polls=[];
   const completed=() => [...pool.store.work.values()].filter((w) => w.state==='complete').length;
   const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workBurst:3},now:() => time,
     sleepImpl:async (ms) => {
       time+=ms;pool.advance(ms);
-      if (ms===1000) {polls.push(completed());controller.abort();throw new Error('operation_aborted');}
+      if (ms===1000) {
+        polls.push(completed());
+        if (completed()>=12) {controller.abort();throw new Error('operation_aborted');}
+      }
     },fetchImpl:async (url,init) => {
       const {method}=JSON.parse(init.body);
       if (method==='eth_chainId') {chainIdReads++;return response(hex(5042));}
@@ -720,9 +775,9 @@ await test('real cooperative run completes 12 jobs before one idle poll; refresh
       assert(['eth_getBlockReceipts','eth_getLogs'].includes(method));return response([]);
     }});
   await runtime.run({signal:controller.signal});
-  assert.deepEqual(frontiers,[0,3,12]);assert.deepEqual(polls,[12]);assert.equal(chainIdReads,1);
-  assert.equal(completed(),12);assert(!pool.calls.some((c) => c.text.includes('receipts:work_counts')));
-  console.log('THROUGHPUT_FIXTURE: 12 completed jobs, 2 bounded productive bursts, 3 head refreshes, 1 idle poll');
+  assert.equal(completed(),12);assert.equal(frontiers[0],0);assert(polls.includes(12));assert.equal(chainIdReads,1);
+  assert(!pool.calls.some((c) => c.text.includes('receipts:work_counts')));
+  console.log('THROUGHPUT_FIXTURE: 12 completed jobs while chain loop had its own idle polling cadence');
 });
 await test('stopped receipt lane does not schedule, claim or spin; reports no immediate continuation',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
@@ -787,7 +842,7 @@ await test('drain hysteresis creates zero chain/work rows; receipts complete wit
   assert.deepEqual(resume.deferredBlocks,[100,101]); // recovery returns to drain as soon as high watermark is reached
   assert.equal([...pool.store.work.values()].filter((w) => ['all_logs','transfer_logs'].includes(w.component)).length,4);
 });
-await test('fresh runtime above high watermark enters drain immediately and productive bursts drain without idle poll',async () => {
+await test('fresh runtime above high watermark enters drain immediately while worker drains independently',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:4},(_,i) => block(100+i)));
   const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<104;n++) await repository.scheduleBlock(n);
   const controller=new AbortController();let time=0;let bulkCalls=0;let headCalls=0;const polls=[];
@@ -798,7 +853,7 @@ await test('fresh runtime above high watermark enters drain immediately and prod
       if (method==='eth_blockNumber') {headCalls++;return response(hex(105));}
       assert.equal(method,'eth_getBlockReceipts');bulkCalls++;return response([receipt(Number(BigInt(params[0])))]);
     }});
-  await runtime.run({signal:controller.signal});assert.equal(bulkCalls,3);assert.equal(headCalls,0);assert.deepEqual(polls,[]);
+  await runtime.run({signal:controller.signal});assert.equal(bulkCalls,3);assert.equal(headCalls,0);assert(polls.length>0);
   assert.equal(pool.store.work.size,4);assert.equal((await repository.workPressure()).outstanding,1);
 });
 await test('deferred recovery pages at most 50 durable blocks, reaches old blocks, is idempotent and preserves existing certificates',async () => {
