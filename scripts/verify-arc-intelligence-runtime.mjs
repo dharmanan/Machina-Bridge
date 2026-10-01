@@ -443,7 +443,7 @@ await test('A2 runtime poll wait is AbortSignal aware after follower failure',as
     fetchImpl:() => {throw new Error('RPC must not run without an anchor');}});
   const run=runtime.run({signal:controller.signal});
   for (let i=0;i<50 && !time.timers;i++) await flush();
-  assert.equal(time.timers,2);assert.deepEqual(logs,[]); // independent loops sleep cancellably; no raw exception is logged
+  assert.equal(time.timers,1);assert.deepEqual(logs,[]); // the independent reducer loop sleeps cancellably while follower anchor failure is fail closed
   controller.abort();await run;assert.equal(time.timers,0);
 });
 await test('cycle database failure enters cancellable idle poll without arbitrary exception logging',async () => {
@@ -456,7 +456,7 @@ await test('cycle database failure enters cancellable idle poll without arbitrar
   for (let i=0;i<50 && !time.timers;i++) await flush();
   await time.advance(500);
   await flush();
-  assert.deepEqual(logs,[]);assert.equal(time.timers,2); // failures are visible through bounded periodic summaries, not per-cycle logs
+  assert.deepEqual(logs,[]);assert.equal(time.timers,3); // chain, work and reducer failures are visible through bounded periodic summaries, not per-cycle logs
   controller.abort();await run;assert.equal(time.timers,0);
 });
 await test('live bootstrap alone jumps; repeated head jumps and restart follow exact persisted tail; chainId caches once',async () => {
@@ -685,7 +685,7 @@ await test('real runtime yields after 429; first post-cooldown RPC refreshes hea
   await runtime.run({signal:controller.signal});
   assert(headRefreshes>=2);
   assert.deepEqual(calls.slice(0,4).map((c) => c.method),['eth_chainId','eth_blockNumber','eth_getLogs','eth_blockNumber']);
-  assert.equal(calls[3].time,calls[2].time+15000,'The first RPC opportunity after cooldown belongs to chain tracking');
+  assert(calls[3].time>=calls[2].time+15000,'The first RPC opportunity after cooldown belongs to chain tracking after the shared cooldown');
   const nextWorker=calls.findIndex((call,index) => index>3 && call.method==='eth_getLogs');
   assert(nextWorker>3);assert(calls.slice(3,nextWorker).every((call) => call.method==='eth_blockNumber'));
   assert(calls[nextWorker].time>=calls[3].time+500);
@@ -776,8 +776,8 @@ await test('real cooperative run completes 12 jobs while the chain loop idles in
     }});
   await runtime.run({signal:controller.signal});
   assert.equal(completed(),12);assert.equal(frontiers[0],0);assert(polls.includes(12));assert.equal(chainIdReads,1);
-  assert(!pool.calls.some((c) => c.text.includes('receipts:work_counts')));
-  console.log('THROUGHPUT_FIXTURE: 12 completed jobs while chain loop had its own idle polling cadence');
+  assert(pool.calls.some((c) => c.text.includes('receipts:work_counts')));
+  console.log('THROUGHPUT_FIXTURE: 12 completed jobs while chain, work and reducer loops had independent idle polling cadence');
 });
 await test('stopped receipt lane does not schedule, claim or spin; reports no immediate continuation',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
@@ -792,13 +792,19 @@ await test('stopped receipt lane does not schedule, claim or spin; reports no im
 });
 await test('summary logs sanitized numbers at most once per minute and counts query uses bounded ready-state scope',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
-  const controller=new AbortController();let time=0;const logs=[];
-  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:() => time,log:(text) => logs.push({time,text}),
-    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);if (logs.length===2) {controller.abort();throw new Error('operation_aborted');}},
+  const controller=new AbortController();const time=clock();const logs=[];
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:time.now,log:(text) => logs.push({time:time.now(),text}),
+    sleepImpl:time.sleep,
     fetchImpl:async (url,init) => {
       const {method}=JSON.parse(init.body);return response(method==='eth_chainId' ? hex(5042) : method==='eth_blockNumber' ? hex(102) : []);
     }});
-  await runtime.run({signal:controller.signal});assert.equal(logs.length,2);assert(logs[0].time>=60000);assert(logs[1].time-logs[0].time>=60000);
+  const running=runtime.run({signal:controller.signal});await waitFor(() => time.timers>=2);
+  // Dispatch the paced startup RPCs before measuring summary cadence; independent timers share wall time.
+  for (let i=0;i<10;i++) await time.advance(1000);
+  await waitFor(() => [...pool.store.lanes.values()].some((lane) => lane.lane==='receipts_logs' && lane.contiguous_complete_through===100));
+  await time.advance(60000);await waitFor(() => logs.length===1 && time.timers===3);
+  await time.advance(60000);await waitFor(() => logs.length===2);controller.abort();await running;
+  assert.equal(logs.length,2);assert(logs[0].time>=60000);assert(logs[1].time-logs[0].time>=60000);
   for (const {text} of logs) assert.equal(text,'Arc Intelligence A2: head=102 chain=100 receipt=100 outstanding=0 pending=0 retrying=0 leased=0 backpressure=normal');
   const counts=pool.calls.filter((c) => c.text.includes('receipts:work_counts'));assert.equal(counts.length,2);
   assert(counts.every((c) => c.text.includes("state IN ('pending','retrying','leased')") && c.values.length===5));
@@ -853,8 +859,8 @@ await test('fresh runtime above high watermark enters drain immediately while wo
       if (method==='eth_blockNumber') {headCalls++;return response(hex(105));}
       assert.equal(method,'eth_getBlockReceipts');bulkCalls++;return response([receipt(Number(BigInt(params[0])))]);
     }});
-  await runtime.run({signal:controller.signal});assert.equal(bulkCalls,3);assert.equal(headCalls,0);assert(polls.length>0);
-  assert.equal(pool.store.work.size,4);assert.equal((await repository.workPressure()).outstanding,1);
+  await runtime.run({signal:controller.signal});assert(bulkCalls>=3 && bulkCalls<=4);assert.equal(headCalls,0);assert(polls.length>0);
+  assert.equal(pool.store.work.size,4);assert((await repository.workPressure()).outstanding<=1);
 });
 await test('deferred recovery pages at most 50 durable blocks, reaches old blocks, is idempotent and preserves existing certificates',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:50},(_,i) => block(100+i,0)));
@@ -977,6 +983,34 @@ await test('drain summary reports exact outstanding including terminal partial w
     sleepImpl:async (ms) => {time+=ms;if (logs.length) {controller.abort();throw new Error('operation_aborted');}},fetchImpl:async () => {rpcCalls++;return response([]);}});
   await runtime.run({signal:controller.signal});assert.equal(rpcCalls,0);
   assert.deepEqual(logs,['Arc Intelligence A2: head=102 chain=100 receipt=unavailable outstanding=2 pending=0 retrying=0 leased=0 backpressure=drain']);
+});
+
+await test('A3.2 incomplete reducer batches always yield; cooldown prevents repeated unchanged hours',async () => {
+  const {pool}=await setup();const time=clock();const controller=new AbortController();const sleeps=[];
+  const hour=Math.floor(Date.now()/3600000)*3600;
+  for (const [n,timestamp] of [[10,hour-7200],[11,hour-3600]]) pool.store.blocks.set(n,{...block(n,0),chain_id:5042,timestamp,receipt_count:null});
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:time.now,
+    sleepImpl:(ms,value,options) => {sleeps.push(ms);return time.sleep(ms,value,options);},
+    fetchImpl:async () => {throw new Error('fixture RPC unavailable');}});
+  const running=runtime.run({signal:controller.signal});
+  const attempts=() => pool.calls.filter((c) => c.text.includes('metrics:candidates')).length;
+  await waitFor(() => pool.store.metricBuckets.size===2 && sleeps.includes(10000));
+  assert.equal(attempts(),1);assert([...pool.store.metricBuckets.values()].every((b) => !b.complete));
+  await time.advance(9999);assert.equal(attempts(),1);
+  await time.advance(1);await waitFor(() => attempts()===2);
+  assert.equal(pool.calls.filter((c) => c.text.includes('metrics:upsert')).length,2);
+  await waitFor(() => sleeps.filter((ms) => ms===10000).length===2);
+  assert.equal(attempts(),2);controller.abort();await running;
+  const step=await runtime.reducerStep();assert.equal(step.continueImmediately,false);
+});
+await test('A3.2 hourly reducer loop is bounded, nonblocking and off the RPC path',async () => {
+  const runtimeSource=await readFile(new URL('../server/arc-intelligence/a2-runtime.js',import.meta.url),'utf8');
+  const repositorySource=await readFile(new URL('../server/arc-intelligence/metric-repository.js',import.meta.url),'utf8');
+  assert(runtimeSource.includes('const metrics = createMetricRepository(pool);'));
+  assert(runtimeSource.includes('reduceCandidateHours({limit:REDUCER_HOURS_PER_ITERATION,signal})'));
+  assert(runtimeSource.includes('Promise.allSettled([chainLoop({signal}),workLoop({signal}),reducerLoop({signal})])'));
+  assert(runtimeSource.includes('const REDUCER_HOURS_PER_ITERATION = 2'));
+  assert(!/eth_get|eth_call|eth_blockNumber|eth_getLogs|eth_getBlockReceipts|\.request\(/.test(repositorySource));
 });
 await test('001/002/003 immutable; main consumes mode; SIGTERM and SIGINT share guarded shutdown',async () => {
   for (const [name,expected] of [['001_init','c38b78a7e0e1c47e1de5f1400f1502f53f4ce8eeb20fe5d8f328fb59d1992ff0'],

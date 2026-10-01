@@ -41,7 +41,7 @@ export async function start(env = process.env, dependencies = {}) {
   try {
     await deps.migrate(pool);
     const repository = deps.createRepository(pool);
-    server = deps.createHttpServer({ repository, allowedOrigins });
+    server = deps.createHttpServer({ repository, allowedOrigins, runtimeMode: runtimeConfig.mode });
     await new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(config.port, '0.0.0.0', resolve);

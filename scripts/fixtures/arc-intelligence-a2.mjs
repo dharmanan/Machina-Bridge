@@ -71,16 +71,37 @@ export function fixturePool() {
               return {...b,receipts_digest:c?.digest ?? null,all_logs_digest:certificate('all_logs'),transfer_logs_digest:certificate('transfer_logs')};
             }));
           }
-          case 'metrics_transactions': case 'metrics_receipts': {
+          case 'metrics_transactions': case 'metrics_receipts': case 'metrics_logs': {
             assert(!transactionOpen,'Heavy fact reads outside publish transaction');assert(text.includes('LIMIT $3'));
-            const facts=operation==='metrics_transactions' ? store.transactions : store.receipts;
+            const facts=operation==='metrics_transactions' ? store.transactions : operation==='metrics_receipts' ? store.receipts : store.logs;
             return rows([...facts.values()].filter((r) => r.chain_id===values[0] && values[1].includes(r.block_number))
-              .sort((a,b) => a.block_number-b.block_number || a.transaction_index-b.transaction_index).slice(0,values[2]));
+              .sort((a,b) => a.block_number-b.block_number || (operation==='metrics_logs' ? a.log_index-b.log_index : a.transaction_index-b.transaction_index)).slice(0,values[2]));
           }
+          case 'metrics_candidates': {
+            assert(text.includes('b.updated_at <= to_timestamp($6)'));
+            assert(text.includes('ORDER BY (b.bucket_start IS NOT NULL),b.updated_at NULLS FIRST,h.bucket_start'));
+            const starts=[...new Set([...store.blocks.values()].filter((b) => b.chain_id===values[0] && b.timestamp<values[4]).map((b) => Math.floor(b.timestamp/3600)*3600))];
+            const eligible=starts.map((start) => {
+              const key=JSON.stringify([values[0],'hour',start,values[1],values[2]]);
+              return {start,bucket:store.metricBuckets.get(key)};
+            }).filter(({bucket}) => !bucket || (!bucket.complete && new Date(bucket.updated_at).getTime()/1000<=values[5]));
+            eligible.sort((a,b) => Number(!!a.bucket)-Number(!!b.bucket)
+              || (a.bucket && b.bucket ? new Date(a.bucket.updated_at)-new Date(b.bucket.updated_at) : 0) || a.start-b.start);
+            return rows(eligible.slice(0,values[3]).map(({start}) => ({bucket_start:start})));
+          }
+          case 'metrics_latest_bucket': {
+            const buckets=[...store.metricBuckets.values()].filter((b) => b.chain_id===values[0] && b.period==='hour' && b.definition_version===values[1] && b.reducer_version===values[2])
+              .sort((a,b) => b.bucket_start-a.bucket_start);
+            return rows(buckets.slice(0,1).map((b) => ({bucket_start:b.bucket_start})));
+          }
+          case 'metrics_timeseries': return rows([...store.metricBuckets.values()].filter((b) => b.chain_id===values[0] && b.period==='hour'
+            && b.definition_version===values[1] && b.reducer_version===values[2] && b.bucket_start>=values[3] && b.bucket_start<values[4])
+            .sort((a,b) => a.bucket_start-b.bucket_start));
           case 'metrics_lock': assert(transactionOpen);return rows();
           case 'metrics_bucket': return rows(store.metricBuckets.has(JSON.stringify(values)) ? [store.metricBuckets.get(JSON.stringify(values))] : []);
           case 'metrics_upsert': {
-            assert(transactionOpen);assert(text.includes('false,false'));assert(text.includes('WHERE arc_intelligence_metric_buckets.evidence_digest<>EXCLUDED.evidence_digest'));
+            assert(transactionOpen);assert(text.includes('false,false'));
+            assert(text.includes('WHERE NOT arc_intelligence_metric_buckets.complete OR (EXCLUDED.complete AND arc_intelligence_metric_buckets.evidence_digest<>EXCLUDED.evidence_digest)'));
             const columns=['chain_id','bucket_start','bucket_end','start_block','end_block','start_hash','end_hash','block_count',
               'definition_version','reducer_version','coverage_status','complete','metrics','coverage','evidence_digest'];
             const r=Object.fromEntries(columns.map((c,i) => [c,values[i]]));Object.assign(r,{period:'hour',required_reducers_complete:false,raw_prunable:false,
@@ -89,7 +110,9 @@ export function fixturePool() {
             if (r.complete) for (const key of ['blockNumbersContiguous','parentHashesContinuous','timestampsMonotonic','receiptEvidenceComplete',
               'certificatesComplete','factSetsComplete','leftBoundaryCovered','rightBoundaryCovered','bounded']) assert.equal(r.coverage[key],true);
             const key=JSON.stringify([r.chain_id,r.period,r.bucket_start,r.definition_version,r.reducer_version]);
-            if (store.metricBuckets.get(key)?.evidence_digest===r.evidence_digest) return rows();
+            const existing=store.metricBuckets.get(key);
+            if (existing?.complete && (!r.complete || existing.evidence_digest===r.evidence_digest)) return rows();
+            r.updated_at=new Date(values[15]*1000).toISOString();
             store.metricBuckets.set(key,r);return rows([r]);
           }
           case 'metrics_raw_counts': {

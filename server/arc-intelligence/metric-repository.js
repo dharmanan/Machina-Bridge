@@ -39,7 +39,9 @@ function rowModel(row) {
 }
 
 // Importing/constructing this repository starts no scheduler, opens no network and does not prune raw facts.
-export function createMetricRepository(pool) {
+export const INCOMPLETE_HOUR_RETRY_SECONDS = 15 * 60;
+
+export function createMetricRepository(pool,{now=Date.now}={}) {
   const identity=identityValues(RECEIPT_IDENTITY);
   const key=(start) => [ARC_CHAIN_ID,'hour',hourStart(start),METRIC_DEFINITION_VERSION,HOURLY_REDUCER_VERSION];
   async function readHour(client,start,lock=false) {
@@ -50,11 +52,38 @@ export function createMetricRepository(pool) {
     return rowModel((await client.query(`/* metrics:bucket */ SELECT * FROM arc_intelligence_metric_buckets
       WHERE chain_id=$1 AND period=$2 AND bucket_start=$3 AND definition_version=$4 AND reducer_version=$5`,key(start))).rows[0]);
   }
+  function metricValue(bucket,id) {
+    const record=bucket?.metrics?.network?.records?.find?.((item) => item.metricId===id);
+    return record?.complete===false || record?.value === undefined ? null : record.value;
+  }
+  function numberMetric(bucket,id) {
+    const value=metricValue(bucket,id);
+    return Number.isSafeInteger(value) ? value : null;
+  }
+  function mapBucket(bucket,start) {
+    const available=bucket?.complete===true && bucket.coverageStatus==='available';
+    const canonical=bucket?.metrics?.assets?.canonicalUsdc;
+    return {
+      start:new Date(start*1000).toISOString(),end:new Date((start+HOUR_SECONDS)*1000).toISOString(),
+      status:available ? 'available' : bucket ? bucket.coverageStatus : 'missing',
+      metrics:{
+        transactions:available ? numberMetric(bucket,'network.transactionCount') : null,
+        activeAddresses:available ? numberMetric(bucket,'network.uniqueTopLevelActiveAddresses') : null,
+        successfulTransactions:available ? numberMetric(bucket,'network.successfulTransactionCount') : null,
+        failedTransactions:available ? numberMetric(bucket,'network.failedTransactionCount') : null,
+        blocks:available ? numberMetric(bucket,'network.blockCount') : null,
+        contractCreations:available ? numberMetric(bucket,'network.topLevelContractCreationCount') : null,
+        canonicalUsdcTransfers:available && canonical?.complete===true ? canonical.transferCount : null,
+        canonicalUsdcMints:available && canonical?.complete===true ? canonical.mintCount : null,
+        canonicalUsdcBurns:available && canonical?.complete===true ? canonical.burnCount : null,
+      },
+    };
+  }
   return Object.freeze({
     async getHour(start) { const client=await pool.connect();try {return await get(client,start);} finally {client.release();} },
     async reduceHour({bucketStart,signal}={}) {
       const start=hourStart(bucketStart);checkAbort(signal);
-      const client=await pool.connect();let rows,transactions=[],receipts=[];
+      const client=await pool.connect();let rows,transactions=[],receipts=[],logs=[];
       try {
         rows=await readHour(client,start);checkAbort(signal);
         if (inspectHour(rows,start).manifestComplete) {
@@ -66,10 +95,14 @@ export function createMetricRepository(pool) {
           receipts=(await client.query(`/* metrics:receipts */ SELECT * FROM arc_intelligence_receipts
             WHERE chain_id=$1 AND block_number=ANY($2::bigint[]) ORDER BY block_number,transaction_index LIMIT $3`,
           [ARC_CHAIN_ID,numbers,MAX_HOURLY_FACT_ROWS+1])).rows;
+          checkAbort(signal);
+          logs=(await client.query(`/* metrics:logs */ SELECT * FROM arc_intelligence_logs
+            WHERE chain_id=$1 AND block_number=ANY($2::bigint[]) ORDER BY block_number,log_index LIMIT $3`,
+          [ARC_CHAIN_ID,numbers,MAX_HOURLY_FACT_ROWS+1])).rows;
         }
       } finally {client.release();}
       // CPU reduction and all fact reads occur before the short publishing transaction.
-      const bucket=reduceDurableHour({rows,transactions,receipts,start,signal});checkAbort(signal);
+      const bucket=reduceDurableHour({rows,transactions,receipts,logs,start,signal});checkAbort(signal);
       return withTransaction(pool,async (writer) => {
         // Serialise this bucket's writers without touching indexer/work advisory locks.
         await writer.query('/* metrics:lock */ SELECT pg_advisory_xact_lock(5042,hashtext($1))',
@@ -79,20 +112,90 @@ export function createMetricRepository(pool) {
         // Block SHARE locks prevent receipt conflict/quarantine races during publication across lane epochs.
         const row=(await writer.query(`/* metrics:upsert */ INSERT INTO arc_intelligence_metric_buckets
           (chain_id,period,bucket_start,bucket_end,start_block,end_block,start_hash,end_hash,block_count,
-           definition_version,reducer_version,coverage_status,complete,required_reducers_complete,raw_prunable,metrics,coverage,evidence_digest)
-          VALUES ($1,'hour',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false,false,$13::jsonb,$14::jsonb,$15)
+           definition_version,reducer_version,coverage_status,complete,required_reducers_complete,raw_prunable,metrics,coverage,evidence_digest,updated_at)
+          VALUES ($1,'hour',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false,false,$13::jsonb,$14::jsonb,$15,to_timestamp($16))
           ON CONFLICT (chain_id,period,bucket_start,definition_version,reducer_version) DO UPDATE SET
             start_block=EXCLUDED.start_block,end_block=EXCLUDED.end_block,start_hash=EXCLUDED.start_hash,end_hash=EXCLUDED.end_hash,
             block_count=EXCLUDED.block_count,coverage_status=EXCLUDED.coverage_status,complete=EXCLUDED.complete,
             required_reducers_complete=false,raw_prunable=false,metrics=EXCLUDED.metrics,coverage=EXCLUDED.coverage,
-            evidence_digest=EXCLUDED.evidence_digest,updated_at=now()
-          WHERE arc_intelligence_metric_buckets.evidence_digest<>EXCLUDED.evidence_digest
+            evidence_digest=EXCLUDED.evidence_digest,updated_at=EXCLUDED.updated_at
+          WHERE NOT arc_intelligence_metric_buckets.complete
+            OR (EXCLUDED.complete
+              AND arc_intelligence_metric_buckets.evidence_digest<>EXCLUDED.evidence_digest)
           RETURNING *`,[ARC_CHAIN_ID,bucket.bucketStart,bucket.bucketEnd,bucket.startBlock,bucket.endBlock,
           bucket.startHash,bucket.endHash,bucket.blockCount,bucket.definitionVersion,bucket.reducerVersion,bucket.coverageStatus,
-          bucket.complete,JSON.stringify(bucket.metrics),JSON.stringify({...bucket.coverage,proofDigest:bucket.proofDigest}),bucket.evidenceDigest])).rows[0];
+          bucket.complete,JSON.stringify(bucket.metrics),JSON.stringify({...bucket.coverage,proofDigest:bucket.proofDigest}),bucket.evidenceDigest,Math.floor(now()/1000)])).rows[0];
         checkAbort(signal);
         return row ? rowModel(row) : get(writer,start);
       });
+    },
+
+    async reduceCandidateHours({limit=2,signal}={}) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 24) throw new Error('invalid_metric_limit');
+      const client=await pool.connect();
+      let candidates;
+      try {
+        candidates=(await client.query(`/* metrics:candidates */ WITH hours AS (
+          SELECT (floor(timestamp / 3600)::bigint * 3600) AS bucket_start
+          FROM arc_intelligence_blocks
+          WHERE chain_id=$1 AND timestamp < $5
+          GROUP BY 1
+        ) SELECT h.bucket_start FROM hours h
+          LEFT JOIN arc_intelligence_metric_buckets b ON b.chain_id=$1 AND b.period='hour'
+            AND b.bucket_start=h.bucket_start AND b.definition_version=$2 AND b.reducer_version=$3
+          WHERE b.bucket_start IS NULL OR (NOT b.complete AND b.updated_at <= to_timestamp($6))
+          ORDER BY (b.bucket_start IS NOT NULL),b.updated_at NULLS FIRST,h.bucket_start LIMIT $4`,
+        [ARC_CHAIN_ID,METRIC_DEFINITION_VERSION,HOURLY_REDUCER_VERSION,limit,Math.floor(now()/(HOUR_SECONDS*1000))*HOUR_SECONDS,
+          Math.floor(now()/1000)-INCOMPLETE_HOUR_RETRY_SECONDS])).rows
+          .map((row) => position(row.bucket_start));
+      } finally { client.release(); }
+      const results=[];
+      for (const bucketStart of candidates) {
+        checkAbort(signal);
+        const bucket=await this.reduceHour({bucketStart,signal});
+        results.push({bucketStart,status:bucket.complete ? 'complete' : 'skipped',reason:bucket.complete ? null : bucket.coverage?.warnings?.[0] ?? 'incomplete_hour',bucket});
+      }
+      const completeResults=results.filter((item) => item.status==='complete');
+      return {processed:results.length,examined:results.length,complete:completeResults.length,
+        skipped:results.length-completeResults.length,
+        earliestCompleteBucket:completeResults.length ? Math.min(...completeResults.map((item) => item.bucketStart)) : null,
+        latestCompleteBucket:completeResults.length ? Math.max(...completeResults.map((item) => item.bucketStart)) : null,results};
+    },
+    async getTimeseries({window='6h'}={}) {
+      const hours = window === '6h' ? 6 : window === '24h' ? 24 : null;
+      if (!hours) throw new Error('unsupported_window');
+      const client=await pool.connect();
+      try {
+        // End is the start of the current UTC hour; only fully closed hours are returned.
+        const generatedAt=new Date(now()).toISOString();
+        const end=Math.floor(now()/(HOUR_SECONDS*1000))*HOUR_SECONDS;
+        const start=end-(hours*HOUR_SECONDS);
+        const rows=(await client.query(`/* metrics:timeseries */ SELECT * FROM arc_intelligence_metric_buckets
+          WHERE chain_id=$1 AND period='hour' AND definition_version=$2 AND reducer_version=$3 AND bucket_start >= $4 AND bucket_start < $5
+          ORDER BY bucket_start`,[ARC_CHAIN_ID,METRIC_DEFINITION_VERSION,HOURLY_REDUCER_VERSION,start,end])).rows.map(rowModel);
+        const byStart=new Map(rows.map((bucket) => [bucket.bucketStart,bucket]));
+        const buckets=[];
+        for (let t=start;t<end;t+=HOUR_SECONDS) buckets.push(mapBucket(byStart.get(t),t));
+        const availableHours=buckets.filter((bucket) => bucket.status==='available').length;
+        const partialHours=buckets.filter((bucket) => bucket.status==='partial' || bucket.status==='unavailable').length;
+        const missingHours=buckets.filter((bucket) => bucket.status==='missing').length;
+        const available=buckets.filter((bucket) => bucket.status==='available');
+        const addresses=new Set();
+        let addressSetsComplete=available.length>0;
+        for (const bucket of rows.filter((bucket) => bucket.complete && bucket.coverageStatus==='available')) {
+          const state=bucket.metrics?.network?.mergeState;
+          for (const field of ['uniqueTopLevelSenders','uniqueTopLevelRecipients']) {
+            const set=state?.[field];
+            if (!Array.isArray(set) || set.some((address) => typeof address!=='string' || !/^0x[0-9a-fA-F]{40}$/.test(address))) {
+              addressSetsComplete=false;continue;
+            }
+            for (const address of set) addresses.add(address.toLowerCase());
+          }
+        }
+        return {generatedAt,window,coverage:{expectedHours:hours,availableHours,partialHours,missingHours,
+          verifiedThrough:available.at(-1)?.end ?? null},
+        summary:{uniqueActiveAddresses:addressSetsComplete ? addresses.size : null,scope:'verified_hours'},buckets};
+      } finally { client.release(); }
     },
     async retentionDryRun({bucketStart,nowSeconds=Math.floor(Date.now()/1000)}={}) {
       const start=hourStart(bucketStart),now=position(nowSeconds),client=await pool.connect();

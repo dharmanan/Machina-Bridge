@@ -6,12 +6,15 @@ import { createReceiptRepository } from './receipt-repository.js';
 import { createReceiptWorker } from './receipt-lane.js';
 import { createRpcBudget } from './rpc-budget.js';
 import { createA2RpcClient } from './a2-rpc.js';
+import { createMetricRepository } from './metric-repository.js';
 
 const SUMMARY_INTERVAL_MS = 60000;
 const WORK_PREFERENCES = Object.freeze([
   ...Array(10).fill('receipts'),'all_logs','transfer_logs',
 ]);
 const BURST_STOPS = new Set(['idle','retrying','aborted','continuity_error','persistent_partial','stale_lease']);
+const REDUCER_HOURS_PER_ITERATION = 2;
+const REDUCER_DELAY_MS = 10000;
 
 // Preference is carried across bursts, including a configured burst of one.
 // Each worker call consumes one position, regardless of the number of jobs in a log batch.
@@ -52,6 +55,7 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   const rpc = createA2RpcClient({budget,fetchImpl});
   const foundation = createFoundationRepository(pool);
   const receipts = createReceiptRepository(pool);
+  const metrics = createMetricRepository(pool);
   const chain = createChainFollower({repository:foundation,rpc,mode:'live',maxBlocks:config.liveMaxBlocks,finalityBlocks});
   const worker = createReceiptWorker({repository:receipts,rpc,maxReceiptReads:config.receiptMaxReads,
     maxLogRangeBlocks:config.logRangeBlocks,owner:randomUUID()});
@@ -70,6 +74,7 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   let cycleActive = false;
   let chainActive = false;
   let workActive = false;
+  let reducerActive = false;
   let runActive = false;
   let nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
   function refreshPressure(allowResume=false) {
@@ -173,6 +178,19 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       return {status:'retrying',error:'work_capacity_reached',work:[],backpressure:'drain',outstanding,continueImmediately:false};
     } finally { workActive = false; }
   }
+
+  async function reducerStep({signal} = {}) {
+    if (reducerActive) return {skipped:true};
+    if (signal?.aborted) return {status:'aborted'};
+    reducerActive = true;
+    try {
+      const result = await metrics.reduceCandidateHours({limit:REDUCER_HOURS_PER_ITERATION,signal});
+      return {status:result.processed > 0 ? 'reduced' : 'idle',...result,
+        continueImmediately:false};
+    } catch {
+      return {status:'retrying',processed:0,complete:0,skipped:0,continueImmediately:false};
+    } finally { reducerActive = false; }
+  }
   async function cycle({signal} = {}) {
     if (cycleActive || runActive) return {skipped:true};
     if (signal?.aborted) return {status:'aborted'};
@@ -214,11 +232,21 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       try { await sleepImpl(config.workerPollMs,undefined,{signal}); } catch { break; }
     }
   }
+  async function reducerLoop({signal}) {
+    while (!signal.aborted) {
+      await reducerStep({signal});
+      if (signal.aborted) break;
+      await summary();
+      if (signal.aborted) break;
+      // Historical reduction must yield even when both selected hours remain incomplete.
+      try { await sleepImpl(REDUCER_DELAY_MS,undefined,{signal}); } catch { break; }
+    }
+  }
   async function run({signal}) {
     if (runActive) return;
     runActive = true;
-    try { await Promise.allSettled([chainLoop({signal}),workLoop({signal})]); }
+    try { await Promise.allSettled([chainLoop({signal}),workLoop({signal}),reducerLoop({signal})]); }
     finally { runActive = false; }
   }
-  return Object.freeze({cycle,run,chainStep,workStep});
+  return Object.freeze({cycle,run,chainStep,workStep,reducerStep});
 }

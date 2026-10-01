@@ -2,11 +2,12 @@ import { createHash } from 'node:crypto';
 import { ARC_CHAIN_ID, ARC_RPC_URL } from '../../api/_lib/arc-intelligence/rpc.js';
 import { DEFINITION_VERSION as CORE_VERSION, MAX_WINDOW_SIZE } from '../../api/_lib/arc-intelligence/core.js';
 import { METRIC_DEFINITION_VERSION, createMetricAccumulator } from '../../api/_lib/arc-intelligence/metrics.js';
+import { summarizeUsdcTransfers } from '../../api/_lib/arc-intelligence/usdc.js';
 import { HISTORY_DEFINITION_VERSION } from '../../api/_lib/arc-intelligence/history.js';
 import { position } from './foundation.js';
 import { receiptSetComplete } from './receipt-repository.js';
 
-export const HOURLY_REDUCER_VERSION = 'arc-a2-durable-core-hour-v1';
+export const HOURLY_REDUCER_VERSION = 'arc-a2-durable-core-usdc-hour-v2';
 export const HOUR_SECONDS = 3600;
 export const RAW_KEEP_SECONDS = 6 * HOUR_SECONDS;
 // Callable, off the indexing hot path. One hour and hard limits, never an archive sweep.
@@ -78,28 +79,43 @@ export function inspectHour(rows,start) {
   return {inside,sorted,coverage,manifestComplete:keys.every((k) => coverage[k]),proofDigest:digest(proofRows(sorted))};
 }
 
-export function reduceDurableHour({rows,transactions=[],receipts=[],start,signal}={}) {
+function logModel(row) {
+  return {
+    blockNumber: position(row.block_number),
+    transactionIndex: position(row.transaction_index),
+    transactionHash: row.transaction_hash,
+    logIndex: position(row.log_index),
+    address: row.address,
+    topics: row.topics,
+    data: row.data,
+  };
+}
+
+export function reduceDurableHour({rows,transactions=[],receipts=[],logs=[],start,signal}={}) {
   const inspected=inspectHour(rows,start),{inside,sorted,coverage}=inspected;
   checkAbort(signal);
   let records=null,mergeState=null;
   if (inspected.manifestComplete) {
     try {
-      if (transactions.length>MAX_HOURLY_FACT_ROWS || receipts.length>MAX_HOURLY_FACT_ROWS) throw new Error('fact_limit');
-      const txByBlock=new Map(),receiptsByBlock=new Map();
-      for (const [facts,map] of [[transactions,txByBlock],[receipts,receiptsByBlock]]) for (const fact of facts) {
+      if (transactions.length>MAX_HOURLY_FACT_ROWS || receipts.length>MAX_HOURLY_FACT_ROWS || logs.length>MAX_HOURLY_FACT_ROWS) throw new Error('fact_limit');
+      const txByBlock=new Map(),receiptsByBlock=new Map(),logsByBlock=new Map();
+      for (const [facts,map] of [[transactions,txByBlock],[receipts,receiptsByBlock],[logs,logsByBlock]]) for (const fact of facts) {
         const n=position(fact.block_number);if (!map.has(n)) map.set(n,[]);map.get(n).push(fact);
       }
       const known=new Set(sorted.map((b) => position(b.block_number)));
-      if ([...txByBlock.keys(),...receiptsByBlock.keys()].some((n) => !known.has(n))) throw new Error('fact_identity');
+      if ([...txByBlock.keys(),...receiptsByBlock.keys(),...logsByBlock.keys()].some((n) => !known.has(n))) throw new Error('fact_identity');
       const views=sorted.map((block) => {
         const n=position(block.block_number),txs=(txByBlock.get(n) ?? []).sort((a,b) => position(a.transaction_index)-position(b.transaction_index));
         const rs=(receiptsByBlock.get(n) ?? []).sort((a,b) => position(a.transaction_index)-position(b.transaction_index));
-        const view={block,transactions:txs,receipts:rs};
+        const ls=(logsByBlock.get(n) ?? []).sort((a,b) => position(a.log_index)-position(b.log_index));
+        const view={block,transactions:txs,receipts:rs,logs:ls};
         if (!receiptSetComplete(view) || new Set(txs.map((t) => t.transaction_hash)).size!==txs.length
           || new Set(rs.map((r) => r.transaction_hash)).size!==rs.length
           || [...txs,...rs].some((r) => r.chain_id!==ARC_CHAIN_ID || r.block_hash!==block.block_hash)
           || txs.some((t) => !/^0x[0-9a-f]{40}$/.test(t.from_address) || (t.to_address!==null && !/^0x[0-9a-f]{40}$/.test(t.to_address)))
-          || rs.some((r) => !/^\d+$/.test(r.gas_used_raw) || (r.effective_gas_price_raw!==null && !/^\d+$/.test(r.effective_gas_price_raw)))) throw new Error('fact_identity');
+          || rs.some((r) => !/^\d+$/.test(r.gas_used_raw) || (r.effective_gas_price_raw!==null && !/^\d+$/.test(r.effective_gas_price_raw)))
+          || ls.some((l) => l.chain_id!==ARC_CHAIN_ID || l.block_hash!==block.block_hash || !/^0x[0-9a-f]{40}$/.test(l.address)
+            || !Array.isArray(l.topics) || !/^0x([0-9a-f]{2})*$/.test(l.data))) throw new Error('fact_identity');
         return view;
       });
       const accumulator=createMetricAccumulator();
@@ -113,7 +129,7 @@ export function reduceDurableHour({rows,transactions=[],receipts=[],start,signal
             from:t.from_address,to:t.to_address}))),
           receipts:chunk.flatMap((v) => v.receipts.map((r) => ({blockNumber:position(r.block_number),transactionIndex:position(r.transaction_index),hash:r.transaction_hash,
             status:r.status,gasUsedRaw:r.gas_used_raw,effectiveGasPriceRaw:r.effective_gas_price_raw,contractAddress:r.contract_address}))),
-          transferLogs:[],verifiedAssetObservations:[],
+          transferLogs:chunk.flatMap((v) => v.logs.map(logModel)),verifiedAssetObservations:[],
         });
       }
       const existing=accumulator.finalize({coreCoverage:{metricSnapshotCoverageComplete:true},legacyUsdcCoverage:{status:'unavailable'}})
@@ -122,10 +138,17 @@ export function reduceDurableHour({rows,transactions=[],receipts=[],start,signal
       // Missing DB protocol/metadata verification must never become the accumulator's empty event counts.
       records=existing.records.filter((r) => r.protocol==='arc.network');
       const txs=views.filter((v) => v.block.window_role==='inside').flatMap((v) => v.transactions);
+      const insideLogs=views.filter((v) => v.block.window_role==='inside').flatMap((v) => v.logs.map(logModel));
+      const canonicalUsdc=summarizeUsdcTransfers(insideLogs,{complete:true});
       mergeState={uniqueTopLevelSenders:[...new Set(txs.map((t) => t.from_address))].sort(),
         uniqueTopLevelRecipients:[...new Set(txs.map((t) => t.to_address).filter(Boolean))].sort(),
         semantics:'Union address sets across hours; never sum hourly unique counts.'};
       coverage.factSetsComplete=true;
+      coverage.canonicalUsdcCountsComplete=canonicalUsdc.complete;
+      coverage.canonicalUsdcRawAmountAvailable=false;
+      coverage.canonicalUsdcRawAmountReason='raw_amount_not_exposed_in_product_timeseries';
+      records={network:records,assets:{canonicalUsdc:{status:canonicalUsdc.complete ? 'available' : 'unavailable',complete:canonicalUsdc.complete,
+        transferCount:canonicalUsdc.transferCount,mintCount:canonicalUsdc.mintCount,burnCount:canonicalUsdc.burnCount}}};
     } catch (error) {
       if (signal?.aborted) throw error;
       coverage.warnings.push('durable_fact_sets_incomplete_or_bounded_limit');
@@ -134,7 +157,9 @@ export function reduceDurableHour({rows,transactions=[],receipts=[],start,signal
   const complete=inspected.manifestComplete && coverage.factSetsComplete;
   const retained=inside.slice(0,MAX_HOURLY_BLOCKS),first=retained[0],last=retained.at(-1);
   // For gaps/partial boundaries even an empty observed transaction set is unavailable, never activity=0.
-  const metrics={network:{status:complete ? 'available' : 'unavailable',records,mergeState},protocols:protocolCoverage()};
+  const networkRecords=Array.isArray(records) ? records : records?.network ?? null;
+  const assets=records?.assets ?? {canonicalUsdc:{status:'unavailable',complete:false,transferCount:null,mintCount:null,burnCount:null}};
+  const metrics={network:{status:complete ? 'available' : 'unavailable',records:networkRecords,mergeState},assets,protocols:protocolCoverage()};
   const result={chainId:ARC_CHAIN_ID,period:'hour',bucketStart:hourStart(start),bucketEnd:hourStart(start)+HOUR_SECONDS,
     startBlock:first ? position(first.block_number) : null,endBlock:last ? position(last.block_number) : null,
     startHash:first?.block_hash ?? null,endHash:last?.block_hash ?? null,blockCount:retained.length,

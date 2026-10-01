@@ -445,4 +445,53 @@ await test('status and logs expose only bounded codes, never arbitrary stored er
   try { assert.equal((await httpCall(server, '/v1/intelligence/status')).body.lastError, null); }
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
+await test('runtime endpoint is exact, read only and separate from A1 status', async () => {
+  const runtimePayload = {
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    runtimeMode: 'a2_shadow',
+    chain: { observedHead: 100, processedThrough: 90 },
+    receipts: { processedThrough: 88 },
+    lags: { headToChain: 10, chainToReceipts: 2 },
+    work: { outstanding: 7, pending: 4, retrying: 2, leased: 1 },
+  };
+  const calls = [];
+  const repository = {
+    async health() {},
+    async getA2RuntimeStatus(mode) { calls.push(mode); return { ...runtimePayload, runtimeMode: mode }; },
+    async getState() { throw new Error('A1 status must not be used for runtime'); },
+    async getLatest() { throw new Error('latest must not be used for runtime'); },
+  };
+  const server = createHttpServer({ repository, runtimeMode: 'a2_shadow' });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const ok = await httpCall(server, '/v1/intelligence/runtime');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.runtimeMode, 'a2_shadow');
+    assert.equal(ok.body.lags.headToChain, 10);
+    assert.deepEqual(calls, ['a2_shadow']);
+    assert.equal((await httpCall(server, '/v1/intelligence/runtime?path=/v1/intelligence/latest')).status, 404);
+    const blocked = await httpCall(server, '/v1/intelligence/runtime', 'POST');
+    assert.equal(blocked.status, 405);
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+await test('timeseries endpoint allows only fixed windows and stays separate from latest snapshot', async () => {
+  const repository = {
+    async health() {},
+    async getTimeseries(window) { return { window, coverage: { expectedHours: window === '24h' ? 24 : 6 }, buckets: [] }; },
+    async getState() { throw new Error('status must not be used for timeseries'); },
+    async getLatest() { throw new Error('latest must not be used for timeseries'); },
+  };
+  const server = createHttpServer({ repository });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const ok = await httpCall(server, '/v1/intelligence/timeseries?window=24h');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.window, '24h');
+    assert.equal(ok.body.coverage.expectedHours, 24);
+    assert.equal((await httpCall(server, '/v1/intelligence/timeseries?window=7d')).status, 400);
+    assert.equal((await httpCall(server, '/v1/intelligence/timeseries?window=24h&path=/health')).status, 400);
+    assert.equal((await httpCall(server, '/v1/intelligence/timeseries?window=24h', 'POST')).status, 405);
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
 console.log(`INTELLIGENCE_SERVER_VERIFIER: PASS (${tests.length} deterministic scenarios; no live DB/RPC)`);

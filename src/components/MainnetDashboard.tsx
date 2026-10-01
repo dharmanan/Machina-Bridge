@@ -25,6 +25,7 @@ import {
 } from '../lib/mainnetSolanaReclaim'
 import { deriveSolanaUsdcAta } from '../lib/solana'
 import { Card, Container } from './ui'
+import ArcIntelligenceOverview from './ArcIntelligenceOverview'
 
 const ERC20_BALANCE_ABI = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
@@ -371,31 +372,29 @@ export default function MainnetDashboard() {
       .slice(0, 30)
   }, [transfers, solanaActivity])
 
-  if (!isConnected) {
-    return (
-      <Container className="py-12">
-        <Card className="text-center">
-          <Wallet size={44} className="mx-auto mb-4 text-slate-400" />
-          <h2 className="text-xl font-semibold">Connect your EVM wallet</h2>
-          <p className="mt-2 text-sm text-slate-500">
-            Connect the wallet used on Arc to view mainnet balances and bridge activity.
-          </p>
-        </Card>
-      </Container>
-    )
-  }
-
   return (
     <Container className="py-10">
       <div className="space-y-6">
         <div>
           <h2 className="text-3xl font-bold tracking-tight">Mainnet Dashboard</h2>
           <p className="mt-2 text-sm text-slate-500">
-            Wallets, USDC balances, completed routes, recent activity, and Solana deposit tracking.
+            Arc Intelligence, wallets, USDC balances, completed routes, recent activity, and Solana deposit tracking.
           </p>
         </div>
 
-        <Card>
+        <ArcIntelligenceOverview />
+
+        {!isConnected ? (
+          <Card className="text-center">
+            <Wallet size={44} className="mx-auto mb-4 text-slate-400" />
+            <h2 className="text-xl font-semibold">Connect your EVM wallet</h2>
+            <p className="mt-2 text-sm text-slate-500">
+              Connect the wallet used on Arc to view mainnet balances and bridge activity.
+            </p>
+          </Card>
+        ) : (
+          <>
+            <Card>
           <h3 className="text-lg font-semibold">Wallet Connections</h3>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <div className="rounded-xl border border-slate-200 bg-[#f8faf7] p-4">
@@ -672,7 +671,9 @@ export default function MainnetDashboard() {
               ))}
             </div>
           )}
-        </Card>
+            </Card>
+          </>
+        )}
       </div>
     </Container>
   )
