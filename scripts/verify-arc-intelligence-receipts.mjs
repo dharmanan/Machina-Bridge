@@ -37,6 +37,16 @@ function worker(ctx,handler,budget=createRpcBudget(),options={}) {
   }});
   return {calls,instance:createReceiptWorker({repository:ctx.repository,rpc,...options})};
 }
+function observedWorker(ctx,handler,options={}) {
+  const events=[],saves=[];
+  const getBlock=ctx.repository.getBlock.bind(ctx.repository),saveReceipts=ctx.repository.saveReceipts.bind(ctx.repository);
+  ctx.repository.getBlock=async (...args) => {events.push('getBlock');return getBlock(...args);};
+  ctx.repository.saveReceipts=async (lease,raw,options) => {
+    events.push('saveReceipts');saves.push({raw,options});return saveReceipts(lease,raw,options);
+  };
+  const w=worker(ctx,(method,...args) => {events.push(method);return handler(method,...args);},createRpcBudget(),options);
+  return {...w,events,saves};
+}
 async function readyLogs(size=10) {
   const ctx=await setup(Array.from({length:size},(_,i) => block(100+i)));
   for (let n=100;n<100+size;n++) {
@@ -113,6 +123,115 @@ await test('bulk exact receipt success needs no individual calls; exact statuses
   assert.equal(ctx.pool.store.receipts.get(transaction(100).hash).gas_used_raw,'9007199254740993');
   const b=ctx.pool.store.blocks.get(100);assert.equal(b.receipt_count,2);assert(b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete);
   assert.equal(b.core_complete,false);assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);
+});
+for (const [name,bulk] of [
+  ['canonical order',[receipt(100),receipt(100,1)]],
+  ['reversed order',[receipt(100,1),receipt(100)]],
+]) await test(`complete bulk fast path: ${name}, one final save, no reload or individual RPC`,async () => {
+  const ctx=await setup([block(100,2)]);const w=observedWorker(ctx,(method) => {
+    assert.equal(method,'eth_getBlockReceipts');return bulk;
+  });await ctx.repository.scheduleBlock(100);
+  const result=await w.instance.runOnce();assert.equal(result.status,'complete');assert.equal(result.complete,true);
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts']);assert.equal(w.saves.length,1);
+  assert.deepEqual(w.saves[0].options,{retryMs:1000,finalize:true,enqueueFollowups:true});
+  assert.equal(w.saves[0].raw.length,2);assert.equal(ctx.pool.store.receipts.size,2);
+  assert.equal(ctx.pool.store.blocks.get(100).receipt_complete,true);
+  assert.equal([...ctx.pool.store.work.values()].find((j) => j.component==='receipts').state,'complete');
+  assert.equal(w.calls.filter((c) => c.method==='eth_getTransactionReceipt').length,0);
+});
+await test('identical duplicate bulk bypasses fast path, safely completes deduped evidence without fabricated conflict',async () => {
+  const ctx=await setup([block(100,2)]);const w=observedWorker(ctx,(method) => {
+    assert.equal(method,'eth_getBlockReceipts');return [receipt(100),receipt(100,1),receipt(100)];
+  });await ctx.repository.scheduleBlock(100);
+  const result=await w.instance.runOnce();assert.equal(result.status,'complete');assert.equal(result.complete,true);
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts','getBlock','saveReceipts']);
+  assert.equal(w.saves.length,2);assert.equal(w.saves[0].options.finalize,false);
+  assert.deepEqual(w.saves[0].raw,[receipt(100),receipt(100,1)]);assert.deepEqual(w.saves[1].raw,[]);
+  assert.equal(w.saves[1].options.finalize ?? true,true);assert.equal(w.calls.length,1);
+  const b=ctx.pool.store.blocks.get(100);assert.equal(b.receipt_complete,true);assert.equal(b.receipt_evidence_conflict,false);
+  assert.equal(ctx.pool.store.receipts.size,2);assert.equal(ctx.pool.store.logs.size,2);
+  assert.equal([...ctx.pool.store.work.values()].find((j) => j.component==='receipts').state,'complete');
+  assert.notEqual((await ctx.repository.getLane()).status,'persistent_partial');
+});
+for (const enqueueFollowups of [true,false]) await test(`empty bulk fast path certifies once; enqueueFollowups=${enqueueFollowups}`,async () => {
+  const ctx=await setup([block(100,0)]);const w=observedWorker(ctx,(method) => {
+    assert.equal(method,'eth_getBlockReceipts');return [];
+  });await ctx.repository.scheduleBlock(100);
+  assert.equal((await w.instance.runOnce({enqueueFollowups})).status,'complete');
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts']);assert.equal(w.saves.length,1);
+  assert.deepEqual(w.saves[0],{raw:[],options:{retryMs:1000,finalize:true,enqueueFollowups}});
+  const b=ctx.pool.store.blocks.get(100);assert.equal(b.receipt_count,0);assert.equal(b.receipt_complete,true);
+  assert.equal(ctx.pool.store.work.size,enqueueFollowups ? 3 : 1);
+  assert.equal([...ctx.pool.store.work.values()][0].state,'complete');
+});
+await test('complete nonempty bulk fast path preserves drain mode zero followups',async () => {
+  const ctx=await setup();const w=observedWorker(ctx,fullHandler(100));await ctx.repository.scheduleBlock(100);
+  assert.equal((await w.instance.runOnce({enqueueFollowups:false})).status,'complete');
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts']);
+  assert.deepEqual(w.saves[0].options,{retryMs:1000,finalize:true,enqueueFollowups:false});
+  assert.equal(ctx.pool.store.work.size,1);assert.equal(ctx.pool.store.receipts.size,1);
+  assert.equal([...ctx.pool.store.work.values()][0].state,'complete');
+});
+await test('complete bulk repository complete:false returns retrying without a same-call second attempt',async () => {
+  const ctx=await setup();const w=observedWorker(ctx,fullHandler(100));let saves=0;
+  ctx.repository.saveReceipts=async (lease,raw,options) => {
+    saves++;w.events.push('saveReceipts');assert.equal(raw.length,1);
+    assert.deepEqual(options,{retryMs:1000,finalize:true,enqueueFollowups:true});
+    return {complete:false,receiptCount:0,missingCount:1};
+  };
+  await ctx.repository.scheduleBlock(100);const result=await w.instance.runOnce();
+  assert.equal(result.status,'retrying');assert.equal(result.complete,false);assert.equal(result.missingCount,1);
+  assert.equal(saves,1);assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts']);
+  assert.equal(w.calls.length,1);assert.equal(ctx.pool.store.receipts.size,0);
+});
+await test('partial bulk persists valid evidence before bounded missing-only recovery and two saves',async () => {
+  const ctx=await setup([block(100,3)]);const w=observedWorker(ctx,(method,params) => {
+    if (method==='eth_getBlockReceipts') return [receipt(100)];
+    assert.equal(method,'eth_getTransactionReceipt');assert.equal(params[0],transaction(100,1).hash);
+    assert.equal(ctx.pool.store.receipts.size,1,'Bulk evidence must be durable before individual recovery');
+    return receipt(100,1);
+  },{maxReceiptReads:1});await ctx.repository.scheduleBlock(100);
+  assert.equal((await w.instance.runOnce()).status,'retrying');
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts','getBlock','eth_getTransactionReceipt','saveReceipts']);
+  assert.equal(w.saves.length,2);assert.equal(w.saves[0].options.finalize,false);
+  assert.equal(w.saves[1].options.finalize ?? true,true);assert.equal(w.saves[1].raw.length,1);
+  assert.equal(ctx.pool.store.receipts.size,2);assert.equal(ctx.pool.store.blocks.get(100).receipt_complete,false);
+});
+for (const [name,bulk] of [
+  ['missing canonical hash despite matching raw count',[receipt(100),receipt(100)]],
+  ['wrong transaction hash',[receipt(100),{...receipt(100,1),transactionHash:hash(999)}]],
+  ['conflicting receipt payload',[receipt(100),receipt(100,1),{...receipt(100),gasUsed:'0x1'}]],
+  ['conflicting log ownership',[receipt(100),receipt(100,1,[log(100,1,0)])]],
+]) await test(`${name} prevents complete bulk fast path and recovers only missing hashes`,async () => {
+  const ctx=await setup([block(100,2)]);const w=observedWorker(ctx,(method,params) => {
+    if (method==='eth_getBlockReceipts') return bulk;
+    assert.equal(method,'eth_getTransactionReceipt');
+    return receipt(100,params[0]===transaction(100).hash ? 0 : 1);
+  });await ctx.repository.scheduleBlock(100);
+  assert.equal((await w.instance.runOnce()).status,'complete');assert.equal(w.events.filter((e) => e==='getBlock').length,2);
+  assert(w.calls.some((c) => c.method==='eth_getTransactionReceipt'));
+  if (w.saves.length===2) assert.equal(w.saves[0].options.finalize,false);
+  assert.equal(ctx.pool.store.receipts.size,2);assert.equal(ctx.pool.store.blocks.get(100).receipt_evidence_conflict,false);
+});
+for (const [name,invalid] of [
+  ['malformed',null],['unknown status',{...receipt(100),status:'unknown'}],
+  ['wrong block',receipt(101)],['wrong transaction position',{...receipt(100),transactionIndex:'0x1'}],
+  ['wrong log ownership',receipt(100,0,[{...log(100),transactionHash:transaction(100,1).hash}])],
+]) await test(`extra ${name} receipt prevents fast path even with a complete valid subset`,async () => {
+  const ctx=await setup([block(100,2)]);const w=observedWorker(ctx,(method) => {
+    assert.equal(method,'eth_getBlockReceipts');return [receipt(100),receipt(100,1),invalid];
+  });await ctx.repository.scheduleBlock(100);assert.equal((await w.instance.runOnce()).status,'complete');
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','saveReceipts','getBlock','saveReceipts']);
+  assert.equal(w.saves.length,2);assert.equal(w.saves[0].options.finalize,false);
+  assert.equal(ctx.pool.store.receipts.size,2);assert.equal(w.calls.length,1);
+});
+for (const failure of ['throw','nonarray']) await test(`empty block ${failure} bulk result is not a successful empty fast path`,async () => {
+  const ctx=await setup([block(100,0)]);const w=observedWorker(ctx,(method) => {
+    assert.equal(method,'eth_getBlockReceipts');if (failure==='throw') throw new Error('transient');return null;
+  });await ctx.repository.scheduleBlock(100);assert.equal((await w.instance.runOnce()).status,'complete');
+  assert.deepEqual(w.events,['getBlock','eth_getBlockReceipts','getBlock','saveReceipts']);
+  assert.equal(w.saves.length,1);assert.equal(w.saves[0].options.finalize,undefined);
+  assert.equal(ctx.pool.store.blocks.get(100).receipt_count,0);
 });
 await test('bulk failure and partial individual successes persist; retry reads only missing hashes and clears error',async () => {
   const ctx=await setup([block(100,3)]);let fail=true;

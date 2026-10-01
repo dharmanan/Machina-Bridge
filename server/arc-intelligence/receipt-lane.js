@@ -102,18 +102,20 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
         const blockTag=`0x${position(view.block.block_number).toString(16)}`;
         if (lease.component === 'receipts') {
           if (await repository.markBulkAttempted(lease)) {
-            let bulk=[];
+            let bulk=[],bulkValid=false;
             try {
               const result=await rpc.request('eth_getBlockReceipts',[blockTag],{signal});
-              if (Array.isArray(result) && result.length <= MAX_ALL_LOGS) bulk=result;
+              if (Array.isArray(result) && result.length <= MAX_ALL_LOGS) {bulk=result;bulkValid=true;}
             } catch { if (signal?.aborted) throw new Error('operation_aborted'); }
             const seen=new Map();
+            const duplicateHashes=new Set();
             const conflicts=new Set();
             const logOwners=new Map();
             for (const raw of bulk) {
               let normalized;
-              try { normalized=validateReceipt(raw,view); } catch { continue; }
+              try { normalized=validateReceipt(raw,view); } catch { bulkValid=false;continue; }
               const payload=JSON.stringify(normalized);
+              if (seen.has(normalized.hash)) duplicateHashes.add(normalized.hash);
               if (seen.has(normalized.hash) && seen.get(normalized.hash).payload !== payload) conflicts.add(normalized.hash);
               for (const log of normalized.logs) {
                 const owner=logOwners.get(log.logIndex);
@@ -125,6 +127,12 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
             // Conflicting rows in one untrusted response have no canonical winner: recover those hashes individually.
             const valid=[...seen.entries()].filter(([hash]) => !conflicts.has(hash)).map(([,entry]) => entry.raw);
             if (signal?.aborted) throw new Error('operation_aborted');
+            const canonicalHashes=new Set(view.transactions.map((t) => t.transaction_hash));
+            if (bulkValid && duplicateHashes.size === 0 && conflicts.size === 0 && valid.length === view.transactions.length
+              && seen.size === canonicalHashes.size && [...seen.keys()].every((hash) => canonicalHashes.has(hash))) {
+              const result=await repository.saveReceipts(lease,valid,{retryMs,finalize:true,enqueueFollowups});
+              return {status:result.complete ? 'complete' : 'retrying',component:lease.component,...result};
+            }
             if (valid.length) await repository.saveReceipts(lease,valid,{retryMs,finalize:false,enqueueFollowups});
             view=await repository.getBlock(position(lease.start_block));
           }
