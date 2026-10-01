@@ -42,6 +42,7 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
   const values = identityValues(identity);
   if (identity.lane !== 'receipts_logs' || identity.scopeId !== 'canonical_receipts_logs') throw new Error('invalid_receipt_lane');
   const transaction = (work) => withTransaction(pool,work);
+  let laneInitialized = false;
   async function load(client, number, lock = false) {
     const block = (await client.query(`/* receipts:block */ SELECT * FROM arc_intelligence_blocks
       WHERE chain_id=$1 AND block_number=$2${lock ? ' FOR UPDATE' : ''}`,[ARC_CHAIN_ID,number])).rows[0];
@@ -202,6 +203,22 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
   async function persistReconciliation(client,lease,evidence,retryMs,deferFrontier=false) {
     const {job,view,state}=await guard(client,lease);
     if (!['all_logs','transfer_logs'].includes(job.component) || !receiptSetComplete(view)) throw new Error('work_identity_mismatch');
+    if (evidence?.derivedFrom !== undefined && !transferDerivationProven(view,evidence)) throw new Error('invalid_reconciliation_evidence');
+    const complete=await writeReconciliation(client,job,view,evidence,retryMs);
+    await writeLaneProgress(client,state,view,complete,deferFrontier);
+    return {complete};
+  }
+  // A Transfer certificate may be derived only from an exact all-log certificate for the same canonical block,
+  // re-read under this transaction's block lock. Completed all-log evidence matched every receipt log identity
+  // and payload (topics included), so its Transfer-topic subset is exactly the receipt Transfer subset.
+  function transferDerivationProven(view,evidence,allCompleteInTransaction=false) {
+    if (!['all_logs_query','all_logs_certificate'].includes(evidence.derivedFrom)) return false;
+    if (evidence.derivedFrom === 'all_logs_query' && allCompleteInTransaction) return true;
+    const all=view.reconciliation.find((r) => r.kind === 'all_logs');
+    return all?.complete === true && all.block_hash === view.block.block_hash && all.query_complete === true
+      && position(all.receipt_log_count) === view.logs.length && position(all.queried_log_count) === view.logs.length;
+  }
+  async function writeReconciliation(client,job,view,evidence,retryMs) {
     const old=view.reconciliation.find((r) => r.kind === job.component);
     // A completed certificate is immutable across retries; never overwrite it with a failed query.
     let complete=old?.complete === true;
@@ -237,6 +254,9 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       await coverage(client,view,job.component,complete,evidence);
     }
     await finish(client,job,complete,retryMs);
+    return complete;
+  }
+  async function writeLaneProgress(client,state,view,complete,deferFrontier) {
     const number=position(view.block.block_number);
     if (deferFrontier) {
       // Persist the processed ceiling with each certificate: a crash before the batch sweep loses no progress.
@@ -247,6 +267,56 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       await writeProgress(client,processed,state.contiguous_complete_through,state.checkpoint_hash,status);
     } else await progress(client,state,number);
     return {complete};
+  }
+  // One canonical block and at most one job per log component, in one short transaction. The all-log certificate
+  // is written first, so a same-response Transfer derivation commits only together with the certificate it relies on.
+  async function persistLogPair(client,record,deferFrontier) {
+    if (!record.companion) return persistReconciliation(client,record.lease,record.evidence,record.retryMs ?? 1000,deferFrontier);
+    const all=record.lease.component === 'all_logs' ? record : record.companion;
+    const transfer=all === record ? record.companion : record;
+    if (all.lease.component !== 'all_logs' || transfer.lease.component !== 'transfer_logs'
+      || all.evidence?.derivedFrom !== undefined) throw new Error('invalid_log_batch');
+    const {job,view,state}=await guard(client,all.lease);
+    if (job.component !== 'all_logs' || !receiptSetComplete(view)) throw new Error('work_identity_mismatch');
+    const allComplete=await writeReconciliation(client,job,view,all.evidence,all.retryMs ?? 1000);
+    // The companion keeps its own fenced lease. Losing it never rolls back the all-log certificate.
+    let transferResult;
+    try {
+      const companion=await requireWorkLease(client,transfer.lease);
+      if (values.some((v,i) => v !== [companion.chain_id,companion.lane,companion.scope_id,companion.epoch,companion.definition_version][i])
+        || companion.component !== 'transfer_logs' || position(companion.start_block) !== position(view.block.block_number)
+        || position(companion.end_block) !== position(view.block.block_number) || companion.block_hash !== view.block.block_hash) throw new Error('work_identity_mismatch');
+      if (transfer.evidence?.derivedFrom !== undefined && !transferDerivationProven(view,transfer.evidence,allComplete)) {
+        // No proof, no certificate: return the job to durable retry, where the independent Transfer query remains available.
+        await finish(client,companion,false,transfer.retryMs ?? 1000);
+        transferResult={complete:false,released:true};
+      } else transferResult={complete:await writeReconciliation(client,companion,view,transfer.evidence,transfer.retryMs ?? 1000)};
+    } catch (error) {
+      if (error.message !== 'stale_lease') throw error;
+      transferResult={complete:false,stale:true};
+    }
+    await writeLaneProgress(client,state,view,allComplete && transferResult.complete,deferFrontier);
+    const allResult={complete:allComplete};
+    return record.lease.component === 'all_logs' ? {...allResult,companion:transferResult} : {...transferResult,companion:allResult};
+  }
+  async function claimSpan(client,first,maxBlocks,leaseMs) {
+    if (values.some((v,i) => v !== [first.chain_id,first.lane,first.scope_id,first.epoch,first.definition_version][i])
+      || !['all_logs','transfer_logs'].includes(first.component)
+      || position(first.start_block) !== position(first.end_block)) throw new Error('work_identity_mismatch');
+    const start=position(first.start_block);
+    const end=start+Math.min(maxBlocks-1,Number.MAX_SAFE_INTEGER-start);
+    // The existing single claim selects priority/fallback. Extend only that component and bounded numeric span.
+    const jobs=maxBlocks===1 ? [] : (await client.query(`/* receipts:claim_logs */ WITH candidates AS (
+      SELECT id FROM arc_intelligence_work WHERE ${where} AND component=$8
+        AND start_block BETWEEN $9 AND $10 AND end_block=start_block AND not_before <= now()
+        AND (state IN ('pending','retrying') OR (state='leased' AND lease_until <= now()))
+      ORDER BY start_block,not_before,id LIMIT $11 FOR UPDATE SKIP LOCKED
+    ) UPDATE arc_intelligence_work w SET state='leased',attempts=w.attempts+1,
+      fencing_token=w.fencing_token+1,lease_owner=$6,lease_until=now()+$7*interval '1 millisecond',updated_at=now()
+      FROM candidates c WHERE w.id=c.id RETURNING w.*`,
+    [...values,first.lease_owner,leaseMs,first.component,start,end,maxBlocks-1])).rows;
+    return [first,...jobs].sort((a,b) => position(a.start_block)-position(b.start_block)
+      || (BigInt(a.id)<BigInt(b.id) ? -1 : 1));
   }
   return {
     identity,
@@ -282,9 +352,13 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
             AND w.end_block=arc_intelligence_blocks.block_number)))
         ORDER BY block_number LIMIT $4`,[ARC_CHAIN_ID,Math.max(0,end-tailSize+1),end,tailSize,...values])).rows.map((b) => position(b.block_number));
     },
-    async scheduleBlock(number) {
-      await this.initialize();
-      return commitAndAdvance(async (client) => {
+    // Scheduling only adds work for an incomplete block, so it can never complete evidence itself. Runtime callers
+    // whose workers always run the shared frontier sweep after completions may skip this redundant sweep.
+    async scheduleBlock(number,{advanceFrontier:sweep=true}={}) {
+      // The lane row is insert-only; after one successful idempotent initialization it never needs re-locking.
+      if (!laneInitialized) {await this.initialize();laneInitialized=true;}
+      const schedule=sweep ? commitAndAdvance : transaction;
+      return schedule(async (client) => {
         const view=await load(client,position(number),true);
         if (view.block.receipt_evidence_conflict) throw new Error('receipt_evidence_conflict');
         const jobs=[];
@@ -304,25 +378,28 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
     async claimLogBatch(firstLease,maxBlocks=10,leaseMs=180000) {
       if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE
         || !Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 300000) throw new Error('invalid_log_batch');
+      return transaction(async (client) => claimSpan(client,await requireWorkLease(client,firstLease),maxBlocks,leaseMs));
+    },
+    // The same bounded span claim, plus the other log component's ready jobs for exactly the claimed canonical
+    // blocks (logical_key is the block hash). Each companion keeps its own lease, attempt and fencing token.
+    async claimLogSpan(firstLease,maxBlocks=10,leaseMs=180000) {
+      if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE
+        || !Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 300000) throw new Error('invalid_log_batch');
       return transaction(async (client) => {
         const first=await requireWorkLease(client,firstLease);
-        if (values.some((v,i) => v !== [first.chain_id,first.lane,first.scope_id,first.epoch,first.definition_version][i])
-          || !['all_logs','transfer_logs'].includes(first.component)
-          || position(first.start_block) !== position(first.end_block)) throw new Error('work_identity_mismatch');
-        const start=position(first.start_block);
-        const end=start+Math.min(maxBlocks-1,Number.MAX_SAFE_INTEGER-start);
-        // The existing single claim selects priority/fallback. Extend only that component and bounded numeric span.
-        const jobs=maxBlocks===1 ? [] : (await client.query(`/* receipts:claim_logs */ WITH candidates AS (
-          SELECT id FROM arc_intelligence_work WHERE ${where} AND component=$8
-            AND start_block BETWEEN $9 AND $10 AND end_block=start_block AND not_before <= now()
+        const leases=await claimSpan(client,first,maxBlocks,leaseMs);
+        const other=first.component === 'all_logs' ? 'transfer_logs' : 'all_logs';
+        const companions=(await client.query(`/* receipts:claim_companions */ WITH candidates AS (
+          SELECT id FROM arc_intelligence_work WHERE ${where} AND component=$8 AND logical_key=ANY($9::text[])
+            AND end_block=start_block AND not_before <= now()
             AND (state IN ('pending','retrying') OR (state='leased' AND lease_until <= now()))
-          ORDER BY start_block,not_before,id LIMIT $11 FOR UPDATE SKIP LOCKED
+          ORDER BY start_block,not_before,id LIMIT $10 FOR UPDATE SKIP LOCKED
         ) UPDATE arc_intelligence_work w SET state='leased',attempts=w.attempts+1,
           fencing_token=w.fencing_token+1,lease_owner=$6,lease_until=now()+$7*interval '1 millisecond',updated_at=now()
           FROM candidates c WHERE w.id=c.id RETURNING w.*`,
-        [...values,first.lease_owner,leaseMs,first.component,start,end,maxBlocks-1])).rows;
-        return [first,...jobs].sort((a,b) => position(a.start_block)-position(b.start_block)
-          || (BigInt(a.id)<BigInt(b.id) ? -1 : 1));
+        [...values,first.lease_owner,leaseMs,other,leases.map((lease) => lease.block_hash),leases.length])).rows
+          .sort((a,b) => position(a.start_block)-position(b.start_block));
+        return {leases,companions};
       });
     },
     async deferredFollowupBlocks(startBlock=0,limit=MAX_WINDOW_SIZE) {
@@ -412,14 +489,16 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         || !Array.isArray(records) || !records.length || records.length > maxBlocks
         || (onError !== undefined && typeof onError !== 'function')) throw new Error('invalid_log_batch');
       const numbers=records.map((r) => position(r.lease.start_block));
-      if (Math.max(...numbers)-Math.min(...numbers) >= maxBlocks
-        || new Set(records.map((r) => r.lease.id)).size !== records.length) throw new Error('invalid_log_batch');
+      const ids=records.flatMap((r) => [r.lease.id,...(r.companion ? [r.companion.lease.id] : [])]);
+      if (Math.max(...numbers)-Math.min(...numbers) >= maxBlocks || new Set(ids).size !== ids.length
+        || records.some((r) => r.companion && (position(r.companion.lease.start_block) !== position(r.lease.start_block)
+          || r.companion.lease.component === r.lease.component))) throw new Error('invalid_log_batch');
       const results=[];
       for (const record of records) {
         try {
           if (signal?.aborted) throw new Error('operation_aborted');
-          // Separate short transactions retain per-job rollback/fencing; no RPC or error callback runs inside.
-          const value=await transaction((client) => persistReconciliation(client,record.lease,record.evidence,record.retryMs ?? 1000,true));
+          // Separate short transactions retain per-block rollback/fencing; no RPC or error callback runs inside.
+          const value=await transaction((client) => persistLogPair(client,record,true));
           results.push({value});
         } catch (error) {
           results.push({error});

@@ -15,6 +15,9 @@ const WORK_PREFERENCES = Object.freeze([
 const BURST_STOPS = new Set(['idle','retrying','aborted','continuity_error','persistent_partial','stale_lease']);
 const REDUCER_HOURS_PER_ITERATION = 2;
 const REDUCER_DELAY_MS = 10000;
+// While the work queue is draining, historical reduction yields the database to the catch-up path,
+// but never for longer than this: durable hourly reduction always keeps making bounded progress.
+export const REDUCER_MAX_DEFER_MS = 5 * 60000;
 
 // Preference is carried across bursts, including a configured burst of one.
 // Each worker call consumes one position, regardless of the number of jobs in a log batch.
@@ -75,6 +78,7 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   let chainActive = false;
   let workActive = false;
   let reducerActive = false;
+  let reducerRanAt = null;
   let runActive = false;
   let nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
   function refreshPressure(allowResume=false) {
@@ -138,7 +142,8 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
           for (const number of recent) {
             if (signal?.aborted) return {status:'aborted'};
             if (await refreshPressure()) break;
-            await receipts.scheduleBlock(number);
+            // Scheduling cannot complete evidence; every completion is followed by the burst's shared frontier sweep.
+            await receipts.scheduleBlock(number,{advanceFrontier:false});
             scheduledBlocks.push(number);
           }
         }
@@ -182,7 +187,11 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
   async function reducerStep({signal} = {}) {
     if (reducerActive) return {skipped:true};
     if (signal?.aborted) return {status:'aborted'};
+    if (draining && reducerRanAt !== null && now()-reducerRanAt < REDUCER_MAX_DEFER_MS) {
+      return {status:'deferred',processed:0,complete:0,skipped:0,continueImmediately:false};
+    }
     reducerActive = true;
+    reducerRanAt = now();
     try {
       const result = await metrics.reduceCandidateHours({limit:REDUCER_HOURS_PER_ITERATION,signal});
       return {status:result.processed > 0 ? 'reduced' : 'idle',...result,

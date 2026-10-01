@@ -135,15 +135,22 @@ export function createMetricRepository(pool,{now=Date.now}={}) {
       const client=await pool.connect();
       let candidates;
       try {
-        candidates=(await client.query(`/* metrics:candidates */ WITH hours AS (
-          SELECT (floor(timestamp / 3600)::bigint * 3600) AS bucket_start
-          FROM arc_intelligence_blocks
-          WHERE chain_id=$1 AND timestamp < $5
-          GROUP BY 1
+        // Hours with at least one block, derived from two time-index endpoints plus one index probe per hour.
+        // A2.7: the previous GROUP BY scanned every durable block on each ~10s iteration, growing with history.
+        candidates=(await client.query(`/* metrics:candidates */ WITH bounds AS (
+          SELECT (SELECT timestamp FROM arc_intelligence_blocks WHERE chain_id=$1 AND timestamp < $5
+              ORDER BY timestamp,block_number LIMIT 1) AS first_timestamp,
+            (SELECT timestamp FROM arc_intelligence_blocks WHERE chain_id=$1 AND timestamp < $5
+              ORDER BY timestamp DESC,block_number DESC LIMIT 1) AS last_timestamp
+        ), hours AS (
+          SELECT generate_series(floor(first_timestamp / 3600)::bigint * 3600,floor(last_timestamp / 3600)::bigint * 3600,3600::bigint) AS bucket_start
+          FROM bounds WHERE first_timestamp IS NOT NULL
         ) SELECT h.bucket_start FROM hours h
           LEFT JOIN arc_intelligence_metric_buckets b ON b.chain_id=$1 AND b.period='hour'
             AND b.bucket_start=h.bucket_start AND b.definition_version=$2 AND b.reducer_version=$3
-          WHERE b.bucket_start IS NULL OR (NOT b.complete AND b.updated_at <= to_timestamp($6))
+          WHERE (b.bucket_start IS NULL OR (NOT b.complete AND b.updated_at <= to_timestamp($6)))
+            AND EXISTS (SELECT 1 FROM arc_intelligence_blocks x WHERE x.chain_id=$1
+              AND x.timestamp >= h.bucket_start AND x.timestamp < h.bucket_start+3600)
           ORDER BY (b.bucket_start IS NOT NULL),b.updated_at NULLS FIRST,h.bucket_start LIMIT $4`,
         [ARC_CHAIN_ID,METRIC_DEFINITION_VERSION,HOURLY_REDUCER_VERSION,limit,Math.floor(now()/(HOUR_SECONDS*1000))*HOUR_SECONDS,
           Math.floor(now()/1000)-INCOMPLETE_HOUR_RETRY_SECONDS])).rows

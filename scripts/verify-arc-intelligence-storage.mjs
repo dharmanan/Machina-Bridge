@@ -47,7 +47,9 @@ async function setup(size=3, receiptLogs=() => []) {
   const worker=createReceiptWorker({repository:receipts,rpc:createRpcBudget().wrap(rpc)});
   for (const n of numbers) {
     await receipts.scheduleBlock(n);
-    for (const preferredComponent of ['receipts','all_logs','transfer_logs']) assert.equal((await worker.runOnce({preferredComponent})).status,'complete');
+    // A2.7: the all-log batch also certifies the block's Transfer companion from the same exact response.
+    for (const preferredComponent of ['receipts','all_logs']) assert.equal((await worker.runOnce({preferredComponent})).status,'complete');
+    assert.equal(pool.store.blocks.get(n).transfer_log_reconciliation_complete,true);
   }
   assert([...pool.store.blocks.values()].every((b) => !b.core_complete));
   // Sparse historical islands are useful independently of an archive-wide frontier.

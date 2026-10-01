@@ -229,6 +229,18 @@ export function fixturePool() {
               lease_owner:values[5],lease_until:clock+values[6]});
             return rows(jobs);
           }
+          case 'receipts_claim_companions': {
+            assert(transactionOpen);assert(text.includes('FOR UPDATE SKIP LOCKED'));assert(text.includes('ORDER BY start_block,not_before,id LIMIT $10'));
+            assert(text.includes('logical_key=ANY($9::text[])'));
+            assert(['all_logs','transfer_logs'].includes(values[7]));assert(Array.isArray(values[8]));assert(values[9]>=1 && values[9]<=50);
+            const jobs=[...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version])===laneKey(values)
+              && w.component===values[7] && values[8].includes(w.logical_key) && w.end_block===w.start_block
+              && !w.locked && w.not_before<=clock && (['pending','retrying'].includes(w.state) || (w.state==='leased' && w.lease_until<=clock)))
+              .sort((a,b) => a.start_block-b.start_block || a.not_before-b.not_before || (BigInt(a.id)<BigInt(b.id) ? -1 : 1)).slice(0,values[9]);
+            for (const w of jobs) Object.assign(w,{state:'leased',attempts:w.attempts+1,fencing_token:(BigInt(w.fencing_token)+1n).toString(),
+              lease_owner:values[5],lease_until:clock+values[6]});
+            return rows(jobs);
+          }
           case 'lease_guard': {
             assert(transactionOpen); assert(text.endsWith('FOR UPDATE'));
             const work=store.work.get(String(values[0]));

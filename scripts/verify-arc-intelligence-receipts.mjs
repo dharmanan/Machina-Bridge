@@ -11,7 +11,7 @@ import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
 import { COMPLETE_WORK_RETAIN,COMPLETE_WORK_PRUNE_BATCH,pruneCompleteWork } from '../server/arc-intelligence/work-retention.js';
 import { createA2RpcClient } from '../server/arc-intelligence/a2-rpc.js';
 import { validateReceipt,normalizedLog } from '../server/arc-intelligence/receipt-facts.js';
-import { reconcileLogs } from '../api/_lib/arc-intelligence/reconciliation.js';
+import { reconcileLogs, reconcileTransferLogs } from '../api/_lib/arc-intelligence/reconciliation.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 import { TRANSFER_TOPIC } from '../api/_lib/arc-intelligence/usdc.js';
 import { MAX_ALL_LOGS,MAX_TRANSFER_LOGS } from '../api/_lib/arc-intelligence/core.js';
@@ -126,7 +126,11 @@ function legacyFollowupEnqueues(pool) {
     };return client;
   };
 }
-async function finish(ctx,instance,n) {await ctx.repository.scheduleBlock(n);for (let i=0;i<3;i++) assert.equal((await instance.runOnce()).status,'complete');}
+// A2.7: one log batch certifies the block's all-log job and, from the same response, its Transfer companion.
+async function finish(ctx,instance,n) {
+  await ctx.repository.scheduleBlock(n);for (let i=0;i<2;i++) assert.equal((await instance.runOnce()).status,'complete');
+  assert([...ctx.pool.store.work.values()].filter((j) => j.start_block===n).every((j) => j.state==='complete'));
+}
 
 await test('003 migration upgrades production-like 001/002 ledger once; immutable hashes and A1 retained',async () => {
   assert.deepEqual(MIGRATIONS,['001_init','002_a2_foundation','003_a2_receipts','004_a2_metric_buckets']);
@@ -309,7 +313,9 @@ await test('bulk failure and partial individual successes persist; retry reads o
   fail=false;ctx.pool.advance(1000);const start=w.calls.length;assert.equal((await w.instance.runOnce()).status,'complete');
   assert.deepEqual(w.calls.slice(start).map((c) => [c.method,c.params[0]]),[['eth_getTransactionReceipt',transaction(100,1).hash]]);
   assert.equal(w.calls.filter((c) => c.method === 'eth_getBlockReceipts').length,1);
-  assert.equal((await w.instance.runOnce()).status,'complete');assert.equal((await w.instance.runOnce()).status,'complete');
+  // A2.7: one log batch certifies all_logs and derives the companion Transfer certificate from the same response.
+  const logs=await w.instance.runOnce();assert.equal(logs.status,'complete');assert.equal(logs.completedCompanionJobs,1);
+  assert.equal((await w.instance.runOnce()).status,'idle');
   const lane=await ctx.repository.getLane();assert.equal(lane.current_error_code,null);assert.equal(lane.status,'caught_up');
   assert([...ctx.pool.store.work.values()].every((j) => j.state === 'complete'));
 });
@@ -480,7 +486,14 @@ for (const [name,modify,field] of [
 ]) await test(`${name} log query cannot certify all or Transfer reconciliation`,async () => {
   const ctx=await setup();const w=worker(ctx,(method) => method === 'eth_getBlockReceipts' ? [receipt(100)] : modify([log(100)]));
   await ctx.repository.scheduleBlock(100);assert.equal((await w.instance.runOnce()).status,'complete');
-  assert.equal((await w.instance.runOnce()).status,'retrying');assert.equal((await w.instance.runOnce()).status,'retrying');
+  // A2.7: incomplete all-log evidence never yields a Transfer certificate; the companion returns to durable retry.
+  for (let attempt=0;attempt<2;attempt++) {
+    const batch=await w.instance.runOnce();assert.equal(batch.status,'retrying');assert.equal(batch.completedCompanionJobs,0);
+    assert.equal(ctx.pool.store.blocks.get(100).transfer_log_reconciliation_complete,false);
+    assert([...ctx.pool.store.work.values()].filter((j) => j.component!=='receipts').every((j) => j.state==='retrying' && j.lease_owner===null));
+    ctx.pool.advance(60000);
+  }
+  assert(![...ctx.pool.store.reconciliation.values()].some((e) => e.kind==='transfer_logs' && e.complete));
   for (const e of ctx.pool.store.reconciliation.values()) {
     assert.equal(e.complete,false);
     if (name==='identityless') {assert.equal(e.query_complete,false);assert.equal(e.reason_code,'query_unavailable');}
@@ -492,22 +505,38 @@ await test('failed all-log query retries only all-log work, keeps complete Trans
   const ctx=await setup();let fail=true;
   const w=worker(ctx,(method,params) => {if (method === 'eth_getBlockReceipts') return [receipt(100)];
     if (!params[0].topics && fail) throw new Error('transient');return [log(100)];});
-  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();assert.equal((await w.instance.runOnce()).status,'retrying');
-  assert.equal((await w.instance.runOnce()).status,'complete');assert.equal(ctx.pool.store.blocks.get(100).receipt_complete,true);
+  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();
+  const failed=await w.instance.runOnce();assert.equal(failed.status,'retrying');assert.equal(failed.completedCompanionJobs,0);
+  // While all_logs is backing off, Transfer falls back to its own independent query (the pre-A2.7 path).
+  const allJob=[...ctx.pool.store.work.values()].find((j) => j.component==='all_logs');allJob.not_before=Number.MAX_SAFE_INTEGER;
+  ctx.pool.advance(60000);const fallback=await w.instance.runOnce();
+  assert.equal(fallback.component,'transfer_logs');assert.equal(fallback.status,'complete');assert.equal(fallback.companionJobs,0);
+  assert.deepEqual(w.calls.at(-1).params[0].topics,[TRANSFER_TOPIC]);assert.equal(ctx.pool.store.blocks.get(100).receipt_complete,true);
   assert.equal(ctx.pool.store.blocks.get(100).all_log_reconciliation_complete,false);
-  const start=w.calls.length;fail=false;ctx.pool.advance(1000);assert.equal((await w.instance.runOnce()).status,'complete');
+  const transfer=structuredClone(ctx.pool.store.reconciliation.get('100:transfer_logs:arc-receipts-logs-v1'));assert(transfer.complete);
+  allJob.not_before=0;const start=w.calls.length;fail=false;assert.equal((await w.instance.runOnce()).status,'complete');
   assert.equal(w.calls.length,start+1);assert.equal(w.calls.at(-1).method,'eth_getLogs');assert(!w.calls.at(-1).params[0].topics);
+  assert.deepEqual(ctx.pool.store.reconciliation.get('100:transfer_logs:arc-receipts-logs-v1'),transfer);
   assert.equal((await ctx.repository.getLane()).current_error_code,null);
 });
-await test('failed Transfer query retries only Transfer work, complete evidence never downgraded',async () => {
+await test('failed fallback Transfer query retries only Transfer work; later certificate derivation needs no RPC and never downgrades',async () => {
   const ctx=await setup();let fail=true;
   const w=worker(ctx,(method,params) => {if (method === 'eth_getBlockReceipts') return [receipt(100)];
     if (params[0].topics && fail) throw new Error('transient');return [log(100)];});
-  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();await w.instance.runOnce();assert.equal((await w.instance.runOnce()).status,'retrying');
+  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();
+  // all_logs is not ready, so the Transfer job has no proof source and uses its independent query, which fails.
+  const allJob=[...ctx.pool.store.work.values()].find((j) => j.component==='all_logs');allJob.not_before=Number.MAX_SAFE_INTEGER;
+  const failed=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(failed.status,'retrying');assert.equal(failed.companionJobs,0);assert.deepEqual(w.calls.at(-1).params[0].topics,[TRANSFER_TOPIC]);
+  allJob.not_before=0;assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).status,'complete');
+  assert.equal(ctx.pool.store.blocks.get(100).transfer_log_reconciliation_complete,false,'A backing-off Transfer job is not a companion');
   const all=structuredClone([...ctx.pool.store.reconciliation.values()].find((r) => r.kind === 'all_logs'));
   const completeCoverage=new Map([...ctx.pool.store.coverage].filter(([,c]) => c.state === 'complete').map(([key,c]) => [key,structuredClone(c)]));
-  const start=w.calls.length;fail=false;ctx.pool.advance(1000);assert.equal((await w.instance.runOnce()).status,'complete');
-  assert.equal(w.calls.length,start+1);assert(w.calls.at(-1).params[0].topics);
+  const start=w.calls.length;fail=false;ctx.pool.advance(1000);
+  const derived=await w.instance.runOnce();assert.equal(derived.component,'transfer_logs');assert.equal(derived.status,'complete');
+  assert.equal(w.calls.length,start,'A durable exact all-log certificate proves the Transfer subset without eth_getLogs');
+  const certificate=ctx.pool.store.reconciliation.get('100:transfer_logs:arc-receipts-logs-v1');
+  assert(certificate.complete);assert.equal(certificate.receipt_log_count,1);assert.equal(certificate.queried_log_count,1);
   assert.deepEqual([...ctx.pool.store.reconciliation.values()].find((r) => r.kind === 'all_logs'),all);
   for (const [key,c] of completeCoverage) assert.deepEqual(ctx.pool.store.coverage.get(key),c,'Transient retry preserves complete coverage');
   const job=[...ctx.pool.store.work.values()].find((j) => j.component === 'all_logs');job.state='pending';
@@ -520,7 +549,8 @@ await test('complete island beyond gap remains blocked; closing gap advances dur
   await finish(ctx,w.instance,101);assert.equal((await ctx.repository.getLane()).processed_through,101);
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,null);const old=w.calls.length;n=100;
   await finish(ctx,w.instance,100);assert.equal((await ctx.repository.getLane()).contiguous_complete_through,101);
-  assert.equal(w.calls.length,old+3);assert.equal(ctx.pool.store.logs.size,2);
+  // A2.7: block receipts plus one unfiltered eth_getLogs serving both log components (previously a third Transfer query).
+  assert.equal(w.calls.length,old+2);assert.equal(ctx.pool.store.logs.size,2);
 });
 await test('stale fencing cannot persist any receipt or overwrite newer recovered work',async () => {
   const ctx=await setup();await ctx.repository.scheduleBlock(100);const old=await ctx.repository.claim('old',1000);ctx.pool.advance(1001);
@@ -611,7 +641,8 @@ await test('closing one gap advances across 120 certified blocks in bounded DB-o
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,null);
   const reads=w.calls.length;const calls=ctx.pool.calls.length;n=100;await finish(ctx,w.instance,100);
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,220);
-  assert.equal((await ctx.repository.getLane()).checkpoint_hash,hash(221));assert.equal(w.calls.length,reads+3);
+  // A2.7: block receipts plus one eth_getLogs for both log components.
+  assert.equal((await ctx.repository.getLane()).checkpoint_hash,hash(221));assert.equal(w.calls.length,reads+2);
   const pages=ctx.pool.calls.slice(calls).filter((c) => c.text.includes('receipts:advance'));
   assert(pages.some((c) => c.values[1] === 150));assert(pages.some((c) => c.values[1] === 200));
   assert(pages.every((c) => c.values[2] === 50));assert.equal(ctx.pool.store.receipts.size,121);
@@ -627,7 +658,8 @@ await test('interrupted DB-only frontier resumes from certified data on reschedu
       return query(sql,values);
     };return client;
   };
-  n=100;await ctx.repository.scheduleBlock(100);await w.instance.runOnce();await w.instance.runOnce();
+  // A2.7: the single log batch (all_logs plus its Transfer companion) runs the interrupted frontier sweep.
+  n=100;await ctx.repository.scheduleBlock(100);await w.instance.runOnce();
   assert.equal((await w.instance.runOnce()).status,'retrying');assert.equal((await ctx.repository.getLane()).contiguous_complete_through,149);
   const reads=w.calls.length;assert.deepEqual(await ctx.repository.scheduleBlock(100),[]);
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,220);assert.equal(w.calls.length,reads);
@@ -636,7 +668,7 @@ await test('canonical mismatch in later DB-only page halts continuity without ex
   const ctx=await setup(Array.from({length:121},(_,i) => block(100+i)));let n=101;
   const w=worker(ctx,(...args) => fullHandler(n)(...args));for (;n<=220;n++) await finish(ctx,w.instance,n);
   ctx.pool.store.blocks.get(177).parent_hash=hash(999);n=100;
-  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();await w.instance.runOnce();
+  await ctx.repository.scheduleBlock(100);await w.instance.runOnce();
   assert.equal((await w.instance.runOnce()).status,'continuity_error');const lane=await ctx.repository.getLane();
   assert.equal(lane.status,'continuity_error');assert.equal(lane.current_error_code,'checkpoint_parent_hash_mismatch');
   assert.equal(lane.contiguous_complete_through,149);assert.equal(ctx.pool.store.blocks.get(100).core_complete,false);
@@ -651,10 +683,10 @@ await test('DB-only frontier stops at exact incomplete or conflicting boundary b
 await test('canonical parent mismatch retains lane-wide fail-closed continuity behavior',async () => {
   const ctx=await setup();ctx.pool.store.blocks.get(100).parent_hash=hash(999);
   const w=worker(ctx,fullHandler(100));await ctx.repository.scheduleBlock(100);
-  await w.instance.runOnce();await w.instance.runOnce();assert.equal((await w.instance.runOnce()).status,'continuity_error');
+  await w.instance.runOnce();assert.equal((await w.instance.runOnce()).status,'continuity_error');
   assert.equal((await ctx.repository.getLane()).status,'continuity_error');
 });
-await test('ten all-log jobs use one RPC, ten Transfer jobs use a separate RPC, and each block certifies only its own logs',async () => {
+await test('A2.7 ten all-log jobs and their ten Transfer companions use one unfiltered RPC; each block certifies only its own logs',async () => {
   const ctx=await readyLogs();const jobs=ctx.pool.store.work.size;
   const w=worker(ctx,(method,[filter]) => {
     assert.equal(method,'eth_getLogs');assert.equal(filter.fromBlock,hex(100));assert.equal(filter.toBlock,hex(109));
@@ -662,11 +694,8 @@ await test('ten all-log jobs use one RPC, ten Transfer jobs use a separate RPC, 
   });
   const all=await w.instance.runOnce({preferredComponent:'all_logs'});
   assert.equal(all.status,'complete');assert.equal(all.jobCount,10);assert.equal(all.completedJobs,10);assert.equal(w.calls.length,1);
+  assert.equal(all.companionJobs,10);assert.equal(all.completedCompanionJobs,10);assert.equal(all.rpcQueries,1);
   assert(!Object.hasOwn(w.calls[0].params[0],'topics'));
-  assert.equal([...ctx.pool.store.reconciliation.values()].filter((r) => r.kind==='transfer_logs').length,0);
-  const transfers=await w.instance.runOnce({preferredComponent:'transfer_logs'});
-  assert.equal(transfers.status,'complete');assert.equal(transfers.jobCount,10);assert.equal(w.calls.length,2);
-  assert.deepEqual(w.calls[1].params[0].topics,[TRANSFER_TOPIC]);
   for (let n=100;n<110;n++) {
     for (const [kind,total] of [['all_logs',2],['transfer_logs',1]]) {
       const r=ctx.pool.store.reconciliation.get(`${n}:${kind}:arc-receipts-logs-v1`);
@@ -674,21 +703,189 @@ await test('ten all-log jobs use one RPC, ten Transfer jobs use a separate RPC, 
       assert.equal(r.block_hash,hash(n+1));
     }
   }
+  // The Transfer certificate keeps its own digest, which records that it was derived from the exact all-log response.
+  const view=await ctx.repository.getBlock(100),transfers=view.logs.map(normalizedLog).filter((l) => l.topics[0]===TRANSFER_TOPIC);
+  const expected={...reconcileLogs(transfers,transfers,{receiptSetComplete:true,queryComplete:true},'transfer'),derivedFrom:'all_logs_query'};
+  assert.equal(ctx.pool.store.reconciliation.get('100:transfer_logs:arc-receipts-logs-v1').evidence_digest,
+    createHash('sha256').update(JSON.stringify({blockHash:hash(101),evidence:expected})).digest('hex'));
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).status,'idle');assert.equal(w.calls.length,1);
   assert.equal(ctx.pool.store.work.size,jobs);assert.equal((await ctx.repository.workPressure()).outstanding,0);
-  console.log('LOG_BATCH_FIXTURE: 10 all_logs jobs = 1 RPC; 10 transfer_logs jobs = 1 independent RPC; zero enqueue');
+  console.log('LOG_BATCH_FIXTURE: 10 all_logs jobs + 10 transfer_logs companions = 1 unfiltered RPC; zero enqueue');
 });
-await test('all-log success is never reused as Transfer proof when the independent Transfer range RPC fails',async () => {
-  const ctx=await readyLogs(3);const w=worker(ctx,(method,[filter]) => {
-    if (filter.topics) throw new Error('private upstream error');return rangeLogs(100,3);
+await test('A2.7 an all-log mismatch in one block releases only that Transfer companion; it is never derived or certified',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,() => rangeLogs(100,3).filter((l) => !(l.blockNumber===hex(101) && l.logIndex==='0x1')));
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'retrying');assert.equal(w.calls.length,1);
+  assert.deepEqual(result.results.map((r) => r.status),['complete','retrying','complete']);
+  assert.deepEqual(result.companionResults.map((r) => r.status),['complete','retrying','complete']);
+  assert.equal(ctx.pool.store.reconciliation.get('101:all_logs:arc-receipts-logs-v1').missing_count,1);
+  assert(!ctx.pool.store.reconciliation.has('101:transfer_logs:arc-receipts-logs-v1'),'No Transfer row from incomplete all-log evidence');
+  assert.equal(ctx.pool.store.blocks.get(101).transfer_log_reconciliation_complete,false);
+  const released=[...ctx.pool.store.work.values()].find((j) => j.component==='transfer_logs' && j.start_block===101);
+  assert.equal(released.state,'retrying');assert.equal(released.lease_owner,null);assert.equal(released.attempts,1);
+  for (const n of [100,102]) assert.equal(ctx.pool.store.blocks.get(n).transfer_log_reconciliation_complete,true);
+});
+const certificate=(ctx,n,kind) => ctx.pool.store.reconciliation.get(`${n}:${kind}:arc-receipts-logs-v1`);
+const transferDigest=(blockHash,logs,derivedFrom) => {
+  const transfers=logs.map(normalizedLog).filter((l) => l.topics[0]===TRANSFER_TOPIC);
+  const evidence={...reconcileLogs(transfers,transfers,{receiptSetComplete:true,queryComplete:true},'transfer'),...(derivedFrom ? {derivedFrom} : {})};
+  return createHash('sha256').update(JSON.stringify({blockHash,evidence})).digest('hex');
+};
+await test('A2.7 zero-Transfer and empty blocks derive exact zero-count Transfer certificates from one unfiltered RPC',async () => {
+  const ctx=await setup([block(100),block(101,0)]);for (const n of [100,101]) await ctx.repository.scheduleBlock(n);
+  const other=[log(100,0,0,false),log(100,0,1,false)];
+  const w=worker(ctx,(method,params) => {
+    if (method==='eth_getBlockReceipts') return Number(BigInt(params[0]))===100 ? [receipt(100,0,other)] : [];
+    assert(!params[0].topics);return other;
   });
-  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,3);
-  const before=structuredClone([...ctx.pool.store.reconciliation.values()]);
-  const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
-  assert.equal(result.status,'retrying');assert.equal(result.completedJobs,0);assert.equal(w.calls.length,2);
-  for (const r of before) assert.deepEqual(ctx.pool.store.reconciliation.get(`${r.block_number}:${r.kind}:${r.definition_version}`),r);
-  for (let n=100;n<103;n++) assert.equal(ctx.pool.store.blocks.get(n).transfer_log_reconciliation_complete,false);
-  assert(result.results.every((r) => r.status==='retrying'));
-  assert([...ctx.pool.store.work.values()].filter((j) => j.component==='transfer_logs').every((j) => j.state==='retrying' && j.attempts===1 && j.lease_owner===null));
+  for (let i=0;i<2;i++) assert.equal((await w.instance.runOnce({preferredComponent:'receipts'})).status,'complete');
+  const batch=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(batch.completedJobs,2);assert.equal(batch.completedCompanionJobs,2);assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,1);
+  for (const [n,total] of [[100,2],[101,0]]) {
+    const all=certificate(ctx,n,'all_logs'),transfer=certificate(ctx,n,'transfer_logs');
+    assert(all.complete && transfer.complete);assert.equal(all.receipt_log_count,total);
+    assert.equal(transfer.receipt_log_count,0);assert.equal(transfer.queried_log_count,0);assert.equal(transfer.missing_count,0);
+    assert(ctx.pool.store.blocks.get(n).transfer_log_reconciliation_complete);
+  }
+  assert.equal(certificate(ctx,101,'transfer_logs').evidence_digest,transferDigest(hash(102),[],'all_logs_query'));
+});
+await test('A2.7 Transfer subset is exact across several transactions with interleaved unrelated logs',async () => {
+  const ctx=await setup([block(100,3)]);await ctx.repository.scheduleBlock(100);
+  // tx0: T,X,T  tx1: T,X,X  tx2: T,X,T  -> nine logs, five Transfer-topic logs.
+  const logsOf=(i) => [log(100,i,i*3,true),log(100,i,i*3+1,false),log(100,i,i*3+2,i!==1)];
+  const w=worker(ctx,(method,params) => method==='eth_getBlockReceipts' ? [0,1,2].map((i) => receipt(100,i,logsOf(i)))
+    : (assert(!params[0].topics),[0,1,2].flatMap(logsOf)));
+  await w.instance.runOnce();const batch=await w.instance.runOnce();
+  assert.equal(batch.component,'all_logs');assert.equal(batch.completedCompanionJobs,1);
+  assert.equal(certificate(ctx,100,'all_logs').receipt_log_count,9);
+  const transfer=certificate(ctx,100,'transfer_logs');assert(transfer.complete);
+  assert.equal(transfer.receipt_log_count,5);assert.equal(transfer.queried_log_count,5);
+  assert.equal(transfer.evidence_digest,transferDigest(hash(101),(await ctx.repository.getBlock(100)).logs,'all_logs_query'));
+});
+await test('A2.7 queued Transfer-only jobs finalize from durable exact all-log certificates with zero RPC, idempotently',async () => {
+  const ctx=await readyLogs();
+  // Transfer jobs queued before A2.7 (or backing off) are not companions of this all-log batch.
+  for (const j of ctx.pool.store.work.values()) if (j.component==='transfer_logs') j.not_before=Number.MAX_SAFE_INTEGER;
+  const w=worker(ctx,(method,[filter]) => {assert(!filter.topics,'No independent Transfer query');return rangeLogs(100,10);});
+  const all=await w.instance.runOnce({preferredComponent:'all_logs'});assert.equal(all.completedJobs,10);assert.equal(all.companionJobs,0);
+  for (const j of ctx.pool.store.work.values()) if (j.component==='transfer_logs') j.not_before=0;
+  const reads=w.calls.length;const transfer=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(transfer.status,'complete');assert.equal(transfer.completedJobs,10);assert.equal(transfer.rpcQueries,0);assert.equal(w.calls.length,reads);
+  for (let n=100;n<110;n++) {
+    const view=await ctx.repository.getBlock(n);const t=certificate(ctx,n,'transfer_logs');
+    assert(t.complete);assert.equal(t.block_hash,hash(n+1));assert.equal(t.evidence_digest,transferDigest(hash(n+1),view.logs,'all_logs_certificate'));
+  }
+  const certificates=structuredClone(ctx.pool.store.reconciliation);
+  for (const j of ctx.pool.store.work.values()) if (j.component==='transfer_logs') {j.state='pending';j.not_before=0;}
+  const again=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(again.completedJobs,10);assert.equal(again.rpcQueries,0);assert.equal(w.calls.length,reads);
+  assert.deepEqual(ctx.pool.store.reconciliation,certificates,'Repeated derivation never rewrites an immutable certificate');
+});
+await test('A2.7 an all-log certificate for another block hash never proves Transfer; that block uses the independent query',async () => {
+  const ctx=await readyLogs();
+  for (const j of ctx.pool.store.work.values()) if (j.component==='transfer_logs') j.not_before=Number.MAX_SAFE_INTEGER;
+  const w=worker(ctx,(method,[filter]) => rangeLogs(100,10,!!filter.topics));
+  await w.instance.runOnce({preferredComponent:'all_logs'});
+  certificate(ctx,104,'all_logs').block_hash=hash(999);
+  for (const j of ctx.pool.store.work.values()) if (j.component==='transfer_logs') j.not_before=0;
+  const reads=w.calls.length;const transfer=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(transfer.status,'complete');assert.equal(transfer.rpcQueries,1);assert.equal(w.calls.length,reads+1);
+  assert.deepEqual(w.calls.at(-1).params[0].topics,[TRANSFER_TOPIC]);
+  for (let n=100;n<110;n++) {
+    const view=await ctx.repository.getBlock(n);
+    assert.equal(certificate(ctx,n,'transfer_logs').evidence_digest,transferDigest(hash(n+1),view.logs,n===104 ? undefined : 'all_logs_certificate'));
+  }
+});
+await test('A2.7 repository rejects forged Transfer derivations without exact same-block all-log proof',async () => {
+  const ctx=await readyLogs(1);const view=await ctx.repository.getBlock(100),logs=view.logs.map(normalizedLog);
+  for (const derivedFrom of ['all_logs_certificate','all_logs_query','transfer_query']) {
+    const lease=await ctx.repository.claim('forger',180000,{preferredComponent:'transfer_logs'});assert.equal(lease.component,'transfer_logs');
+    const forged={...reconcileTransferLogs(logs,logs,{receiptSetComplete:true,queryComplete:true}),derivedFrom};
+    await assert.rejects(ctx.repository.saveReconciliation(lease,forged,1000),/invalid_reconciliation_evidence/);
+    assert(!certificate(ctx,100,'transfer_logs'));assert.equal(ctx.pool.store.blocks.get(100).transfer_log_reconciliation_complete,false);
+    ctx.pool.advance(200000);
+  }
+  // A pair may only derive Transfer from the all-log evidence it commits in the same transaction.
+  const all=await ctx.repository.claim('pair',180000,{preferredComponent:'all_logs'});
+  const [companion]=(await ctx.repository.claimLogSpan(all,1)).companions;assert.equal(companion.component,'transfer_logs');
+  const incomplete={...reconcileLogs(logs,[],{receiptSetComplete:true,queryComplete:true},'all')};
+  const derived={...reconcileTransferLogs(logs,logs,{receiptSetComplete:true,queryComplete:true}),derivedFrom:'all_logs_query'};
+  const result=await ctx.repository.saveReconciliationBatch([{lease:all,evidence:incomplete,retryMs:1000,companion:{lease:companion,evidence:derived,retryMs:1000}}]);
+  assert.equal(result.results[0].value.complete,false);assert.deepEqual(result.results[0].value.companion,{complete:false,released:true});
+  assert(!certificate(ctx,100,'transfer_logs'));assert.equal(ctx.pool.store.work.get(companion.id).state,'retrying');
+});
+await test('A2.7 a lost companion lease never rolls back the all-log certificate and never overwrites the new owner',async () => {
+  const ctx=await readyLogs(3);let replacement;
+  const w=worker(ctx,async () => {
+    const job=[...ctx.pool.store.work.values()].find((j) => j.component==='transfer_logs' && j.start_block===101);job.lease_until=0;
+    replacement=await ctx.repository.claim('replacement',180000,{preferredComponent:'transfer_logs'});assert.equal(replacement.id,job.id);
+    return rangeLogs(100,3);
+  });
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.status,'complete');assert.deepEqual(result.results.map((r) => r.status),['complete','complete','complete']);
+  assert.deepEqual(result.companionResults.map((r) => r.status),['complete','stale_lease','complete']);
+  assert(certificate(ctx,101,'all_logs').complete);assert(!certificate(ctx,101,'transfer_logs'));
+  const job=ctx.pool.store.work.get(replacement.id);assert.equal(job.lease_owner,'replacement');assert.equal(job.state,'leased');
+  assert.equal(job.fencing_token,replacement.fencing_token);
+});
+await test('A2.7 receipt evidence lost before persistence certifies neither component for that block',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,() => {ctx.pool.store.receipts.delete(transaction(101).hash);return rangeLogs(100,3);});
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.deepEqual(result.results.map((r) => r.status),['complete','retrying','complete']);
+  assert.deepEqual(result.companionResults.map((r) => r.status),['complete','retrying','complete']);
+  assert(!certificate(ctx,101,'all_logs'));assert(!certificate(ctx,101,'transfer_logs'));
+  assert.equal(ctx.pool.store.blocks.get(101).transfer_log_reconciliation_complete,false);
+});
+await test('A2.7 a companion for another canonical block hash at the same height is never claimed',async () => {
+  const ctx=await readyLogs(2);
+  const transfer=[...ctx.pool.store.work.values()].find((j) => j.component==='transfer_logs' && j.start_block===101);
+  transfer.logical_key=hash(999);transfer.block_hash=hash(999);
+  const w=worker(ctx,() => rangeLogs(100,2));const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.companionJobs,1);assert.deepEqual(result.companionResults.map((r) => r.blockNumber),[100]);
+  assert.equal(ctx.pool.store.work.get(transfer.id).state,'pending');assert.equal(ctx.pool.store.work.get(transfer.id).lease_owner,null);
+});
+await test('A2.7 derivation also respects the independent Transfer range cap; above it the companion is released',async () => {
+  const ctx=await setup([block(100)]);await ctx.repository.scheduleBlock(100);
+  const logs=Array.from({length:MAX_TRANSFER_LOGS+1},(_,i) => log(100,0,i));
+  const prep=await ctx.repository.claim('prep',180000,{preferredComponent:'receipts'});await ctx.repository.saveReceipts(prep,[receipt(100,0,logs)]);
+  const w=worker(ctx,(method,[filter]) => {assert(!filter.topics);return logs;});
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.completedJobs,1);assert(certificate(ctx,100,'all_logs').complete);
+  assert.deepEqual(result.companionResults.map((r) => r.status),['retrying']);assert(!certificate(ctx,100,'transfer_logs'));
+});
+await test('A2.7 durable certificate derivation honours the absolute Transfer cap across the whole claimed span',async () => {
+  const ctx=await setup([block(100),block(101)]);const perBlock=Math.floor(MAX_TRANSFER_LOGS/2)+1;
+  const logsFor=(n) => Array.from({length:perBlock},(_,i) => log(n,0,i));
+  for (const n of [100,101]) {
+    await ctx.repository.scheduleBlock(n);
+    const prep=await ctx.repository.claim('prep',180000,{preferredComponent:'receipts'});await ctx.repository.saveReceipts(prep,[receipt(n,0,logsFor(n))]);
+  }
+  assert(perBlock<=MAX_TRANSFER_LOGS && 2*perBlock>MAX_TRANSFER_LOGS,'Each block alone is below the cap; the span is above it');
+  // Certify all_logs first, with Transfer held back, so both Transfer jobs can only use the certificate fast path.
+  const transferJobs=[...ctx.pool.store.work.values()].filter((j) => j.component==='transfer_logs');
+  for (const j of transferJobs) j.not_before=Number.MAX_SAFE_INTEGER;
+  // Every log is a Transfer log, so the unfiltered and the filtered range responses are identical.
+  const w=worker(ctx,() => [...logsFor(100),...logsFor(101)]);
+  const all=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(all.completedJobs,2);assert.equal(all.companionJobs,0);
+  for (const n of [100,101]) assert(certificate(ctx,n,'all_logs').complete);
+  const allCertificates=structuredClone([...ctx.pool.store.reconciliation.values()].filter((r) => r.kind==='all_logs'));
+  for (const j of transferJobs) j.not_before=0;
+  const reads=w.calls.length;const span=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  // Without the aggregate cap both would derive with zero RPC. With it, the span takes the independent query, whose
+  // own absolute cap rejects the over-cap response: nothing is certified and both jobs stay retryable.
+  assert.equal(span.jobCount,2);assert.equal(span.completedJobs,0);assert.equal(span.status,'retrying');
+  assert.equal(span.rpcQueries,1);assert.equal(w.calls.length,reads+1);assert.deepEqual(w.calls.at(-1).params[0].topics,[TRANSFER_TOPIC]);
+  for (const n of [100,101]) {
+    assert.notEqual(certificate(ctx,n,'transfer_logs')?.complete,true);assert.equal(ctx.pool.store.blocks.get(n).transfer_log_reconciliation_complete,false);
+  }
+  assert(transferJobs.every((j) => ctx.pool.store.work.get(j.id).state==='retrying' && ctx.pool.store.work.get(j.id).lease_owner===null));
+  assert.deepEqual([...ctx.pool.store.reconciliation.values()].filter((r) => r.kind==='all_logs'),allCertificates,'All-log certificates are untouched');
+  // Control: a one-block span is within the cap, so the same durable certificate derives that block with zero RPC.
+  ctx.pool.advance(60000);const single=worker(ctx,() => {throw new Error('No RPC for a within-cap certificate span');},undefined,{maxLogRangeBlocks:1});
+  const one=await single.instance.runOnce({preferredComponent:'transfer_logs'});
+  assert.equal(one.status,'complete');assert.equal(one.jobCount,1);assert.equal(one.rpcQueries,0);assert.equal(single.calls.length,0);
+  assert(certificate(ctx,one.results[0].blockNumber,'transfer_logs').complete);
 });
 await test('log batch claims preserve exact identity, readiness, owner, fences and numeric span with SKIP LOCKED',async () => {
   const ctx=await readyLogs(12);const all=[...ctx.pool.store.work.values()].filter((j) => j.component==='all_logs');
@@ -752,8 +949,10 @@ await test('configured maximum batches exactly 50 blocks and leaves the 51st job
 await test('Transfer range enforces its independent topic and absolute total cap, without multiplying limits by block count',async () => {
   for (const raw of [[log(100,0,1,false)],Array(MAX_TRANSFER_LOGS+1).fill(log(100))]) {
     const ctx=await readyLogs(3);const w=worker(ctx,() => raw);
+    // A2.7: without ready all-log work or certificates, Transfer keeps its independent query and its own caps.
+    for (const j of ctx.pool.store.work.values()) if (j.component==='all_logs') j.not_before=Number.MAX_SAFE_INTEGER;
     const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
-    assert.equal(result.completedJobs,0);assert.equal(result.status,'retrying');assert.equal(w.calls.length,1);
+    assert.equal(result.completedJobs,0);assert.equal(result.status,'retrying');assert.equal(w.calls.length,1);assert.equal(result.companionJobs,0);
     assert.deepEqual(w.calls[0].params[0].topics,[TRANSFER_TOPIC]);
     assert([...ctx.pool.store.reconciliation.values()].every((r) => !r.complete && !r.query_complete));
   }
@@ -817,14 +1016,18 @@ await test('abort between per-block commits retains observed successful evidence
   const ctx=await readyLogs(3);const controller=new AbortController();const connect=ctx.pool.connect.bind(ctx.pool);let stop=true;
   ctx.pool.connect=async () => {const client=await connect(),query=client.query.bind(client);
     client.query=async (...args) => {const result=await query(...args);
-      if (stop && args[0]==='COMMIT' && ctx.pool.store.reconciliation.size===1) {stop=false;controller.abort();}
+      // A2.7: the first per-block commit atomically holds the all-log and derived Transfer certificates.
+      if (stop && args[0]==='COMMIT' && ctx.pool.store.reconciliation.size>0) {stop=false;controller.abort();}
       return result;
     };return client;
   };
   const w=worker(ctx,() => rangeLogs(100,3));const result=await w.instance.runOnce({preferredComponent:'all_logs',signal:controller.signal});
   assert.equal(result.status,'aborted');assert.equal(result.completedJobs,1);
   assert.deepEqual(result.results.map((r) => r.status),['complete','aborted','aborted']);
-  assert.equal(ctx.pool.store.reconciliation.size,1);assert.equal(w.calls.length,1);
+  assert.deepEqual(result.companionResults.map((r) => r.status),['complete','retrying','retrying']);
+  assert.deepEqual([...ctx.pool.store.reconciliation.keys()].sort(),['100:all_logs:arc-receipts-logs-v1','100:transfer_logs:arc-receipts-logs-v1']);
+  assert.equal(w.calls.length,1);
+  assert([...ctx.pool.store.work.values()].filter((j) => j.component!=='receipts' && j.start_block>100).every((j) => j.state==='retrying' && j.lease_owner===null));
 });
 await test('already complete per-block certificates remain immutable and require no repeated range RPC',async () => {
   const ctx=await readyLogs(3);const w=worker(ctx,() => rangeLogs(100,3));
@@ -861,12 +1064,15 @@ await test('worker hands ten precomputed records to one batch call; no single sa
   ctx.repository.saveReconciliationBatch=async (records,options) => {
     let depth=0;for (const c of ctx.pool.calls) {if (c.text==='BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(c.text)) depth--;}
     assert.equal(depth,0);assert.equal(records.length,10);assert(records.every((r) => r.evidence.complete));
-    batches.push(records.map((r) => r.lease.component));return save(records,options);
+    // A2.7: each per-block record carries its Transfer companion, derived from the same exact response.
+    assert(records.every((r) => r.companion?.evidence.complete && r.companion.evidence.derivedFrom==='all_logs_query'));
+    batches.push(records.map((r) => [r.lease.component,r.companion.lease.component]));return save(records,options);
   };
   const w=worker(ctx,(method,[filter]) => rangeLogs(100,10,!!filter.topics));
-  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,10);
-  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).completedJobs,10);
-  assert.deepEqual(batches,[Array(10).fill('all_logs'),Array(10).fill('transfer_logs')]);assert.equal(w.calls.length,2);
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.completedJobs,10);assert.equal(result.completedCompanionJobs,10);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).status,'idle');
+  assert.deepEqual(batches,[Array(10).fill(['all_logs','transfer_logs'])]);assert.equal(w.calls.length,1);
   const lane=await ctx.repository.getLane();assert.equal(lane.processed_through,109);assert.equal(lane.contiguous_complete_through,109);
   assert.equal(lane.checkpoint_hash,hash(110));assert.equal(lane.status,'caught_up');
   assert([...ctx.pool.store.blocks.values()].every((b) => b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete && !b.core_complete));
@@ -912,9 +1118,10 @@ await test('batch bounds reject oversized ranges and duplicate jobs before any p
 });
 await test('single-job worker uses bounded batch API and preserves certification/frontier',async () => {
   const ctx=await readyLogs(1);const w=worker(ctx,(method,[filter]) => rangeLogs(100,1,!!filter.topics),undefined,{maxLogRangeBlocks:1});
-  assert.equal((await w.instance.runOnce({preferredComponent:'all_logs'})).completedJobs,1);
-  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).completedJobs,1);
-  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);assert.equal(w.calls.length,2);
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
+  assert.equal(result.completedJobs,1);assert.equal(result.completedCompanionJobs,1);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).status,'idle');
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);assert.equal(w.calls.length,1);
 });
 await test('receipt evidence revalidated after RPC cannot be falsely certified from the earlier worker view',async () => {
   const ctx=await readyLogs(3);const w=worker(ctx,() => {
@@ -930,15 +1137,20 @@ await test('canonical lease hash mismatch halts the lane before later batch reco
     job.block_hash=hash(999);return rangeLogs(100,3);
   });const result=await w.instance.runOnce({preferredComponent:'all_logs'});
   assert.equal(result.status,'continuity_error');assert.deepEqual(result.results.map((r) => r.status),['complete','continuity_error','continuity_error']);
-  assert.equal(ctx.pool.store.reconciliation.size,1);assert.equal((await ctx.repository.getLane()).status,'continuity_error');
+  // A2.7: block 100 committed its all-log and derived Transfer certificates together; nothing after the halt.
+  assert.deepEqual([...ctx.pool.store.reconciliation.keys()].sort(),['100:all_logs:arc-receipts-logs-v1','100:transfer_logs:arc-receipts-logs-v1']);
+  assert.equal((await ctx.repository.getLane()).status,'continuity_error');
   assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,false);
+  assert.equal(ctx.pool.store.blocks.get(102).transfer_log_reconciliation_complete,false);
 });
 await test('shared frontier failure reports retrying and retains durable processed ceiling for DB-only recovery',async () => {
   const ctx=await readyLogs(3);let fail=false;const w=worker(ctx,(method,[filter]) => {
     if (fail) ctx.pool.fail('receipts:advance');return rangeLogs(100,3,!!filter.topics);
-  });await w.instance.runOnce({preferredComponent:'all_logs'});fail=true;
-  const result=await w.instance.runOnce({preferredComponent:'transfer_logs'});
+  });fail=true;
+  // A2.7: the single log batch (all_logs plus Transfer companions) owns the shared frontier sweep that fails.
+  const result=await w.instance.runOnce({preferredComponent:'all_logs'});
   assert.equal(result.status,'retrying');assert.equal(result.error,'required_read_unavailable');assert.equal(result.completedJobs,3);
+  assert.equal(result.completedCompanionJobs,3);
   let lane=await ctx.repository.getLane();assert.equal(lane.processed_through,102);assert.equal(lane.contiguous_complete_through,null);
   assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));const calls=w.calls.length;
   await ctx.repository.advanceFrontier();lane=await ctx.repository.getLane();assert.equal(lane.contiguous_complete_through,102);
@@ -983,7 +1195,7 @@ await test('A2.5H pg parsed bigint strings and nullable typed facts survive extr
   for (const name of ['transactions','receipts','logs','reconciliation']) for (const row of expected[name]) row.block_number=String(row.block_number);
   assert.deepEqual(await ctx.repository.getBlock(100),expected);
 });
-await test('A2.5H normal 10/1/1 burst reproduces base truth with 990->703 SQL, 66->55 transactions, 22->11 scans',async () => {
+await test('A2.5H normal 10/1/1 burst reproduces base truth with 840->620 SQL, 54->44 transactions, 21->11 scans',async () => {
   async function profile(legacy) {
     const ctx=await setup(Array.from({length:10},(_,i) => block(100+i)));
     legacyFollowupEnqueues(ctx.pool); // Keep the A2.5H regression isolated from this enqueue optimization.
@@ -996,25 +1208,30 @@ await test('A2.5H normal 10/1/1 burst reproduces base truth with 990->703 SQL, 6
     const burst=createWorkBurst({worker:{async runOnce(options) {
       await ctx.repository.workPressure();return w.instance.runOnce(options);
     }},...(legacy ? {} : {frontier:() => ctx.repository.advanceFrontier()})});
-    const results=await burst();assert.equal(results.length,12);assert(results.every((r) => r.status==='complete'));
-    assert.deepEqual(results.map((r) => r.component),[...Array(10).fill('receipts'),'all_logs','transfer_logs']);
+    const results=await burst();assert.equal(results.length,12);
+    // A2.7: the all-log batch also certifies its ten Transfer companions, so the twelfth slot finds no work.
+    assert(results.slice(0,11).every((r) => r.status==='complete'));assert.equal(results[11].status,'idle');
+    assert.deepEqual(results.slice(0,11).map((r) => r.component),[...Array(10).fill('receipts'),'all_logs']);
+    assert.equal(results[10].completedCompanionJobs,10);
     assert.equal(w.calls.filter((c) => c.method==='eth_getBlockReceipts').length,10);
-    assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,2);assert.equal(w.calls.length,12);
+    assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,1);assert.equal(w.calls.length,11);
     return {ctx,totals:{sql:ctx.pool.calls.length,transactions:ctx.pool.calls.filter((c) => c.text==='BEGIN').length,
       advance:ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length}};
   }
   const before=await profile(true),after=await profile(false);
-  assert.deepEqual(before.totals,{sql:990,transactions:66,advance:22});
-  assert.deepEqual(after.totals,{sql:703,transactions:55,advance:11});
+  // A2.7 absorbs the Transfer batch into the all-log batch (pre-A2.7: 990->703 SQL, 66->55 transactions, 22->11 scans).
+  assert.deepEqual(before.totals,{sql:840,transactions:54,advance:21});
+  assert.deepEqual(after.totals,{sql:620,transactions:44,advance:11});
   for (const key of ['blocks','transactions','receipts','logs','reconciliation','coverage','work','lanes'])
     assert.deepEqual(after.ctx.pool.store[key],before.ctx.pool.store[key],`${key} must remain identical`);
   console.log(`A2.5H_BURST_PROFILE: before=${JSON.stringify(before.totals)} after=${JSON.stringify(after.totals)}; identical durable truth`);
 });
 await test('A2.5H durable certificates survive crash before flush and idle restarted burst recovers without RPC',async () => {
   const ctx=await readyLogs(3);const w=worker(ctx,(method,[filter]) => rangeLogs(100,3,!!filter.topics));
-  for (const preferredComponent of ['all_logs','transfer_logs']) {
-    assert.equal((await w.instance.runOnce({preferredComponent,deferFrontier:true})).status,'complete');
-  }
+  // A2.7: the deferred all-log batch durably certifies its Transfer companions too; nothing remains for the Transfer slot.
+  const batch=await w.instance.runOnce({preferredComponent:'all_logs',deferFrontier:true});
+  assert.equal(batch.status,'complete');assert.equal(batch.completedCompanionJobs,3);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs',deferFrontier:true})).status,'idle');
   const lane=await ctx.repository.getLane();assert.equal(lane.processed_through,102);assert.equal(lane.contiguous_complete_through,null);
   assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));
   const facts=structuredClone(ctx.pool.store),reads=w.calls.length;
@@ -1032,7 +1249,7 @@ await test('A2.5H abort flush preserves committed truth and leaves remaining lea
     const start=Number(BigInt(filter.fromBlock)),end=Number(BigInt(filter.toBlock));
     return rangeLogs(start,end-start+1,!!filter.topics);
   });
-  await w.instance.runOnce({preferredComponent:'all_logs'});
+  // A2.7: the burst's first log batch carries both components; abort lands after block 100's pair commit.
   const controller=new AbortController(),connect=ctx.pool.connect.bind(ctx.pool);let armed=false;
   ctx.pool.connect=async () => {
     const c=await connect(),query=c.query.bind(c);let written=false;
@@ -1046,6 +1263,7 @@ await test('A2.5H abort flush preserves committed truth and leaves remaining lea
   armed=true;
   const result=await createWorkBurst({worker:w.instance,frontier:() => ctx.repository.advanceFrontier()})({signal:controller.signal});
   assert.equal(result.length,1);assert.equal(result[0].status,'aborted');assert.equal(result[0].completedJobs,1);
+  assert.equal(result[0].completedCompanionJobs,1);
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);
   assert.equal(ctx.pool.store.blocks.get(101).transfer_log_reconciliation_complete,false);
   ctx.pool.advance(1000000);
@@ -1254,7 +1472,7 @@ await test('A2.5I pair prune preserves complete retention and all non-complete s
   assert.equal([...ctx.pool.store.work.values()].filter((w) => w.state==='complete').length,COMPLETE_WORK_RETAIN);
   for (const id of protectedIds) assert(ctx.pool.store.work.has(id));
 });
-await test('A2.5I same burst keeps durable truth with 703->653 SQL and 100->50 followup statements',async () => {
+await test('A2.5I same burst keeps durable truth with 620->570 SQL and 100->50 followup statements',async () => {
   async function profile(legacy) {
     const ctx=await setup(Array.from({length:10},(_,i) => block(100+i)));
     if (legacy) legacyFollowupEnqueues(ctx.pool);
@@ -1273,15 +1491,17 @@ await test('A2.5I same burst keeps durable truth with 703->653 SQL and 100->50 f
     const results=await createWorkBurst({worker:{async runOnce(options) {
       await ctx.repository.workPressure();return w.instance.runOnce(options);
     }},frontier:() => ctx.repository.advanceFrontier()})();
-    assert.equal(results.length,12);assert(results.every((r) => r.status==='complete'));
-    assert.deepEqual(results.map((r) => r.component),[...Array(10).fill('receipts'),'all_logs','transfer_logs']);
-    assert.equal(w.calls.length,12);assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,2);
+    // A2.7: the all-log batch also certifies its ten Transfer companions, so the twelfth slot finds no work.
+    assert.equal(results.length,12);assert(results.slice(0,11).every((r) => r.status==='complete'));assert.equal(results[11].status,'idle');
+    assert.deepEqual(results.slice(0,11).map((r) => r.component),[...Array(10).fill('receipts'),'all_logs']);
+    assert.equal(w.calls.length,11);assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,1);
     return {ctx,totals:{sql:ctx.pool.calls.length,transactions:ctx.pool.calls.filter((c) => c.text==='BEGIN').length,
       advance:ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,followupSql}};
   }
   const before=await profile(true),after=await profile(false);
-  assert.deepEqual(before.totals,{sql:703,transactions:55,advance:11,followupSql:100});
-  assert.deepEqual(after.totals,{sql:653,transactions:55,advance:11,followupSql:50});
+  // A2.7 absorbs the Transfer batch into the all-log batch (pre-A2.7: 703->653 SQL with 55 transactions).
+  assert.deepEqual(before.totals,{sql:620,transactions:44,advance:11,followupSql:100});
+  assert.deepEqual(after.totals,{sql:570,transactions:44,advance:11,followupSql:50});
   for (const key of ['blocks','transactions','receipts','logs','reconciliation','coverage','work','lanes'])
     assert.deepEqual(after.ctx.pool.store[key],before.ctx.pool.store[key]);
   console.log(`A2.5I_BURST_PROFILE: before=${JSON.stringify(before.totals)} after=${JSON.stringify(after.totals)}; identical durable truth`);

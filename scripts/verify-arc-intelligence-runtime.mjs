@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { readRuntimeConfig } from '../server/arc-intelligence/runtime-config.js';
 import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
 import { createA2RpcClient } from '../server/arc-intelligence/a2-rpc.js';
-import { createA2Runtime, createWorkBurst } from '../server/arc-intelligence/a2-runtime.js';
+import { createA2Runtime, createWorkBurst, REDUCER_MAX_DEFER_MS } from '../server/arc-intelligence/a2-runtime.js';
 import { start } from '../server/arc-intelligence/main.js';
 import { createHttpServer } from '../server/arc-intelligence/http.js';
 import { createFoundationRepository, CHAIN_IDENTITY, MAX_WORK_ROWS } from '../server/arc-intelligence/foundation.js';
@@ -379,10 +379,12 @@ await test('real A2 cycle uses shared paced RPC, persists before scheduling, rec
   }});
   const first=await runtime.cycle();
   assert.equal(first.chain.persistedBlocks,3);assert.equal(first.chain.targetHead,1000);assert.equal(first.chain.observedHead,1002);
-  assert.deepEqual(first.scheduledBlocks,[995,996,997,998]);assert.equal(first.work.length,7);
+  // A2.7: one log batch certifies four all-log jobs and their four Transfer companions from one response.
+  assert.deepEqual(first.scheduledBlocks,[995,996,997,998]);assert.equal(first.work.length,6);
   assert(first.work.slice(0,-1).every((result) => result.status==='complete'));assert.equal(first.work.at(-1).status,'idle');
-  assert.equal(first.work.filter((r) => r.component==='all_logs')[0].jobCount,4);
-  assert.equal(first.work.filter((r) => r.component==='transfer_logs')[0].jobCount,4);assert.equal(first.continueImmediately,true);
+  const logs=first.work.filter((r) => r.component==='all_logs');assert.equal(logs.length,1);
+  assert.equal(logs[0].jobCount,4);assert.equal(logs[0].completedCompanionJobs,4);
+  assert(!first.work.some((r) => r.component==='transfer_logs'));assert.equal(first.continueImmediately,true);
   assert(![...pool.store.work.values()].some((w) => w.start_block===100));assert(pool.store.work.size<=12);
   assert.deepEqual(calls.slice(0,4).map((c) => c.method),['eth_chainId','eth_blockNumber','block_batch','eth_getBlockReceipts']);
   await runtime.cycle();await runtime.cycle();
@@ -592,8 +594,11 @@ await test('A2.5H actual restarted idle runtime repairs durable deferred frontie
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
   const repository=createReceiptRepository(pool);await repository.initialize();await repository.scheduleBlock(100);
   const w=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
-  for (const preferredComponent of ['receipts','all_logs','transfer_logs'])
-    assert.equal((await w.runOnce({preferredComponent,deferFrontier:true})).status,'complete');
+  assert.equal((await w.runOnce({preferredComponent:'receipts',deferFrontier:true})).status,'complete');
+  // A2.7: the all-log batch also durably certifies the Transfer companion; the Transfer slot then finds no work.
+  const logs=await w.runOnce({preferredComponent:'all_logs',deferFrontier:true});
+  assert.equal(logs.status,'complete');assert.equal(logs.completedCompanionJobs,1);
+  assert.equal((await w.runOnce({preferredComponent:'transfer_logs',deferFrontier:true})).status,'idle');
   assert.equal((await repository.getLane()).contiguous_complete_through,null);
   const before=structuredClone(pool.store.a1);let time=0;const methods=[];
   const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:() => time,
@@ -731,7 +736,9 @@ await test('10/1/1 also drains ready receipts and ten-job log batches without cr
   const result=await runtime.cycle();assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');
   assert.deepEqual(result.work.map((r) => r.component),preferenceCycle);assert(result.work.every((r) => r.status==='complete'));
   assert(result.work.slice(10).every((r) => r.jobCount===10 && r.completedJobs===10));
-  assert.equal(pool.store.work.size,rows);assert.equal(result.outstanding,40);
+  // A2.7: each log batch also completes the other component's ten companion jobs from one unfiltered response.
+  assert(result.work.slice(10).every((r) => r.companionJobs===10 && r.completedCompanionJobs===10 && r.rpcQueries===1));
+  assert.equal(pool.store.work.size,rows);assert.equal(result.outstanding,20);
   assert.deepEqual(result.scheduledBlocks,[]);assert.deepEqual(result.deferredBlocks,[]);
 });
 await test('empty preferred all_logs and transfer_logs slots fall back to ready single-block receipts',async () => {
@@ -926,10 +933,12 @@ await test('high-water drain keeps retrying durable and gives post-cooldown RPC 
   const size=pool.store.work.size;const from=pool.calls.length;const first=await runtime.cycle({signal:controller.signal});
   assert.equal(first.backpressure,'drain');assert.equal(first.work.length,1);assert.equal(first.work[0].status,'retrying');assert.equal(first.continueImmediately,false);
   const retry=[...pool.store.work.values()].find((w) => w.state==='retrying');assert(retry);assert.equal(retry.attempts,1);assert(retry.not_before>1000000);
+  // A2.7: the 429'd batch durably retried both log components; once that retry is ready, its RPC still waits for the shared cooldown.
+  pool.advance(1000);
   await runtime.cycle({signal:controller.signal});assert.deepEqual(calls,[{method:'eth_getLogs',time:0},{method:'eth_getLogs',time:15000}]);
   assert.equal(pool.store.work.size,size);assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
 });
-await test('two ten-job log batches drain existing work with zero enqueue and resume chain only below low water',async () => {
+await test('A2.7 one ten-block log batch drains both log components with one unfiltered RPC, zero enqueue, and resumes chain only below low water',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:10},(_,i) => block(100+i,0)));
   const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<110;n++) await repository.scheduleBlock(n);
   const preparer=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
@@ -942,17 +951,16 @@ await test('two ten-job log batches drain existing work with zero enqueue and re
       assert.equal(method,'eth_getLogs');return response([]);
     }});
   const from=pool.calls.length;
-  for (const outstanding of [10,0]) {
-    const result=await runtime.cycle();assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');
-    assert.equal(result.work[0].jobCount,10);assert.equal(result.work[0].completedJobs,10);assert.equal(result.outstanding,outstanding);
-    assert(result.continueImmediately);assert.equal(pool.store.work.size,size);assert.equal(pool.store.blocks.size,10);
-  }
+  const result=await runtime.cycle();assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');
+  assert.equal(result.work[0].jobCount,10);assert.equal(result.work[0].completedJobs,10);
+  assert.equal(result.work[0].companionJobs,10);assert.equal(result.work[0].completedCompanionJobs,10);assert.equal(result.outstanding,0);
+  assert(result.continueImmediately);assert.equal(pool.store.work.size,size);assert.equal(pool.store.blocks.size,10);
   assert(!pool.calls.slice(from).some((c) => /a2:enqueue|receipts:recent|receipts:deferred|a2:block/.test(c.text)));
-  assert.deepEqual(calls.map((c) => c.method),['eth_getLogs','eth_getLogs']);
-  assert(!calls[0].params[0].topics);assert.deepEqual(calls[1].params[0].topics,[TRANSFER_TOPIC]);
-  for (const call of calls) assert.deepEqual([call.params[0].fromBlock,call.params[0].toBlock],[hex(100),hex(109)]);
+  assert.deepEqual(calls.map((c) => c.method),['eth_getLogs']);assert(!calls[0].params[0].topics);
+  assert.deepEqual([calls[0].params[0].fromBlock,calls[0].params[0].toBlock],[hex(100),hex(109)]);
+  assert([...pool.store.blocks.values()].every((b) => b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete));
   const normal=await runtime.cycle();assert.equal(normal.backpressure,'normal');assert.equal(normal.chain.status,'caught_up');
-  assert.deepEqual(calls.slice(2).map((c) => c.method),['eth_chainId','eth_blockNumber']);assert.equal(pool.store.work.size,size);
+  assert.deepEqual(calls.slice(1).map((c) => c.method),['eth_chainId','eth_blockNumber']);assert.equal(pool.store.work.size,size);
 });
 await test('capacity race is explicit, pauses producers and sleeps safely while global capacity remains occupied',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
@@ -1011,6 +1019,110 @@ await test('A3.2 hourly reducer loop is bounded, nonblocking and off the RPC pat
   assert(runtimeSource.includes('Promise.allSettled([chainLoop({signal}),workLoop({signal}),reducerLoop({signal})])'));
   assert(runtimeSource.includes('const REDUCER_HOURS_PER_ITERATION = 2'));
   assert(!/eth_get|eth_call|eth_blockNumber|eth_getLogs|eth_getBlockReceipts|\.request\(/.test(repositorySource));
+});
+await test('A2.7 reducer yields while draining for at most REDUCER_MAX_DEFER_MS and never defers in normal mode',async () => {
+  const {pool,foundation}=await setup();const repository=createReceiptRepository(pool);await repository.initialize();
+  for (let n=100;n<103;n++) await foundation.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:hash(n),startBlock:n,endBlock:n,blockHash:hash(n)});
+  let time=0;const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:3,workLowWater:1},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;},log:() => {},fetchImpl:async () => {throw new Error('fixture RPC unavailable');}});
+  const reductions=() => pool.calls.filter((c) => c.text.includes('metrics:candidates')).length;
+  assert.equal((await runtime.chainStep()).backpressure,'drain');
+  // The first reduction is never deferred; afterwards drain defers it, bounded by REDUCER_MAX_DEFER_MS.
+  assert.equal((await runtime.reducerStep()).status,'idle');assert.equal(reductions(),1);
+  for (let i=0;i<29;i++) {time+=10000;const step=await runtime.reducerStep();assert.equal(step.status,'deferred');assert.equal(step.continueImmediately,false);}
+  assert.equal(reductions(),1,'Deferred steps issue no reducer SQL');
+  time=REDUCER_MAX_DEFER_MS;assert.equal((await runtime.reducerStep()).status,'idle');assert.equal(reductions(),2);
+  time+=REDUCER_MAX_DEFER_MS-1;assert.equal((await runtime.reducerStep()).status,'deferred');
+  time+=1;assert.equal((await runtime.reducerStep()).status,'idle');assert.equal(reductions(),3);
+  for (const j of pool.store.work.values()) j.state='complete';
+  assert.equal((await runtime.chainStep()).backpressure,'normal');
+  for (let i=0;i<3;i++) assert.equal((await runtime.reducerStep()).status,'idle');
+  assert.equal(reductions(),6,'Normal mode reduces on every step');
+  assert(REDUCER_MAX_DEFER_MS>=60000 && REDUCER_MAX_DEFER_MS<=600000);
+});
+await test('A2.7 reducer candidates use bounded time-index probes instead of grouping every durable block',async () => {
+  const source=await readFile(new URL('../server/arc-intelligence/metric-repository.js',import.meta.url),'utf8');
+  const sql=source.slice(source.indexOf('/* metrics:candidates */'),source.indexOf('LIMIT $4`',source.indexOf('/* metrics:candidates */')));
+  assert(!sql.includes('GROUP BY'),'No full-history GROUP BY over arc_intelligence_blocks');
+  assert(sql.includes('ORDER BY timestamp,block_number LIMIT 1') && sql.includes('ORDER BY timestamp DESC,block_number DESC LIMIT 1'));
+  assert(sql.includes('generate_series(') && sql.includes('AND EXISTS (SELECT 1 FROM arc_intelligence_blocks x WHERE x.chain_id=$1'));
+  assert(sql.includes('x.timestamp >= h.bucket_start AND x.timestamp < h.bucket_start+3600'));
+  // Same candidate semantics: hours with at least one block before the current hour, never-reduced first.
+  const {pool}=await setup();const hour=Math.floor(Date.now()/3600000)*3600;
+  for (const [n,timestamp] of [[10,hour-3*3600],[11,hour-3600],[12,hour+5]]) pool.store.blocks.set(n,{...block(n,0),chain_id:5042,timestamp,receipt_count:null});
+  const {createMetricRepository}=await import('../server/arc-intelligence/metric-repository.js');
+  const result=await createMetricRepository(pool).reduceCandidateHours({limit:24});
+  assert.deepEqual(result.results.map((r) => r.bucketStart),[hour-3*3600,hour-3600]);
+});
+await test('A2.7 runtime scheduling skips the redundant frontier sweep and lane re-initialization; the burst flush still advances',async () => {
+  const {pool}=await setup();let time=0;const methods=[];
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),liveMaxBlocks:10},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},log:() => {},fetchImpl:async (url,init) => {
+      const body=JSON.parse(init.body);
+      if (Array.isArray(body)) {methods.push('block_batch');return {status:200,ok:true,async json(){
+        return body.map(({id,params}) => ({jsonrpc:'2.0',id,result:rawBlock(Number(BigInt(params[0])),0)}));}};}
+      methods.push(body.method);
+      if (body.method==='eth_chainId') return response(hex(5042));if (body.method==='eth_blockNumber') return response(hex(111));
+      return response([]);
+    }});
+  const from=pool.calls.length;const chain=await runtime.chainStep();
+  assert.deepEqual(chain.scheduledBlocks,Array.from({length:10},(_,i) => 100+i));
+  const scheduling=pool.calls.slice(from);
+  assert(!scheduling.some((c) => c.text.includes('receipts:advance')),'Scheduling incomplete blocks never sweeps the frontier');
+  assert.equal(scheduling.filter((c) => c.text.includes('receipts:lane')).length,0,'No receipt-lane row lock while scheduling');
+  assert.equal(scheduling.filter((c) => c.text.includes('a2:anchor')).length,1,'The receipt lane is initialized once per repository');
+  assert.equal([...pool.store.work.values()].filter((w) => w.component==='receipts').length,10);
+  const work=await runtime.workStep();assert(work.work.slice(0,-1).every((r) => r.status==='complete'));
+  const lane=await createReceiptRepository(pool).getLane();
+  assert.equal(lane.contiguous_complete_through,109,'Every completion is still followed by the shared frontier flush');
+  assert.deepEqual(methods.filter((m) => m==='eth_getLogs').length,1);
+});
+await test('A2.7 synthetic ten-block pipeline: one eth_getLogs, fewer SQL statements, identical evidence and bounded RPC concurrency',async () => {
+  const {pool}=await setup();let time=0,active=0,peak=0;const rpc={};
+  const TX=4,LOGS=3;
+  const log=(n,i,index,transfer) => ({blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:hex(i),transactionHash:transaction(n,i).hash,
+    logIndex:hex(index),address:'0x'+'5'.repeat(40),topics:[transfer ? TRANSFER_TOPIC : hash(987)],data:hash(123),removed:false});
+  const fullReceipt=(n,i) => ({blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:hex(i),transactionHash:transaction(n,i).hash,
+    status:'0x1',gasUsed:'0x5208',effectiveGasPrice:'0x1',contractAddress:null,logs:Array.from({length:LOGS},(_,k) => log(n,i,i*LOGS+k,k<2))});
+  const config=readRuntimeConfig({INTELLIGENCE_RUNTIME_MODE:'a2_shadow',INTELLIGENCE_A2_LIVE_MAX_BLOCKS:'10',INTELLIGENCE_A2_RPC_MIN_INTERVAL_MS:'200',
+    INTELLIGENCE_A2_RECEIPT_MAX_READS:'4',INTELLIGENCE_A2_WORK_BURST:'12'});
+  const runtime=createA2Runtime({pool,config,now:() => time,sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},log:() => {},
+    fetchImpl:async (url,init) => {
+      active++;peak=Math.max(peak,active);
+      try {
+        const body=JSON.parse(init.body);
+        if (Array.isArray(body)) {rpc.block_batch=(rpc.block_batch ?? 0)+1;return {status:200,ok:true,async json(){
+          return body.map(({id,params}) => ({jsonrpc:'2.0',id,result:rawBlock(Number(BigInt(params[0])),TX)}));}};}
+        const {method,params}=body;rpc[method]=(rpc[method] ?? 0)+1;
+        if (method==='eth_chainId') return response(hex(5042));if (method==='eth_blockNumber') return response(hex(111));
+        if (method==='eth_getBlockReceipts') {const n=Number(BigInt(params[0]));return response(Array.from({length:TX},(_,i) => fullReceipt(n,i)));}
+        assert.equal(method,'eth_getLogs');assert(!params[0].topics,'No independent Transfer query when derivation is proven');
+        const out=[];for (let n=Number(BigInt(params[0].fromBlock));n<=Number(BigInt(params[0].toBlock));n++)
+          for (let i=0;i<TX;i++) out.push(...fullReceipt(n,i).logs);
+        return response(out);
+      } finally { active--; }
+    }});
+  const from=pool.calls.length;await runtime.chainStep();const chainSql=pool.calls.length-from;
+  const work=await runtime.workStep();const workSql=pool.calls.length-from-chainSql;
+  assert.deepEqual(work.work.map((r) => r.component ?? r.status),[...Array(10).fill('receipts'),'all_logs','idle']);
+  assert.equal(work.work[10].completedJobs,10);assert.equal(work.work[10].completedCompanionJobs,10);
+  assert.deepEqual(rpc,{eth_chainId:1,eth_blockNumber:1,block_batch:1,eth_getBlockReceipts:10,eth_getLogs:1});
+  assert.equal(peak,1,'Active RPC transport never exceeds INTELLIGENCE_A2_RPC_CONCURRENCY=1');
+  const blocks=[...pool.store.blocks.values()];assert.equal(blocks.length,10);
+  assert(blocks.every((b) => b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete && !b.core_complete));
+  for (const b of blocks) {
+    const all=pool.store.reconciliation.get(`${b.block_number}:all_logs:arc-receipts-logs-v1`);
+    const transfer=pool.store.reconciliation.get(`${b.block_number}:transfer_logs:arc-receipts-logs-v1`);
+    assert(all.complete && transfer.complete);assert.equal(all.receipt_log_count,TX*LOGS);assert.equal(transfer.receipt_log_count,TX*2);
+    assert.equal(transfer.queried_log_count,TX*2);assert.equal(transfer.block_hash,b.block_hash);
+  }
+  assert([...pool.store.work.values()].every((j) => j.state==='complete'));
+  const totals={chainSql,workSql,transactions:pool.calls.slice(from).filter((c) => c.text==='BEGIN').length,
+    workTableCounts:pool.calls.slice(from).filter((c) => /count\(\*\)[^]*FROM arc_intelligence_work/.test(c.text)).length};
+  // Pre-A2.7, measured on this exact workload: 15 RPC calls incl. the one-time eth_chainId (2 eth_getLogs),
+  // 283 chain SQL, 800 worker SQL, 90 transactions and 73 work-table count(*) statements.
+  assert.deepEqual(totals,{chainSql:208,workSql:703,transactions:58,workTableCounts:68});
+  console.log(`A2.7_PIPELINE_PROFILE: 10 blocks rpc=${JSON.stringify(rpc)} ${JSON.stringify(totals)} peakRpc=${peak}`);
 });
 await test('001/002/003 immutable; main consumes mode; SIGTERM and SIGINT share guarded shutdown',async () => {
   for (const [name,expected] of [['001_init','c38b78a7e0e1c47e1de5f1400f1502f53f4ce8eeb20fe5d8f328fb59d1992ff0'],
