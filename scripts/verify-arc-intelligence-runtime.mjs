@@ -37,6 +37,7 @@ function clock() {
 }
 const response = (result,status=200) => ({status,ok:status===200,async json() {return {jsonrpc:'2.0',id:1,result};}});
 const hex = (n) => `0x${n.toString(16)}`;
+const preferenceCycle = [...Array(10).fill('receipts'),'all_logs','transfer_logs'];
 function receipt(n) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:'0x0',transactionHash:transaction(n).hash,
   status:'0x1',gasUsed:'0x1234',effectiveGasPrice:'0x1',contractAddress:null,logs:[]};}
 
@@ -334,15 +335,35 @@ await test('unavailable or noncanonical chain never reaches head/block reads; on
   for (let i=0;i<2;i++) {assert.equal((await follower.tick()).status,'retrying');assert.equal(pool.store.blocks.size,0);assert.equal(headReads,0);}
   assert.equal((await follower.tick()).persistedBlocks,3);await follower.tick();assert.equal(checks,3);assert.equal(headReads,2);
 });
-await test('work burst is bounded and carries 6/3/3 fairness even across single-call bursts',async () => {
+await test('work burst is bounded with an exact 10/1/1 worker-call preference cycle',async () => {
   const preferences=[];const worker={async runOnce({preferredComponent}) {preferences.push(preferredComponent);return {status:'complete'};}};
   const defaultBurst=createWorkBurst({worker});assert.equal((await defaultBurst()).length,12);
-  assert.deepEqual(preferences,[...Array(6).fill('receipts'),...Array(3).fill('all_logs'),...Array(3).fill('transfer_logs')]);
-  preferences.length=0;const single=createWorkBurst({worker,maxCalls:1});for (let i=0;i<12;i++) assert.equal((await single()).length,1);
-  assert.equal(preferences.filter((c) => c==='receipts').length,6);assert.equal(preferences.filter((c) => c==='all_logs').length,3);
-  assert.equal(preferences.filter((c) => c==='transfer_logs').length,3);
+  assert.deepEqual(preferences,preferenceCycle);
   assert.equal((await createWorkBurst({worker,maxCalls:50})()).length,50);
   for (const maxCalls of [0,51,1.5]) assert.throws(() => createWorkBurst({worker,maxCalls}));
+});
+await test('small and single-call bursts carry preferences; endless receipt backlog cannot starve either log component',async () => {
+  for (const maxCalls of [1,5]) {
+    const preferences=[];
+    // All components stay ready; receipt work never runs out to force a log fallback.
+    const burst=createWorkBurst({maxCalls,worker:{async runOnce({preferredComponent}) {
+      preferences.push(preferredComponent);return {status:'complete',component:preferredComponent};
+    }}});
+    for (let i=0;i<36;i++) assert.equal((await burst()).length,maxCalls);
+    assert.deepEqual(preferences,Array.from({length:36*maxCalls},(_,i) => preferenceCycle[i%12]));
+    assert.equal(preferences.filter((c) => c==='all_logs').length,3*maxCalls);
+    assert.equal(preferences.filter((c) => c==='transfer_logs').length,3*maxCalls);
+  }
+});
+await test('each ten-job all_logs or transfer_logs batch consumes only one preference position',async () => {
+  const preferences=[];const burst=createWorkBurst({worker:{async runOnce({preferredComponent}) {
+    preferences.push(preferredComponent);const jobCount=preferredComponent==='receipts' ? 1 : 10;
+    return {status:'complete',component:preferredComponent,jobCount,completedJobs:jobCount};
+  }}});
+  const results=[...await burst(),...await burst()];
+  assert.deepEqual(preferences,[...preferenceCycle,...preferenceCycle]);
+  for (const i of [10,11,22,23]) assert.equal(results[i].completedJobs,10);
+  assert.equal(results[12].component,'receipts');assert.equal(results.length,24);
 });
 await test('retrying ends the burst immediately without starting a second worker job',async () => {
   let calls=0;
@@ -404,14 +425,44 @@ await test('real worker/repository honors receipt priority and both log quotas d
   const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<150;n++) await repository.scheduleBlock(n);
   const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request() {return [];}});
   const worker=createReceiptWorker({repository,rpc});
-  for (let i=0;i<30;i++) assert.equal((await worker.runOnce({preferredComponent:'receipts'})).status,'complete');
-  const from=pool.calls.length;const results=await createWorkBurst({worker})();
-  assert.deepEqual(results.map((r) => r.component),[...Array(6).fill('receipts'),...Array(3).fill('all_logs'),...Array(3).fill('transfer_logs')]);
+  for (let i=0;i<20;i++) assert.equal((await worker.runOnce({preferredComponent:'receipts'})).status,'complete');
+  const from=pool.calls.length;const burst=createWorkBurst({worker});const results=[...await burst(),...await burst()];
+  assert.deepEqual(results.map((r) => r.component),[...preferenceCycle,...preferenceCycle]);
   assert(results.every((r) => r.status==='complete'));
-  assert.equal([...pool.store.work.values()].filter((w) => w.component==='receipts' && w.state==='pending').length,14);
-  assert(results.slice(6).every((r) => r.jobCount===10 && r.completedJobs===10));
+  assert.equal([...pool.store.work.values()].filter((w) => w.component==='receipts' && w.state==='pending').length,10);
+  assert(results.filter((r) => r.component!=='receipts').every((r) => r.jobCount===10 && r.completedJobs===10));
+  assert.equal(results.filter((r) => r.component==='receipts').length,20);
+  assert([...pool.store.work.values()].filter((w) => w.component==='receipts').every((w) => w.start_block===w.end_block));
   const claims=pool.calls.slice(from).filter((c) => c.text.includes('a2:claim'));assert(claims.every((c) => c.text.includes('FOR UPDATE SKIP LOCKED')));
+  assert.equal(claims.length,24);
   assert.deepEqual(claims.map((c) => c.values[7]),results.map((r) => r.component));
+});
+await test('10/1/1 also drains ready receipts and ten-job log batches without creating any work',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,Array.from({length:50},(_,i) => block(100+i,0)));
+  const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<150;n++) await repository.scheduleBlock(n);
+  const preparer=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (let i=0;i<20;i++) assert.equal((await preparer.runOnce({preferredComponent:'receipts'})).status,'complete');
+  const rows=pool.store.work.size;let time=0;
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workHighWater:50,workLowWater:10},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      assert.equal(url,ARC_RPC_URL);assert.equal(JSON.parse(init.body).method,'eth_getLogs');return response([]);
+    }});
+  const result=await runtime.cycle();assert.equal(result.backpressure,'drain');assert.equal(result.chain.status,'paused');
+  assert.deepEqual(result.work.map((r) => r.component),preferenceCycle);assert(result.work.every((r) => r.status==='complete'));
+  assert(result.work.slice(10).every((r) => r.jobCount===10 && r.completedJobs===10));
+  assert.equal(pool.store.work.size,rows);assert.equal(result.outstanding,40);
+  assert.deepEqual(result.scheduledBlocks,[]);assert.deepEqual(result.deferredBlocks,[]);
+});
+await test('empty preferred all_logs and transfer_logs slots fall back to ready single-block receipts',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0),block(101,0)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();for (const n of [100,101]) await repository.scheduleBlock(n);
+  const worker=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (const preferredComponent of ['all_logs','transfer_logs']) {
+    const result=await worker.runOnce({preferredComponent,enqueueFollowups:false});
+    assert.equal(result.status,'complete');assert.equal(result.component,'receipts');
+  }
+  assert.equal(pool.store.work.size,2);
+  assert([...pool.store.work.values()].every((w) => w.state==='complete' && w.start_block===w.end_block));
 });
 await test('preferred claim falls back, respects not_before, excludes terminal work and preserves old callers',async () => {
   const {pool,foundation}=await setup();const repository=createReceiptRepository(pool);await repository.initialize();

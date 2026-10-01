@@ -9,11 +9,12 @@ import { createA2RpcClient } from './a2-rpc.js';
 
 const SUMMARY_INTERVAL_MS = 60000;
 const WORK_PREFERENCES = Object.freeze([
-  ...Array(6).fill('receipts'),...Array(3).fill('all_logs'),...Array(3).fill('transfer_logs'),
+  ...Array(10).fill('receipts'),'all_logs','transfer_logs',
 ]);
 const BURST_STOPS = new Set(['idle','retrying','aborted','continuity_error','persistent_partial','stale_lease']);
 
 // Preference is carried across bursts, including a configured burst of one.
+// Each worker call consumes one position, regardless of the number of jobs in a log batch.
 // Claim falls back to any ready component, so unused opportunities are never reserved.
 export function createWorkBurst({worker,maxCalls=12} = {}) {
   if (!worker?.runOnce || !Number.isSafeInteger(maxCalls) || maxCalls < 1 || maxCalls > 50) throw new Error('invalid_work_burst');
