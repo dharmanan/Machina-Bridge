@@ -129,7 +129,7 @@ function legacyFollowupEnqueues(pool) {
 async function finish(ctx,instance,n) {await ctx.repository.scheduleBlock(n);for (let i=0;i<3;i++) assert.equal((await instance.runOnce()).status,'complete');}
 
 await test('003 migration upgrades production-like 001/002 ledger once; immutable hashes and A1 retained',async () => {
-  assert.deepEqual(MIGRATIONS,['001_init','002_a2_foundation','003_a2_receipts']);
+  assert.deepEqual(MIGRATIONS,['001_init','002_a2_foundation','003_a2_receipts','004_a2_metric_buckets']);
   for (const [name,expected] of [['001_init','c38b78a7e0e1c47e1de5f1400f1502f53f4ce8eeb20fe5d8f328fb59d1992ff0'],
     ['002_a2_foundation','308c747d1b1f1c3fa3cace6daba11434eb5a1ba3709701b657ec1a93c3f43cd5']]) {
     const sql=await readFile(new URL(`../server/arc-intelligence/sql/${name}.sql`,import.meta.url));
@@ -137,7 +137,7 @@ await test('003 migration upgrades production-like 001/002 ledger once; immutabl
   }
   const pool=fixturePool();await migrate(pool);const a1=structuredClone(pool.store.a1);
   pool.store.migrations.delete('003_a2_receipts');const old=structuredClone(pool.store.migrations);pool.calls.length=0;
-  await migrate(pool);await migrate(pool);assert.equal(pool.store.migrations.size,3);assert.deepEqual(pool.store.a1,a1);
+  await migrate(pool);await migrate(pool);assert.equal(pool.store.migrations.size,4);assert.deepEqual(pool.store.a1,a1);
   for (const [key,value] of old) assert.deepEqual(pool.store.migrations.get(key),value);
   assert.equal(pool.calls.filter((c) => c.text.startsWith('ALTER TABLE arc_intelligence_blocks')).length,1);
   assert(!pool.calls.some((c) => c.text.startsWith('CREATE TABLE IF NOT EXISTS arc_intelligence_state')));

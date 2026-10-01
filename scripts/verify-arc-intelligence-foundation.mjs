@@ -22,8 +22,8 @@ const job = (key='blocks100') => ({component:'manifest',logicalKey:key,startBloc
 await test('versioned migrations are idempotent, additive, checksum protected and preserve A1',async () => {
   const pool=fixturePool(); const a1=structuredClone(pool.store.a1);
   await migrate(pool); const records=structuredClone(pool.store.migrations); await migrate(pool);
-  assert.equal(pool.store.migrations.size,3); assert.deepEqual(pool.store.migrations,records); assert.deepEqual(pool.store.a1,a1);
-  assert.equal(pool.store.tables.size,13); names.forEach((name) => assert(pool.store.tables.has(name)));
+  assert.equal(pool.store.migrations.size,4); assert.deepEqual(pool.store.migrations,records); assert.deepEqual(pool.store.a1,a1);
+  assert.equal(pool.store.tables.size,14); names.forEach((name) => assert(pool.store.tables.has(name)));
   const sql=await readFile(new URL('../server/arc-intelligence/sql/002_a2_foundation.sql',import.meta.url),'utf8');
   assert(!/\b(?:ALTER|DROP|TRUNCATE)\b/.test(sql));
   names.forEach((name) => assert(!sql.includes(name)));
@@ -46,7 +46,7 @@ await test('interrupted migration rolls back ledger and tables, retry applies ex
   const pool=fixturePool(); const a1=structuredClone(pool.store.a1);
   pool.fail('CREATE TABLE IF NOT EXISTS arc_intelligence_lanes');
   await assert.rejects(migrate(pool)); assert.equal(pool.store.migrations.size,0); assert.equal(pool.store.tables.size,4);
-  assert.deepEqual(pool.store.a1,a1); await migrate(pool); await migrate(pool); assert.equal(pool.store.migrations.size,3);
+  assert.deepEqual(pool.store.a1,a1); await migrate(pool); await migrate(pool); assert.equal(pool.store.migrations.size,4);
 });
 await test('missing A1 anchor never assumes genesis or prevents A1 migration',async () => {
   const pool=fixturePool(); pool.store.a1=null; await migrate(pool);

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { ARC_CHAIN_ID, ARC_RPC_URL } from '../../api/_lib/arc-intelligence/rpc.js';
 
 export const FOUNDATION_EPOCH = 'a2-foundation-1';
-export const MIGRATIONS = Object.freeze(['001_init', '002_a2_foundation', '003_a2_receipts']);
+export const MIGRATIONS = Object.freeze(['001_init', '002_a2_foundation', '003_a2_receipts', '004_a2_metric_buckets']);
 
 export function captureA1Anchor(state) {
   if (!state) return { epoch: FOUNDATION_EPOCH, anchor: null };

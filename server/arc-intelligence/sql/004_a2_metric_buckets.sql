@@ -1,0 +1,35 @@
+CREATE TABLE IF NOT EXISTS arc_intelligence_metric_buckets (
+  chain_id integer NOT NULL CHECK (chain_id = 5042),
+  period text NOT NULL CHECK (period IN ('hour','day')),
+  bucket_start bigint NOT NULL CHECK (bucket_start >= 0),
+  bucket_end bigint NOT NULL,
+  start_block bigint CHECK (start_block >= 0),
+  end_block bigint,
+  start_hash text,
+  end_hash text,
+  block_count integer NOT NULL CHECK (block_count >= 0),
+  definition_version text NOT NULL,
+  reducer_version text NOT NULL,
+  coverage_status text NOT NULL CHECK (coverage_status IN ('available','partial','unavailable')),
+  complete boolean NOT NULL DEFAULT false,
+  required_reducers_complete boolean NOT NULL DEFAULT false,
+  raw_prunable boolean NOT NULL DEFAULT false,
+  metrics jsonb NOT NULL,
+  coverage jsonb NOT NULL,
+  evidence_digest text NOT NULL CHECK (evidence_digest ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (chain_id,period,bucket_start,definition_version,reducer_version),
+  CHECK (bucket_end - bucket_start = CASE period WHEN 'hour' THEN 3600 ELSE 86400 END),
+  CHECK (bucket_start % (CASE period WHEN 'hour' THEN 3600 ELSE 86400 END) = 0),
+  CHECK ((block_count = 0 AND start_block IS NULL AND end_block IS NULL AND start_hash IS NULL AND end_hash IS NULL)
+    OR (block_count > 0 AND start_block IS NOT NULL AND end_block IS NOT NULL AND end_block >= start_block
+      AND start_hash IS NOT NULL AND start_hash ~ '^0x[0-9a-f]{64}$'
+      AND end_hash IS NOT NULL AND end_hash ~ '^0x[0-9a-f]{64}$')),
+  CHECK (complete = (coverage_status = 'available')),
+  CHECK (NOT complete OR (block_count = end_block - start_block + 1 AND coverage @> '{"scope":"core_network",
+    "blockNumbersContiguous":true,"parentHashesContinuous":true,"timestampsMonotonic":true,
+    "receiptEvidenceComplete":true,"certificatesComplete":true,"factSetsComplete":true,
+    "leftBoundaryCovered":true,"rightBoundaryCovered":true,"bounded":true}'::jsonb)),
+  CHECK (NOT raw_prunable OR (complete AND required_reducers_complete))
+);

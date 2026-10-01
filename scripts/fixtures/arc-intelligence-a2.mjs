@@ -25,7 +25,7 @@ const names = ['arc_intelligence_state','arc_intelligence_chunks','arc_intellige
 // SQL/state doubles follow the real repository calls. They do not certify a deployed Postgres instance.
 export function fixturePool() {
   let store = { a1:{ id:1,chain_id:5042,source:ARC_RPC_URL,last_indexed_block:'99',last_indexed_hash:hash(100),next_block:'100' },
-    migrations:new Map(),lanes:new Map(),blocks:new Map(),work:new Map(),coverage:new Map(),tables:new Set(names),nextId:1,transactions:new Map(),receipts:new Map(),logs:new Map(),reconciliation:new Map() };
+    migrations:new Map(),lanes:new Map(),blocks:new Map(),work:new Map(),coverage:new Map(),tables:new Set(names),nextId:1,transactions:new Map(),receipts:new Map(),logs:new Map(),reconciliation:new Map(),metricBuckets:new Map() };
   let clock = 1000000;
   let failure = null;
   const calls = [];
@@ -52,10 +52,57 @@ export function fixturePool() {
           store.migrations.set(values[0],{version:values[0],checksum:values[1],metadata:JSON.parse(values[2])}); return rows();
         }
         if (text === 'SELECT * FROM arc_intelligence_state WHERE id = 1') return rows(store.a1 ? [store.a1] : []);
-        const parsed=text.match(/^\/\* (a2|receipts):(\w+) \*\//);
-        const operation=parsed?.[1] === 'receipts' ? `receipts_${parsed[2]}` : parsed?.[2];
+        const parsed=text.match(/^\/\* (a2|receipts|metrics):(\w+) \*\//);
+        const operation=parsed?.[1] !== 'a2' ? `${parsed?.[1]}_${parsed?.[2]}` : parsed?.[2];
         const lane = store.lanes.get(laneKey(values));
         switch (operation) {
+          case 'metrics_hour': {
+            if (text.endsWith('FOR SHARE OF b')) assert(transactionOpen);
+            const blocks=[...store.blocks.values()].filter((b) => b.chain_id===values[0]);
+            const ordered=blocks.sort((a,b) => a.timestamp-b.timestamp || a.block_number-b.block_number);
+            const selected=[...ordered.filter((b) => b.timestamp>=values[5] && b.timestamp<values[6]).slice(0,values[7]).map((b) => ({...b,window_role:'inside'})),
+              ...ordered.filter((b) => b.timestamp<values[5]).slice(-1).map((b) => ({...b,window_role:'before'})),
+              ...ordered.filter((b) => b.timestamp>=values[6]).slice(0,1).map((b) => ({...b,window_role:'after'}))];
+            return rows(selected.sort((a,b) => a.block_number-b.block_number).map((b) => {
+              const c=[...store.coverage.values()].find((c) => laneKey(c.identity)===laneKey(values) && c.start===b.block_number
+                && c.end===b.block_number && c.startHash===b.block_hash && c.endHash===b.block_hash && c.dimension==='receipts' && c.state==='complete');
+              const certificate=(kind) => [...store.reconciliation.values()].find((r) => r.chain_id===values[0] && r.block_number===b.block_number
+                && r.block_hash===b.block_hash && r.kind===kind && r.definition_version===values[4] && r.complete)?.evidence_digest ?? null;
+              return {...b,receipts_digest:c?.digest ?? null,all_logs_digest:certificate('all_logs'),transfer_logs_digest:certificate('transfer_logs')};
+            }));
+          }
+          case 'metrics_transactions': case 'metrics_receipts': {
+            assert(!transactionOpen,'Heavy fact reads outside publish transaction');assert(text.includes('LIMIT $3'));
+            const facts=operation==='metrics_transactions' ? store.transactions : store.receipts;
+            return rows([...facts.values()].filter((r) => r.chain_id===values[0] && values[1].includes(r.block_number))
+              .sort((a,b) => a.block_number-b.block_number || a.transaction_index-b.transaction_index).slice(0,values[2]));
+          }
+          case 'metrics_lock': assert(transactionOpen);return rows();
+          case 'metrics_bucket': return rows(store.metricBuckets.has(JSON.stringify(values)) ? [store.metricBuckets.get(JSON.stringify(values))] : []);
+          case 'metrics_upsert': {
+            assert(transactionOpen);assert(text.includes('false,false'));assert(text.includes('WHERE arc_intelligence_metric_buckets.evidence_digest<>EXCLUDED.evidence_digest'));
+            const columns=['chain_id','bucket_start','bucket_end','start_block','end_block','start_hash','end_hash','block_count',
+              'definition_version','reducer_version','coverage_status','complete','metrics','coverage','evidence_digest'];
+            const r=Object.fromEntries(columns.map((c,i) => [c,values[i]]));Object.assign(r,{period:'hour',required_reducers_complete:false,raw_prunable:false,
+              metrics:JSON.parse(r.metrics),coverage:JSON.parse(r.coverage)});
+            assert.equal(r.complete,r.coverage_status==='available');
+            if (r.complete) for (const key of ['blockNumbersContiguous','parentHashesContinuous','timestampsMonotonic','receiptEvidenceComplete',
+              'certificatesComplete','factSetsComplete','leftBoundaryCovered','rightBoundaryCovered','bounded']) assert.equal(r.coverage[key],true);
+            const key=JSON.stringify([r.chain_id,r.period,r.bucket_start,r.definition_version,r.reducer_version]);
+            if (store.metricBuckets.get(key)?.evidence_digest===r.evidence_digest) return rows();
+            store.metricBuckets.set(key,r);return rows([r]);
+          }
+          case 'metrics_raw_counts': {
+            const counts=Object.fromEntries(['transactions','receipts','logs','reconciliation'].map((table) => [table,String([...store[table].values()]
+              .filter((r) => r.chain_id===values[0] && values[1].includes(r.block_number)).slice(0,values[2]).length)]));
+            counts.coverage=String([...store.coverage.values()].filter((r) => r.identity[0]===values[0] && r.start>=values[3] && r.end<=values[4]).slice(0,values[2]).length);
+            return rows([counts]);
+          }
+          case 'metrics_unresolved': {
+            const counts=new Map();for (const w of store.work.values()) if (w.chain_id===values[0] && w.start_block<=values[2] && w.end_block>=values[1] && w.state!=='complete')
+              counts.set(w.state,(counts.get(w.state) ?? 0)+1);
+            return rows([...counts].map(([state,count]) => ({state,count:String(count)})));
+          }
           case 'anchor': assert(text.endsWith('FOR UPDATE')); return rows(store.migrations.has(values[0]) ? [{metadata:store.migrations.get(values[0]).metadata}] : []);
           case 'capture_anchor': {
             assert(transactionOpen);
