@@ -12,6 +12,22 @@ export const RECEIPT_IDENTITY = Object.freeze({ ...CHAIN_IDENTITY,lane:'receipts
 const where = 'chain_id=$1 AND lane=$2 AND scope_id=$3 AND epoch=$4 AND definition_version=$5';
 const dimensions = { receipts:'receipts',all_logs:'all_log_reconciliation',transfer_logs:'transfer_log_reconciliation' };
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+// Native result columns retain pg's bigint/text/array/timestamp parsers; no JSON numeric conversion.
+const factTables = [
+  ['transactions','chain_id block_number block_hash transaction_index transaction_hash from_address to_address value_raw input_selector'],
+  ['receipts','chain_id block_number block_hash transaction_index transaction_hash status gas_used_raw effective_gas_price_raw contract_address'],
+  ['logs','chain_id block_number block_hash transaction_index transaction_hash log_index address topics data removed'],
+  ['reconciliation','chain_id block_number block_hash kind definition_version receipt_log_count queried_log_count missing_count extra_count duplicate_receipt_count duplicate_query_count identityless_receipt_count identityless_query_count payload_mismatch_count query_complete complete evidence_digest reason_code updated_at'],
+].map(([table,columns]) => [table,columns.split(' ')]);
+const factColumns = [...new Set(factTables.flatMap(([,columns]) => columns))];
+const factType = (column) => column === 'block_number' ? 'bigint' : column === 'topics' ? 'text[]'
+  : column === 'updated_at' ? 'timestamptz' : ['removed','query_complete','complete'].includes(column) ? 'boolean'
+  : column === 'chain_id' || column.endsWith('_index') || column.endsWith('_count') ? 'integer' : 'text';
+const factSql = `/* receipts:facts */ ${factTables.map(([table,columns],kind) =>
+  `SELECT ${kind} AS fact_kind,${factColumns.map((column) => columns.includes(column)
+    ? column : `NULL::${factType(column)} AS ${column}`).join(',')}
+   FROM arc_intelligence_${table} WHERE chain_id=$1 AND block_number=$2${table === 'reconciliation' ? ' AND definition_version=$3' : ''}`
+).join(' UNION ALL ')} ORDER BY fact_kind,transaction_index,log_index`;
 
 export function receiptSetComplete(view) {
   return view.block.transactions_complete === true && !view.block.receipt_evidence_conflict
@@ -30,16 +46,14 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
     const block = (await client.query(`/* receipts:block */ SELECT * FROM arc_intelligence_blocks
       WHERE chain_id=$1 AND block_number=$2${lock ? ' FOR UPDATE' : ''}`,[ARC_CHAIN_ID,number])).rows[0];
     if (!block || block.transactions_complete !== true) throw new Error('chain_facts_unavailable');
-    const transactions = (await client.query(`/* receipts:transactions */ SELECT * FROM arc_intelligence_transactions
-      WHERE chain_id=$1 AND block_number=$2 ORDER BY transaction_index`,[ARC_CHAIN_ID,number])).rows;
+    const facts = Object.fromEntries(factTables.map(([table]) => [table,[]]));
+    for (const row of (await client.query(factSql,[ARC_CHAIN_ID,number,identity.definitionVersion])).rows) {
+      const [table,columns]=factTables[row.fact_kind];
+      facts[table].push(Object.fromEntries(columns.filter((column) => Object.hasOwn(row,column)).map((column) => [column,row[column]])));
+    }
+    const {transactions,receipts,logs,reconciliation}=facts;
     if (transactions.length !== position(block.transaction_count) || transactions.some((t,i) => position(t.transaction_index) !== i
       || t.block_hash !== block.block_hash)) throw new Error('chain_facts_unavailable');
-    const receipts = (await client.query(`/* receipts:receipts */ SELECT * FROM arc_intelligence_receipts
-      WHERE chain_id=$1 AND block_number=$2 ORDER BY transaction_index`,[ARC_CHAIN_ID,number])).rows;
-    const logs = (await client.query(`/* receipts:logs */ SELECT * FROM arc_intelligence_logs
-      WHERE chain_id=$1 AND block_number=$2 ORDER BY log_index`,[ARC_CHAIN_ID,number])).rows;
-    const reconciliation = (await client.query(`/* receipts:evidence */ SELECT * FROM arc_intelligence_reconciliation
-      WHERE chain_id=$1 AND block_number=$2 AND definition_version=$3`,[ARC_CHAIN_ID,number,identity.definitionVersion])).rows;
     return { block,transactions,receipts,logs,reconciliation };
   }
   async function guard(client, lease) {
@@ -162,9 +176,9 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       throw error;
     }
   }
-  async function commitAndAdvance(work) {
+  async function commitAndAdvance(work,deferFrontier=false) {
     const result = await transaction(work);
-    await advanceFrontier();
+    if (!deferFrontier) await advanceFrontier();
     return result;
   }
   async function persistReconciliation(client,lease,evidence,retryMs,deferFrontier=false) {
@@ -353,7 +367,7 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         return true;
       });
     },
-    async saveReceipts(lease,rawReceipts,{ retryMs=1000,finalize=true,enqueueFollowups=true }={}) {
+    async saveReceipts(lease,rawReceipts,{ retryMs=1000,finalize=true,enqueueFollowups=true,deferFrontier=false }={}) {
       return commitAndAdvance(async (client) => {
         const {job,view,state}=await guard(client,lease);
         if (job.component !== 'receipts') throw new Error('work_identity_mismatch');
@@ -371,12 +385,12 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         if (finalize) await finish(client,job,complete,retryMs);
         await progress(client,state,position(view.block.block_number));
         return { complete,receiptCount:view.receipts.length,missingCount:view.transactions.length-view.receipts.length };
-      });
+      },deferFrontier);
     },
     async saveReconciliation(lease,evidence,retryMs=1000) {
       return commitAndAdvance((client) => persistReconciliation(client,lease,evidence,retryMs));
     },
-    async saveReconciliationBatch(records,{maxBlocks=10,signal,onError}={}) {
+    async saveReconciliationBatch(records,{maxBlocks=10,signal,onError,deferFrontier=false}={}) {
       if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE
         || !Array.isArray(records) || !records.length || records.length > maxBlocks
         || (onError !== undefined && typeof onError !== 'function')) throw new Error('invalid_log_batch');
@@ -396,7 +410,7 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         }
       }
       let frontierError;
-      if (results.some((r) => r.value)) {
+      if (!deferFrontier && results.some((r) => r.value)) {
         try { await advanceFrontier(); } catch (error) { frontierError=error; }
       }
       return {results,frontierError};

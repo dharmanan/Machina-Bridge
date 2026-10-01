@@ -186,7 +186,22 @@ export function fixturePool() {
               || (b.receipt_complete && !b.transfer_log_reconciliation_complete && !hasWork(b,'transfer_logs'))))
             .sort((a,b) => a.block_number-b.block_number).slice(0,values[3]).map((b) => ({block_number:b.block_number})));
           }
-          case 'receipts_block': return rows(store.blocks.has(values[1]) ? [store.blocks.get(values[1])] : []);
+          case 'receipts_block': {
+            if (text.endsWith('FOR UPDATE')) assert(transactionOpen);
+            return rows(store.blocks.has(values[1]) ? [store.blocks.get(values[1])] : []);
+          }
+          case 'receipts_facts': {
+            assert.equal((text.match(/ UNION ALL /g) ?? []).length,3);
+            assert(text.endsWith('ORDER BY fact_kind,transaction_index,log_index'));
+            assert(!/json|row_to_json/i.test(text));
+            const tables=['transactions','receipts','logs','reconciliation'];
+            return rows(tables.flatMap((table,fact_kind) => [...store[table].values()]
+              .filter((r) => r.chain_id===values[0] && r.block_number===values[1]
+                && (table!=='reconciliation' || r.definition_version===values[2]))
+              .sort((a,b) => table==='logs' ? a.log_index-b.log_index
+                : table==='reconciliation' ? 0 : a.transaction_index-b.transaction_index)
+              .map((r) => ({fact_kind,...r}))));
+          }
           case 'receipts_transactions': return rows([...store.transactions.values()].filter((t) => t.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
           case 'receipts_receipts': return rows([...store.receipts.values()].filter((r) => r.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
           case 'receipts_logs': return rows([...store.logs.values()].filter((l) => l.block_number === values[1]).sort((a,b) => a.log_index-b.log_index));

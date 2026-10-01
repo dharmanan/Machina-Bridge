@@ -27,7 +27,7 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
     if (lease) await repository.retry(lease,retryMs).catch(() => {});
     return {status:signal?.aborted ? 'aborted' : 'retrying',error:error.message==='work_capacity_reached' ? 'work_capacity_reached' : 'required_read_unavailable'};
   }
-  async function runLogBatch(firstLease,firstView,signal) {
+  async function runLogBatch(firstLease,firstView,signal,deferFrontier) {
     const leases=await repository.claimLogBatch(firstLease,maxLogRangeBlocks);
     const component=firstLease.component;
     const transfer=component==='transfer_logs';
@@ -84,7 +84,8 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
     let frontierError;
     const pending=records.filter((r) => !r.result);
     if (pending.length) {
-      const batch=await repository.saveReconciliationBatch(pending,{maxBlocks:maxLogRangeBlocks,signal,onError:fail});
+      const batch=await repository.saveReconciliationBatch(pending,{maxBlocks:maxLogRangeBlocks,signal,onError:fail,
+        ...(deferFrontier ? {deferFrontier:true} : {})});
       for (let i=0;i<pending.length;i++) if (batch.results[i].value) {
         pending[i].result={status:batch.results[i].value.complete ? 'complete' : 'retrying'};
       }
@@ -98,10 +99,11 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
       ...(frontierError ? {error:frontierStatus==='continuity_error' ? 'checkpoint_parent_hash_mismatch' : 'required_read_unavailable'} : {})};
   }
   return {
-    async runOnce({signal,preferredComponent=null,enqueueFollowups=true}={}) {
+    async runOnce({signal,preferredComponent=null,enqueueFollowups=true,deferFrontier=false}={}) {
       if (active) return {skipped:true};
       if (signal?.aborted) return {status:'aborted'};
       active=true;
+      const frontierOptions=deferFrontier ? {deferFrontier:true} : {};
       let lease;
       let retryMs=1000;
       try {
@@ -140,10 +142,10 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
             const canonicalHashes=new Set(view.transactions.map((t) => t.transaction_hash));
             if (bulkValid && duplicateHashes.size === 0 && conflicts.size === 0 && valid.length === view.transactions.length
               && seen.size === canonicalHashes.size && [...seen.keys()].every((hash) => canonicalHashes.has(hash))) {
-              const result=await repository.saveReceipts(lease,valid,{retryMs,finalize:true,enqueueFollowups});
+              const result=await repository.saveReceipts(lease,valid,{retryMs,finalize:true,enqueueFollowups,...frontierOptions});
               return {status:result.complete ? 'complete' : 'retrying',component:lease.component,...result};
             }
-            if (valid.length) await repository.saveReceipts(lease,valid,{retryMs,finalize:false,enqueueFollowups});
+            if (valid.length) await repository.saveReceipts(lease,valid,{retryMs,finalize:false,enqueueFollowups,...frontierOptions});
             view=await repository.getBlock(position(lease.start_block));
           }
           const present=new Set(view.receipts.map((r) => r.transaction_hash));
@@ -155,10 +157,10 @@ export function createReceiptWorker({ repository,rpc,owner='receipt-worker',maxR
           }));
           if (signal?.aborted) throw new Error('operation_aborted');
           const raw=results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-          const result=await repository.saveReceipts(lease,raw,{retryMs,enqueueFollowups});
+          const result=await repository.saveReceipts(lease,raw,{retryMs,enqueueFollowups,...frontierOptions});
           return {status:result.complete ? 'complete' : 'retrying',component:lease.component,...result};
         }
-        return await runLogBatch(lease,view,signal);
+        return await runLogBatch(lease,view,signal,deferFrontier);
       } catch (error) {
         return await handleFailure(lease,error,retryMs,signal);
       } finally {active=false;}

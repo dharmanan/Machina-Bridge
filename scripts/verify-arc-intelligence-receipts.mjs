@@ -22,7 +22,10 @@ function log(n,i=0,index=i,transfer=true) {return {blockNumber:hex(n),blockHash:
 function receipt(n,i=0,logs=[log(n,i)]) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:hex(i),transactionHash:transaction(n,i).hash,
   status:i % 2 ? '0x0' : '0x1',gasUsed:'0x20000000000001',effectiveGasPrice:'0x20000000000002',contractAddress:null,logs};}
 let count=0;
-async function test(name,work) {await work();count++;console.log(`PASS ${name}`);}
+async function test(name,work) {
+  if (process.argv.includes('--focused-a25h') && !name.startsWith('A2.5H')) return;
+  await work();count++;console.log(`PASS ${name}`);
+}
 async function setup(blocks=[block(100)]) {
   const pool=fixturePool();await migrate(pool);const chain=createFoundationRepository(pool);await chain.initializeChainLane();
   for (const b of blocks) await chain.persistManifest(CHAIN_IDENTITY,[b]);
@@ -72,6 +75,28 @@ function fullHandler(n,count=1) {return (method,params) => {
   if (method === 'eth_getLogs') return Array.from({length:count},(_,i) => log(n,i));
   throw new Error('unexpected_call');
 };}
+// Reproduce the base's four independent typed fact reads without caching their results.
+function legacyFactReads(pool) {
+  const connect=pool.connect.bind(pool);
+  pool.connect=async () => {
+    const client=await connect(),query=client.query.bind(client);
+    client.query=async (sql,values) => {
+      if (!sql.includes('receipts:facts')) return query(sql,values);
+      const tables=[['transactions','transactions','transaction_index'],['receipts','receipts','transaction_index'],
+        ['logs','logs','log_index'],['evidence','reconciliation',null]];
+      const rows=[];
+      for (let fact_kind=0;fact_kind<tables.length;fact_kind++) {
+        const [tag,table,order]=tables[fact_kind];
+        const result=await query(`/* receipts:${tag} */ SELECT * FROM arc_intelligence_${table}
+          WHERE chain_id=$1 AND block_number=$2${order ? ` ORDER BY ${order}` : ' AND definition_version=$3'}`,
+        order ? values.slice(0,2) : values);
+        rows.push(...result.rows.map((row) => ({fact_kind,...row})));
+      }
+      return {rows};
+    };
+    return client;
+  };
+}
 async function finish(ctx,instance,n) {await ctx.repository.scheduleBlock(n);for (let i=0;i<3;i++) assert.equal((await instance.runOnce()).status,'complete');}
 
 await test('003 migration upgrades production-like 001/002 ledger once; immutable hashes and A1 retained',async () => {
@@ -889,6 +914,177 @@ await test('shared frontier failure reports retrying and retains durable process
   assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));const calls=w.calls.length;
   await ctx.repository.advanceFrontier();lane=await ctx.repository.getLane();assert.equal(lane.contiguous_complete_through,102);
   assert.equal(lane.checkpoint_hash,hash(103));assert.equal(w.calls.length,calls);
+});
+await test('A2.5H typed fact load equals legacy reads, retains precision, ordering, timestamps and block locks',async () => {
+  const ctx=await setup([block(100,2)]);await ctx.repository.scheduleBlock(100);
+  const w=worker(ctx,fullHandler(100,2));await w.instance.runOnce({preferredComponent:'receipts'});
+  const lease=await ctx.repository.claim('typed-test',180000,{preferredComponent:'all_logs'});
+  const view=await ctx.repository.getBlock(100),logs=view.logs.map(normalizedLog);
+  await ctx.repository.saveReconciliation(lease,reconcileLogs(logs,logs,{receiptSetComplete:true,queryComplete:true},'all'));
+  const cert=ctx.pool.store.reconciliation.values().next().value;cert.updated_at=new Date('2026-10-01T00:00:00Z');
+  // Deliberately reverse durable insertion order: SQL ordering must determine the view.
+  for (const name of ['transactions','receipts','logs']) ctx.pool.store[name]=new Map([...ctx.pool.store[name]].reverse());
+  const before=ctx.pool.calls.length,actual=await ctx.repository.getBlock(100);
+  assert.equal(ctx.pool.calls.length-before,2);
+  legacyFactReads(ctx.pool);
+  assert.deepEqual(actual,await ctx.repository.getBlock(100));
+  assert.deepEqual(actual.transactions.map((r) => r.transaction_index),[0,1]);
+  assert.deepEqual(actual.receipts.map((r) => r.transaction_index),[0,1]);
+  assert.deepEqual(actual.logs.map((r) => r.log_index),[0,1]);
+  assert.equal(actual.transactions[0].value_raw,'900719925474099312345');
+  assert.equal(actual.receipts[0].gas_used_raw,'9007199254740993');
+  assert.equal(actual.receipts[0].effective_gas_price_raw,'9007199254740994');
+  assert(actual.reconciliation[0].updated_at instanceof Date);
+  assert(ctx.pool.calls.some((c) => c.text.includes('receipts:block') && c.text.endsWith('FOR UPDATE')));
+  const sql=ctx.pool.calls.find((c) => c.text.includes('receipts:facts')).text;
+  assert(sql.includes('NULL::bigint AS block_number')===false); // bigint comes directly from every table.
+  assert(sql.includes('NULL::text[] AS topics'));assert(sql.includes('NULL::timestamptz AS updated_at'));
+});
+await test('A2.5H pg parsed bigint strings and nullable typed facts survive extraction unchanged',async () => {
+  const ctx=await readyLogs(1),expected=await ctx.repository.getBlock(100);
+  const connect=ctx.pool.connect.bind(ctx.pool);
+  ctx.pool.connect=async () => {
+    const c=await connect(),query=c.query.bind(c);
+    c.query=async (...args) => {
+      const result=await query(...args);
+      if (args[0].includes('receipts:facts')) for (const row of result.rows) row.block_number=String(row.block_number);
+      return result;
+    };return c;
+  };
+  for (const name of ['transactions','receipts','logs','reconciliation']) for (const row of expected[name]) row.block_number=String(row.block_number);
+  assert.deepEqual(await ctx.repository.getBlock(100),expected);
+});
+await test('A2.5H normal 10/1/1 burst reproduces base truth with 990->703 SQL, 66->55 transactions, 22->11 scans',async () => {
+  async function profile(legacy) {
+    const ctx=await setup(Array.from({length:10},(_,i) => block(100+i)));
+    if (legacy) legacyFactReads(ctx.pool);
+    for (let n=100;n<110;n++) await ctx.repository.scheduleBlock(n);
+    const w=worker(ctx,(method,[arg]) => method==='eth_getBlockReceipts'
+      ? [receipt(Number(BigInt(arg)),0,[log(Number(BigInt(arg))),log(Number(BigInt(arg)),0,1,false)])]
+      : rangeLogs(100,10,!!arg.topics));
+    ctx.pool.calls.length=0;
+    const burst=createWorkBurst({worker:{async runOnce(options) {
+      await ctx.repository.workPressure();return w.instance.runOnce(options);
+    }},...(legacy ? {} : {frontier:() => ctx.repository.advanceFrontier()})});
+    const results=await burst();assert.equal(results.length,12);assert(results.every((r) => r.status==='complete'));
+    assert.deepEqual(results.map((r) => r.component),[...Array(10).fill('receipts'),'all_logs','transfer_logs']);
+    assert.equal(w.calls.filter((c) => c.method==='eth_getBlockReceipts').length,10);
+    assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,2);assert.equal(w.calls.length,12);
+    return {ctx,totals:{sql:ctx.pool.calls.length,transactions:ctx.pool.calls.filter((c) => c.text==='BEGIN').length,
+      advance:ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length}};
+  }
+  const before=await profile(true),after=await profile(false);
+  assert.deepEqual(before.totals,{sql:990,transactions:66,advance:22});
+  assert.deepEqual(after.totals,{sql:703,transactions:55,advance:11});
+  for (const key of ['blocks','transactions','receipts','logs','reconciliation','coverage','work','lanes'])
+    assert.deepEqual(after.ctx.pool.store[key],before.ctx.pool.store[key],`${key} must remain identical`);
+  console.log(`A2.5H_BURST_PROFILE: before=${JSON.stringify(before.totals)} after=${JSON.stringify(after.totals)}; identical durable truth`);
+});
+await test('A2.5H durable certificates survive crash before flush and idle restarted burst recovers without RPC',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,(method,[filter]) => rangeLogs(100,3,!!filter.topics));
+  for (const preferredComponent of ['all_logs','transfer_logs']) {
+    assert.equal((await w.instance.runOnce({preferredComponent,deferFrontier:true})).status,'complete');
+  }
+  const lane=await ctx.repository.getLane();assert.equal(lane.processed_through,102);assert.equal(lane.contiguous_complete_through,null);
+  assert([...ctx.pool.store.work.values()].every((j) => j.state==='complete'));
+  const facts=structuredClone(ctx.pool.store),reads=w.calls.length;
+  // New repository/worker/burst has no memory of deferred writes and no ready work.
+  ctx.repository=createReceiptRepository(ctx.pool);
+  const restarted=worker(ctx,() => {throw new Error('Recovery must be DB-only');});
+  const result=await createWorkBurst({worker:restarted.instance,frontier:() => ctx.repository.advanceFrontier()})();
+  assert.equal(result[0].status,'idle');assert.equal(restarted.calls.length,0);assert.equal(w.calls.length,reads);
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,102);
+  assert.equal((await ctx.repository.getLane()).checkpoint_hash,hash(103));
+  for (const key of ['blocks','receipts','logs','reconciliation','coverage','work']) assert.deepEqual(ctx.pool.store[key],facts[key]);
+});
+await test('A2.5H abort flush preserves committed truth and leaves remaining leases recoverable',async () => {
+  const ctx=await readyLogs(3);const w=worker(ctx,(method,[filter]) => {
+    const start=Number(BigInt(filter.fromBlock)),end=Number(BigInt(filter.toBlock));
+    return rangeLogs(start,end-start+1,!!filter.topics);
+  });
+  await w.instance.runOnce({preferredComponent:'all_logs'});
+  const controller=new AbortController(),connect=ctx.pool.connect.bind(ctx.pool);let armed=false;
+  ctx.pool.connect=async () => {
+    const c=await connect(),query=c.query.bind(c);let written=false;
+    c.query=async (sql,...args) => {
+      if (armed && sql.includes('receipts:reconciliation')) written=true;
+      const result=await query(sql,...args);
+      if (armed && written && sql==='COMMIT') {armed=false;controller.abort();}
+      return result;
+    };return c;
+  };
+  armed=true;
+  const result=await createWorkBurst({worker:w.instance,frontier:() => ctx.repository.advanceFrontier()})({signal:controller.signal});
+  assert.equal(result.length,1);assert.equal(result[0].status,'aborted');assert.equal(result[0].completedJobs,1);
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);
+  assert.equal(ctx.pool.store.blocks.get(101).transfer_log_reconciliation_complete,false);
+  ctx.pool.advance(1000000);
+  assert.equal((await w.instance.runOnce({preferredComponent:'transfer_logs'})).status,'complete');
+  assert.equal((await ctx.repository.getLane()).contiguous_complete_through,102);
+});
+await test('A2.5H nondeferred receipt and log APIs still sweep immediately; deferred receipt still runs in-tx progress',async () => {
+  const ctx=await setup([block(100)]);await ctx.repository.scheduleBlock(100);
+  const lease=await ctx.repository.claim('single-test');ctx.pool.calls.length=0;
+  await ctx.repository.saveReceipts(lease,[receipt(100)]);
+  assert.equal(ctx.pool.calls.filter((c) => c.text==='BEGIN').length,2);
+  assert.equal(ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,2);
+  const r=await ctx.repository.claim('single-log',180000,{preferredComponent:'all_logs'});
+  const view=await ctx.repository.getBlock(100),logs=view.logs.map(normalizedLog);ctx.pool.calls.length=0;
+  await ctx.repository.saveReconciliation(r,reconcileLogs(logs,logs,{receiptSetComplete:true,queryComplete:true},'all'));
+  assert.equal(ctx.pool.calls.filter((c) => c.text==='BEGIN').length,2);
+  assert.equal(ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,2);
+  const deferred=await setup();await deferred.repository.scheduleBlock(100);
+  const job=await deferred.repository.claim('deferred');deferred.pool.calls.length=0;
+  await deferred.repository.saveReceipts(job,[receipt(100)],{deferFrontier:true});
+  assert.equal(deferred.pool.calls.filter((c) => c.text==='BEGIN').length,1);
+  assert.equal(deferred.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,1);
+  assert.equal(deferred.pool.calls.filter((c) => c.text.includes('a2:enqueue')).length,2);
+});
+await test('A2.5H deferred batch preserves per-job fencing, rollback isolation and completed certificate immutability',async () => {
+  const ctx=await readyLogs(3),records=await preparedLogRecords(ctx);
+  records[0].evidence={...records[0].evidence,missingLogCount:1};
+  ctx.pool.store.work.get(records[1].lease.id).lease_until=0;
+  const replacement=await ctx.repository.claim('replacement',180000,{preferredComponent:'all_logs'});
+  const result=await ctx.repository.saveReconciliationBatch(records,{deferFrontier:true,onError:async (r,error) => {
+    if (error.message!=='stale_lease') await ctx.repository.retry(r.lease,r.retryMs);
+  }});
+  assert.deepEqual(result.results.map((r) => r.error?.message ?? r.value.complete),['invalid_reconciliation_evidence','stale_lease',true]);
+  assert.equal(ctx.pool.store.work.get(replacement.id).lease_owner,'replacement');
+  assert(!ctx.pool.store.reconciliation.has('100:all_logs:arc-receipts-logs-v1'));
+  assert(!ctx.pool.store.reconciliation.has('101:all_logs:arc-receipts-logs-v1'));
+  assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,true);
+  await ctx.repository.advanceFrontier();assert.equal((await ctx.repository.getLane()).contiguous_complete_through,null);
+  const completed=ctx.pool.store.work.get(records[2].lease.id);completed.state='pending';completed.not_before=0;
+  const lease=await ctx.repository.claim('immutable',180000,{preferredComponent:'all_logs'});
+  assert.equal(lease.id,completed.id);
+  const certificates=structuredClone(ctx.pool.store.reconciliation),coverage=structuredClone(ctx.pool.store.coverage);
+  const retried=await ctx.repository.saveReconciliationBatch([{lease,evidence:{complete:false}}],{deferFrontier:true});
+  assert.equal(retried.results[0].value.complete,true);
+  assert.deepEqual(ctx.pool.store.reconciliation,certificates);assert.deepEqual(ctx.pool.store.coverage,coverage);
+});
+await test('A2.5H deferred worker freshly locks/reloads facts after RPC and canonical mismatch stops continuity',async () => {
+  for (const failure of ['missing_receipt','changed_receipt','canonical_hash']) {
+    const ctx=await readyLogs(3);let rpcBoundary;
+    const w=worker(ctx,() => {
+      rpcBoundary=ctx.pool.calls.length;
+      if (failure==='missing_receipt') ctx.pool.store.receipts.delete(transaction(101).hash);
+      else if (failure==='changed_receipt') ctx.pool.store.receipts.get(transaction(101).hash).block_hash=hash(999);
+      else [...ctx.pool.store.work.values()].find((j) => j.component==='all_logs' && j.start_block===101).block_hash=hash(999);
+      return rangeLogs(100,3);
+    });
+    const burst=createWorkBurst({worker:w.instance,frontier:() => ctx.repository.advanceFrontier()});
+    const result=(await burst())[0];
+    assert.equal(result.status,failure==='canonical_hash' ? 'continuity_error' : 'retrying');
+    assert.equal(ctx.pool.store.blocks.get(101).all_log_reconciliation_complete,false);
+    assert(!ctx.pool.store.reconciliation.has('101:all_logs:arc-receipts-logs-v1'));
+    const after=ctx.pool.calls.slice(rpcBoundary);
+    assert(after.some((c) => c.text.includes('receipts:block') && c.text.endsWith('FOR UPDATE') && c.values[1]===101));
+    assert(after.some((c) => c.text.includes('receipts:facts') && c.values[1]===101));
+    if (failure==='canonical_hash') {
+      assert.equal((await ctx.repository.getLane()).status,'continuity_error');
+      assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,false);
+    }
+  }
 });
 await test('over 10000 completed logical jobs cannot exhaust queue; pruning preserves active/persistent states and durable evidence',async () => {
   const ctx=await setup();const w=worker(ctx,fullHandler(100));await finish(ctx,w.instance,100);

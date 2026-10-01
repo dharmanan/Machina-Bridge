@@ -16,18 +16,29 @@ const BURST_STOPS = new Set(['idle','retrying','aborted','continuity_error','per
 // Preference is carried across bursts, including a configured burst of one.
 // Each worker call consumes one position, regardless of the number of jobs in a log batch.
 // Claim falls back to any ready component, so unused opportunities are never reserved.
-export function createWorkBurst({worker,maxCalls=12} = {}) {
+export function createWorkBurst({worker,maxCalls=12,frontier} = {}) {
   if (!worker?.runOnce || !Number.isSafeInteger(maxCalls) || maxCalls < 1 || maxCalls > 50) throw new Error('invalid_work_burst');
+  if (frontier !== undefined && typeof frontier !== 'function') throw new Error('invalid_work_burst');
   let preference = 0;
   return async ({signal} = {}) => {
     const results = [];
-    for (let i=0;i<maxCalls;i++) {
-      if (signal?.aborted) break;
-      const preferredComponent = WORK_PREFERENCES[preference];
-      preference = (preference+1)%WORK_PREFERENCES.length;
-      const result = await worker.runOnce({signal,preferredComponent});
-      results.push(result);
-      if (BURST_STOPS.has(result.status)) break;
+    try {
+      for (let i=0;i<maxCalls;i++) {
+        if (signal?.aborted) break;
+        const preferredComponent = WORK_PREFERENCES[preference];
+        preference = (preference+1)%WORK_PREFERENCES.length;
+        const result = await worker.runOnce({signal,preferredComponent,...(frontier ? {deferFrontier:true} : {})});
+        results.push(result);
+        if (BURST_STOPS.has(result.status)) break;
+      }
+    } finally {
+      // Always recover from durable processed/certificate state, even on idle after a hard crash.
+      // This cleanup is DB-only and must also run after abort or an early burst stop.
+      if (frontier) try { await frontier(); } catch (error) {
+        const continuity=error.message==='lane_continuity_stopped' || error.message==='checkpoint_parent_hash_mismatch';
+        results.push({status:continuity ? 'continuity_error' : 'retrying',
+          error:continuity ? 'checkpoint_parent_hash_mismatch' : 'required_read_unavailable',frontierFlush:true});
+      }
     }
     return results;
   };
@@ -54,7 +65,7 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
     const result=await worker.runOnce({...options,enqueueFollowups:!draining});
     if (result.error==='work_capacity_reached') capacityError();
     return result;
-  }},maxCalls:config.workBurst});
+  }},maxCalls:config.workBurst,frontier:() => receipts.advanceFrontier()});
   let active = false;
   let nextSummaryAt = now()+SUMMARY_INTERVAL_MS;
   async function refreshPressure(allowResume=false) {
@@ -123,7 +134,8 @@ export function createA2Runtime({ pool, config, finalityBlocks = 2, fetchImpl = 
       const work = receiptLane?.status === 'continuity_error' ? [{status:'continuity_error'}] : await burst({signal});
       if (!signal?.aborted) await refreshPressure();
       const last = work.at(-1)?.status;
-      const stopped = ['aborted','continuity_error','persistent_partial','stale_lease'].includes(last);
+      const stopped = work.at(-1)?.frontierFlush === true
+        || ['aborted','continuity_error','persistent_partial','stale_lease'].includes(last);
       const fullBurst=work.length===(config.workBurst ?? 12);
       const continueImmediately = draining
         ? !signal?.aborted && fullBurst && work.every((result) => result.status==='complete')

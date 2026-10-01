@@ -17,7 +17,10 @@ import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 import { TRANSFER_TOPIC } from '../api/_lib/arc-intelligence/usdc.js';
 import { fixturePool, block, rawBlock, hash, transaction, fixtureChainRpc } from './fixtures/arc-intelligence-a2.mjs';
 let count = 0;
-async function test(name, work) { await work(); console.log(`PASS ${name}`); count++; }
+async function test(name, work) {
+  if (process.argv.includes('--focused-a25h') && !name.startsWith('A2.5H')) return;
+  await work(); console.log(`PASS ${name}`); count++;
+}
 async function flush() { for (let i=0;i<40;i++) await Promise.resolve(); }
 function clock() {
   let time = 0;
@@ -531,6 +534,73 @@ await test('retrying ends the burst immediately without starting a second worker
     return {status:calls===1 ? 'retrying' : 'complete'};
   }}});
   assert.deepEqual(await burst(),[{status:'retrying'}]);assert.equal(calls,1);
+});
+await test('A2.5H shared frontier flush runs exactly once after normal, early stop, abort and thrown worker',async () => {
+  for (const status of ['complete','idle','retrying','continuity_error','persistent_partial','stale_lease','aborted']) {
+    const events=[];const burst=createWorkBurst({maxCalls:3,frontier:async () => events.push('flush'),
+      worker:{async runOnce(options) {assert.equal(options.deferFrontier,true);events.push('work');return {status};}}});
+    const result=await burst();assert.equal(result.length,status==='complete' ? 3 : 1);
+    assert.equal(events.at(-1),'flush');assert.equal(events.filter((e) => e==='flush').length,1);
+  }
+  const controller=new AbortController();let flushed=0,calls=0;
+  const burst=createWorkBurst({frontier:async () => flushed++,worker:{async runOnce() {calls++;controller.abort();return {status:'complete'};}}});
+  assert.equal((await burst({signal:controller.signal})).length,1);assert.equal(calls,1);assert.equal(flushed,1);
+  assert.deepEqual(await burst({signal:controller.signal}),[]);assert.equal(flushed,2);
+  const throwing=createWorkBurst({frontier:async () => flushed++,worker:{async runOnce() {throw new Error('worker failure');}}});
+  await assert.rejects(throwing(),/worker failure/);assert.equal(flushed,3);
+});
+await test('A2.5H frontier flush errors are sanitized and stop successful runtime continuation',async () => {
+  for (const error of ['private DB body','lane_continuity_stopped','checkpoint_parent_hash_mismatch']) {
+    const burst=createWorkBurst({maxCalls:1,frontier:async () => {throw new Error(error);},
+      worker:{async runOnce() {return {status:'complete'};}}});
+    const result=await burst();assert.equal(result.length,2);assert.equal(result[0].status,'complete');
+    assert.deepEqual(result[1],{status:error==='private DB body' ? 'retrying' : 'continuity_error',
+      error:error==='private DB body' ? 'required_read_unavailable' : 'checkpoint_parent_hash_mismatch',frontierFlush:true});
+  }
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();await repository.scheduleBlock(100);
+  const connect=pool.connect.bind(pool);let receiptCommit=false,failOnce=true;
+  pool.connect=async () => {
+    const c=await connect(),query=c.query.bind(c);let writes=false;
+    c.query=async (sql,...args) => {
+      if (sql.includes('receipts:certify')) writes=true;
+      if (receiptCommit && failOnce && sql.includes('receipts:advance')) {failOnce=false;throw new Error('private DB body');}
+      const result=await query(sql,...args);
+      if (writes && sql==='COMMIT') receiptCommit=true;
+      return result;
+    };return c;
+  };
+  let time=0;
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),workBurst:1},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      const body=JSON.parse(init.body);
+      if (Array.isArray(body)) return blockBatchResponse(body);
+      if (body.method==='eth_chainId') return response(hex(5042));
+      if (body.method==='eth_blockNumber') return response(hex(200));
+      assert.equal(body.method,'eth_getBlockReceipts');return response([receipt(Number(BigInt(body.params[0])))]);
+    }});
+  const result=await runtime.cycle();assert.equal(result.chain.status,'indexing');
+  assert.equal(result.work[0].status,'complete');assert.equal(result.work.at(-1).status,'retrying');
+  assert.equal(result.work.at(-1).frontierFlush,true);assert.equal(result.continueImmediately,false);
+  assert.equal(pool.store.blocks.get(100).receipt_complete,true);
+});
+await test('A2.5H actual restarted idle runtime repairs durable deferred frontier with no worker RPC',async () => {
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0)]);
+  const repository=createReceiptRepository(pool);await repository.initialize();await repository.scheduleBlock(100);
+  const w=createReceiptWorker({repository,rpc:createRpcBudget().wrap({url:ARC_RPC_URL,async request(){return [];}})});
+  for (const preferredComponent of ['receipts','all_logs','transfer_logs'])
+    assert.equal((await w.runOnce({preferredComponent,deferFrontier:true})).status,'complete');
+  assert.equal((await repository.getLane()).contiguous_complete_through,null);
+  const before=structuredClone(pool.store.a1);let time=0;const methods=[];
+  const runtime=createA2Runtime({pool,config:readRuntimeConfig({}),now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      const body=JSON.parse(init.body);methods.push(body.method);
+      if (body.method==='eth_chainId') return response(hex(5042));
+      assert.equal(body.method,'eth_blockNumber');return response(hex(102));
+    }});
+  const result=await runtime.cycle();assert.equal(result.work[0].status,'idle');
+  assert.equal((await repository.getLane()).contiguous_complete_through,100);
+  assert.deepEqual(methods,['eth_chainId','eth_blockNumber']);assert.deepEqual(pool.store.a1,before);
 });
 await test('real runtime yields after 429; first post-cooldown RPC refreshes head before another worker RPC',async () => {
   const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100,0),block(101,0)]);
