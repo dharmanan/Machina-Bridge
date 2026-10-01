@@ -80,6 +80,24 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [...values,component,block.block_hash,block.block_number,block.block_number,block.block_hash])).rows[0];
   }
+  async function enqueueFollowupWork(client,block,components) {
+    if (!components.length) return [];
+    // One canonical block, at most two log components, in the caller's receipt transaction.
+    await client.query('SELECT pg_advisory_xact_lock(5042,177004)');
+    await pruneCompleteWork(client);
+    const existing=(await client.query(`/* a2:followups_existing */ SELECT * FROM arc_intelligence_work
+      WHERE ${where} AND component=ANY($6::text[]) AND logical_key=$7 LIMIT 2`,
+    [...values,components,block.block_hash])).rows;
+    const missing=components.filter((component) => !existing.some((row) => row.component===component));
+    if (!missing.length) return existing;
+    const count=(await client.query('/* a2:work_count */ SELECT count(*) AS count FROM arc_intelligence_work WHERE state <> \'complete\'')).rows[0].count;
+    if (position(count)+missing.length > MAX_WORK_ROWS) throw new Error('work_capacity_reached');
+    const inserted=(await client.query(`/* a2:enqueue_followups */ INSERT INTO arc_intelligence_work
+      (chain_id,lane,scope_id,epoch,definition_version,component,logical_key,start_block,end_block,block_hash)
+      SELECT $1,$2,$3,$4,$5,component,$7,$8,$8,$7 FROM unnest($6::text[]) AS components(component)
+      RETURNING *`,[...values,missing,block.block_hash,block.block_number])).rows;
+    return [...existing,...inserted];
+  }
   async function coverage(client, view, component, complete, evidence) {
     await client.query(`/* receipts:coverage */ INSERT INTO arc_intelligence_coverage
       (chain_id,lane,scope_id,epoch,definition_version,start_block,end_block,start_hash,end_hash,coverage_dimension,evidence_digest,state)
@@ -379,9 +397,8 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
           SET receipt_count=CASE WHEN $3 THEN $4 ELSE receipt_count END,receipt_complete=receipt_complete OR $3
           WHERE chain_id=$1 AND block_number=$2`,[ARC_CHAIN_ID,view.block.block_number,complete,view.receipts.length]);
         await coverage(client,view,'receipts',complete,view.receipts);
-        if (complete && enqueueFollowups) for (const component of ['all_logs','transfer_logs']) {
-          if (!view.reconciliation.some((r) => r.kind === component && r.complete)) await enqueue(client,view.block,component);
-        }
+        if (complete && enqueueFollowups) await enqueueFollowupWork(client,view.block,
+          ['all_logs','transfer_logs'].filter((component) => !view.reconciliation.some((r) => r.kind===component && r.complete)));
         if (finalize) await finish(client,job,complete,retryMs);
         await progress(client,state,position(view.block.block_number));
         return { complete,receiptCount:view.receipts.length,missingCount:view.transactions.length-view.receipts.length };

@@ -3,12 +3,12 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fixturePool,block,rawBlock,transaction,hash,address,fixtureChainRpc } from './fixtures/arc-intelligence-a2.mjs';
 import { migrate,MIGRATIONS } from '../server/arc-intelligence/migrate.js';
-import { createFoundationRepository,CHAIN_IDENTITY } from '../server/arc-intelligence/foundation.js';
+import { createFoundationRepository,CHAIN_IDENTITY,MAX_WORK_ROWS,identityValues } from '../server/arc-intelligence/foundation.js';
 import { createReceiptRepository,RECEIPT_IDENTITY } from '../server/arc-intelligence/receipt-repository.js';
 import { createReceiptWorker } from '../server/arc-intelligence/receipt-lane.js';
 import { createChainFollower } from '../server/arc-intelligence/chain-lane.js';
 import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
-import { COMPLETE_WORK_RETAIN,COMPLETE_WORK_PRUNE_BATCH } from '../server/arc-intelligence/work-retention.js';
+import { COMPLETE_WORK_RETAIN,COMPLETE_WORK_PRUNE_BATCH,pruneCompleteWork } from '../server/arc-intelligence/work-retention.js';
 import { createA2RpcClient } from '../server/arc-intelligence/a2-rpc.js';
 import { validateReceipt,normalizedLog } from '../server/arc-intelligence/receipt-facts.js';
 import { reconcileLogs } from '../api/_lib/arc-intelligence/reconciliation.js';
@@ -24,6 +24,7 @@ function receipt(n,i=0,logs=[log(n,i)]) {return {blockNumber:hex(n),blockHash:ha
 let count=0;
 async function test(name,work) {
   if (process.argv.includes('--focused-a25h') && !name.startsWith('A2.5H')) return;
+  if (process.argv.includes('--focused-a25i') && !name.startsWith('A2.5I')) return;
   await work();count++;console.log(`PASS ${name}`);
 }
 async function setup(blocks=[block(100)]) {
@@ -95,6 +96,34 @@ function legacyFactReads(pool) {
       return {rows};
     };
     return client;
+  };
+}
+// Fixture-only replay of the pre-A2.5I two single-component enqueue paths.
+function legacyFollowupEnqueues(pool) {
+  const connect=pool.connect.bind(pool);
+  pool.connect=async () => {
+    const client=await connect(),query=client.query.bind(client);
+    client.query=async (sql,values) => {
+      if (!sql.includes('a2:followups_existing')) return query(sql,values);
+      const rows=[];
+      for (let i=0;i<values[5].length;i++) {
+        // The pair helper has already performed the first lock/prune.
+        if (i) {await query('SELECT pg_advisory_xact_lock(5042,177004)');await pruneCompleteWork({query});}
+        const identity=values.slice(0,5),component=values[5][i],hash=values[6];
+        const existing=(await query(`/* a2:work_existing */ SELECT * FROM arc_intelligence_work
+          WHERE chain_id=$1 AND lane=$2 AND scope_id=$3 AND epoch=$4 AND definition_version=$5 AND component=$6 AND logical_key=$7`,
+        [...identity,component,hash])).rows[0];
+        if (existing) {rows.push(existing);continue;}
+        const count=(await query('/* a2:work_count */ SELECT count(*) AS count FROM arc_intelligence_work WHERE state <> \'complete\'')).rows[0].count;
+        if (Number(count)>=MAX_WORK_ROWS) throw new Error('work_capacity_reached');
+        const block=pool.store.blocks.get([...pool.store.blocks.keys()].find((n) => pool.store.blocks.get(n).block_hash===hash));
+        rows.push(...(await query(`/* a2:enqueue */ INSERT INTO arc_intelligence_work
+          (chain_id,lane,scope_id,epoch,definition_version,component,logical_key,start_block,end_block,block_hash)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [...identity,component,hash,block.block_number,block.block_number,hash])).rows);
+      }
+      return {rows};
+    };return client;
   };
 }
 async function finish(ctx,instance,n) {await ctx.repository.scheduleBlock(n);for (let i=0;i<3;i++) assert.equal((await instance.runOnce()).status,'complete');}
@@ -957,6 +986,7 @@ await test('A2.5H pg parsed bigint strings and nullable typed facts survive extr
 await test('A2.5H normal 10/1/1 burst reproduces base truth with 990->703 SQL, 66->55 transactions, 22->11 scans',async () => {
   async function profile(legacy) {
     const ctx=await setup(Array.from({length:10},(_,i) => block(100+i)));
+    legacyFollowupEnqueues(ctx.pool); // Keep the A2.5H regression isolated from this enqueue optimization.
     if (legacy) legacyFactReads(ctx.pool);
     for (let n=100;n<110;n++) await ctx.repository.scheduleBlock(n);
     const w=worker(ctx,(method,[arg]) => method==='eth_getBlockReceipts'
@@ -1038,7 +1068,8 @@ await test('A2.5H nondeferred receipt and log APIs still sweep immediately; defe
   await deferred.repository.saveReceipts(job,[receipt(100)],{deferFrontier:true});
   assert.equal(deferred.pool.calls.filter((c) => c.text==='BEGIN').length,1);
   assert.equal(deferred.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,1);
-  assert.equal(deferred.pool.calls.filter((c) => c.text.includes('a2:enqueue')).length,2);
+  const followups=deferred.pool.calls.filter((c) => c.text.includes('a2:enqueue_followups'));
+  assert.equal(followups.length,1);assert.deepEqual(followups[0].values[5],['all_logs','transfer_logs']);
 });
 await test('A2.5H deferred batch preserves per-job fencing, rollback isolation and completed certificate immutability',async () => {
   const ctx=await readyLogs(3),records=await preparedLogRecords(ctx);
@@ -1085,6 +1116,175 @@ await test('A2.5H deferred worker freshly locks/reloads facts after RPC and cano
       assert.equal(ctx.pool.store.blocks.get(102).all_log_reconciliation_complete,false);
     }
   }
+});
+async function receiptFollowupContext(existing=[]) {
+  const ctx=await setup();await ctx.repository.scheduleBlock(100);
+  for (const component of existing) await ctx.chain.enqueue(RECEIPT_IDENTITY,{component,logicalKey:hash(101),
+    startBlock:100,endBlock:100,blockHash:hash(101)});
+  const lease=await ctx.repository.claim('followup-test',180000,{preferredComponent:'receipts'});
+  return {...ctx,lease};
+}
+function fillWorkCapacity(ctx,outstanding) {
+  const current=[...ctx.pool.store.work.values()].filter((w) => w.state!=='complete').length;
+  for (let i=current;i<outstanding;i++) {
+    const id=`capacity-${i}`;
+    ctx.pool.store.work.set(id,{id,chain_id:5042,lane:'other',scope_id:'other',epoch:'other',definition_version:'other',
+      component:'other',logical_key:id,state:'failed',reason_code:null});
+  }
+}
+for (const existing of [[],['all_logs'],['transfer_logs'],['all_logs','transfer_logs']]) {
+  await test(`A2.5I bounded followup pair reuses ${existing.join('+') || 'none'} and inserts only missing jobs`,async () => {
+    const ctx=await receiptFollowupContext(existing),before=structuredClone(ctx.pool.store.work);ctx.pool.calls.length=0;
+    assert.equal((await ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true})).complete,true);
+    const calls=ctx.pool.calls;
+    assert.equal(calls.filter((c) => c.text.startsWith('SELECT pg_advisory_xact_lock')).length,1);
+    // One pair prune plus the unchanged successful work finish prune.
+    assert.equal(calls.filter((c) => c.text.includes('a2:prune_complete')).length,2);
+    const lookup=calls.filter((c) => c.text.includes('a2:followups_existing'));assert.equal(lookup.length,1);
+    assert(lookup[0].text.endsWith('LIMIT 2'));assert.deepEqual(lookup[0].values.slice(0,5),identityValues(RECEIPT_IDENTITY));
+    assert.deepEqual(lookup[0].values[5],['all_logs','transfer_logs']);assert.equal(lookup[0].values[6],hash(101));
+    const inserts=calls.filter((c) => c.text.includes('a2:enqueue_followups'));
+    assert.equal(inserts.length,existing.length===2 ? 0 : 1);
+    assert.equal(calls.filter((c) => c.text.includes('a2:work_count')).length,existing.length===2 ? 0 : 1);
+    if (inserts.length) assert.deepEqual(inserts[0].values[5],['all_logs','transfer_logs'].filter((c) => !existing.includes(c)));
+    const jobs=[...ctx.pool.store.work.values()].filter((w) => w.component!=='receipts');assert.equal(jobs.length,2);
+    for (const j of jobs) {
+      assert.equal(j.logical_key,hash(101));assert.equal(j.block_hash,hash(101));assert.equal(j.start_block,100);assert.equal(j.end_block,100);
+      assert.deepEqual([j.chain_id,j.lane,j.scope_id,j.epoch,j.definition_version],lookup[0].values.slice(0,5));
+      if (existing.includes(j.component)) assert.deepEqual(j,before.get(j.id));
+    }
+    // A fresh retry lease can re-save identical evidence without duplicating either logical followup.
+    const row=ctx.pool.store.work.get(ctx.lease.id);row.state='pending';row.not_before=0;
+    const lease=await ctx.repository.claim('followup-retry',180000,{preferredComponent:'receipts'});
+    const durable=structuredClone(ctx.pool.store.work);ctx.pool.calls.length=0;
+    await ctx.repository.saveReceipts(lease,[receipt(100)],{deferFrontier:true});
+    assert(!ctx.pool.calls.some((c) => c.text.includes('a2:enqueue_followups')));
+    assert.equal(ctx.pool.store.work.size,3);
+    for (const j of jobs) assert.deepEqual(ctx.pool.store.work.get(j.id),durable.get(j.id));
+  });
+}
+await test('A2.5I every durable work state suppresses duplicate followups; other identities do not',async () => {
+  for (const state of ['pending','retrying','leased','persistent_partial','complete']) {
+    const ctx=await receiptFollowupContext(['all_logs','transfer_logs']);
+    for (const j of ctx.pool.store.work.values()) if (j.component!=='receipts') j.state=state;
+    const previous=structuredClone(ctx.pool.store.work);ctx.pool.calls.length=0;
+    await ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true});
+    assert(!ctx.pool.calls.some((c) => c.text.includes('a2:enqueue_followups')));
+    for (const j of previous.values()) if (j.component!=='receipts') assert.deepEqual(ctx.pool.store.work.get(j.id),j);
+  }
+  const ctx=await receiptFollowupContext();
+  for (const identity of [{...RECEIPT_IDENTITY,scopeId:'other'}, {...RECEIPT_IDENTITY,lane:'other'},
+    {...RECEIPT_IDENTITY,epoch:'other'},{...RECEIPT_IDENTITY,definitionVersion:'other'}]) {
+    await ctx.chain.enqueue(identity,{component:'all_logs',logicalKey:hash(101),startBlock:100,endBlock:100,blockHash:hash(101)});
+  }
+  await ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true});
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='all_logs').length,5);
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='transfer_logs').length,1);
+});
+await test('A2.5I exact capacity boundary counts missing jobs before inserting and rolls back an over-capacity pair',async () => {
+  for (const [existing,outstanding,success] of [
+    [[],MAX_WORK_ROWS-2,true],[[],MAX_WORK_ROWS-1,false],[[],MAX_WORK_ROWS,false],
+    [['all_logs'],MAX_WORK_ROWS-1,true],[['transfer_logs'],MAX_WORK_ROWS-1,true],
+    [['all_logs'],MAX_WORK_ROWS,false],[['all_logs','transfer_logs'],MAX_WORK_ROWS,true],
+  ]) {
+    const ctx=await receiptFollowupContext(existing);fillWorkCapacity(ctx,outstanding);
+    const before=structuredClone(ctx.pool.store);ctx.pool.calls.length=0;
+    const save=ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true});
+    if (success) {
+      assert.equal((await save).complete,true);
+      assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='all_logs').length,1);
+      assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='transfer_logs').length,1);
+      // The leased receipt still counts at admission; only afterwards does unchanged finish release its capacity.
+      assert.equal([...ctx.pool.store.work.values()].filter((w) => w.state!=='complete').length,outstanding+2-existing.length-1);
+    } else {
+      await assert.rejects(save,/work_capacity_reached/);assert.deepEqual(ctx.pool.store,before);
+      assert(!ctx.pool.calls.some((c) => c.text.includes('a2:enqueue_followups')));
+    }
+  }
+});
+await test('A2.5I failure after pair INSERT rolls back both jobs and receipt evidence/certification/coverage/progress',async () => {
+  const ctx=await receiptFollowupContext(),before=structuredClone(ctx.pool.store);ctx.pool.fail('a2:result');
+  await assert.rejects(ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true}),/Injected failure/);
+  assert(ctx.pool.calls.some((c) => c.text.includes('a2:enqueue_followups')));
+  assert.deepEqual(ctx.pool.store,before);
+  await ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{deferFrontier:true});
+  assert.equal(ctx.pool.store.work.size,3);assert.equal(ctx.pool.store.receipts.size,1);
+});
+await test('A2.5I capacity failure remains retrying with durable receipt bulk-attempt marker and no fabricated success',async () => {
+  const ctx=await setup();await ctx.repository.scheduleBlock(100);fillWorkCapacity(ctx,MAX_WORK_ROWS-1);
+  const w=worker(ctx,fullHandler(100));const result=await w.instance.runOnce({preferredComponent:'receipts',deferFrontier:true});
+  assert.equal(result.status,'retrying');assert.equal(result.error,'work_capacity_reached');
+  assert.equal(ctx.pool.store.receipts.size,0);assert.equal(ctx.pool.store.logs.size,0);
+  assert.equal(ctx.pool.store.blocks.get(100).receipt_complete,false);assert.equal(ctx.pool.store.blocks.get(100).receipt_bulk_attempted,true);
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='all_logs' || w.component==='transfer_logs').length,0);
+  const job=[...ctx.pool.store.work.values()].find((w) => w.component==='receipts');assert.equal(job.state,'retrying');
+  assert.equal(job.reason_code,'required_read_unavailable');assert.equal(job.lease_owner,null);
+});
+await test('A2.5I completed reconciliation suppresses that component; drain and bounded old-block recovery stay unchanged',async () => {
+  const ctx=await readyLogs(1),records=await preparedLogRecords(ctx,1);
+  await ctx.repository.saveReconciliationBatch(records);
+  const j=ctx.pool.store.work.get(records[0].lease.id);ctx.pool.store.work.delete(j.id);
+  const receiptJob=[...ctx.pool.store.work.values()].find((w) => w.component==='receipts');receiptJob.state='pending';receiptJob.not_before=0;
+  const lease=await ctx.repository.claim('certificate-retry',180000,{preferredComponent:'receipts'});ctx.pool.calls.length=0;
+  await ctx.repository.saveReceipts(lease,[receipt(100,0,[log(100),log(100,0,1,false)])],{deferFrontier:true});
+  const lookup=ctx.pool.calls.find((c) => c.text.includes('a2:followups_existing'));
+  assert.deepEqual(lookup.values[5],['transfer_logs']);assert(!ctx.pool.calls.some((c) => c.text.includes('a2:enqueue_followups')));
+  const drain=await setup([block(100),block(1000)]);await drain.repository.scheduleBlock(100);
+  const w=worker(drain,fullHandler(100));drain.pool.calls.length=0;
+  assert.equal((await w.instance.runOnce({preferredComponent:'receipts',enqueueFollowups:false,deferFrontier:true})).status,'complete');
+  assert(!drain.pool.calls.some((c) => c.text.includes('a2:followups_existing') || c.text.includes('a2:enqueue')));
+  assert.deepEqual(await drain.repository.recentIncompleteBlocks(1000),[1000]);
+  assert.deepEqual((await drain.repository.deferredFollowupBlocks()).blocks,[100]);
+  assert.equal((await drain.repository.recoverDeferredFollowups(100)).length,2);
+  assert.equal((await drain.repository.recoverDeferredFollowups(100)).length,0);assert.equal(drain.pool.store.work.size,3);
+});
+await test('A2.5I pair prune preserves complete retention and all non-complete states',async () => {
+  const ctx=await receiptFollowupContext();
+  for (let i=0;i<COMPLETE_WORK_RETAIN+10;i++) {
+    const id=String(10000+i);ctx.pool.store.work.set(id,{id,state:'complete'});
+  }
+  const protectedIds=[];
+  for (const state of ['pending','leased','retrying','persistent_partial','failed']) {
+    const id=`protected-${state}`;protectedIds.push(id);ctx.pool.store.work.set(id,{id,state});
+  }
+  ctx.pool.calls.length=0;
+  // No finish prune in this call: precisely the pair's single retention pass.
+  await ctx.repository.saveReceipts(ctx.lease,[receipt(100)],{finalize:false,deferFrontier:true});
+  assert.equal(ctx.pool.calls.filter((c) => c.text.includes('a2:prune_complete')).length,1);
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.state==='complete').length,COMPLETE_WORK_RETAIN);
+  for (const id of protectedIds) assert(ctx.pool.store.work.has(id));
+});
+await test('A2.5I same burst keeps durable truth with 703->653 SQL and 100->50 followup statements',async () => {
+  async function profile(legacy) {
+    const ctx=await setup(Array.from({length:10},(_,i) => block(100+i)));
+    if (legacy) legacyFollowupEnqueues(ctx.pool);
+    for (let n=100;n<110;n++) await ctx.repository.scheduleBlock(n);
+    let followupSql=0;const save=ctx.repository.saveReceipts.bind(ctx.repository);
+    ctx.repository.saveReceipts=async (...args) => {
+      const start=ctx.pool.calls.length,result=await save(...args),calls=ctx.pool.calls.slice(start);
+      const first=calls.findIndex((c) => c.text.startsWith('SELECT pg_advisory_xact_lock'));
+      const last=calls.findLastIndex((c) => c.text.includes('a2:enqueue'));
+      assert(first>=0 && last>=first);followupSql+=last-first+1;return result;
+    };
+    const w=worker(ctx,(method,[arg]) => method==='eth_getBlockReceipts'
+      ? [receipt(Number(BigInt(arg)),0,[log(Number(BigInt(arg))),log(Number(BigInt(arg)),0,1,false)])]
+      : rangeLogs(100,10,!!arg.topics));
+    ctx.pool.calls.length=0;
+    const results=await createWorkBurst({worker:{async runOnce(options) {
+      await ctx.repository.workPressure();return w.instance.runOnce(options);
+    }},frontier:() => ctx.repository.advanceFrontier()})();
+    assert.equal(results.length,12);assert(results.every((r) => r.status==='complete'));
+    assert.deepEqual(results.map((r) => r.component),[...Array(10).fill('receipts'),'all_logs','transfer_logs']);
+    assert.equal(w.calls.length,12);assert.equal(w.calls.filter((c) => c.method==='eth_getLogs').length,2);
+    return {ctx,totals:{sql:ctx.pool.calls.length,transactions:ctx.pool.calls.filter((c) => c.text==='BEGIN').length,
+      advance:ctx.pool.calls.filter((c) => c.text.includes('receipts:advance')).length,followupSql}};
+  }
+  const before=await profile(true),after=await profile(false);
+  assert.deepEqual(before.totals,{sql:703,transactions:55,advance:11,followupSql:100});
+  assert.deepEqual(after.totals,{sql:653,transactions:55,advance:11,followupSql:50});
+  for (const key of ['blocks','transactions','receipts','logs','reconciliation','coverage','work','lanes'])
+    assert.deepEqual(after.ctx.pool.store[key],before.ctx.pool.store[key]);
+  console.log(`A2.5I_BURST_PROFILE: before=${JSON.stringify(before.totals)} after=${JSON.stringify(after.totals)}; identical durable truth`);
 });
 await test('over 10000 completed logical jobs cannot exhaust queue; pruning preserves active/persistent states and durable evidence',async () => {
   const ctx=await setup();const w=worker(ctx,fullHandler(100));await finish(ctx,w.instance,100);

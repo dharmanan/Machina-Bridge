@@ -105,6 +105,13 @@ export function fixturePool() {
             status:'indexing',current_error_code:null,last_success_at:clock}); return rows();
           case 'work_existing': return rows([...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version]) === laneKey(values)
             && w.component === values[5] && w.logical_key === values[6]));
+          case 'followups_existing': {
+            assert(transactionOpen);assert(text.includes('component=ANY($6::text[])'));assert(text.endsWith('LIMIT 2'));
+            assert(values[5].length<=2 && new Set(values[5]).size===values[5].length);
+            assert(values[5].every((c) => ['all_logs','transfer_logs'].includes(c)));
+            return rows([...store.work.values()].filter((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version])===laneKey(values)
+              && values[5].includes(w.component) && w.logical_key===values[6]).slice(0,2));
+          }
           case 'work_count': return rows([{count:String([...store.work.values()].filter((w) => w.state !== 'complete').length)}]);
           case 'prune_complete': {
             assert(transactionOpen);assert(text.includes("w.state='complete'"));assert(text.includes('FOR UPDATE OF w SKIP LOCKED'));
@@ -117,6 +124,19 @@ export function fixturePool() {
               start_block:values[7],end_block:values[8],block_hash:values[9],state:'pending',attempts:0,not_before:clock,
               lease_owner:null,lease_until:null,fencing_token:'0',reason_code:null};
             store.work.set(id,work); return rows([work]);
+          }
+          case 'enqueue_followups': {
+            assert(transactionOpen);assert(text.includes('FROM unnest($6::text[])'));assert(text.endsWith('RETURNING *'));
+            assert(values[5].length>0 && values[5].length<=2 && new Set(values[5]).size===values[5].length);
+            const inserted=values[5].map((component) => {
+              assert(['all_logs','transfer_logs'].includes(component));
+              assert(![...store.work.values()].some((w) => laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version])===laneKey(values)
+                && w.component===component && w.logical_key===values[6]),'Logical work identity remains unique');
+              const id=String(store.nextId++),work={id,chain_id:values[0],lane:values[1],scope_id:values[2],epoch:values[3],definition_version:values[4],
+                component,logical_key:values[6],start_block:values[7],end_block:values[7],block_hash:values[6],state:'pending',attempts:0,
+                not_before:clock,lease_owner:null,lease_until:null,fencing_token:'0',reason_code:null};
+              store.work.set(id,work);return work;
+            });return rows(inserted);
           }
           case 'claim': {
             assert(text.includes('FOR UPDATE SKIP LOCKED'));
