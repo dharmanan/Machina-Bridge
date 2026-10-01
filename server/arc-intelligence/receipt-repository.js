@@ -181,7 +181,22 @@ export function createReceiptRepository(pool, identity = RECEIPT_IDENTITY) {
         WHERE chain_id=$1 AND block_number BETWEEN $2 AND $3 AND transactions_complete
         AND NOT receipt_evidence_conflict
         AND NOT (receipt_complete AND all_log_reconciliation_complete AND transfer_log_reconciliation_complete)
-        ORDER BY block_number LIMIT $4`,[ARC_CHAIN_ID,Math.max(0,end-tailSize+1),end,tailSize])).rows.map((b) => position(b.block_number));
+        AND ((NOT receipt_complete AND NOT EXISTS (SELECT 1 FROM arc_intelligence_work w
+          WHERE w.chain_id=$5 AND w.lane=$6 AND w.scope_id=$7 AND w.epoch=$8 AND w.definition_version=$9
+            AND w.component='receipts' AND w.logical_key=arc_intelligence_blocks.block_hash
+            AND w.block_hash=arc_intelligence_blocks.block_hash AND w.start_block=arc_intelligence_blocks.block_number
+            AND w.end_block=arc_intelligence_blocks.block_number))
+          OR (receipt_complete AND NOT all_log_reconciliation_complete AND NOT EXISTS (SELECT 1 FROM arc_intelligence_work w
+            WHERE w.chain_id=$5 AND w.lane=$6 AND w.scope_id=$7 AND w.epoch=$8 AND w.definition_version=$9
+              AND w.component='all_logs' AND w.logical_key=arc_intelligence_blocks.block_hash
+              AND w.block_hash=arc_intelligence_blocks.block_hash AND w.start_block=arc_intelligence_blocks.block_number
+              AND w.end_block=arc_intelligence_blocks.block_number))
+          OR (receipt_complete AND NOT transfer_log_reconciliation_complete AND NOT EXISTS (SELECT 1 FROM arc_intelligence_work w
+            WHERE w.chain_id=$5 AND w.lane=$6 AND w.scope_id=$7 AND w.epoch=$8 AND w.definition_version=$9
+              AND w.component='transfer_logs' AND w.logical_key=arc_intelligence_blocks.block_hash
+              AND w.block_hash=arc_intelligence_blocks.block_hash AND w.start_block=arc_intelligence_blocks.block_number
+            AND w.end_block=arc_intelligence_blocks.block_number)))
+        ORDER BY block_number LIMIT $4`,[ARC_CHAIN_ID,Math.max(0,end-tailSize+1),end,tailSize,...values])).rows.map((b) => position(b.block_number));
     },
     async scheduleBlock(number) {
       await this.initialize();

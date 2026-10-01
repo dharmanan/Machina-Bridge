@@ -144,6 +144,58 @@ await test('empty block is explicitly certified, with no fabricated missing rece
   assert.equal(ctx.pool.store.blocks.get(100).receipt_count,0);assert.equal(ctx.pool.store.blocks.get(100).core_complete,false);
   assert.equal((await ctx.repository.getLane()).contiguous_complete_through,100);
 });
+await test('50 incomplete recent blocks with 40 durable receipt jobs returns only ten missing blocks',async () => {
+  const blocks=Array.from({length:50},(_,i) => block(100+i));const ctx=await setup(blocks);
+  const states=['pending','retrying','leased','persistent_partial','complete'];
+  for (let i=0;i<40;i++) {
+    const b=blocks[i];const row=await ctx.chain.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:b.block_hash,
+      startBlock:b.block_number,endBlock:b.block_number,blockHash:b.block_hash});
+    ctx.pool.store.work.get(row.id).state=states[i%states.length];
+  }
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(149),Array.from({length:10},(_,i) => 140+i));
+});
+for (const state of ['pending','retrying','leased','complete']) await test(`${state} receipt work suppresses recent scheduling`,async () => {
+  const ctx=await setup([block(100)]);const b=ctx.pool.store.blocks.get(100);
+  const row=await ctx.chain.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:b.block_hash,
+    startBlock:100,endBlock:100,blockHash:b.block_hash});ctx.pool.store.work.get(row.id).state=state;
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[]);
+});
+await test('receipt-complete block with only all_logs work is recovered once and scheduleBlock adds only missing transfer work',async () => {
+  const ctx=await setup([block(100,0)]);const b=ctx.pool.store.blocks.get(100);
+  Object.assign(b,{receipt_complete:true,receipt_count:0,all_log_reconciliation_complete:false,transfer_log_reconciliation_complete:false});
+  await ctx.chain.enqueue(RECEIPT_IDENTITY,{component:'all_logs',logicalKey:b.block_hash,startBlock:100,endBlock:100,blockHash:b.block_hash});
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[100]);
+  const before=ctx.pool.store.work.size;await ctx.repository.scheduleBlock(100);assert.equal(ctx.pool.store.work.size,before+1);
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='all_logs').length,1);
+  assert.equal([...ctx.pool.store.work.values()].filter((w) => w.component==='transfer_logs').length,1);
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[]);
+});
+await test('receipt-complete block with both durable log jobs is not scheduled again',async () => {
+  const ctx=await setup([block(100,0)]);const b=ctx.pool.store.blocks.get(100);
+  Object.assign(b,{receipt_complete:true,receipt_count:0,all_log_reconciliation_complete:false,transfer_log_reconciliation_complete:false});
+  for (const component of ['all_logs','transfer_logs']) await ctx.chain.enqueue(RECEIPT_IDENTITY,{component,logicalKey:b.block_hash,
+    startBlock:100,endBlock:100,blockHash:b.block_hash});
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[]);
+});
+await test('missing receipt work is returned and scheduleBlock creates it',async () => {
+  const ctx=await setup([block(100)]);assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[100]);
+  const jobs=await ctx.repository.scheduleBlock(100);assert.equal(jobs.length,1);assert.equal(jobs[0].component,'receipts');
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[]);
+});
+await test('other lane epoch/definition work does not suppress exact-identity recovery',async () => {
+  const ctx=await setup([block(100)]);const b=ctx.pool.store.blocks.get(100);
+  const otherIdentities=[{...RECEIPT_IDENTITY,epoch:'other-epoch',definitionVersion:'other-definition'},
+    {...RECEIPT_IDENTITY,lane:'other-lane'},{...RECEIPT_IDENTITY,scopeId:'other-scope'}];
+  for (const other of otherIdentities) await ctx.chain.enqueue(other,{component:'receipts',logicalKey:b.block_hash,
+    startBlock:100,endBlock:100,blockHash:b.block_hash});
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(100),[100]);
+  const isolated=createReceiptRepository(ctx.pool,otherIdentities[0]);assert.deepEqual(await isolated.recentIncompleteBlocks(100),[]);
+});
+await test('recent incomplete scan stays within the bounded last-50-block window',async () => {
+  const ctx=await setup(Array.from({length:60},(_,i) => block(100+i)));
+  assert.deepEqual(await ctx.repository.recentIncompleteBlocks(159),Array.from({length:50},(_,i) => 110+i));
+  for (const tail of [0,51,1.5]) await assert.rejects(ctx.repository.recentIncompleteBlocks(159,tail),/invalid_recent_tail/);
+});
 await test('receipt duplicate idempotent; conflicting payload/identity/log evidence rejected without overwrite',async () => {
   const ctx=await setup();await ctx.repository.scheduleBlock(100);const lease=await ctx.repository.claim('test');
   await ctx.repository.saveReceipts(lease,[receipt(100)],{finalize:false});const saved=structuredClone(ctx.pool.store.receipts);

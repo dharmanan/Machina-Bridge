@@ -383,7 +383,8 @@ await test('real A2 cycle uses shared paced RPC, persists before scheduling, rec
   assert.equal(pool.store.blocks.get(995).core_complete,false);assert.deepEqual(pool.store.a1,a1);
   assert(!pool.calls.some((c) => /(?:INSERT INTO|UPDATE|DELETE FROM) arc_intelligence_(?:state|chunks|latest|runs)\b/.test(c.text)));
   const query=pool.calls.find((c) => c.text.includes('receipts:recent'));
-  assert.deepEqual(query.values,[5042,949,998,50]);assert(query.text.includes('LIMIT $4'));
+  assert.deepEqual(query.values,[5042,949,998,50,...Object.values(RECEIPT_IDENTITY)]);
+  assert(query.text.includes('LIMIT $4'));assert.equal((query.text.match(/NOT EXISTS/g) ?? []).length,3);
   assert.equal(pool.store.blocks.get(995).receipt_complete,true);
 });
 await test('recent recovery excludes certified/conflicted/transaction-incomplete blocks and validates tail bounds',async () => {
@@ -393,6 +394,29 @@ await test('recent recovery excludes certified/conflicted/transaction-incomplete
   const receipts=createReceiptRepository(pool);assert.deepEqual(await receipts.recentIncompleteBlocks(103,4),[100]);
   assert.deepEqual(await receipts.recentIncompleteBlocks(103,2),[]);
   for (const invalid of [0,51,1.5]) await assert.rejects(receipts.recentIncompleteBlocks(103,invalid));
+});
+await test('runtime schedules only ten missing jobs from a 50-block recent tail',async () => {
+  const {pool,foundation}=await setup();const older=Array.from({length:40},(_,i) => block(100+i));
+  await foundation.persistManifest(CHAIN_IDENTITY,older);
+  const repository=createReceiptRepository(pool);await repository.initialize();
+  for (const b of older) await foundation.enqueue(RECEIPT_IDENTITY,{component:'receipts',logicalKey:b.block_hash,
+    startBlock:b.block_number,endBlock:b.block_number,blockHash:b.block_hash});
+  const previous=new Set([...pool.store.work.values()].map((w) => w.id));const calls=[];let time=0;
+  const runtime=createA2Runtime({pool,config:{...readRuntimeConfig({}),liveMaxBlocks:10,workBurst:1},now:() => time,
+    sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
+      const body=JSON.parse(init.body);const respond=({id,method,params}) => ({jsonrpc:'2.0',id,result:method==='eth_getBlockByNumber'
+        ? rawBlock(Number(BigInt(params[0]))) : []});
+      if (Array.isArray(body)) {calls.push('block_batch');return {status:200,ok:true,async json(){return body.map(respond);}};}
+      const {method,params}=body;calls.push(method);
+      return response(method==='eth_chainId' ? hex(5042) : method==='eth_blockNumber' ? hex(151)
+        : method==='eth_getBlockReceipts' ? [receipt(Number(BigInt(params[0])))] : []);
+    }});
+  const result=await runtime.cycle();assert.deepEqual(result.scheduledBlocks,Array.from({length:10},(_,i) => 140+i));
+  assert.equal(calls.filter((m) => m==='block_batch').length,1);
+  const created=[...pool.store.work.values()].filter((w) => !previous.has(w.id) && w.component==='receipts');
+  assert.deepEqual(created.map((w) => w.start_block).sort((a,b) => a-b),Array.from({length:10},(_,i) => 140+i));
+  const query=pool.calls.find((c) => c.text.includes('receipts:recent'));
+  assert.deepEqual(query.values,[5042,100,149,50,...Object.values(RECEIPT_IDENTITY)]);
 });
 await test('overlapping runtime cycles skip; abort active runtime stops queued requests and poll sleep',async () => {
   const {pool}=await setup();const controller=new AbortController();const time=clock();let starts=0;let release;

@@ -171,10 +171,21 @@ export function fixturePool() {
             return rows([{pending:String(jobs.filter((w) => w.state==='pending').length),
               retrying:String(jobs.filter((w) => w.state==='retrying').length),leased:String(jobs.filter((w) => w.state==='leased').length)}]);
           }
-          case 'receipts_recent': return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1] && b.block_number <= values[2]
+          case 'receipts_recent': {
+            assert.equal(values[4],5042);assert.equal(values[5],'receipts_logs');assert.equal(values[6],'canonical_receipts_logs');
+            assert.equal(typeof values[7],'string');assert.equal(typeof values[8],'string');
+            const hasWork=(b,component) => [...store.work.values()].some((w) =>
+              laneKey([w.chain_id,w.lane,w.scope_id,w.epoch,w.definition_version])===laneKey(values.slice(4))
+              && w.component===component && w.logical_key===b.block_hash && w.block_hash===b.block_hash
+              && w.start_block===b.block_number && w.end_block===b.block_number);
+            return rows([...store.blocks.values()].filter((b) => b.block_number >= values[1] && b.block_number <= values[2]
             && b.transactions_complete && !b.receipt_evidence_conflict
-            && !(b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete))
+            && !(b.receipt_complete && b.all_log_reconciliation_complete && b.transfer_log_reconciliation_complete)
+            && ((!b.receipt_complete && !hasWork(b,'receipts'))
+              || (b.receipt_complete && !b.all_log_reconciliation_complete && !hasWork(b,'all_logs'))
+              || (b.receipt_complete && !b.transfer_log_reconciliation_complete && !hasWork(b,'transfer_logs'))))
             .sort((a,b) => a.block_number-b.block_number).slice(0,values[3]).map((b) => ({block_number:b.block_number})));
+          }
           case 'receipts_block': return rows(store.blocks.has(values[1]) ? [store.blocks.get(values[1])] : []);
           case 'receipts_transactions': return rows([...store.transactions.values()].filter((t) => t.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
           case 'receipts_receipts': return rows([...store.receipts.values()].filter((r) => r.block_number === values[1]).sort((a,b) => a.transaction_index-b.transaction_index));
