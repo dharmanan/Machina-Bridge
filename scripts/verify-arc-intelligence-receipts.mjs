@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { fixturePool,block,rawBlock,transaction,hash,address } from './fixtures/arc-intelligence-a2.mjs';
+import { fixturePool,block,rawBlock,transaction,hash,address,fixtureChainRpc } from './fixtures/arc-intelligence-a2.mjs';
 import { migrate,MIGRATIONS } from '../server/arc-intelligence/migrate.js';
 import { createFoundationRepository,CHAIN_IDENTITY } from '../server/arc-intelligence/foundation.js';
 import { createReceiptRepository,RECEIPT_IDENTITY } from '../server/arc-intelligence/receipt-repository.js';
@@ -87,7 +87,7 @@ await test('inconsistent/missing transaction list never certifies a block',async
   assert.equal(ctx.pool.store.transactions.size,0);
 });
 await test('live tail stops at safe head; raw observed head retained; historical gap does not advance contiguous checkpoint',async () => {
-  const ctx=await setup([]);const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const ctx=await setup([]);const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method === 'eth_chainId') return hex(5042);if (method === 'eth_blockNumber') return hex(1000);
     assert.equal(params[1],true);return rawBlock(Number(BigInt(params[0])));
   }});
@@ -98,7 +98,7 @@ await test('live tail stops at safe head; raw observed head retained; historical
 });
 await test('head below finality offset creates no negative block; contiguous follower still fills from anchor',async () => {
   const ctx=await setup([]);let head=1;
-  const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method === 'eth_chainId') return hex(5042);if (method === 'eth_blockNumber') return hex(head);return rawBlock(Number(BigInt(params[0])));
   }});
   const follower=createChainFollower({repository:ctx.chain,rpc,maxBlocks:2});assert.equal((await follower.tick()).status,'retrying');
@@ -359,7 +359,7 @@ await test('A2 repositories never issue A1 writes; default runtime remains A1 an
 });
 await test('incremental live follower makes zero reads at same head, one at +1, and bounds a large jump',async () => {
   const ctx=await setup([]);let head=1000;const reads=[];
-  const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method === 'eth_chainId') return hex(5042);if (method === 'eth_blockNumber') return hex(head);
     reads.push(Number(BigInt(params[0])));return rawBlock(reads.at(-1));
   }});

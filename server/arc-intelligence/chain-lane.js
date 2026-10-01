@@ -10,7 +10,7 @@ export function normalizeManifest(raw, requestedBlock) {
 
 // Started only by the explicit A2 runtime; contiguous mode remains available to foundation callers.
 export function createChainFollower({ repository, rpc, identity = CHAIN_IDENTITY, maxBlocks = 25, finalityBlocks = 2, mode = 'contiguous' } = {}) {
-  if (!repository || rpc?.url !== ARC_RPC_URL || !rpc.budget || !Number.isSafeInteger(maxBlocks)
+  if (!repository || rpc?.url !== ARC_RPC_URL || !rpc.budget || typeof rpc.requestBlockRange !== 'function' || !Number.isSafeInteger(maxBlocks)
     || maxBlocks < 1 || maxBlocks > MAX_WINDOW_SIZE || !Number.isSafeInteger(finalityBlocks)
     || finalityBlocks < 0 || finalityBlocks > 10000 || !['contiguous','live'].includes(mode)) throw new Error('invalid_chain_follower');
   let active = false;
@@ -41,15 +41,23 @@ export function createChainFollower({ repository, rpc, identity = CHAIN_IDENTITY
             ? Math.max(position(lane.origin_block),targetHead-maxBlocks+1)
             : position(lane.processed_through)+1;
         }
-        while (next <= targetHead && persistedBlocks < maxBlocks) {
+        if (next <= targetHead) {
           if (signal?.aborted) return { status:'aborted',persistedBlocks };
           errorCode = 'block_unavailable';
-          const block = normalizeManifest(await rpc.request('eth_getBlockByNumber',[`0x${next.toString(16)}`,true],{signal}),next);
+          const batchEnd = Math.min(next+maxBlocks-1,targetHead);
+          const raw = await rpc.requestBlockRange(next,batchEnd,{signal});
+          if (!Array.isArray(raw) || raw.length !== batchEnd-next+1) throw new Error('block_unavailable');
+          const blocks = raw.map((block,i) => normalizeManifest(block,next+i));
+          if (new Set(blocks.map((b) => b.block_number)).size !== blocks.length) throw new Error('block_unavailable');
+          if (blocks.some((block,i) => i > 0 && block.parent_hash !== blocks[i-1].block_hash)) {
+            await repository.setLaneStatus(identity,'continuity_error','checkpoint_parent_hash_mismatch');
+            throw new Error('checkpoint_parent_hash_mismatch');
+          }
           if (signal?.aborted) return { status:'aborted',persistedBlocks };
           errorCode = 'database_unavailable';
-          lane = await repository.persistManifest(identity,[block]);
-          persistedBlocks++;
-          next = mode === 'live' ? next+1 : position(lane.contiguous_complete_through)+1;
+          lane = await repository.persistManifest(identity,blocks);
+          persistedBlocks = blocks.length;
+          next = mode === 'live' ? batchEnd+1 : position(lane.contiguous_complete_through)+1;
         }
         const status = next > targetHead ? 'caught_up' : 'indexing';
         await repository.setLaneStatus(identity,status,null,head);

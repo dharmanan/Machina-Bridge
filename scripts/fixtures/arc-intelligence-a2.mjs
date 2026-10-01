@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { ARC_RPC_URL } from '../../api/_lib/arc-intelligence/rpc.js';
+import { createA2RpcClient } from '../../server/arc-intelligence/a2-rpc.js';
+import { createRpcBudget } from '../../server/arc-intelligence/rpc-budget.js';
 export const hash = (n) => `0x${n.toString(16).padStart(64,'0')}`;
 export const address = (n) => `0x${n.toString(16).padStart(40,'0')}`;
 export const transaction = (n,index=0) => ({hash:hash(100000+n*100+index),blockNumber:n,transactionIndex:index,
@@ -9,6 +11,15 @@ export const block = (n,count=1) => ({block_number:n,block_hash:hash(n+1),parent
 export function rawBlock(n,count=1) { return {number:`0x${n.toString(16)}`,hash:hash(n+1),parentHash:hash(n),timestamp:'0x6553f100',
   transactions:Array.from({length:count},(_,i) => ({...transaction(n,i),blockNumber:`0x${n.toString(16)}`,transactionIndex:`0x${i.toString(16)}`,
     blockHash:hash(n+1),value:'0x30d400000000000001',input:'0x12345678abcdef',from:address(1),to:i ? null : address(2)}))}; }
+// Existing chain fixtures use the real A2 single/batch adapter with an injected transport.
+export function fixtureChainRpc(rpc) {
+  return createA2RpcClient({budget:createRpcBudget(),fetchImpl:async (url,init) => {
+    assert.equal(url,ARC_RPC_URL);const body=JSON.parse(init.body);
+    const respond=async ({id,method,params}) => ({jsonrpc:'2.0',id,result:await rpc.request(method,params,{signal:init.signal})});
+    const payload=Array.isArray(body) ? await Promise.all(body.map(respond)) : await respond(body);
+    return {status:200,ok:true,async json(){return payload;}};
+  }});
+}
 const laneKey = (values) => JSON.stringify(values.slice(0,5));
 const names = ['arc_intelligence_state','arc_intelligence_chunks','arc_intelligence_latest','arc_intelligence_runs'];
 // SQL/state doubles follow the real repository calls. They do not certify a deployed Postgres instance.

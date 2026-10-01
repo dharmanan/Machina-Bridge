@@ -7,7 +7,7 @@ import { createRpcBudget } from '../server/arc-intelligence/rpc-budget.js';
 import { createFoundationScheduler } from '../server/arc-intelligence/scheduler.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 
-import { fixturePool,hash,block,rawBlock } from './fixtures/arc-intelligence-a2.mjs';
+import { fixturePool,hash,block,rawBlock,fixtureChainRpc } from './fixtures/arc-intelligence-a2.mjs';
 const names = ['arc_intelligence_state','arc_intelligence_chunks','arc_intelligence_latest','arc_intelligence_runs'];
 
 async function setup() {
@@ -226,12 +226,12 @@ await test('chain follower uses only canonical block reads and never writes A1',
     assert.equal(method,'eth_getBlockByNumber'); assert.equal(params[1],true);
     const n=Number(BigInt(params[0])); return rawBlock(n);
   }};
-  const follower=createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),maxBlocks:2});
+  const follower=createChainFollower({repository,rpc:fixtureChainRpc(rpc),maxBlocks:2});
   assert.equal((await follower.tick()).status,'indexing'); const result=await follower.tick();
   assert.equal(result.status,'caught_up'); assert.equal(result.coreComplete,false); assert.equal(pool.store.blocks.size,3);
   assert.equal(result.observedHead,104); assert.equal(result.targetHead,102);
   assert.equal((await repository.getLane()).observed_head,104); assert.equal(Math.max(...pool.store.blocks.keys()),102);
-  const other=await setup(); const custom=await createChainFollower({repository:other.repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks:3}).tick();
+  const other=await setup(); const custom=await createChainFollower({repository:other.repository,rpc:fixtureChainRpc(rpc),finalityBlocks:3}).tick();
   assert.equal(custom.observedHead,104); assert.equal(custom.targetHead,101); assert.equal(Math.max(...other.pool.store.blocks.keys()),101);
   assert.deepEqual(pool.store.a1,a1); assert(!calls.some((m) => /Receipt|Logs/.test(m)));
   assert(!pool.calls.some(({text}) => /(?:INSERT INTO|UPDATE|DELETE FROM) arc_intelligence_(?:state|chunks|latest|runs)\b/.test(text)));
@@ -243,7 +243,7 @@ await test('chain read failure preserves checkpoint; retry resumes and shutdown 
     if (failing) throw new Error('arbitrary RPC body');
     return {number:'0x64',hash:hash(101),parentHash:hash(100),timestamp:'0x6553f100',transactions:[]};
   }};
-  const follower=createChainFollower({repository,rpc:createRpcBudget().wrap(rpc)});
+  const follower=createChainFollower({repository,rpc:fixtureChainRpc(rpc)});
   assert.deepEqual(await follower.tick(),{status:'retrying',error:'block_unavailable',persistedBlocks:0});
   assert.equal((await repository.getLane()).contiguous_complete_through,null);
   failing=false; assert.equal((await follower.tick()).status,'caught_up');
@@ -255,12 +255,12 @@ await test('safe-head option is bounded; head below offset preserves raw head wi
     reads.push(method); if (method === 'eth_chainId') return '0x13b2'; if (method === 'eth_blockNumber') return '0x1';
     assert.fail('No block read is allowed below finality offset');
   }};
-  for (const finalityBlocks of [-1,10001,1.5]) assert.throws(() => createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks}),/invalid_chain_follower/);
-  const result=await createChainFollower({repository,rpc:createRpcBudget().wrap(rpc)}).tick();
+  for (const finalityBlocks of [-1,10001,1.5]) assert.throws(() => createChainFollower({repository,rpc:fixtureChainRpc(rpc),finalityBlocks}),/invalid_chain_follower/);
+  const result=await createChainFollower({repository,rpc:fixtureChainRpc(rpc)}).tick();
   assert.equal(result.status,'retrying'); assert.equal(result.error,'rpc_head_unavailable'); assert.equal(result.persistedBlocks,0);
   const lane=await repository.getLane(); assert.equal(lane.observed_head,1); assert.equal(lane.contiguous_complete_through,null);
   assert.equal(pool.store.blocks.size,0); assert.deepEqual(reads,['eth_chainId','eth_blockNumber']);
-  const zero=await createChainFollower({repository,rpc:createRpcBudget().wrap(rpc),finalityBlocks:0}).tick(); assert.equal(zero.status,'caught_up'); assert.equal(zero.targetHead,1);
+  const zero=await createChainFollower({repository,rpc:fixtureChainRpc(rpc),finalityBlocks:0}).tick(); assert.equal(zero.status,'caught_up'); assert.equal(zero.targetHead,1);
 });
 await test('RPC budget is bounded, shared, and cancels queued work without freeing active slots early',async () => {
   assert.throws(() => createRpcBudget({maxConcurrency:5}),/invalid_rpc_budget/);

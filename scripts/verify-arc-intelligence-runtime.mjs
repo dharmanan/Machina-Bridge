@@ -15,7 +15,7 @@ import { createReceiptWorker } from '../server/arc-intelligence/receipt-lane.js'
 import { migrate } from '../server/arc-intelligence/migrate.js';
 import { ARC_RPC_URL } from '../api/_lib/arc-intelligence/rpc.js';
 import { TRANSFER_TOPIC } from '../api/_lib/arc-intelligence/usdc.js';
-import { fixturePool, block, rawBlock, hash, transaction } from './fixtures/arc-intelligence-a2.mjs';
+import { fixturePool, block, rawBlock, hash, transaction, fixtureChainRpc } from './fixtures/arc-intelligence-a2.mjs';
 let count = 0;
 async function test(name, work) { await work(); console.log(`PASS ${name}`); count++; }
 async function flush() { for (let i=0;i<40;i++) await Promise.resolve(); }
@@ -36,6 +36,9 @@ function clock() {
   };
 }
 const response = (result,status=200) => ({status,ok:status===200,async json() {return {jsonrpc:'2.0',id:1,result};}});
+const blockBatchResponse = (requests) => ({status:200,ok:true,async json() {
+  return requests.map(({id,params}) => ({jsonrpc:'2.0',id,result:rawBlock(Number(BigInt(params[0])))}));
+}});
 const hex = (n) => `0x${n.toString(16)}`;
 const preferenceCycle = [...Array(10).fill('receipts'),'all_logs','transfer_logs'];
 function receipt(n) {return {blockNumber:hex(n),blockHash:hash(n+1),transactionIndex:'0x0',transactionHash:transaction(n).hash,
@@ -204,6 +207,136 @@ async function setup() {
   const foundation=createFoundationRepository(pool);await foundation.initializeChainLane();
   return {pool,foundation};
 }
+async function batchFollower(mutate=(payload) => payload) {
+  const ctx=await setup();const calls=[];const writes=[];
+  const persist=ctx.foundation.persistManifest.bind(ctx.foundation);
+  ctx.foundation.persistManifest=async (identity,blocks) => {writes.push(blocks.map((b) => b.block_number));return persist(identity,blocks);};
+  const rpc=createA2RpcClient({budget:createRpcBudget(),fetchImpl:async (url,init) => {
+    assert.equal(url,ARC_RPC_URL);assert.equal(init.method,'POST');const body=JSON.parse(init.body);calls.push(body);
+    let depth=0;for (const {text} of ctx.pool.calls) {if (text==='BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(text)) depth--;}
+    assert.equal(depth,0,'No DB transaction spans a batch transport');
+    if (!Array.isArray(body)) return response(body.method==='eth_chainId' ? hex(5042) : hex(111));
+    assert.equal(body.length,10);assert.deepEqual(body.map((r) => r.id),Array.from({length:10},(_,i) => i+1));
+    assert(body.every((r,i) => r.method==='eth_getBlockByNumber' && r.params[0]===hex(100+i) && r.params[1]===true));
+    const payload=body.map(({id,params}) => ({jsonrpc:'2.0',id,result:rawBlock(Number(BigInt(params[0])))}));
+    return {status:200,ok:true,async json(){return mutate(payload);}};
+  }});
+  return {...ctx,calls,writes,rpc,follower:createChainFollower({repository:ctx.foundation,rpc,maxBlocks:10})};
+}
+await test('ten contiguous blocks use one HTTP batch and one atomic multi-block persist; chain/head behavior unchanged',async () => {
+  const ctx=await batchFollower();const first=await ctx.follower.tick();
+  assert.equal(first.status,'caught_up');assert.equal(first.persistedBlocks,10);assert.equal(first.observedHead,111);assert.equal(first.targetHead,109);
+  assert.equal(ctx.calls.filter(Array.isArray).length,1);assert.deepEqual(ctx.writes,[Array.from({length:10},(_,i) => 100+i)]);
+  assert.deepEqual([...ctx.pool.store.blocks.keys()],ctx.writes[0]);assert.equal(ctx.pool.store.transactions.size,10);
+  assert([...ctx.pool.store.blocks.values()].every((b) => b.transactions_complete && !b.core_complete && !b.receipt_complete));
+  const lane=await ctx.foundation.getLane();assert.equal(lane.processed_through,109);assert.equal(lane.contiguous_complete_through,109);assert.equal(lane.observed_head,111);
+  assert.equal((await ctx.follower.tick()).persistedBlocks,0);
+  assert.equal(ctx.calls.filter((c) => c.method==='eth_chainId').length,1);assert.equal(ctx.calls.filter((c) => c.method==='eth_blockNumber').length,2);
+  assert.equal(ctx.calls.filter(Array.isArray).length,1);
+  console.log('CHAIN_BATCH_FIXTURE: 10 blocks = 1 block HTTP transport = 1 persistManifest call; separate chainId/head reads');
+});
+await test('shuffled batch responses are reassociated by id before normalization and persistence',async () => {
+  const ctx=await batchFollower((payload) => payload.reverse());assert.equal((await ctx.follower.tick()).persistedBlocks,10);
+  assert.deepEqual(ctx.writes,[Array.from({length:10},(_,i) => 100+i)]);
+});
+for (const [name,mutate] of [
+  ['non-array body',() => ({result:[]})],
+  ['missing response id',(p) => {delete p[4].id;return p;}],
+  ['duplicate response id',(p) => {p[4].id=p[3].id;return p;}],
+  ['unknown response id',(p) => {p[4].id=999;return p;}],
+  ['wrong id type',(p) => {p[4].id=String(p[4].id);return p;}],
+  ['missing response',(p) => p.slice(0,-1)],
+  ['JSON-RPC error',(p) => {p[4]={jsonrpc:'2.0',id:5,error:{code:-32000,message:'arbitrary upstream body'}};return p;}],
+  ['null result',(p) => {p[4].result=null;return p;}],
+  ['missing result',(p) => {delete p[4].result;return p;}],
+  ['primitive result',(p) => {p[4].result=42;return p;}],
+  ['wrong block number',(p) => {p[4].result.number=hex(200);return p;}],
+  ['duplicate block number',(p) => {p[4].result=p[3].result;return p;}],
+  ['malformed manifest',(p) => {p[4].result.hash='0x12';return p;}],
+  ['malformed transaction set',(p) => {p[4].result.transactions[0].transactionIndex='0x1';return p;}],
+]) await test(`invalid block batch (${name}) persists zero blocks and performs no fallback`,async () => {
+  const ctx=await batchFollower(mutate);const before=structuredClone(ctx.pool.store.transactions);
+  assert.deepEqual(await ctx.follower.tick(),{status:'retrying',error:'block_unavailable',persistedBlocks:0});
+  assert.equal(ctx.pool.store.blocks.size,0);assert.deepEqual(ctx.pool.store.transactions,before);assert.equal(ctx.pool.store.coverage.size,0);
+  assert.equal(ctx.writes.length,0);assert.equal(ctx.calls.filter(Array.isArray).length,1);
+  assert(!ctx.calls.some((c) => c.method==='eth_getBlockByNumber'));
+  const lane=await ctx.foundation.getLane();assert.equal(lane.processed_through,null);assert.equal(lane.contiguous_complete_through,null);
+});
+for (const index of [0,5]) await test(`batch parent mismatch at index ${index} halts continuity without persisting a prefix`,async () => {
+  const ctx=await batchFollower((p) => {p[index].result.parentHash=hash(999);return p;});
+  const result=await ctx.follower.tick();assert.equal(result.status,'continuity_error');assert.equal(result.persistedBlocks,0);
+  assert.equal(ctx.pool.store.blocks.size,0);assert.equal(ctx.pool.store.transactions.size,0);assert.equal(ctx.pool.store.coverage.size,0);
+  assert.equal(ctx.calls.filter(Array.isArray).length,1);assert.equal(ctx.writes.length,index===0 ? 1 : 0);
+  const lane=await ctx.foundation.getLane();assert.equal(lane.status,'continuity_error');assert.equal(lane.current_error_code,'checkpoint_parent_hash_mismatch');
+  assert.equal(lane.processed_through,null);assert.equal((await ctx.follower.tick()).status,'continuity_error');assert.equal(ctx.calls.length,3);
+});
+await test('one ten-item batch consumes one shared budget opportunity and honors pacing/concurrency',async () => {
+  const time=clock();const starts=[];let release;
+  const budget=createRpcBudget({maxConcurrency:1,minIntervalMs:500,now:time.now,sleepImpl:time.sleep});
+  const rpc=createA2RpcClient({budget,fetchImpl:async (url,init) => {
+    const body=JSON.parse(init.body);starts.push({body,time:time.now()});assert.equal(budget.active,1);
+    if (Array.isArray(body)) return new Promise((resolve) => {release=() => resolve(blockBatchResponse(body));});
+    return response(hex(111));
+  }});
+  const batch=rpc.requestBlockRange(100,109);const head=rpc.request('eth_blockNumber');await flush();
+  assert.equal(starts.length,1);assert.equal(budget.active,1);assert.equal(budget.pending,1);
+  release();assert.equal((await batch).length,10);await flush();await time.advance(499);assert.equal(starts.length,1);
+  await time.advance(1);await head;await flush();assert.deepEqual(starts.map((s) => s.time),[0,500]);
+  assert.equal(time.timers,0);assert.equal(budget.active,0);
+});
+await test('batch 429 arms shared cooldown before another batch or single caller; one attempt only',async () => {
+  const time=clock();const starts=[];const budget=createRpcBudget({maxConcurrency:1,minIntervalMs:500,now:time.now,sleepImpl:time.sleep});
+  const rpc=createA2RpcClient({budget,fetchImpl:async (url,init) => {
+    const body=JSON.parse(init.body);starts.push({body,time:time.now()});
+    if (starts.length===1) return response(null,429);
+    return Array.isArray(body) ? blockBatchResponse(body) : response(hex(111));
+  }});
+  const failed=assert.rejects(rpc.requestBlockRange(100,109),/required_read_unavailable/);
+  const second=rpc.requestBlockRange(100,109);const head=rpc.request('eth_blockNumber');await flush();await failed;
+  await time.advance(14999);assert.equal(starts.length,1);
+  await time.advance(1);await second;assert.equal(starts.length,2);assert.equal(starts[1].time,15000);
+  await time.advance(500);await head;await flush();assert.deepEqual(starts.map((s) => s.time),[0,15000,15500]);assert.equal(time.timers,0);
+});
+await test('batch bounds use MAX_WINDOW_SIZE; invalid ranges start no transport',async () => {
+  let calls=0;const rpc=createA2RpcClient({budget:createRpcBudget(),fetchImpl:async (url,init) => {calls++;return blockBatchResponse(JSON.parse(init.body));}});
+  for (const [start,end] of [[-1,1],[1,0],[1,51],[1.5,2],[0,Infinity]]) assert.throws(() => rpc.requestBlockRange(start,end),/invalid_block_batch/);
+  assert.equal(calls,0);assert.equal((await rpc.requestBlockRange(100,149)).length,50);assert.equal(calls,1);
+});
+await test('abort before, during and after batch response persists nothing; active transport gets shutdown signal',async () => {
+  const before=await batchFollower();const stopped=new AbortController();stopped.abort();
+  assert.equal((await before.follower.tick({signal:stopped.signal})).status,'aborted');assert.equal(before.calls.length,0);assert.equal(before.pool.store.blocks.size,0);
+  for (const afterResponse of [false,true]) {
+    const ctx=await setup();const controller=new AbortController();let activeSignal;let starts=0;let begun;
+    const started=new Promise((resolve) => {begun=resolve;});
+    const rpc=createA2RpcClient({budget:createRpcBudget(),fetchImpl:async (url,init) => {
+      const body=JSON.parse(init.body);if (!Array.isArray(body)) return response(body.method==='eth_chainId' ? hex(5042) : hex(111));
+      starts++;activeSignal=init.signal;
+      if (afterResponse) {controller.abort();return blockBatchResponse(body);}
+      begun();return new Promise((resolve,reject) => init.signal.addEventListener('abort',() => reject(new Error('aborted')),{once:true}));
+    }});
+    const follower=createChainFollower({repository:ctx.foundation,rpc,maxBlocks:10});const pending=follower.tick({signal:controller.signal});
+    if (!afterResponse) {await started;controller.abort();}
+    const result=await pending;assert.equal(result.status,'aborted');assert.equal(result.persistedBlocks,0);assert.equal(starts,1);assert.equal(activeSignal.aborted,true);
+    assert.equal(ctx.pool.store.blocks.size,0);assert.equal(ctx.pool.store.transactions.size,0);assert.equal((await ctx.foundation.getLane()).processed_through,null);
+  }
+});
+await test('queued batch cancellation during cooldown prevents transport and releases pacing timer',async () => {
+  const time=clock();const budget=createRpcBudget({maxConcurrency:1,now:time.now,sleepImpl:time.sleep});let calls=0;const controller=new AbortController();
+  const rpc=createA2RpcClient({budget,fetchImpl:async () => {calls++;return response(null,429);}});
+  await assert.rejects(rpc.requestBlockRange(100,109),/required_read_unavailable/);
+  const queued=assert.rejects(rpc.requestBlockRange(100,109,{signal:controller.signal}),/operation_aborted/);await flush();
+  assert.equal(time.timers,1);controller.abort();await queued;await flush();assert.equal(time.timers,0);assert.equal(budget.pending,0);
+  await time.advance(20000);assert.equal(calls,1);
+});
+await test('batch timeout, HTTP 5xx and network failure are sanitized and never retried internally',async () => {
+  for (const failure of ['timeout','5xx','network']) {
+    let calls=0;const rpc=createA2RpcClient({budget:createRpcBudget(),timeoutMs:5,fetchImpl:async (url,init) => {
+      calls++;if (failure==='5xx') return response(null,503);if (failure==='network') throw new TypeError('arbitrary provider body');
+      return new Promise((resolve,reject) => init.signal.addEventListener('abort',() => reject(new Error('timeout')),{once:true}));
+    }});
+    await assert.rejects(rpc.requestBlockRange(100,109),/^Error: required_read_unavailable$/);assert.equal(calls,1);
+  }
+});
 await test('work pressure counts every non-complete state, including failed/conflict, with exact receipt lane scope',async () => {
   const {pool,foundation}=await setup();const repository=createReceiptRepository(pool);await repository.initialize();
   const states=['pending','retrying','leased','failed','persistent_partial','complete'];
@@ -225,11 +358,11 @@ await test('real A2 cycle uses shared paced RPC, persists before scheduling, rec
   await foundation.persistManifest(CHAIN_IDENTITY,[block(995)]);
   let time=0;const calls=[];const config={...readRuntimeConfig({}),mode:'a2_shadow'};
   const runtime=createA2Runtime({pool,config,now:() => time,sleepImpl:async (ms) => {time+=ms;},fetchImpl:async (url,init) => {
-    assert.equal(url,ARC_RPC_URL);const {method,params}=JSON.parse(init.body);calls.push({method,time});
+    assert.equal(url,ARC_RPC_URL);const body=JSON.parse(init.body);const {method,params}=body;calls.push({method:Array.isArray(body) ? 'block_batch' : method,time});
     let depth=0;for (const call of pool.calls) {if (call.text==='BEGIN') depth++;if (['COMMIT','ROLLBACK'].includes(call.text)) depth--;}
     assert.equal(depth,0,'RPC never runs inside a DB transaction');
+    if (Array.isArray(body)) return blockBatchResponse(body);
     if (method==='eth_chainId') return response(hex(5042));if (method==='eth_blockNumber') return response(hex(1002));
-    if (method==='eth_getBlockByNumber') return response(rawBlock(Number(BigInt(params[0]))));
     if (method==='eth_getBlockReceipts') {
       assert(pool.store.blocks.has(998));assert(pool.store.work.size>0);
       return response([receipt(Number(BigInt(params[0])))]);
@@ -244,7 +377,7 @@ await test('real A2 cycle uses shared paced RPC, persists before scheduling, rec
   assert.equal(first.work.filter((r) => r.component==='all_logs')[0].jobCount,4);
   assert.equal(first.work.filter((r) => r.component==='transfer_logs')[0].jobCount,4);assert.equal(first.continueImmediately,true);
   assert(![...pool.store.work.values()].some((w) => w.start_block===100));assert(pool.store.work.size<=12);
-  assert.deepEqual(calls.slice(0,6).map((c) => c.method),['eth_chainId','eth_blockNumber','eth_getBlockByNumber','eth_getBlockByNumber','eth_getBlockByNumber','eth_getBlockReceipts']);
+  assert.deepEqual(calls.slice(0,4).map((c) => c.method),['eth_chainId','eth_blockNumber','block_batch','eth_getBlockReceipts']);
   await runtime.cycle();await runtime.cycle();
   for (let i=1;i<calls.length;i++) assert(calls[i].time-calls[i-1].time>=500);
   assert.equal(pool.store.blocks.get(995).core_complete,false);assert.deepEqual(pool.store.a1,a1);
@@ -297,7 +430,7 @@ await test('cycle database failure enters cancellable idle poll without arbitrar
 });
 await test('live bootstrap alone jumps; repeated head jumps and restart follow exact persisted tail; chainId caches once',async () => {
   const {pool,foundation}=await setup();let head=1000;let chainReads=0;let headReads=0;const reads=[];
-  const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method==='eth_chainId') {chainReads++;return hex(5042);}
     if (method==='eth_blockNumber') {headReads++;return hex(head);}
     reads.push(Number(BigInt(params[0])));return rawBlock(reads.at(-1));
@@ -312,21 +445,23 @@ await test('live bootstrap alone jumps; repeated head jumps and restart follow e
   assert(!pool.store.blocks.has(100)); // old anchor-to-bootstrap gap stays untouched
 });
 await test('explicit processedThrough=100 target=110 advances 101..103 then 104..106; failed read resumes exact next block',async () => {
-  const {foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
+  const {pool,foundation}=await setup();await foundation.persistManifest(CHAIN_IDENTITY,[block(100)]);
   const reads=[];let fail=false;
-  const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method==='eth_chainId') return hex(5042);if (method==='eth_blockNumber') return hex(112);
     const n=Number(BigInt(params[0]));reads.push(n);if (fail && n===108) throw new Error('transient');return rawBlock(n);
   }});
   const follower=createChainFollower({repository:foundation,rpc,maxBlocks:3,mode:'live'});
   assert.equal((await follower.tick()).status,'indexing');assert.deepEqual(reads,[101,102,103]);
   await follower.tick();assert.deepEqual(reads.slice(-3),[104,105,106]);
-  fail=true;assert.equal((await follower.tick()).status,'retrying');assert.deepEqual(reads.slice(-2),[107,108]);
-  fail=false;assert.equal((await follower.tick()).status,'caught_up');assert.deepEqual(reads.slice(-3),[108,109,110]);
+  fail=true;const failed=await follower.tick();assert.equal(failed.status,'retrying');assert.equal(failed.persistedBlocks,0);
+  assert.deepEqual(reads.slice(-3),[107,108,109]);assert(!pool.store.blocks.has(107));assert.equal((await foundation.getLane()).processed_through,106);
+  fail=false;assert.equal((await follower.tick()).status,'indexing');assert.deepEqual(reads.slice(-3),[107,108,109]);
+  assert.equal((await follower.tick()).status,'caught_up');assert.equal(reads.at(-1),110);
 });
 await test('unavailable or noncanonical chain never reaches head/block reads; only success is cached',async () => {
   const {pool,foundation}=await setup();let checks=0;let headReads=0;
-  const rpc=createRpcBudget().wrap({url:ARC_RPC_URL,async request(method,params) {
+  const rpc=fixtureChainRpc({url:ARC_RPC_URL,async request(method,params) {
     if (method==='eth_chainId') {checks++;if (checks===1) return hex(1);if (checks===2) throw new Error('private body');return hex(5042);}
     if (method==='eth_blockNumber') {headReads++;return hex(1000);}
     return rawBlock(Number(BigInt(params[0])));
@@ -533,9 +668,9 @@ await test('drain hysteresis creates zero chain/work rows; receipts complete wit
   const repository=createReceiptRepository(pool);await repository.initialize();for (let n=100;n<105;n++) await repository.scheduleBlock(n);
   let time=0;const calls=[];const config={...readRuntimeConfig({}),workHighWater:5,workLowWater:2,workBurst:1,liveMaxBlocks:1};
   const runtime=createA2Runtime({pool,config,now:() => time,sleepImpl:async (ms) => {time+=ms;pool.advance(ms);},fetchImpl:async (url,init) => {
-    const {method,params}=JSON.parse(init.body);calls.push(method);
+    const body=JSON.parse(init.body);const {method,params}=body;calls.push(Array.isArray(body) ? 'block_batch' : method);
+    if (Array.isArray(body)) return blockBatchResponse(body);
     if (method==='eth_chainId') return response(hex(5042));if (method==='eth_blockNumber') return response(hex(1002));
-    if (method==='eth_getBlockByNumber') return response(rawBlock(Number(BigInt(params[0]))));
     if (method==='eth_getBlockReceipts') return response([receipt(Number(BigInt(params[0])))]);
     return response([]);
   }});
@@ -553,7 +688,7 @@ await test('drain hysteresis creates zero chain/work rows; receipts complete wit
   assert.deepEqual(calls,['eth_getBlockReceipts','eth_getBlockReceipts','eth_getBlockReceipts']);
   assert.equal(pool.store.receipts.size,3);assert.equal((await repository.workPressure()).outstanding,2);
   const resume=await runtime.cycle();assert.equal(resume.chain.persistedBlocks,1);
-  assert.deepEqual(calls.slice(3,6),['eth_chainId','eth_blockNumber','eth_getBlockByNumber']);
+  assert.deepEqual(calls.slice(3,6),['eth_chainId','eth_blockNumber','block_batch']);
   assert(pool.store.blocks.has(996));assert(!pool.store.blocks.has(105));
   assert.deepEqual(resume.deferredBlocks,[100,101]); // recovery returns to drain as soon as high watermark is reached
   assert.equal([...pool.store.work.values()].filter((w) => ['all_logs','transfer_logs'].includes(w.component)).length,4);
