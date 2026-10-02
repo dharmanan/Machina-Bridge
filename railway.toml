@@ -4,5 +4,4 @@ buildCommand = "node --check scripts/run-compact-hour.mjs && node --check server
 
 [deploy]
 startCommand = "HOUR=$(node -e 'const d=new Date(Date.now()-3600000);d.setUTCMinutes(0,0,0);process.stdout.write(d.toISOString())'); exec node --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs \"$HOUR\""
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 3
+restartPolicyType = "NEVER"
