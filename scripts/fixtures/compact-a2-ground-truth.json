@@ -1,0 +1,20 @@
+{
+  "provenance": {
+    "source": "A2 production timeseries, GET /api/intelligence?view=timeseries&window=24h through the local Vite proxy",
+    "capturedAt": "2026-10-01T22:09Z",
+    "bucketStatus": "available",
+    "retainedOnly": "Receipt-based fields (successful, failed, contractCreations, fees) are intentionally excluded: the compact engine does not compute them.",
+    "hourMembership": "timestamp >= hourStart && timestamp < hourStart + 3600"
+  },
+  "windowUniqueActiveAddresses": 20482,
+  "hours": [
+    { "hourStart": 1790812800, "utc": "2026-10-01T00:00Z", "blocks": 7096, "transactions": 33532, "activeAddresses": 6904, "canonicalUsdcTransfers": 28506, "usdcMints": 29, "usdcBurns": 23 },
+    { "hourStart": 1790816400, "utc": "2026-10-01T01:00Z", "blocks": 7096, "transactions": 44397, "activeAddresses": 6818, "canonicalUsdcTransfers": 35013, "usdcMints": 25, "usdcBurns": 16 },
+    { "hourStart": 1790820000, "utc": "2026-10-01T02:00Z", "blocks": 7093, "transactions": 42600, "activeAddresses": 6999, "canonicalUsdcTransfers": 38574, "usdcMints": 186, "usdcBurns": 28 },
+    { "hourStart": 1790823600, "utc": "2026-10-01T03:00Z", "blocks": 7096, "transactions": 37187, "activeAddresses": 6732, "canonicalUsdcTransfers": 29690, "usdcMints": 35, "usdcBurns": 27 },
+    { "hourStart": 1790827200, "utc": "2026-10-01T04:00Z", "blocks": 7096, "transactions": 29463, "activeAddresses": 4520, "canonicalUsdcTransfers": 22028, "usdcMints": 50, "usdcBurns": 27 },
+    { "hourStart": 1790830800, "utc": "2026-10-01T05:00Z", "blocks": 7095, "transactions": 29889, "activeAddresses": 4881, "canonicalUsdcTransfers": 24012, "usdcMints": 55, "usdcBurns": 24 },
+    { "hourStart": 1790834400, "utc": "2026-10-01T06:00Z", "blocks": 7095, "transactions": 42430, "activeAddresses": 5581, "canonicalUsdcTransfers": 33794, "usdcMints": 54, "usdcBurns": 26 },
+    { "hourStart": 1790838000, "utc": "2026-10-01T07:00Z", "blocks": 7096, "transactions": 44281, "activeAddresses": 6332, "canonicalUsdcTransfers": 35869, "usdcMints": 66, "usdcBurns": 30 }
+  ]
+}
