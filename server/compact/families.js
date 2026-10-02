@@ -9,12 +9,12 @@ import { summarizeVerifiedAssetTransfers } from '../../api/_lib/arc-intelligence
 import {
   decodeV3Burn, decodeV3Mint, decodeV3Swap, decodeV4Initialize, decodeV4ModifyLiquidity, decodeV4Swap, UNISWAP_EVENT_TOPICS,
 } from '../../api/_lib/arc-intelligence/uniswap.js';
+import { FamilyError } from './family-error.js';
 import { senderOf } from './logs.js';
+import { PROTOCOL_FAMILIES } from './protocols/index.js';
 import { poolRecordOf } from './registry.js';
 
-export class FamilyError extends Error {
-  constructor(code) { super(code); this.code = code; }
-}
+export { FamilyError };
 
 export function createNetworkAccumulator() {
   let blockCount = 0;
@@ -187,10 +187,23 @@ export function createUniswapV4Accumulator() {
 }
 
 // Field templates: an unavailable family keeps every field, all null, so missing evidence can never read as zero.
+// The first four families are the Stage 1/2 ones; protocol families (protocols/index.js) follow in their declared order.
 export const FAMILY_FIELDS = Object.freeze({
   usdc: Object.freeze(['transferCount', 'amountRaw', 'rawDecimals', 'mintCount', 'burnCount']),
   assets: Object.freeze(['items']),
   uniswapV3: Object.freeze(['poolCreatedCount', 'swapCount', 'mintCount', 'burnCount', 'uniqueTraders', 'poolsWithSwaps',
     'foreignEmitterCount', 'foreignEventCount']),
   uniswapV4: Object.freeze(['initializeCount', 'swapCount', 'modifyLiquidityCount', 'uniqueTraders', 'poolsWithSwaps']),
+  ...Object.fromEntries(PROTOCOL_FAMILIES.map((family) => [family.name, Object.freeze([...family.fields])])),
+});
+
+// What adds up across hours (windows.js): counts and raw amounts do; per-hour unique counts, pools-with-activity and
+// foreign-emitter counts do not (the same actor or pool in two hours would be counted twice), so windows leave them out.
+export const FAMILY_WINDOWS = Object.freeze({
+  usdc: Object.freeze({ counts: ['transferCount', 'mintCount', 'burnCount'], amounts: ['amountRaw'], constants: ['rawDecimals'] }),
+  assets: Object.freeze({ lists: { items: { key: 'address', counts: ['transferCount', 'mintCount', 'burnCount'], amounts: ['amountRaw'],
+    constants: ['symbol', 'address', 'decimals'] } } }),
+  uniswapV3: Object.freeze({ counts: ['poolCreatedCount', 'swapCount', 'mintCount', 'burnCount', 'foreignEventCount'] }),
+  uniswapV4: Object.freeze({ counts: ['initializeCount', 'swapCount', 'modifyLiquidityCount'] }),
+  ...Object.fromEntries(PROTOCOL_FAMILIES.map((family) => [family.name, family.window])),
 });

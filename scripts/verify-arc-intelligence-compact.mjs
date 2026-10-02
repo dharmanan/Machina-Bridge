@@ -14,7 +14,8 @@ import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intellig
 import { locateHourBlocks } from '../server/compact/boundary.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { HourIncompleteError, processBlockRange, processHour } from '../server/compact/hour.js';
-import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS } from '../server/compact/offline.js';
+import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_PROTOCOL } from '../server/compact/offline.js';
+import { PROTOCOL_FAMILIES } from '../server/compact/protocols/index.js';
 import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError } from '../server/compact/provider.js';
 import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../server/compact/registry.js';
 import { COMPACT_DEFINITION_VERSION, DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
@@ -99,7 +100,14 @@ const clean = chainOf();
 const expectedFirst = firstAtOrAfter(clean, HOUR);
 const expectedLast = firstAtOrAfter(clean, HOUR + 3600) - 1;
 const expected = reference(clean, expectedFirst, expectedLast);
-const cleanResult = await processHour({ provider: offlineProvider(clean.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
+const cleanProvider = offlineProvider(clean.fetchImpl);
+const cleanResult = await processHour({ provider: cleanProvider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
+// Stage 3 protocol families read a few views per hour (Aave reserves, Morpho markets and vaults); Uniswap reads none.
+const PROTOCOL_ETH_CALLS = cleanProvider.stats.calls.eth_call;
+assert(PROTOCOL_ETH_CALLS > 0 && cleanResult.complete);
+// The Stage 1/2 streams: the recorded mainnet fixtures hold exactly these, nothing for the Stage 3 protocol families.
+const STAGE2_STREAMS = LOG_STREAMS.filter((stream) => ['usdc', 'assets', 'v3Factory', 'v3Pools', 'v4'].includes(stream.key));
+const FAMILY_NAMES = Object.keys(FAMILY_FIELDS);
 
 function assertNullFamily(result, name, reason) {
   const family = result.families[name];
@@ -298,7 +306,8 @@ const microRegistry = { fromBlock: 0, through: micro.first - 1, throughHash: mic
 async function runMicro() {
   const recorded = createRecordedFetch(micro.calls);
   const provider = offlineProvider(recorded.fetchImpl);
-  const result = await processBlockRange({ provider, first: micro.first, last: micro.last, before: microBefore, v3Registry: microRegistry });
+  const result = await processBlockRange({ provider, first: micro.first, last: micro.last, before: microBefore, v3Registry: microRegistry,
+    streams: STAGE2_STREAMS });
   assert.deepEqual(recorded.missing, []);
   return { result, provider };
 }
@@ -325,7 +334,10 @@ await test('real Arc micro window: network, canonical USDC and V4 equal an indep
     uniqueTraders: swapSenders.size, poolsWithSwaps: new Set(v4Logs.map((log) => log.topics[1])).size });
   assert.equal(microResult.families.uniswapV3.swapCount, 0);
   assert(microResult.families.assets.items.every((item) => item.transferCount === 0));
-  assert.equal(microResult.complete, true);
+  for (const name of ['usdc', 'assets', 'uniswapV3', 'uniswapV4']) assert.equal(microResult.families[name].status, 'available', name);
+  for (const { name } of PROTOCOL_FAMILIES) {
+    assert.deepEqual([microResult.families[name].status, microResult.families[name].reason], ['unavailable', 'stream_not_requested'], name);
+  }
   assert.equal(microResult.range.lastHash, bodies.at(-1).hash);
 });
 
@@ -356,7 +368,7 @@ await test('dense streams: canonical USDC, V4 and topic-only V3 requests never s
   } } });
   const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, windowBlocks: 2000, v3Registry: V3 });
   assert.deepEqual(result, cleanResult);
-  for (const key of ['usdc', 'v4', 'v3Pools']) {
+  for (const key of ['usdc', 'v4', 'v3Pools', 'erc4626Vaults']) {
     assert(Math.max(...spans[key]) <= DENSE_LOG_RANGE_BLOCKS, `${key} requested ${Math.max(...spans[key])} blocks`);
     assert.equal(spans[key].reduce((sum, span) => sum + span, 0), cleanResult.network.blockCount);
   }
@@ -372,7 +384,7 @@ await test('V3 source check: a non-revert RPC error on a V3 stream makes V3 unav
   assertNullFamily(unavailable, 'uniswapV3', 'rpc_error');
   assert.equal(unavailable.registry.uniswapV3, null, 'an unavailable V3 hour adds nothing to the registry');
   assert.deepEqual(unavailable.network, cleanResult.network);
-  assert.equal(provider.stats.calls.eth_call ?? 0, 0);
+  assert.equal(provider.stats.calls.eth_call ?? 0, PROTOCOL_ETH_CALLS, 'V3 adds no eth_call; only protocol families read views');
 });
 
 await test('V3 registry: bootstrap proves its start, catch-up checks continuity, same-hour pools come from the overlay', async () => {
@@ -413,7 +425,7 @@ await test('V3: more than 50 foreign V3-signature emitters never make V3 unavail
   assert.deepEqual({ ...v3, foreignEmitterCount: 1, foreignEventCount: expected.v3ForeignEvents }, cleanResult.families.uniswapV3,
     'official pool metrics are unchanged by foreign emitters');
   assert.equal(result.complete, true);
-  assert.equal(provider.stats.calls.eth_call ?? 0, 0);
+  assert.equal(provider.stats.calls.eth_call ?? 0, PROTOCOL_ETH_CALLS, 'foreign V3 emitters cost no eth_call');
 });
 
 await test('V3: a malformed event from an official pool fails closed; a malformed foreign event is ignored', async () => {
@@ -476,7 +488,8 @@ await test('streaming equivalence: any window size and any per-response split gi
 await test('dependency policy: engine, tests and validator import only node: built-ins and repository files', async () => {
   const compactDirectory = new URL('../server/compact/', import.meta.url);
   const queue = [...(await readdir(compactDirectory)).filter((name) => name.endsWith('.js')).map((name) => new URL(name, compactDirectory)),
-    new URL(import.meta.url), new URL('./validate-compact-hour.mjs', import.meta.url)];
+    new URL(import.meta.url), new URL('./validate-compact-hour.mjs', import.meta.url), new URL('./verify-arc-intelligence-compact-protocols.mjs', import.meta.url),
+    new URL('./smoke-compact-protocols.mjs', import.meta.url)];
   const visited = new Set();
   while (queue.length) {
     const url = queue.pop();
@@ -856,7 +869,8 @@ if (!sqlite) {
         .map((row) => row.text).join('');
       assert.equal(hourText.match(/0x[0-9a-f]{64}/g).length, hours.length * 3, 'only boundary block hashes; no transaction or log hashes');
       const familyText = db.prepare("SELECT COALESCE(metrics_json, '') AS text FROM compact_family_hours").all().map((row) => row.text).join('');
-      assert.equal(/0x[0-9a-f]{64}/.test(familyText), false);
+      // The only 32-byte values in family rows are Morpho market ids (a market key, not a transaction or log hash).
+      assert((familyText.match(/0x[0-9a-f]{64}/g) ?? []).every((value) => value in SYNTHETIC_PROTOCOL.morphoMarkets));
       assert(db.prepare('SELECT MAX(LENGTH(metrics_json)) AS size FROM compact_family_hours').get().size < 4096);
       assert(db.prepare('SELECT MAX(LENGTH(network_json)) AS size FROM compact_hours').get().size < 1024);
       assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_registry').get().count, 1, 'one official pool, written once');
@@ -901,7 +915,7 @@ if (!sqlite) {
         'from the factory deployment to the block before the hour, not to the safe head');
       assert.equal(summary.registryAfter, `${ORIGIN.originNumber}-${expectedLast}`, 'the committed hour extends coverage through itself');
       assert.equal(summary.officialV3Pools, 1);
-      assert.deepEqual(summary.families, { usdc: 'available', assets: 'available', uniswapV3: 'available', uniswapV4: 'available' });
+      assert.deepEqual(summary.families, Object.fromEntries(FAMILY_NAMES.map((name) => [name, 'available'])));
       assert.deepEqual([summary.checkpoint.hour, summary.checkpoint.lastBlock], [new Date(HOUR * 1000).toISOString(), expectedLast]);
       assert(provider.stats.requests > 0 && summary.sqliteBytes.db > 0);
       for (const key of ['TARGET_HOUR', 'SQLITE_PATH', 'REGISTRY_MODE', 'REGISTRY_COVERAGE', 'V3_OFFICIAL_POOLS', 'HOUR_OUTCOME', 'FAMILIES',
@@ -909,7 +923,7 @@ if (!sqlite) {
       assert.equal(lines.at(-1), 'RESULT PASS');
       const db = open('runner.sqlite');
       const store = createCompactStore(db);
-      assert.deepEqual(store.familyRows(HOUR).map((row) => row.metrics), ['assets', 'uniswapV3', 'uniswapV4', 'usdc']
+      assert.deepEqual(store.familyRows(HOUR).map((row) => row.metrics), [...FAMILY_NAMES].sort()
         .map((name) => metricsOf(cleanResult.families[name], name)), 'the runner stores exactly what the engine computes');
       db.close();
     });

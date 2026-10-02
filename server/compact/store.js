@@ -4,11 +4,17 @@
 // with null metrics, never zero), and the hour's active-address identities, kept only for the latest 24 hours so 1H, 6H
 // and 24H unique counts are exact. Plus the official Uniswap V3 pool registry and its explicit coverage. An hour, its
 // family rows, its addresses, its registry rows and the contiguous checkpoint are written in one transaction.
+// Family definitions: every family's definition version is recorded in compact_meta (`family_version:<name>`) the first
+// time the database is opened with that family. A database whose recorded version differs from the running code is refused
+// before anything is written: a changed definition needs an explicit migration, never a silent mix of old and new rows.
+// A family added later (Stage 3: protocol families) has no row for hours stored before it; replaying such an hour inserts
+// its row (outcome `upgraded`) without touching the hour, its other families or the checkpoint.
 import { createHash } from 'node:crypto';
-import { FAMILY_FIELDS } from './families.js';
+import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
-import { COMPACT_DEFINITION_VERSION } from './sources.js';
+import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
+import { sumWindow } from './windows.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -132,7 +138,14 @@ export function createCompactStore(db) {
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(SCHEMA);
-    db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)').run('schema_version', COMPACT_SCHEMA_VERSION);
+    const setMeta = db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)');
+    setMeta.run('schema_version', COMPACT_SCHEMA_VERSION);
+    for (const [name, version] of Object.entries(FAMILY_VERSIONS)) {
+      setMeta.run(`family_version:${name}`, version);
+      if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get(`family_version:${name}`)?.value !== version) {
+        throw new StoreError('family_definition_mismatch');
+      }
+    }
     db.exec('COMMIT');
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* the original error is the one to report */ }
@@ -157,6 +170,8 @@ export function createCompactStore(db) {
       (SELECT COUNT(*) FROM compact_hour_addresses a WHERE a.hour_start = h.hour_start) AS stored
       FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ?`),
     windowUnique: db.prepare('SELECT COUNT(DISTINCT address) AS count FROM compact_hour_addresses WHERE hour_start BETWEEN ? AND ?'),
+    windowFamily: db.prepare(`SELECT h.hour_start, f.status, f.metrics_json FROM compact_hours h
+      LEFT JOIN compact_family_hours f ON f.hour_start = h.hour_start AND f.family = ? WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`),
     pool: db.prepare('SELECT created_block, created_log_index, created_tx FROM compact_registry WHERE kind = ? AND address = ?'),
     pools: db.prepare('SELECT address FROM compact_registry WHERE kind = ?'),
     insertPool: db.prepare(`INSERT INTO compact_registry (kind, address, created_block, created_log_index, created_tx, meta_json)
@@ -263,8 +278,11 @@ export function createCompactStore(db) {
       } else {
         for (const family of rows.families) {
           const stored = sql.family.get(int(range.hourStart), family.name);
-          if (!stored) throw new StoreError('hour_inconsistent');
-          if (stored.status === 'available') {
+          if (!stored) {
+            // A family added after this hour was stored: its first row for the hour, available or unavailable.
+            sql.insertFamily.run(int(range.hourStart), family.name, family.status, family.reason, family.json, family.sha);
+            outcome = 'upgraded';
+          } else if (stored.status === 'available') {
             if (family.status === 'available' && family.sha !== stored.metrics_sha256) throw new StoreError('hour_conflict');
           } else if (family.status === 'available') {
             sql.upgradeFamily.run(family.json, family.sha, int(range.hourStart), family.name);
@@ -304,11 +322,28 @@ export function createCompactStore(db) {
     return sql.windowUnique.get(int(start), int(endHourStart)).count;
   }
 
+  // Sum of one family's additive metrics over the `hours` complete hours ending with endHourStart (windows.js), e.g. the
+  // current 6H next to the 6H before it. Unavailable unless every hour is stored with that family available: a window is
+  // never partial and missing evidence never counts as zero.
+  function familyWindow(family, endHourStart, hours) {
+    if (!FAMILY_WINDOWS[family] || !UNIQUE_ADDRESS_WINDOWS.includes(hours) || !Number.isSafeInteger(endHourStart) || endHourStart % HOUR !== 0) {
+      throw new StoreError('unsupported_window');
+    }
+    const fromHour = endHourStart - (hours - 1) * HOUR;
+    const rows = sql.windowFamily.all(family, int(fromHour), int(endHourStart));
+    const base = { family, fromHour, toHour: endHourStart, hours };
+    if (rows.length !== hours) return { ...base, status: 'unavailable', reason: 'hour_missing', metrics: null };
+    const gap = rows.find((row) => row.status !== 'available');
+    if (gap) return { ...base, status: 'unavailable', reason: gap.status ? 'family_unavailable' : 'family_not_processed', hourStart: gap.hour_start, metrics: null };
+    return { ...base, status: 'available', metrics: sumWindow(FAMILY_WINDOWS[family], rows.map((row) => JSON.parse(row.metrics_json))) };
+  }
+
   return Object.freeze({
     commitHour,
     checkpoint,
     extendRegistry,
     uniqueActiveAddresses,
+    familyWindow,
     hourCount: () => db.prepare('SELECT COUNT(*) AS count FROM compact_hours').get().count,
     familyRows: (hourStart) => sql.families.all(int(hourStart)).map((row) => ({ family: row.family, status: row.status, reason: row.reason,
       metrics: row.metrics_json === null ? null : JSON.parse(row.metrics_json) })),

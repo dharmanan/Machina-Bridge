@@ -4,6 +4,12 @@
 //  - createSyntheticChain: a deterministic Arc-shaped chain generated on demand, with provider limits and fault hooks.
 import { USDC_SYSTEM_EMITTER, TRANSFER_TOPIC } from '../../api/_lib/arc-intelligence/usdc.js';
 import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
+import { encodeCall } from './abi.js';
+import { AAVE_V4_ARC, AAVE_V4_EVENTS } from './protocols/aave.js';
+import { ACROSS_ARC, ACROSS_EVENTS } from './protocols/across.js';
+import { CCTP_EVENTS, CIRCLE_ARC, GATEWAY_EVENTS } from './protocols/circle.js';
+import { ERC4626_EVENTS, MORPHO_ARC, MORPHO_BLUE_EVENTS } from './protocols/morpho.js';
+import { PROTOCOL_FAMILIES } from './protocols/index.js';
 import { ARC_CHAIN_ID } from './provider.js';
 
 const hex = (number) => `0x${number.toString(16)}`;
@@ -78,6 +84,173 @@ const V4_SWAP_DATA = [
 const V4_POOLS = ['0x96fbcfa73dfb947230681cb211fcd0fba8221fbcddbdb3375c795add2afad714', '0xa5edcec276913c24bb618b5836cbcc44e94f32e80f7fc74a8a4aa597e2af7ac9'];
 const V4_ROUTER = '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1';
 
+// Protocol families (Stage 3): official emitters from protocols/*.js, plus synthetic markets, reserves and vaults.
+const USDC_INTERFACE = CIRCLE_ARC.usdc;
+const CIRBTC = '0x171a4217b86a807a64eb94757db6849fb4bdbaa0';
+const WETH = '0x128cc466b61f542da60c70e3aa11c10e19b84edb';
+export const SYNTHETIC_PROTOCOL = Object.freeze({
+  // Aave V4 reserves per spoke: [underlying, decimals].
+  aaveReserves: Object.freeze({ [AAVE_V4_ARC.mainSpoke]: [[USDC_INTERFACE, 6], [SYNTHETIC_CONTRACTS.eurc, 6], [CIRBTC, 8]],
+    [AAVE_V4_ARC.forexSpoke]: [[SYNTHETIC_CONTRACTS.eurc, 6], [USDC_INTERFACE, 6]] }),
+  // Morpho Blue markets: id -> [loanToken, collateralToken, lltv].
+  morphoMarkets: Object.freeze({ [`0x${'a1'.repeat(32)}`]: [USDC_INTERFACE, CIRBTC, 860_000_000_000_000_000n],
+    [`0x${'b2'.repeat(32)}`]: [SYNTHETIC_CONTRACTS.eurc, WETH, 770_000_000_000_000_000n] }),
+  morphoCreatedMarket: `0x${'c3'.repeat(32)}`,
+  // Vault V2 vaults (proven by the factory) -> asset; foreignVault emits ERC-4626 events but is not a Vault V2.
+  morphoVaults: Object.freeze({ [address('fa01', 1)]: USDC_INTERFACE, [address('fa02', 2)]: SYNTHETIC_CONTRACTS.eurc }),
+  foreignVault: address('fa0f', 15),
+  cctpDomains: Object.freeze([0, 2, 3, 6]),
+  gatewayDomains: Object.freeze([0, 26, 6]),
+  acrossChains: Object.freeze([1n, 8453n, 42161n]),
+});
+const PROTOCOL_CODE = new Set([...PROTOCOL_FAMILIES.flatMap((family) => family.codeAddresses), ...Object.keys(SYNTHETIC_PROTOCOL.morphoVaults),
+  SYNTHETIC_PROTOCOL.foreignVault]);
+const bytes32Of = (value) => `0x${value.slice(2).padStart(64, '0')}`;
+
+function encodeWord(type, value) {
+  if (type === 'address' || type === 'bytes32') return value.slice(2).toLowerCase().padStart(64, '0');
+  if (type === 'bool') return value ? word(1) : word(0);
+  return word(value);
+}
+
+// The ABI encoding of one event (test-side inverse of abi.js defineEvent(...).decode).
+export function encodeEventLog(definition, values) {
+  const topics = [definition.topic];
+  const head = [];
+  const tails = [];
+  let tailOffset = definition.inputs.filter((input) => !input.indexed).reduce((sum, input) => sum + (input.components?.length ?? 1), 0) * 32;
+  for (const input of definition.inputs) {
+    const value = values[input.name];
+    if (input.indexed) topics.push(`0x${encodeWord(input.type, value)}`);
+    else if (input.components) for (const component of input.components) head.push(encodeWord(component.type, value[component.name]));
+    else if (input.dynamic) {
+      const content = (value ?? '0x').slice(2);
+      const words = Math.ceil(content.length / 64);
+      head.push(word(tailOffset));
+      tails.push(`${word(content.length / 2)}${content.padEnd(words * 64, '0')}`);
+      tailOffset += 32 + words * 32;
+    } else head.push(encodeWord(input.type, value));
+  }
+  return { topics, data: `0x${head.join('')}${tails.join('')}` };
+}
+
+// Deterministic protocol events of one block: [family, kind, emitter, definition, values], in emission order.
+function protocolActivityOf(seed, number, senderPool, recipientPool) {
+  const out = [];
+  const r = rand(seed, number, 7000);
+  const amount = BigInt(1 + (r % 5000)) * 1_000_000n;
+  const user = address('7e', r % recipientPool);
+  const pick = (list) => list[r % list.length];
+  if (number % 97 === 0) {
+    out.push(['cctp', 'depositForBurn', CIRCLE_ARC.tokenMessenger, CCTP_EVENTS.depositForBurn, { burnToken: USDC_INTERFACE, amount,
+      depositor: address('5e', r % senderPool), mintRecipient: bytes32Of(user), destinationDomain: pick(SYNTHETIC_PROTOCOL.cctpDomains),
+      destinationTokenMessenger: bytes32Of(CIRCLE_ARC.tokenMessenger), destinationCaller: bytes32Of(ZERO), maxFee: r % 1000,
+      minFinalityThreshold: 2000, hookData: r % 2 ? '0x' : '0x1234abcd' }]);
+  }
+  if (number % 89 === 0) {
+    out.push(['cctp', 'mintAndWithdraw', CIRCLE_ARC.tokenMessenger, CCTP_EVENTS.mintAndWithdraw, { mintRecipient: user, amount,
+      mintToken: USDC_INTERFACE, feeCollected: r % 777 }]);
+    out.push(['cctp', 'messageReceived', CIRCLE_ARC.messageTransmitter, CCTP_EVENTS.messageReceived, { caller: address('5e', r % senderPool),
+      sourceDomain: pick(SYNTHETIC_PROTOCOL.cctpDomains), nonce: `0x${word(r)}`, sender: bytes32Of(CIRCLE_ARC.tokenMessenger),
+      finalityThresholdExecuted: 2000, messageBody: `0x${'ab'.repeat(100 + (r % 40))}` }]);
+  }
+  if (number % 113 === 0) {
+    out.push(['gateway', 'deposited', CIRCLE_ARC.gatewayWallet, GATEWAY_EVENTS.deposited, { token: USDC_INTERFACE, depositor: user,
+      sender: address('5e', r % senderPool), value: amount }]);
+  }
+  if (number % 127 === 0) {
+    out.push(['gateway', 'gatewayBurned', CIRCLE_ARC.gatewayWallet, GATEWAY_EVENTS.gatewayBurned, { token: USDC_INTERFACE, depositor: user,
+      transferSpecHash: `0x${word(r + 1)}`, destinationDomain: pick(SYNTHETIC_PROTOCOL.gatewayDomains), destinationRecipient: bytes32Of(user),
+      signer: user, value: amount, fee: r % 999, fromAvailable: amount, fromWithdrawing: 0 }]);
+  }
+  if (number % 131 === 0) {
+    out.push(['gateway', 'attestationUsed', CIRCLE_ARC.gatewayMinter, GATEWAY_EVENTS.attestationUsed, { token: USDC_INTERFACE, recipient: user,
+      transferSpecHash: `0x${word(r + 2)}`, sourceDomain: pick([0, 6]), sourceDepositor: bytes32Of(user), sourceSigner: bytes32Of(user), value: amount }]);
+  }
+  if (number % 251 === 0) {
+    out.push(['gateway', 'withdrawalInitiated', CIRCLE_ARC.gatewayWallet, GATEWAY_EVENTS.withdrawalInitiated, { token: USDC_INTERFACE,
+      depositor: user, value: amount, remainingAvailable: 0, totalWithdrawing: amount, withdrawalBlock: number + 100 }]);
+  }
+  if (number % 257 === 0) {
+    out.push(['gateway', 'withdrawalCompleted', CIRCLE_ARC.gatewayWallet, GATEWAY_EVENTS.withdrawalCompleted, { token: USDC_INTERFACE,
+      depositor: user, value: amount }]);
+  }
+  if (number % 71 === 0) {
+    out.push(['across', 'fundsDeposited', ACROSS_ARC.spokePool, ACROSS_EVENTS.fundsDeposited, { inputToken: bytes32Of(pick([USDC_INTERFACE, WETH])),
+      outputToken: bytes32Of(`0x${'0b'.repeat(20)}`), inputAmount: amount, outputAmount: amount - 1000n, destinationChainId: pick(SYNTHETIC_PROTOCOL.acrossChains),
+      depositId: number, quoteTimestamp: 1, fillDeadline: 2, exclusivityDeadline: 0, depositor: bytes32Of(user), recipient: bytes32Of(user),
+      exclusiveRelayer: bytes32Of(ZERO), message: '0x' }]);
+  }
+  if (number % 73 === 0) {
+    out.push(['across', 'filledRelay', ACROSS_ARC.spokePool, ACROSS_EVENTS.filledRelay, { inputToken: bytes32Of(`0x${'0c'.repeat(20)}`),
+      outputToken: bytes32Of(USDC_INTERFACE), inputAmount: amount, outputAmount: amount - 500n, repaymentChainId: 1, originChainId: pick(SYNTHETIC_PROTOCOL.acrossChains),
+      depositId: number, fillDeadline: 2, exclusivityDeadline: 0, exclusiveRelayer: bytes32Of(ZERO), relayer: bytes32Of(address('5e', 1)),
+      depositor: bytes32Of(user), recipient: bytes32Of(user), messageHash: `0x${word(0)}`,
+      relayExecutionInfo: { updatedRecipient: bytes32Of(user), updatedMessageHash: `0x${word(0)}`, updatedOutputAmount: amount - 400n, fillType: r % 3 } }]);
+  }
+  const spoke = pick([AAVE_V4_ARC.mainSpoke, AAVE_V4_ARC.forexSpoke]);
+  const reserveId = r % SYNTHETIC_PROTOCOL.aaveReserves[spoke].length;
+  const aave = { reserveId, caller: address('5e', r % senderPool), user };
+  const premiumDelta = { sharesDelta: -5, offsetRayDelta: 7, restoredPremiumRay: 3 };
+  if (number % 41 === 0) out.push(['aaveV4', 'supply', spoke, AAVE_V4_EVENTS.supply, { ...aave, suppliedShares: amount - 1n, suppliedAmount: amount }]);
+  if (number % 43 === 0) out.push(['aaveV4', 'withdraw', spoke, AAVE_V4_EVENTS.withdraw, { ...aave, withdrawnShares: amount - 1n, withdrawnAmount: amount }]);
+  if (number % 47 === 0) out.push(['aaveV4', 'borrow', spoke, AAVE_V4_EVENTS.borrow, { ...aave, drawnShares: amount - 1n, drawnAmount: amount }]);
+  if (number % 53 === 0) {
+    out.push(['aaveV4', 'repay', spoke, AAVE_V4_EVENTS.repay, { ...aave, drawnShares: amount - 1n, totalAmountRepaid: amount + 10n, premiumDelta }]);
+  }
+  if (number % 577 === 0) {
+    out.push(['aaveV4', 'liquidationCall', AAVE_V4_ARC.mainSpoke, AAVE_V4_EVENTS.liquidationCall, { collateralReserveId: 2, debtReserveId: 0, user,
+      liquidator: address('5e', 2), receiveShares: r % 2 === 0, debtAmountRestored: amount, drawnSharesLiquidated: amount - 1n, premiumDelta,
+      collateralAmountRemoved: amount / 1000n + 1n, collateralSharesLiquidated: 9, collateralSharesToLiquidator: 1 }]);
+  }
+  const market = pick(Object.keys(SYNTHETIC_PROTOCOL.morphoMarkets));
+  const blue = { id: market, caller: address('5e', r % senderPool), onBehalf: user, receiver: user };
+  if (number % 59 === 0) out.push(['morphoBlue', 'supply', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.supply, { ...blue, assets: amount, shares: amount * 10n }]);
+  if (number % 61 === 0) out.push(['morphoBlue', 'withdraw', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.withdraw, { ...blue, assets: amount, shares: amount * 10n }]);
+  if (number % 67 === 0) out.push(['morphoBlue', 'borrow', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.borrow, { ...blue, assets: amount, shares: amount * 10n }]);
+  if (number % 79 === 0) out.push(['morphoBlue', 'repay', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.repay, { ...blue, assets: amount, shares: amount * 10n }]);
+  if (number % 83 === 0) out.push(['morphoBlue', 'supplyCollateral', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.supplyCollateral, { ...blue, assets: amount }]);
+  if (number % 101 === 0) out.push(['morphoBlue', 'withdrawCollateral', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.withdrawCollateral, { ...blue, assets: amount }]);
+  if (number % 613 === 0) {
+    out.push(['morphoBlue', 'liquidate', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.liquidate, { id: market, caller: address('5e', 3), borrower: user,
+      repaidAssets: amount, repaidShares: amount * 10n, seizedAssets: amount / 100n, badDebtAssets: r % 3 === 0 ? 5n : 0n, badDebtShares: 0 }]);
+  }
+  if (number % 2999 === 0) {
+    out.push(['morphoBlue', 'createMarket', MORPHO_ARC.blue, MORPHO_BLUE_EVENTS.createMarket, { id: SYNTHETIC_PROTOCOL.morphoCreatedMarket,
+      marketParams: { loanToken: USDC_INTERFACE, collateralToken: WETH, oracle: address('0c', 1), irm: address('0d', 1), lltv: 915_000_000_000_000_000n } }]);
+  }
+  const vault = pick([...Object.keys(SYNTHETIC_PROTOCOL.morphoVaults), SYNTHETIC_PROTOCOL.foreignVault]);
+  if (number % 37 === 0) {
+    out.push(['morphoVaultsV2', 'deposit', vault, ERC4626_EVENTS.deposit, { sender: address('5e', r % senderPool), owner: user, assets: amount, shares: amount }]);
+  }
+  if (number % 103 === 0) {
+    out.push(['morphoVaultsV2', 'withdraw', vault, ERC4626_EVENTS.withdraw, { sender: user, receiver: user, owner: user, assets: amount, shares: amount }]);
+  }
+  return out;
+}
+
+// View answers for the synthetic protocol contracts; undefined means "not a protocol view" (falls through to reverts).
+function protocolCall(target, data) {
+  for (const [spoke, reserves] of Object.entries(SYNTHETIC_PROTOCOL.aaveReserves)) {
+    if (target !== spoke) continue;
+    const id = reserves.findIndex((_, index) => data === encodeCall('getReserve(uint256)', [['uint256', index]]));
+    if (id < 0) return { error: { code: 3, message: 'execution reverted' } };
+    const [underlying, decimals] = reserves[id];
+    return { result: `0x${word(BigInt(underlying))}${word(BigInt(AAVE_V4_ARC.coreHub))}${word(id)}${word(decimals)}${word(0)}${word(1)}${word(0)}` };
+  }
+  if (target === MORPHO_ARC.blue && data.startsWith(encodeCall('idToMarketParams(bytes32)', [['bytes32', `0x${'0'.repeat(64)}`]]).slice(0, 10))) {
+    const params = SYNTHETIC_PROTOCOL.morphoMarkets[`0x${data.slice(10)}`];
+    return { result: params ? `0x${word(BigInt(params[0]))}${word(BigInt(params[1]))}${word(1)}${word(2)}${word(params[2])}` : `0x${word(0).repeat(5)}` };
+  }
+  if (target === MORPHO_ARC.vaultV2Factory && data.startsWith(encodeCall('isVaultV2(address)', [['address', ZERO]]).slice(0, 10))) {
+    return { result: `0x${word(SYNTHETIC_PROTOCOL.morphoVaults[`0x${data.slice(-40)}`] ? 1 : 0)}` };
+  }
+  if (data === encodeCall('asset()') && (SYNTHETIC_PROTOCOL.morphoVaults[target] || target === SYNTHETIC_PROTOCOL.foreignVault)) {
+    return { result: `0x${word(BigInt(SYNTHETIC_PROTOCOL.morphoVaults[target] ?? USDC_INTERFACE))}` };
+  }
+  return undefined;
+}
+
 // Block spacing in 1/10,000 s: by default 0.5074 s with integer-second timestamps, so neighbours often share a second,
 // like Arc. The official V3 factory has code from factoryDeployedAt; the official pool (validV3Pool) emits nothing before
 // its PoolCreated at poolCreatedAt and swaps in that same block right after it. foreignV3Emitters distinct contracts emit
@@ -85,7 +258,7 @@ const V4_ROUTER = '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1';
 export function createSyntheticChain({ originNumber = 23_000_000, originTimestamp = 1_790_000_000, blockSpacing = 5074, txPerBlock = 6,
   usdcPerBlock = 10, v4PerBlock = 5, senderPool = 4000, recipientPool = 2500, assetEvery = 40, v3Every = 300,
   factoryDeployedAt = originNumber, poolCreatedAt = originNumber, foreignV3Emitters = 1, foreignV3Every = v3Every,
-  head = originNumber + 20_000, limits = {}, faults = {}, seed = 0x6d61 } = {}) {
+  head = originNumber + 20_000, protocols = true, limits = {}, faults = {}, seed = 0x6d61 } = {}) {
   const maxRange = limits.maxRange ?? 10000;
   const maxResults = limits.maxResults ?? Infinity;
   const timestampOf = (number) => originTimestamp + Math.floor(((number - originNumber) * blockSpacing) / 10000);
@@ -135,11 +308,18 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
     if (number % foreignV3Every === 7 % foreignV3Every) specs.push(['v3ForeignSwap', Math.floor(number / foreignV3Every) % foreignV3Emitters]);
     if (poolLive && number % (v3Every * 2) === 11) specs.push(['v3Mint', 0]);
     if (number === poolCreatedAt) specs.push(['v3PoolCreated', 0], ['v3Swap', 0]);
+    if (protocols) for (const activity of protocolActivityOf(seed, number, senderPool, recipientPool)) specs.push(['protocol', activity]);
     return specs.map(([kind, index], logIndex) => {
       const transactionIndex = Math.floor((logIndex * transactions.length) / specs.length);
       const r = rand(seed, number, 3000 + logIndex);
       const base = { blockHash: blockHash(number), blockNumber: hex(number), blockTimestamp: hex(timestampOf(number)),
         transactionHash: transactions[transactionIndex].hash, transactionIndex: hex(transactionIndex), logIndex: hex(logIndex), removed: false };
+      if (kind === 'protocol') {
+        // `synthetic` (non-enumerable, so never serialized into an RPC response) lets the tests count without decoding.
+        const [family, event, emitter, definition, values] = index;
+        const log = { ...base, address: emitter, ...encodeEventLog(definition, values) };
+        return Object.defineProperty(log, 'synthetic', { value: { family, event, values }, enumerable: false });
+      }
       if (kind === 'usdc' || kind === 'eurc') {
         const from = kind === 'usdc' && r % 113 === 0 ? ZERO : address('5e', r % senderPool);
         const to = kind === 'usdc' && r % 127 === 1 ? ZERO : address('7e', (r >>> 7) % recipientPool);
@@ -179,11 +359,11 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
     const to = Number(BigInt(filter.toBlock));
     if (to - from + 1 > maxRange) return { error: { code: -32012, message: 'requested range too large' } };
     const addresses = filter.address ? new Set([].concat(filter.address).map((value) => value.toLowerCase())) : null;
-    const topics = new Set(filter.topics[0]);
+    const topics = filter.topics?.[0] ? new Set(filter.topics[0]) : null; // no topics: every log of the addresses
     const out = [];
     for (let number = from; number <= to; number++) {
       for (const log of logsOf(number)) {
-        if ((addresses && !addresses.has(log.address)) || !topics.has(log.topics[0])) continue;
+        if ((addresses && !addresses.has(log.address)) || (topics && !topics.has(log.topics[0]))) continue;
         out.push(log);
       }
     }
@@ -191,11 +371,12 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
     return { result: faults.logs ? faults.logs(filter, out) : out };
   }
 
-  // Contract code by block: the V4 PoolManager always, the V3 factory from its deployment block.
+  // Contract code by block: the V4 PoolManager and the protocol contracts always, the V3 factory from its deployment block.
   function codeAt(target, blockTag) {
     const at = /^0x[0-9a-f]+$/i.test(blockTag ?? '') ? Number(BigInt(blockTag)) : head;
-    const present = target === UNISWAP_REGISTRY.v4PoolManager.address || (target === UNISWAP_REGISTRY.v3Factory.address && at >= factoryDeployedAt);
-    return present ? '0x6080604052348015600f57600080fd5b50' : '0x';
+    const present = target === UNISWAP_REGISTRY.v4PoolManager.address || PROTOCOL_CODE.has(target)
+      || (target === UNISWAP_REGISTRY.v3Factory.address && at >= factoryDeployedAt);
+    return (faults.code ? faults.code(target, present) : present) ? '0x6080604052348015600f57600080fd5b50' : '0x';
   }
 
   function answer(item) {
@@ -206,6 +387,16 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
       case 'eth_getBlockByNumber': return envelope({ result: rawBlock(Number(BigInt(item.params[0])), item.params[1] === true) });
       case 'eth_getLogs': return envelope(getLogs(item.params[0]));
       case 'eth_getCode': return envelope({ result: codeAt(item.params[0].toLowerCase(), item.params[1]) });
+      case 'eth_getTransactionByHash': {
+        // Synthetic transaction hashes embed their block and index (fakeHash tag '7a').
+        const hash = String(item.params[0]).toLowerCase();
+        const number = Number.parseInt(hash.slice(4, 18), 16);
+        const index = Number.parseInt(hash.slice(18, 26), 16);
+        const found = hash.startsWith('0x7a') && transactionsOf(number)[index]?.hash === hash;
+        return envelope({ result: found ? { hash, blockNumber: hex(number), transactionIndex: hex(index) } : null });
+      }
+      case 'eth_call': return envelope(faults.call?.(item.params[0]) ?? protocolCall(item.params[0].to.toLowerCase(), item.params[0].data.toLowerCase())
+        ?? { error: { code: 3, message: 'execution reverted' } });
       default: return envelope({ error: { code: -32601, message: 'method not found' } });
     }
   }

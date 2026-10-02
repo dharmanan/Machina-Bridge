@@ -4,13 +4,14 @@
 // rescan history. Coverage is only extended to the block before the requested hour; the hour's own validated PoolCreated
 // logs advance it through the hour on commit. Strictly forward-only: an empty database accepts any first hour; after that
 // only the checkpoint's next hour is processed. An hour already stored with every family available is reported without
-// any RPC request; an hour stored with an unavailable family is repaired (see runCompactHour).
+// any RPC request; an hour stored with an unavailable family, or without a row for a family added later, is repaired.
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
 import { stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { locateHour, processHour } from '../server/compact/hour.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { bootstrapV3Registry, catchUpV3Registry } from '../server/compact/registry.js';
@@ -60,7 +61,9 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     const before = store.v3Registry();
     summary.registryBefore = span(before);
     const stored = store.familyRows(hourStart);
-    const unavailableStored = stored.filter((row) => row.status !== 'available').map((row) => row.family);
+    // Unavailable families, and families added after the hour was stored (no row yet), are both repaired.
+    const unavailableStored = [...stored.filter((row) => row.status !== 'available').map((row) => row.family),
+      ...(stored.length ? Object.keys(FAMILY_FIELDS).filter((name) => !stored.some((row) => row.family === name)) : [])];
     if (stored.length && !unavailableStored.length) {
       // Stored with every family available: nothing to fetch, scan or write.
       summary.hourMode = 'stored';

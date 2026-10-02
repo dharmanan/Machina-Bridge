@@ -10,6 +10,7 @@ import {
   createUsdcAccumulator, FAMILY_FIELDS, FamilyError,
 } from './families.js';
 import { LogError, streamLogs, validateLogs } from './logs.js';
+import { PROTOCOL_FAMILIES } from './protocols/index.js';
 import { ARC_CHAIN_ID, ProviderError } from './provider.js';
 import { codeIsPresent } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, COMPACT_SOURCE_VERSIONS, DENSE_LOG_RANGE_BLOCKS, FAMILY_STREAMS, LOG_STREAMS } from './sources.js';
@@ -48,10 +49,13 @@ export async function processBlockRange({ provider, first, last, before, after =
   windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null }) {
   const network = createNetworkAccumulator();
   const families = {
-    usdc: { accumulator: createUsdcAccumulator(), error: null },
-    assets: { accumulator: createAssetsAccumulator(), error: null },
-    uniswapV3: { accumulator: createUniswapV3Accumulator({ registry: v3Registry }), error: registryGap(v3Registry, first, before) },
-    uniswapV4: { accumulator: createUniswapV4Accumulator(), error: null },
+    usdc: { accumulator: createUsdcAccumulator(), error: null, codeAddresses: [] },
+    assets: { accumulator: createAssetsAccumulator(), error: null, codeAddresses: [] },
+    uniswapV3: { accumulator: createUniswapV3Accumulator({ registry: v3Registry }), error: registryGap(v3Registry, first, before),
+      codeAddresses: [UNISWAP_REGISTRY.v3Factory.address] },
+    uniswapV4: { accumulator: createUniswapV4Accumulator(), error: null, codeAddresses: [UNISWAP_REGISTRY.v4PoolManager.address] },
+    ...Object.fromEntries(PROTOCOL_FAMILIES.map((family) => [family.name,
+      { accumulator: family.create(), error: null, codeAddresses: family.codeAddresses }])),
   };
   const requested = new Set(streams.map((stream) => stream.key));
   for (const [name, family] of Object.entries(families)) {
@@ -92,24 +96,28 @@ export async function processBlockRange({ provider, first, last, before, after =
     throw new HourIncompleteError('right_boundary_mismatch', last + 1);
   }
 
+  // One batched eth_getCode at the range's last block for every official contract a still-available family relies on.
   const blockTag = hex(last);
-  let code = {};
-  if (!families.uniswapV3.error || !families.uniswapV4.error) {
-    try {
-      const [factory, poolManager] = await provider.batch([['eth_getCode', [UNISWAP_REGISTRY.v3Factory.address, blockTag]],
-        ['eth_getCode', [UNISWAP_REGISTRY.v4PoolManager.address, blockTag]]]);
-      code = { factoryCodePresent: codeIsPresent(factory), poolManagerCodePresent: codeIsPresent(poolManager) };
-    } catch (error) {
-      if (!(error instanceof ProviderError)) throw error;
-      families.uniswapV3.error ??= 'contract_code_unavailable';
-      families.uniswapV4.error ??= 'contract_code_unavailable';
+  const targets = [...new Set(Object.values(families).filter((family) => !family.error).flatMap((family) => family.codeAddresses))];
+  const present = new Map();
+  try {
+    for (let offset = 0; offset < targets.length; offset += 50) {
+      const chunk = targets.slice(offset, offset + 50);
+      const answers = await provider.batch(chunk.map((address) => ['eth_getCode', [address, blockTag]]));
+      chunk.forEach((address, index) => present.set(address, codeIsPresent(answers[index])));
     }
+  } catch (error) {
+    if (!(error instanceof ProviderError)) throw error;
+    for (const family of Object.values(families)) if (family.codeAddresses.length) family.error ??= 'contract_code_unavailable';
   }
+  const context = { provider, blockTag, codePresent: (address) => present.get(address) === true,
+    factoryCodePresent: present.get(UNISWAP_REGISTRY.v3Factory.address) === true,
+    poolManagerCodePresent: present.get(UNISWAP_REGISTRY.v4PoolManager.address) === true };
   const results = {};
   for (const [name, family] of Object.entries(families)) {
     if (!family.error) {
       try {
-        results[name] = { status: 'available', ...(await family.accumulator.finish(code)) };
+        results[name] = { status: 'available', ...(await family.accumulator.finish(context)) };
         continue;
       } catch (error) {
         if (!familyFailure(error)) throw error;
