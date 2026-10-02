@@ -150,11 +150,19 @@ export async function processBlockRange({ provider, first, last, before, after =
   };
 }
 
-// The result depends only on the hour: boundaries are exact, so any safe head past the hour gives the same answer, and
-// any registry that covers the blocks before the hour classifies V3 emitters the same way.
-export async function processHour({ provider, hourStart, safeHead, windowBlocks = DEFAULT_WINDOW_BLOCKS, onLogs = null, v3Registry = null }) {
-  if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
+function checkedBounds(bounds, hourStart) {
+  const { before, first, last, after } = bounds ?? {};
   const hourEnd = hourStart + HOUR_SECONDS;
+  if (!before || !first || !last || !after || first.number !== before.number + 1 || after.number !== last.number + 1
+    || before.timestamp >= hourStart || first.timestamp < hourStart || last.timestamp >= hourEnd || after.timestamp < hourEnd) {
+    throw new HourIncompleteError('boundary_invariant_failed');
+  }
+  return bounds;
+}
+
+// Exact boundary headers { before, first, last, after } of a complete UTC hour under a finalized safe head.
+export async function locateHour({ provider, hourStart, safeHead }) {
+  if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
   const headers = new Map();
   const header = async (number) => {
     if (!headers.has(number)) headers.set(number, headerOf(await provider.request('eth_getBlockByNumber', [hex(number), false]), number));
@@ -162,17 +170,23 @@ export async function processHour({ provider, hourStart, safeHead, windowBlocks 
   };
   let bounds;
   try {
-    bounds = await locateHourBlocks({ header, safeHead, hourStart, hourEnd });
+    bounds = await locateHourBlocks({ header, safeHead, hourStart, hourEnd: hourStart + HOUR_SECONDS });
   } catch (error) {
     if (error instanceof SpineError || error instanceof ProviderError) throw new HourIncompleteError(error.code, error.blockNumber ?? null);
     if (BOUNDARY_CODES.has(error?.message)) throw new HourIncompleteError(error.message);
     throw error;
   }
-  const { before, first, last, after } = bounds;
-  if (first.number !== before.number + 1 || after.number !== last.number + 1 || before.timestamp >= hourStart
-    || first.timestamp < hourStart || last.timestamp >= hourEnd || after.timestamp < hourEnd) {
-    throw new HourIncompleteError('boundary_invariant_failed');
-  }
+  return checkedBounds(bounds, hourStart);
+}
+
+// The result depends only on the hour: boundaries are exact, so any safe head past the hour gives the same answer, and
+// any registry that covers the blocks before the hour classifies V3 emitters the same way. `bounds` (from locateHour)
+// skips the boundary search; it is checked again here and the spine re-validates every block against it.
+export async function processHour({ provider, hourStart, safeHead, windowBlocks = DEFAULT_WINDOW_BLOCKS, onLogs = null, v3Registry = null,
+  bounds = null }) {
+  if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
+  const hourEnd = hourStart + HOUR_SECONDS;
+  const { before, first, last, after } = bounds ? checkedBounds(bounds, hourStart) : await locateHour({ provider, hourStart, safeHead });
   const result = await processBlockRange({ provider, first: first.number, last: last.number, before, after, hourStart, hourEnd,
     windowBlocks, onLogs, v3Registry });
   if (result.range.firstHash !== first.hash || result.range.lastHash !== last.hash) throw new HourIncompleteError('boundary_hash_mismatch');

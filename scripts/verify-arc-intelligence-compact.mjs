@@ -3,10 +3,12 @@
 // node:sqlite tests run when the runtime has it (Node 22.13+); COMPACT_REQUIRE_SQLITE=1 turns its absence into a failure.
 // COMPACT_SQLITE_DIR (optional) is where the temporary database directory is created; it is deleted afterwards.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { USDC_ERC20_ADDRESS, USDC_SYSTEM_EMITTER } from '../api/_lib/arc-intelligence/usdc.js';
 import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
 import { locateHourBlocks } from '../server/compact/boundary.js';
@@ -18,6 +20,7 @@ import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../ser
 import { COMPACT_DEFINITION_VERSION, DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
 import { headerOf } from '../server/compact/spine.js';
 import { ADDRESS_WINDOW_HOURS, createCompactStore } from '../server/compact/store.js';
+import { runCompactHour, runnerConfig } from './run-compact-hour.mjs';
 import { validateHour } from './validate-compact-hour.mjs';
 
 const capture = JSON.parse(await readFile(new URL('./fixtures/compact-arc-capture-2026-10-01.json', import.meta.url), 'utf8'));
@@ -870,6 +873,208 @@ if (!sqlite) {
       assert.deepEqual({ status: report.sqlite.status, first: report.sqlite.first, replay: report.sqlite.replay },
         { status: 'verified', first: 'inserted', replay: 'unchanged' });
       assert(!(await readdir(directory)).some((name) => name.startsWith('compact-validation-')));
+    });
+
+    // Stage 2b one-shot runner on persistent files: registry warm start, forward-only hours, fail-closed errors.
+    // Every official-factory eth_getLogs range is recorded, so a historical registry scan cannot go unnoticed.
+    const runner = async (name, { hourStart = HOUR, fetchImpl = chainOf().fetchImpl, registryFromBlock = ORIGIN.originNumber } = {}) => {
+      const factoryScans = [];
+      const provider = offlineProvider(async (url, init) => {
+        for (const item of [].concat(JSON.parse(init.body))) {
+          const filter = item.method === 'eth_getLogs' ? item.params[0] : null;
+          if (filter?.address?.[0] === UNISWAP_REGISTRY.v3Factory.address) factoryScans.push([Number(BigInt(filter.fromBlock)), Number(BigInt(filter.toBlock))]);
+        }
+        return fetchImpl(url, init);
+      });
+      const lines = [];
+      const summary = await runCompactHour({ sqlitePath: join(directory, name), hourStart, provider, registryFromBlock, print: (text) => lines.push(text) });
+      return { summary, lines, factoryScans, provider };
+    };
+    const lineOf = (lines, key) => lines.find((text) => text.startsWith(`${key} `));
+    const historyScans = (scans, beforeBlock) => scans.filter(([from]) => from < beforeBlock);
+
+    await test('runner: an empty database bootstraps the registry once, only up to the block before the hour, then commits it', async () => {
+      const { summary, lines, factoryScans, provider } = await runner('runner.sqlite');
+      assert.deepEqual([summary.registryMode, summary.registryBefore, summary.hourOutcome, summary.ok], ['bootstrap', 'none', 'inserted', true]);
+      const history = historyScans(factoryScans, expectedFirst);
+      assert.deepEqual([Math.min(...history.map(([from]) => from)), Math.max(...history.map(([, to]) => to))], [ORIGIN.originNumber, expectedFirst - 1],
+        'from the factory deployment to the block before the hour, not to the safe head');
+      assert.equal(summary.registryAfter, `${ORIGIN.originNumber}-${expectedLast}`, 'the committed hour extends coverage through itself');
+      assert.equal(summary.officialV3Pools, 1);
+      assert.deepEqual(summary.families, { usdc: 'available', assets: 'available', uniswapV3: 'available', uniswapV4: 'available' });
+      assert.deepEqual([summary.checkpoint.hour, summary.checkpoint.lastBlock], [new Date(HOUR * 1000).toISOString(), expectedLast]);
+      assert(provider.stats.requests > 0 && summary.sqliteBytes.db > 0);
+      for (const key of ['TARGET_HOUR', 'SQLITE_PATH', 'REGISTRY_MODE', 'REGISTRY_COVERAGE', 'V3_OFFICIAL_POOLS', 'HOUR_OUTCOME', 'FAMILIES',
+        'CHECKPOINT', 'PROVIDER', 'ELAPSED_MS', 'SQLITE_BYTES', 'COMPACT_RUN_SUMMARY']) assert(lineOf(lines, key), key);
+      assert.equal(lines.at(-1), 'RESULT PASS');
+      const db = open('runner.sqlite');
+      const store = createCompactStore(db);
+      assert.deepEqual(store.familyRows(HOUR).map((row) => row.metrics), ['assets', 'uniswapV3', 'uniswapV4', 'usdc']
+        .map((name) => metricsOf(cleanResult.families[name], name)), 'the runner stores exactly what the engine computes');
+      db.close();
+    });
+
+    await test('runner: a second invocation on the same file reuses the registry and makes no request for a stored hour', async () => {
+      const { summary, lines, factoryScans, provider } = await runner('runner.sqlite');
+      assert.deepEqual([summary.registryMode, summary.hourOutcome, summary.ok], ['reused', 'already_committed', true]);
+      assert.deepEqual([provider.stats.requests, factoryScans.length], [0, 0], 'no RPC request and no registry scan');
+      assert.equal(summary.registryAfter, summary.registryBefore);
+      assert.equal(lines.at(-1), 'RESULT PASS');
+      // The real CLI on the same file: its primary-RPC provider is created but never used.
+      const cli = spawnSync(process.execPath, [fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url)), new Date(HOUR * 1000).toISOString()],
+        { env: { ...process.env, COMPACT_SQLITE_PATH: join(directory, 'runner.sqlite') }, encoding: 'utf8' });
+      assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+      for (const text of ['REGISTRY_MODE reused', 'HOUR_OUTCOME already_committed', 'PROVIDER requests=0 retries=0']) assert(cli.stdout.includes(text), text);
+      assert(cli.stdout.trim().endsWith('RESULT PASS'));
+    });
+
+    await test('runner: the next hour runs on the stored registry with no historical scan', async () => {
+      const { summary, factoryScans } = await runner('runner.sqlite', { hourStart: HOUR + 3600 });
+      assert.deepEqual([summary.registryMode, summary.hourOutcome, summary.ok], ['reused', 'inserted', true]);
+      assert.deepEqual(historyScans(factoryScans, hours[1].range.firstBlock), [], 'only the hour\'s own PoolCreated stream is read');
+      assert.equal(summary.registryAfter, `${ORIGIN.originNumber}-${hours[1].range.lastBlock}`);
+      const earlier = await runner('runner.sqlite');
+      assert.deepEqual([earlier.summary.hourOutcome, earlier.provider.stats.requests], ['already_committed', 0], 'a stored earlier hour too');
+    });
+
+    await test('runner: coverage behind the hour catches up only the blocks after it', async () => {
+      const partial = expectedFirst - 1500;
+      const db = open('catchup.sqlite');
+      createCompactStore(db).extendRegistry(await bootstrapV3Registry(offlineProvider(chainOf().fetchImpl), { fromBlock: ORIGIN.originNumber, toBlock: partial }));
+      db.close();
+      const { summary, factoryScans } = await runner('catchup.sqlite');
+      assert.deepEqual([summary.registryMode, summary.registryBefore, summary.hourOutcome, summary.ok], ['catchup', `${ORIGIN.originNumber}-${partial}`, 'inserted', true]);
+      const history = historyScans(factoryScans, expectedFirst);
+      assert.deepEqual([Math.min(...history.map(([from]) => from)), Math.max(...history.map(([, to]) => to))], [partial + 1, expectedFirst - 1]);
+    });
+
+    await test('runner: forward only; a gap or an earlier unstored hour is refused before any request or write', async () => {
+      for (const [hourStart, code] of [[HOUR + 3 * 3600, 'checkpoint_gap'], [HOUR - 3600, 'hour_before_checkpoint']]) {
+        const { summary, lines, provider } = await runner('runner.sqlite', { hourStart });
+        assert.deepEqual([summary.ok, summary.reason, summary.hourOutcome, provider.stats.requests], [false, code, null, 0]);
+        assert.equal(lines.at(-1), `RESULT FAIL ${code}`);
+      }
+      const db = open('runner.sqlite');
+      const store = createCompactStore(db);
+      assert.deepEqual([store.hourCount(), store.checkpoint().hourStart], [2, HOUR + 3600]);
+      db.close();
+    });
+
+    await test('runner: configuration refuses RPC pacing below 500 ms, a missing or in-memory database and a non-hour target', async () => {
+      const config = (env, argv = ['2026-10-01T07:00:00Z']) => runnerConfig({ argv, env });
+      assert.deepEqual(config({ COMPACT_SQLITE_PATH: '/data/arc-compact.sqlite' }),
+        { hourStart: 1_790_838_000, sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000 });
+      assert.equal(config({ COMPACT_SQLITE_PATH: '/data/a.sqlite', COMPACT_RPC_MIN_INTERVAL_MS: '500' }).minIntervalMs, 500);
+      for (const pacing of ['499', '250', '0', '-1', '1e3', 'fast', '']) {
+        assert.throws(() => config({ COMPACT_SQLITE_PATH: '/data/a.sqlite', COMPACT_RPC_MIN_INTERVAL_MS: pacing }), (error) => error.code === 'unsafe_rpc_pacing', pacing);
+      }
+      for (const path of [undefined, '', '  ', ':memory:', 'file::memory:']) {
+        assert.throws(() => config({ COMPACT_SQLITE_PATH: path }), (error) => error.code === 'sqlite_path_required', String(path));
+      }
+      for (const argv of [[], ['2026-10-01T07:30:00Z'], ['yesterday']]) {
+        assert.throws(() => config({ COMPACT_SQLITE_PATH: '/data/a.sqlite' }, argv), (error) => error.code === 'invalid_hour', String(argv));
+      }
+      const cli = spawnSync(process.execPath, [fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url)), '2026-10-01T07:00:00Z'],
+        { env: { ...process.env, COMPACT_SQLITE_PATH: join(directory, 'never.sqlite'), COMPACT_RPC_MIN_INTERVAL_MS: '250' }, encoding: 'utf8' });
+      assert.deepEqual([cli.status, cli.stdout.trim()], [1, 'RESULT FAIL unsafe_rpc_pacing']);
+      assert(!(await readdir(directory)).includes('never.sqlite'), 'refused before the database file is created');
+    });
+
+    await test('runner: registry and store errors fail closed and leave nothing half written', async () => {
+      const factoryDown = chainOf({ faults: { request: (body) => (!Array.isArray(body) && body.method === 'eth_getLogs'
+        && body.params[0].address?.[0] === UNISWAP_REGISTRY.v3Factory.address
+        ? { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'header not found' } } : undefined) } });
+      const broken = await runner('broken.sqlite', { fetchImpl: factoryDown.fetchImpl });
+      assert.deepEqual([broken.summary.ok, broken.summary.reason, broken.summary.registryMode, broken.summary.hourOutcome],
+        [false, 'rpc_error', 'bootstrap', null]);
+      assert.equal(broken.summary.diagnostics.detail, 'header not found');
+      const late = await runner('late.sqlite', { registryFromBlock: ORIGIN.originNumber + 1 });
+      assert.deepEqual([late.summary.ok, late.summary.reason], [false, 'registry_start_after_factory_deployment']);
+      for (const name of ['broken.sqlite', 'late.sqlite']) {
+        const db = open(name);
+        const store = createCompactStore(db);
+        assert.deepEqual([store.v3Registry(), store.hourCount(), store.checkpoint()], [null, 0, null], name);
+        db.close();
+      }
+      const stage1 = await runner('stage1.sqlite'); // the Stage 1 file from the schema test above
+      assert.deepEqual([stage1.summary.ok, stage1.summary.reason, stage1.provider.stats.requests], [false, 'schema_version_mismatch', 0]);
+    });
+
+    await test('runner: an unavailable family is committed as null, reported unavailable and never as zero', async () => {
+      const v4Down = chainOf({ faults: { request: (body) => (!Array.isArray(body) && body.method === 'eth_getLogs'
+        && body.params[0].address?.[0] === UNISWAP_REGISTRY.v4PoolManager.address
+        ? { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'header not found' } } : undefined) } });
+      const { summary, lines } = await runner('partial.sqlite', { fetchImpl: v4Down.fetchImpl });
+      assert.deepEqual([summary.hourOutcome, summary.ok, summary.reason, summary.families.uniswapV4],
+        ['inserted', false, 'families_unavailable:uniswapV4', 'unavailable(rpc_error)']);
+      assert(lineOf(lines, 'FAMILIES').includes('uniswapV4=unavailable(rpc_error)'));
+      assert.equal(lines.at(-1), 'RESULT FAIL families_unavailable:uniswapV4');
+      const db = open('partial.sqlite');
+      assert.deepEqual(createCompactStore(db).familyRows(HOUR).find((row) => row.family === 'uniswapV4'),
+        { family: 'uniswapV4', status: 'unavailable', reason: 'rpc_error', metrics: null });
+      db.close();
+    });
+
+    // Repair: a stored hour with an unavailable family is never treated as finished.
+    const v4DownChain = (options = {}) => chainOf({ ...options, faults: { ...options.faults, request: (body) => (!Array.isArray(body)
+      && body.method === 'eth_getLogs' && body.params[0].address?.[0] === UNISWAP_REGISTRY.v4PoolManager.address
+      ? { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'header not found' } } : undefined) } });
+    const storedRows = (name, hourStart = HOUR) => {
+      const db = open(name);
+      const store = createCompactStore(db);
+      const state = { families: Object.fromEntries(store.familyRows(hourStart).map((row) => [row.family, row])), hours: store.hourCount(),
+        checkpoint: store.checkpoint(), registry: store.v3Registry() };
+      db.close();
+      return state;
+    };
+
+    await test('runner: a stored hour with an unavailable family is reprocessed and upgraded on the stored registry, with no scan', async () => {
+      const before = storedRows('partial.sqlite');
+      assert.equal(before.families.uniswapV4.status, 'unavailable');
+      const { summary, lines, factoryScans, provider } = await runner('partial.sqlite');
+      assert.deepEqual([summary.hourMode, summary.repairFamilies, summary.registryMode, summary.hourOutcome, summary.ok],
+        ['repair', ['uniswapV4'], 'reused', 'upgraded', true]);
+      assert(provider.stats.requests > 0, 'the hour is reprocessed');
+      assert.deepEqual(historyScans(factoryScans, expectedFirst), [], 'no historical V3 registry scan during a repair');
+      assert.equal(lineOf(lines, 'HOUR_MODE'), 'HOUR_MODE repair repair_families=uniswapV4');
+      assert.equal(lines.at(-1), 'RESULT PASS');
+      const after = storedRows('partial.sqlite');
+      assert.deepEqual(after.families.uniswapV4.metrics, metricsOf(cleanResult.families.uniswapV4, 'uniswapV4'), 'upgraded to the verified value');
+      for (const name of ['usdc', 'assets', 'uniswapV3']) assert.deepEqual(after.families[name], before.families[name], `${name} is untouched`);
+      assert.deepEqual([after.hours, after.checkpoint, after.registry.through], [before.hours, before.checkpoint, before.registry.through]);
+      const settled = await runner('partial.sqlite');
+      assert.deepEqual([settled.summary.hourMode, settled.summary.hourOutcome, settled.provider.stats.requests, settled.summary.ok],
+        ['stored', 'already_committed', 0, true], 'once every family is available the hour exits early with zero RPC');
+    });
+
+    await test('runner: a repair that still cannot verify a family keeps it unavailable; available families never change', async () => {
+      const first = await runner('repair.sqlite', { fetchImpl: v4DownChain().fetchImpl });
+      assert.deepEqual([first.summary.hourOutcome, first.summary.ok], ['inserted', false]);
+      const original = storedRows('repair.sqlite');
+      // V4 still down, and USDC now fails on replay: V4 stays unavailable, the stored available USDC is kept as it was.
+      const usdcRemoved = v4DownChain({ faults: { logs: (filter, logs) => (filter.address?.[0] === USDC_SYSTEM_EMITTER.toLowerCase() && logs.length
+        ? [{ ...logs[0], removed: true }, ...logs.slice(1)] : logs) } });
+      const still = await runner('repair.sqlite', { fetchImpl: usdcRemoved.fetchImpl });
+      assert.deepEqual([still.summary.hourMode, still.summary.hourOutcome, still.summary.ok, still.summary.reason],
+        ['repair', 'unchanged', false, 'families_unavailable:uniswapV4']);
+      assert.deepEqual([still.summary.families.uniswapV4, still.summary.families.usdc], ['unavailable(rpc_error)', 'available']);
+      assert.deepEqual(storedRows('repair.sqlite'), original, 'nothing stored changed');
+      // A replay that computes a different value for an already-available family is refused as a whole.
+      const usdcChanged = chainOf({ faults: { logs: (filter, logs) => (filter.address?.[0] === USDC_SYSTEM_EMITTER.toLowerCase() && logs.length
+        ? [{ ...logs[0], data: `0x${(BigInt(logs[0].data) + 1n).toString(16).padStart(64, '0')}` }, ...logs.slice(1)] : logs) } });
+      const conflict = await runner('repair.sqlite', { fetchImpl: usdcChanged.fetchImpl });
+      assert.deepEqual([conflict.summary.hourMode, conflict.summary.ok, conflict.summary.reason], ['repair', false, 'hour_conflict']);
+      assert.deepEqual(storedRows('repair.sqlite'), original, 'the V4 upgrade in that replay was rolled back with it');
+      // After the next hour moved the checkpoint on, repairing the earlier hour upgrades it and leaves the checkpoint ahead.
+      const next = await runner('repair.sqlite', { hourStart: HOUR + 3600 });
+      assert.deepEqual([next.summary.hourMode, next.summary.hourOutcome, next.summary.ok], ['new', 'inserted', true]);
+      const repaired = await runner('repair.sqlite');
+      assert.deepEqual([repaired.summary.hourMode, repaired.summary.hourOutcome, repaired.summary.ok], ['repair', 'upgraded', true]);
+      for (const run of [still, conflict, repaired]) assert.deepEqual(historyScans(run.factoryScans, expectedFirst), [], 'no registry rescan');
+      const final = storedRows('repair.sqlite');
+      assert.deepEqual([final.hours, final.checkpoint.hourStart], [2, HOUR + 3600], 'the checkpoint never moves back');
+      assert.deepEqual(final.families.usdc, original.families.usdc, 'the first stored USDC value is immutable');
+      assert.equal(final.families.uniswapV4.status, 'available');
     });
   } finally {
     await rm(directory, { recursive: true, force: true });
