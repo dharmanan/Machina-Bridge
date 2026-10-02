@@ -13,10 +13,11 @@ import { locateHourBlocks } from '../server/compact/boundary.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { HourIncompleteError, processBlockRange, processHour } from '../server/compact/hour.js';
 import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS } from '../server/compact/offline.js';
-import { createProvider, ProviderError } from '../server/compact/provider.js';
-import { DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
+import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError } from '../server/compact/provider.js';
+import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../server/compact/registry.js';
+import { COMPACT_DEFINITION_VERSION, DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
 import { headerOf } from '../server/compact/spine.js';
-import { createCompactStore } from '../server/compact/store.js';
+import { ADDRESS_WINDOW_HOURS, createCompactStore } from '../server/compact/store.js';
 import { validateHour } from './validate-compact-hour.mjs';
 
 const capture = JSON.parse(await readFile(new URL('./fixtures/compact-arc-capture-2026-10-01.json', import.meta.url), 'utf8'));
@@ -42,7 +43,12 @@ async function rejectsWith(promise, code) {
 const HOUR = 1_790_006_400;
 const ORIGIN = { originNumber: 23_000_000, originTimestamp: HOUR - 1000 };
 const SAFE_HEAD = ORIGIN.originNumber + 12_000;
-const chainOf = (options = {}) => createSyntheticChain({ ...ORIGIN, poolCreatedAt: 23_002_500, ...options });
+// The official V3 pool is created inside the synthetic hour (block 23,002,500) and swaps in that same block.
+const POOL_CREATED_AT = 23_002_500;
+const chainOf = (options = {}) => createSyntheticChain({ ...ORIGIN, poolCreatedAt: POOL_CREATED_AT, ...options });
+// Official V3 pool registry for the synthetic chain: from the factory deployment past every hour the tests process.
+const V3 = registrySnapshot(await bootstrapV3Registry(offlineProvider(chainOf().fetchImpl),
+  { fromBlock: ORIGIN.originNumber, toBlock: ORIGIN.originNumber + 25_000 }));
 
 function firstAtOrAfter(chain, target) {
   let number = ORIGIN.originNumber + Math.floor(((target - ORIGIN.originTimestamp) * 10000) / 5074) - 5;
@@ -54,8 +60,9 @@ function firstAtOrAfter(chain, target) {
 // Independent reference straight from the generator: no engine module, normalizer or decoder involved.
 function reference(chain, first, last) {
   const senders = new Set(), recipients = new Set(), v4Traders = new Set(), v4Pools = new Set(), v3Traders = new Set();
+  const v3Foreign = new Set();
   const out = { blockCount: 0, transactionCount: 0, gasUsed: 0n, deployments: 0, usdc: 0, usdcAmount: 0n, mints: 0, burns: 0,
-    eurc: 0, v4Swaps: 0, v4Modify: 0, v4Init: 0, v3Swaps: 0, v3Mints: 0, v3Created: 0 };
+    eurc: 0, v4Swaps: 0, v4Modify: 0, v4Init: 0, v3Swaps: 0, v3Mints: 0, v3Created: 0, v3ForeignEvents: 0 };
   for (let number = first; number <= last; number++) {
     const transactions = chain.transactionsOf(number);
     out.blockCount += 1;
@@ -78,17 +85,18 @@ function reference(chain, first, last) {
       else if (log.topics[0] === UNISWAP_EVENT_TOPICS.v3PoolCreated) out.v3Created += 1;
       else if (log.address === SYNTHETIC_CONTRACTS.validV3Pool && log.topics[0] === UNISWAP_EVENT_TOPICS.v3Swap) { out.v3Swaps += 1; v3Traders.add(from); }
       else if (log.address === SYNTHETIC_CONTRACTS.validV3Pool && log.topics[0] === UNISWAP_EVENT_TOPICS.v3Mint) out.v3Mints += 1;
+      else if (log.topics[0] === UNISWAP_EVENT_TOPICS.v3Swap) { out.v3ForeignEvents += 1; v3Foreign.add(log.address); }
     }
   }
   return { ...out, senders: senders.size, recipients: recipients.size, active: new Set([...senders, ...recipients]).size,
-    v4Traders: v4Traders.size, v4Pools: v4Pools.size, v3Traders: v3Traders.size };
+    v4Traders: v4Traders.size, v4Pools: v4Pools.size, v3Traders: v3Traders.size, v3ForeignEmitters: v3Foreign.size };
 }
 
 const clean = chainOf();
 const expectedFirst = firstAtOrAfter(clean, HOUR);
 const expectedLast = firstAtOrAfter(clean, HOUR + 3600) - 1;
 const expected = reference(clean, expectedFirst, expectedLast);
-const cleanResult = await processHour({ provider: offlineProvider(clean.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+const cleanResult = await processHour({ provider: offlineProvider(clean.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
 
 function assertNullFamily(result, name, reason) {
   const family = result.families[name];
@@ -131,26 +139,26 @@ await test('hour boundary selection: 8 recorded Arc mainnet hours equal A2 verif
 // 2. Block continuity
 await test('block continuity: broken parent hash inside the hour fails the hour', async () => {
   const chain = chainOf({ faults: { block: (n, raw, full) => (full && n === expectedFirst + 1500 ? { ...raw, parentHash: `0x${'ab'.repeat(32)}` } : raw) } });
-  const error = await rejectsWith(processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD }), 'parent_hash_mismatch');
+  const error = await rejectsWith(processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'parent_hash_mismatch');
   assert(error instanceof HourIncompleteError);
   assert.equal(error.blockNumber, expectedFirst + 1500);
 });
 
 await test('block continuity: right boundary block must descend from the last hour block', async () => {
   const chain = chainOf({ faults: { block: (n, raw, full) => (!full && n === expectedLast + 1 ? { ...raw, parentHash: `0x${'cd'.repeat(32)}` } : raw) } });
-  await rejectsWith(processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD }), 'right_boundary_mismatch');
+  await rejectsWith(processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'right_boundary_mismatch');
 });
 
 // 3. Missing block
 await test('missing block: null body or hash-only body is never an empty block', async () => {
   const missing = chainOf({ faults: { block: (n, raw, full) => (full && n === expectedFirst + 10 ? null : raw) } });
-  await rejectsWith(processHour({ provider: offlineProvider(missing.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD }), 'missing_block');
+  await rejectsWith(processHour({ provider: offlineProvider(missing.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'missing_block');
   const hashesOnly = chainOf({ faults: { block: (n, raw, full) => (full && n === expectedFirst + 20 ? { ...raw, transactions: raw.transactions.map((tx) => tx.hash) } : raw) } });
-  await rejectsWith(processHour({ provider: offlineProvider(hashesOnly.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD }), 'transaction_bodies_missing');
+  await rejectsWith(processHour({ provider: offlineProvider(hashesOnly.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'transaction_bodies_missing');
 });
 
 // 4. Malformed batch response
-await test('malformed batch response: short, duplicate-id and truncated batches fail closed after retries and failover', async () => {
+await test('malformed batch response: short, duplicate-id and truncated batches fail closed after bounded retries, no failover', async () => {
   const isBodyBatch = (body) => Array.isArray(body) && body[0]?.method === 'eth_getBlockByNumber';
   const variants = [
     (body) => body.slice(1).map((item) => ({ jsonrpc: '2.0', id: item.id, result: null })),
@@ -160,14 +168,14 @@ await test('malformed batch response: short, duplicate-id and truncated batches 
   for (const variant of variants) {
     const chain = chainOf({ faults: { request: (body) => (isBodyBatch(body) ? variant(body) : undefined) } });
     const provider = offlineProvider(chain.fetchImpl);
-    await rejectsWith(processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD }), 'invalid_response');
-    assert.equal(provider.stats.failovers, 1);
-    assert.equal(provider.stats.retries, 4);
+    await rejectsWith(processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'invalid_response');
+    assert.equal(provider.stats.retries, 2, 'three attempts on the one endpoint');
+    assert(chain.requests.length > 0 && provider.endpoint.name === ARC_PRIMARY_ENDPOINT.name);
   }
   let once = true;
   const transient = chainOf({ faults: { request: (body) => (isBodyBatch(body) && once ? ((once = false), '[]') : undefined) } });
   const provider = offlineProvider(transient.fetchImpl);
-  assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD }), cleanResult);
+  assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), cleanResult);
   assert.equal(provider.stats.retries, 1);
 });
 
@@ -182,7 +190,8 @@ await test('provider item-level -32005: real recorded Arc batch never becomes em
   const error = await rejectsWith(provider.batch(items.map((item) => ['eth_getLogs', item.params]), { allowItemErrors: true }), 'rate_limited');
   assert(error instanceof ProviderError);
   assert.equal(error.rpcCode, -32005);
-  assert.equal(provider.stats.requests, 2 * 3 + 2, 'three attempts on each endpoint plus one chainId check each');
+  assert.equal(error.detail, 'rate limit exceeded', 'the RPC message is kept for diagnostics');
+  assert.equal(provider.stats.requests, 3 + 1, 'three attempts on the one endpoint plus one chainId check');
 });
 
 await test('provider item-level -32005: one rate-limited body item is retried, result unchanged, getLogs never batched', async () => {
@@ -194,7 +203,7 @@ await test('provider item-level -32005: one rate-limited body item is retried, r
       : { jsonrpc: '2.0', id: item.id, result: chain.rawBlock(Number(BigInt(item.params[0])), true) }));
   } } });
   const provider = offlineProvider(chain.fetchImpl);
-  assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD }), cleanResult);
+  assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), cleanResult);
   assert.equal(provider.stats.retries, 1);
   assert(!chain.requests.some((request) => Array.isArray(request) && request.includes('eth_getLogs')), 'eth_getLogs must never be batched');
   assert(chain.requests.filter(Array.isArray).every((request) => request.length <= 50), 'batches are at most 50 calls');
@@ -205,10 +214,10 @@ await test('range splitting: -32012 and -32602 split down to identical results; 
   for (const limits of [{ maxRange: 300 }, { maxResults: 2000 }]) {
     const chain = chainOf({ limits });
     const provider = offlineProvider(chain.fetchImpl);
-    assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD }), cleanResult, JSON.stringify(limits));
+    assert.deepEqual(await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), cleanResult, JSON.stringify(limits));
   }
   const chain = chainOf({ limits: { maxResults: 3 } });
-  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(result, 'usdc', 'unsplittable_range');
   assert.deepEqual(result.network, cleanResult.network, 'network spine is unaffected by a log family failure');
 });
@@ -217,7 +226,7 @@ await test('range splitting: -32012 and -32602 split down to identical results; 
 await test('removed log rejection: a removed log makes its family unavailable, never a smaller count', async () => {
   const chain = chainOf({ faults: { logs: (filter, logs) => (filter.address?.[0] === USDC_SYSTEM_EMITTER.toLowerCase() && logs.length
     ? logs.map((log, index) => (index === 7 ? { ...log, removed: true } : log)) : logs) } });
-  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(result, 'usdc', 'removed_log');
   assert.deepEqual(result.families.uniswapV4, cleanResult.families.uniswapV4);
 });
@@ -227,11 +236,11 @@ await test('blockHash mismatch: a log from another block hash or transaction is 
   const isV4 = (filter) => filter.address?.[0] === UNISWAP_REGISTRY.v4PoolManager.address;
   const wrongHash = chainOf({ faults: { logs: (filter, logs) => (isV4(filter) && logs.length
     ? [{ ...logs[0], blockHash: `0x${'ee'.repeat(32)}` }, ...logs.slice(1)] : logs) } });
-  const first = await processHour({ provider: offlineProvider(wrongHash.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const first = await processHour({ provider: offlineProvider(wrongHash.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(first, 'uniswapV4', 'log_block_hash_mismatch');
   const wrongTx = chainOf({ faults: { logs: (filter, logs) => (isV4(filter) && logs.length
     ? [{ ...logs[0], transactionHash: `0x${'ff'.repeat(32)}` }, ...logs.slice(1)] : logs) } });
-  const second = await processHour({ provider: offlineProvider(wrongTx.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const second = await processHour({ provider: offlineProvider(wrongTx.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(second, 'uniswapV4', 'log_transaction_mismatch');
 });
 
@@ -246,7 +255,7 @@ await test('canonical USDC semantics: system emitter only, mint/burn by zero add
   assert(expected.mints > 0 && expected.burns > 0);
   const injected = chainOf({ faults: { logs: (filter, logs) => (filter.address?.[0] === USDC_SYSTEM_EMITTER.toLowerCase() && logs.length
     ? [...logs, { ...logs[0], address: USDC_ERC20_ADDRESS, logIndex: '0x3e7' }] : logs) } });
-  const result = await processHour({ provider: offlineProvider(injected.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const result = await processHour({ provider: offlineProvider(injected.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(result, 'usdc', 'unexpected_log_address');
 });
 
@@ -270,18 +279,23 @@ await test('unique address semantics: top-level from ∪ to, deployments are not
   assert.equal(v3.mintCount, expected.v3Mints);
   assert.equal(v3.poolCreatedCount, expected.v3Created);
   assert.equal(v3.uniqueTraders, expected.v3Traders);
-  assert.deepEqual(v3.verifiedPools.map((pool) => pool.address), [SYNTHETIC_CONTRACTS.validV3Pool]);
-  assert.equal(v3.rejectedEmitterCount, 1, 'emitter from a foreign factory is rejected');
+  assert.equal(v3.poolsWithSwaps, 1);
+  assert.equal(v3.foreignEmitterCount, 1, 'an emitter outside the official registry is foreign, never an official pool');
+  assert.equal(v3.foreignEventCount, expected.v3ForeignEvents);
+  assert(!('verifiedPools' in v3), 'pool details live in the registry, not in every hourly result');
+  assert.deepEqual(cleanResult.registry.uniswapV3.created.map((pool) => pool.address), [SYNTHETIC_CONTRACTS.validV3Pool]);
   assert.equal(cleanResult.families.assets.items.find((item) => item.symbol === 'EURC').transferCount, expected.eurc);
 });
 
 // Real Arc mainnet micro window (blocks 23677449-23677452, crosses 08:00 UTC): equivalence with the raw responses.
 const micro = capture.microWindow;
 const microBefore = headerOf(micro.calls[0].result, micro.first - 1);
+// A registry known complete through the block before the window; no official pool emitted inside it.
+const microRegistry = { fromBlock: 0, through: micro.first - 1, throughHash: microBefore.hash, pools: new Set() };
 async function runMicro() {
   const recorded = createRecordedFetch(micro.calls);
   const provider = offlineProvider(recorded.fetchImpl);
-  const result = await processBlockRange({ provider, first: micro.first, last: micro.last, before: microBefore });
+  const result = await processBlockRange({ provider, first: micro.first, last: micro.last, before: microBefore, v3Registry: microRegistry });
   assert.deepEqual(recorded.missing, []);
   return { result, provider };
 }
@@ -321,12 +335,12 @@ await test('incomplete hour never zero: unfinished hour, missing bodies and fail
   assert(error instanceof HourIncompleteError, 'recorded Arc hour without bodies yields no result at all');
   const failing = chainOf({ faults: { request: (body) => (!Array.isArray(body) && body.method === 'eth_getLogs'
     && body.params[0].address?.[0] === UNISWAP_REGISTRY.v4PoolManager.address ? { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'header not found' } } : undefined) } });
-  const result = await processHour({ provider: offlineProvider(failing.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
+  const result = await processHour({ provider: offlineProvider(failing.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
   assertNullFamily(result, 'uniswapV4', 'rpc_error');
   assert.equal(JSON.stringify(result.families.uniswapV4).includes(':0'), false);
 });
 
-await test('dense streams: canonical USDC and V4 requests never span more than 500 blocks and stay gap-free', async () => {
+await test('dense streams: canonical USDC, V4 and topic-only V3 requests never span more than 500 blocks and stay gap-free', async () => {
   const spans = {};
   const chain = chainOf({ faults: { request: (body) => {
     if (!Array.isArray(body) && body.method === 'eth_getLogs') {
@@ -337,25 +351,123 @@ await test('dense streams: canonical USDC and V4 requests never span more than 5
     }
     return undefined;
   } } });
-  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, windowBlocks: 2000 });
+  const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, windowBlocks: 2000, v3Registry: V3 });
   assert.deepEqual(result, cleanResult);
-  for (const key of ['usdc', 'v4']) {
+  for (const key of ['usdc', 'v4', 'v3Pools']) {
     assert(Math.max(...spans[key]) <= DENSE_LOG_RANGE_BLOCKS, `${key} requested ${Math.max(...spans[key])} blocks`);
     assert.equal(spans[key].reduce((sum, span) => sum + span, 0), cleanResult.network.blockCount);
   }
   assert(Math.max(...spans.assets) > DENSE_LOG_RANGE_BLOCKS, 'sparse streams follow the window size');
 });
 
-await test('V3 pool check: a non-revert RPC error makes V3 unavailable; only a revert rejects the pool', async () => {
-  const answer = (error) => ({ to }) => (to.toLowerCase() === SYNTHETIC_CONTRACTS.validV3Pool ? { error } : undefined);
-  const lagging = chainOf({ faults: { call: answer({ code: -32000, message: 'header not found' }) } });
-  const unavailable = await processHour({ provider: offlineProvider(lagging.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD });
-  assertNullFamily(unavailable, 'uniswapV3', 'v3_pool_verification_unavailable');
-  const reverting = chainOf({ faults: { call: answer({ code: 3, message: 'execution reverted' }) } });
-  const rejected = (await processHour({ provider: offlineProvider(reverting.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD })).families.uniswapV3;
-  assert.equal(rejected.status, 'available');
-  assert.deepEqual(rejected.verifiedPools, []);
-  assert.equal(rejected.rejectedEmitterCount, 2);
+// Replaces the Stage 1 per-hour eth_call pool check: V3 sources now fail closed on RPC errors with no eth_call at all.
+await test('V3 source check: a non-revert RPC error on a V3 stream makes V3 unavailable; no eth_call is ever made', async () => {
+  const isV3 = (body) => !Array.isArray(body) && body.method === 'eth_getLogs' && body.params[0].topics[0][0] === UNISWAP_EVENT_TOPICS.v3Swap;
+  const lagging = chainOf({ faults: { request: (body) => (isV3(body) ? { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'header not found' } } : undefined) } });
+  const provider = offlineProvider(lagging.fetchImpl);
+  const unavailable = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
+  assertNullFamily(unavailable, 'uniswapV3', 'rpc_error');
+  assert.equal(unavailable.registry.uniswapV3, null, 'an unavailable V3 hour adds nothing to the registry');
+  assert.deepEqual(unavailable.network, cleanResult.network);
+  assert.equal(provider.stats.calls.eth_call ?? 0, 0);
+});
+
+await test('V3 registry: bootstrap proves its start, catch-up checks continuity, same-hour pools come from the overlay', async () => {
+  const provider = offlineProvider(chainOf().fetchImpl);
+  await rejectsWith(bootstrapV3Registry(provider, { fromBlock: ORIGIN.originNumber + 1, toBlock: ORIGIN.originNumber + 10 }),
+    'registry_start_after_factory_deployment');
+  const early = await bootstrapV3Registry(provider, { fromBlock: ORIGIN.originNumber, toBlock: expectedFirst - 1001 });
+  assert.deepEqual(early.created, [], 'the official pool is created inside the hour, after this bootstrap');
+  const behind = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: registrySnapshot(early) });
+  assertNullFamily(behind, 'uniswapV3', 'v3_registry_behind');
+  assert.deepEqual(behind.network, cleanResult.network);
+  const missing = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD });
+  assertNullFamily(missing, 'uniswapV3', 'v3_registry_missing');
+  await rejectsWith(catchUpV3Registry(provider, { ...registrySnapshot(early), throughHash: `0x${'aa'.repeat(32)}` }, expectedFirst - 1), 'v3_registry_fork');
+  const caught = registrySnapshot(await catchUpV3Registry(provider, registrySnapshot(early), expectedFirst - 1), registrySnapshot(early));
+  assert.equal(caught.through, expectedFirst - 1);
+  assert.equal(caught.pools.size, 0);
+  const forked = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: { ...caught, throughHash: `0x${'bb'.repeat(32)}` } });
+  assertNullFamily(forked, 'uniswapV3', 'v3_registry_fork');
+  const overlay = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: caught });
+  assert(clean.logsOf(POOL_CREATED_AT).some((log) => log.address === SYNTHETIC_CONTRACTS.validV3Pool && log.topics[0] === UNISWAP_EVENT_TOPICS.v3Swap),
+    'the fixture swaps in the pool creation block');
+  assert.deepEqual(overlay, cleanResult, 'a registry ending right before the hour plus the overlay equals a registry past the hour');
+  assert.deepEqual(overlay.registry.uniswapV3.created.map((pool) => [pool.address, pool.createdBlock]), [[SYNTHETIC_CONTRACTS.validV3Pool, POOL_CREATED_AT]]);
+  assert.equal(overlay.registry.uniswapV3.through, expectedLast);
+});
+
+await test('V3: more than 50 foreign V3-signature emitters never make V3 unavailable and cost no RPC reads', async () => {
+  const chain = chainOf({ foreignV3Emitters: 80, foreignV3Every: 10 });
+  const provider = offlineProvider(chain.fetchImpl);
+  const result = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 });
+  const many = reference(chain, expectedFirst, expectedLast);
+  assert(many.v3ForeignEmitters === 80 && many.v3ForeignEvents > 500);
+  const v3 = result.families.uniswapV3;
+  assert.equal(v3.status, 'available');
+  assert.deepEqual({ foreignEmitterCount: v3.foreignEmitterCount, foreignEventCount: v3.foreignEventCount },
+    { foreignEmitterCount: 80, foreignEventCount: many.v3ForeignEvents });
+  assert.deepEqual({ ...v3, foreignEmitterCount: 1, foreignEventCount: expected.v3ForeignEvents }, cleanResult.families.uniswapV3,
+    'official pool metrics are unchanged by foreign emitters');
+  assert.equal(result.complete, true);
+  assert.equal(provider.stats.calls.eth_call ?? 0, 0);
+});
+
+await test('V3: a malformed event from an official pool fails closed; a malformed foreign event is ignored', async () => {
+  const corrupt = (target) => chainOf({ faults: { logs: (filter, logs) => logs.map((log) => (log.address === target
+    && log.topics[0] === UNISWAP_EVENT_TOPICS.v3Swap ? { ...log, data: '0x00' } : log)) } });
+  const official = await processHour({ provider: offlineProvider(corrupt(SYNTHETIC_CONTRACTS.validV3Pool).fetchImpl), hourStart: HOUR,
+    safeHead: SAFE_HEAD, v3Registry: V3 });
+  assertNullFamily(official, 'uniswapV3', 'malformed_v3_pool_event');
+  const foreign = await processHour({ provider: offlineProvider(corrupt(SYNTHETIC_CONTRACTS.foreignV3Emitter).fetchImpl), hourStart: HOUR,
+    safeHead: SAFE_HEAD, v3Registry: V3 });
+  assert.deepEqual(foreign, cleanResult);
+});
+
+await test('omitted streams: a family whose streams were not requested is unavailable with nulls, never zero', async () => {
+  // A bounded range around the official pool's creation, so every omitted family would have had real activity.
+  const first = POOL_CREATED_AT - 50;
+  const last = POOL_CREATED_AT + 149;
+  const before = headerOf(clean.rawBlock(first - 1, false), first - 1);
+  const range = (streams) => processBlockRange({ provider: offlineProvider(chainOf().fetchImpl), first, last, before, v3Registry: V3, streams });
+  const full = await range(LOG_STREAMS);
+  assert.equal(full.complete, true);
+  assert(full.families.uniswapV3.swapCount > 0 && full.families.uniswapV4.swapCount > 0
+    && full.families.assets.items.find((item) => item.symbol === 'EURC').transferCount > 0, 'each omitted family has activity in this range');
+  for (const [name, omitted] of [['uniswapV3', ['v3Factory', 'v3Pools']], ['uniswapV3', ['v3Pools']], ['uniswapV4', ['v4']], ['assets', ['assets']]]) {
+    const result = await range(LOG_STREAMS.filter((stream) => !omitted.includes(stream.key)));
+    assertNullFamily(result, name, 'stream_not_requested');
+    for (const other of Object.keys(full.families).filter((key) => key !== name)) {
+      assert.deepEqual(result.families[other], full.families[other], `omitting ${omitted} must not change ${other}`);
+    }
+    assert.deepEqual(result.network, full.network);
+  }
+  assert.equal((await range(LOG_STREAMS.filter((stream) => stream.key !== 'v3Pools'))).registry.uniswapV3, null,
+    'an unavailable V3 adds nothing to the registry');
+});
+
+await test('streaming equivalence: any window size and any per-response split give a byte-identical hour', async () => {
+  for (const { windowBlocks, limits } of [{ windowBlocks: 50 }, { windowBlocks: 250 }, { windowBlocks: 1000 }, { limits: { maxRange: 120 } }]) {
+    const chain = chainOf(limits ? { limits } : {});
+    const result = await processHour({ provider: offlineProvider(chain.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3,
+      ...(windowBlocks ? { windowBlocks } : {}) });
+    assert.equal(digest(result), digest(cleanResult), JSON.stringify({ windowBlocks, limits }));
+  }
+  // With a 120-block provider limit each 500-block window arrives as several responses; each is handed over on its own,
+  // in chain order, and never merged into a window-wide array.
+  let previous = -1;
+  let widest = 0;
+  let responses = 0;
+  await processHour({ provider: offlineProvider(chainOf({ limits: { maxRange: 120 } }).fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3,
+    onLogs: (key, logs) => {
+      if (key !== 'usdc' || !logs.length) return;
+      responses += 1;
+      assert(logs[0].blockNumber > previous, 'responses arrive in ascending block order');
+      previous = logs.at(-1).blockNumber;
+      widest = Math.max(widest, logs.at(-1).blockNumber - logs[0].blockNumber + 1);
+    } });
+  assert(widest <= 120, `a single hand-over spans ${widest} blocks`);
+  assert(responses >= Math.ceil(expected.blockCount / 120));
 });
 
 await test('dependency policy: engine, tests and validator import only node: built-ins and repository files', async () => {
@@ -379,10 +491,11 @@ await test('dependency policy: engine, tests and validator import only node: bui
 // Live validator gate, exercised offline: same code path as the GitHub Actions run, synthetic chains as providers.
 const syntheticTruth = { blocks: expected.blockCount, transactions: expected.transactionCount, activeAddresses: expected.active,
   canonicalUsdcTransfers: expected.usdc, usdcMints: expected.mints, usdcBurns: expected.burns };
+// secondaryFetch null means no secondary was requested (the default for the live validator without --secondary).
 async function validateOffline({ expectedValues = syntheticTruth, secondaryFetch = chainOf().fetchImpl, sqliteDirectory = null } = {}) {
   const lines = [];
-  const report = await validateHour({ primary: offlineProvider(chainOf().fetchImpl), secondary: offlineProvider(secondaryFetch),
-    hourStart: HOUR, expected: expectedValues, sqliteDirectory, print: (text) => lines.push(text) });
+  const report = await validateHour({ primary: offlineProvider(chainOf().fetchImpl), secondary: secondaryFetch && offlineProvider(secondaryFetch),
+    hourStart: HOUR, expected: expectedValues, sqliteDirectory, v3RegistryFromBlock: ORIGIN.originNumber, print: (text) => lines.push(text) });
   return { report, lines };
 }
 
@@ -397,6 +510,12 @@ await test('validator gate: an equal hour prints EXPECTED / ACTUAL / MATCH for e
   assert.equal(report.secondary.checks.length, 9);
   assert.equal(report.resources.primary.returnedLogsByStream.usdc, expected.usdc);
   assert.equal(report.resources.primary.logCallsByStream.usdc, Math.ceil(expected.blockCount / DENSE_LOG_RANGE_BLOCKS));
+  for (const field of ['rss', 'heapUsed', 'heapTotal', 'external', 'arrayBuffers']) {
+    for (const phase of ['Before', 'PeakSampled', 'After']) assert(Number.isFinite(report.resources.primary[`${field}${phase}Mb`]), `${field}${phase}Mb`);
+  }
+  assert.equal(report.resources.registry.officialPools, 1);
+  assert(lines.some((text) => text.startsWith('RECOMMENDED PRODUCTION NODE FLAGS --max-old-space-size=64 --max-semi-space-size=2')));
+  assert(lines.some((text) => text.startsWith('UNISWAP V3 official:') && text.includes('foreign V3-signature emitters ignored: 1')));
 });
 
 await test('validator gate: any metric mismatch fails the run, with no tolerance', async () => {
@@ -422,13 +541,20 @@ await test('validator gate: a log missing on the secondary is a located identity
 });
 
 await test('validator gate: a rate-limited secondary is NOT VERIFIED and fails the run, never a silent pass', async () => {
-  const limited = async () => ({ status: 429, ok: false, text: async () => '' });
+  const limited = async () => ({ status: 429, ok: false, text: async () => 'Too Many Requests' });
   const { report, lines } = await validateOffline({ secondaryFetch: limited });
   assert.equal(report.ok, false);
   assert.equal(report.secondary.status, 'not_verified');
   assert.equal(report.secondary.reason, 'rate_limited');
-  assert(lines.some((text) => text.startsWith('SECONDARY NOT VERIFIED')));
+  assert.deepEqual({ httpStatus: report.secondary.diagnostics.httpStatus, detail: report.secondary.diagnostics.detail },
+    { httpStatus: 429, detail: 'Too Many Requests' });
+  assert(lines.some((text) => text.startsWith('SECONDARY NOT VERIFIED') && text.includes('"httpStatus":429')));
   assert(report.metrics.every((metric) => metric.match));
+  // Not requested is reported as such; it is never shown as verified.
+  const alone = await validateOffline({ secondaryFetch: null });
+  assert.equal(alone.report.secondary.status, 'not_requested');
+  assert.equal(alone.report.ok, true);
+  assert(alone.lines.at(-1).includes('secondary not_requested'));
 });
 
 // SQLite store on built-in node:sqlite (Node 22.13+). Temporary files only, deleted at the end.
@@ -441,22 +567,129 @@ if (!sqlite) {
   const open = (name = 'store.sqlite') => new sqlite.DatabaseSync(join(directory, name));
   const hours = [cleanResult];
   for (const offset of [1, 2]) {
-    hours.push(await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR + offset * 3600, safeHead: ORIGIN.originNumber + 25_000 }));
+    hours.push(await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR + offset * 3600, safeHead: ORIGIN.originNumber + 25_000,
+      v3Registry: V3 }));
   }
   assert(hours.every((hour) => hour.complete));
-  const rows = (db) => db.prepare('SELECT hour_start, result_sha256 FROM compact_hours ORDER BY hour_start').all()
-    .map((row) => `${row.hour_start}:${row.result_sha256}`);
+  // The second hour again, with a removed canonical USDC log: the spine is complete, USDC is unavailable.
+  const removedUsdc = await processHour({ provider: offlineProvider(chainOf({ faults: { logs: (filter, logs) => (filter.address?.[0]
+    === USDC_SYSTEM_EMITTER.toLowerCase() && logs.length ? [{ ...logs[0], removed: true }, ...logs.slice(1)] : logs) } }).fetchImpl),
+  hourStart: HOUR + 3600, safeHead: ORIGIN.originNumber + 25_000, v3Registry: V3 });
+  assert(removedUsdc.families.usdc.status === 'unavailable' && removedUsdc.families.uniswapV4.status === 'available');
+  const rows = (db) => db.prepare('SELECT hour_start, network_sha256 FROM compact_hours ORDER BY hour_start').all()
+    .map((row) => `${row.hour_start}:${row.network_sha256}`);
+  const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
+  const TABLES = ['compact_checkpoint', 'compact_family_hours', 'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_registry',
+    'compact_registry_coverage'];
+  const metricsOf = (family, name) => Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, family[field]]));
   try {
-    await test('sqlite: schema is created on node:sqlite and reopening keeps it', async () => {
+    await test('sqlite: schema v2 is created with WAL, synchronous=NORMAL and busy_timeout=5000; reopening keeps it', async () => {
       const db = open();
       createCompactStore(db);
-      assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name),
-        ['compact_checkpoint', 'compact_hours', 'compact_meta']);
+      assert.deepEqual(tables(db), TABLES);
+      assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+      assert.equal(db.prepare('PRAGMA synchronous').get().synchronous, 1, 'NORMAL');
+      assert.equal(Object.values(db.prepare('PRAGMA busy_timeout').get())[0], 5000);
       db.close();
       const again = open();
       createCompactStore(again);
-      assert.equal(again.prepare('SELECT value FROM compact_meta WHERE key = ?').get('schema_version').value, '1');
+      assert.equal(again.prepare('SELECT value FROM compact_meta WHERE key = ?').get('schema_version').value, '2');
       again.close();
+    });
+
+    await test('sqlite: an incompatible Stage 1 (v1) database is refused before anything in the file changes', async () => {
+      const path = join(directory, 'stage1.sqlite');
+      const v1 = new sqlite.DatabaseSync(path);
+      // The Stage 1 schema, as written by the v1 store, with one stored hour.
+      v1.exec(`CREATE TABLE compact_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+        CREATE TABLE compact_hours (hour_start INTEGER PRIMARY KEY CHECK (hour_start % 3600 = 0), definition_version TEXT NOT NULL,
+          first_block INTEGER NOT NULL, last_block INTEGER NOT NULL, first_hash TEXT NOT NULL, last_hash TEXT NOT NULL,
+          block_count INTEGER NOT NULL CHECK (block_count = last_block - first_block + 1), transaction_count INTEGER NOT NULL,
+          unique_active_addresses INTEGER NOT NULL, usdc_transfer_count INTEGER NOT NULL, usdc_mint_count INTEGER NOT NULL,
+          usdc_burn_count INTEGER NOT NULL, result_json TEXT NOT NULL, result_sha256 TEXT NOT NULL) STRICT;
+        CREATE TABLE compact_checkpoint (id INTEGER PRIMARY KEY CHECK (id = 1), hour_start INTEGER NOT NULL, last_block INTEGER NOT NULL,
+          last_hash TEXT NOT NULL) STRICT;
+        INSERT INTO compact_meta VALUES ('schema_version', '1');
+        INSERT INTO compact_hours VALUES (${HOUR}, 'arc-compact-hour-v1', 10, 19, 'a', 'b', 10, 0, 0, 0, 0, 0, '{}', 'h');`);
+      v1.close();
+      const fingerprint = async () => createHash('sha256').update(await readFile(path)).digest('hex');
+      const before = await fingerprint();
+      const db = new sqlite.DatabaseSync(path);
+      assert.throws(() => createCompactStore(db), (error) => error.code === 'schema_version_mismatch');
+      assert.deepEqual(tables(db), ['compact_checkpoint', 'compact_hours', 'compact_meta'], 'no v2 table was created');
+      assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'delete', 'the journal mode was not switched to WAL');
+      db.close();
+      assert.equal(await fingerprint(), before, 'the file is byte-identical');
+      assert(!(await readdir(directory)).some((name) => name.startsWith('stage1.sqlite-')), 'no WAL or shared-memory file appeared');
+      const orphan = new sqlite.DatabaseSync(join(directory, 'orphan.sqlite'));
+      orphan.exec('CREATE TABLE compact_hours (hour_start INTEGER PRIMARY KEY) STRICT');
+      assert.throws(() => createCompactStore(orphan), (error) => error.code === 'schema_version_mismatch', 'compact tables without a version row');
+      assert.deepEqual(tables(orphan), ['compact_hours']);
+      orphan.close();
+    });
+
+    await test('sqlite: a new hour with another definition version or chain id is refused before anything is written', async () => {
+      const db = open('identity.sqlite');
+      const store = createCompactStore(db);
+      assert.throws(() => store.commitHour({ ...hours[0], definitionVersion: 'arc-compact-hour-v1' }), (error) => error.code === 'definition_version_mismatch');
+      assert.throws(() => store.commitHour({ ...hours[0], chainId: 1 }), (error) => error.code === 'chain_id_mismatch');
+      const dataTables = TABLES.filter((table) => table !== 'compact_meta');
+      assert.deepEqual(dataTables.map((table) => db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count), dataTables.map(() => 0));
+      assert.equal(store.commitHour(hours[0]).outcome, 'inserted', 'the same hour with the expected identity is accepted');
+      db.close();
+    });
+
+    await test('sqlite: the checkpoint advances only across hash-linked hours; a forged parent hash is refused', async () => {
+      const db = open('continuity.sqlite');
+      const store = createCompactStore(db);
+      store.commitHour(hours[0]);
+      assert.equal(hours[1].range.parentHash, hours[0].range.lastHash, 'genuine neighbours link by hash');
+      const forged = { ...hours[1], range: { ...hours[1].range, parentHash: `0x${'ab'.repeat(32)}` } };
+      assert.equal(forged.range.firstBlock, hours[0].range.lastBlock + 1, 'block numbers alone still look contiguous');
+      assert.throws(() => store.commitHour(forged), (error) => error.code === 'checkpoint_discontinuity');
+      assert.deepEqual([store.hourCount(), store.checkpoint().hourStart], [1, HOUR], 'the forged hour is not stored and the checkpoint stays');
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_hour_addresses WHERE hour_start = ?').get(BigInt(HOUR + 3600)).count, 0);
+      assert.equal(store.commitHour(hours[1]).checkpoint.hourStart, HOUR + 3600, 'the genuine hour still advances it');
+      db.close();
+    });
+
+    await test('sqlite: forward only; a new hour ahead of the checkpoint is refused before any row is written', async () => {
+      const db = open('forward.sqlite');
+      const store = createCompactStore(db);
+      const count = (table) => db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
+      const state = () => ({ tables: TABLES.filter((table) => table !== 'compact_meta').map((table) => [table, count(table)]),
+        families: db.prepare('SELECT hour_start, family, status, metrics_sha256 FROM compact_family_hours ORDER BY hour_start, family').all()
+          .map((row) => `${row.hour_start}:${row.family}:${row.status}:${row.metrics_sha256}`),
+        registry: store.v3Registry(), checkpoint: store.checkpoint() });
+      store.extendRegistry(await bootstrapV3Registry(offlineProvider(chainOf().fetchImpl), { fromBlock: ORIGIN.originNumber, toBlock: hours[0].range.firstBlock - 1 }));
+      assert.equal(store.commitHour(hours[0]).outcome, 'inserted', 'an empty database accepts its first hour at any hour start');
+      const before = state();
+      // H+2 straight after H, carrying an extra pool row as well: refused, and nothing at all is written.
+      const extraPool = { ...hours[2].registry.uniswapV3, created: [...hours[2].registry.uniswapV3.created, { address: `0x${'ee'.repeat(20)}`,
+        createdBlock: hours[2].range.firstBlock, createdLogIndex: 0, createdTx: `0x${'ee'.repeat(32)}`, token0: `0x${'01'.repeat(20)}`,
+        token1: `0x${'02'.repeat(20)}`, fee: 3000, tickSpacing: 60 }] };
+      for (const ahead of [hours[2], { ...hours[2], registry: { uniswapV3: extraPool } }]) {
+        assert.throws(() => store.commitHour(ahead), (error) => error.code === 'checkpoint_gap');
+      }
+      assert.deepEqual(state(), before, 'no hour, family, address, registry, coverage or checkpoint change');
+      assert.equal(count('compact_hour_addresses'), hours[0].network.uniqueActiveAddresses);
+      // H+1 (here with canonical USDC unavailable) is the next canonical hour, then H+2 follows it.
+      assert.deepEqual(store.commitHour(removedUsdc).checkpoint.hourStart, HOUR + 3600);
+      assert.equal(store.commitHour(hours[2]).checkpoint.hourStart, HOUR + 7200);
+      assert.equal(store.v3Registry().through, hours[2].range.lastBlock);
+      // Existing hours still replay: unchanged, and an unavailable family upgrades when the network hash matches.
+      assert.equal(store.commitHour(hours[0]).outcome, 'unchanged');
+      assert.equal(store.commitHour(hours[1]).outcome, 'upgraded');
+      assert.equal(store.familyRows(HOUR + 3600).find((row) => row.family === 'usdc').status, 'available');
+      assert.deepEqual([store.hourCount(), store.checkpoint().hourStart], [3, HOUR + 7200]);
+      db.close();
+      // Once a checkpoint exists, a new hour behind it is refused too: the run only grows forward.
+      const later = open('forward-behind.sqlite');
+      const behind = createCompactStore(later);
+      assert.equal(behind.commitHour(hours[1]).outcome, 'inserted');
+      assert.throws(() => behind.commitHour(hours[0]), (error) => error.code === 'hour_before_checkpoint');
+      assert.deepEqual([behind.hourCount(), behind.checkpoint().hourStart], [1, HOUR + 3600]);
+      later.close();
     });
 
     await test('sqlite: hour row and checkpoint commit together; an injected failure before COMMIT advances neither', async () => {
@@ -472,8 +705,9 @@ if (!sqlite) {
       store = createCompactStore(db);
       assert.equal(store.hourCount(), 1, 'state on disk after reopen');
       assert.equal(store.checkpoint().hourStart, HOUR);
-      assert.equal(store.commitHour(hours[2]).checkpoint.hourStart, HOUR, 'a gap never moves the checkpoint');
-      assert.equal(store.commitHour(hours[1]).checkpoint.hourStart, HOUR + 7200, 'closing the gap moves it across contiguous hours');
+      assert.throws(() => store.commitHour(hours[2]), (error) => error.code === 'checkpoint_gap', 'an hour ahead of the checkpoint is refused');
+      assert.equal(store.commitHour(hours[1]).checkpoint.hourStart, HOUR + 3600, 'the next canonical hour moves the checkpoint');
+      assert.equal(store.commitHour(hours[2]).checkpoint.hourStart, HOUR + 7200);
       db.close();
     });
 
@@ -489,37 +723,145 @@ if (!sqlite) {
       db.close();
     });
 
-    await test('sqlite: an incomplete or inconsistent hour can never be committed as complete', async () => {
+    // Stage 2a: an unavailable family no longer blocks an hour (next test); everything below is still refused.
+    await test('sqlite: an incomplete spine or an inconsistent hour can never be committed', async () => {
       const db = open('refusals.sqlite');
       const store = createCompactStore(db);
       const unavailableUsdc = { status: 'unavailable', reason: 'removed_log', ...Object.fromEntries(FAMILY_FIELDS.usdc.map((field) => [field, null])) };
-      for (const result of [
-        { ...hours[0], complete: false, families: { ...hours[0].families, usdc: unavailableUsdc } },
-        { ...hours[0], families: { ...hours[0].families, usdc: unavailableUsdc } },
-        microResult,
-        { ...hours[0], network: { ...hours[0].network, blockCount: hours[0].network.blockCount - 1 } },
-      ]) assert.throws(() => store.commitHour(result), (error) => error.code === 'hour_not_complete');
+      for (const [result, code] of [
+        [microResult, 'hour_not_complete'],
+        [{ ...hours[0], network: { ...hours[0].network, blockCount: hours[0].network.blockCount - 1 } }, 'hour_not_complete'],
+        [{ ...hours[0], activeAddresses: hours[0].activeAddresses.slice(1) }, 'hour_not_complete'],
+        [{ ...hours[0], families: { ...hours[0].families, usdc: unavailableUsdc } }, 'hour_inconsistent'],
+        [{ ...hours[0], complete: false, families: { ...hours[0].families, usdc: { ...unavailableUsdc, transferCount: 0 } } }, 'hour_inconsistent'],
+        [{ ...hours[0], registry: { uniswapV3: null } }, 'hour_inconsistent'],
+      ]) assert.throws(() => store.commitHour(result), (error) => error.code === code, code);
       assert.equal(store.hourCount(), 0);
       assert.equal(store.checkpoint(), null);
-      assert.throws(() => db.prepare("INSERT INTO compact_hours VALUES (?, 'x', 10, 20, 'a', 'b', 5, 0, 0, 0, 0, 0, '{}', 'h')").run(BigInt(HOUR)),
+      assert.throws(() => db.prepare("INSERT INTO compact_hours VALUES (?, 'x', 10, 20, 'p', 'a', 'b', 5, 0, 0, '{}', 'h')").run(BigInt(HOUR)),
         /CHECK constraint/i);
       store.commitHour(hours[0]);
-      const shifted = { ...hours[1], range: { ...hours[1].range, firstBlock: hours[1].range.firstBlock + 1, lastBlock: hours[1].range.lastBlock + 1 } };
+      assert.throws(() => db.prepare("INSERT INTO compact_family_hours VALUES (?, 'zero', 'unavailable', 'x', '{\"count\":0}', NULL)").run(BigInt(HOUR)),
+        /CHECK constraint/i, 'an unavailable family row can never hold metrics');
+      const { range, registry } = hours[1];
+      const shifted = { ...hours[1], range: { ...range, firstBlock: range.firstBlock + 1, lastBlock: range.lastBlock + 1 },
+        registry: { uniswapV3: { ...registry.uniswapV3, through: range.lastBlock + 1 } } };
       assert.throws(() => store.commitHour(shifted), (error) => error.code === 'checkpoint_discontinuity');
       assert.equal(store.hourCount(), 1);
       db.close();
     });
 
+    await test('sqlite: a spine-complete hour commits with a family unavailable; the family stays null and the checkpoint advances', async () => {
+      const db = open('families.sqlite');
+      const store = createCompactStore(db);
+      store.commitHour(hours[0]);
+      const { outcome, checkpoint } = store.commitHour(removedUsdc);
+      assert.equal(outcome, 'inserted');
+      assert.equal(checkpoint.hourStart, HOUR + 3600, 'a valid spine hour moves the checkpoint even with a family unavailable');
+      const families = Object.fromEntries(store.familyRows(HOUR + 3600).map((row) => [row.family, row]));
+      assert.deepEqual(families.usdc, { family: 'usdc', status: 'unavailable', reason: 'removed_log', metrics: null });
+      for (const name of ['assets', 'uniswapV3', 'uniswapV4']) assert.deepEqual(families[name].metrics, metricsOf(hours[1].families[name], name));
+      assert.equal(store.uniqueActiveAddresses(HOUR + 3600, 1), hours[1].network.uniqueActiveAddresses);
+      assert.equal(store.commitHour(hours[2]).checkpoint.hourStart, HOUR + 7200);
+      db.close();
+    });
+
+    await test('sqlite: unavailable -> available replay upgrades a family only when the network hash matches', async () => {
+      const db = open('families.sqlite');
+      const store = createCompactStore(db);
+      const usdcRow = () => store.familyRows(HOUR + 3600).find((row) => row.family === 'usdc');
+      assert.throws(() => store.commitHour({ ...hours[1], network: { ...hours[1].network, gasUsedRaw: '1' } }), (error) => error.code === 'hour_conflict');
+      assert.equal(usdcRow().status, 'unavailable', 'a different network never upgrades anything');
+      assert.equal(store.commitHour(hours[1]).outcome, 'upgraded');
+      assert.deepEqual(usdcRow().metrics, metricsOf(hours[1].families.usdc, 'usdc'));
+      assert.equal(store.commitHour(hours[1]).outcome, 'unchanged');
+      assert.equal(store.commitHour(removedUsdc).outcome, 'unchanged', 'an available family is never downgraded');
+      assert.equal(usdcRow().status, 'available');
+      const changed = { ...hours[1], families: { ...hours[1].families, usdc: { ...hours[1].families.usdc, transferCount: hours[1].families.usdc.transferCount + 1 } } };
+      assert.throws(() => store.commitHour(changed), (error) => error.code === 'hour_conflict');
+      assert.deepEqual([store.hourCount(), store.checkpoint().hourStart], [3, HOUR + 7200]);
+      db.close();
+    });
+
+    await test('sqlite: registry coverage is explicit and contiguous; hour commits extend it; pools are written once', async () => {
+      const db = open('registry.sqlite');
+      const store = createCompactStore(db);
+      assert.equal(store.v3Registry(), null);
+      const provider = offlineProvider(chainOf().fetchImpl);
+      const early = await bootstrapV3Registry(provider, { fromBlock: ORIGIN.originNumber, toBlock: expectedFirst - 1001 });
+      const late = await catchUpV3Registry(provider, registrySnapshot(early), expectedFirst - 1);
+      assert.throws(() => store.extendRegistry(late), (error) => error.code === 'registry_discontinuity', 'a catch-up needs its bootstrap first');
+      store.extendRegistry(early);
+      store.extendRegistry(late);
+      assert.throws(() => store.extendRegistry(early), (error) => error.code === 'registry_discontinuity', 'coverage never restarts');
+      const stored = store.v3Registry();
+      assert.deepEqual([stored.fromBlock, stored.through, stored.pools.size], [ORIGIN.originNumber, expectedFirst - 1, 0]);
+      const hour = await processHour({ provider, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: stored });
+      assert.deepEqual(hour, cleanResult);
+      store.commitHour(hour);
+      const extended = store.v3Registry();
+      assert.deepEqual([extended.through, extended.throughHash, [...extended.pools]], [expectedLast, hour.range.lastHash, [SYNTHETIC_CONTRACTS.validV3Pool]]);
+      assert.equal(store.commitHour(hour).outcome, 'unchanged');
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_registry').get().count, 1);
+      const next = await processHour({ provider, hourStart: HOUR + 3600, safeHead: ORIGIN.originNumber + 25_000, v3Registry: store.v3Registry() });
+      assert.equal(digest(next), digest(hours[1]), 'the next hour runs from the stored registry, with no scan');
+      store.commitHour(next);
+      assert.equal(store.v3Registry().through, next.range.lastBlock);
+      db.close();
+    });
+
+    await test('sqlite: rolling 24H unique active addresses are exact; only 1H, 6H and 24H exist; nothing older is kept', async () => {
+      // One block per minute keeps 25 consecutive hours small.
+      const slowOrigin = { originNumber: ORIGIN.originNumber, originTimestamp: HOUR - 120, blockSpacing: 600_000 };
+      const slow = createSyntheticChain({ ...slowOrigin, senderPool: 900, recipientPool: 600 });
+      const slowHead = slowOrigin.originNumber + 1_600;
+      const provider = offlineProvider(slow.fetchImpl);
+      const registry = registrySnapshot(await bootstrapV3Registry(provider, { fromBlock: slowOrigin.originNumber, toBlock: slowHead }));
+      const identities = Array.from({ length: 25 }, () => new Set());
+      for (let number = slowOrigin.originNumber; number <= slowHead; number++) {
+        const index = Math.floor((slow.timestampOf(number) - HOUR) / 3600);
+        if (index < 0 || index >= 25) continue;
+        for (const tx of slow.transactionsOf(number)) { identities[index].add(tx.from); if (tx.to) identities[index].add(tx.to); }
+      }
+      const union = (from, to) => new Set(identities.slice(from, to + 1).flatMap((set) => [...set])).size;
+      const db = open('windows.sqlite');
+      const store = createCompactStore(db);
+      for (let index = 0; index < 25; index++) {
+        const hourStart = HOUR + index * 3600;
+        assert.equal(store.commitHour(await processHour({ provider, hourStart, safeHead: slowHead, v3Registry: registry })).outcome, 'inserted');
+        if (index === 2) assert.equal(store.uniqueActiveAddresses(hourStart, 6), null, 'a window with missing hours is unavailable, never partial');
+      }
+      const last = HOUR + 24 * 3600;
+      assert.equal(store.uniqueActiveAddresses(last, 1), identities[24].size);
+      assert.equal(store.uniqueActiveAddresses(last, 6), union(19, 24));
+      assert.equal(store.uniqueActiveAddresses(last, 24), union(1, 24));
+      assert(union(1, 24) < identities.slice(1).reduce((sum, set) => sum + set.size, 0), 'the 24H union is not a sum of hourly counts');
+      assert.equal(store.uniqueActiveAddresses(last - 3600, 24), null, 'its first hour is past the 24-hour identity horizon');
+      assert.equal(store.uniqueActiveAddresses(last - 3600, 6), union(18, 23));
+      assert.equal(store.uniqueActiveAddresses(HOUR, 1), identities[0].size, '1H stays exact from the hour row');
+      for (const span of [2, 168, 720]) assert.throws(() => store.uniqueActiveAddresses(last, span), (error) => error.code === 'unsupported_window');
+      const kept = db.prepare('SELECT COUNT(DISTINCT hour_start) AS hours, MIN(hour_start) AS first FROM compact_hour_addresses').get();
+      assert.deepEqual([kept.hours, kept.first], [ADDRESS_WINDOW_HOURS, last - 23 * 3600]);
+      assert.deepEqual(tables(db), TABLES, 'no daily, weekly or monthly address storage');
+      db.close();
+    });
+
     await test('sqlite: the compact database holds aggregates only, no raw block, transaction, receipt or log archive', async () => {
       const db = open();
-      assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name),
-        ['compact_checkpoint', 'compact_hours', 'compact_meta']);
-      const text = db.prepare('SELECT first_hash || last_hash || result_json AS text FROM compact_hours').all().map((row) => row.text).join('');
-      assert.equal(text.match(/0x[0-9a-f]{64}/g).length, hours.length * 4, 'only first and last block hashes; no transaction or log hashes');
-      assert(db.prepare('SELECT MAX(LENGTH(result_json)) AS size FROM compact_hours').get().size < 16384);
+      assert.deepEqual(tables(db), TABLES);
+      const hourText = db.prepare('SELECT parent_hash || first_hash || last_hash || network_json AS text FROM compact_hours').all()
+        .map((row) => row.text).join('');
+      assert.equal(hourText.match(/0x[0-9a-f]{64}/g).length, hours.length * 3, 'only boundary block hashes; no transaction or log hashes');
+      const familyText = db.prepare("SELECT COALESCE(metrics_json, '') AS text FROM compact_family_hours").all().map((row) => row.text).join('');
+      assert.equal(/0x[0-9a-f]{64}/.test(familyText), false);
+      assert(db.prepare('SELECT MAX(LENGTH(metrics_json)) AS size FROM compact_family_hours').get().size < 4096);
+      assert(db.prepare('SELECT MAX(LENGTH(network_json)) AS size FROM compact_hours').get().size < 1024);
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_registry').get().count, 1, 'one official pool, written once');
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_hour_addresses').get().count,
+        hours.reduce((sum, hour) => sum + hour.network.uniqueActiveAddresses, 0), 'one 20-byte identity per active address per hour');
       db.close();
       const { size } = await stat(join(directory, 'store.sqlite'));
-      assert(size < 256 * 1024, `database is ${size} bytes for ${hours.length} hours`);
+      assert(size < 2 * 1024 * 1024, `database is ${size} bytes for ${hours.length} hours`);
     });
 
     await test('validator gate: a verified hour round-trips through a temporary node:sqlite file that is then deleted', async () => {
@@ -537,25 +879,35 @@ if (!sqlite) {
 // 13. Replay idempotence
 await test('replay idempotence: same hour, any window size or safe head, byte-identical result', async () => {
   const runs = [
-    await processHour({ provider: offlineProvider(clean.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD }),
-    await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD + 3000, windowBlocks: 500 }),
-    await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD + 40_000, windowBlocks: 2000 }),
+    await processHour({ provider: offlineProvider(clean.fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }),
+    await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD + 3000, windowBlocks: 500, v3Registry: V3 }),
+    await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR, safeHead: SAFE_HEAD + 40_000, windowBlocks: 2000, v3Registry: V3 }),
   ];
   for (const run of runs) assert.equal(digest(run), digest(cleanResult));
   assert.equal(digest((await runMicro()).result), digest(microResult));
 });
 
-await test('provider: wrong chain and dead primary fail over to the fallback endpoint', async () => {
+// Stage 2a: there is no fallback endpoint any more. A wrong chain or a dead primary yields no result, with diagnostics.
+await test('provider: wrong chain fails closed; a dead primary yields no result and never fails over', async () => {
   const chain = chainOf();
-  const wrongChain = async (url, init) => (url.includes('rpc.mainnet.arc.io')
-    ? { status: 200, ok: true, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }) } : chain.fetchImpl(url, init));
+  const urls = new Set();
+  const wrongChain = async (url) => { urls.add(url); return { status: 200, ok: true, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }) }; };
   const provider = offlineProvider(wrongChain);
-  assert.equal(await provider.request('eth_chainId'), hex(5042));
-  assert.equal(provider.stats.failovers, 1);
-  const dead = async (url, init) => (url.includes('rpc.mainnet.arc.io') ? { status: 503, ok: false, text: async () => '' } : chain.fetchImpl(url, init));
-  const fallback = offlineProvider(dead);
-  assert.deepEqual(await processHour({ provider: fallback, hourStart: HOUR, safeHead: SAFE_HEAD }), cleanResult);
-  assert(fallback.stats.byEndpoint.drpc > 0);
+  const mismatch = await rejectsWith(provider.request('eth_chainId'), 'chain_mismatch');
+  assert.equal(mismatch.detail, '0x1');
+  assert.equal(provider.stats.requests, 1, 'a wrong chain is never retried');
+  const dead = async (url) => { urls.add(url); return { status: 503, ok: false, text: async () => '<html>upstream\n unavailable</html>' }; };
+  const primary = offlineProvider(dead);
+  const error = await rejectsWith(processHour({ provider: primary, hourStart: HOUR, safeHead: SAFE_HEAD, v3Registry: V3 }), 'transport');
+  assert(error instanceof HourIncompleteError);
+  assert.equal(primary.stats.requests, 3, 'three attempts on the primary, then nothing');
+  const direct = await rejectsWith(offlineProvider(dead).request('eth_blockNumber'), 'transport');
+  assert.deepEqual([direct.httpStatus, direct.detail, direct.endpoint], [503, '<html>upstream unavailable</html>', 'circle']);
+  assert.deepEqual([...urls], [ARC_PRIMARY_ENDPOINT.url], 'the default provider only ever talks to the primary Arc RPC');
+  const thrown = await rejectsWith(offlineProvider(async () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); })
+    .request('eth_blockNumber'), 'transport');
+  assert.equal(thrown.detail, 'TypeError: fetch failed: ECONNRESET');
+  assert.equal((await offlineProvider(chain.fetchImpl).request('eth_chainId')), hex(5042));
 });
 
 console.log('COMPACT_REAL_MICRO_WINDOW', JSON.stringify({ range: microResult.range, network: microResult.network, families: microResult.families,

@@ -4,11 +4,14 @@ import { ARC_VERIFIED_ASSETS } from '../../api/_lib/arc-intelligence/assets.js';
 import { TRANSFER_TOPIC, USDC_SYSTEM_EMITTER } from '../../api/_lib/arc-intelligence/usdc.js';
 import { UNISWAP_DEFINITION_VERSION, UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
 
-export const COMPACT_DEFINITION_VERSION = 'arc-compact-hour-v1';
+// v2: lean spine (calldata and value are no longer parsed), per-response log streaming, Uniswap V3 pools from the
+// official factory registry (foreign V3-signature emitters are counted, never fatal), per-family availability.
+export const COMPACT_DEFINITION_VERSION = 'arc-compact-hour-v2';
 export const COMPACT_SOURCE_VERSIONS = Object.freeze({
   hour: COMPACT_DEFINITION_VERSION,
   usdc: 'canonical-system-emitter-v1',
   uniswap: UNISWAP_DEFINITION_VERSION,
+  uniswapV3Pools: 'official-factory-pool-created-registry-v1',
 });
 
 const NON_USDC_ASSET_ADDRESSES = ARC_VERIFIED_ASSETS.filter((asset) => asset.symbol !== 'USDC').map((asset) => asset.address.toLowerCase());
@@ -16,7 +19,8 @@ const NON_USDC_ASSET_ADDRESSES = ARC_VERIFIED_ASSETS.filter((asset) => asset.sym
 // Dense streams (several logs per block) are never requested over more than this many blocks per call.
 export const DENSE_LOG_RANGE_BLOCKS = 500;
 
-// address: null means topic-only (V3 pools are not known before their events are seen; they are verified afterwards).
+// address: null means topic-only: every V3-signature emitter on Arc. Only pools in the official factory registry (or
+// created earlier in the same hour) are counted; any other emitter is reported as foreign.
 // maxRange: per-request block cap before any provider-limit split; sparse streams follow the window size.
 export const LOG_STREAMS = Object.freeze([
   Object.freeze({ key: 'usdc', address: Object.freeze([USDC_SYSTEM_EMITTER.toLowerCase()]), topics: Object.freeze([TRANSFER_TOPIC]),
@@ -25,7 +29,8 @@ export const LOG_STREAMS = Object.freeze([
   Object.freeze({ key: 'v3Factory', address: Object.freeze([UNISWAP_REGISTRY.v3Factory.address]),
     topics: Object.freeze([UNISWAP_EVENT_TOPICS.v3PoolCreated]) }),
   Object.freeze({ key: 'v3Pools', address: null,
-    topics: Object.freeze([UNISWAP_EVENT_TOPICS.v3Swap, UNISWAP_EVENT_TOPICS.v3Mint, UNISWAP_EVENT_TOPICS.v3Burn]) }),
+    topics: Object.freeze([UNISWAP_EVENT_TOPICS.v3Swap, UNISWAP_EVENT_TOPICS.v3Mint, UNISWAP_EVENT_TOPICS.v3Burn]),
+    maxRange: DENSE_LOG_RANGE_BLOCKS }),
   Object.freeze({ key: 'v4', address: Object.freeze([UNISWAP_REGISTRY.v4PoolManager.address]),
     topics: Object.freeze([UNISWAP_EVENT_TOPICS.v4Initialize, UNISWAP_EVENT_TOPICS.v4Swap, UNISWAP_EVENT_TOPICS.v4ModifyLiquidity]),
     maxRange: DENSE_LOG_RANGE_BLOCKS }),

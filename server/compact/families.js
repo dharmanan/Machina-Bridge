@@ -1,13 +1,16 @@
-// Compact engine: per-family accumulators. Each consumes validated windows and keeps only counters and the address
-// sets its unique counts need, so raw blocks and logs can be released after every window. Semantics are the A2 ones:
-// network sets from top-level transactions, canonical USDC from the system emitter only, Uniswap via the shared
-// decoders and pool-verification rules, unique traders as the transaction sender (event `sender` is usually a router).
+// Compact engine: per-family accumulators. Each consumes validated log responses and keeps only counters and the
+// address sets its unique counts need, so raw blocks and logs are released after every response. Semantics are the A2
+// ones: network sets from top-level transactions, canonical USDC from the system emitter only, Uniswap via the shared
+// decoders, unique traders as the transaction sender (event `sender` is usually a router). Uniswap V3 pools are the
+// official factory's PoolCreated pools (durable registry plus this range's overlay); other V3-signature emitters are
+// foreign: counted, never decoded, never fatal.
 import { summarizeUsdcTransfers } from '../../api/_lib/arc-intelligence/usdc.js';
 import { summarizeVerifiedAssetTransfers } from '../../api/_lib/arc-intelligence/tokens.js';
 import {
-  decodeV3Burn, decodeV3Mint, decodeV3PoolCreated, decodeV3Swap, decodeV4Initialize, decodeV4ModifyLiquidity, decodeV4Swap,
-  MAX_UNISWAP_POOL_CANDIDATES, UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY,
+  decodeV3Burn, decodeV3Mint, decodeV3Swap, decodeV4Initialize, decodeV4ModifyLiquidity, decodeV4Swap, UNISWAP_EVENT_TOPICS,
 } from '../../api/_lib/arc-intelligence/uniswap.js';
+import { senderOf } from './logs.js';
+import { poolRecordOf } from './registry.js';
 
 export class FamilyError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -24,14 +27,21 @@ export function createNetworkAccumulator() {
     addBlocks(blocks) {
       for (const block of blocks) {
         blockCount += 1;
-        gasUsed += BigInt(block.gasUsedRaw);
-        for (const transaction of block.transactions) {
-          transactionCount += 1;
-          senders.add(transaction.from);
-          if (transaction.to) recipients.add(transaction.to);
+        gasUsed += block.gasUsed;
+        transactionCount += block.txHashes.length;
+        for (let index = 0; index < block.txFrom.length; index++) {
+          senders.add(block.txFrom[index]);
+          const to = block.txTo[index];
+          if (to) recipients.add(to);
           else deploymentAttempts += 1;
         }
       }
+    },
+    // The exact identity set behind uniqueActiveAddresses (senders ∪ recipients), sorted.
+    activeAddresses() {
+      const active = [...senders];
+      for (const recipient of recipients) if (!senders.has(recipient)) active.push(recipient);
+      return active.sort();
     },
     finish({ durationSeconds = null } = {}) {
       let active = senders.size;
@@ -97,112 +107,51 @@ export function createAssetsAccumulator() {
   };
 }
 
-// Same selectors and acceptance rules as verifyV3Pool in api/_lib/arc-intelligence/uniswap.js (not exported there).
-const V3_SELECTORS = Object.freeze({ factory: '0xc45a0155', token0: '0x0dfe1681', token1: '0xd21220a7', fee: '0xddca3f43',
-  getPool: '0x1698ee82' });
-const WORD = /^0x[0-9a-f]{64}$/i;
-const wordAddress = (result) => (typeof result === 'string' && WORD.test(result) && /^0x0{24}/i.test(result)
-  ? `0x${result.slice(-40)}`.toLowerCase() : null);
-const wordUint24 = (result) => {
-  if (typeof result !== 'string' || !WORD.test(result)) return null;
-  const value = BigInt(result);
-  return value < (1n << 24n) ? Number(value) : null;
-};
-const addressWord = (address) => address.slice(2).toLowerCase().padStart(64, '0');
-export const codeIsPresent = (code) => typeof code === 'string' && /^0x(?!0*$)[0-9a-f]+$/i.test(code);
-
-// Batched: 5 reads per emitter (10 emitters per batch), then one getPool read per getter-valid emitter.
-// A read the provider could not serve makes the family unavailable; only an execution revert rejects the emitter,
-// so a lagging backend ("header not found") can never silently drop a real pool's events.
-const reverted = (answer) => Boolean(answer.error) && (answer.error.code === 3 || /revert/i.test(answer.error.message));
-const unserved = (answer) => (answer.error ? !reverted(answer) : typeof answer.result !== 'string');
-export async function verifyV3Pools(provider, emitters, blockTag) {
-  const verdicts = new Map();
-  for (let offset = 0; offset < emitters.length; offset += 10) {
-    const chunk = emitters.slice(offset, offset + 10);
-    const answers = await provider.batch(chunk.flatMap((address) => [
-      ['eth_getCode', [address, blockTag]],
-      ...['factory', 'token0', 'token1', 'fee'].map((name) => ['eth_call', [{ to: address, data: V3_SELECTORS[name] }, blockTag]]),
-    ]), { allowItemErrors: true });
-    const candidates = [];
-    chunk.forEach((address, index) => {
-      const [code, factory, token0, token1, fee] = answers.slice(index * 5, index * 5 + 5);
-      if (code.error || typeof code.result !== 'string' || [factory, token0, token1, fee].some(unserved)) {
-        throw new FamilyError('v3_pool_verification_unavailable');
-      }
-      if (!codeIsPresent(code.result)) return verdicts.set(address, { status: 'rejected', reason: 'no_pool_bytecode' });
-      if ([factory, token0, token1, fee].some(reverted)) {
-        return verdicts.set(address, { status: 'rejected', reason: 'pool_getters_reverted' });
-      }
-      const pool = { address, factory: wordAddress(factory.result), token0: wordAddress(token0.result),
-        token1: wordAddress(token1.result), fee: wordUint24(fee.result) };
-      if (!pool.factory || !pool.token0 || !pool.token1 || pool.token0 === pool.token1 || pool.fee === null) {
-        return verdicts.set(address, { status: 'rejected', reason: 'pool_getters_malformed' });
-      }
-      if (pool.factory !== UNISWAP_REGISTRY.v3Factory.address) return verdicts.set(address, { status: 'rejected', reason: 'foreign_factory' });
-      return candidates.push(pool);
-    });
-    if (!candidates.length) continue;
-    const mapped = await provider.batch(candidates.map((pool) => ['eth_call', [{ to: UNISWAP_REGISTRY.v3Factory.address,
-      data: `${V3_SELECTORS.getPool}${addressWord(pool.token0)}${addressWord(pool.token1)}${pool.fee.toString(16).padStart(64, '0')}` },
-    blockTag]]), { allowItemErrors: true });
-    candidates.forEach((pool, index) => {
-      if (mapped[index].error || typeof mapped[index].result !== 'string') throw new FamilyError('v3_pool_verification_unavailable');
-      verdicts.set(pool.address, wordAddress(mapped[index].result) === pool.address
-        ? { status: 'verified', token0: pool.token0, token1: pool.token1, fee: pool.fee }
-        : { status: 'rejected', reason: 'factory_mapping_mismatch' });
-    });
-  }
-  return verdicts;
-}
-
-export function createUniswapV3Accumulator({ maxPoolCandidates = MAX_UNISWAP_POOL_CANDIDATES } = {}) {
-  let poolCreatedCount = 0;
-  const emitters = new Map();
-  const decoders = { [UNISWAP_EVENT_TOPICS.v3Swap]: ['swaps', decodeV3Swap], [UNISWAP_EVENT_TOPICS.v3Mint]: ['mints', decodeV3Mint],
-    [UNISWAP_EVENT_TOPICS.v3Burn]: ['burns', decodeV3Burn] };
+// registry: { pools: Set of official pool addresses } covering every block before the range (hour.js checks coverage).
+// Pools created inside the range join an in-memory overlay first: the factory stream of a window is always consumed
+// before that window's pool stream, so a pool created and used in the same block is counted.
+export function createUniswapV3Accumulator({ registry }) {
+  let poolCreatedCount = 0, swapCount = 0, mintCount = 0, burnCount = 0, foreignEventCount = 0;
+  const created = new Map();
+  const traders = new Set();
+  const swapPools = new Set();
+  const foreign = new Set();
+  const decoders = { [UNISWAP_EVENT_TOPICS.v3Swap]: ['swap', decodeV3Swap], [UNISWAP_EVENT_TOPICS.v3Mint]: ['mint', decodeV3Mint],
+    [UNISWAP_EVENT_TOPICS.v3Burn]: ['burn', decodeV3Burn] };
   return {
-    add(stream, logs) {
+    add(stream, logs, window) {
       if (stream === 'v3Factory') {
         for (const log of logs) {
-          const event = decodeV3PoolCreated(log);
-          if (!event) throw new FamilyError('malformed_v3_pool_created');
+          const pool = poolRecordOf(log);
+          if (!pool) throw new FamilyError('malformed_v3_pool_created');
+          if (created.has(pool.address)) throw new FamilyError('duplicate_v3_pool_created');
+          created.set(pool.address, pool);
           poolCreatedCount += 1;
         }
         return;
       }
       for (const log of logs) {
-        let emitter = emitters.get(log.address);
-        if (!emitter) {
-          if (emitters.size >= maxPoolCandidates) throw new FamilyError('v3_pool_candidate_limit');
-          emitter = { swaps: 0, mints: 0, burns: 0, malformed: 0, traders: new Set() };
-          emitters.set(log.address, emitter);
+        if (!registry.pools.has(log.address) && !created.has(log.address)) {
+          foreign.add(log.address);
+          foreignEventCount += 1;
+          continue;
         }
-        const [counter, decode] = decoders[log.topics[0]];
-        if (!decode(log)) { emitter.malformed += 1; continue; }
-        emitter[counter] += 1;
-        if (counter === 'swaps') emitter.traders.add(log.transactionFrom);
+        const [kind, decode] = decoders[log.topics[0]];
+        if (!decode(log)) throw new FamilyError('malformed_v3_pool_event');
+        if (kind === 'swap') {
+          swapCount += 1;
+          traders.add(senderOf(window, log));
+          swapPools.add(log.address);
+        } else if (kind === 'mint') mintCount += 1;
+        else burnCount += 1;
       }
     },
-    async finish({ provider, blockTag, factoryCodePresent }) {
+    // Official pools created inside the range, in chain order: the registry rows this range adds.
+    createdPools: () => [...created.values()],
+    async finish({ factoryCodePresent }) {
       if (!factoryCodePresent) throw new FamilyError('v3_factory_code_unverified');
-      const addresses = [...emitters.keys()].sort();
-      const verdicts = await verifyV3Pools(provider, addresses, blockTag);
-      const traders = new Set();
-      let swapCount = 0, mintCount = 0, burnCount = 0, poolsWithSwaps = 0;
-      const verifiedPools = [];
-      for (const address of addresses) {
-        const verdict = verdicts.get(address);
-        if (verdict.status !== 'verified') continue;
-        const emitter = emitters.get(address);
-        if (emitter.malformed) throw new FamilyError('malformed_v3_pool_event');
-        swapCount += emitter.swaps; mintCount += emitter.mints; burnCount += emitter.burns;
-        if (emitter.swaps) poolsWithSwaps += 1;
-        for (const trader of emitter.traders) traders.add(trader);
-        verifiedPools.push({ address, token0: verdict.token0, token1: verdict.token1, fee: verdict.fee });
-      }
-      return { poolCreatedCount, swapCount, mintCount, burnCount, uniqueTraders: traders.size, poolsWithSwaps, verifiedPools,
-        rejectedEmitterCount: addresses.length - verifiedPools.length };
+      return { poolCreatedCount, swapCount, mintCount, burnCount, uniqueTraders: traders.size, poolsWithSwaps: swapPools.size,
+        foreignEmitterCount: foreign.size, foreignEventCount };
     },
   };
 }
@@ -212,14 +161,14 @@ export function createUniswapV4Accumulator() {
   const traders = new Set();
   const swapPools = new Set();
   return {
-    add(_stream, logs) {
+    add(_stream, logs, window) {
       for (const log of logs) {
         const topic = log.topics[0];
         if (topic === UNISWAP_EVENT_TOPICS.v4Swap) {
           const event = decodeV4Swap(log);
           if (!event) throw new FamilyError('malformed_v4_swap');
           swapCount += 1;
-          traders.add(log.transactionFrom);
+          traders.add(senderOf(window, log));
           swapPools.add(event.poolId);
         } else if (topic === UNISWAP_EVENT_TOPICS.v4ModifyLiquidity) {
           if (!decodeV4ModifyLiquidity(log)) throw new FamilyError('malformed_v4_modify_liquidity');
@@ -242,6 +191,6 @@ export const FAMILY_FIELDS = Object.freeze({
   usdc: Object.freeze(['transferCount', 'amountRaw', 'rawDecimals', 'mintCount', 'burnCount']),
   assets: Object.freeze(['items']),
   uniswapV3: Object.freeze(['poolCreatedCount', 'swapCount', 'mintCount', 'burnCount', 'uniqueTraders', 'poolsWithSwaps',
-    'verifiedPools', 'rejectedEmitterCount']),
+    'foreignEmitterCount', 'foreignEventCount']),
   uniswapV4: Object.freeze(['initializeCount', 'swapCount', 'modifyLiquidityCount', 'uniqueTraders', 'poolsWithSwaps']),
 });

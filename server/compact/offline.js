@@ -64,8 +64,7 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 
 export const SYNTHETIC_CONTRACTS = Object.freeze({
   validV3Pool: address('c0de01', 1),
-  foreignV3Emitter: address('c0de02', 2),
-  foreignFactory: address('c0de03', 3),
+  foreignV3Emitter: address('c0de02', 2), // the first of the foreignV3Emitters synthetic V3-signature emitters
   tokenA: address('70ce0a', 10),
   tokenB: address('70ce0b', 11),
   eurc: '0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1',
@@ -79,13 +78,17 @@ const V4_SWAP_DATA = [
 const V4_POOLS = ['0x96fbcfa73dfb947230681cb211fcd0fba8221fbcddbdb3375c795add2afad714', '0xa5edcec276913c24bb618b5836cbcc44e94f32e80f7fc74a8a4aa597e2af7ac9'];
 const V4_ROUTER = '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1';
 
-// Average block time 0.5074 s with integer-second timestamps, so neighbours often share a second, like Arc.
-export function createSyntheticChain({ originNumber = 23_000_000, originTimestamp = 1_790_000_000, txPerBlock = 6, usdcPerBlock = 10,
-  v4PerBlock = 5, senderPool = 4000, recipientPool = 2500, assetEvery = 40, v3Every = 300, poolCreatedAt = null,
+// Block spacing in 1/10,000 s: by default 0.5074 s with integer-second timestamps, so neighbours often share a second,
+// like Arc. The official V3 factory has code from factoryDeployedAt; the official pool (validV3Pool) emits nothing before
+// its PoolCreated at poolCreatedAt and swaps in that same block right after it. foreignV3Emitters distinct contracts emit
+// V3-signature swaps every foreignV3Every blocks without ever appearing in a PoolCreated.
+export function createSyntheticChain({ originNumber = 23_000_000, originTimestamp = 1_790_000_000, blockSpacing = 5074, txPerBlock = 6,
+  usdcPerBlock = 10, v4PerBlock = 5, senderPool = 4000, recipientPool = 2500, assetEvery = 40, v3Every = 300,
+  factoryDeployedAt = originNumber, poolCreatedAt = originNumber, foreignV3Emitters = 1, foreignV3Every = v3Every,
   head = originNumber + 20_000, limits = {}, faults = {}, seed = 0x6d61 } = {}) {
   const maxRange = limits.maxRange ?? 10000;
   const maxResults = limits.maxResults ?? Infinity;
-  const timestampOf = (number) => originTimestamp + Math.floor(((number - originNumber) * 5074) / 10000);
+  const timestampOf = (number) => originTimestamp + Math.floor(((number - originNumber) * blockSpacing) / 10000);
   const blockHash = (number) => fakeHash(seed, 'b10c', number);
 
   function transactionsOf(number) {
@@ -127,10 +130,11 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
     for (let index = 0; index < v4Count; index++) specs.push([index % 7 === 6 ? 'v4Modify' : 'v4Swap', index]);
     if (number % 3001 === 0) specs.push(['v4Initialize', 0]);
     if (number % assetEvery === 0) specs.push(['eurc', 0]);
-    if (number % v3Every === 0) specs.push(['v3Swap', 0]);
-    if (number % v3Every === 7) specs.push(['v3ForeignSwap', 0]);
-    if (number % (v3Every * 2) === 11) specs.push(['v3Mint', 0]);
-    if (number === poolCreatedAt) specs.push(['v3PoolCreated', 0]);
+    const poolLive = number > poolCreatedAt;
+    if (poolLive && number % v3Every === 0) specs.push(['v3Swap', 0]);
+    if (number % foreignV3Every === 7 % foreignV3Every) specs.push(['v3ForeignSwap', Math.floor(number / foreignV3Every) % foreignV3Emitters]);
+    if (poolLive && number % (v3Every * 2) === 11) specs.push(['v3Mint', 0]);
+    if (number === poolCreatedAt) specs.push(['v3PoolCreated', 0], ['v3Swap', 0]);
     return specs.map(([kind, index], logIndex) => {
       const transactionIndex = Math.floor((logIndex * transactions.length) / specs.length);
       const r = rand(seed, number, 3000 + logIndex);
@@ -160,7 +164,7 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
           topics: [UNISWAP_EVENT_TOPICS.v3PoolCreated, topicOf(SYNTHETIC_CONTRACTS.tokenA), topicOf(SYNTHETIC_CONTRACTS.tokenB), `0x${word(V3_FEE)}`],
           data: `0x${word(60)}${word(BigInt(SYNTHETIC_CONTRACTS.validV3Pool))}` };
       }
-      const pool = kind === 'v3ForeignSwap' ? SYNTHETIC_CONTRACTS.foreignV3Emitter : SYNTHETIC_CONTRACTS.validV3Pool;
+      const pool = kind === 'v3ForeignSwap' ? address('c0de02', 2 + index) : SYNTHETIC_CONTRACTS.validV3Pool;
       if (kind === 'v3Mint') {
         return { ...base, address: pool, topics: [UNISWAP_EVENT_TOPICS.v3Mint, topicOf(V4_ROUTER), `0x${word(-600)}`, `0x${word(600)}`],
           data: `0x${word(BigInt(V4_ROUTER))}${word(10n ** 15n)}${word(r)}${word(r + 1)}` };
@@ -187,23 +191,11 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
     return { result: faults.logs ? faults.logs(filter, out) : out };
   }
 
-  const code = new Set([UNISWAP_REGISTRY.v3Factory.address, UNISWAP_REGISTRY.v4PoolManager.address, SYNTHETIC_CONTRACTS.validV3Pool,
-    SYNTHETIC_CONTRACTS.foreignV3Emitter]);
-  function ethCall({ to, data }) {
-    const selector = data.slice(0, 10);
-    const target = to.toLowerCase();
-    if (target === SYNTHETIC_CONTRACTS.validV3Pool || target === SYNTHETIC_CONTRACTS.foreignV3Emitter) {
-      const factory = target === SYNTHETIC_CONTRACTS.validV3Pool ? UNISWAP_REGISTRY.v3Factory.address : SYNTHETIC_CONTRACTS.foreignFactory;
-      const answers = { '0xc45a0155': factory, '0x0dfe1681': SYNTHETIC_CONTRACTS.tokenA, '0xd21220a7': SYNTHETIC_CONTRACTS.tokenB };
-      if (selector === '0xddca3f43') return { result: `0x${word(V3_FEE)}` };
-      if (answers[selector]) return { result: `0x${word(BigInt(answers[selector]))}` };
-    }
-    if (target === UNISWAP_REGISTRY.v3Factory.address && selector === '0x1698ee82') {
-      const args = data.slice(10);
-      const matches = args === `${word(BigInt(SYNTHETIC_CONTRACTS.tokenA))}${word(BigInt(SYNTHETIC_CONTRACTS.tokenB))}${word(V3_FEE)}`;
-      return { result: `0x${word(matches ? BigInt(SYNTHETIC_CONTRACTS.validV3Pool) : 0n)}` };
-    }
-    return { error: { code: 3, message: 'execution reverted' } };
+  // Contract code by block: the V4 PoolManager always, the V3 factory from its deployment block.
+  function codeAt(target, blockTag) {
+    const at = /^0x[0-9a-f]+$/i.test(blockTag ?? '') ? Number(BigInt(blockTag)) : head;
+    const present = target === UNISWAP_REGISTRY.v4PoolManager.address || (target === UNISWAP_REGISTRY.v3Factory.address && at >= factoryDeployedAt);
+    return present ? '0x6080604052348015600f57600080fd5b50' : '0x';
   }
 
   function answer(item) {
@@ -213,8 +205,7 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
       case 'eth_blockNumber': return envelope({ result: hex(head) });
       case 'eth_getBlockByNumber': return envelope({ result: rawBlock(Number(BigInt(item.params[0])), item.params[1] === true) });
       case 'eth_getLogs': return envelope(getLogs(item.params[0]));
-      case 'eth_getCode': return envelope({ result: code.has(item.params[0].toLowerCase()) ? '0x6080604052348015600f57600080fd5b50' : '0x' });
-      case 'eth_call': return envelope(faults.call?.(item.params[0]) ?? ethCall(item.params[0]));
+      case 'eth_getCode': return envelope({ result: codeAt(item.params[0].toLowerCase(), item.params[1]) });
       default: return envelope({ error: { code: -32601, message: 'method not found' } });
     }
   }
