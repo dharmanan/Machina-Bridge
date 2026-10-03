@@ -1,7 +1,12 @@
+# Machina Intelligence: one always-on service. Serverless (app sleeping) must be OFF and no cron schedule may be set:
+# the in-process scheduler indexes checkpoint + 1 hour on its own, with or without HTTP traffic.
 [build]
 builder = "RAILPACK"
-buildCommand = "node --check scripts/run-compact-hour.mjs && node --check server/compact/hour.js"
+buildCommand = "node --check scripts/serve-compact-intelligence.mjs && node --check scripts/run-compact-hour.mjs && node --check server/compact/read-model.js && node --check server/compact/http.js && node --check server/compact/scheduler.js && node --input-type=module -e \"await import('./scripts/serve-compact-intelligence.mjs')\""
 
 [deploy]
-startCommand = "HOUR=$(node -e 'const d=new Date(Date.now()-3600000);d.setUTCMinutes(0,0,0);process.stdout.write(d.toISOString())'); exec node --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs \"$HOUR\""
-restartPolicyType = "NEVER"
+startCommand = "exec node --max-old-space-size=128 scripts/serve-compact-intelligence.mjs"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 300
