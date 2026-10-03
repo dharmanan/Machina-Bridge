@@ -1,328 +1,1573 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, AlertCircle, RefreshCw, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  bucketValue,
-  fetchArcIntelligenceView,
-  fetchArcTimeseries,
+  Activity, AlertCircle, ArrowDown, ArrowDownLeft, ArrowLeftRight, ArrowRight, ArrowUpRight, Banknote, Building2, Clock, Coins,
+  Droplets, Landmark, Layers, Radar, RefreshCw, Rocket, Search, Store,
+} from 'lucide-react'
+import {
+  ARC_INTELLIGENCE_BACKEND_WINDOWS,
+  ARC_INTELLIGENCE_WINDOWS,
+  type ArcIntelligenceWindow,
+} from '../config/arcIntelligenceUiScope'
+import { MAINNET_BORROW_WRITES_ENABLED } from '../config/mainnetBorrow'
+import {
+  ARC_KNOWN_TOKENS,
+  formatCompact,
+  formatCompactRaw,
   formatCount,
-  formatHourLabel,
-  formatPercent,
-  formatTimestamp,
-  type ArcIntelligenceRuntime,
-  type ArcTimeseriesBucket,
-  type ArcTimeseriesResponse,
-  type ArcTimeseriesWindow,
+  formatDecimal,
+  formatDecimalString,
+  formatRatioPercent,
+  formatSignedPercent,
+  formatTokenAmount,
+  formatUtcDateTime,
+  formatUtcHour,
+  formatUtcHourRange,
+  isFiniteNumber,
+  loadArcBorrowMarkets,
+  loadArcIntelligence,
+  metricAmount,
+  metricNumber,
+  metricSum,
+  percentChange,
+  shortenAddress,
+  shortenMarketId,
+  verifiedAssetItems,
+  windowStatus,
+  type ArcIntelligenceLoad,
+  type BorrowMarketState,
+  type ArcSummary,
+  type ArcTimeseries,
+  type FamilyWindow,
+  type IntelligenceDataStatus,
 } from '../lib/arcIntelligence'
-import { Card } from './ui'
 
-type LoadState = {
-  timeseries: ArcTimeseriesResponse | null
-  runtime: ArcIntelligenceRuntime | null
-  loading: boolean
-  refreshing: boolean
-  error: string | null
+// Arc Intelligence section of the Mainnet Dashboard. Every capability of src/config/arcIntelligenceUiScope.ts has a
+// permanent place here, marked with data-intel-section / data-intel-item. Missing data keeps its place and shows a calm
+// status; it is never drawn as zero, replaced by another window, or filled with an estimate.
+
+type DisplayStatus = IntelligenceDataStatus | 'loading'
+// ready: the selected window loaded. history: a window the API has no history for yet (never requested).
+type Mode = 'loading' | 'ready' | 'history' | 'failed'
+
+type ViewContext = {
+  mode: Mode
+  windowLabel: string
+  // 24H charts are hourly; 7D and 30D charts are daily.
+  period: 'hour' | 'day'
+  historyNote: string
+  summary: ArcSummary | null
+  timeseries: ArcTimeseries | null
+  collectingNote: string
 }
 
-type MetricKey = keyof ArcTimeseriesBucket['metrics']
+type Cell = { status: DisplayStatus; raw?: string | number; text?: string; note?: string }
 
-const initialState: LoadState = {
-  timeseries: null,
-  runtime: null,
-  loading: true,
-  refreshing: false,
-  error: null,
+const STATUS_TEXT: Record<DisplayStatus, string> = {
+  available: 'Available',
+  collecting: 'Collecting',
+  unavailable: 'Unavailable',
+  source_pending: 'Source pending',
+  loading: 'Loading',
 }
 
-function MetricCard({ label, value, note }: { label: string; value: string; note: string }) {
+const PILL_CLASS: Record<DisplayStatus, string> = {
+  available: 'border-[#d5e9c7] bg-[#eef7e8] text-[#2F6E0C]',
+  collecting: 'border-[#d5e9c7] bg-[#eef7e8] text-[#2F6E0C]',
+  unavailable: 'border-amber-200 bg-amber-50 text-amber-700',
+  source_pending: 'border-slate-200 bg-slate-50 text-slate-500',
+  loading: 'border-slate-200 bg-slate-50 text-slate-400 animate-pulse',
+}
+
+const V3_BAR = 'bg-[#2F6E0C]'
+const V4_BAR = 'bg-[#9CCB7F]'
+const ADDRESS_BAR = 'bg-[#4C8F25]'
+
+const AAVE_ACTIONS = ['supplyCount', 'withdrawCount', 'borrowCount', 'repayCount', 'liquidationCount'] as const
+const MORPHO_BLUE_ACTIONS = ['supplyCount', 'withdrawCount', 'borrowCount', 'repayCount', 'supplyCollateralCount',
+  'withdrawCollateralCount', 'liquidationCount'] as const
+const MORPHO_VAULT_ACTIONS = ['depositCount', 'withdrawCount'] as const
+
+function markerProps(item: string, status: DisplayStatus, value?: string | number | null): Record<string, string> {
+  return {
+    'data-intel-item': item,
+    'data-intel-status': status,
+    ...(status === 'available' && value !== undefined && value !== null ? { 'data-intel-value': String(value) } : {}),
+  }
+}
+
+function liveStatus(ctx: ViewContext, entry: { status: string; reason?: string } | null | undefined): DisplayStatus {
+  if (ctx.mode === 'loading') return 'loading'
+  if (ctx.mode === 'history') return 'collecting'
+  if (ctx.mode === 'failed') return 'unavailable'
+  return windowStatus(entry)
+}
+
+function noteFor(ctx: ViewContext, status: DisplayStatus, pendingNote = 'Not available yet'): string | undefined {
+  if (status === 'loading') return 'Loading verified data'
+  if (status === 'collecting') return ctx.collectingNote
+  if (status === 'unavailable') return ctx.mode === 'failed' ? 'Could not be loaded right now' : 'Not verified for this window'
+  if (status === 'source_pending') return pendingNote
+  return undefined
+}
+
+function numberCell(ctx: ViewContext, entry: { status: string; reason?: string } | null | undefined, value: number | null,
+  format: (value: number) => string): Cell {
+  const status = liveStatus(ctx, entry)
+  if (status === 'available' && value !== null) return { status, raw: value, text: format(value) }
+  const shown = status === 'available' ? 'unavailable' : status
+  return { status: shown, note: noteFor(ctx, shown) }
+}
+
+const tokenName = (address: string, symbol?: string | null) =>
+  symbol ?? ARC_KNOWN_TOKENS[address.toLowerCase()]?.symbol ?? shortenAddress(address)
+
+function objectEntries(value: unknown): [string, Record<string, unknown>][] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  return Object.entries(value as Record<string, unknown>)
+    .filter((entry): entry is [string, Record<string, unknown>] => Boolean(entry[1]) && typeof entry[1] === 'object')
+}
+
+// Per-token amounts of one family, summed per token in that token's own units (never across tokens, never in USD).
+type TokenFlow = { token: string; label: string; verified: boolean; decimals: number | null; amounts: bigint[] }
+
+function tokenFlows(rows: { token: unknown; symbol?: unknown; decimals: unknown; amounts: unknown[] }[]): TokenFlow[] {
+  const flows = new Map<string, TokenFlow>()
+  for (const row of rows) {
+    if (typeof row.token !== 'string') continue
+    const values = row.amounts.map((amount) => (typeof amount === 'string' && /^\d+$/.test(amount) ? BigInt(amount) : null))
+    if (values.some((amount) => amount === null)) continue
+    const key = row.token.toLowerCase()
+    const decimals = isFiniteNumber(row.decimals) ? row.decimals : null
+    const symbol = typeof row.symbol === 'string' ? row.symbol : null
+    const flow = flows.get(key) ?? { token: key, label: tokenName(key, symbol), verified: Boolean(symbol ?? ARC_KNOWN_TOKENS[key]),
+      decimals, amounts: values.map(() => 0n) }
+    if (flow.decimals !== decimals) flow.decimals = null
+    flow.amounts = flow.amounts.map((amount, index) => amount + (values[index] as bigint))
+    flows.set(key, flow)
+  }
+  return [...flows.values()].sort((a, b) => Number(b.verified) - Number(a.verified) || a.label.localeCompare(b.label))
+}
+
+// Tokens with 8 or more decimals (cirBTC, WETH) carry meaningful value below 0.01, so they show four decimals.
+const shownDigits = (decimals: number) => (decimals >= 8 ? 4 : 2)
+const formatAmount = (raw: string, decimals: number) => formatTokenAmount(raw, decimals, shownDigits(decimals))
+
+function formatFlowAmount(flow: TokenFlow, index: number): string | null {
+  return flow.decimals === null ? null : formatAmount(flow.amounts[index].toString(10), flow.decimals)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Small building blocks
+
+function StatusPill({ status }: { status: DisplayStatus }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">{label}</p>
-      <p className="mt-2 text-3xl font-bold tracking-tight text-slate-950">{value}</p>
-      <p className="mt-1 text-xs text-slate-500">{note}</p>
+    <span data-status-pill="" className={`inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${PILL_CLASS[status]}`}>
+      {STATUS_TEXT[status]}
+    </span>
+  )
+}
+
+function TabButton({ selected, onClick, children, disabled, marker }: {
+  selected: boolean
+  onClick?: () => void
+  children: ReactNode
+  disabled?: boolean
+  marker?: Record<string, string>
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      disabled={disabled}
+      onClick={onClick}
+      {...marker}
+      className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed ${
+        selected
+          ? 'border-[#2F6E0C] bg-[#2F6E0C] text-white shadow-sm'
+          : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function GroupHeader({ title, icon: Icon }: { title: string; icon?: typeof Activity }) {
+  return (
+    <div className="flex items-center gap-2 pt-2">
+      {Icon && <Icon aria-hidden="true" className="h-3.5 w-3.5 text-[#2F6E0C]" />}
+      <h3 className="text-xs font-semibold uppercase tracking-[0.18em] text-[#2F6E0C]">{title}</h3>
+      <div className="h-px flex-1 bg-[#dfead8]" />
     </div>
   )
 }
 
-function chartSegments(points: Array<{ x: number; y: number; value: number | null }>) {
-  const segments: string[][] = []
-  let current: string[] = []
-  for (const point of points) {
-    if (point.value === null) {
-      if (current.length) segments.push(current)
-      current = []
+function CardTitle({ title, subtitle, right }: { title: string; subtitle?: string; right?: ReactNode }) {
+  return (
+    <div>
+      <div className="flex items-start justify-between gap-3">
+        <h4 className="min-w-0 text-base font-semibold text-slate-950">{title}</h4>
+        {right && <div className="shrink-0">{right}</div>}
+      </div>
+      {subtitle && <p className="mt-0.5 text-xs leading-5 text-slate-500">{subtitle}</p>}
+    </div>
+  )
+}
+
+const CARD = 'rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5'
+
+function Banner({ tone, children }: { tone: 'info' | 'warn'; children: ReactNode }) {
+  const style = tone === 'warn' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-[#d5e9c7] bg-[#eef7e8] text-[#25580A]'
+  const Icon = tone === 'warn' ? AlertCircle : Clock
+  return (
+    <div className={`flex items-start gap-2 rounded-xl border px-3 py-2.5 text-sm ${style}`}>
+      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+      <p className="leading-6">{children}</p>
+    </div>
+  )
+}
+
+// A permanent slot whose verified data is not available: keeps its place, never shows a number.
+function EmptyState({ status, title, detail, className = '' }: { status: DisplayStatus; title: string; detail?: string; className?: string }) {
+  return (
+    <div className={`rounded-xl border border-dashed border-slate-200 bg-[#f8faf7] px-4 py-5 text-center ${className}`}>
+      <StatusPill status={status} />
+      <p className="mt-2 text-sm font-medium text-slate-700">{title}</p>
+      {detail && <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-slate-500">{detail}</p>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Chart: hourly bars with axes, UTC hour labels, honest gaps and a hover or tap tooltip.
+
+type ChartPoint = { start: string; end: string; values: number[] | null }
+type ChartSeries = { name: string; barClass: string }
+
+function niceMax(value: number): number {
+  if (value <= 0) return 1
+  const magnitude = 10 ** Math.floor(Math.log10(value))
+  for (const step of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (step * magnitude >= value) return step * magnitude
+  return 10 * magnitude
+}
+
+const pointTotal = (point: ChartPoint) => (point.values ? point.values.reduce((sum, value) => sum + value, 0) : null)
+
+function BarChart({ points, series, unit }: { points: ChartPoint[]; series: ChartSeries[]; unit: string }) {
+  const [active, setActive] = useState<number | null>(null)
+  const totals = points.map(pointTotal)
+  const max = niceMax(Math.max(0, ...totals.filter((total): total is number => total !== null)))
+  const count = points.length
+  const labelEvery = count > 12 ? 6 : 2
+  const activePoint = active === null ? null : points[active]
+  const activeShare = active === null ? 0 : (active + 0.5) / count
+  const shift = activeShare < 0.2 ? '-10%' : activeShare > 0.8 ? '-90%' : '-50%'
+
+  return (
+    <div className="mt-4" onMouseLeave={() => setActive(null)}>
+      <div className="relative h-44 sm:h-52">
+        {[1, 0.5, 0].map((fraction) => (
+          <div key={fraction} className="absolute inset-x-0 flex items-center gap-2" style={{ bottom: `${fraction * 100}%`, transform: 'translateY(50%)' }}>
+            <span className="w-9 shrink-0 text-right text-[10px] tabular-nums text-slate-400">{formatCompact(max * fraction)}</span>
+            <span className="h-px flex-1 bg-slate-100" />
+          </div>
+        ))}
+        <div className="absolute inset-y-0 left-11 right-0 flex items-end gap-[2px]">
+          {points.map((point, index) => {
+            const total = totals[index]
+            const label = point.values && total !== null
+              ? `${formatUtcHourRange(point.start, point.end)}: ${formatCount(total)} ${unit}`
+              : `${formatUtcHourRange(point.start, point.end)}: no verified data`
+            return (
+              <button key={point.start} type="button" aria-label={label} onMouseEnter={() => setActive(index)}
+                onFocus={() => setActive(index)} onClick={() => setActive(index)}
+                className="relative flex h-full min-w-0 flex-1 flex-col justify-end rounded-t-[3px] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#66D121]/40">
+                {point.values && total !== null ? (
+                  <span className={`flex w-full flex-col-reverse overflow-hidden rounded-t-[3px] ${active === index ? 'opacity-100' : 'opacity-85'}`}
+                    style={{ height: `${(total / max) * 100}%` }}>
+                    {point.values.map((value, seriesIndex) => (
+                      <span key={series[seriesIndex]?.name ?? seriesIndex} className={`block w-full ${series[seriesIndex]?.barClass ?? V3_BAR}`}
+                        style={{ height: total > 0 ? `${(value / total) * 100}%` : '0%' }} />
+                    ))}
+                  </span>
+                ) : (
+                  <span className="block h-full w-full rounded-t-[3px]"
+                    style={{ backgroundImage: 'repeating-linear-gradient(135deg, #f1f5f9 0, #f1f5f9 3px, transparent 3px, transparent 6px)' }} />
+                )}
+              </button>
+            )
+          })}
+        </div>
+        {activePoint && (
+          <div className="pointer-events-none absolute top-0 z-10 w-max max-w-[240px] rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg"
+            style={{ left: `calc(2.75rem + (100% - 2.75rem) * ${activeShare})`, transform: `translateX(${shift})` }}>
+            <p className="font-semibold text-slate-900">{formatUtcHourRange(activePoint.start, activePoint.end)}</p>
+            {activePoint.values ? (
+              <div className="mt-1 space-y-0.5">
+                {series.length > 1 && activePoint.values.map((value, index) => (
+                  <p key={series[index]?.name ?? index} className="flex items-center gap-1.5 text-slate-600">
+                    <span className={`h-2 w-2 rounded-sm ${series[index]?.barClass ?? V3_BAR}`} />
+                    {series[index]?.name}: <span className="font-semibold tabular-nums text-slate-900">{formatCount(value)}</span>
+                  </p>
+                ))}
+                <p className="text-slate-600">
+                  {series.length > 1 ? 'Total' : series[0]?.name}: <span className="font-semibold tabular-nums text-slate-900">{formatCount(totals[active ?? 0] ?? 0)}</span> {unit}
+                </p>
+              </div>
+            ) : (
+              <p className="mt-1 text-slate-500">No verified data for this hour yet</p>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="ml-11 mt-1.5 flex gap-[2px]">
+        {points.map((point, index) => (
+          <span key={point.start} className="relative h-4 min-w-0 flex-1">
+            {index % labelEvery === 0 && (
+              <span className="absolute left-0 whitespace-nowrap text-[10px] tabular-nums text-slate-400">{formatUtcHour(point.start)}</span>
+            )}
+          </span>
+        ))}
+      </div>
+      <p className="mt-1 text-right text-[10px] text-slate-400">Hours in UTC</p>
+    </div>
+  )
+}
+
+// Latest complete hour (chronologically last verified hour) and peak hour, labeled separately.
+function HourReadout({ item, status, points, unit, period = 'hour' }: { item: string; status: DisplayStatus; points: ChartPoint[]; unit: string; period?: 'hour' | 'day' }) {
+  const verified = points.filter((point) => point.values)
+  const latest = verified[verified.length - 1] ?? null
+  const peak = verified.reduce<ChartPoint | null>((best, point) => (best === null || (pointTotal(point) ?? 0) > (pointTotal(best) ?? 0) ? point : best), null)
+  const shown: DisplayStatus = status === 'available' && !latest ? 'collecting' : status
+  const tiles = [{ label: `Latest complete ${period}`, point: latest }, { label: `Peak ${period} in window`, point: peak }]
+  return (
+    <div {...markerProps(item, shown, latest ? pointTotal(latest) : null)} className="mt-3 grid grid-cols-2 gap-2">
+      {tiles.map(({ label, point }) => (
+        <div key={label} className="min-w-0 rounded-xl bg-[#f8faf7] px-3 py-2">
+          <p className="text-[11px] text-slate-500">{label}</p>
+          {shown === 'available' && point ? (
+            <>
+              <p className="text-sm font-semibold tabular-nums text-slate-950">
+                {formatCount(pointTotal(point) ?? 0)} <span className="font-normal text-slate-500">{unit}</span>
+              </p>
+              <p className="text-[11px] text-slate-400">{formatUtcHourRange(point.start, point.end)}</p>
+            </>
+          ) : (
+            <div className="mt-1.5"><span aria-hidden="true" className="inline-block h-3 w-16 rounded bg-slate-100 align-middle" /></div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function chartStatus(ctx: ViewContext, points: ChartPoint[] | null): DisplayStatus {
+  if (ctx.mode !== 'ready') return liveStatus(ctx, null)
+  if (!points) return 'unavailable'
+  return points.some((point) => point.values) ? 'available' : 'collecting'
+}
+
+function swapPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
+  if (!timeseries) return null
+  return timeseries.buckets.map((bucket) => {
+    const v3 = bucket.status === 'committed' ? bucket.families?.uniswapV3 : undefined
+    const v4 = bucket.status === 'committed' ? bucket.families?.uniswapV4 : undefined
+    const complete = v3?.status === 'available' && v4?.status === 'available' && isFiniteNumber(v3.swapCount) && isFiniteNumber(v4.swapCount)
+    return { start: bucket.start, end: bucket.end, values: complete ? [v3.swapCount as number, v4.swapCount as number] : null }
+  })
+}
+
+function addressPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
+  if (!timeseries) return null
+  return timeseries.buckets.map((bucket) => {
+    const value = bucket.status === 'committed' ? bucket.network?.uniqueActiveAddresses : undefined
+    return { start: bucket.start, end: bucket.end, values: isFiniteNumber(value) ? [value] : null }
+  })
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sections
+
+function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
+  item: string
+  label: string
+  caption: string
+  cell: Cell
+  delta?: number | null
+  windowLabel: string
+}) {
+  return (
+    <div {...markerProps(item, cell.status, cell.raw)} className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</p>
+      {cell.status === 'available'
+        ? <p className="mt-2 truncate text-2xl font-bold tracking-tight text-slate-950 tabular-nums sm:text-3xl">{cell.text}</p>
+        : <div className="mt-3"><StatusPill status={cell.status} /></div>}
+      <p className="mt-2 text-xs leading-5 text-slate-500">{cell.status === 'available' ? caption : cell.note}</p>
+      {cell.status === 'available' && delta !== null && delta !== undefined && (
+        <p className={`mt-1 text-xs font-semibold ${delta >= 0 ? 'text-[#2F6E0C]' : 'text-rose-600'}`}>
+          {formatSignedPercent(delta)} <span className="font-normal text-slate-500">vs previous {windowLabel}</span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }) {
+  const network = ctx.summary?.network ?? null
+  const uniques = network?.uniqueActiveAddresses ?? null
+  const active = numberCell(ctx, uniques, uniques && isFiniteNumber(uniques.value) ? uniques.value : null, formatCount)
+  const transactions = numberCell(ctx, network, network && isFiniteNumber(network.transactions) ? network.transactions : null, formatCount)
+  const previous = network?.previous
+  const previousUniques = previous?.uniqueActiveAddresses
+  const activeDelta = previousUniques?.status === 'available' && isFiniteNumber(previousUniques.value) && active.status === 'available'
+    ? percentChange(Number(active.raw), previousUniques.value) : null
+  const transactionsDelta = previous?.status === 'available' && isFiniteNumber(previous.transactions) && transactions.status === 'available'
+    ? percentChange(Number(transactions.raw), previous.transactions) : null
+  const blocks = numberCell(ctx, network, network && isFiniteNumber(network.blocks) ? network.blocks : null, formatCount)
+  const tps = numberCell(ctx, network, network && isFiniteNumber(network.transactionsPerSecond) ? network.transactionsPerSecond : null,
+    (value) => formatDecimal(value, 2))
+  const gasStatus = liveStatus(ctx, network)
+  const gas: Cell = gasStatus === 'available' && network?.gasUsedRaw && /^\d+$/.test(network.gasUsedRaw)
+    ? { status: 'available', raw: network.gasUsedRaw, text: formatCompactRaw(network.gasUsedRaw) }
+    : { status: gasStatus === 'available' ? 'unavailable' : gasStatus }
+  const volume: Cell = { status: 'source_pending', note: 'Needs verified USD pricing for every pair. Not available yet.' }
+  const fee: Cell = { status: 'source_pending', note: 'Fee data is not available yet.' }
+
+  return (
+    <section data-intel-section="network" aria-label="Network Activity" className="space-y-4">
+      {header}
+      <GroupHeader title="Network Activity" />
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <KpiCard item="network.active-addresses" label="Active Addresses" cell={active} delta={activeDelta} windowLabel={ctx.windowLabel}
+          caption={`Unique addresses, last ${ctx.windowLabel}`} />
+        <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.windowLabel}
+          caption={`Total transactions, last ${ctx.windowLabel}`} />
+        <KpiCard item="network.total-volume" label="Total Volume" cell={volume} windowLabel={ctx.windowLabel} caption="" />
+        <KpiCard item="network.average-fee" label="Average Fee" cell={fee} windowLabel={ctx.windowLabel} caption="" />
+      </div>
+      <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
+        {([
+          ['network.blocks', 'Blocks', `Total, last ${ctx.windowLabel}`, blocks, ''],
+          ['network.tps', 'Transactions per second', `Average over the last ${ctx.windowLabel}`, tps, ''],
+          ['network.gas-used', 'Gas used', `Total, last ${ctx.windowLabel}`, gas, 'gas'],
+        ] as const).map(([item, label, caption, cell, unit]) => (
+          <div key={item} {...markerProps(item, cell.status, cell.raw)} className="flex items-center justify-between gap-3 py-3 sm:px-4">
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-700">{label}</p>
+              <p className="text-[11px] text-slate-400">{caption}</p>
+            </div>
+            {cell.status === 'available'
+              ? <p className="shrink-0 text-base font-semibold tabular-nums text-slate-950">{cell.text}{unit && <span className="ml-1 text-xs font-normal text-slate-500">{unit}</span>}</p>
+              : <StatusPill status={cell.status} />}
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialView: 'volume' | 'swaps' }) {
+  // Volume is the primary DEX metric and the default view; Swaps is the secondary, verified view.
+  const [tab, setTab] = useState<'volume' | 'swaps'>(initialView)
+  const points = ctx.mode === 'ready' ? swapPoints(ctx.timeseries) : null
+  const status = chartStatus(ctx, points)
+  const series: ChartSeries[] = [{ name: 'Uniswap V3', barClass: V3_BAR }, { name: 'Uniswap V4', barClass: V4_BAR }]
+  return (
+    <section data-intel-section="volume-chart" aria-label="DEX Activity" className={`${CARD} min-w-0 lg:col-span-3`}>
+      <CardTitle
+        title={tab === 'volume' ? 'DEX Volume' : 'DEX Swaps'}
+        subtitle={tab === 'volume'
+          ? `USD value traded per UTC ${ctx.period} across all verified pairs.`
+          : `Swap events per UTC ${ctx.period} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Counts, not amounts.`}
+        right={(
+          <div role="tablist" aria-label="DEX chart" className="flex gap-1.5">
+            <TabButton selected={tab === 'volume'} onClick={() => setTab('volume')} marker={markerProps('volume-chart.volume', 'source_pending')}>Volume</TabButton>
+            <TabButton selected={tab === 'swaps'} onClick={() => setTab('swaps')} marker={markerProps('volume-chart.swaps', status)}>Swaps</TabButton>
+          </div>
+        )}
+      />
+      {tab === 'volume' ? (
+        <>
+          <HourReadout item="volume-chart.latest" status="source_pending" points={[]} unit="USD" period={ctx.period} />
+          <EmptyState status="source_pending" className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
+            title="DEX volume is not available yet"
+            detail="Volume needs a verified USD price for every traded pair. Swap counts are available in the Swaps tab." />
+        </>
+      ) : status === 'available' && points ? (
+        <>
+          <HourReadout item="volume-chart.latest" status={status} points={points} unit="swaps" />
+          <BarChart points={points} series={series} unit="swaps" />
+        </>
+      ) : (
+        <>
+          <HourReadout item="volume-chart.latest" status={status} points={[]} unit="swaps" period={ctx.period} />
+          <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
+            title={ctx.mode === 'history' ? 'History is still being collected' : 'Hourly swaps are not available right now'}
+            detail={ctx.mode === 'history' ? ctx.historyNote : noteFor(ctx, status)} />
+        </>
+      )}
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
+        <span {...markerProps('volume-chart.uniswap-v3', status)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V3_BAR}`} />Uniswap V3</span>
+        <span {...markerProps('volume-chart.uniswap-v4', status)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V4_BAR}`} />Uniswap V4</span>
+        <span {...markerProps('volume-chart.other', 'source_pending')} className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2.5 w-2.5 rounded-sm border border-dashed border-slate-300" />Other DEX protocols: not available yet</span>
+      </div>
+    </section>
+  )
+}
+
+function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
+  const points = ctx.mode === 'ready' ? addressPoints(ctx.timeseries) : null
+  const status = chartStatus(ctx, points)
+  return (
+    <section data-intel-section="active-addresses-chart" aria-label="Active Addresses" className={`${CARD} min-w-0 lg:col-span-2`}>
+      <CardTitle title="Active Addresses"
+        subtitle={ctx.mode === 'history'
+          ? `Unique addresses per day, last ${ctx.windowLabel}.`
+          : 'Unique addresses active in each UTC hour. Hourly values are not added together.'} />
+      <div {...markerProps('active-addresses-chart.series', status)}>
+        {status === 'available' && points ? (
+          <>
+            <HourReadout item="active-addresses-chart.latest" status={status} points={points} unit="addresses" />
+            <BarChart points={points} series={[{ name: 'Active addresses', barClass: ADDRESS_BAR }]} unit="addresses" />
+          </>
+        ) : (
+          <>
+            <HourReadout item="active-addresses-chart.latest" status={status} points={[]} unit="addresses" period={ctx.period} />
+            <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
+              title={ctx.mode === 'history' ? 'History is still being collected' : 'Hourly active addresses are not available right now'}
+              detail={ctx.mode === 'history' ? ctx.historyNote : noteFor(ctx, status)} />
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Lower half building blocks. One status badge per card with a short line of text; cells without verified data show a
+// quiet gap, never a digit; every bar is a real count relative to the other real counts beside it, never a share of an
+// unverified total.
+
+const INLINE_STATUS_CLASS: Record<DisplayStatus, string> = {
+  available: 'text-[#2F6E0C]',
+  collecting: 'text-[#2F6E0C]',
+  unavailable: 'text-amber-700',
+  source_pending: 'text-slate-400',
+  loading: 'text-slate-400',
+}
+
+function InlineStatus({ status }: { status: DisplayStatus }) {
+  return <span className={`whitespace-nowrap text-[11px] font-medium ${INLINE_STATUS_CLASS[status]}`}>{STATUS_TEXT[status]}</span>
+}
+
+function ValueGap({ className = 'w-10' }: { className?: string }) {
+  return <span aria-hidden="true" className={`inline-block h-3 rounded bg-slate-100 align-middle ${className}`} />
+}
+
+// The status every cell of a card shares, shown once; null when the cells differ or all are available.
+function sharedStatus(statuses: DisplayStatus[]): DisplayStatus | null {
+  const first = statuses[0]
+  return first && first !== 'available' && statuses.every((status) => status === first) ? first : null
+}
+
+// Activity bar: a real count relative to the largest real count beside it. A tiny non-zero count keeps a visible sliver.
+function ActivityBar({ value, max, barClass = 'bg-[#2F6E0C]' }: { value: number | null; max: number; barClass?: string }) {
+  const width = value === null || value <= 0 || max <= 0 ? 0 : Math.max((value / max) * 100, 1.5)
+  return (
+    <span className="block h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+      {value !== null && (
+        <span data-activity-bar="" data-activity-value={value} className={`block h-full rounded-full ${barClass}`} style={{ width: `${width}%` }} />
+      )}
+    </span>
+  )
+}
+
+const ASSET_CATEGORY: Record<string, string> = {
+  USDC: 'Stablecoin',
+  EURC: 'Stablecoin',
+  cirBTC: 'Tokenized bitcoin',
+  WETH: 'Wrapped asset',
+  USYC: 'Tokenized fund',
+}
+const CATEGORY_TONE: Record<string, string> = {
+  Stablecoin: 'bg-[#eef7e8] text-[#2F6E0C]',
+  'Tokenized bitcoin': 'bg-amber-50 text-amber-700',
+  'Wrapped asset': 'bg-sky-50 text-sky-700',
+  'Tokenized fund': 'bg-teal-50 text-teal-700',
+}
+const NEUTRAL_TONE = 'bg-slate-100 text-slate-600'
+const toneFor = (symbol: string) => CATEGORY_TONE[ASSET_CATEGORY[symbol] ?? ''] ?? NEUTRAL_TONE
+
+// Machina has no token logo assets and none are invented: a neutral initial avatar, tinted by asset category.
+function TokenAvatar({ symbol, size = 'md' }: { symbol: string; size?: 'sm' | 'md' }) {
+  const initial = symbol.startsWith('0x') ? '0x' : symbol.replace(/[^A-Za-z]/g, '').charAt(0).toUpperCase() || '?'
+  return (
+    <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center rounded-full font-bold ${toneFor(symbol)} ${
+      size === 'sm' ? 'h-5 w-5 text-[9px]' : 'h-8 w-8 text-xs'}`}>
+      {initial}
+    </span>
+  )
+}
+
+function Chip({ children, tone = NEUTRAL_TONE }: { children: ReactNode; tone?: string }) {
+  return <span className={`inline-flex shrink-0 items-center rounded-md px-1.5 py-px text-[10px] font-semibold ${tone}`}>{children}</span>
+}
+
+const LABEL = 'text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-400'
+
+// Small stat tile for real supporting numbers (new pools, pools tracked, asset counts).
+function StatTile({ label, cell, unit, marker }: { label: string; cell: Cell; unit?: string; marker?: Record<string, string> }) {
+  return (
+    <div {...marker} className="min-w-0 rounded-lg border border-slate-100 bg-[#f8faf7] px-2.5 py-1.5">
+      <p className="truncate text-[11px] text-slate-500">{label}</p>
+      {cell.status === 'available'
+        ? <p className="text-sm font-semibold tabular-nums text-slate-950">{cell.text}{unit && <span className="ml-1 text-[11px] font-normal text-slate-500">{unit}</span>}</p>
+        : <p className="flex items-center gap-1.5 pt-0.5"><ValueGap /><InlineStatus status={cell.status} /></p>}
+    </div>
+  )
+}
+
+// A table whose rows do not exist yet: column headings stay (chips on phones, where rows become stacked cards), and the
+// first rows will replace the compact empty line in place.
+function ShellTable({ columns, gridClass, children }: { columns: { item: string; label: string }[]; gridClass: string; children: ReactNode }) {
+  return (
+    <div className="mt-3">
+      <div className={`hidden gap-3 border-b border-slate-100 pb-1.5 md:grid ${gridClass}`}>
+        {columns.map((column) => (
+          <span key={column.item} {...markerProps(column.item, 'source_pending')} className={LABEL}>{column.label}</span>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1.5 md:hidden">
+        {columns.map((column) => (
+          <span key={column.item} {...markerProps(column.item, 'source_pending')}
+            className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-500">
+            {column.label}
+          </span>
+        ))}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function EmptyRows({ title, detail, status }: { title: string; detail: string; status?: DisplayStatus }) {
+  return (
+    <div className="py-4 text-center">
+      {status && <div className="mb-1.5"><StatusPill status={status} /></div>}
+      <p className="text-xs font-medium text-slate-600">{title}</p>
+      <p className="mx-auto mt-0.5 max-w-md text-[11px] leading-4 text-slate-400">{detail}</p>
+    </div>
+  )
+}
+
+function CardHeader({ title, subtitle, icon: Icon, right }: { title: string; subtitle?: string; icon?: typeof Coins; right?: ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex min-w-0 items-start gap-2.5">
+        {Icon && (
+          <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#eef7e8] text-[#2F6E0C]">
+            <Icon className="h-3.5 w-3.5" />
+          </span>
+        )}
+        <div className="min-w-0">
+          <h4 className="text-base font-semibold text-slate-950">{title}</h4>
+          {subtitle && <p className="text-xs leading-5 text-slate-500">{subtitle}</p>}
+        </div>
+      </div>
+      {right && <div className="shrink-0">{right}</div>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Markets
+
+const PROTOCOL_ROWS: { item: string; name: string; category: string; family: (summary: ArcSummary) => FamilyWindow;
+  fields: readonly string[]; unit: string }[] = [
+  { item: 'top-protocols.uniswap-v3', name: 'Uniswap V3', category: 'DEX', family: (summary) => summary.dex.uniswapV3, fields: ['swapCount'], unit: 'swaps' },
+  { item: 'top-protocols.uniswap-v4', name: 'Uniswap V4', category: 'DEX', family: (summary) => summary.dex.uniswapV4, fields: ['swapCount'], unit: 'swaps' },
+  { item: 'top-protocols.aave', name: 'Aave', category: 'Lending', family: (summary) => summary.lending.aaveV4, fields: AAVE_ACTIONS, unit: 'lending actions' },
+  { item: 'top-protocols.morpho-blue', name: 'Morpho Blue', category: 'Lending', family: (summary) => summary.lending.morphoBlue, fields: MORPHO_BLUE_ACTIONS, unit: 'market actions' },
+  { item: 'top-protocols.morpho-vaults', name: 'Morpho Vaults', category: 'Vaults', family: (summary) => summary.lending.morphoVaultsV2, fields: MORPHO_VAULT_ACTIONS, unit: 'vault actions' },
+]
+
+function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
+  const rows = PROTOCOL_ROWS.map((row) => {
+    const family = ctx.summary ? row.family(ctx.summary) : null
+    return { ...row, cell: numberCell(ctx, family, metricSum(family, row.fields), formatCount) }
+  })
+  const shared = sharedStatus(rows.map((row) => row.cell.status))
+  const max = Math.max(0, ...rows.map((row) => (row.cell.status === 'available' ? Number(row.cell.raw) : 0)))
+  return (
+    <section data-intel-section="top-protocols" aria-label="Top Protocols" className={`${CARD} min-w-0`}>
+      <CardHeader title="Top Protocols" subtitle={`Verified Arc protocols, last ${ctx.windowLabel}`} />
+      <div {...markerProps('top-protocols.volume-ranking', 'source_pending')}
+        className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-dashed border-slate-200 px-3 py-2">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-slate-700">Ranked by USD volume</p>
+          <p className="text-[11px] leading-4 text-slate-500">Primary ranking. Fixed order until volume is verified.</p>
+        </div>
+        <StatusPill status="source_pending" />
+      </div>
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <p className={LABEL}>Activity, last {ctx.windowLabel}</p>
+        {shared && <InlineStatus status={shared} />}
+      </div>
+      <ul className="mt-1.5 space-y-2.5">
+        {rows.map((row) => (
+          <li key={row.item} {...markerProps(row.item, row.cell.status, row.cell.raw)}>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-sm font-semibold text-slate-900">{row.name}</span>
+                <Chip>{row.category}</Chip>
+              </p>
+              {row.cell.status === 'available'
+                ? <p className="shrink-0 text-sm font-semibold tabular-nums text-slate-950">{row.cell.text} <span className="text-[11px] font-normal text-slate-500">{row.unit}</span></p>
+                : shared ? <ValueGap /> : <InlineStatus status={row.cell.status} />}
+            </div>
+            <div className="mt-1"><ActivityBar value={row.cell.status === 'available' ? Number(row.cell.raw) : null} max={max} /></div>
+          </li>
+        ))}
+        <li {...markerProps('top-protocols.other', 'source_pending')} className="flex items-center justify-between gap-3 border-t border-dashed border-slate-200 pt-2">
+          <p className="min-w-0 truncate text-sm font-medium text-slate-500">Other Arc protocols</p>
+          <InlineStatus status="source_pending" />
+        </li>
+      </ul>
+    </section>
+  )
+}
+
+function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | 'v4' }) {
+  const id = version === 'v3' ? 'top-pools-v3' : 'top-pools-v4'
+  const family = ctx.summary ? (version === 'v3' ? ctx.summary.dex.uniswapV3 : ctx.summary.dex.uniswapV4) : null
+  const newPools = numberCell(ctx, family, metricNumber(family, version === 'v3' ? 'poolCreatedCount' : 'initializeCount'), formatCount)
+  const registry = ctx.summary?.dex.officialV3Pools
+  const poolCountStatus: DisplayStatus = ctx.mode !== 'ready' ? liveStatus(ctx, null)
+    : registry?.status === 'available' && isFiniteNumber(registry.count) ? 'available' : 'unavailable'
+  const poolCount: Cell = poolCountStatus === 'available' && registry && isFiniteNumber(registry.count)
+    ? { status: 'available', raw: registry.count, text: formatCount(registry.count) } : { status: poolCountStatus }
+  const label = version === 'v3' ? 'V3' : 'V4'
+  return (
+    <section data-intel-section={id} aria-label={`Top Pools (Uniswap ${label})`} className={`${CARD} min-w-0`}>
+      <CardHeader title={`Top Pools (Uniswap ${label})`} subtitle={`All verified ${label} pairs, last ${ctx.windowLabel}`} />
+      <div className={`mt-3 grid gap-2 ${version === 'v3' ? 'grid-cols-2' : 'grid-cols-1'}`}>
+        <StatTile marker={markerProps(`${id}.new-pools`, newPools.status, newPools.raw)} label={`New pools, ${ctx.windowLabel}`} cell={newPools} />
+        {version === 'v3' && (
+          <StatTile marker={markerProps('top-pools-v3.pool-count', poolCount.status, poolCount.raw)} label="Verified pools tracked" cell={poolCount} />
+        )}
+      </div>
+      <ShellTable
+        gridClass="grid-cols-[1.4fr_1fr_1fr_1fr]"
+        columns={[
+          { item: `${id}.all-pairs`, label: 'Pair' },
+          { item: `${id}.volume`, label: 'Volume' },
+          { item: `${id}.swaps`, label: 'Swaps' },
+          { item: `${id}.liquidity`, label: 'Liquidity' },
+        ]}
+      >
+        <EmptyRows status="source_pending" title="Pool rankings will appear here"
+          detail={`Every verified Uniswap ${label} pair will be listed here, not only USDC pairs. Tokens without verified details show their shortened address.`} />
+      </ShellTable>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Recent activity and launches
+
+function RecentActivitySection({ ctx }: { ctx: ViewContext }) {
+  const [tab, setTab] = useState<'all' | 'swaps' | 'adds' | 'removes'>('all')
+  const tabs = [['all', 'All'], ['swaps', 'Swaps'], ['adds', 'Adds'], ['removes', 'Removes']] as const
+  return (
+    <section data-intel-section="recent-activity" aria-label="Recent Activity" className={CARD}>
+      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+        <div className="min-w-[10rem] flex-1">
+          <h4 className="text-base font-semibold text-slate-950">Latest DEX activity</h4>
+          <p className="text-xs leading-5 text-slate-500">Swaps and liquidity changes across all verified pairs, last {ctx.windowLabel}</p>
+        </div>
+        <div role="tablist" aria-label="Activity type" className="flex flex-wrap gap-1.5">
+          {tabs.map(([key, label]) => (
+            <TabButton key={key} selected={tab === key} onClick={() => setTab(key)} marker={markerProps(`recent-activity.${key}`, 'source_pending')}>{label}</TabButton>
+          ))}
+        </div>
+      </div>
+      <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-100 bg-[#f8faf7] px-3 py-1.5">
+        <StatusPill status="source_pending" />
+        <p className="text-xs text-slate-600">Verified DEX activity feed is being completed</p>
+      </div>
+      <ShellTable
+        gridClass="grid-cols-[0.8fr_1.4fr_1.6fr_1fr_1fr]"
+        columns={[
+          { item: 'recent-activity.type', label: 'Type' },
+          { item: 'recent-activity.pair', label: 'Pair' },
+          { item: 'recent-activity.amounts', label: 'Amounts' },
+          { item: 'recent-activity.time', label: 'Time (UTC)' },
+          { item: 'recent-activity.transaction-links', label: 'Transaction' },
+        ]}
+      >
+        <EmptyRows title="No activity rows yet"
+          detail="Each swap, add and remove will appear here with its pair, token amounts, time and a link to the transaction on the Arc explorer." />
+      </ShellTable>
+    </section>
+  )
+}
+
+const LAUNCH_CAPABILITIES = [
+  { icon: Search, title: 'Token discovery', detail: 'New tokens created on Arc' },
+  { icon: Rocket, title: 'Launch source', detail: 'Where and how each token launched' },
+  { icon: Droplets, title: 'First pool + DEX activity', detail: 'First trading pair and early swaps' },
+]
+
+function LaunchesSection({ ctx }: { ctx: ViewContext }) {
+  return (
+    <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
+      <CardHeader title="Newly launched tokens" subtitle={`Tokens launched on Arc, last ${ctx.windowLabel}`} right={<StatusPill status="source_pending" />} />
+      <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        {LAUNCH_CAPABILITIES.map(({ icon: Icon, title, detail }) => (
+          <div key={title} className="flex items-start gap-2.5 rounded-lg border border-slate-100 bg-[#f8faf7] px-3 py-2">
+            <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500 ring-1 ring-slate-200">
+              <Icon className="h-3.5 w-3.5" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-slate-800">{title}</p>
+              <p className="text-[11px] leading-4 text-slate-500">{detail}</p>
+              <p className="mt-0.5 text-[11px] font-medium text-slate-400">Source pending</p>
+            </div>
+          </div>
+        ))}
+      </div>
+      <ShellTable
+        gridClass="grid-cols-8"
+        columns={[
+          { item: 'launches.token', label: 'Token' },
+          { item: 'launches.symbol-address', label: 'Symbol and address' },
+          { item: 'launches.source', label: 'Launched via' },
+          { item: 'launches.time', label: 'Launch time' },
+          { item: 'launches.transaction', label: 'Transaction' },
+          { item: 'launches.initial-pool', label: 'First pool' },
+          { item: 'launches.dex-activity', label: 'DEX activity' },
+          { item: 'launches.status', label: 'Status' },
+        ]}
+      >
+        <EmptyRows title="No launches listed yet" detail="Launches appear here once token discovery is verified. No sample tokens are shown." />
+      </ShellTable>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Assets
+
+function AssetsSection({ ctx }: { ctx: ViewContext }) {
+  const usdc = ctx.summary?.assets.usdc ?? null
+  const verified = ctx.summary?.assets.verifiedAssets ?? null
+  const items = verifiedAssetItems(verified)
+  type AssetRow = { item: string; symbol: string; cell: Cell; transfers?: number; mints?: number; burns?: number; amount?: string | null }
+  const usdcStatus = liveStatus(ctx, usdc)
+  const usdcCounts = [metricNumber(usdc, 'transferCount'), metricNumber(usdc, 'mintCount'), metricNumber(usdc, 'burnCount')]
+  const usdcAmount = metricAmount(usdc, 'amountRaw')
+  const usdcDecimals = metricNumber(usdc, 'rawDecimals')
+  const rows: AssetRow[] = [usdcStatus === 'available' && usdcCounts.every((value) => value !== null)
+    ? { item: 'assets.usdc', symbol: 'USDC', cell: { status: 'available', raw: usdcCounts[0] as number },
+      transfers: usdcCounts[0] as number, mints: usdcCounts[1] as number, burns: usdcCounts[2] as number,
+      amount: usdcAmount !== null && usdcDecimals !== null ? `${formatTokenAmount(usdcAmount, usdcDecimals)} USDC` : null }
+    : { item: 'assets.usdc', symbol: 'USDC', cell: { status: usdcStatus === 'available' ? 'unavailable' : usdcStatus } }]
+  const assetStatus = liveStatus(ctx, verified)
+  for (const [item, symbol] of [['assets.eurc', 'EURC'], ['assets.cirbtc', 'cirBTC'], ['assets.weth', 'WETH'], ['assets.usyc', 'USYC']] as const) {
+    if (assetStatus !== 'available' || !items) {
+      rows.push({ item, symbol, cell: { status: assetStatus === 'available' ? 'unavailable' : assetStatus } })
       continue
     }
-    current.push(`${current.length ? 'L' : 'M'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    const found = items.find((entry) => entry.symbol === symbol)
+    // The window is fully verified: an asset without an entry, or with no events, had no transfers in it.
+    rows.push(found && found.transferCount + found.mintCount + found.burnCount > 0
+      ? { item, symbol, cell: { status: 'available', raw: found.transferCount }, transfers: found.transferCount,
+        mints: found.mintCount, burns: found.burnCount, amount: `${formatAmount(found.amountRaw, found.decimals)} ${symbol}` }
+      : { item, symbol, cell: { status: 'available', raw: 0 } })
   }
-  if (current.length) segments.push(current)
-  return segments
+  const shared = sharedStatus(rows.map((row) => row.cell.status))
+  const maxTransfers = Math.max(0, ...rows.map((row) => row.transfers ?? 0))
+  const pendingRows = [
+    { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: 'More assets as they are verified' },
+    { item: 'assets.new-tokens', label: 'Newly discovered tokens', detail: 'Shown with a shortened address until verified' },
+  ]
+  const grid = 'md:grid-cols-[1.5fr_1.6fr_0.6fr_0.6fr_1.4fr]'
+  return (
+    <section data-intel-section="assets" aria-label="Assets" className={CARD}>
+      <CardHeader title="Verified asset transfers"
+        subtitle={`Transfer, mint and burn events of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD.`}
+        right={shared ? <StatusPill status={shared} /> : undefined} />
+      <div className={`mt-3 hidden gap-4 border-b border-slate-100 pb-1.5 md:grid ${grid}`}>
+        <span className={LABEL}>Asset</span><span className={LABEL}>Transfer activity</span><span className={`${LABEL} text-right`}>Mints</span>
+        <span className={`${LABEL} text-right`}>Burns</span><span className={`${LABEL} text-right`}>Amount moved</span>
+      </div>
+      <ul className="mt-3 space-y-2 md:mt-0 md:space-y-0">
+        {rows.map((row) => (
+          <li key={row.item} {...markerProps(row.item, row.cell.status, row.cell.raw)}
+            className={`rounded-xl border border-slate-100 p-3 md:grid md:items-center md:gap-4 md:rounded-none md:border-0 md:border-b md:px-0 md:py-2.5 ${grid}`}>
+            <div className="flex min-w-0 items-center gap-2.5">
+              <TokenAvatar symbol={row.symbol} />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-900">{row.symbol}</p>
+                <Chip tone={toneFor(row.symbol)}>{ASSET_CATEGORY[row.symbol]}</Chip>
+              </div>
+            </div>
+            {row.cell.status !== 'available' ? (
+              <div className="mt-2 md:col-span-4 md:mt-0">{shared ? <ValueGap className="w-24" /> : <InlineStatus status={row.cell.status} />}</div>
+            ) : row.transfers === undefined ? (
+              <p className="mt-2 text-xs text-slate-500 md:col-span-4 md:mt-0">No verified transfers in this window</p>
+            ) : (
+              <>
+                <div className="mt-2 md:mt-0">
+                  <p className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="text-slate-500 md:hidden">Transfers</span>
+                    <span className="font-semibold tabular-nums text-slate-950">{formatCount(row.transfers)}</span>
+                  </p>
+                  <div className="mt-1"><ActivityBar value={row.transfers} max={maxTransfers} /></div>
+                </div>
+                {([['Mints', row.mints], ['Burns', row.burns]] as const).map(([label, value]) => (
+                  <p key={label} className="mt-1 flex justify-between gap-3 text-sm md:mt-0 md:block md:text-right">
+                    <span className="text-slate-500 md:hidden">{label}</span>
+                    <span className="font-semibold tabular-nums text-slate-950">{formatCount(value ?? 0)}</span>
+                  </p>
+                ))}
+                <p className="mt-1 flex justify-between gap-3 text-sm md:mt-0 md:block md:text-right">
+                  <span className="shrink-0 text-slate-500 md:hidden">Amount moved</span>
+                  {row.amount ? <span className="text-right font-semibold tabular-nums text-slate-950">{row.amount}</span> : <InlineStatus status="unavailable" />}
+                </p>
+              </>
+            )}
+          </li>
+        ))}
+        {pendingRows.map((row) => (
+          <li key={row.item} {...markerProps(row.item, 'source_pending')}
+            className={`flex items-center justify-between gap-3 rounded-xl border border-dashed border-slate-200 p-3 md:grid md:gap-4 md:rounded-none md:border-0 md:border-b md:border-dashed md:px-0 md:py-2.5 ${grid}`}>
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span aria-hidden="true" className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-dashed border-slate-300 text-xs font-semibold text-slate-400">+</span>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-500">{row.label}</p>
+                <p className="text-[11px] text-slate-400">{row.detail}</p>
+              </div>
+            </div>
+            <div className="shrink-0 md:col-span-4 md:text-right"><InlineStatus status="source_pending" /></div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
 }
 
-function LineChart({ title, buckets, metric, color = '#2F6E0C' }: {
-  title: string
-  buckets: ArcTimeseriesBucket[]
-  metric: MetricKey
-  color?: string
-}) {
-  const values = buckets.map((bucket) => bucketValue(bucket, metric))
-  const present = values.filter((value): value is number => value !== null)
-  const max = Math.max(...present, 1)
-  const width = 520
-  const height = 180
-  const padX = 24
-  const padY = 22
-  const points = values.map((value, index) => {
-    const x = buckets.length <= 1 ? width / 2 : padX + ((width - padX * 2) * index) / (buckets.length - 1)
-    const y = value === null ? height - padY : padY + (height - padY * 2) * (1 - value / max)
-    return { x, y, value }
-  })
-  const segments = chartSegments(points)
-  const first = buckets[0]?.start
-  const last = buckets.length ? buckets[buckets.length - 1]?.start : undefined
+// ---------------------------------------------------------------------------------------------------------------------
+// Borrow: the existing guarded Circle Borrow Kit product (src/lib/mainnetBorrow.ts), shown read only. Every validated Arc
+// cirBTC/USDC market is listed the same way, by market ID; none is selected, ranked or recommended. There is no Borrow
+// route in Machina yet, so no action or market selection is offered; MAINNET_BORROW_WRITES_ENABLED decides the note.
 
+function BorrowAsset({ symbol, role }: { symbol: string; role: string }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h4 className="font-semibold text-slate-950">{title}</h4>
-          <p className="mt-1 text-xs text-slate-500">Verified hourly values only. Gaps mean evidence is not complete.</p>
-        </div>
-        <span className="rounded-full bg-[#eef7e8] px-2.5 py-1 text-[11px] font-semibold text-[#2F6E0C]">
-          {present.length} points
-        </span>
-      </div>
-      <div className="mt-4 overflow-hidden rounded-xl bg-[#f8faf7] p-3">
-        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title} chart`} className="h-48 w-full">
-          <line x1={padX} y1={height - padY} x2={width - padX} y2={height - padY} stroke="#cbd5e1" strokeWidth="1" />
-          {points.map((point, index) => point.value === null ? (
-            <line key={`gap-${buckets[index]?.start}`} x1={point.x} y1={padY} x2={point.x} y2={height - padY} stroke="#cbd5e1" strokeWidth="1" strokeDasharray="4 5" />
-          ) : null)}
-          {segments.map((segment, index) => (
-            <path key={index} d={segment.join(' ')} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-          ))}
-          {points.map((point, index) => point.value !== null ? (
-            <circle key={buckets[index]?.start} cx={point.x} cy={point.y} r="4" fill="white" stroke={color} strokeWidth="2">
-              <title>{`${formatHourLabel(buckets[index].start)}: ${formatCount(point.value)}`}</title>
-            </circle>
-          ) : null)}
-        </svg>
-        <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-          <span>{first ? formatHourLabel(first) : 'Unavailable'}</span>
-          <span>{last ? formatHourLabel(last) : 'Unavailable'}</span>
-        </div>
+    <div className="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-slate-200 bg-[#f8faf7] px-3 py-2.5">
+      <TokenAvatar symbol={symbol} />
+      <div className="min-w-0">
+        <p className="text-sm font-semibold text-slate-950">{symbol}</p>
+        <p className="text-[11px] text-slate-500">{role}</p>
       </div>
     </div>
   )
 }
 
-function aggregate(buckets: ArcTimeseriesBucket[]) {
-  const available = buckets.filter((bucket) => bucket.status === 'available')
-  const sum = (key: MetricKey) => available.reduce((total, bucket) => {
-    const value = bucketValue(bucket, key)
-    return value === null ? total : total + value
-  }, 0)
-  const successful = sum('successfulTransactions')
-  const failed = sum('failedTransactions')
-  const denominator = successful + failed
-  const usdcTransfers = available.some((bucket) => bucketValue(bucket, 'canonicalUsdcTransfers') !== null)
-    ? sum('canonicalUsdcTransfers')
-    : null
-  return {
-    availableHours: available.length,
-    transactions: sum('transactions'),
-    successRate: denominator > 0 ? (successful / denominator) * 100 : null,
-    usdcTransfers,
-  }
+type BorrowMarket = Extract<BorrowMarketState, { status: 'available' }>['markets'][number]
+
+const BORROW_TERM_LABELS = ['Borrow APY', 'Liquidation LTV', 'Utilization', 'Available liquidity'] as const
+
+// Only terms the Borrow Service reports for that market; a missing term is left out, never estimated.
+function borrowTerms(market: BorrowMarket): [string, string][] {
+  const reported: [string, string | null][] = [
+    ['Borrow APY', market.borrowApy !== null ? formatRatioPercent(market.borrowApy) : null],
+    ['Liquidation LTV', market.lltv !== null ? formatRatioPercent(market.lltv) : null],
+    ['Utilization', market.utilization !== null ? formatRatioPercent(market.utilization) : null],
+    ['Available liquidity', market.liquidity ? amountText(market.liquidity.amount, market.liquidity.token) : null],
+  ]
+  return reported.filter((entry): entry is [string, string] => entry[1] !== null)
 }
 
-export default function ArcIntelligenceOverview() {
-  const [window, setWindow] = useState<ArcTimeseriesWindow>('24h')
-  const [state, setState] = useState<LoadState>(initialState)
-
-  const load = useCallback(async (selectedWindow: ArcTimeseriesWindow, refreshing = false) => {
-    const controller = new AbortController()
-    setState((current) => ({ ...current, loading: !current.timeseries, refreshing, error: null }))
-    try {
-      const [timeseries, runtime] = await Promise.allSettled([
-        fetchArcTimeseries(selectedWindow, controller.signal),
-        fetchArcIntelligenceView<ArcIntelligenceRuntime>('runtime', controller.signal),
-      ])
-      if (timeseries.status === 'rejected') throw timeseries.reason
-      setState({
-        timeseries: timeseries.value,
-        runtime: runtime.status === 'fulfilled' ? runtime.value : null,
-        loading: false,
-        refreshing: false,
-        error: null,
-      })
-    } catch (error) {
-      setState((current) => ({
-        ...current,
-        loading: false,
-        refreshing: false,
-        error: error instanceof Error ? error.message : 'Arc Intelligence is temporarily unavailable',
-      }))
-    }
-    return () => controller.abort()
-  }, [])
-
-  useEffect(() => {
-    const controller = new AbortController()
-    setState((current) => ({ ...current, loading: true, error: null }))
-    Promise.allSettled([
-      fetchArcTimeseries(window, controller.signal),
-      fetchArcIntelligenceView<ArcIntelligenceRuntime>('runtime', controller.signal),
-    ]).then(([timeseries, runtime]) => {
-      if (controller.signal.aborted) return
-      if (timeseries.status === 'rejected') {
-        setState((current) => ({
-          ...current,
-          loading: false,
-          error: timeseries.reason instanceof Error ? timeseries.reason.message : 'Arc Intelligence is temporarily unavailable',
-        }))
-        return
-      }
-      setState({
-        timeseries: timeseries.value,
-        runtime: runtime.status === 'fulfilled' ? runtime.value : null,
-        loading: false,
-        refreshing: false,
-        error: null,
-      })
-    })
-    return () => controller.abort()
-  }, [window])
-
-  const series = state.timeseries
-  const totals = useMemo(() => aggregate(series?.buckets ?? []), [series])
-  const expectedHours = series?.coverage.expectedHours ?? (window === '24h' ? 24 : 6)
-  const availableHours = series?.coverage.availableHours ?? 0
-  const verifiedThrough = series?.coverage.verifiedThrough
-  const hasBuckets = Boolean(series?.buckets.length)
-  const hasVerifiedHours = availableHours > 0
-  const catchup = (state.runtime?.lags?.headToChain ?? 0) > 0 || availableHours < expectedHours
-
-  if (state.loading) {
-    return (
-      <Card className="overflow-hidden border-[#dfead8] bg-gradient-to-br from-white to-[#f8faf7]">
-        <div className="animate-pulse space-y-5">
-          <div className="h-5 w-48 rounded bg-slate-200" />
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {Array.from({ length: 4 }).map((_, index) => <div key={index} className="h-24 rounded-2xl bg-slate-100" />)}
-          </div>
-          <div className="grid gap-4 lg:grid-cols-2">
-            <div className="h-72 rounded-2xl bg-slate-100" />
-            <div className="h-72 rounded-2xl bg-slate-100" />
-          </div>
-        </div>
-      </Card>
-    )
-  }
-
-  if (state.error || !series) {
-    return (
-      <Card className="border-amber-200 bg-amber-50">
-        <div className="flex items-start gap-3">
-          <AlertCircle size={20} className="mt-0.5 text-amber-700" />
-          <div>
-            <h3 className="font-semibold text-amber-950">Arc Intelligence is temporarily unavailable</h3>
-            <p className="mt-1 text-sm text-amber-900/80">
-              The dashboard keeps Bridge and Earn usable while network analytics are unavailable.
-            </p>
-            <button
-              type="button"
-              onClick={() => void load(window, true)}
-              className="mt-4 inline-flex items-center gap-2 rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900 hover:bg-amber-50"
-            >
-              <RefreshCw size={13} />
-              Retry
-            </button>
-          </div>
-        </div>
-      </Card>
-    )
-  }
-
+// One read only market record. No control, badge or emphasis: every listed market is shown the same way.
+function BorrowMarketRecord({ market, label, idStatus, termsStatus }: {
+  market: BorrowMarket | null
+  label: string
+  idStatus: DisplayStatus
+  termsStatus: DisplayStatus
+}) {
+  const terms = market ? borrowTerms(market) : []
   return (
-    <Card className="overflow-hidden border-[#dfead8] bg-gradient-to-br from-white via-white to-[#f8faf7]">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div>
-          <div className="inline-flex items-center gap-2 rounded-full bg-[#eef7e8] px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-[#2F6E0C]">
-            <ShieldCheck size={14} />
-            Arc Intelligence
+    <li className="min-w-0 rounded-lg border border-slate-100 bg-[#f8faf7] px-3 py-2">
+      <div {...markerProps('borrow.market-id', idStatus, market?.marketId)} className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-slate-800">{label}</p>
+        {market
+          ? <span title={market.marketId} className="font-mono text-[11px] text-slate-500">{shortenMarketId(market.marketId)}</span>
+          : <ValueGap className="w-20" />}
+      </div>
+      <dl {...markerProps('borrow.market-terms', termsStatus, market?.marketId)} className="mt-1.5 space-y-1">
+        {market && !terms.length && <p className="text-[11px] text-slate-500">Terms are not reported yet</p>}
+        {(market ? terms : BORROW_TERM_LABELS.map((term): [string, string | null] => [term, null])).map(([term, value]) => (
+          <div key={term} className="flex items-baseline justify-between gap-3 text-xs">
+            <dt className="text-slate-500">{term}</dt>
+            <dd className="text-right font-semibold tabular-nums text-slate-950">{value ?? <ValueGap />}</dd>
           </div>
-          <h3 className="mt-3 text-3xl font-bold tracking-tight text-slate-950">Arc Network Activity</h3>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">Verified onchain activity across Arc.</p>
+        ))}
+      </dl>
+    </li>
+  )
+}
+
+function BorrowSection({ borrowMarket }: { borrowMarket: BorrowMarketState }) {
+  const markets = borrowMarket.status === 'available' ? borrowMarket.markets : []
+  const listStatus: DisplayStatus = borrowMarket.status === 'loading' ? 'loading' : markets.length ? 'available' : 'unavailable'
+  const termsStatus: DisplayStatus = listStatus !== 'available' ? listStatus
+    : markets.some((market) => borrowTerms(market).length > 0) ? 'available' : 'unavailable'
+  return (
+    <section data-intel-section="borrow" aria-label="Borrow on Arc" className={CARD}>
+      <CardHeader title="Borrow on Arc" subtitle="Powered by Circle Borrow Kit on Arc" icon={Banknote}
+        right={<span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600">
+          {MAINNET_BORROW_WRITES_ENABLED ? 'Read only here' : 'Preview'}
+        </span>} />
+      <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_1.35fr]">
+        <div {...markerProps('borrow.route', 'available')} className="min-w-0">
+          <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+            <BorrowAsset symbol="cirBTC" role="Collateral" />
+            <span className="flex justify-center text-slate-400">
+              <ArrowDown className="h-4 w-4 sm:hidden" />
+              <ArrowRight className="hidden h-4 w-4 sm:block" />
+            </span>
+            <BorrowAsset symbol="USDC" role="Borrow" />
+          </div>
+          <p className="mt-2 text-[11px] text-slate-500">Deposit cirBTC as collateral and borrow USDC from a Morpho market on Arc.</p>
+        </div>
+        <div {...markerProps('borrow.market-list', listStatus, markets.length || null)} className="min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <p className={LABEL}>Arc cirBTC / USDC markets</p>
+            {listStatus !== 'available' && <InlineStatus status={listStatus} />}
+          </div>
+          <ul className={`mt-1.5 grid gap-2 ${markets.length > 1 ? 'sm:grid-cols-2' : ''}`}>
+            {listStatus === 'available'
+              ? markets.map((market, index) => (
+                <BorrowMarketRecord key={market.marketId} market={market} label={`Market ${index + 1}`} idStatus="available" termsStatus={termsStatus} />
+              ))
+              : <BorrowMarketRecord market={null} label="Market" idStatus={listStatus} termsStatus={listStatus} />}
+          </ul>
+          <p className="mt-1.5 text-[11px] text-slate-400">
+            {listStatus === 'available'
+              ? 'Read only from Circle Borrow Kit. Listed by market ID; the order is not a ranking.'
+              : listStatus === 'loading' ? 'Reading market terms from Circle Borrow Kit' : 'Market terms could not be read right now.'}
+          </p>
+        </div>
+      </div>
+      <div {...markerProps('borrow.action', 'source_pending')} className="mt-4 flex items-start gap-2 rounded-lg border border-dashed border-slate-200 px-3 py-2">
+        <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+        <p className="text-xs text-slate-600">
+          {MAINNET_BORROW_WRITES_ENABLED
+            ? 'Borrowing is not offered from this dashboard.'
+            : 'Preview only. Borrowing from Machina is not enabled yet, so no wallet action is offered here.'}
+        </p>
+      </div>
+    </section>
+  )
+}
+
+function amountText(amount: string, token: string): string | null {
+  const shown = formatDecimalString(amount)
+  return shown === null ? null : `${shown} ${token}`
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Lending
+
+type EventField = { label: string; field: string; dot: string }
+const SUPPLY: EventField = { label: 'Supply', field: 'supplyCount', dot: 'bg-[#2F6E0C]' }
+const WITHDRAW: EventField = { label: 'Withdraw', field: 'withdrawCount', dot: 'bg-[#9CCB7F]' }
+const BORROW: EventField = { label: 'Borrow', field: 'borrowCount', dot: 'bg-amber-400' }
+const REPAY: EventField = { label: 'Repay', field: 'repayCount', dot: 'bg-sky-400' }
+const LIQUIDATIONS: EventField = { label: 'Liquidations', field: 'liquidationCount', dot: 'bg-rose-400' }
+
+function EventCell({ entry, value }: { entry: EventField; value: number | null }) {
+  return (
+    <div className="min-w-0 rounded-lg bg-[#f8faf7] px-2.5 py-1.5">
+      <p className="flex items-center gap-1.5 truncate text-[11px] text-slate-500"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${entry.dot}`} />{entry.label}</p>
+      {value !== null ? <p className="text-base font-semibold tabular-nums text-slate-950">{formatCount(value)}</p> : <p className="pt-1"><ValueGap /></p>}
+    </div>
+  )
+}
+
+// Event mix: real event counts side by side as one bar. Not a volume and not a share of value.
+function EventMix({ fields, family }: { fields: EventField[]; family: FamilyWindow | null }) {
+  const counts = fields.map((entry) => ({ ...entry, count: metricNumber(family, entry.field) }))
+  if (counts.some((entry) => entry.count === null)) return null
+  const total = counts.reduce((sum, entry) => sum + (entry.count ?? 0), 0)
+  return (
+    <div className="mt-3">
+      <p className={LABEL}>Event mix</p>
+      <div className="mt-1 flex h-2 w-full overflow-hidden rounded-full bg-slate-100">
+        {total > 0 && counts.map((entry) => (entry.count ? (
+          <span key={entry.field} data-mix-segment={entry.field} data-mix-count={entry.count} className={entry.dot}
+            style={{ width: `${((entry.count ?? 0) / total) * 100}%` }} />
+        ) : null))}
+      </div>
+      {total === 0 && <p className="mt-1 text-[11px] text-slate-400">No events in this window</p>}
+    </div>
+  )
+}
+
+function TokenFlows({ flows, labels, title = 'Amounts by token' }: { flows: TokenFlow[]; labels: string[]; title?: string }) {
+  const shown = flows.slice(0, 4)
+  return (
+    <div className="mt-3">
+      <p className={LABEL}>{title}</p>
+      {!flows.length ? <p className="mt-1 text-[11px] text-slate-400">No token amounts in this window</p> : (
+        <ul className="mt-1 space-y-1">
+          {shown.map((flow) => (
+            <li key={flow.token} title={flow.token} className="flex items-center justify-between gap-2 rounded-lg border border-slate-100 px-2 py-1.5">
+              <span className="flex shrink-0 items-center gap-1.5">
+                <TokenAvatar symbol={flow.label} size="sm" />
+                <span className="text-xs font-semibold text-slate-800">{flow.label}</span>
+              </span>
+              {flow.decimals === null ? (
+                <span className="text-right text-[11px] text-slate-500">Token details are not verified yet</span>
+              ) : (
+                <span className="flex min-w-0 flex-wrap justify-end gap-x-2 text-right text-[11px] text-slate-500">
+                  {labels.map((label, index) => (
+                    <span key={label}>{label} <span className="font-semibold tabular-nums text-slate-900">{formatFlowAmount(flow, index)}</span></span>
+                  ))}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {flows.length > shown.length && <p className="mt-1 text-[11px] text-slate-400">and {flows.length - shown.length} more tokens</p>}
+    </div>
+  )
+}
+
+function ProtocolCard({ item, cell, title, subtitle, category, children }: {
+  item: string
+  cell: Cell
+  title: string
+  subtitle: string
+  category: string
+  children: ReactNode
+}) {
+  return (
+    <div {...markerProps(item, cell.status, cell.raw)} className={`${CARD} min-w-0`}>
+      <CardHeader title={title} subtitle={subtitle} right={cell.status === 'available' ? <Chip>{category}</Chip> : <StatusPill status={cell.status} />} />
+      {children}
+      {cell.status !== 'available' && cell.note && <p className="mt-3 text-[11px] text-slate-500">{cell.note}</p>}
+    </div>
+  )
+}
+
+function LendingSection({ ctx }: { ctx: ViewContext }) {
+  const aave = ctx.summary?.lending.aaveV4 ?? null
+  const blue = ctx.summary?.lending.morphoBlue ?? null
+  const vaults = ctx.summary?.lending.morphoVaultsV2 ?? null
+  const cards = [
+    {
+      item: 'lending.aave', title: 'Aave', category: 'Lending market', subtitle: `Lending events, last ${ctx.windowLabel}`, family: aave,
+      total: metricSum(aave, AAVE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY], secondary: [LIQUIDATIONS],
+      flows: tokenFlows(objectEntries(aave?.metrics?.reserves).map(([, entry]) => ({ token: entry.underlying, decimals: entry.decimals,
+        amounts: [entry.suppliedRaw, entry.borrowedRaw] }))),
+      flowLabels: ['Supplied', 'Borrowed'],
+    },
+    {
+      item: 'lending.morpho-blue', title: 'Morpho Blue', category: 'Lending market', subtitle: `Market events, last ${ctx.windowLabel}`, family: blue,
+      total: metricSum(blue, MORPHO_BLUE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY],
+      secondary: [{ label: 'Collateral +', field: 'supplyCollateralCount', dot: 'bg-teal-500' }, { label: 'Collateral -', field: 'withdrawCollateralCount', dot: 'bg-teal-200' },
+        LIQUIDATIONS, { label: 'New markets', field: 'marketCreatedCount', dot: 'bg-slate-300' }],
+      flows: tokenFlows(objectEntries(blue?.metrics?.markets).map(([, entry]) => {
+        const unit = (entry.units as { loanToken?: { symbol?: unknown; decimals?: unknown } } | undefined)?.loanToken
+        return { token: entry.loanToken, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry.suppliedRaw, entry.borrowedRaw] }
+      })),
+      flowLabels: ['Supplied', 'Borrowed'],
+    },
+    {
+      item: 'lending.morpho-vaults', title: 'Morpho Vaults', category: 'Vaults', subtitle: `Vault deposits and withdrawals, last ${ctx.windowLabel}`, family: vaults,
+      total: metricSum(vaults, MORPHO_VAULT_ACTIONS),
+      primary: [{ label: 'Deposits', field: 'depositCount', dot: 'bg-[#2F6E0C]' }, { label: 'Withdrawals', field: 'withdrawCount', dot: 'bg-[#9CCB7F]' }],
+      secondary: [] as EventField[],
+      flows: tokenFlows(objectEntries(vaults?.metrics?.vaults).map(([, entry]) => {
+        const unit = (entry.units as { asset?: { symbol?: unknown; decimals?: unknown } } | undefined)?.asset
+        return { token: entry.asset, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry.depositedAssetsRaw, entry.withdrawnAssetsRaw] }
+      })),
+      flowLabels: ['Deposited', 'Withdrawn'],
+    },
+  ]
+  return (
+    <section data-intel-section="lending" aria-label="Lending" className="grid gap-4 lg:grid-cols-3">
+      {cards.map((card) => {
+        const cell = numberCell(ctx, card.family, card.total, formatCount)
+        const available = cell.status === 'available'
+        return (
+          <ProtocolCard key={card.item} item={card.item} cell={cell} title={card.title} subtitle={card.subtitle} category={card.category}>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              {card.primary.map((entry) => <EventCell key={entry.field} entry={entry} value={available ? metricNumber(card.family, entry.field) : null} />)}
+            </div>
+            {card.secondary.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
+                {card.secondary.map((entry) => {
+                  const value = available ? metricNumber(card.family, entry.field) : null
+                  return (
+                    <span key={entry.field} className="inline-flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <span className={`h-1.5 w-1.5 rounded-full ${entry.dot}`} />{entry.label}
+                      {value !== null ? <span className="font-semibold tabular-nums text-slate-900">{formatCount(value)}</span> : <ValueGap className="w-5" />}
+                    </span>
+                  )
+                })}
+              </div>
+            )}
+            {available && <EventMix fields={[...card.primary, ...card.secondary]} family={card.family} />}
+            {available && <TokenFlows flows={card.flows} labels={card.flowLabels} />}
+          </ProtocolCard>
+        )
+      })}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Cross-chain: directions stay separate and are never added into a bridge volume.
+
+type Leg = { cell: Cell; amount: string | null }
+
+function usdcLeg(ctx: ViewContext, family: FamilyWindow | null, countField: string, amountField: string): Leg {
+  const cell = numberCell(ctx, family, metricNumber(family, countField), formatCount)
+  const units = family?.metrics?.units as { decimals?: unknown; symbol?: unknown } | undefined
+  const raw = metricAmount(family, amountField)
+  const amount = cell.status === 'available' && raw !== null && isFiniteNumber(units?.decimals) && typeof units?.symbol === 'string'
+    ? `${formatTokenAmount(raw, units.decimals)} ${units.symbol}` : null
+  return { cell, amount }
+}
+
+const DIRECTION = {
+  out: { icon: ArrowUpRight, tone: 'bg-[#eef7e8] text-[#2F6E0C]', bar: 'bg-[#2F6E0C]' },
+  in: { icon: ArrowDownLeft, tone: 'bg-sky-50 text-sky-700', bar: 'bg-sky-400' },
+}
+
+function DirectionIcon({ direction }: { direction: 'out' | 'in' }) {
+  const { icon: Icon, tone } = DIRECTION[direction]
+  return <span className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${tone}`}><Icon className="h-3.5 w-3.5" /></span>
+}
+
+function DirectionRow({ direction, label, detail, leg, max }: { direction: 'out' | 'in'; label: string; detail: string; leg: Leg; max: number }) {
+  const available = leg.cell.status === 'available'
+  return (
+    <div className="py-2">
+      <div className="flex items-center justify-between gap-3">
+        <p className="flex min-w-0 items-center gap-2">
+          <DirectionIcon direction={direction} />
+          <span className="min-w-0">
+            <span className="block text-sm font-medium text-slate-800">{label}</span>
+            <span className="block text-[11px] text-slate-400">{detail}</span>
+          </span>
+        </p>
+        {available
+          ? <p className="shrink-0 text-right text-sm font-semibold tabular-nums text-slate-950">{leg.cell.text} <span className="text-[11px] font-normal text-slate-500">transfers</span></p>
+          : <ValueGap />}
+      </div>
+      <div className="mt-1.5"><ActivityBar value={available ? Number(leg.cell.raw) : null} max={max} barClass={DIRECTION[direction].bar} /></div>
+      {available && <p className="mt-1 text-right text-xs tabular-nums text-slate-500">{leg.amount ?? 'Amount not verified'}</p>}
+    </div>
+  )
+}
+
+function LegCell({ label, direction, leg }: { label: string; direction?: 'out' | 'in'; leg: Leg }) {
+  const available = leg.cell.status === 'available'
+  return (
+    <div className="min-w-0 rounded-lg bg-[#f8faf7] px-2.5 py-2">
+      <p className="flex items-center gap-1.5 text-[11px] text-slate-500">{direction && <DirectionIcon direction={direction} />}{label}</p>
+      {available ? (
+        <>
+          <p className="mt-0.5 text-base font-semibold tabular-nums text-slate-950">{leg.cell.text}<span className="ml-1 text-[11px] font-normal text-slate-500">transfers</span></p>
+          <p className="truncate text-[11px] tabular-nums text-slate-500">{leg.amount ?? 'Amount not verified'}</p>
+        </>
+      ) : <p className="pt-1.5"><ValueGap /></p>}
+    </div>
+  )
+}
+
+function CrossChainSection({ ctx }: { ctx: ViewContext }) {
+  const cctp = ctx.summary?.crossChain.cctp ?? null
+  const gateway = ctx.summary?.crossChain.gateway ?? null
+  const across = ctx.summary?.crossChain.across ?? null
+  const cctpCell = numberCell(ctx, cctp, metricSum(cctp, ['outboundTransferCount', 'inboundMintCount']), formatCount)
+  const gatewayCell = numberCell(ctx, gateway, metricSum(gateway, ['depositCount', 'outboundBurnCount', 'inboundMintCount', 'withdrawalCompletedCount']), formatCount)
+  const acrossCell = numberCell(ctx, across, metricSum(across, ['depositCount', 'fillCount']), formatCount)
+  const outbound = usdcLeg(ctx, cctp, 'outboundTransferCount', 'outboundAmountRaw')
+  const inbound = usdcLeg(ctx, cctp, 'inboundMintCount', 'inboundAmountRaw')
+  const cctpMax = Math.max(0, ...[outbound, inbound].map((leg) => (leg.cell.status === 'available' ? Number(leg.cell.raw) : 0)))
+  const acrossFlows = (field: string, amountField: string) => tokenFlows(objectEntries(across?.metrics?.[field]).map(([token, entry]) => {
+    const unit = entry.units as { symbol?: unknown; decimals?: unknown } | undefined
+    return { token, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry[amountField]] }
+  }))
+  const acrossLegs = [
+    { key: 'deposits', direction: 'out' as const, label: 'Deposits from Arc', cell: numberCell(ctx, across, metricNumber(across, 'depositCount'), formatCount),
+      flows: acrossFlows('depositByToken', 'inputAmountRaw'), title: 'Deposited by token' },
+    { key: 'fills', direction: 'in' as const, label: 'Fills on Arc', cell: numberCell(ctx, across, metricNumber(across, 'fillCount'), formatCount),
+      flows: acrossFlows('fillByToken', 'outputAmountRaw'), title: 'Filled by token' },
+  ]
+  return (
+    <section data-intel-section="cross-chain" aria-label="Cross-chain" className="grid gap-4 lg:grid-cols-3">
+      <ProtocolCard item="cross-chain.cctp" cell={cctpCell} title="CCTP" subtitle={`USDC transfers to and from Arc, last ${ctx.windowLabel}`} category="USDC bridge">
+        <div className="mt-2 divide-y divide-slate-100">
+          <DirectionRow direction="out" label="Outbound" detail="From Arc to other chains" leg={outbound} max={cctpMax} />
+          <DirectionRow direction="in" label="Inbound" detail="From other chains to Arc" leg={inbound} max={cctpMax} />
+        </div>
+        <p className="mt-1 text-[11px] leading-4 text-slate-400">Directions are shown separately and are never added together.</p>
+      </ProtocolCard>
+      <ProtocolCard item="cross-chain.gateway" cell={gatewayCell} title="Gateway" subtitle={`Unified USDC balance activity on Arc, last ${ctx.windowLabel}`} category="Unified balance">
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <LegCell label="Deposit" leg={usdcLeg(ctx, gateway, 'depositCount', 'depositAmountRaw')} />
+          <LegCell label="Sent" direction="out" leg={usdcLeg(ctx, gateway, 'outboundBurnCount', 'outboundBurnAmountRaw')} />
+          <LegCell label="Received" direction="in" leg={usdcLeg(ctx, gateway, 'inboundMintCount', 'inboundMintAmountRaw')} />
+          <LegCell label="Withdraw" leg={usdcLeg(ctx, gateway, 'withdrawalCompletedCount', 'withdrawalAmountRaw')} />
+        </div>
+      </ProtocolCard>
+      <ProtocolCard item="cross-chain.across" cell={acrossCell} title="Across" subtitle={`Bridge deposits and fills on Arc, last ${ctx.windowLabel}`} category="Bridge">
+        <div className="mt-3 space-y-2">
+          {acrossLegs.map((leg) => (
+            <div key={leg.key} className="rounded-lg border border-slate-100 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <p className="flex min-w-0 items-center gap-2"><DirectionIcon direction={leg.direction} /><span className="text-sm font-medium text-slate-800">{leg.label}</span></p>
+                {leg.cell.status === 'available'
+                  ? <p className="shrink-0 text-sm font-semibold tabular-nums text-slate-950">{leg.cell.text}</p>
+                  : <ValueGap />}
+              </div>
+              {leg.cell.status === 'available' && <TokenFlows flows={leg.flows} labels={['Amount']} title={leg.title} />}
+            </div>
+          ))}
+        </div>
+      </ProtocolCard>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Ecosystem
+
+const ECOSYSTEM_SLOTS = [
+  { item: 'rwa-other.other-protocols', icon: Radar, title: 'Verified Arc protocol activity', detail: 'Activity of further verified Arc protocols' },
+  { item: 'rwa-other.exchange-flows', icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },
+  { item: 'rwa-other.more-protocols', icon: Layers, title: 'Other verified Arc protocols', detail: 'New sources as they are verified' },
+]
+
+function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
+  const verified = ctx.summary?.assets.verifiedAssets ?? null
+  const status = liveStatus(ctx, verified)
+  const items = verifiedAssetItems(verified)
+  const usycEntry = items?.find((entry) => entry.symbol === 'USYC')
+  const usyc = usycEntry && usycEntry.transferCount + usycEntry.mintCount + usycEntry.burnCount > 0 ? usycEntry : undefined
+  const shown: DisplayStatus = status === 'available' && !items ? 'unavailable' : status
+  return (
+    <section data-intel-section="rwa-other" aria-label="RWA and Other Verified Protocols" className="grid gap-4 lg:grid-cols-2">
+      <div {...markerProps('rwa-other.rwa', shown, shown === 'available' ? usyc?.transferCount ?? 0 : null)} className={`${CARD} min-w-0`}>
+        <CardHeader title="RWA" subtitle={`Tokenized real-world assets on Arc, last ${ctx.windowLabel}`} icon={Building2}
+          right={shown !== 'available' ? <StatusPill status={shown} /> : undefined} />
+        <div className="mt-3 rounded-xl border border-slate-100 bg-[#f8faf7] p-3">
+          <div className="flex items-center gap-3">
+            <TokenAvatar symbol="USYC" />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-slate-950">USYC</p>
+              <p className="mt-0.5 flex flex-wrap gap-1"><Chip tone={toneFor('USYC')}>Tokenized fund</Chip><Chip>RWA</Chip></p>
+            </div>
+          </div>
+          {shown !== 'available' ? (
+            <p className="mt-2 text-xs text-slate-500">{noteFor(ctx, shown)}</p>
+          ) : usyc ? (
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {([['Transfers', formatCount(usyc.transferCount)], ['Mints', formatCount(usyc.mintCount)], ['Burns', formatCount(usyc.burnCount)],
+                ['Amount moved', `${formatAmount(usyc.amountRaw, usyc.decimals)} USYC`]] as const).map(([label, value]) => (
+                <div key={label} className="min-w-0 rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-slate-100">
+                  <p className="text-[11px] text-slate-500">{label}</p>
+                  <p className="truncate text-sm font-semibold tabular-nums text-slate-950">{value}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-slate-500">No verified transfers in this window</p>
+          )}
+          <p className="mt-2 text-[11px] text-slate-400">Amounts are in token units, not USD.</p>
+        </div>
+      </div>
+      <div className={`${CARD} min-w-0`}>
+        <CardHeader title="Other Verified Protocols" subtitle="Permanent places for further verified Arc sources" right={<StatusPill status="source_pending" />} />
+        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+          {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => (
+            <div key={item} {...markerProps(item, 'source_pending')} className="min-w-0 rounded-lg border border-dashed border-slate-200 px-3 py-2.5">
+              <Icon className="h-4 w-4 text-slate-400" />
+              <p className="mt-1.5 text-xs font-semibold text-slate-700">{title}</p>
+              <p className="text-[11px] leading-4 text-slate-500">{detail}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Dashboard (pure: renders from props only) and the data-loading wrapper.
+
+export type ArcIntelligenceDashboardProps = {
+  selectedWindow: ArcIntelligenceWindow
+  // Load result of the selected window; null while its first load runs (or for a window that is never requested).
+  data: ArcIntelligenceLoad | null
+  refreshing?: boolean
+  lastVerifiedThrough?: string | null
+  onWindowChange?: (window: ArcIntelligenceWindow) => void
+  onRefresh?: () => void
+  // Read only Borrow Kit market for the Borrow card; not tied to the selected window.
+  borrowMarket?: BorrowMarketState
+  initialDexView?: 'volume' | 'swaps'
+}
+
+export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = false, lastVerifiedThrough = null, onWindowChange,
+  onRefresh, borrowMarket = { status: 'loading' }, initialDexView = 'volume' }: ArcIntelligenceDashboardProps) {
+  const windowLabel = ARC_INTELLIGENCE_WINDOWS.find((entry) => entry.id === selectedWindow)?.label ?? selectedWindow
+  const supported = ARC_INTELLIGENCE_BACKEND_WINDOWS[selectedWindow]
+  const loaded = supported && data && data.window === selectedWindow ? data : null
+  const mode: Mode = !supported ? 'history' : !loaded ? 'loading' : loaded.failed || !loaded.summary ? 'failed' : 'ready'
+  const summary = mode === 'ready' ? loaded?.summary ?? null : null
+  const timeseries = mode === 'ready' ? loaded?.timeseries ?? null : null
+  const windowHours = summary?.window.hours ?? 24
+  const storedHours = summary ? Math.min(summary.coverage.storedHours, windowHours) : 0
+  const progress = mode === 'ready' && storedHours > 0 && storedHours < windowHours ? ` (${storedHours} of ${windowHours} hours so far)` : ''
+  const days = selectedWindow === '30d' ? 30 : 7
+  const historyNote = `The ${windowLabel} view fills in once ${days} full days of verified history are stored.`
+  const ctx: ViewContext = { mode, windowLabel, period: supported ? 'hour' : 'day', historyNote, summary, timeseries,
+    collectingNote: 'History is still being collected' }
+  const verifiedThrough = summary?.freshness.verifiedThrough ?? timeseries?.freshness.verifiedThrough ?? lastVerifiedThrough
+  const networkCollecting = mode === 'ready' && windowStatus(summary?.network) === 'collecting'
+
+  const header = (
+    <>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2.5">
+            <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#eef7e8] text-[#2F6E0C]">
+              <Activity className="h-5 w-5" />
+            </span>
+            <h2 className="text-xl font-bold tracking-tight text-slate-950">Arc Intelligence</h2>
+          </div>
+          <p className="mt-1.5 text-sm text-slate-500">Verified Arc network activity</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {(['6h', '24h'] as const).map((item) => (
-            <button
-              key={item}
-              type="button"
-              onClick={() => setWindow(item)}
-              className={`rounded-xl px-3 py-2 text-xs font-semibold transition-colors ${
-                window === item ? 'bg-[#2F6E0C] text-white' : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-              }`}
-            >
-              {item.toUpperCase()}
-            </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => void load(window, true)}
-            disabled={state.refreshing}
-            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60"
-          >
-            <RefreshCw size={13} className={state.refreshing ? 'animate-spin' : ''} />
+          <div role="tablist" aria-label="Time window" className="flex gap-1.5">
+            {ARC_INTELLIGENCE_WINDOWS.map((entry) => (
+              <TabButton key={entry.id} selected={entry.id === selectedWindow} onClick={() => onWindowChange?.(entry.id)}
+                marker={markerProps(`window.${entry.id}`, ARC_INTELLIGENCE_BACKEND_WINDOWS[entry.id] ? 'available' : 'collecting')}>
+                {entry.label}
+              </TabButton>
+            ))}
+          </div>
+          <button type="button" onClick={onRefresh} disabled={!supported || refreshing}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             Refresh
           </button>
         </div>
       </div>
-
-      {!hasBuckets || !hasVerifiedHours ? (
-        <div className="mt-6 rounded-3xl border border-slate-200 bg-white p-8 text-center">
-          <Activity size={36} className="mx-auto text-slate-300" />
-          <h4 className="mt-4 text-lg font-semibold text-slate-950">Verified historical activity is still being prepared.</h4>
-          <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-500">
-            Charts will appear after complete hourly evidence is available. Missing hours are kept as gaps instead of zero activity.
-          </p>
-        </div>
-      ) : (
-        <>
-          <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <MetricCard label="Transactions" value={formatCount(totals.transactions)} note={`${availableHours} verified hour${availableHours === 1 ? '' : 's'}`} />
-            <MetricCard label="Active Addresses" value={formatCount(series?.summary?.uniqueActiveAddresses)} note="Unique across verified hours" />
-            <MetricCard label="Success Rate" value={formatPercent(totals.successRate)} note="Verified successes and failures" />
-            {totals.usdcTransfers !== null && (
-              <MetricCard label="USDC Transfers" value={formatCount(totals.usdcTransfers)} note="Canonical verified count" />
-            )}
-          </div>
-
-          <div className="mt-6 grid gap-4 xl:grid-cols-2">
-            <LineChart title="Transactions over time" buckets={series.buckets} metric="transactions" />
-            <LineChart title="Active addresses over time" buckets={series.buckets} metric="activeAddresses" color="#0f766e" />
-            {series.buckets.some((bucket) => bucketValue(bucket, 'canonicalUsdcTransfers') !== null) && (
-              <LineChart title="USDC transfers over time" buckets={series.buckets} metric="canonicalUsdcTransfers" color="#2563eb" />
-            )}
-          </div>
-        </>
+      <p className="text-xs text-slate-500">
+        {verifiedThrough ? <>Verified through <span className="font-semibold text-slate-700">{formatUtcDateTime(verifiedThrough)}</span></> : 'Verified data, updated every hour'}
+      </p>
+      {mode === 'history' && (
+        <Banner tone="info">History is still being collected. {historyNote}</Banner>
       )}
+      {mode === 'failed' && <Banner tone="warn">Arc Intelligence data could not be loaded right now. The layout stays in place; try Refresh in a moment.</Banner>}
+      {networkCollecting && (
+        <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the hourly charts already show each verified hour.</Banner>
+      )}
+      {mode === 'ready' && summary?.freshness.stale && <Banner tone="warn">Updates are delayed. The latest verified hour is older than usual.</Banner>}
+    </>
+  )
 
-      <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-4">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h4 className="font-semibold text-slate-950">Data coverage</h4>
-            <p className="mt-1 text-sm text-slate-500">
-              {availableHours} of {expectedHours} hours verified{verifiedThrough ? ` · Verified through ${formatTimestamp(verifiedThrough)}` : ''}
-            </p>
-          </div>
-          {catchup && (
-            <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
-              Indexer is catching up. Charts include only verified hours.
-            </span>
-          )}
-        </div>
+  return (
+    <div data-arc-intelligence="" className="space-y-4 rounded-3xl border border-[#dfead8] bg-[#f8faf7] p-4 sm:p-6">
+      <NetworkSection ctx={ctx} header={header} />
+      <div className="grid gap-4 lg:grid-cols-5">
+        <VolumeChartSection ctx={ctx} initialView={initialDexView} />
+        <ActiveAddressesChartSection ctx={ctx} />
       </div>
-    </Card>
+      <GroupHeader title="Markets" />
+      <div className="grid gap-4 lg:grid-cols-3">
+        <TopProtocolsSection ctx={ctx} />
+        <TopPoolsSection ctx={ctx} version="v3" />
+        <TopPoolsSection ctx={ctx} version="v4" />
+      </div>
+      <GroupHeader title="Recent Activity" />
+      <RecentActivitySection ctx={ctx} />
+      <GroupHeader title="Assets" icon={Coins} />
+      <AssetsSection ctx={ctx} />
+      <GroupHeader title="New Token Launches" icon={Rocket} />
+      <LaunchesSection ctx={ctx} />
+      <GroupHeader title="Borrow" icon={Banknote} />
+      <BorrowSection borrowMarket={borrowMarket} />
+      <GroupHeader title="Lending" icon={Landmark} />
+      <LendingSection ctx={ctx} />
+      <GroupHeader title="Cross-chain" icon={ArrowLeftRight} />
+      <CrossChainSection ctx={ctx} />
+      <GroupHeader title="Ecosystem" icon={Building2} />
+      <RwaOtherSection ctx={ctx} />
+    </div>
+  )
+}
+
+export default function ArcIntelligenceOverview() {
+  const [selectedWindow, setSelectedWindow] = useState<ArcIntelligenceWindow>('24h')
+  const [loads, setLoads] = useState<Partial<Record<ArcIntelligenceWindow, ArcIntelligenceLoad>>>({})
+  const [refreshing, setRefreshing] = useState(false)
+  const [borrowMarket, setBorrowMarket] = useState<BorrowMarketState>({ status: 'loading' })
+  const controller = useRef<AbortController | null>(null)
+
+  // Only windows the API can answer are ever requested; 7D and 30D render their collecting state without a request.
+  const load = useCallback(async (target: ArcIntelligenceWindow) => {
+    if (!ARC_INTELLIGENCE_BACKEND_WINDOWS[target]) return
+    controller.current?.abort()
+    const current = new AbortController()
+    controller.current = current
+    setRefreshing(true)
+    const result = await loadArcIntelligence(target, { signal: current.signal })
+    if (current.signal.aborted) return
+    setLoads((previous) => ({ ...previous, [target]: result }))
+    setRefreshing(false)
+  }, [])
+
+  useEffect(() => {
+    if (!loads[selectedWindow]) void load(selectedWindow)
+  }, [selectedWindow])
+
+  useEffect(() => () => controller.current?.abort(), [])
+
+  // Borrow card: one read only market listing through the existing Borrow Kit boundary. No wallet, no write.
+  useEffect(() => {
+    let active = true
+    void loadArcBorrowMarkets().then((state) => {
+      if (active) setBorrowMarket(state)
+    })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const lastVerifiedThrough = Object.values(loads).map((entry) => entry?.summary?.freshness.verifiedThrough ?? null)
+    .filter((value): value is string => Boolean(value)).sort().pop() ?? null
+
+  return (
+    <ArcIntelligenceDashboard
+      selectedWindow={selectedWindow}
+      data={loads[selectedWindow] ?? null}
+      refreshing={refreshing}
+      lastVerifiedThrough={lastVerifiedThrough}
+      onWindowChange={setSelectedWindow}
+      onRefresh={() => void load(selectedWindow)}
+      borrowMarket={borrowMarket}
+    />
   )
 }
