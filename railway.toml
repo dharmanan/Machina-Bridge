@@ -2,7 +2,7 @@
 # the in-process scheduler indexes checkpoint + 1 hour on its own, with or without HTTP traffic.
 [build]
 builder = "RAILPACK"
-buildCommand = "node --check scripts/serve-compact-intelligence.mjs && node --check scripts/run-compact-hour.mjs && node --check server/compact/read-model.js && node --check server/compact/http.js && node --check server/compact/scheduler.js && node --input-type=module -e \"await import('./scripts/serve-compact-intelligence.mjs')\""
+buildCommand = "node --check scripts/serve-compact-intelligence.mjs && node --check scripts/run-compact-hour.mjs && node --check server/compact/read-model.js && node --check server/compact/http.js && node --check server/compact/scheduler.js"
 
 [deploy]
 startCommand = "exec node --max-old-space-size=128 scripts/serve-compact-intelligence.mjs"
