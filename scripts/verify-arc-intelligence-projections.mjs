@@ -3,9 +3,11 @@
 // node:sqlite tests run when the runtime has it (Node 22.13+); COMPACT_REQUIRE_SQLITE=1 turns its absence into a failure.
 // COMPACT_SQLITE_DIR (optional) is where the temporary database directory is created; it is deleted afterwards.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { normalizeLog } from '../api/_lib/arc-intelligence/normalize.js';
 import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
 import { USDC_ERC20_ADDRESS } from '../api/_lib/arc-intelligence/usdc.js';
@@ -14,20 +16,22 @@ import { processHour } from '../server/compact/hour.js';
 import { LogError } from '../server/compact/logs.js';
 import { createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_V4_HOOKS, syntheticV4PoolKey } from '../server/compact/offline.js';
 import {
-  backfillProjectionHour, formatPlan, planProjectionBackfill, planV4Registry, PROJECTION_BACKFILL_STREAMS, readBackfillInputs,
-  runProjectionBackfill, validateBackfillLogs, verifyStoredBoundaries,
+  backfillProjectionHour, formatPlan, planProjectionBackfill, planProjectionRepair, planV4Registry, PROJECTION_BACKFILL_STREAMS,
+  readBackfillInputs, runProjectionBackfill, validateBackfillLogs, verifyStoredBoundaries,
 } from '../server/compact/projection-backfill.js';
 import {
   activityOrder, ACTIVITY_ROWS_PER_KIND, createProjectionSink, newestActivity, POOL_HOUR_RETENTION_HOURS, poolHourCutoff, PROJECTION_VERSIONS,
-  PROJECTIONS, reconcilePoolRows, v4PoolIdOf, v4PoolRecordOf, validV4Record,
+  projectionRepairState, PROJECTIONS, reconcilePoolRows, v4PoolIdOf, v4PoolRecordOf, validV4Record,
 } from '../server/compact/projections.js';
 import { ARC_CHAIN_ID, createProvider } from '../server/compact/provider.js';
 import {
   bootstrapV3Registry, bootstrapV4Registry, catchUpV4Registry, locateDeploymentBlock, registrySnapshot, v4RegistryScanRequests,
 } from '../server/compact/registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_STREAMS, FAMILY_VERSIONS, LOG_STREAMS, V4_INITIALIZE_STREAM } from '../server/compact/sources.js';
+import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createCompactStore } from '../server/compact/store.js';
 import { backfillConfig, runBackfillTool } from './backfill-compact-projections.mjs';
+import { repairConfig, repairProjectionHour } from './repair-compact-projection-hour.mjs';
 import { runCompactHour } from './run-compact-hour.mjs';
 
 let passed = 0;
@@ -387,9 +391,13 @@ await test('projections are not a compact family: no family version, field, stre
   assert(!LOG_STREAMS.some((stream) => stream.key === V4_INITIALIZE_STREAM.key), 'the registry stream is never requested by the hour');
   assert(!JSON.stringify(LIVE.network).includes('projection'));
   assert.equal(COMPACT_DEFINITION_VERSION, 'arc-compact-hour-v2', 'the hour definition is unchanged');
-  for (const file of ['../server/compact/read-model.js', '../server/compact/scheduler.js']) {
-    assert(!(await readFile(new URL(file, import.meta.url), 'utf8')).includes('projection'), `${file} never sees projections`);
-  }
+  // The read model and scheduler know projections only for the projection-only self-heal, never in family repair.
+  const readModel = await readFile(new URL('../server/compact/read-model.js', import.meta.url), 'utf8');
+  assert(!readModel.match(/availableFamilies: `([^`]*)`/)[1].includes('projection'), 'family repair candidates never look at projections');
+  assert(!readModel.match(/const TABLES = Object\.freeze\(\[([^\]]*)\]/)[1].includes('projection'), 'projection tables are not in the family schema check');
+  const scheduler = await readFile(new URL('../server/compact/scheduler.js', import.meta.url), 'utf8');
+  assert.match(scheduler, /runChild\(candidate, 'repair'\)/, 'family repair runs the hour runner');
+  assert.match(scheduler, /runChild\(projectionHour, 'projection_repair', runProjectionRepair\)/, 'projection repair runs only the projection-only child');
   const runner = await readFile(new URL('./run-compact-hour.mjs', import.meta.url), 'utf8');
   assert(/unavailableStored = \[\.\.\.stored\.filter/.test(runner) && /summary\.ok = unavailable\.length === 0/.test(runner),
     'the runner repairs and fails on families only');
@@ -574,6 +582,112 @@ await test('backfill CLI: dry run by default; writes need an execute flag and CO
 
 // ---------------------------------------------------------------------------------------------------------------------
 // SQLite store (built-in node:sqlite, Node 22.13+). Temporary files only, deleted at the end.
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Projection-only self-heal (Phase 1A.1): the repair rule, the single-hour plan, the streams it fetches, the strict child.
+
+const AVAILABLE_FAMILIES = { uniswapV3: 'available', uniswapV4: 'available' };
+const REPAIR_COVERAGE = { uniswap_v3_pools: { through: 1999 }, uniswap_v4_pools: { through: 999 } };
+const repairState = (projections, families = AVAILABLE_FAMILIES, coverage = REPAIR_COVERAGE) => projectionRepairState({ families, projections,
+  firstBlock: 1000, lastBlock: 1999, coverage });
+const ELIGIBLE = (state) => ({ state, repair: 'eligible', blocker: null });
+const NONE = (state) => ({ state, repair: 'none', blocker: null });
+const LIVE_ONLY = (state) => ({ state, repair: 'none', blocker: null, reason: 'live_only' });
+
+await test('repair rule: a missing or unavailable pool projection with an available family is eligible; nothing else is', async () => {
+  assert.deepEqual(repairState({ uniswap_v3_pools: 'available', uniswap_v4_pools: 'available', dex_activity: 'available' }),
+    { uniswap_v3_pools: NONE('available'), uniswap_v4_pools: NONE('available'), dex_activity: NONE('available') }, 'available is never a candidate');
+  assert.deepEqual(repairState({}), { uniswap_v3_pools: ELIGIBLE('missing'), uniswap_v4_pools: ELIGIBLE('missing'), dex_activity: LIVE_ONLY('missing') },
+    'missing is a candidate');
+  assert.deepEqual(repairState({ uniswap_v3_pools: 'unavailable', uniswap_v4_pools: 'unavailable', dex_activity: 'unavailable' }),
+    { uniswap_v3_pools: ELIGIBLE('unavailable'), uniswap_v4_pools: ELIGIBLE('unavailable'), dex_activity: LIVE_ONLY('unavailable') }, 'unavailable is a candidate');
+  assert.deepEqual(repairState({ uniswap_v3_pools: 'unavailable' }, { uniswapV3: 'unavailable', uniswapV4: null }),
+    { uniswap_v3_pools: NONE('family_unavailable'), uniswap_v4_pools: NONE('family_unavailable'), dex_activity: LIVE_ONLY('missing') },
+    'a projection whose family is unavailable (or not stored) is never retried');
+  const activityOnly = repairState({ uniswap_v3_pools: 'available', uniswap_v4_pools: 'available' });
+  assert.deepEqual([activityOnly.uniswap_v3_pools.repair, activityOnly.uniswap_v4_pools.repair, activityOnly.dex_activity], ['none', 'none',
+    LIVE_ONLY('missing')], 'missing historical activity alone is never a candidate');
+});
+
+await test('repair rule: a registry that is missing or behind blocks the repair; it is never bootstrapped', async () => {
+  const blocked = (coverage) => { const out = repairState({}, AVAILABLE_FAMILIES, coverage); return [out.uniswap_v3_pools, out.uniswap_v4_pools]; };
+  assert.deepEqual(blocked({ uniswap_v3_pools: null, uniswap_v4_pools: null }), [{ state: 'missing', repair: 'blocked', blocker: 'v3_registry_missing' },
+    { state: 'missing', repair: 'blocked', blocker: 'v4_registry_missing' }]);
+  assert.deepEqual(blocked({ uniswap_v3_pools: { through: 1998 }, uniswap_v4_pools: { through: 998 } }).map((entry) => entry.blocker),
+    ['v3_registry_behind', 'v4_registry_behind']);
+  assert.deepEqual(blocked({ uniswap_v3_pools: { through: 1999 }, uniswap_v4_pools: { through: 999 } }).map((entry) => entry.repair), ['eligible', 'eligible'],
+    'V3 through the last block, V4 through the block before the hour');
+  assert.deepEqual(blocked({ uniswap_v3_pools: { through: 9000 }, uniswap_v4_pools: { through: 9000 } }).map((entry) => entry.repair), ['eligible', 'eligible']);
+});
+
+await test('single-hour repair plan: only the needed projections, inside pool-hour retention, never activity', async () => {
+  const hour = (projections, families = { uniswapV3: { status: 'available' }, uniswapV4: { status: 'available' } }) => ({ hourStart: HOUR,
+    firstBlock: 1000, lastBlock: 1999, families, projections });
+  const input = (h, newestHour = HOUR) => ({ hour: h, newestHour, v3Coverage: { through: 1999 }, v4Coverage: { through: 999 } });
+  assert.deepEqual(planProjectionRepair({ ...input(null) }).reason, 'hour_missing');
+  assert.equal(planProjectionRepair(input(hour({}), HOUR + POOL_HOUR_RETENTION_HOURS * 3600)).reason, 'outside_retention');
+  assert.deepEqual(planProjectionRepair(input(hour({}), HOUR + (POOL_HOUR_RETENTION_HOURS - 1) * 3600)).needs,
+    { uniswap_v3_pools: true, uniswap_v4_pools: true });
+  assert.deepEqual(planProjectionRepair(input(hour({ uniswap_v4_pools: 'available' }))).needs, { uniswap_v3_pools: true }, 'only V3');
+  assert.deepEqual(planProjectionRepair(input(hour({ uniswap_v3_pools: 'available', dex_activity: 'unavailable' }))).needs, { uniswap_v4_pools: true },
+    'only V4; activity is never a need');
+  const behind = planProjectionRepair({ ...input(hour({ uniswap_v3_pools: 'available' })), v4Coverage: { through: 500 } });
+  assert.deepEqual([behind.needs, behind.blocked], [{}, { uniswap_v4_pools: 'v4_registry_behind' }]);
+});
+
+async function recordedRepairStreams(needs) {
+  const chain = chainOf();
+  const filters = [];
+  const provider = offlineProvider(async (url, init) => {
+    for (const item of [].concat(JSON.parse(init.body))) if (item.method === 'eth_getLogs') filters.push(item.params[0]);
+    return chain.fetchImpl(url, init);
+  });
+  const out = await backfillProjectionHour({ provider, hour: liveHourInput(needs), v3Pools: V3.pools });
+  return { out, filters, calls: provider.stats.calls };
+}
+const chunks = Math.ceil((LIVE.range.lastBlock - LIVE.range.firstBlock + 1) / 500);
+
+await test('single-hour repair fetches only v3Pools when only V3 is needed', async () => {
+  const { out, filters, calls } = await recordedRepairStreams({ uniswap_v3_pools: true });
+  assert.deepEqual(out.uniswap_v3_pools, LIVE.projections.uniswap_v3_pools);
+  assert.deepEqual(calls, { eth_chainId: 1, eth_getLogs: chunks });
+  assert(filters.every((filter) => filter.address === undefined && JSON.stringify(filter.topics) === JSON.stringify([[T.v3Swap, T.v3Mint, T.v3Burn]])));
+  assert(filters.every((filter) => Number(BigInt(filter.toBlock)) - Number(BigInt(filter.fromBlock)) < 500), '500-block ranges');
+});
+
+await test('single-hour repair fetches only v4 when only V4 is needed', async () => {
+  const { out, filters, calls } = await recordedRepairStreams({ uniswap_v4_pools: true });
+  assert.deepEqual(out.uniswap_v4_pools, LIVE.projections.uniswap_v4_pools);
+  assert.deepEqual(calls, { eth_chainId: 1, eth_getLogs: chunks });
+  assert(filters.every((filter) => JSON.stringify(filter.address) === JSON.stringify([PM])
+    && JSON.stringify(filter.topics) === JSON.stringify([[T.v4Initialize, T.v4Swap, T.v4ModifyLiquidity]])));
+});
+
+await test('repair child: strict arguments (exactly one UTC hour, no flags, no bulk mode); never processHour, the spine or receipts', async () => {
+  const env = { COMPACT_SQLITE_PATH: '/data/arc-compact.sqlite' };
+  assert.deepEqual(repairConfig({ argv: ['2026-10-01T07:00:00.000Z'], env }), { hourStart: Date.parse('2026-10-01T07:00:00.000Z') / 1000,
+    sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000 });
+  const refused = (argv, environment, code) => assert.throws(() => repairConfig({ argv, env: environment }), (error) => error.code === code, code);
+  refused([], env, 'exactly_one_hour_required');
+  refused(['2026-10-01T07:00:00.000Z', '2026-10-01T08:00:00.000Z'], env, 'exactly_one_hour_required');
+  refused(['--execute-backfill'], env, 'invalid_hour');
+  refused(['2026-10-01T07:00:00Z'], env, 'invalid_hour');
+  refused(['2026-10-01T07:30:00.000Z'], env, 'invalid_hour');
+  refused(['2026-10-01T07:00:00.000Z'], {}, 'sqlite_path_required');
+  refused(['2026-10-01T07:00:00.000Z'], { ...env, COMPACT_RPC_MIN_INTERVAL_MS: '100' }, 'unsafe_rpc_pacing');
+  const script = fileURLToPath(new URL('./repair-compact-projection-hour.mjs', import.meta.url));
+  for (const [argv, expected] of [[[], 'RESULT FAIL exactly_one_hour_required'], [['--all'], 'RESULT FAIL invalid_hour']]) {
+    const run = spawnSync(process.execPath, [script, ...argv], { env: { PATH: process.env.PATH, ...env }, encoding: 'utf8', timeout: 20_000 });
+    assert.deepEqual([run.status, run.stdout.trim()], [1, expected], run.stderr);
+  }
+  const repairSource = await readFile(new URL('./repair-compact-projection-hour.mjs', import.meta.url), 'utf8');
+  const backfillSource = await readFile(new URL('../server/compact/projection-backfill.js', import.meta.url), 'utf8');
+  for (const text of [repairSource, backfillSource]) {
+    assert.doesNotMatch(text, /processHour\(|processBlockRange\(|spineWindows|hour\.js'|eth_getTransactionReceipt|eth_getBlockReceipts|\[hex\([^)]*\), true\]/);
+  }
+  assert.doesNotMatch(repairSource, /--execute|COMPACT_PROJECTION_EXECUTE|readBackfillInputs|runProjectionBackfill|bootstrapV4Registry|catchUpV4Registry/);
+  assert.match(repairSource, /commitProjectionHour\(hourStart, projections, \{ only: summary\.needs \}\)/, 'writes only the rebuilt projections');
+});
 
 const sqlite = await import('node:sqlite').catch(() => null);
 if (!sqlite) {
@@ -820,6 +934,159 @@ if (!sqlite) {
       const again = await runCompactHour({ sqlitePath: join(directory, 'runner.sqlite'), hourStart: HOUR, provider: offlineProvider(chainOf().fetchImpl),
         registryFromBlock: ORIGIN.originNumber, print: () => {} });
       assert.deepEqual([again.hourMode, again.provider.requests], ['stored', 0], 'no repair is triggered by an unavailable projection');
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Projection-only self-heal (Phase 1A.1).
+    const v3Down = (result) => {
+      const copy = clone(result);
+      copy.families.uniswapV3 = { status: 'unavailable', reason: 'v3_registry_behind', ...Object.fromEntries(FAMILY_FIELDS.uniswapV3.map((field) => [field, null])) };
+      return { ...copy, complete: false, registry: { uniswapV3: null } };
+    };
+    const tamper = (result, name, field = 'swapCount') => {
+      const copy = clone(result);
+      copy.projections[name].rows[0][field] += 5;
+      for (const key of PROJECTIONS) delete copy.projections[key]?.rowsSha256;
+      return copy;
+    };
+
+    await test('sqlite: read model repair candidates: missing or unavailable with an available family, oldest first; blocked hours reported', async () => {
+      const db = open('candidates.sqlite');
+      const store = createCompactStore(db);
+      store.extendRegistry({ kind: 'uniswap_v3_pool', fromBlock: 1, previousThrough: null, through: 999_999, throughHash: fakeHash(999_999), created: [] });
+      store.extendV4Registry({ kind: 'uniswap_v4_pool', fromBlock: 1, previousThrough: null, through: 999_999, throughHash: fakeHash(999_999), created: [] });
+      const hour4 = fakeHour(4);
+      hour4.projections.dex_activity = { status: 'unavailable', reason: 'activity_spine_missing' };
+      for (const result of [fakeHour(0), tamper(fakeHour(1), 'uniswap_v3_pools'), withoutProjections(fakeHour(2)), v3Down(fakeHour(3)), hour4,
+        tamper(fakeHour(5), 'uniswap_v4_pools')]) store.commitHour(result);
+      const hour = (i) => FAKE_BASE + i * 3600;
+      const readModel = createCompactReadModel({ path: join(directory, 'candidates.sqlite'), DatabaseSync: sqlite.DatabaseSync });
+      const range = { fromHour: hour(0), toHour: hour(5) };
+      assert.deepEqual(readModel.projectionRepairCandidates(range), { hours: [hour(1), hour(2)],
+        blocked: [{ hourStart: hour(5), projection: 'uniswap_v4_pools', reason: 'v4_registry_behind' }] });
+      const states = Object.fromEntries(readModel.projectionStates(range).hours.map((entry) => [entry.hourStart, entry.projections]));
+      assert.deepEqual(states[hour(0)].uniswap_v3_pools, { state: 'available', repair: 'none', blocker: null }, 'available');
+      assert.deepEqual(states[hour(1)].uniswap_v3_pools, { state: 'unavailable', repair: 'eligible', blocker: null }, 'unavailable');
+      assert.deepEqual([states[hour(2)].uniswap_v3_pools.state, states[hour(2)].uniswap_v4_pools.state], ['missing', 'missing'], 'missing');
+      assert.deepEqual(states[hour(3)].uniswap_v3_pools, { state: 'family_unavailable', repair: 'none', blocker: null }, 'family unavailable');
+      assert.deepEqual(states[hour(4)].dex_activity, { state: 'unavailable', repair: 'none', blocker: null, reason: 'live_only' }, 'activity is live-only');
+      assert.deepEqual(readModel.projectionRepairCandidates({ fromHour: hour(3), toHour: hour(4) }), { hours: [], blocked: [] });
+      assert.throws(() => readModel.projectionRepairCandidates({ fromHour: hour(0) + 1, toHour: hour(5) }), (error) => error.code === 'invalid_range');
+      readModel.close();
+      db.close();
+    });
+
+    const STORED = withoutProjections(LIVE);
+    async function storedHourDb(name, { v3 = true, v4Through = LIVE.range.firstBlock - 1 } = {}) {
+      const db = open(name);
+      const store = createCompactStore(db);
+      if (v3) store.extendRegistry(await bootstrapV3Registry(offlineProvider(chainOf().fetchImpl), { fromBlock: ORIGIN.originNumber, toBlock: LIVE.range.firstBlock - 1 }));
+      if (v4Through !== null) {
+        store.extendV4Registry(await bootstrapV4Registry(offlineProvider(chainOf({ poolManagerDeployedAt: ORIGIN.originNumber }).fetchImpl),
+          { fromBlock: ORIGIN.originNumber, toBlock: v4Through }));
+      }
+      store.commitHour(STORED);
+      return { db, store, path: join(directory, name) };
+    }
+    async function repairHour(path, { providerFactory = null } = {}) {
+      const chain = chainOf();
+      const record = { filters: [], batches: [], created: 0, lines: [] };
+      const fetchImpl = async (url, init) => {
+        const body = JSON.parse(init.body);
+        if (Array.isArray(body)) record.batches.push(body.map((item) => [item.method, item.params]));
+        for (const item of [].concat(body)) if (item.method === 'eth_getLogs') record.filters.push(item.params[0]);
+        return chain.fetchImpl(url, init);
+      };
+      record.summary = await repairProjectionHour({ sqlitePath: path, hourStart: HOUR, DatabaseSync: sqlite.DatabaseSync,
+        providerFactory: providerFactory ?? (() => { record.created += 1; return offlineProvider(fetchImpl); }), print: (line) => record.lines.push(line) });
+      return record;
+    }
+    const familyJson = (db) => db.prepare('SELECT family, metrics_json FROM compact_family_hours ORDER BY family').all().map((row) => ({ ...row }));
+    const onlyHeaders = (batches) => batches.every((batch) => batch.every(([method, params]) => method === 'eth_getBlockByNumber' && params[1] === false));
+
+    await test('sqlite: projection-only repair of V3 alone: only v3Pools logs, stored hour/families/checkpoint untouched, no activity', async () => {
+      const { db, store, path } = await storedHourDb('repair-v3.sqlite', { v4Through: null });
+      const before = { state: hourState(db), families: familyJson(db) };
+      const run = await repairHour(path);
+      assert.deepEqual([run.summary.needs, run.summary.blocked, run.summary.ok], [['uniswap_v3_pools'], { uniswap_v4_pools: 'v4_registry_missing' }, false]);
+      assert.equal(run.summary.reason, 'blocked:uniswap_v4_pools=v4_registry_missing', 'the V4 blocker is reported, never bootstrapped');
+      assert.equal(run.filters.length, chunks);
+      assert(run.filters.every((filter) => filter.address === undefined && filter.topics[0].includes(T.v3Swap)), 'v3Pools only');
+      assert(onlyHeaders(run.batches) && run.batches.flat().length === 2, 'two boundary headers, never a block body or receipt');
+      assert.equal(run.summary.requests, 1 + 1 + chunks, 'chain id + one boundary batch + the V3 log chunks');
+      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'available' }, 'no V4 row (blocked) and no activity row');
+      assert.deepEqual(store.poolHours(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_pools.rows, 'reconciled to the stored V3 family counters');
+      assert.equal(count(db, 'compact_dex_activity'), 0, 'historical repair never fabricates activity');
+      assert.deepEqual({ state: hourState(db), families: familyJson(db) }, before, 'compact_hours, compact_family_hours and the checkpoint are untouched');
+      assert.equal(store.v4Registry().coverage, null, 'no automatic V4 bootstrap');
+      db.close();
+    });
+
+    await test('sqlite: projection-only repair of V4 alone: only v4 logs, registry and coverage extended, reconciled, nothing else written', async () => {
+      const { db, store, path } = await storedHourDb('repair-v4.sqlite');
+      store.commitProjectionHour(HOUR, LIVE.projections, { only: ['uniswap_v3_pools'] });
+      const before = { state: hourState(db), families: familyJson(db) };
+      const run = await repairHour(path);
+      assert.deepEqual([run.summary.needs, run.summary.blocked, run.summary.ok, run.lines.at(-1)], [['uniswap_v4_pools'], {}, true, 'RESULT PASS']);
+      assert.equal(run.filters.length, chunks);
+      assert(run.filters.every((filter) => JSON.stringify(filter.address) === JSON.stringify([PM])), 'v4 only');
+      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'available', uniswap_v4_pools: 'available' });
+      assert.deepEqual(store.poolHours(HOUR, 'uniswap_v4'), LIVE.projections.uniswap_v4_pools.rows);
+      assert.deepEqual(store.v4Registry(), { coverage: { fromBlock: ORIGIN.originNumber, through: LIVE.range.lastBlock, throughHash: LIVE.range.lastHash },
+        pools: 3 });
+      assert.equal(count(db, 'compact_dex_activity'), 0);
+      assert.deepEqual({ state: hourState(db), families: familyJson(db) }, before);
+      const again = await repairHour(path);
+      assert.deepEqual([again.summary.needs, again.created, again.summary.ok], [[], 0, true], 'nothing left: no provider, no request');
+      db.close();
+    });
+
+    await test('sqlite: a V4 registry behind the hour blocks the V4 repair with no RPC request and no bootstrap', async () => {
+      const { db, store, path } = await storedHourDb('repair-behind.sqlite', { v4Through: LIVE.range.firstBlock - 101 });
+      store.commitProjectionHour(HOUR, LIVE.projections, { only: ['uniswap_v3_pools'] });
+      const run = await repairHour(path, { providerFactory: () => { throw new Error('a blocked repair must not create a provider'); } });
+      assert.deepEqual([run.summary.ok, run.summary.reason, run.summary.requests], [false, 'blocked:uniswap_v4_pools=v4_registry_behind', 0]);
+      assert.equal(store.v4Registry().coverage.through, LIVE.range.firstBlock - 101, 'coverage untouched');
+      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'available' });
+      db.close();
+    });
+
+    await test('sqlite: a repair that does not reconcile with the stored family counters stays unavailable, and stays so on retry', async () => {
+      const { db, store, path } = await storedHourDb('repair-mismatch.sqlite', { v4Through: null });
+      const metrics = JSON.parse(db.prepare("SELECT metrics_json FROM compact_family_hours WHERE family = 'uniswapV3'").get().metrics_json);
+      db.prepare("UPDATE compact_family_hours SET metrics_json = ? WHERE family = 'uniswapV3'").run(JSON.stringify({ ...metrics, swapCount: metrics.swapCount + 1 }));
+      const before = familyJson(db);
+      const first = await repairHour(path);
+      assert.deepEqual([first.summary.ok, first.summary.reason], [false, 'not_repaired:uniswap_v3_pools']);
+      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'unavailable(reconciliation_mismatch)' });
+      assert.deepEqual(store.poolHours(HOUR, 'uniswap_v3'), [], 'nothing partial');
+      const second = await repairHour(path);
+      assert.deepEqual([second.summary.outcomes, statusOf(store, HOUR).uniswap_v3_pools], [{ uniswap_v3_pools: 'unchanged' },
+        'unavailable(reconciliation_mismatch)']);
+      assert.deepEqual(familyJson(db), before, 'the family row is never rewritten by a projection repair');
+      db.close();
+    });
+
+    await test('sqlite: repairing one failed V4 hour closes the coverage gap through the later stored hours', async () => {
+      const db = open('repair-chain.sqlite');
+      const store = createCompactStore(db);
+      store.extendRegistry(await bootstrapV3Registry(offlineProvider(chainOf().fetchImpl), { fromBlock: ORIGIN.originNumber, toBlock: LIVE.range.firstBlock - 1 }));
+      store.extendV4Registry(await bootstrapV4Registry(offlineProvider(chainOf({ poolManagerDeployedAt: ORIGIN.originNumber }).fetchImpl),
+        { fromBlock: ORIGIN.originNumber, toBlock: LIVE.range.firstBlock - 1 }));
+      const next = await processHour({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR + 3600, safeHead: ORIGIN.originNumber + 25_000,
+        v3Registry: V3 });
+      store.commitHour(tamper(LIVE, 'uniswap_v4_pools'));
+      store.commitHour(next);
+      assert.equal(store.v4Registry().coverage.through, LIVE.range.firstBlock - 1, 'the failed hour stalls coverage; the next hour cannot extend it');
+      const readModel = createCompactReadModel({ path: join(directory, 'repair-chain.sqlite'), DatabaseSync: sqlite.DatabaseSync });
+      assert.deepEqual(readModel.projectionRepairCandidates({ fromHour: HOUR, toHour: HOUR + 3600 }), { hours: [HOUR], blocked: [] });
+      const run = await repairHour(join(directory, 'repair-chain.sqlite'));
+      assert.deepEqual([run.summary.needs, run.summary.ok], [['uniswap_v4_pools'], true]);
+      assert.deepEqual(store.v4Registry().coverage, { fromBlock: ORIGIN.originNumber, through: next.range.lastBlock, throughHash: next.range.lastHash });
+      assert.equal(statusOf(store, HOUR).dex_activity, 'unavailable(projection_inputs_unavailable)', 'the failed live hour keeps no activity');
+      assert.deepEqual(readModel.projectionRepairCandidates({ fromHour: HOUR, toHour: HOUR + 3600 }), { hours: [], blocked: [] });
+      readModel.close();
+      db.close();
     });
   } finally {
     await rm(directory, { recursive: true, force: true });

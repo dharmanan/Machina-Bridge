@@ -1,8 +1,12 @@
 // Compact engine: the always-on Machina Intelligence service. One parent process owns a read-only SQLite read model, the
 // public read-only HTTP API, and the deterministic hourly scheduler. The scheduler runs the unchanged
 // scripts/run-compact-hour.mjs as a memory-isolated child for checkpoint + 1 hour until caught up; that child stays the
-// only writer. Railway: always-on service, Serverless (app sleeping) OFF, no cron schedule, restart ON_FAILURE.
-//   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] [PORT=8080] \
+// only writer. When caught up it may also run scripts/repair-compact-projection-hour.mjs for one stored hour (projection-only
+// self-heal); never two children at once. Railway: always-on service, Serverless (app sleeping) OFF, no cron schedule,
+// restart ON_FAILURE.
+// COMPACT_SCHEDULER_ENABLED (maintenance gate): unset, empty or "true" runs the scheduler; "false" serves the read API
+// only, starts no indexing child and writes nothing; any other value refuses to start.
+//   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] [PORT=8080] [COMPACT_SCHEDULER_ENABLED=true] \
 //   node --max-old-space-size=128 scripts/serve-compact-intelligence.mjs
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -12,6 +16,7 @@ import { createChildHourRunner, createScheduler } from '../server/compact/schedu
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
 
 export const RUNNER_SCRIPT = fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url));
+export const PROJECTION_REPAIR_SCRIPT = fileURLToPath(new URL('./repair-compact-projection-hour.mjs', import.meta.url));
 export const DEFAULT_PORT = 8080;
 export const SHUTDOWN_TIMEOUT_MS = 25_000;
 
@@ -29,7 +34,10 @@ export function serviceConfig({ env = process.env } = {}) {
   const portText = env.PORT ?? String(DEFAULT_PORT);
   const port = /^\d+$/.test(portText) ? Number(portText) : Number.NaN;
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new ServiceConfigError('invalid_port');
-  return { sqlitePath: resolve(sqlitePath), minIntervalMs, port, host: '0.0.0.0' };
+  // Exactly "true" or "false"; a malformed value fails closed instead of silently pausing (or running) the indexer.
+  const enabled = env.COMPACT_SCHEDULER_ENABLED ?? '';
+  if (enabled !== '' && enabled !== 'true' && enabled !== 'false') throw new ServiceConfigError('invalid_scheduler_enabled');
+  return { sqlitePath: resolve(sqlitePath), minIntervalMs, port, host: '0.0.0.0', schedulerEnabled: enabled !== 'false' };
 }
 
 // Wires the three parts; returns shutdown(code, reason) so signals, fatal read-model errors and tests share one path.
@@ -58,7 +66,10 @@ export function startIntelligenceService({ config, readModel, scheduler, server,
     return closing;
   }
   server.listen(config.port, config.host, () => log(`SERVICE_LISTENING port=${config.port}`));
-  scheduler.start();
+  // Maintenance gate: a paused scheduler starts no timer and no child; reads keep being served; shutdown is unchanged.
+  const schedulerEnabled = config.schedulerEnabled !== false;
+  log(`SCHEDULER_ENABLED ${schedulerEnabled}`);
+  if (schedulerEnabled) scheduler.start();
   return { shutdown };
 }
 
@@ -95,9 +106,10 @@ async function main() {
   }
   let service = null;
   const fatal = () => service?.shutdown(1, 'database_incompatible');
-  const runHour = createChildHourRunner({ scriptPath: RUNNER_SCRIPT,
-    env: { ...process.env, COMPACT_SQLITE_PATH: config.sqlitePath, COMPACT_RPC_MIN_INTERVAL_MS: String(config.minIntervalMs) } });
-  const scheduler = createScheduler({ readModel, runHour, log, onFatal: fatal });
+  const childEnv = { ...process.env, COMPACT_SQLITE_PATH: config.sqlitePath, COMPACT_RPC_MIN_INTERVAL_MS: String(config.minIntervalMs) };
+  const runHour = createChildHourRunner({ scriptPath: RUNNER_SCRIPT, env: childEnv });
+  const runProjectionRepair = createChildHourRunner({ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv });
+  const scheduler = createScheduler({ readModel, runHour, runProjectionRepair, log, onFatal: fatal });
   const server = createIntelligenceServer({ readModel, log, onFatal: fatal });
   service = startIntelligenceService({ config, readModel, scheduler, server, log });
   process.once('SIGTERM', () => { void service.shutdown(0, 'SIGTERM'); });

@@ -2,14 +2,18 @@
 // the service shutdown path. Fake clock and fake runner for scheduling; real child processes running tiny temporary
 // scripts for process handling. No Arc RPC, no SQLite writes, no network. Runs on any supported Node.
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createIntelligenceServer } from '../server/compact/http.js';
+import { POOL_HOUR_RETENTION_HOURS } from '../server/compact/projections.js';
 import {
   assertHourIso, backoffMs, CHILD_NODE_ARGS, createChildHourRunner, createScheduler, DEFAULT_SAFETY_DELAY_MS, hourIso, latestSafeHourStart,
-  MAX_BACKOFF_MS,
+  MAX_BACKOFF_MS, PROJECTION_REPAIR_COOLDOWN_MS, PROJECTION_REPAIR_WINDOW_HOURS,
 } from '../server/compact/scheduler.js';
-import { RUNNER_SCRIPT, serviceConfig, startIntelligenceService } from './serve-compact-intelligence.mjs';
+import { PROJECTION_REPAIR_SCRIPT, RUNNER_SCRIPT, serviceConfig, startIntelligenceService } from './serve-compact-intelligence.mjs';
 
 let passed = 0;
 async function test(name, run) { await run(); passed += 1; console.log(`PASS ${name}`); }
@@ -20,19 +24,30 @@ const at = (hours, minutes = 0) => (BASE + hours * H + minutes * 60) * 1000;
 const settle = () => new Promise((done) => setImmediate(done));
 
 // A fake world: a clock, a checkpoint the fake runner advances exactly like the real runner (only checkpoint + 1 commits),
-// timers that never fire on their own, and a log of every child start.
-function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit', candidates = () => [] } = {}) {
-  const state = { checkpoint, clock, starts: [], running: 0, maxRunning: 0, timers: [], terminated: [], pending: [] };
+// timers that never fire on their own, and a log of every child start. With projectionCandidates, the read model also
+// answers projection repair candidates and the scheduler gets a projection repair runner sharing the same child counters.
+function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit', candidates = () => [], projectionCandidates = null,
+  projectionBehavior = () => 'repair' } = {}) {
+  const state = { checkpoint, clock, starts: [], kinds: [], running: 0, maxRunning: 0, timers: [], terminated: [], pending: [], logs: [],
+    projectionQueries: [] };
   const readModel = {
     checkpoint: () => (state.checkpoint === null ? null : { hourStart: state.checkpoint, lastBlock: 1 }),
     repairCandidates: ({ fromHour, toHour }) => candidates(state).filter((hour) => hour >= fromHour && hour <= toHour),
   };
-  function runHour(hour) {
+  if (projectionCandidates) {
+    readModel.projectionRepairCandidates = ({ fromHour, toHour }) => {
+      state.projectionQueries.push({ fromHour, toHour });
+      const { hours = [], blocked = [] } = projectionCandidates(state);
+      return { hours: hours.filter((hour) => hour >= fromHour && hour <= toHour), blocked };
+    };
+  }
+  const runnerFor = (kind, decide) => function run(hour) {
     const hourStart = Date.parse(hour) / 1000;
     state.starts.push(hourStart);
+    state.kinds.push(kind);
     state.running += 1;
     state.maxRunning = Math.max(state.maxRunning, state.running);
-    const mode = behavior(hourStart, state);
+    const mode = decide(hourStart, state);
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
     const complete = (outcome) => {
@@ -40,14 +55,15 @@ function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit'
       finish({ exitCode: outcome.exitCode, signal: outcome.signal ?? null, error: null, startedAt: state.clock, finishedAt: state.clock });
     };
     const commit = () => {
-      // The real runner refuses anything but checkpoint + 1 (or the first hour of an empty store).
-      if (state.checkpoint === null || hourStart === state.checkpoint + H) state.checkpoint = hourStart;
+      // The real runner refuses anything but checkpoint + 1 (or the first hour of an empty store); a projection repair
+      // never commits an hour.
+      if (kind === 'hour' && (state.checkpoint === null || hourStart === state.checkpoint + H)) state.checkpoint = hourStart;
     };
     if (mode === 'commit') { commit(); complete({ exitCode: 0 }); }
     else if (mode === 'commit-unavailable') { commit(); complete({ exitCode: 1 }); }
     else if (mode === 'fail') complete({ exitCode: 1 });
     else if (mode === 'repair') complete({ exitCode: 0 });
-    else state.pending.push({ hourStart, release: () => { commit(); complete({ exitCode: 0 }); } }); // 'hold'
+    else state.pending.push({ hourStart, kind, release: () => { commit(); complete({ exitCode: 0 }); } }); // 'hold'
     return {
       hour,
       done,
@@ -58,15 +74,17 @@ function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit'
         return done;
       },
     };
-  }
+  };
   let fatal = 0;
   const scheduler = createScheduler({
-    readModel, runHour, now: () => state.clock, onFatal: () => { fatal += 1; },
+    readModel, runHour: runnerFor('hour', behavior), runProjectionRepair: projectionCandidates ? runnerFor('projection', projectionBehavior) : null,
+    now: () => state.clock, onFatal: () => { fatal += 1; }, log: (line) => state.logs.push(line),
     setTimer: (fn, ms) => { const handle = { fn, ms }; state.timers.push(handle); return handle; },
     clearTimer: (handle) => { state.timers = state.timers.filter((timer) => timer !== handle); },
   });
   return { state, scheduler, readModel, fatal: () => fatal };
 }
+const startsOf = (state, kind) => state.starts.filter((_, index) => state.kinds[index] === kind);
 
 await test('scheduler: the safe hour is the latest UTC hour that ended at least five minutes ago', () => {
   assert.equal(DEFAULT_SAFETY_DELAY_MS, 5 * 60_000);
@@ -234,6 +252,125 @@ await test('scheduler: an incompatible database is fatal and starts nothing', as
   assert.deepEqual(fatalWorld.state.starts, []);
 });
 
+await test('projection repair: the window is the 35-day pool-hour retention and the cooldown is one hour per hour', async () => {
+  assert.equal(PROJECTION_REPAIR_WINDOW_HOURS, POOL_HOUR_RETENTION_HOURS);
+  assert.equal(PROJECTION_REPAIR_COOLDOWN_MS, 60 * 60_000);
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [] }) });
+  await scheduler.tick();
+  assert.deepEqual(state.projectionQueries, [{ fromHour: BASE + 9 * H - (35 * 24 - 1) * H, toHour: BASE + 9 * H }]);
+  assert.deepEqual(state.starts, []);
+});
+
+await test('projection repair: caught up, the oldest eligible hour first, exactly one projection child per tick', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H,
+    projectionCandidates: () => ({ hours: [BASE + 2 * H, BASE + 5 * H, BASE + 8 * H, BASE - 900 * H] }) });
+  await scheduler.tick();
+  assert.deepEqual([state.starts, state.kinds], [[BASE + 2 * H], ['projection']], 'the oldest candidate first');
+  await scheduler.tick();
+  assert.deepEqual(startsOf(state, 'projection'), [BASE + 2 * H, BASE + 5 * H], 'one more per tick');
+  await scheduler.tick();
+  await scheduler.tick();
+  assert.deepEqual(startsOf(state, 'projection'), [BASE + 2 * H, BASE + 5 * H, BASE + 8 * H], 'everything else is cooling down or outside the window');
+  assert(state.logs.includes(`SCHEDULER_PROJECTION_REPAIR_DONE hour=${hourIso(BASE + 2 * H)} exit=0`));
+  assert.equal(scheduler.status().lastRun.kind, 'projection_repair');
+});
+
+await test('projection repair: catch-up of missing hours always comes first', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 6 * H, projectionCandidates: () => ({ hours: [BASE + 1 * H] }) });
+  await scheduler.tick();
+  assert.deepEqual(state.kinds, ['hour', 'hour', 'hour', 'projection']);
+  assert.deepEqual(state.starts, [BASE + 7 * H, BASE + 8 * H, BASE + 9 * H, BASE + 1 * H]);
+  assert.equal(state.maxRunning, 1);
+});
+
+await test('projection repair: a due family repair comes first; the projection repair waits for a later tick', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, candidates: () => [BASE + 8 * H], behavior: () => 'repair',
+    projectionCandidates: () => ({ hours: [BASE + 3 * H] }) });
+  await scheduler.tick();
+  assert.deepEqual([state.starts, state.kinds], [[BASE + 8 * H], ['hour']], 'only the family repair in this tick');
+  await scheduler.tick();
+  assert.deepEqual([state.starts, state.kinds], [[BASE + 8 * H, BASE + 3 * H], ['hour', 'projection']], 'family repair cooling down: projection next');
+});
+
+await test('projection repair: the same hour is retried only after its cooldown, never hammered', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, clock: at(10, 6), projectionCandidates: () => ({ hours: [BASE + 3 * H] }),
+    projectionBehavior: () => 'fail' });
+  await scheduler.tick();
+  for (let minute = 0; minute < 50; minute += 5) {
+    state.clock = at(10, 7 + minute);
+    await scheduler.tick();
+  }
+  assert.deepEqual(startsOf(state, 'projection'), [BASE + 3 * H], 'a failed repair is not retried within the hour');
+  state.clock = at(11, 7);
+  await scheduler.tick();
+  assert.deepEqual(state.kinds, ['projection', 'hour', 'projection'], 'the new hour is caught up first, then the retry');
+  assert.equal(scheduler.status().consecutiveFailures, 0, 'a failed projection repair is not a chain failure');
+});
+
+await test('projection repair: a second tick while a projection child runs never starts another child', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [BASE + 3 * H, BASE + 4 * H] }),
+    projectionBehavior: () => 'hold' });
+  const runs = [scheduler.tick(), scheduler.tick(), scheduler.tick()];
+  await settle();
+  assert.deepEqual([state.starts.length, state.running], [1, 1]);
+  state.pending.shift().release();
+  await Promise.all(runs);
+  assert.deepEqual([state.starts, state.maxRunning], [[BASE + 3 * H], 1], 'the next projection waits for a later tick');
+});
+
+await test('projection repair cannot overlap catch-up: a new hour waits for the running repair, then runs before any other repair', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, clock: at(10, 6), projectionCandidates: () => ({ hours: [BASE + 3 * H] }),
+    projectionBehavior: () => 'hold' });
+  const first = scheduler.tick();
+  await settle();
+  state.clock = at(11, 5); // hour 10 is now due; the repaired hour is still cooling down
+  const second = scheduler.tick();
+  await settle();
+  assert.deepEqual([state.starts, state.running], [[BASE + 3 * H], 1], 'no catch-up child while the repair runs');
+  state.pending.shift().release();
+  await Promise.all([first, second]);
+  await scheduler.tick();
+  assert.deepEqual([state.starts, state.kinds], [[BASE + 3 * H, BASE + 10 * H], ['projection', 'hour']]);
+  assert.equal(state.maxRunning, 1);
+});
+
+await test('projection repair cannot overlap family repair: one child at a time, family first', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, candidates: () => [BASE + 8 * H], behavior: () => 'hold',
+    projectionCandidates: () => ({ hours: [BASE + 3 * H] }) });
+  const run = scheduler.tick();
+  await settle();
+  const second = scheduler.tick();
+  await settle();
+  assert.deepEqual([state.kinds, state.running], [['hour'], 1]);
+  state.pending.shift().release();
+  await Promise.all([run, second]);
+  await scheduler.tick();
+  assert.deepEqual([state.kinds, state.maxRunning], [['hour', 'projection'], 1]);
+});
+
+await test('projection repair: hours blocked by a missing or behind registry start no child and are logged once per change', async () => {
+  let blocked = [{ hourStart: BASE + 4 * H, projection: 'uniswap_v4_pools', reason: 'v4_registry_behind' }];
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [], blocked }) });
+  await scheduler.tick();
+  await scheduler.tick();
+  assert.deepEqual(state.starts, []);
+  assert.deepEqual(state.logs.filter((line) => line.startsWith('SCHEDULER_PROJECTION_REPAIR_BLOCKED')), ['SCHEDULER_PROJECTION_REPAIR_BLOCKED v4_registry_behind:1']);
+  assert.deepEqual(scheduler.status().projectionRepairBlocked, { v4_registry_behind: 1 });
+  blocked = [];
+  await scheduler.tick();
+  assert.equal(state.logs.at(-1), 'SCHEDULER_PROJECTION_REPAIR_BLOCKED none');
+});
+
+await test('projection repair: stop() terminates a running projection child and nothing starts after it', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [BASE + 3 * H] }), projectionBehavior: () => 'hold' });
+  const run = scheduler.tick();
+  await settle();
+  assert.equal(scheduler.status().runningKind, 'projection_repair');
+  await scheduler.stop();
+  await run;
+  assert.deepEqual([state.terminated, state.running, state.starts], [[BASE + 3 * H], 0, [BASE + 3 * H]]);
+});
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Real child processes running tiny temporary scripts.
 const workdir = mkdtempSync(join(tmpdir(), 'compact-runtime-'));
@@ -284,13 +421,70 @@ await test('child runner: terminate() sends SIGTERM, and SIGKILL after the grace
 
 await test('service: configuration is validated before anything starts', () => {
   assert.deepEqual(serviceConfig({ env: { COMPACT_SQLITE_PATH: '/data/arc-compact.sqlite' } }),
-    { sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000, port: 8080, host: '0.0.0.0' });
+    { sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000, port: 8080, host: '0.0.0.0', schedulerEnabled: true });
   assert.equal(serviceConfig({ env: { COMPACT_SQLITE_PATH: '/data/x.sqlite', PORT: '3000', COMPACT_RPC_MIN_INTERVAL_MS: '1500' } }).port, 3000);
   for (const [env, code] of [[{}, 'sqlite_path_required'], [{ COMPACT_SQLITE_PATH: ':memory:' }, 'sqlite_path_required'],
     [{ COMPACT_SQLITE_PATH: 'file:x.sqlite' }, 'sqlite_path_required'], [{ COMPACT_SQLITE_PATH: '/d.sqlite', COMPACT_RPC_MIN_INTERVAL_MS: '250' }, 'unsafe_rpc_pacing'],
     [{ COMPACT_SQLITE_PATH: '/d.sqlite', PORT: '80a' }, 'invalid_port'], [{ COMPACT_SQLITE_PATH: '/d.sqlite', PORT: '70000' }, 'invalid_port']]) {
     assert.throws(() => serviceConfig({ env }), (error) => error.code === code, JSON.stringify(env));
   }
+});
+
+await test('service: COMPACT_SCHEDULER_ENABLED: unset or "true" runs the scheduler, "false" pauses it, anything else fails closed', () => {
+  const base = { COMPACT_SQLITE_PATH: '/data/arc-compact.sqlite' };
+  assert.equal(serviceConfig({ env: base }).schedulerEnabled, true, 'unset');
+  assert.equal(serviceConfig({ env: { ...base, COMPACT_SCHEDULER_ENABLED: '' } }).schedulerEnabled, true, 'empty is unset');
+  assert.equal(serviceConfig({ env: { ...base, COMPACT_SCHEDULER_ENABLED: 'true' } }).schedulerEnabled, true);
+  assert.equal(serviceConfig({ env: { ...base, COMPACT_SCHEDULER_ENABLED: 'false' } }).schedulerEnabled, false);
+  for (const value of ['TRUE', 'False', '0', '1', 'yes', 'no', 'off', ' true', 'false ', 'paused']) {
+    assert.throws(() => serviceConfig({ env: { ...base, COMPACT_SCHEDULER_ENABLED: value } }), (error) => error.code === 'invalid_scheduler_enabled', value);
+  }
+});
+
+await test('service: a malformed COMPACT_SCHEDULER_ENABLED stops the real service before it opens or serves anything', () => {
+  const path = join(workdir, 'never-created.sqlite');
+  const run = spawnSync(process.execPath, [fileURLToPath(new URL('./serve-compact-intelligence.mjs', import.meta.url))],
+    { env: { PATH: process.env.PATH, COMPACT_SQLITE_PATH: path, COMPACT_SCHEDULER_ENABLED: 'maybe' }, encoding: 'utf8', timeout: 20_000 });
+  assert.equal(run.status, 1, run.stdout + run.stderr);
+  assert.equal(run.stdout.trim(), 'SERVICE_FAIL invalid_scheduler_enabled');
+  assert(!existsSync(path), 'no database file was touched');
+});
+
+const fakeReadModel = () => ({ health: () => ({ status: 'ok', checkpointHour: null, verifiedThrough: null }),
+  summary: () => { throw Object.assign(new Error('not_ready'), { code: 'not_ready' }); }, timeseries: () => ({}), close: () => {} });
+async function serviceWith(schedulerEnabled) {
+  const calls = [];
+  const logs = [];
+  const scheduler = { start: () => calls.push('start'), stop: async () => calls.push('stop') };
+  const server = createIntelligenceServer({ readModel: fakeReadModel() });
+  let listening;
+  const ready = new Promise((done) => { listening = done; });
+  const exits = [];
+  const service = startIntelligenceService({ config: { port: 0, host: '127.0.0.1', schedulerEnabled }, readModel: fakeReadModel(), scheduler, server,
+    log: (line) => { logs.push(line); if (line.startsWith('SERVICE_LISTENING')) listening(); }, exit: (code) => exits.push(code) });
+  await ready;
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/health`);
+  const body = await response.json();
+  await service.shutdown(0, 'test');
+  return { calls, logs, exits, status: response.status, body };
+}
+
+await test('service: with the scheduler disabled the read API still serves, no indexing starts, and shutdown stays clean', async () => {
+  const paused = await serviceWith(false);
+  assert.deepEqual(paused.calls, ['stop'], 'scheduler.start is never called; stop on shutdown is a no-op');
+  assert(paused.logs.includes('SCHEDULER_ENABLED false'));
+  assert.deepEqual([paused.status, paused.body.status, paused.exits], [200, 'ok', [0]]);
+  const running = await serviceWith(true);
+  assert.deepEqual(running.calls, ['start', 'stop']);
+  assert(running.logs.includes('SCHEDULER_ENABLED true'));
+  assert.equal(running.status, 200);
+});
+
+await test('service: the scheduler gets the strict single-hour projection repair child, never a bulk backfill', () => {
+  assert.ok(PROJECTION_REPAIR_SCRIPT.endsWith('/scripts/repair-compact-projection-hour.mjs'));
+  const source = readFileSync(new URL('./serve-compact-intelligence.mjs', import.meta.url), 'utf8');
+  assert.match(source, /createScheduler\(\{ readModel, runHour, runProjectionRepair, log, onFatal: fatal \}\)/);
+  assert.doesNotMatch(source, /backfill-compact-projections|--execute|COMPACT_PROJECTION_EXECUTE/);
 });
 
 await test('service: shutdown stops the scheduler first, then HTTP, then the read connection, exactly once', async () => {

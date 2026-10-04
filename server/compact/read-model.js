@@ -8,6 +8,7 @@
 import { existsSync } from 'node:fs';
 import { ARC_ASSETS_BY_ADDRESS } from '../../api/_lib/arc-intelligence/assets.js';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
+import { POOL_PROJECTION_FAMILY, projectionRepairState, V4_POOL_KIND } from './projections.js';
 import { CIRCLE_ARC } from './protocols/circle.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
@@ -136,6 +137,18 @@ const SQL = Object.freeze({
     WHERE hour_start BETWEEN ? AND ?`,
   registryCoverage: 'SELECT through_block FROM compact_registry_coverage WHERE kind = ?',
   poolCount: 'SELECT COUNT(*) AS count FROM compact_registry WHERE kind = ? AND created_block <= ?',
+  // Projection repair state per stored hour: primary-key lookups only (compact_hours by hour, family and projection rows by
+  // their (hour_start, name) keys), so a 35-day scan stays a bounded index read.
+  projectionTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_projection_hours'",
+  projectionRows: `SELECT h.hour_start, h.first_block, h.last_block, v3f.status AS v3_family, v4f.status AS v4_family,
+    v3p.status AS v3_projection, v4p.status AS v4_projection, ap.status AS activity
+    FROM compact_hours h
+    LEFT JOIN compact_family_hours v3f ON v3f.hour_start = h.hour_start AND v3f.family = 'uniswapV3'
+    LEFT JOIN compact_family_hours v4f ON v4f.hour_start = h.hour_start AND v4f.family = 'uniswapV4'
+    LEFT JOIN compact_projection_hours v3p ON v3p.hour_start = h.hour_start AND v3p.projection = 'uniswap_v3_pools'
+    LEFT JOIN compact_projection_hours v4p ON v4p.hour_start = h.hour_start AND v4p.projection = 'uniswap_v4_pools'
+    LEFT JOIN compact_projection_hours ap ON ap.hour_start = h.hour_start AND ap.projection = 'dex_activity'
+    WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
   availableFamilies: `SELECT h.hour_start,
     (SELECT COUNT(*) FROM compact_family_hours f WHERE f.hour_start = h.hour_start AND f.status = 'available') AS available
     FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start DESC`,
@@ -359,6 +372,28 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       latestCompleteHour: iso(latestCompleteHour), lagHours, stale: lagHours >= STALE_LAG_HOURS, staleRule: `lagHours >= ${STALE_LAG_HOURS}` };
   }
 
+  // Projection state of every stored hour in [fromHour, toHour], oldest first (see projections.js projectionRepairState).
+  // Before the writer has created the projection tables nothing is stored yet, and nothing is reported.
+  function projectionStates(fromHour, toHour) {
+    if (!statement('projectionTable').get()) return { ready: false, hours: [] };
+    const through = (kind) => {
+      const row = statement('registryCoverage').get(kind);
+      return row ? { through: row.through_block } : null;
+    };
+    const coverage = { uniswap_v3_pools: through(V3_POOL_KIND), uniswap_v4_pools: through(V4_POOL_KIND) };
+    const hours = statement('projectionRows').all(int(fromHour), int(toHour)).map((row) => ({ hourStart: row.hour_start,
+      projections: projectionRepairState({ families: { [POOL_PROJECTION_FAMILY.uniswap_v3_pools]: row.v3_family,
+        [POOL_PROJECTION_FAMILY.uniswap_v4_pools]: row.v4_family },
+      projections: { uniswap_v3_pools: row.v3_projection, uniswap_v4_pools: row.v4_projection, dex_activity: row.activity },
+      firstBlock: row.first_block, lastBlock: row.last_block, coverage }) }));
+    return { ready: true, hours };
+  }
+  const checkedRange = (fromHour, toHour) => {
+    if (!Number.isSafeInteger(fromHour) || !Number.isSafeInteger(toHour) || fromHour % HOUR || toHour % HOUR) {
+      throw new ReadModelError('invalid_range');
+    }
+  };
+
   const definitions = Object.freeze({ schemaVersion: COMPACT_SCHEMA_VERSION, hourDefinition: COMPACT_DEFINITION_VERSION,
     families: FAMILY_VERSIONS, aggregationRules: AGGREGATION_RULES });
   const chain = Object.freeze({ id: ARC_CHAIN_ID, name: 'Arc' });
@@ -401,6 +436,26 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       }
       return snapshot(() => statement('availableFamilies').all(int(fromHour), int(toHour))
         .filter((row) => row.available < FAMILIES.length).map((row) => row.hour_start));
+    },
+    // Internal (scheduler and tests only, never an HTTP route): per-hour projection state in [fromHour, toHour].
+    projectionStates({ fromHour, toHour }) {
+      checkedRange(fromHour, toHour);
+      return snapshot(() => projectionStates(fromHour, toHour));
+    },
+    // For the scheduler's projection-only self-heal: stored hours in [fromHour, toHour] with at least one pool projection
+    // missing or unavailable while its family is available, oldest first. Hours whose only such projections wait for a
+    // registry are reported as blocked instead (no RPC child is started for them). Recent activity is never a candidate.
+    projectionRepairCandidates({ fromHour, toHour }) {
+      checkedRange(fromHour, toHour);
+      return snapshot(() => {
+        const { hours } = projectionStates(fromHour, toHour);
+        const pools = Object.keys(POOL_PROJECTION_FAMILY);
+        return {
+          hours: hours.filter((hour) => pools.some((name) => hour.projections[name].repair === 'eligible')).map((hour) => hour.hourStart),
+          blocked: hours.flatMap((hour) => pools.filter((name) => hour.projections[name].repair === 'blocked')
+            .map((name) => ({ hourStart: hour.hourStart, projection: name, reason: hour.projections[name].blocker }))),
+        };
+      });
     },
     close() {
       cache.clear();

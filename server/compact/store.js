@@ -295,6 +295,7 @@ export function createCompactStore(db) {
     setCoverage: db.prepare(`INSERT INTO compact_registry_coverage (kind, from_block, through_block, through_hash) VALUES (?, ?, ?, ?)
       ON CONFLICT (kind) DO UPDATE SET through_block = excluded.through_block, through_hash = excluded.through_hash`),
     hourRange: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash FROM compact_hours WHERE hour_start = ?'),
+    hourByLastBlock: db.prepare('SELECT hour_start FROM compact_hours WHERE last_block = ?'),
     uniswapFamilies: db.prepare(`SELECT family, status, metrics_json FROM compact_family_hours WHERE hour_start = ?
       AND family IN ('uniswapV3', 'uniswapV4')`),
     projection: db.prepare('SELECT status, rows_sha256 FROM compact_projection_hours WHERE hour_start = ? AND projection = ?'),
@@ -397,6 +398,19 @@ export function createCompactStore(db) {
     sql.setCoverage.run(kind, int(current.fromBlock), int(range.lastBlock), range.lastHash);
   }
 
+  // Every stored hour whose V4 projection is available has all of its validated Initialize rows in the registry, so V4
+  // coverage that ends exactly at such an hour's parent (same hash) runs on through it, hour by hour. This lets a
+  // projection-only repair (or a registry scan) close a gap left by one failed hour without any RPC or operator step.
+  function chainV4Coverage(fromHourStart) {
+    for (let hour = fromHourStart + HOUR; ; hour += HOUR) {
+      const current = coverageOf(V4_POOL_KIND);
+      const next = sql.hourRange.get(int(hour));
+      if (!current || !next || next.first_block !== current.through + 1 || next.parent_hash !== current.throughHash) return;
+      if (sql.projection.get(int(hour), 'uniswap_v4_pools')?.status !== 'available') return;
+      sql.setCoverage.run(V4_POOL_KIND, int(current.fromBlock), int(next.last_block), next.last_hash);
+    }
+  }
+
   // An hour with V3 available validated all of its PoolCreated logs against its spine, so a registry that reaches the
   // block before the hour (with the same hash) or into the hour becomes complete through the hour's last block.
   function advanceRegistry(range, v3) {
@@ -408,7 +422,8 @@ export function createCompactStore(db) {
   // identical one is `unchanged`, a different one is reported as `conflict` and nothing is replaced. An unavailable one is
   // upgraded when an available one arrives. Recent activity is idempotent by (block_number, log_index) and pruned to the
   // newest rows per kind; pool-hours and projection status rows follow the 35-day retention. Returns name -> outcome.
-  function writeProjections(range, normalized) {
+  // names: the projections to write (a projection-only repair writes only the ones it rebuilt; nothing else is touched).
+  function writeProjections(range, normalized, names = PROJECTIONS) {
     const hour = int(range.hourStart);
     const report = {};
     const projections = { ...normalized };
@@ -422,7 +437,7 @@ export function createCompactStore(db) {
       projections.uniswap_v4_pools = unavailableProjection('duplicate_v4_initialize');
       if (projections.dex_activity.status === 'available') projections.dex_activity = unavailableProjection('projection_inputs_unavailable');
     }
-    for (const name of PROJECTIONS) {
+    for (const name of names) {
       const entry = projections[name];
       const stored = sql.projection.get(hour, name);
       if (stored?.status === 'available') {
@@ -448,6 +463,7 @@ export function createCompactStore(db) {
         if (protocol === 'uniswap_v4') {
           insertRegistryRows(V4_POOL_KIND, entry.registry);
           advanceCoverage(V4_POOL_KIND, range);
+          chainV4Coverage(range.hourStart);
         }
       }
       if (stored) sql.upgradeProjection.run(int(entry.rows.length), entry.sha, hour, name);
@@ -509,16 +525,20 @@ export function createCompactStore(db) {
     }, beforeCommit);
   }
 
-  // Projection-only commit for an hour that is already stored (the projection backfill): never touches the hour, its
-  // families, the addresses or the checkpoint. The projections are reconciled against the stored family counters.
-  function commitProjectionHour(hourStart, projections, { beforeCommit = null } = {}) {
+  // Projection-only commit for an hour that is already stored (the projection backfill and the single-hour repair): never
+  // touches the hour, its families, the addresses or the checkpoint. The projections are reconciled against the stored
+  // family counters. only: the projections to write (default all); the others keep whatever is stored.
+  function commitProjectionHour(hourStart, projections, { beforeCommit = null, only = PROJECTIONS } = {}) {
+    if (!Array.isArray(only) || !only.length || !only.every((name) => PROJECTIONS.includes(name)) || new Set(only).size !== only.length) {
+      throw new StoreError('invalid_projection_names');
+    }
     return transaction(() => {
       const hour = sql.hourRange.get(int(hourStart));
       if (!hour) throw new StoreError('hour_missing');
       const families = Object.fromEntries(sql.uniswapFamilies.all(int(hourStart)).map((row) => [row.family,
         row.status === 'available' ? { status: 'available', ...JSON.parse(row.metrics_json) } : { status: row.status }]));
       const range = { hourStart, firstBlock: hour.first_block, lastBlock: hour.last_block, parentHash: hour.parent_hash, lastHash: hour.last_hash };
-      return writeProjections(range, normalizeProjections(projections, range, families));
+      return writeProjections(range, normalizeProjections(projections, range, families), only);
     }, beforeCommit);
   }
 
@@ -532,6 +552,10 @@ export function createCompactStore(db) {
       if (kind === V4_POOL_KIND && !registryScan.created.every(validV4Record)) throw new StoreError('registry_record_invalid');
       insertRegistryRows(kind, registryScan.created);
       sql.setCoverage.run(kind, int(registryScan.fromBlock), int(registryScan.through), registryScan.throughHash);
+      // A V4 scan that ends at a stored hour's last block continues through the stored hours after it that already hold
+      // their Initialize rows (V4 projection available).
+      const end = kind === V4_POOL_KIND ? sql.hourByLastBlock.get(int(registryScan.through)) : null;
+      if (end) chainV4Coverage(end.hour_start);
       return coverageOf(kind);
     });
   }

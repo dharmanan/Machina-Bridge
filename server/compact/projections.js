@@ -161,6 +161,43 @@ export function newestActivity(rows, limit = ACTIVITY_ROWS_PER_KIND) {
 export const poolHourCutoff = (newestHourStart) => newestHourStart - POOL_HOUR_RETENTION_HOURS * HOUR;
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Projection-only repair (self-heal) of stored hours. One rule for the read model (which hours are candidates) and the
+// single-hour repair child (what it fetches): a pool projection is repairable when it is missing or unavailable while its
+// family is available, and its registry already covers the hour. A registry that is missing or behind is a blocker,
+// never a reason to bootstrap it automatically. Recent activity is live-only: it needs the block spine's transaction
+// senders, so a stored hour never gets activity afterwards and dex_activity is never a repair target.
+
+export const POOL_PROJECTION_FAMILY = Object.freeze({ uniswap_v3_pools: 'uniswapV3', uniswap_v4_pools: 'uniswapV4' });
+export const PROJECTION_REPAIR_BLOCKERS = Object.freeze(['v3_registry_missing', 'v3_registry_behind', 'v4_registry_missing',
+  'v4_registry_behind']);
+
+// V3 pool classification needs the official registry through the hour's last block; V4 registry coverage must reach the
+// block before the hour, so the repaired hour's Initialize rows extend it contiguously. coverage: { through } or null.
+export function registryRepairBlocker(projection, coverage, { firstBlock, lastBlock }) {
+  if (projection === 'uniswap_v3_pools') return !coverage ? 'v3_registry_missing' : coverage.through < lastBlock ? 'v3_registry_behind' : null;
+  return !coverage ? 'v4_registry_missing' : coverage.through < firstBlock - 1 ? 'v4_registry_behind' : null;
+}
+
+// Repair state of one stored hour. families / projections: stored status per name, or null when there is no row.
+// Pool projection: state available | missing | unavailable | family_unavailable, repair eligible | blocked | none.
+export function projectionRepairState({ families, projections, firstBlock, lastBlock, coverage }) {
+  const out = {};
+  for (const [name, family] of Object.entries(POOL_PROJECTION_FAMILY)) {
+    const stored = projections[name] ?? null;
+    if (stored === 'available') out[name] = { state: 'available', repair: 'none', blocker: null };
+    else if (families[family] !== 'available') out[name] = { state: 'family_unavailable', repair: 'none', blocker: null };
+    else {
+      const blocker = registryRepairBlocker(name, coverage[name] ?? null, { firstBlock, lastBlock });
+      out[name] = { state: stored === null ? 'missing' : 'unavailable', repair: blocker ? 'blocked' : 'eligible', blocker };
+    }
+  }
+  const activity = projections.dex_activity ?? null;
+  out.dex_activity = activity === 'available' ? { state: 'available', repair: 'none', blocker: null }
+    : { state: activity === null ? 'missing' : 'unavailable', repair: 'none', blocker: null, reason: 'live_only' };
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Projection sink. Never throws into its caller: a family accumulator keeps counting exactly as before whatever happens
 // here; a failure only marks the affected projection unavailable for the hour. `activity: false` (the logs-only
 // backfill, which has no block spine) leaves recent activity out.

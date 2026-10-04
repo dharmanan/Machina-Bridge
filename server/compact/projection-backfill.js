@@ -6,13 +6,17 @@
 // store.js then reconciles the result exactly against the hour's STORED family counters before anything is written;
 // a mismatch is stored as unavailable. Recent activity needs the spine's transaction senders, so a backfilled hour
 // never has activity: it fills from live hours only.
-// Nothing here runs by itself: scripts/backfill-compact-projections.mjs plans by default and writes only on request.
+// Nothing here runs by itself: scripts/backfill-compact-projections.mjs plans by default and writes only on request, and
+// scripts/repair-compact-projection-hour.mjs (the scheduler's self-heal child) repairs exactly one stored hour.
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
 import {
   decodeV3Burn, decodeV3Mint, decodeV3Swap, decodeV4Initialize, decodeV4ModifyLiquidity, decodeV4Swap, UNISWAP_EVENT_TOPICS,
 } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { LogError, streamLogs } from './logs.js';
-import { ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, createProjectionSink, poolHourCutoff, POOL_HOUR_RETENTION_HOURS, PROJECTIONS } from './projections.js';
+import {
+  ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, createProjectionSink, poolHourCutoff, POOL_HOUR_RETENTION_HOURS, POOL_PROJECTION_FAMILY, PROJECTIONS,
+  projectionRepairState,
+} from './projections.js';
 import { ProviderError } from './provider.js';
 import { v4RegistryScanRequests } from './registry.js';
 import { DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from './sources.js';
@@ -44,44 +48,82 @@ export class BackfillError extends Error {
 // Inputs, read-only. db: an open node:sqlite DatabaseSync (the CLI opens it with readOnly and query_only). Works on a
 // database written before projections existed: missing projection tables mean "no projection stored yet".
 
-export function readBackfillInputs(db, { schemaVersion = '2' } = {}) {
+function compactTables(db, schemaVersion) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'compact_*'").all().map((row) => row.name));
   if (!tables.has('compact_meta') || !tables.has('compact_hours')) throw new BackfillError('database_not_compact');
   if (db.prepare("SELECT value FROM compact_meta WHERE key = 'schema_version'").get()?.value !== schemaVersion) {
     throw new BackfillError('schema_version_mismatch');
   }
-  const projectionTables = tables.has('compact_projection_hours');
+  return tables;
+}
+
+// Stored hours (all, or the one at hourStart) with their Uniswap family rows and projection status, oldest first.
+function storedHours(db, { projectionTables, hourStart = null }) {
+  const only = hourStart === null ? [] : [BigInt(hourStart)];
   const statuses = new Map();
   if (projectionTables) {
-    for (const row of db.prepare('SELECT hour_start, projection, status FROM compact_projection_hours').all()) {
+    const rows = db.prepare(`SELECT hour_start, projection, status FROM compact_projection_hours${hourStart === null ? '' : ' WHERE hour_start = ?'}`)
+      .all(...only);
+    for (const row of rows) {
       if (!statuses.has(row.hour_start)) statuses.set(row.hour_start, {});
       statuses.get(row.hour_start)[row.projection] = row.status;
     }
   }
   const familyOf = (status, json) => (status === 'available' ? { status, ...JSON.parse(json) } : { status: status ?? 'missing' });
-  const hours = db.prepare(`SELECT h.hour_start, h.first_block, h.last_block, h.parent_hash, h.first_hash, h.last_hash,
+  return db.prepare(`SELECT h.hour_start, h.first_block, h.last_block, h.parent_hash, h.first_hash, h.last_hash,
       v3.status AS v3_status, v3.metrics_json AS v3_metrics, v4.status AS v4_status, v4.metrics_json AS v4_metrics
     FROM compact_hours h
     LEFT JOIN compact_family_hours v3 ON v3.hour_start = h.hour_start AND v3.family = 'uniswapV3'
     LEFT JOIN compact_family_hours v4 ON v4.hour_start = h.hour_start AND v4.family = 'uniswapV4'
-    ORDER BY h.hour_start`).all().map((row) => ({
+    ${hourStart === null ? '' : 'WHERE h.hour_start = ?'} ORDER BY h.hour_start`).all(...only).map((row) => ({
     hourStart: row.hour_start, firstBlock: row.first_block, lastBlock: row.last_block, parentHash: row.parent_hash, firstHash: row.first_hash,
     lastHash: row.last_hash, families: { uniswapV3: familyOf(row.v3_status, row.v3_metrics), uniswapV4: familyOf(row.v4_status, row.v4_metrics) },
     projections: statuses.get(row.hour_start) ?? {},
   }));
-  const coverage = (kind) => {
-    const row = db.prepare('SELECT from_block, through_block, through_hash FROM compact_registry_coverage WHERE kind = ?').get(kind);
-    return row ? { fromBlock: row.from_block, through: row.through_block, throughHash: row.through_hash } : null;
-  };
+}
+
+function coverageOf(db, kind) {
+  const row = db.prepare('SELECT from_block, through_block, through_hash FROM compact_registry_coverage WHERE kind = ?').get(kind);
+  return row ? { fromBlock: row.from_block, through: row.through_block, throughHash: row.through_hash } : null;
+}
+
+export function readBackfillInputs(db, { schemaVersion = '2' } = {}) {
+  const projectionTables = compactTables(db, schemaVersion).has('compact_projection_hours');
   const checkpoint = db.prepare('SELECT hour_start, last_block, last_hash FROM compact_checkpoint WHERE id = 1').get();
   return {
-    hours,
+    hours: storedHours(db, { projectionTables }),
     projectionTables,
-    v3Coverage: coverage('uniswap_v3_pool'),
-    v4Coverage: coverage('uniswap_v4_pool'),
+    v3Coverage: coverageOf(db, 'uniswap_v3_pool'),
+    v4Coverage: coverageOf(db, 'uniswap_v4_pool'),
     v4Pools: db.prepare("SELECT COUNT(*) AS count FROM compact_registry WHERE kind = 'uniswap_v4_pool'").get().count,
     checkpoint: checkpoint ? { hourStart: checkpoint.hour_start, lastBlock: checkpoint.last_block, lastHash: checkpoint.last_hash } : null,
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Single-hour projection repair (the scheduler's self-heal). Same rule as the read model (projections.js
+// projectionRepairState): only pool projections that are missing or unavailable while their family is available, only
+// when their registry already covers the hour, only inside pool-hour retention. Recent activity is never rebuilt.
+
+export function readProjectionRepairInput(db, hourStart, { schemaVersion = '2' } = {}) {
+  const projectionTables = compactTables(db, schemaVersion).has('compact_projection_hours');
+  const [hour = null] = storedHours(db, { projectionTables, hourStart });
+  return { hour, newestHour: db.prepare('SELECT MAX(hour_start) AS hour FROM compact_hours').get().hour,
+    v3Coverage: coverageOf(db, 'uniswap_v3_pool'), v4Coverage: coverageOf(db, 'uniswap_v4_pool') };
+}
+
+// Returns { reason, needs: { name: true }, blocked: { name: blocker }, state }. reason: hour_missing | outside_retention.
+export function planProjectionRepair({ hour, newestHour, v3Coverage, v4Coverage }) {
+  if (!hour) return { reason: 'hour_missing', needs: {}, blocked: {}, state: null };
+  if (hour.hourStart <= poolHourCutoff(newestHour)) return { reason: 'outside_retention', needs: {}, blocked: {}, state: null };
+  const state = projectionRepairState({
+    families: Object.fromEntries(Object.values(POOL_PROJECTION_FAMILY).map((family) => [family, hour.families[family].status])),
+    projections: Object.fromEntries(PROJECTIONS.map((name) => [name, hour.projections[name] ?? null])),
+    firstBlock: hour.firstBlock, lastBlock: hour.lastBlock, coverage: { uniswap_v3_pools: v3Coverage, uniswap_v4_pools: v4Coverage } });
+  const pools = Object.keys(POOL_PROJECTION_FAMILY);
+  return { reason: null, state,
+    needs: Object.fromEntries(pools.filter((name) => state[name].repair === 'eligible').map((name) => [name, true])),
+    blocked: Object.fromEntries(pools.filter((name) => state[name].repair === 'blocked').map((name) => [name, state[name].blocker])) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

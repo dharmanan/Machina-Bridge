@@ -4,7 +4,11 @@
 // hour is committed. A failed hour is never skipped: the same hour is retried with bounded exponential backoff, and no
 // later hour can start before it commits (the runner itself also refuses any checkpoint gap). Progress is judged by the
 // checkpoint, not the exit code: the runner exits 1 when an hour commits with a family unavailable, which is progress.
-// Only after the chain is caught up, at most one recent hour with an unavailable family is repaired per tick.
+// Only after the chain is caught up, at most one recent hour with an unavailable family is repaired per tick. Only when no
+// family repair is due either, at most one stored hour whose Uniswap pool projection is missing or unavailable is repaired
+// per tick by a projection-only child (scripts/repair-compact-projection-hour.mjs): never processHour, never the hour,
+// its families or the checkpoint. Every child (catch-up, family repair, projection repair) is the single child of the
+// single run loop, so no two ever overlap.
 import { spawn } from 'node:child_process';
 
 export const HOUR_MS = 3_600_000;
@@ -17,6 +21,10 @@ export const DEFAULT_BASE_BACKOFF_MS = 60_000;
 export const MAX_BACKOFF_MS = 30 * 60_000;
 export const REPAIR_WINDOW_HOURS = 24;
 export const REPAIR_COOLDOWN_MS = HOUR_MS;
+// Projection repair looks back as far as pool-hours are kept (35 days, projections.js POOL_HOUR_RETENTION_HOURS), oldest
+// first, one hour per tick, and retries the same hour at most once per hour.
+export const PROJECTION_REPAIR_WINDOW_HOURS = 35 * 24;
+export const PROJECTION_REPAIR_COOLDOWN_MS = HOUR_MS;
 export const DEFAULT_CHILD_KILL_GRACE_MS = 15_000;
 // Equivalent to the proven production command: node --max-old-space-size=64 --max-semi-space-size=2 run-compact-hour.mjs
 export const CHILD_NODE_ARGS = Object.freeze(['--max-old-space-size=64', '--max-semi-space-size=2']);
@@ -73,10 +81,14 @@ export function createChildHourRunner({ scriptPath, execPath = process.execPath,
   };
 }
 
-// readModel: { checkpoint(), repairCandidates({ fromHour, toHour }) } (read-only). runHour(hourIso): { done, terminate }.
-export function createScheduler({ readModel, runHour, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout,
-  log = () => {}, onFatal = null, safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
-  maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS }) {
+// readModel: { checkpoint(), repairCandidates({ fromHour, toHour }), projectionRepairCandidates({ fromHour, toHour }) }
+// (read-only). runHour(hourIso) / runProjectionRepair(hourIso): { done, terminate }. Without runProjectionRepair there is
+// no projection repair at all.
+export function createScheduler({ readModel, runHour, runProjectionRepair = null, now = () => Date.now(), setTimer = setTimeout,
+  clearTimer = clearTimeout, log = () => {}, onFatal = null, safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS,
+  baseBackoffMs = DEFAULT_BASE_BACKOFF_MS, maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS,
+  repairCooldownMs = REPAIR_COOLDOWN_MS, projectionRepairWindowHours = PROJECTION_REPAIR_WINDOW_HOURS,
+  projectionRepairCooldownMs = PROJECTION_REPAIR_COOLDOWN_MS }) {
   let stopped = false;
   let active = null; // the single in-flight run loop
   let child = null; // the single running child
@@ -84,11 +96,13 @@ export function createScheduler({ readModel, runHour, now = () => Date.now(), se
   let failures = 0;
   let retryAt = 0;
   const repairAttempts = new Map(); // hour start -> last attempt (ms)
-  const status = { lastRun: null, consecutiveFailures: 0, retryAt: null };
+  const projectionAttempts = new Map(); // hour start -> last projection repair attempt (ms)
+  let blockedSummary = '';
+  const status = { lastRun: null, consecutiveFailures: 0, retryAt: null, projectionRepairBlocked: null };
 
-  async function runChild(hourStart, kind) {
-    const handle = runHour(hourIso(hourStart));
-    child = handle;
+  async function runChild(hourStart, kind, runner = runHour) {
+    const handle = runner(hourIso(hourStart));
+    child = { kind, terminate: () => handle.terminate() };
     log(`SCHEDULER_CHILD_START kind=${kind} hour=${handle.hour}`);
     try {
       return await handle.done;
@@ -129,12 +143,37 @@ export function createScheduler({ readModel, runHour, now = () => Date.now(), se
       .find((hour) => nowMs - (repairAttempts.get(hour) ?? -Infinity) >= repairCooldownMs);
     for (const hour of repairAttempts.keys()) if (hour < fromHour) repairAttempts.delete(hour);
     const nextHourDue = (target + 2 * HOUR_SECONDS) * 1000 + safetyDelayMs;
-    if (candidate === undefined) return { again: false, wakeAt: nextHourDue };
-    repairAttempts.set(candidate, nowMs);
-    const outcome = await runChild(candidate, 'repair');
-    status.lastRun = { kind: 'repair', hour: hourIso(candidate), ...outcome };
-    log(`SCHEDULER_REPAIR_DONE hour=${hourIso(candidate)} exit=${outcome.exitCode}`);
+    if (candidate !== undefined) {
+      repairAttempts.set(candidate, nowMs);
+      const outcome = await runChild(candidate, 'repair');
+      status.lastRun = { kind: 'repair', hour: hourIso(candidate), ...outcome };
+      log(`SCHEDULER_REPAIR_DONE hour=${hourIso(candidate)} exit=${outcome.exitCode}`);
+      return { again: false, wakeAt: nextHourDue };
+    }
+    // Caught up and no family repair due: at most one projection-only repair, oldest eligible hour first.
+    if (!runProjectionRepair) return { again: false, wakeAt: nextHourDue };
+    const projectionFrom = checkpoint.hourStart - (projectionRepairWindowHours - 1) * HOUR_SECONDS;
+    const { hours, blocked } = readModel.projectionRepairCandidates({ fromHour: projectionFrom, toHour: checkpoint.hourStart });
+    for (const hour of projectionAttempts.keys()) if (hour < projectionFrom) projectionAttempts.delete(hour);
+    noteBlocked(blocked);
+    const projectionHour = hours.find((hour) => nowMs - (projectionAttempts.get(hour) ?? -Infinity) >= projectionRepairCooldownMs);
+    if (projectionHour === undefined) return { again: false, wakeAt: nextHourDue };
+    projectionAttempts.set(projectionHour, nowMs);
+    const outcome = await runChild(projectionHour, 'projection_repair', runProjectionRepair);
+    if (stopped) return { again: false };
+    status.lastRun = { kind: 'projection_repair', hour: hourIso(projectionHour), ...outcome };
+    log(`SCHEDULER_PROJECTION_REPAIR_DONE hour=${hourIso(projectionHour)} exit=${outcome.exitCode}`);
     return { again: false, wakeAt: nextHourDue };
+  }
+
+  // Hours waiting for a registry (never bootstrapped automatically): logged once per change, kept in status().
+  function noteBlocked(blocked) {
+    const counts = {};
+    for (const entry of blocked) counts[entry.reason] = (counts[entry.reason] ?? 0) + 1;
+    const summary = Object.keys(counts).sort().map((reason) => `${reason}:${counts[reason]}`).join(',');
+    status.projectionRepairBlocked = summary ? counts : null;
+    if (summary !== blockedSummary) log(`SCHEDULER_PROJECTION_REPAIR_BLOCKED ${summary || 'none'}`);
+    blockedSummary = summary;
   }
 
   function schedule(wakeAt) {
@@ -188,6 +227,6 @@ export function createScheduler({ readModel, runHour, now = () => Date.now(), se
       await child?.terminate();
       await active;
     },
-    status: () => ({ ...status, running: Boolean(child), stopped }),
+    status: () => ({ ...status, running: Boolean(child), stopped, runningKind: child?.kind ?? null }),
   });
 }
