@@ -1303,4 +1303,138 @@ await test('Borrow markets 7 with several markets listed, writes stay false and 
   }
 });
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Scope contract locks: Recent Activity columns, From/To semantics, Liquidity meaning, Volume as the primary metric.
+
+const SEMANTICS = scopeModule.ARC_INTELLIGENCE_FIELD_SEMANTICS;
+const scopeItem = (id) => SCOPE.flatMap((section) => section.items).find((entry) => entry.id === id);
+const RECENT_COLUMNS = [['recent-activity.time', 'Time (UTC)'], ['recent-activity.type', 'Type'], ['recent-activity.protocol', 'Protocol'],
+  ['recent-activity.pair', 'Pair'], ['recent-activity.amounts', 'Amount'], ['recent-activity.from', 'From'], ['recent-activity.to', 'To'],
+  ['recent-activity.transaction-links', 'Tx']];
+const TO_NOTE = 'From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.';
+const ROUTER_AS_RECIPIENT = /router|tx\.to|called contract|transaction recipient/i;
+const UI_CODE = [['component', componentSource], ['lib', libSource]];
+
+function assertToSemantics(tree, name) {
+  const text = textOf(sectionNode(tree, 'recent-activity'));
+  if (!text.includes(TO_NOTE)) throw new Error(`${name}: To semantics note missing`);
+  if (ROUTER_AS_RECIPIENT.test(text)) throw new Error(`${name}: a router or tx.to is presented as the recipient`);
+}
+function assertPendingField(tree, ids, name) {
+  for (const id of ids) {
+    const nodes = byAttr(tree, 'data-intel-item', id);
+    if (!nodes.length) throw new Error(`${name}: ${id} missing`);
+    for (const node of nodes) {
+      if (node.attrs['data-intel-status'] !== 'source_pending' || node.attrs['data-intel-value'] !== undefined) {
+        throw new Error(`${name}: ${id} is filled without its exact source`);
+      }
+    }
+  }
+}
+const LIQUIDITY_IDS = ['top-pools-v3.liquidity', 'top-pools-v4.liquidity'];
+const VOLUME_IDS = ['top-pools-v3.volume', 'top-pools-v4.volume', 'top-protocols.volume-ranking', 'volume-chart.volume', 'network.total-volume'];
+const LIQUIDITY_FROM_ACTIVITY = /liquidity[^\n]*(mintCount|burnCount|modifyLiquidityCount|addCount|removeCount|add_count|remove_count)|(mintCount|burnCount|modifyLiquidityCount)[^\n]*liquidity/i;
+const VOLUME_FROM_COUNTS = /\.sort\([^)\n]*swap|markerProps\(`\$\{id\}\.volume`|volume[^\n]*swapCount|swapCount[^\n]*volume/i;
+const NEW_POOLS_TILE = '<StatTile marker={markerProps(`${id}.new-pools`, newPools.status, newPools.raw)} label={`New pools, ${ctx.windowLabel}`} cell={newPools} />';
+
+await test('Contract 1 Recent Activity keeps Time, Type, Protocol, Pair, Amount, From, To and Tx, in that order, in every state', async () => {
+  const items = SCOPE.find((section) => section.id === 'recent-activity').items;
+  for (const id of ['recent-activity.protocol', 'recent-activity.from', 'recent-activity.to']) assert.equal(scopeItem(id)?.backend, 'pending', id);
+  assert.deepEqual(items.map((entry) => entry.id).filter((id) => RECENT_COLUMNS.some(([column]) => column === id)), RECENT_COLUMNS.map(([id]) => id),
+    'manifest keeps the column order');
+  for (const tab of ['all', 'swaps', 'adds', 'removes']) assert.ok(scopeItem(`recent-activity.${tab}`), tab);
+  for (const [name, { tree }] of Object.entries(rendered)) {
+    const section = sectionNode(tree, 'recent-activity');
+    for (const variant of ['md:grid', 'md:hidden']) {
+      const row = [...walk(section)].find((node) => (node.attrs.class ?? '').includes(variant)
+        && node.children.some((child) => child.attrs['data-intel-item'] === 'recent-activity.time'));
+      assert.ok(row, `${name} ${variant}`);
+      assert.deepEqual(row.children.map((child) => [child.attrs['data-intel-item'], textOf(child)]), RECENT_COLUMNS, `${name} ${variant} columns`);
+    }
+    assertPendingField(tree, RECENT_COLUMNS.map(([id]) => id), name);
+  }
+  for (const id of ['recent-activity.protocol', 'recent-activity.from', 'recent-activity.to']) {
+    const line = componentSource.split('\n').find((entry) => entry.includes(`item: '${id}'`));
+    const mutated = loadMutated(COMPONENT_PATH, componentSource.replace(`${line}\n`, ''));
+    assert.throws(() => checkScope(render(STATES.ready, mutated.ArcIntelligenceDashboard).tree, SCOPE), new RegExp(`item ${id.replace('.', '\\.')} not rendered`),
+      `dropping ${id} is caught`);
+  }
+});
+
+await test('Contract 2 From is the transaction sender; To is only an exact event recipient or owner, never tx.to or a router', async () => {
+  assert.match(SEMANTICS['recent-activity.protocol'].meaning, /exact protocol identity/);
+  assert.match(SEMANTICS['recent-activity.from'].meaning, /exact transaction sender/);
+  assert.match(SEMANTICS['recent-activity.from'].source, /verified block spine/);
+  assert.match(SEMANTICS['recent-activity.to'].meaning, /exact event-level recipient, owner or counterparty/);
+  for (const forbidden of ['tx.to', 'router', 'top-level transaction recipient', 'called contract']) {
+    assert.ok(SEMANTICS['recent-activity.to'].forbidden.includes(forbidden), forbidden);
+  }
+  assert.deepEqual([...SEMANTICS['recent-activity.to'].unavailableWhen], ['uniswap_v4_swap'], 'V4 swaps have no exact recipient: To is unavailable');
+  assert.doesNotMatch(scopeItem('recent-activity.to').label, ROUTER_AS_RECIPIENT);
+  for (const [name, { tree }] of Object.entries(rendered)) assertToSemantics(tree, name);
+  for (const [file, source] of UI_CODE) {
+    assert.equal(/txTo|tx\.to\b|transaction\.to\b|\brouter\b/i.exec(source), null, `${file}: no top-level transaction recipient or router feeds To`);
+  }
+  const mutated = componentSource.replace(TO_NOTE, 'To is the router that received the swap (tx.to).');
+  assert.notEqual(mutated, componentSource);
+  assert.throws(() => assertToSemantics(render(STATES.ready, loadMutated(COMPONENT_PATH, mutated).ArcIntelligenceDashboard).tree, 'mutated'),
+    /router or tx\.to is presented as the recipient|To semantics note missing/, 'labelling the router as the recipient is caught');
+});
+
+await test('Contract 3 Liquidity means value held in the pool: source_pending, never filled from add or remove activity', async () => {
+  assert.match(SEMANTICS['top-pools.liquidity'].meaning, /actual pool liquidity: value held in the pool/);
+  for (const forbidden of ['add or remove event count', 'mint, burn or modifyLiquidity activity', 'liquidity activity']) {
+    assert.ok(SEMANTICS['top-pools.liquidity'].forbidden.includes(forbidden), forbidden);
+  }
+  for (const id of LIQUIDITY_IDS) {
+    assert.equal(scopeItem(id).backend, 'pending', id);
+    assert.match(scopeItem(id).label, /value held in the pool/);
+    assert.doesNotMatch(scopeItem(id).label, /activity/i, `${id} is not liquidity activity`);
+  }
+  for (const [name, { tree }] of Object.entries(rendered)) {
+    assertPendingField(tree, LIQUIDITY_IDS, name);
+    for (const id of ['top-pools-v3', 'top-pools-v4']) assert.match(textOf(sectionNode(tree, id)), /Liquidity is the value held in the pool\./, `${name} ${id}`);
+  }
+  assert.equal(LIQUIDITY_FROM_ACTIVITY.exec(componentSource), null, 'no Liquidity value comes from add or remove counts');
+  const mutated = componentSource.replace(NEW_POOLS_TILE, `${NEW_POOLS_TILE}
+        <StatTile marker={markerProps(\`\${id}.liquidity\`, 'available', metricSum(family, ['mintCount', 'burnCount']))} label="Liquidity" cell={newPools} />`);
+  assert.notEqual(mutated, componentSource);
+  assert.ok(LIQUIDITY_FROM_ACTIVITY.test(mutated), 'the source check catches the mutation');
+  assert.throws(() => assertPendingField(render(STATES.ready, loadMutated(COMPONENT_PATH, mutated).ArcIntelligenceDashboard).tree, LIQUIDITY_IDS, 'mutated'),
+    /filled without its exact source/, 'filling Liquidity from mint and burn counts is caught');
+});
+
+await test('Contract 4 Volume stays the primary ranking and source_pending; swap counts appear only as labelled secondary data', async () => {
+  for (const forbidden of ['swap count', 'event count', 'raw token sum', 'usdc-only flow']) {
+    assert.ok(SEMANTICS['top-pools.volume'].forbidden.includes(forbidden), forbidden);
+  }
+  assert.match(SEMANTICS['top-pools.volume'].meaning, /primary ranking/);
+  assert.match(SEMANTICS['top-pools.swaps'].meaning, /secondary and labelled as a count/);
+  for (const version of ['v3', 'v4']) {
+    assert.match(scopeItem(`top-pools-${version}.volume`).label, /USD, the primary ranking/);
+    assert.match(scopeItem(`top-pools-${version}.swaps`).label, /secondary and labelled as a count/);
+  }
+  for (const [name, { tree }] of Object.entries(rendered)) {
+    assertPendingField(tree, VOLUME_IDS, name);
+    for (const id of ['top-pools-v3', 'top-pools-v4']) assert.match(textOf(sectionNode(tree, id)), /Pool rankings by USD volume will appear here/, `${name} ${id}`);
+    const protocols = textOf(sectionNode(tree, 'top-protocols'));
+    assert.match(protocols, /Ranked by USD volume Primary ranking\. Fixed order until volume is verified\./, name);
+    assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
+  }
+  const unitOf = (node) => textOf(node).match(/(swaps|lending actions|market actions|vault actions)$/)?.[1];
+  for (const node of byAttr(sectionNode(rendered.ready.tree, 'top-protocols'), 'data-intel-value')) {
+    assert.ok(unitOf(node), `${node.attrs['data-intel-item']}: a count is always shown with its unit`);
+  }
+  assert.equal(VOLUME_FROM_COUNTS.exec(componentSource), null, 'no Volume value or ranking comes from swap counts');
+  const swapsAsVolume = componentSource.replace(NEW_POOLS_TILE, `${NEW_POOLS_TILE}
+        <StatTile marker={markerProps(\`\${id}.volume\`, 'available', metricNumber(family, 'swapCount'))} label="Volume" cell={newPools} />`);
+  assert.ok(VOLUME_FROM_COUNTS.test(swapsAsVolume), 'the source check catches the mutation');
+  assert.throws(() => assertPendingField(render(STATES.ready, loadMutated(COMPONENT_PATH, swapsAsVolume).ArcIntelligenceDashboard).tree, VOLUME_IDS, 'mutated'),
+    /filled without its exact source/, 'filling Volume from swap counts is caught');
+  const unlabelled = componentSource.replace('<p className={LABEL}>Activity, last {ctx.windowLabel}</p>', '<p className={LABEL}>Ranking</p>');
+  assert.notEqual(unlabelled, componentSource);
+  assert.doesNotMatch(textOf(sectionNode(render(STATES.ready, loadMutated(COMPONENT_PATH, unlabelled).ArcIntelligenceDashboard).tree, 'top-protocols')),
+    /Activity, last 24H/, 'removing the secondary Activity label would fail the check above');
+});
+
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

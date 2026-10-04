@@ -107,9 +107,9 @@ export const ARC_INTELLIGENCE_UI_SCOPE: readonly ArcIntelligenceScopeSection[] =
     group: 'Markets',
     items: [
       pending('top-pools-v3.all-pairs', 'All verified V3 pairs, not only USDC pairs'),
-      pending('top-pools-v3.volume', 'Pool volume'),
-      pending('top-pools-v3.swaps', 'Pool swaps'),
-      pending('top-pools-v3.liquidity', 'Pool liquidity activity'),
+      pending('top-pools-v3.volume', 'Pool volume in USD, the primary ranking'),
+      pending('top-pools-v3.swaps', 'Pool swap count, secondary and labelled as a count'),
+      pending('top-pools-v3.liquidity', 'Pool liquidity: value held in the pool (TVL style)'),
       live('top-pools-v3.new-pools', 'New V3 pools in the window'),
       live('top-pools-v3.pool-count', 'Verified V3 pools tracked'),
     ],
@@ -120,9 +120,9 @@ export const ARC_INTELLIGENCE_UI_SCOPE: readonly ArcIntelligenceScopeSection[] =
     group: 'Markets',
     items: [
       pending('top-pools-v4.all-pairs', 'All verified V4 pairs, not only USDC pairs'),
-      pending('top-pools-v4.volume', 'Pool volume'),
-      pending('top-pools-v4.swaps', 'Pool swaps'),
-      pending('top-pools-v4.liquidity', 'Pool liquidity activity'),
+      pending('top-pools-v4.volume', 'Pool volume in USD, the primary ranking'),
+      pending('top-pools-v4.swaps', 'Pool swap count, secondary and labelled as a count'),
+      pending('top-pools-v4.liquidity', 'Pool liquidity: value held in the pool (TVL style)'),
       live('top-pools-v4.new-pools', 'New V4 pools in the window'),
     ],
   },
@@ -135,10 +135,13 @@ export const ARC_INTELLIGENCE_UI_SCOPE: readonly ArcIntelligenceScopeSection[] =
       pending('recent-activity.swaps', 'Swaps'),
       pending('recent-activity.adds', 'Adds'),
       pending('recent-activity.removes', 'Removes'),
+      pending('recent-activity.time', 'Time'),
       pending('recent-activity.type', 'Activity type'),
+      pending('recent-activity.protocol', 'Protocol'),
       pending('recent-activity.pair', 'Pair, all verified pairs'),
       pending('recent-activity.amounts', 'Token amounts'),
-      pending('recent-activity.time', 'Time'),
+      pending('recent-activity.from', 'From: transaction sender'),
+      pending('recent-activity.to', 'To: recipient or owner recorded by the event'),
       pending('recent-activity.transaction-links', 'Transaction links'),
     ],
   },
@@ -216,6 +219,34 @@ export const ARC_INTELLIGENCE_UI_SCOPE: readonly ArcIntelligenceScopeSection[] =
     ],
   },
 ]
+
+// Locked meaning of fields whose value is easy to substitute with something that only looks similar. A backend or UI
+// change may fill these fields only from the stated source; every listed substitute is forbidden, and a field without
+// its exact source stays source_pending (or unavailable for that row) rather than borrowing another number.
+export type ArcIntelligenceFieldSemantics = {
+  meaning: string
+  source: string
+  forbidden: readonly string[]
+  unavailableWhen?: readonly string[]
+}
+
+export const ARC_INTELLIGENCE_FIELD_SEMANTICS: Readonly<Record<string, ArcIntelligenceFieldSemantics>> = Object.freeze({
+  'recent-activity.protocol': Object.freeze({ meaning: 'exact protocol identity of the event', source: 'verified emitter (Uniswap V3 pool or V4 PoolManager)',
+    forbidden: Object.freeze(['guessed protocol', 'router or aggregator name']) }),
+  'recent-activity.from': Object.freeze({ meaning: 'exact transaction sender', source: 'verified block spine (top-level transaction from)',
+    forbidden: Object.freeze(['event sender field', 'router', 'guessed wallet']) }),
+  'recent-activity.to': Object.freeze({ meaning: 'exact event-level recipient, owner or counterparty with known semantics',
+    source: 'decoded event field (for example the V3 Swap recipient)',
+    forbidden: Object.freeze(['tx.to', 'router', 'top-level transaction recipient', 'called contract']),
+    unavailableWhen: Object.freeze(['uniswap_v4_swap']) }),
+  'top-pools.volume': Object.freeze({ meaning: 'valued swap volume of the pool, the primary ranking', source: 'raw swap flows valued in USD',
+    forbidden: Object.freeze(['swap count', 'event count', 'raw token sum', 'usdc-only flow']) }),
+  'top-pools.swaps': Object.freeze({ meaning: 'swap event count of the pool, secondary and labelled as a count', source: 'decoded swap events',
+    forbidden: Object.freeze(['ranking in place of volume']) }),
+  'top-pools.liquidity': Object.freeze({ meaning: 'actual pool liquidity: value held in the pool (TVL style)',
+    source: 'exact, defensible pool state; source_pending until one exists',
+    forbidden: Object.freeze(['add or remove event count', 'mint, burn or modifyLiquidity activity', 'liquidity activity', 'in-range liquidity units']) }),
+})
 
 // The only capabilities intentionally removed from the product: they need per-transaction receipts.
 export const ARC_INTELLIGENCE_REMOVED_SCOPE: readonly string[] = [

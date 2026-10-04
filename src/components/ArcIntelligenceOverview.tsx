@@ -767,8 +767,8 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
           { item: `${id}.liquidity`, label: 'Liquidity' },
         ]}
       >
-        <EmptyRows status="source_pending" title="Pool rankings will appear here"
-          detail={`Every verified Uniswap ${label} pair will be listed here, not only USDC pairs. Tokens without verified details show their shortened address.`} />
+        <EmptyRows status="source_pending" title="Pool rankings by USD volume will appear here"
+          detail={`Every verified Uniswap ${label} pair will be listed here, not only USDC pairs. Tokens without verified details show their shortened address. Liquidity is the value held in the pool.`} />
       </ShellTable>
     </section>
   )
@@ -776,6 +776,19 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Recent activity and launches
+
+// Permanent column order. From is the transaction sender; To is only an exact event-level recipient or owner (never the
+// called contract), and is unavailable for rows whose event records none (Uniswap V4 swaps).
+const RECENT_ACTIVITY_COLUMNS = [
+  { item: 'recent-activity.time', label: 'Time (UTC)' },
+  { item: 'recent-activity.type', label: 'Type' },
+  { item: 'recent-activity.protocol', label: 'Protocol' },
+  { item: 'recent-activity.pair', label: 'Pair' },
+  { item: 'recent-activity.amounts', label: 'Amount' },
+  { item: 'recent-activity.from', label: 'From' },
+  { item: 'recent-activity.to', label: 'To' },
+  { item: 'recent-activity.transaction-links', label: 'Tx' },
+]
 
 function RecentActivitySection({ ctx }: { ctx: ViewContext }) {
   const [tab, setTab] = useState<'all' | 'swaps' | 'adds' | 'removes'>('all')
@@ -798,18 +811,15 @@ function RecentActivitySection({ ctx }: { ctx: ViewContext }) {
         <p className="text-xs text-slate-600">Verified DEX activity feed is being completed</p>
       </div>
       <ShellTable
-        gridClass="grid-cols-[0.8fr_1.4fr_1.6fr_1fr_1fr]"
-        columns={[
-          { item: 'recent-activity.type', label: 'Type' },
-          { item: 'recent-activity.pair', label: 'Pair' },
-          { item: 'recent-activity.amounts', label: 'Amounts' },
-          { item: 'recent-activity.time', label: 'Time (UTC)' },
-          { item: 'recent-activity.transaction-links', label: 'Transaction' },
-        ]}
+        gridClass="grid-cols-[1fr_0.8fr_0.9fr_1.3fr_1.4fr_1fr_1fr_0.7fr]"
+        columns={RECENT_ACTIVITY_COLUMNS}
       >
         <EmptyRows title="No activity rows yet"
-          detail="Each swap, add and remove will appear here with its pair, token amounts, time and a link to the transaction on the Arc explorer." />
+          detail="Each swap, add and remove will appear here with its time, protocol, pair, token amounts, sender, recipient where the event records one, and a link to the transaction on the Arc explorer." />
       </ShellTable>
+      <p className="mt-1 text-[11px] leading-4 text-slate-400">
+        From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.
+      </p>
     </section>
   )
 }
