@@ -1,5 +1,5 @@
-// Vercel /api/intelligence: a strict read-only proxy to the compact Machina Intelligence API on Railway. Twelve exact
-// requests map to twelve fixed upstream URLs from a table; no user input is ever concatenated into a path or origin. The
+// Vercel /api/intelligence: a strict read-only proxy to the compact Machina Intelligence API on Railway. Twenty exact
+// requests map to twenty fixed upstream URLs from a table; no user input is ever concatenated into a path or origin. The
 // upstream body is forwarded byte for byte only after it parses as a JSON object of the expected schema, so a domain-level
 // `unavailable` (for example insufficient_coverage) stays an HTTP 200, while a failure of the upstream itself becomes a
 // fixed, sanitized error. Data routes are CDN-cacheable (completed-hour data; freshness is inside the payload); health and
@@ -18,24 +18,36 @@ export const NO_STORE = 'no-store'
 const JSON_TYPE = 'application/json; charset=utf-8'
 
 // The only upstream requests that exist. view=health takes no window; summary and timeseries take exactly one window;
-// pools takes exactly a protocol and a window; activity takes exactly a type.
+// pools takes exactly a protocol and a window; activity takes exactly a type. 7D and 30D follow the same rules as 24H.
 const HEALTH_ROUTE = Object.freeze({ path: '/health', check: (body) => body.status === 'ok', cacheable: false })
 const WINDOWED_ROUTES = Object.freeze({
   summary: Object.freeze({
     '1h': Object.freeze({ path: '/v1/intelligence/summary?window=1h', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
     '6h': Object.freeze({ path: '/v1/intelligence/summary?window=6h', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
     '24h': Object.freeze({ path: '/v1/intelligence/summary?window=24h', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
+    '7d': Object.freeze({ path: '/v1/intelligence/summary?window=7d', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
+    '30d': Object.freeze({ path: '/v1/intelligence/summary?window=30d', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
   }),
   timeseries: Object.freeze({
     '6h': Object.freeze({ path: '/v1/intelligence/timeseries?window=6h', check: (body) => body.schema === TIMESERIES_SCHEMA, cacheable: true }),
     '24h': Object.freeze({ path: '/v1/intelligence/timeseries?window=24h', check: (body) => body.schema === TIMESERIES_SCHEMA, cacheable: true }),
+    '7d': Object.freeze({ path: '/v1/intelligence/timeseries?window=7d', check: (body) => body.schema === TIMESERIES_SCHEMA, cacheable: true }),
+    '30d': Object.freeze({ path: '/v1/intelligence/timeseries?window=30d', check: (body) => body.schema === TIMESERIES_SCHEMA, cacheable: true }),
   }),
 })
-const isPools = (body, protocol) => body.schema === POOLS_SCHEMA && body.protocol === protocol && body.window?.key === '24h'
+const isPools = (body, protocol, window) => body.schema === POOLS_SCHEMA && body.protocol === protocol && body.window?.key === window
 const isActivity = (body, type) => body.schema === ACTIVITY_SCHEMA && body.type === type
 const POOLS_ROUTES = Object.freeze({
-  v3: Object.freeze({ '24h': Object.freeze({ path: '/v1/intelligence/pools?protocol=v3&window=24h', check: (body) => isPools(body, 'v3'), cacheable: true }) }),
-  v4: Object.freeze({ '24h': Object.freeze({ path: '/v1/intelligence/pools?protocol=v4&window=24h', check: (body) => isPools(body, 'v4'), cacheable: true }) }),
+  v3: Object.freeze({
+    '24h': Object.freeze({ path: '/v1/intelligence/pools?protocol=v3&window=24h', check: (body) => isPools(body, 'v3', '24h'), cacheable: true }),
+    '7d': Object.freeze({ path: '/v1/intelligence/pools?protocol=v3&window=7d', check: (body) => isPools(body, 'v3', '7d'), cacheable: true }),
+    '30d': Object.freeze({ path: '/v1/intelligence/pools?protocol=v3&window=30d', check: (body) => isPools(body, 'v3', '30d'), cacheable: true }),
+  }),
+  v4: Object.freeze({
+    '24h': Object.freeze({ path: '/v1/intelligence/pools?protocol=v4&window=24h', check: (body) => isPools(body, 'v4', '24h'), cacheable: true }),
+    '7d': Object.freeze({ path: '/v1/intelligence/pools?protocol=v4&window=7d', check: (body) => isPools(body, 'v4', '7d'), cacheable: true }),
+    '30d': Object.freeze({ path: '/v1/intelligence/pools?protocol=v4&window=30d', check: (body) => isPools(body, 'v4', '30d'), cacheable: true }),
+  }),
 })
 const ACTIVITY_ROUTES = Object.freeze({
   all: Object.freeze({ path: '/v1/intelligence/activity?type=all', check: (body) => isActivity(body, 'all'), cacheable: true }),

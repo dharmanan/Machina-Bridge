@@ -22,8 +22,9 @@ import {
   formatUsdCompact,
   formatUsdMicros,
   formatUtcDateTime,
+  formatUtcDay,
   formatUtcHour,
-  formatUtcHourRange,
+  formatUtcPeriodRange,
   isFiniteNumber,
   loadArcBorrowMarkets,
   loadArcIntelligence,
@@ -36,6 +37,8 @@ import {
   shortenMarketId,
   usdMicrosToNumber,
   usdVolumeStatus,
+  V4_SWAP_TO_BLOCKER,
+  V4_SWAP_TO_TEXT,
   verifiedAssetItems,
   windowStatus,
   type ArcActivity,
@@ -49,6 +52,8 @@ import {
   type FamilyWindow,
   type IntelligenceDataStatus,
   type PoolToken,
+  type ProtocolUsd,
+  type SwapFeesWindow,
   type UsdVolumeWindow,
 } from '../lib/arcIntelligence'
 
@@ -63,13 +68,15 @@ type Mode = 'loading' | 'ready' | 'history' | 'failed'
 type ViewContext = {
   mode: Mode
   windowLabel: string
-  // 24H charts are hourly; 7D and 30D charts are daily.
+  // 24H charts are hourly; 7D and 30D charts are daily (24-hour periods ending at the latest verified hour).
   period: 'hour' | 'day'
+  // hours the selected window covers once complete (24, 168 or 720)
+  windowHours: number
   historyNote: string
   summary: ArcSummary | null
   timeseries: ArcTimeseries | null
   collectingNote: string
-  // 24H pools and recent activity reads (null when a read failed or the view is not ready)
+  // Pools of the selected window and recent activity (null when a read failed or the view is not ready)
   pools: { v3: ArcPools | null; v4: ArcPools | null } | null
   activity: Partial<Record<ArcActivityType, ArcActivity | null>> | null
   // Arc explorer base URL for transaction links, passed in by the page; without it a hash is shown as text
@@ -124,6 +131,42 @@ function noteFor(ctx: ViewContext, status: DisplayStatus, pendingNote = 'Not ava
   if (status === 'unavailable') return ctx.mode === 'failed' ? 'Could not be loaded right now' : 'Not verified for this window'
   if (status === 'source_pending') return pendingNote
   return undefined
+}
+
+// Plain words for every reason a value is not shown. A reason never becomes a number, and an unknown one reads as not verified.
+const REASON_TEXT: Record<string, string> = {
+  insufficient_coverage: 'History is still being collected.',
+  valuation_not_ready: 'USD valuation rows are missing from this snapshot.',
+  valuation_not_processed: 'Some hours of this window are not valued yet.',
+  valuation_hour_unavailable: 'Some hours of this window have no verified USD value.',
+  prices_unavailable: 'No verified price for a token in some hour of this window.',
+  no_verified_price: 'No verified price',
+  fee_inputs_unavailable: 'Fee details of some swaps are missing.',
+  family_hour_unavailable: 'Some hours of this window are not verified.',
+  family_not_processed: 'Some hours of this window are not verified yet.',
+  unverified_token: 'Includes a token that is not a verified Arc asset, so it has no USD value.',
+  decimals_mismatch: 'Token units do not match the verified asset, so no USD value is given.',
+  tvl_not_collected: 'Pool holdings have not been read yet. They are read every hour for the top pools.',
+  tvl_not_collected_for_pool: 'Holdings are read for the top pools of the latest hour only.',
+  hook_may_hold_pool_value: 'This pool\'s hook may hold part of its value, so its holdings are not stated.',
+  tvl_scan_unbounded: 'This pool has too many price ranges to read its holdings exactly.',
+  tvl_state_inconsistent: 'Pool holdings could not be read consistently.',
+  tick_out_of_range: 'Pool holdings could not be read consistently.',
+  balance_unreadable: 'A token balance of this pool could not be read.',
+  pool_not_initialized: 'This pool has no price yet.',
+  identity_retention_exceeded: 'Unique addresses are counted within 24H only. Longer windows would count the same address more than once.',
+}
+const reasonText = (reason: string | null | undefined, fallback = 'Not verified for this window.') => (reason && REASON_TEXT[reason]) || fallback
+
+// The first reason that explains an unavailable entry: a specific hour reason before the generic window reason.
+const firstReason = (entry: { reason?: string | null; reasons?: string[] } | null | undefined) =>
+  entry?.reasons?.find((reason) => reason in REASON_TEXT) ?? entry?.reason ?? null
+
+// "History is still being collected (52 of 168 hours so far)." while a long window fills.
+function collectingText(ctx: ViewContext): string {
+  const stored = ctx.summary ? Math.min(ctx.summary.coverage.storedHours, ctx.windowHours) : 0
+  return stored > 0 && stored < ctx.windowHours ? `History is still being collected (${stored} of ${ctx.windowHours} hours so far).`
+    : 'History is still being collected.'
 }
 
 function numberCell(ctx: ViewContext, entry: { status: string; reason?: string } | null | undefined, value: number | null,
@@ -256,9 +299,10 @@ function EmptyState({ status, title, detail, className = '' }: { status: Display
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Chart: hourly bars with axes, UTC hour labels, honest gaps and a hover or tap tooltip.
+// Chart: hourly (24H) or daily (7D, 30D) bars with axes, UTC labels, honest gaps and a hover or tap tooltip.
 
-type ChartPoint = { start: string; end: string; values: number[] | null }
+// note: why a gap has no value (a day still filling says how many of its hours are stored)
+type ChartPoint = { start: string; end: string; values: number[] | null; note?: string }
 type ChartSeries = { name: string; barClass: string }
 
 function niceMax(value: number): number {
@@ -273,13 +317,14 @@ const pointTotal = (point: ChartPoint) => (point.values ? point.values.reduce((s
 const withUnit = (text: string, unit: string) => (unit ? `${text} ${unit}` : text)
 
 // format: how one bar value reads (counts by default; USD charts pass a dollar format and no unit).
-function BarChart({ points, series, unit, format = formatCount, axisFormat = formatCompact }: { points: ChartPoint[]; series: ChartSeries[]; unit: string;
-  format?: (value: number) => string; axisFormat?: (value: number) => string }) {
+function BarChart({ points, series, unit, period = 'hour', format = formatCount, axisFormat = formatCompact }: { points: ChartPoint[]; series: ChartSeries[];
+  unit: string; period?: 'hour' | 'day'; format?: (value: number) => string; axisFormat?: (value: number) => string }) {
   const [active, setActive] = useState<number | null>(null)
   const totals = points.map(pointTotal)
   const max = niceMax(Math.max(0, ...totals.filter((total): total is number => total !== null)))
   const count = points.length
-  const labelEvery = count > 12 ? 6 : 2
+  const labelEvery = period === 'day' ? (count > 12 ? 5 : 1) : count > 12 ? 6 : 2
+  const range = (point: ChartPoint) => formatUtcPeriodRange(point.start, point.end, period)
   const activePoint = active === null ? null : points[active]
   const activeShare = active === null ? 0 : (active + 0.5) / count
   const shift = activeShare < 0.2 ? '-10%' : activeShare > 0.8 ? '-90%' : '-50%'
@@ -297,8 +342,8 @@ function BarChart({ points, series, unit, format = formatCount, axisFormat = for
           {points.map((point, index) => {
             const total = totals[index]
             const label = point.values && total !== null
-              ? `${formatUtcHourRange(point.start, point.end)}: ${withUnit(format(total), unit)}`
-              : `${formatUtcHourRange(point.start, point.end)}: no verified data`
+              ? `${range(point)}: ${withUnit(format(total), unit)}`
+              : `${range(point)}: ${point.note ?? 'no verified data'}`
             return (
               <button key={point.start} type="button" aria-label={label} onMouseEnter={() => setActive(index)}
                 onFocus={() => setActive(index)} onClick={() => setActive(index)}
@@ -322,7 +367,7 @@ function BarChart({ points, series, unit, format = formatCount, axisFormat = for
         {activePoint && (
           <div className="pointer-events-none absolute top-0 z-10 w-max max-w-[240px] rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg"
             style={{ left: `calc(2.75rem + (100% - 2.75rem) * ${activeShare})`, transform: `translateX(${shift})` }}>
-            <p className="font-semibold text-slate-900">{formatUtcHourRange(activePoint.start, activePoint.end)}</p>
+            <p className="font-semibold text-slate-900">{range(activePoint)}</p>
             {activePoint.values ? (
               <div className="mt-1 space-y-0.5">
                 {series.length > 1 && activePoint.values.map((value, index) => (
@@ -336,7 +381,7 @@ function BarChart({ points, series, unit, format = formatCount, axisFormat = for
                 </p>
               </div>
             ) : (
-              <p className="mt-1 text-slate-500">No verified data for this hour yet</p>
+              <p className="mt-1 text-slate-500">{activePoint.note ?? `No verified data for this ${period} yet`}</p>
             )}
           </div>
         )}
@@ -345,19 +390,23 @@ function BarChart({ points, series, unit, format = formatCount, axisFormat = for
         {points.map((point, index) => (
           <span key={point.start} className="relative h-4 min-w-0 flex-1">
             {index % labelEvery === 0 && (
-              <span className="absolute left-0 whitespace-nowrap text-[10px] tabular-nums text-slate-400">{formatUtcHour(point.start)}</span>
+              <span className="absolute left-0 whitespace-nowrap text-[10px] tabular-nums text-slate-400">
+                {period === 'day' ? formatUtcDay(point.start) : formatUtcHour(point.start)}
+              </span>
             )}
           </span>
         ))}
       </div>
-      <p className="mt-1 text-right text-[10px] text-slate-400">Hours in UTC</p>
+      <p className="mt-1 text-right text-[10px] text-slate-400">
+        {period === 'day' ? 'Days in UTC, each the 24 hours ending at the same hour as the latest verified hour' : 'Hours in UTC'}
+      </p>
     </div>
   )
 }
 
 // Latest complete hour (chronologically last verified hour) and peak hour, labeled separately.
-function HourReadout({ item, status, points, unit, period = 'hour', format = formatCount }: { item: string; status: DisplayStatus; points: ChartPoint[]; unit: string;
-  period?: 'hour' | 'day'; format?: (value: number) => string }) {
+function HourReadout({ item, status, points, unit, period = 'hour', format = formatCount, note }: { item: string; status: DisplayStatus; points: ChartPoint[];
+  unit: string; period?: 'hour' | 'day'; format?: (value: number) => string; note?: string }) {
   const verified = points.filter((point) => point.values)
   const latest = verified[verified.length - 1] ?? null
   const peak = verified.reduce<ChartPoint | null>((best, point) => (best === null || (pointTotal(point) ?? 0) > (pointTotal(best) ?? 0) ? point : best), null)
@@ -373,10 +422,12 @@ function HourReadout({ item, status, points, unit, period = 'hour', format = for
               <p className="text-sm font-semibold tabular-nums text-slate-950">
                 {format(pointTotal(point) ?? 0)}{unit && <span className="font-normal text-slate-500"> {unit}</span>}
               </p>
-              <p className="text-[11px] text-slate-400">{formatUtcHourRange(point.start, point.end)}</p>
+              <p className="text-[11px] text-slate-400">{formatUtcPeriodRange(point.start, point.end, period)}</p>
             </>
-          ) : (
+          ) : status === 'loading' ? (
             <div className="mt-1.5"><span aria-hidden="true" className="inline-block h-3 w-16 rounded bg-slate-100 align-middle" /></div>
+          ) : (
+            <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{note ?? STATUS_TEXT[shown]}</p>
           )}
         </div>
       ))}
@@ -390,13 +441,21 @@ function chartStatus(ctx: ViewContext, points: ChartPoint[] | null): DisplayStat
   return points.some((point) => point.values) ? 'available' : 'collecting'
 }
 
+// Why one hour or day of the USD chart has no value.
+const GAP_TEXT: Record<string, string> = { valuation_not_processed: 'not valued yet', valuation_not_ready: 'not valued yet',
+  prices_unavailable: 'no verified price', fee_inputs_unavailable: 'no verified data' }
+
+// A day still filling says how many of its hours are stored; it is a gap, never a partial total.
+const bucketNote = (bucket: ArcTimeseries['buckets'][number]) => (bucket.status === 'incomplete' && isFiniteNumber(bucket.storedHours)
+  ? `${bucket.storedHours} of 24 hours stored so far` : undefined)
+
 function swapPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
   if (!timeseries) return null
   return timeseries.buckets.map((bucket) => {
     const v3 = bucket.status === 'committed' ? bucket.families?.uniswapV3 : undefined
     const v4 = bucket.status === 'committed' ? bucket.families?.uniswapV4 : undefined
     const complete = v3?.status === 'available' && v4?.status === 'available' && isFiniteNumber(v3.swapCount) && isFiniteNumber(v4.swapCount)
-    return { start: bucket.start, end: bucket.end, values: complete ? [v3.swapCount as number, v4.swapCount as number] : null }
+    return { start: bucket.start, end: bucket.end, values: complete ? [v3.swapCount as number, v4.swapCount as number] : null, note: bucketNote(bucket) }
   })
 }
 
@@ -407,7 +466,8 @@ function usdPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
     const hour = bucket.status === 'committed' ? bucket.dexUsdVolume : null
     const v3 = hour?.status === 'available' ? usdMicrosToNumber(hour.uniswapV3UsdMicros) : null
     const v4 = hour?.status === 'available' ? usdMicrosToNumber(hour.uniswapV4UsdMicros) : null
-    return { start: bucket.start, end: bucket.end, values: v3 !== null && v4 !== null ? [v3, v4] : null }
+    return { start: bucket.start, end: bucket.end, values: v3 !== null && v4 !== null ? [v3, v4] : null,
+      note: bucketNote(bucket) ?? (hour?.status === 'unavailable' ? GAP_TEXT[hour.reason ?? ''] : undefined) }
   })
 }
 
@@ -426,6 +486,12 @@ const unvaluedSwapsIn = (timeseries: ArcTimeseries | null) => (timeseries?.bucke
   const hour = bucket.status === 'committed' ? bucket.dexUsdVolume : null
   return total + (hour?.status === 'available' && isFiniteNumber(hour.unvaluedSwaps) ? hour.unvaluedSwaps : 0)
 }, 0)
+
+// The reason the USD chart has no valued hour: the first stored hour's own reason, in plain words.
+function usdGapReason(timeseries: ArcTimeseries | null): string {
+  const reason = timeseries?.buckets.find((bucket) => bucket.status === 'committed' && bucket.dexUsdVolume?.status === 'unavailable')?.dexUsdVolume?.reason
+  return reasonText(reason, 'No hour of this window has a verified USD value.')
+}
 
 const usdText = (value: number) => formatUsdCompact(value)
 
@@ -464,12 +530,29 @@ function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
   )
 }
 
+const DEX_VOLUME_SCOPE = 'USD-valued Uniswap V3 and V4 swaps on Arc.'
+
+// Note of a USD entry that is not shown: the window still filling, hours not valued yet, or the exact reason.
+function usdNote(ctx: ViewContext, status: DisplayStatus, entry: { reason?: string | null; reasons?: string[]; unavailableHours?: string[] } | null | undefined, pending: string): string | undefined {
+  if (status === 'source_pending') return pending
+  if ((status === 'collecting' || status === 'unavailable') && ctx.mode === 'ready') {
+    const reason = entry?.reason === 'insufficient_coverage' ? collectingText(ctx) : reasonText(firstReason(entry))
+    const missing = entry?.unavailableHours?.length ?? 0
+    const backfillCutoff = Date.parse(ctx.summary?.window.end ?? '') - 72 * 3_600_000
+    const olderMissing = entry?.unavailableHours?.some((hour) => Date.parse(hour) < backfillCutoff) ?? false
+    const backfillLimit = ctx.windowHours > 72 && olderMissing
+      ? ' The historical valuation backfill covers the latest 72 hours at most; older missing hours require additional verified history.' : ''
+    return `${reason}${missing > 0 ? ' Some hourly valuations are missing in this window.' : ''}${backfillLimit}`
+  }
+  return noteFor(ctx, status)
+}
+
 // Total DEX USD volume of the window. An API without USD valuation reads as not available yet; a window whose hours are
-// not all valued yet is collecting; anything else missing is unavailable. Never a number without its verified source.
+// not all valued yet is collecting; anything else missing is unavailable with its reason. Never a number without its source.
 function usdVolumeCell(ctx: ViewContext, entry: UsdVolumeWindow | null | undefined): Cell {
   if (ctx.mode !== 'ready') {
     const status = liveStatus(ctx, null)
-    return { status, note: noteFor(ctx, status) }
+    return { status, note: `${DEX_VOLUME_SCOPE} ${noteFor(ctx, status) ?? ''}`.trim() }
   }
   const status = usdVolumeStatus(entry)
   const value = status === 'available' ? usdMicrosToNumber(entry?.totalUsdMicros) : null
@@ -477,14 +560,35 @@ function usdVolumeCell(ctx: ViewContext, entry: UsdVolumeWindow | null | undefin
     return { status, raw: entry.totalUsdMicros, text: usdText(value), title: formatUsdMicros(entry.totalUsdMicros) }
   }
   const shown: DisplayStatus = status === 'available' ? 'unavailable' : status
-  if (shown === 'collecting') return { status: shown, note: 'USD volume appears once every hour of the window is valued.' }
-  return { status: shown, note: noteFor(ctx, shown) }
+  return { status: shown, note: `${DEX_VOLUME_SCOPE} ${usdNote(ctx, shown, entry, 'Verified data does not include DEX USD valuations yet.')}` }
+}
+
+// Estimated average swap fee: estimated pool fees / valued swaps. Same states as the
+// volume; a window without a valued swap has no average, never a zero.
+function averageFeeCell(ctx: ViewContext, entry: SwapFeesWindow | null | undefined): Cell {
+  if (ctx.mode !== 'ready') {
+    const status = liveStatus(ctx, null)
+    return { status, note: noteFor(ctx, status) }
+  }
+  const status = usdVolumeStatus(entry)
+  if (status === 'available' && entry?.averageFeeUsdMicros && entry.totalFeeUsdMicros) {
+    const value = usdMicrosToNumber(entry.averageFeeUsdMicros)
+    if (value !== null) return { status, raw: entry.averageFeeUsdMicros, text: usdText(value), title: formatUsdMicros(entry.averageFeeUsdMicros) }
+  }
+  if (status === 'available') return { status: 'unavailable', note: 'No valued swaps in this window, so there is no average fee.' }
+  return { status, note: usdNote(ctx, status, entry, 'Verified data does not include estimated swap fees yet.') }
+}
+
+// Unique active addresses: exact within 24H; over 7D and 30D never counted, because identities are kept for one day only.
+function activeAddressesCell(ctx: ViewContext): Cell {
+  const uniques = ctx.summary?.network?.uniqueActiveAddresses ?? null
+  if (ctx.mode === 'ready' && ctx.windowHours > 24) return { status: 'unavailable', note: reasonText('identity_retention_exceeded') }
+  return numberCell(ctx, uniques, uniques && isFiniteNumber(uniques.value) ? uniques.value : null, formatCount)
 }
 
 function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }) {
   const network = ctx.summary?.network ?? null
-  const uniques = network?.uniqueActiveAddresses ?? null
-  const active = numberCell(ctx, uniques, uniques && isFiniteNumber(uniques.value) ? uniques.value : null, formatCount)
+  const active = activeAddressesCell(ctx)
   const transactions = numberCell(ctx, network, network && isFiniteNumber(network.transactions) ? network.transactions : null, formatCount)
   const previous = network?.previous
   const previousUniques = previous?.uniqueActiveAddresses
@@ -504,9 +608,17 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
   const previousVolume = usdVolume?.previous?.status === 'available' ? usdMicrosToNumber(usdVolume.previous.totalUsdMicros) : null
   const volumeDelta = volume.status === 'available' ? percentChange(usdMicrosToNumber(String(volume.raw)), previousVolume) : null
   const unvalued = usdVolume?.status === 'available' && isFiniteNumber(usdVolume.unvaluedSwaps) ? usdVolume.unvaluedSwaps : 0
-  const volumeCaption = `Uniswap V3 and V4 swaps, last ${ctx.windowLabel}.${unvalued > 0
+  const volumeCaption = `${DEX_VOLUME_SCOPE} Total, last ${ctx.windowLabel}.${unvalued > 0
     ? ` ${formatCount(unvalued)} swaps without a verified price excluded.` : ''}`
-  const fee: Cell = { status: 'source_pending', note: 'Fee data is not available yet.' }
+  const swapFees = ctx.summary?.dex.swapFees
+  const fee = averageFeeCell(ctx, swapFees)
+  const previousFee = swapFees?.previous?.status === 'available' ? usdMicrosToNumber(swapFees.previous.averageFeeUsdMicros) : null
+  const feeDelta = fee.status === 'available' ? percentChange(usdMicrosToNumber(String(fee.raw)), previousFee) : null
+  const feeTotal = fee.status === 'available' ? usdMicrosToNumber(swapFees?.totalFeeUsdMicros) : null
+  const unvaluedFees = fee.status === 'available' && isFiniteNumber(swapFees?.unvaluedSwaps) ? swapFees.unvaluedSwaps : 0
+  const feeCaption = `Estimated pool fee per valued Uniswap V3 and V4 swap, last ${ctx.windowLabel}. Does not include per step rounding or hook fees.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
+    ? ` ${usdText(feeTotal)} estimated across ${formatCount(swapFees.valuedSwaps)} swaps.` : ''}${unvaluedFees > 0
+    ? ` ${formatCount(unvaluedFees)} swaps without a valued fee excluded.` : ''}`
 
   return (
     <section data-intel-section="network" aria-label="Network Activity" className="space-y-4">
@@ -517,8 +629,8 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
           caption={`Unique addresses, last ${ctx.windowLabel}`} />
         <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.windowLabel}
           caption={`Total transactions, last ${ctx.windowLabel}`} />
-        <KpiCard item="network.total-volume" label="Total Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.windowLabel} caption={volumeCaption} />
-        <KpiCard item="network.average-fee" label="Average Fee" cell={fee} windowLabel={ctx.windowLabel} caption="" />
+        <KpiCard item="network.total-volume" label="DEX Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.windowLabel} caption={volumeCaption} />
+        <KpiCard item="network.average-fee" label="Estimated Average Swap Fee" cell={fee} delta={feeDelta} windowLabel={ctx.windowLabel} caption={feeCaption} />
       </div>
       <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
         {([
@@ -556,8 +668,8 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
       <CardTitle
         title={tab === 'volume' ? 'DEX Volume' : 'DEX Swaps'}
         subtitle={tab === 'volume'
-          ? `USD value of swaps per UTC ${ctx.period} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Each swap is counted once.`
-          : `Swap events per UTC ${ctx.period} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Counts, not amounts.`}
+          ? `${DEX_VOLUME_SCOPE} USD value per ${ctx.period === 'day' ? 'day' : 'UTC hour'} across all verified pairs, last ${ctx.windowLabel}. Each swap is counted once.`
+          : `Swap events per ${ctx.period === 'day' ? 'day' : 'UTC hour'} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Counts, not amounts.`}
         right={(
           <div role="tablist" aria-label="DEX chart" className="flex gap-1.5">
             <TabButton selected={tab === 'volume'} onClick={() => setTab('volume')} marker={markerProps('volume-chart.volume', usdStatus)}>Volume</TabButton>
@@ -568,8 +680,8 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
       {tab === 'volume' ? (
         usdStatus === 'available' && usd ? (
           <>
-            <HourReadout item="volume-chart.latest" status={usdStatus} points={usd} unit="" format={usdText} />
-            <BarChart points={usd} series={series} unit="" format={usdText} axisFormat={usdText} />
+            <HourReadout item="volume-chart.latest" status={usdStatus} points={usd} unit="" period={ctx.period} format={usdText} />
+            <BarChart points={usd} series={series} unit="" period={ctx.period} format={usdText} axisFormat={usdText} />
             <p className="mt-1 text-[11px] leading-4 text-slate-400">
               Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools.
               {unvalued > 0 && ` ${formatCount(unvalued)} swaps between tokens without a verified price are not included.`}
@@ -577,27 +689,30 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
           </>
         ) : (
           <>
-            <HourReadout item="volume-chart.latest" status={usdStatus} points={[]} unit="" period={ctx.period} />
+            <HourReadout item="volume-chart.latest" status={usdStatus} points={[]} unit="" period={ctx.period}
+              note={usdStatus === 'collecting' ? 'Not valued yet' : undefined} />
             <EmptyState status={usdStatus} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
               title={usdStatus === 'source_pending' ? 'DEX volume is not available yet'
                 : ctx.mode === 'history' ? 'History is still being collected'
-                  : usdStatus === 'collecting' ? 'DEX volume is still being collected' : 'Hourly DEX volume is not available right now'}
-              detail={usdStatus === 'source_pending' ? 'Swap counts are available in the Swaps tab.'
+                  : usdStatus === 'collecting' ? 'DEX volume is still being collected' : `DEX volume per ${ctx.period} is not available right now`}
+              detail={usdStatus === 'source_pending' ? 'Verified data does not include hourly DEX USD valuations yet. Swap counts are available in the Swaps tab.'
                 : ctx.mode === 'history' ? ctx.historyNote
-                  : usdStatus === 'collecting' ? 'Hours appear here once their swaps are valued.' : noteFor(ctx, usdStatus)} />
+                  : usdStatus === 'collecting' ? `${ctx.period === 'day' ? 'Days' : 'Hours'} appear here once their swaps are valued.`
+                    : ctx.mode === 'ready' ? usdGapReason(ctx.timeseries) : noteFor(ctx, usdStatus)} />
           </>
         )
       ) : status === 'available' && points ? (
         <>
-          <HourReadout item="volume-chart.latest" status={status} points={points} unit="swaps" />
-          <BarChart points={points} series={series} unit="swaps" />
+          <HourReadout item="volume-chart.latest" status={status} points={points} unit="swaps" period={ctx.period} />
+          <BarChart points={points} series={series} unit="swaps" period={ctx.period} />
         </>
       ) : (
         <>
           <HourReadout item="volume-chart.latest" status={status} points={[]} unit="swaps" period={ctx.period} />
           <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
-            title={ctx.mode === 'history' ? 'History is still being collected' : 'Hourly swaps are not available right now'}
-            detail={ctx.mode === 'history' ? ctx.historyNote : noteFor(ctx, status)} />
+            title={ctx.mode === 'history' ? 'History is still being collected' : status === 'collecting' ? 'History is still being collected'
+              : `Swaps per ${ctx.period} are not available right now`}
+            detail={ctx.mode === 'history' ? ctx.historyNote : status === 'collecting' ? collectingText(ctx) : noteFor(ctx, status)} />
         </>
       )}
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
@@ -609,14 +724,17 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
   )
 }
 
+// Hourly only: a day's unique addresses cannot be built from hourly counts, and identities are kept for one day only, so 7D
+// and 30D state that instead of drawing a sum.
 function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
-  const points = ctx.mode === 'ready' ? addressPoints(ctx.timeseries) : null
-  const status = chartStatus(ctx, points)
+  const daily = ctx.period === 'day'
+  const points = ctx.mode === 'ready' && !daily ? addressPoints(ctx.timeseries) : null
+  const status: DisplayStatus = daily && ctx.mode === 'ready' ? 'unavailable' : chartStatus(ctx, points)
   return (
     <section data-intel-section="active-addresses-chart" aria-label="Active Addresses" className={`${CARD} min-w-0 lg:col-span-2`}>
       <CardTitle title="Active Addresses"
-        subtitle={ctx.mode === 'history'
-          ? `Unique addresses per day, last ${ctx.windowLabel}.`
+        subtitle={daily
+          ? 'Unique addresses are counted per UTC hour, within the 24H view.'
           : 'Unique addresses active in each UTC hour. Hourly values are not added together.'} />
       <div {...markerProps('active-addresses-chart.series', status)}>
         {status === 'available' && points ? (
@@ -624,12 +742,18 @@ function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
             <HourReadout item="active-addresses-chart.latest" status={status} points={points} unit="addresses" />
             <BarChart points={points} series={[{ name: 'Active addresses', barClass: ADDRESS_BAR }]} unit="addresses" />
           </>
+        ) : daily && ctx.mode === 'ready' ? (
+          <>
+            <HourReadout item="active-addresses-chart.latest" status={status} points={[]} unit="addresses" period="day" note="Not counted per day" />
+            <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
+              title="Daily active addresses are not available" detail={`${reasonText('identity_retention_exceeded')} Switch to 24H for hourly counts.`} />
+          </>
         ) : (
           <>
             <HourReadout item="active-addresses-chart.latest" status={status} points={[]} unit="addresses" period={ctx.period} />
             <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
-              title={ctx.mode === 'history' ? 'History is still being collected' : 'Hourly active addresses are not available right now'}
-              detail={ctx.mode === 'history' ? ctx.historyNote : noteFor(ctx, status)} />
+              title={ctx.mode === 'history' || status === 'collecting' ? 'History is still being collected' : 'Hourly active addresses are not available right now'}
+              detail={ctx.mode === 'history' ? ctx.historyNote : status === 'collecting' ? collectingText(ctx) : noteFor(ctx, status)} />
           </>
         )}
       </div>
@@ -801,7 +925,9 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
         className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-dashed border-slate-200 px-3 py-2">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-slate-700">Ranked by USD volume</p>
-          <p className="text-[11px] leading-4 text-slate-500">Primary ranking. Fixed order until every protocol has a verified USD measure.</p>
+          <p className="text-[11px] leading-4 text-slate-500">
+            Not available: lending and bridge USD values are kept per action (supplied, borrowed, sent), so protocols share no comparable USD volume. Listed in a fixed order.
+          </p>
         </div>
         <StatusPill status="source_pending" />
       </div>
@@ -880,10 +1006,16 @@ function poolsEmpty(ctx: ViewContext, status: DisplayStatus): [string, string] {
 
 const POOL_GRID = 'grid-cols-[1rem_minmax(0,1fr)_auto_auto]'
 
-// One pool's USD volume over the window. A pool whose swaps cannot all be valued says so; while the table's volume is not
-// available, the cell stays a quiet gap and the status is stated once below the table.
-function PoolVolume({ status, volume }: { status: DisplayStatus; volume: ArcPools['pools'][number]['usdVolume'] }) {
-  if (status !== 'available') return <span className="text-right"><ValueGap /></span>
+// One pool's USD volume over the window. A pool whose swaps cannot all be valued says "No verified price"; when the
+// table's volume is not available, the shared reason is stated once below the table.
+function PoolVolume({ status, volume, reason }: { status: DisplayStatus; volume: ArcPools['pools'][number]['usdVolume']; reason: string }) {
+  if (status === 'loading') return <span className="text-right"><ValueGap /></span>
+    if (status === 'collecting') {
+      return <span className="max-w-[5rem] text-right text-[11px] leading-tight text-slate-400" title={reason}>Not valued yet</span>
+    }
+    if (status !== 'available') {
+      return <span className="max-w-[5rem] text-right text-[11px] leading-tight text-slate-400" title={reason} />
+    }
   if (volume?.status === 'available' && volume.usdMicros) {
     const value = usdMicrosToNumber(volume.usdMicros)
     return (
@@ -893,7 +1025,50 @@ function PoolVolume({ status, volume }: { status: DisplayStatus; volume: ArcPool
       </p>
     )
   }
-  return <span className="text-right text-[11px] leading-tight text-slate-400" title="No verified USD price for this pair in every hour">No price</span>
+  return (
+    <span className="max-w-[5rem] text-right text-[11px] leading-tight text-slate-400" title="No verified USD price for this pair in every hour of the window">
+      No verified price
+    </span>
+  )
+}
+
+type PoolLiquidity = ArcPools['pools'][number]['liquidityUsd']
+
+// Value held in one pool at the end of the latest verified hour, from pool state (never from add or remove activity).
+function PoolLiquidityLine({ liquidity }: { liquidity: PoolLiquidity }) {
+  if (!liquidity) return null
+  if (liquidity.status === 'available' && liquidity.usdMicros) {
+    const value = usdMicrosToNumber(liquidity.usdMicros)
+    return (
+      <p className="mt-0.5 text-[11px] text-slate-500" title={formatUsdMicros(liquidity.usdMicros)}>
+        {liquidity.calculation === 'estimated_principal_reserves' ? 'Estimated reserves ' : 'Holds '}<span className="font-semibold tabular-nums text-slate-800">{value === null ? '' : usdText(value)}</span>
+      </p>
+    )
+  }
+  const text = POOL_HOLDINGS_TEXT[liquidity.reason ?? ''] ?? 'Holdings not stated'
+  return <p className="mt-0.5 text-[11px] leading-4 text-slate-400" title={reasonText(liquidity.reason)}>{text}</p>
+}
+
+// Why one pool's holdings are not stated, in a few words (the full reason is on hover).
+const POOL_HOLDINGS_TEXT: Record<string, string> = {
+  no_verified_price: 'Holdings: no verified price',
+  tvl_not_collected: 'Holdings not read at the latest verified hour end block',
+  tvl_not_collected_for_pool: 'Holdings not read: only the top pools of the latest hour are read',
+  hook_may_hold_pool_value: 'Holdings not stated: its hook may hold part of the value',
+  tvl_scan_unbounded: 'Holdings not stated: too many price ranges to read exactly',
+  balance_unreadable: 'Holdings not stated: a token balance could not be read',
+  pool_not_initialized: 'Holdings not stated: the pool has no price yet',
+  tvl_state_inconsistent: 'Holdings not stated: pool state could not be read consistently',
+  tick_out_of_range: 'Holdings not stated: pool state could not be read consistently',
+}
+
+// Status of the Liquidity column: from the pools read itself (pool state of the latest verified hour); not read yet is
+// collecting, an API without it is not available yet.
+function liquidityStatus(status: DisplayStatus, ranking: ArcPools['ranking']['liquidityUsd'] | undefined): DisplayStatus {
+  if (status !== 'available') return status
+  if (!ranking || ranking.status === 'source_pending') return 'source_pending'
+  if (ranking.status === 'available') return 'available'
+  return ranking.reason === 'tvl_not_collected' ? 'collecting' : 'unavailable'
 }
 
 function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | 'v4' }) {
@@ -913,6 +1088,14 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
   const ranking = data?.ranking.usdVolume
   const volumeStatus: DisplayStatus = status !== 'available' ? status
     : ranking?.status === 'source_pending' ? 'source_pending' : usdVolumeStatus(ranking ?? null)
+  const volumeReason = volumeStatus === 'collecting' && ranking?.reason === 'insufficient_coverage' ? collectingText(ctx)
+    : volumeStatus === 'source_pending' ? 'Verified data does not include pool USD valuations yet.' : reasonText(firstReason(ranking))
+  const holdings = data?.ranking.liquidityUsd
+  const holdingsStatus = liquidityStatus(status, holdings)
+  const asOf = holdings?.asOfHour && !Number.isNaN(Date.parse(holdings.asOfHour)) ? new Date(Date.parse(holdings.asOfHour) + 3_600_000).toISOString() : null
+  const holdingsText = holdingsStatus === 'available'
+    ? `${version === 'v4' ? 'Estimated principal reserves, excluding uncollected fees and position rounding' : 'Token balances held by each pool'} at ${asOf ? formatUtcDateTime(asOf) : 'the end of the latest verified hour'}, valued with that hour's verified prices.`
+    : holdingsStatus === 'source_pending' ? 'Verified data does not include pool balance or reserve snapshots yet.' : reasonText(holdings?.reason)
   const [emptyTitle, emptyDetail] = poolsEmpty(ctx, status)
   return (
     <section data-intel-section={id} aria-label={`Top Pools (Uniswap ${label})`} className={`${CARD} min-w-0`}>
@@ -940,8 +1123,9 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
                   <Chip>{feeText(pool.fee)}</Chip>
                   {pool.hooks && pool.hooks !== ZERO_HOOKS && <Chip>Hooks</Chip>}
                 </p>
+                <PoolLiquidityLine liquidity={pool.liquidityUsd} />
               </div>
-              <PoolVolume status={volumeStatus} volume={pool.usdVolume} />
+              <PoolVolume status={volumeStatus} volume={pool.usdVolume} reason={volumeReason} />
               <p className="text-right leading-tight">
                 <span className="block text-sm font-semibold tabular-nums text-slate-950">{formatCount(pool.swapCount)}</span>
                 <span className="block text-[11px] text-slate-500">swaps</span>
@@ -952,18 +1136,21 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
       ) : (
         <EmptyRows status={status === 'available' ? undefined : status} title={emptyTitle} detail={emptyDetail} />
       )}
-      {/* Fields without verified data keep their place in one quiet block, never a number. */}
-      <div className="mt-2 space-y-0.5 rounded-lg bg-slate-50 px-3 py-1.5 text-[11px] text-slate-600">
+      {/* Volume and Liquidity state their status and reason once here; a missing value is never a number. */}
+      <div className="mt-2 space-y-1 rounded-lg bg-slate-50 px-3 py-1.5 text-[11px] text-slate-600">
         {volumeStatus !== 'available' && rows.length > 0 && (
-          <p className="flex items-center justify-between gap-3"><span>Volume (USD)</span><InlineStatus status={volumeStatus} /></p>
+          <div>
+            <p className="flex items-center justify-between gap-3"><span>Volume (USD)</span><InlineStatus status={volumeStatus} /></p>
+            {volumeStatus !== 'loading' && <p className="text-slate-400">{volumeReason}</p>}
+          </div>
         )}
-        <p className="flex items-center justify-between gap-3">
-          <span {...markerProps(`${id}.liquidity`, 'source_pending')}>Liquidity</span>
-          <InlineStatus status="source_pending" />
-        </p>
+        <div {...markerProps(`${id}.liquidity`, holdingsStatus)}>
+          <p className="flex items-center justify-between gap-3"><span>Liquidity</span><InlineStatus status={holdingsStatus} /></p>
+          {holdingsStatus !== 'loading' && status === 'available' && <p className="text-slate-400">{holdingsText}</p>}
+        </div>
       </div>
       <p className="mt-1 text-[11px] leading-4 text-slate-400">
-        Every verified Uniswap {label} pair is ranked by swaps, not only USDC pairs. Volume is the USD value of the pool's swaps, each counted once. Liquidity is the value held in the pool. Tokens without verified details show their shortened address.
+        Every verified Uniswap {label} pair is ranked by swaps, not only USDC pairs. Volume is the USD value of the pool's swaps, each counted once. Liquidity uses {version === 'v4' ? 'estimated principal reserves from pool state' : 'token balances held by the pool'}. Tokens without verified details show their shortened address.
       </p>
     </section>
   )
@@ -1065,7 +1252,9 @@ function ActivityRowView({ row, explorerUrl, sharedTx }: { row: ArcActivityRow; 
       </ActivityCell>
       <ActivityCell label="From"><span className={ADDRESS_TEXT} title={row.from}>{shortenAddress(row.from)}</span></ActivityCell>
       <ActivityCell label="To">
-        {row.to ? <span className={ADDRESS_TEXT} title={row.to}>{shortenAddress(row.to)}</span> : <InlineStatus status="unavailable" />}
+        {row.to ? <span className={ADDRESS_TEXT} title={row.to}>{shortenAddress(row.to)}</span> : (
+          <span title={row.toReason === V4_SWAP_TO_BLOCKER ? V4_SWAP_TO_TEXT : undefined}><InlineStatus status="unavailable" /></span>
+        )}
       </ActivityCell>
       <ActivityCell label="Tx">
         {explorerUrl
@@ -1134,6 +1323,7 @@ function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initial
       </ShellTable>
       <p className="mt-1 text-[11px] leading-4 text-slate-400">
         From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.
+        {' '}Uniswap V4 swaps: {V4_SWAP_TO_TEXT}
       </p>
     </section>
   )
@@ -1473,6 +1663,56 @@ function TokenFlows({ flows, labels, title = 'Amounts by token' }: { flows: Toke
   )
 }
 
+// USD value of one protocol's amounts over the window, per action (never added across actions, directions or protocols).
+type UsdField = readonly [label: string, field: string]
+const PROTOCOL_USD_FIELDS: Record<'aaveV4' | 'morphoBlue' | 'morphoVaultsV2' | 'cctp' | 'gateway' | 'across', readonly UsdField[]> = {
+  aaveV4: [['Supplied', 'suppliedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros'], ['Borrowed', 'borrowedUsdMicros'], ['Repaid', 'repaidUsdMicros'],
+    ['Debt liquidated', 'liquidatedDebtUsdMicros']],
+  morphoBlue: [['Supplied', 'suppliedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros'], ['Borrowed', 'borrowedUsdMicros'], ['Repaid', 'repaidUsdMicros'],
+    ['Collateral added', 'collateralSuppliedUsdMicros'], ['Collateral removed', 'collateralWithdrawnUsdMicros']],
+  morphoVaultsV2: [['Deposited', 'depositedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros']],
+  cctp: [['Outbound', 'outboundUsdMicros'], ['Inbound', 'inboundUsdMicros']],
+  gateway: [['Deposit', 'depositUsdMicros'], ['Sent', 'outboundBurnUsdMicros'], ['Received', 'inboundMintUsdMicros'], ['Withdraw', 'withdrawalUsdMicros']],
+  across: [['Deposits from Arc', 'depositUsdMicros'], ['Fills on Arc', 'fillUsdMicros']],
+}
+
+function protocolUsdStatus(ctx: ViewContext, entry: ProtocolUsd | null | undefined): DisplayStatus {
+  if (ctx.mode !== 'ready') return liveStatus(ctx, null)
+  if (!entry) return 'source_pending'
+  if (entry.status === 'available' && entry.values) return 'available'
+  return entry.reason === 'insufficient_coverage' ? 'collecting' : 'unavailable'
+}
+
+function UsdValues({ ctx, item, name }: { ctx: ViewContext; item: string; name: keyof typeof PROTOCOL_USD_FIELDS }) {
+  const entry = ctx.summary?.protocolUsd?.[name]
+  const status = protocolUsdStatus(ctx, entry)
+  const values = status === 'available' ? entry?.values ?? null : null
+  const rows = PROTOCOL_USD_FIELDS[name].map(([label, field]) => [label, values?.[field]] as const)
+    .filter(([label, micros]) => typeof micros === 'string' && /^\d+$/.test(micros) && (micros !== '0' || !label.startsWith('Debt')))
+  const note = status === 'collecting' ? collectingText(ctx) : status === 'source_pending' ? 'Verified data does not include protocol USD valuations yet.'
+    : status === 'unavailable' && ctx.mode === 'ready' ? reasonText(entry?.reason) : noteFor(ctx, status)
+  return (
+    <div {...markerProps(item, status)} className="mt-3 rounded-lg border border-slate-100 px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className={LABEL}>USD value, last {ctx.windowLabel}</p>
+        {status !== 'available' && <InlineStatus status={status} />}
+      </div>
+      {values ? (
+        <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5">
+          {rows.map(([label, micros]) => (
+            <div key={label} className="flex items-baseline justify-between gap-2 text-[11px]">
+              <dt className="truncate text-slate-500">{label}</dt>
+              <dd className="font-semibold tabular-nums text-slate-900" title={formatUsdMicros(micros as string)}>{usdMicrosToNumber(micros) === null
+                ? formatUsdMicros(micros as string) : usdText(usdMicrosToNumber(micros) as number)}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : status === 'loading' ? <p className="pt-1"><ValueGap /></p> : <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{note}</p>}
+      {values && <p className="mt-1 text-[10px] leading-4 text-slate-400">Each action is valued on its own with that hour's verified prices and never added together.</p>}
+    </div>
+  )
+}
+
 function ProtocolCard({ item, cell, title, subtitle, category, children }: {
   item: string
   cell: Cell
@@ -1496,14 +1736,16 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
   const vaults = ctx.summary?.lending.morphoVaultsV2 ?? null
   const cards = [
     {
-      item: 'lending.aave', title: 'Aave', category: 'Lending market', subtitle: `Lending events, last ${ctx.windowLabel}`, family: aave,
+      item: 'lending.aave', usdItem: 'lending.aave-usd', usd: 'aaveV4' as const, title: 'Aave', category: 'Lending market',
+      subtitle: `Lending events, last ${ctx.windowLabel}`, family: aave,
       total: metricSum(aave, AAVE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY], secondary: [LIQUIDATIONS],
       flows: tokenFlows(objectEntries(aave?.metrics?.reserves).map(([, entry]) => ({ token: entry.underlying, decimals: entry.decimals,
         amounts: [entry.suppliedRaw, entry.borrowedRaw] }))),
       flowLabels: ['Supplied', 'Borrowed'],
     },
     {
-      item: 'lending.morpho-blue', title: 'Morpho Blue', category: 'Lending market', subtitle: `Market events, last ${ctx.windowLabel}`, family: blue,
+      item: 'lending.morpho-blue', usdItem: 'lending.morpho-blue-usd', usd: 'morphoBlue' as const, title: 'Morpho Blue', category: 'Lending market',
+      subtitle: `Market events, last ${ctx.windowLabel}`, family: blue,
       total: metricSum(blue, MORPHO_BLUE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY],
       secondary: [{ label: 'Collateral +', field: 'supplyCollateralCount', dot: 'bg-teal-500' }, { label: 'Collateral -', field: 'withdrawCollateralCount', dot: 'bg-teal-200' },
         LIQUIDATIONS, { label: 'New markets', field: 'marketCreatedCount', dot: 'bg-slate-300' }],
@@ -1514,7 +1756,8 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
       flowLabels: ['Supplied', 'Borrowed'],
     },
     {
-      item: 'lending.morpho-vaults', title: 'Morpho Vaults', category: 'Vaults', subtitle: `Vault deposits and withdrawals, last ${ctx.windowLabel}`, family: vaults,
+      item: 'lending.morpho-vaults', usdItem: 'lending.morpho-vaults-usd', usd: 'morphoVaultsV2' as const, title: 'Morpho Vaults', category: 'Vaults',
+      subtitle: `Vault deposits and withdrawals, last ${ctx.windowLabel}`, family: vaults,
       total: metricSum(vaults, MORPHO_VAULT_ACTIONS),
       primary: [{ label: 'Deposits', field: 'depositCount', dot: 'bg-[#2F6E0C]' }, { label: 'Withdrawals', field: 'withdrawCount', dot: 'bg-[#9CCB7F]' }],
       secondary: [] as EventField[],
@@ -1550,6 +1793,7 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
             )}
             {available && <EventMix fields={[...card.primary, ...card.secondary]} family={card.family} />}
             {available && <TokenFlows flows={card.flows} labels={card.flowLabels} />}
+            <UsdValues ctx={ctx} item={card.usdItem} name={card.usd} />
           </ProtocolCard>
         )
       })}
@@ -1646,6 +1890,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
           <DirectionRow direction="in" label="Inbound" detail="From other chains to Arc" leg={inbound} max={cctpMax} />
         </div>
         <p className="mt-1 text-[11px] leading-4 text-slate-400">Directions are shown separately and are never added together.</p>
+        <UsdValues ctx={ctx} item="cross-chain.cctp-usd" name="cctp" />
       </ProtocolCard>
       <ProtocolCard item="cross-chain.gateway" cell={gatewayCell} title="Gateway" subtitle={`Unified USDC balance activity on Arc, last ${ctx.windowLabel}`} category="Unified balance">
         <div className="mt-3 grid grid-cols-2 gap-2">
@@ -1654,6 +1899,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
           <LegCell label="Received" direction="in" leg={usdcLeg(ctx, gateway, 'inboundMintCount', 'inboundMintAmountRaw')} />
           <LegCell label="Withdraw" leg={usdcLeg(ctx, gateway, 'withdrawalCompletedCount', 'withdrawalAmountRaw')} />
         </div>
+        <UsdValues ctx={ctx} item="cross-chain.gateway-usd" name="gateway" />
       </ProtocolCard>
       <ProtocolCard item="cross-chain.across" cell={acrossCell} title="Across" subtitle={`Bridge deposits and fills on Arc, last ${ctx.windowLabel}`} category="Bridge">
         <div className="mt-3 space-y-2">
@@ -1669,6 +1915,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
             </div>
           ))}
         </div>
+        <UsdValues ctx={ctx} item="cross-chain.across-usd" name="across" />
       </ProtocolCard>
     </section>
   )
@@ -1764,12 +2011,13 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   const mode: Mode = !supported ? 'history' : !loaded ? 'loading' : loaded.failed || !loaded.summary ? 'failed' : 'ready'
   const summary = mode === 'ready' ? loaded?.summary ?? null : null
   const timeseries = mode === 'ready' ? loaded?.timeseries ?? null : null
-  const windowHours = summary?.window.hours ?? 24
+  const windowHours = summary?.window.hours ?? (selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24)
   const storedHours = summary ? Math.min(summary.coverage.storedHours, windowHours) : 0
   const progress = mode === 'ready' && storedHours > 0 && storedHours < windowHours ? ` (${storedHours} of ${windowHours} hours so far)` : ''
   const days = selectedWindow === '30d' ? 30 : 7
   const historyNote = `The ${windowLabel} view fills in once ${days} full days of verified history are stored.`
-  const ctx: ViewContext = { mode, windowLabel, period: supported ? 'hour' : 'day', historyNote, summary, timeseries,
+  const ctx: ViewContext = { mode, windowLabel, period: selectedWindow === '24h' ? 'hour' : 'day', windowHours: selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24,
+    historyNote, summary, timeseries,
     collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
     activity: mode === 'ready' ? loaded?.activity ?? null : null, explorerUrl }
   const verifiedThrough = summary?.freshness.verifiedThrough ?? timeseries?.freshness.verifiedThrough ?? lastVerifiedThrough
@@ -1811,7 +2059,8 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
       )}
       {mode === 'failed' && <Banner tone="warn">Arc Intelligence data could not be loaded right now. The layout stays in place; try Refresh in a moment.</Banner>}
       {networkCollecting && (
-        <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the hourly charts already show each verified hour.</Banner>
+        <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the {selectedWindow === '24h'
+          ? 'hourly charts already show each verified hour' : 'daily charts already show each complete day'}.</Banner>
       )}
       {mode === 'ready' && summary?.freshness.stale && <Banner tone="warn">Updates are delayed. The latest verified hour is older than usual.</Banner>}
     </>
@@ -1855,7 +2104,7 @@ export default function ArcIntelligenceOverview({ explorerUrl = null }: { explor
   const [borrowMarket, setBorrowMarket] = useState<BorrowMarketState>({ status: 'loading' })
   const controller = useRef<AbortController | null>(null)
 
-  // Only windows the API can answer are ever requested; 7D and 30D render their collecting state without a request.
+  // Only windows the API can answer are ever requested (24H, 7D and 30D); each window is read once and kept.
   const load = useCallback(async (target: ArcIntelligenceWindow) => {
     if (!ARC_INTELLIGENCE_BACKEND_WINDOWS[target]) return
     controller.current?.abort()

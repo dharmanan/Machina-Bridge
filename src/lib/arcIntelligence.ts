@@ -67,14 +67,37 @@ export type UsdVolumeWindow = {
   previous?: UsdVolumeWindow
 }
 
+// Estimated pool swap fees and their average per valued swap. Hourly flow summaries omit per-step integer rounding.
+// Hook-taken fees are never included; swaps whose fee cannot be valued are counted, never zero.
+export type SwapFeesWindow = {
+  calculation?: 'estimated'
+  basis?: string
+  status: 'available' | 'unavailable'
+  reason: string | null
+  reasons?: string[]
+  unavailableHours?: string[]
+  totalFeeUsdMicros: string | null
+  byProtocol: { uniswapV3: string; uniswapV4: string } | null
+  valuedSwaps: number | null
+  unvaluedSwaps: number | null
+  averageFeeUsdMicros: string | null
+  previous?: SwapFeesWindow
+}
+
+// USD value of another protocol's amounts over the window, per action (never added across actions, legs or protocols).
+export type ProtocolUsd = { status: 'available' | 'unavailable'; reason: string | null; values: Record<string, string> | null; failedHour?: string;
+  unavailableHours?: string[] }
+
 export type ArcSummary = {
   schema: typeof SUMMARY_SCHEMA
   window: { key: string; hours: number; start: string; end: string }
   freshness: ArcFreshness
   network: NetworkWindow
   assets: { usdc: FamilyWindow; verifiedAssets: FamilyWindow }
-  dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null }; usdVolume?: UsdVolumeWindow }
+  dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null }; usdVolume?: UsdVolumeWindow;
+    swapFees?: SwapFeesWindow }
   lending: { aaveV4: FamilyWindow; morphoBlue: FamilyWindow; morphoVaultsV2: FamilyWindow }
+  protocolUsd?: Partial<Record<'cctp' | 'gateway' | 'across' | 'aaveV4' | 'morphoBlue' | 'morphoVaultsV2', ProtocolUsd>>
   crossChain: { cctp: FamilyWindow; gateway: FamilyWindow; across: FamilyWindow }
   coverage: { firstStoredHour: string; storedHours: number; checkpointHour: string; verifiedThrough: string }
 }
@@ -85,11 +108,14 @@ export type TimeseriesFamily = { status: 'available' | 'unavailable'; reason?: s
 export type HourUsdVolume = { status: 'available' | 'unavailable'; reason?: string; totalUsdMicros?: string; uniswapV3UsdMicros?: string;
   uniswapV4UsdMicros?: string; valuedSwaps?: number; unvaluedSwaps?: number }
 
+// One bucket: an hour (24H) or a 24-hour period (7D, 30D). A 24-hour bucket is committed only when all its hours are; it
+// carries no unique active addresses (hourly uniques never add up).
 export type TimeseriesBucket = {
   start: string
   end: string
-  status: 'committed' | 'not_stored'
-  network: { blocks: number; transactions: number; uniqueActiveAddresses: number; gasUsedRaw: string } | null
+  status: 'committed' | 'not_stored' | 'incomplete'
+  storedHours?: number
+  network: { blocks: number; transactions: number; uniqueActiveAddresses: number | null; gasUsedRaw: string } | null
   families: Record<string, TimeseriesFamily> | null
   dexUsdVolume?: HourUsdVolume | null
 }
@@ -98,6 +124,7 @@ export type ArcTimeseries = {
   schema: typeof TIMESERIES_SCHEMA
   window: { key: string; hours: number; start: string; end: string }
   freshness: ArcFreshness
+  bucketHours?: number
   buckets: TimeseriesBucket[]
 }
 
@@ -122,9 +149,13 @@ export type ArcPool = {
   flowsRaw: { token0In: string; token0Out: string; token1In: string; token1Out: string }
   // USD value of the pool's swaps in the window (each swap once); unavailable when any of its swap hours has no verified value
   usdVolume?: { status: 'available' | 'unavailable'; reason: string | null; usdMicros: string | null; basis: string | null }
+  // Value held in the pool: pool state at the latest verified hour's last block, valued with that hour's prices. Never
+  // derived from add or remove activity.
+  liquidityUsd?: { status: 'available' | 'unavailable'; reason: string | null; usdMicros: string | null; amount0Raw: string | null;
+    amount1Raw: string | null; asOfBlock: number | null; calculation?: 'balance_snapshot' | 'estimated_principal_reserves' }
 }
 
-// Top pools of one Uniswap version, ranked by swap count. USD volume is shown beside the count; USD liquidity is source_pending.
+// Top pools of one Uniswap version, ranked by swap count. USD volume and USD liquidity are shown beside the count.
 export type ArcPools = {
   schema: typeof POOLS_SCHEMA
   protocol: 'v3' | 'v4'
@@ -133,7 +164,7 @@ export type ArcPools = {
   status: 'available' | 'unavailable'
   reason: string | null
   ranking: { by: 'swap_count'; usdVolume: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; reasons?: string[] };
-    liquidityUsd: { status: 'source_pending' } }
+    liquidityUsd: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; asOfHour?: string } }
   poolsTracked: number | null
   newPools: number | null
   pools: ArcPool[]
@@ -160,6 +191,8 @@ export type ArcActivityRow = {
   from: string
   to: string | null
   toKind: 'swap_recipient' | 'liquidity_owner' | 'event_sender' | 'none'
+  // Why To is empty: a Uniswap V4 swap records no recipient and no trace data is available (never filled from transaction-level target fields)
+  toReason?: string | null
 }
 
 export type ArcActivity = {
@@ -178,12 +211,13 @@ export type ArcIntelligenceLoad = {
   timeseries: ArcTimeseries | null
   // true when the data the selected window needs could not be loaded (network, proxy or schema failure)
   failed: boolean
-  // 24H only. A read that failed or did not match its exact shape is null: the section shows a status, never a guess.
+  // Pools of the selected window and the shared recent activity. A read that failed or did not match its exact shape is
+  // null: the section shows a status, never a guess.
   pools?: { v3: ArcPools | null; v4: ArcPools | null }
   activity?: Record<ArcActivityType, ArcActivity | null>
 }
 
-// The only requests the dashboard makes. Windows the API cannot answer (7D, 30D) are never requested at all.
+// The only requests the dashboard makes. Windows the API cannot answer (1H, 6H) are never requested at all.
 export const ARC_INTELLIGENCE_REQUESTS = Object.freeze({
   summary24h: '/api/intelligence?view=summary&window=24h',
   timeseries24h: '/api/intelligence?view=timeseries&window=24h',
@@ -193,6 +227,14 @@ export const ARC_INTELLIGENCE_REQUESTS = Object.freeze({
   activitySwaps: '/api/intelligence?view=activity&type=swaps',
   activityAdds: '/api/intelligence?view=activity&type=adds',
   activityRemoves: '/api/intelligence?view=activity&type=removes',
+  summary7d: '/api/intelligence?view=summary&window=7d',
+  timeseries7d: '/api/intelligence?view=timeseries&window=7d',
+  poolsV3_7d: '/api/intelligence?view=pools&protocol=v3&window=7d',
+  poolsV4_7d: '/api/intelligence?view=pools&protocol=v4&window=7d',
+  summary30d: '/api/intelligence?view=summary&window=30d',
+  timeseries30d: '/api/intelligence?view=timeseries&window=30d',
+  poolsV3_30d: '/api/intelligence?view=pools&protocol=v3&window=30d',
+  poolsV4_30d: '/api/intelligence?view=pools&protocol=v4&window=30d',
 })
 const ACTIVITY_REQUESTS: Readonly<Record<ArcActivityType, string>> = Object.freeze({ all: ARC_INTELLIGENCE_REQUESTS.activityAll,
   swaps: ARC_INTELLIGENCE_REQUESTS.activitySwaps, adds: ARC_INTELLIGENCE_REQUESTS.activityAdds, removes: ARC_INTELLIGENCE_REQUESTS.activityRemoves })
@@ -207,6 +249,10 @@ export const ARC_KNOWN_TOKENS: Readonly<Record<string, { symbol: string; decimal
   '0x8a5d989bbb96929f689b0200f435f53da42bf490': { symbol: 'USYC', decimals: 6 },
 })
 
+// Why a Uniswap V4 swap has no To (server/compact/read-model.js V4_SWAP_TO_BLOCKER), and what the dashboard says about it.
+export const V4_SWAP_TO_BLOCKER = 'v4_swap_recipient_not_emitted_and_trace_unavailable'
+export const V4_SWAP_TO_TEXT = 'V4 swap recipient is not emitted by the event and trace data is unavailable.'
+
 export function shortenAddress(address: string): string {
   return /^0x[0-9a-fA-F]{40}$/.test(address) ? `${address.slice(0, 6)}...${address.slice(-4)}` : address
 }
@@ -215,8 +261,14 @@ export function shortenHash(hash: string): string {
   return /^0x[0-9a-fA-F]{64}$/.test(hash) ? `${hash.slice(0, 6)}...${hash.slice(-4)}` : hash
 }
 
-const WINDOW_REQUESTS: Partial<Record<ArcIntelligenceWindow, { summary: string; timeseries: string }>> = {
-  '24h': { summary: ARC_INTELLIGENCE_REQUESTS.summary24h, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries24h },
+// Per window: its own summary, timeseries and pools reads. Recent activity has no window and is shared.
+const WINDOW_REQUESTS: Partial<Record<ArcIntelligenceWindow, { summary: string; timeseries: string; poolsV3: string; poolsV4: string }>> = {
+  '24h': { summary: ARC_INTELLIGENCE_REQUESTS.summary24h, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries24h,
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_24h, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_24h },
+  '7d': { summary: ARC_INTELLIGENCE_REQUESTS.summary7d, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries7d,
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_7d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_7d },
+  '30d': { summary: ARC_INTELLIGENCE_REQUESTS.summary30d, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries30d,
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_30d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_30d },
 }
 
 type FetchLike = (url: string, init: { method: 'GET'; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
@@ -262,6 +314,16 @@ function isPoolToken(value: unknown): value is PoolToken {
 }
 
 const isUsdMicros = (value: unknown) => typeof value === 'string' && UNSIGNED.test(value)
+// Pool liquidity: available carries the exact USD value and the raw held amounts; unavailable carries its reason and no value.
+function isPoolLiquidity(value: unknown) {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+  if (value.calculation !== undefined && value.calculation !== 'balance_snapshot' && value.calculation !== 'estimated_principal_reserves') return false
+  return value.status === 'available'
+    ? isUsdMicros(value.usdMicros) && isRawUnsigned(value.amount0Raw) && isRawUnsigned(value.amount1Raw) && isCount(value.asOfBlock)
+    : value.status === 'unavailable' && value.usdMicros === null && typeof value.reason === 'string'
+}
+
 function isPoolUsdVolume(value: unknown) {
   if (value === undefined) return true
   if (!isRecord(value)) return false
@@ -280,10 +342,11 @@ function isArcPool(value: unknown, protocol: 'v3' | 'v4'): value is ArcPool {
   const flows = value.flowsRaw
   return isPairFields(value, protocol) && isCount(value.createdBlock) && isCount(value.swapCount) && isRecord(flows)
     && ['token0In', 'token0Out', 'token1In', 'token1Out'].every((field) => isRawUnsigned(flows[field])) && isPoolUsdVolume(value.usdVolume)
+    && isPoolLiquidity(value.liquidityUsd)
 }
 
-export function parseArcPools(value: unknown, protocol: 'v3' | 'v4'): ArcPools | null {
-  if (!isRecord(value) || value.schema !== POOLS_SCHEMA || value.protocol !== protocol || !isRecord(value.window) || value.window.key !== '24h'
+export function parseArcPools(value: unknown, protocol: 'v3' | 'v4', window: ArcIntelligenceWindow = '24h'): ArcPools | null {
+  if (!isRecord(value) || value.schema !== POOLS_SCHEMA || value.protocol !== protocol || !isRecord(value.window) || value.window.key !== window
     || !isRecord(value.ranking) || value.ranking.by !== 'swap_count' || !isNullableCount(value.poolsTracked) || !isNullableCount(value.newPools)
     || !Array.isArray(value.pools) || value.pools.length > 10) return null
   if (value.status === 'available') return value.pools.every((pool) => isArcPool(pool, protocol)) ? value as unknown as ArcPools : null
@@ -307,7 +370,9 @@ function isActivityRow(value: unknown): value is ArcActivityRow {
   // To: exactly the counterparty the event records; a Uniswap V4 swap records none.
   const expectedKind = swap ? (v3 ? 'swap_recipient' : 'none') : v3 ? 'liquidity_owner' : 'event_sender'
   const toOk = expectedKind === 'none' ? value.to === null : typeof value.to === 'string' && HEX_ADDRESS_LOWER.test(value.to)
-  return amountsOk && value.toKind === expectedKind && toOk
+  // A reason only ever explains an empty To, and it is the exact V4 blocker (absent in an older API).
+  const reasonOk = value.toReason === undefined || (expectedKind === 'none' ? value.toReason === V4_SWAP_TO_BLOCKER : value.toReason === null)
+  return amountsOk && value.toKind === expectedKind && toOk && reasonOk
 }
 
 export function parseArcActivity(value: unknown, type: ArcActivityType): ArcActivity | null {
@@ -322,7 +387,7 @@ const settledObject = (result: PromiseSettledResult<Record<string, unknown>>) =>
 
 // Never rejects: every failure becomes `failed: true` with null data, so the dashboard keeps its full layout. A window
 // without history in the API resolves immediately without any request; it is shown as still being collected. Pools and
-// activity are read only for 24H; each one that fails is null on its own and never hides the rest.
+// activity are read with every window; each one that fails is null on its own and never hides the rest.
 export async function loadArcIntelligence(
   selected: ArcIntelligenceWindow,
   { fetchImpl, signal }: { fetchImpl?: FetchLike; signal?: AbortSignal } = {},
@@ -334,8 +399,8 @@ export async function loadArcIntelligence(
   const [summary, timeseries, poolsV3, poolsV4, ...activity] = await Promise.allSettled([
     read(requests.summary),
     read(requests.timeseries),
-    read(ARC_INTELLIGENCE_REQUESTS.poolsV3_24h),
-    read(ARC_INTELLIGENCE_REQUESTS.poolsV4_24h),
+    read(requests.poolsV3),
+    read(requests.poolsV4),
     ...ARC_ACTIVITY_TYPES.map((type) => read(ACTIVITY_REQUESTS[type])),
   ])
   const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA
@@ -347,7 +412,7 @@ export async function loadArcIntelligence(
     summary: summaryValue,
     timeseries: timeseriesValue,
     failed: summaryValue === null,
-    pools: { v3: parseArcPools(settledObject(poolsV3), 'v3'), v4: parseArcPools(settledObject(poolsV4), 'v4') },
+    pools: { v3: parseArcPools(settledObject(poolsV3), 'v3', selected), v4: parseArcPools(settledObject(poolsV4), 'v4', selected) },
     activity: Object.fromEntries(ARC_ACTIVITY_TYPES.map((type, index) => [type, parseArcActivity(settledObject(activity[index]), type)])) as
       Record<ArcActivityType, ArcActivity | null>,
   }
@@ -371,7 +436,8 @@ export function usdVolumeStatus(entry: { status: string; reason?: string | null;
 // A micro-USD amount as a number of dollars (for charts and comparisons only; displays use the exact string).
 export function usdMicrosToNumber(micros: string | null | undefined): number | null {
   if (typeof micros !== 'string' || !USD_MICROS.test(micros)) return null
-  return Number(BigInt(micros)) / 1_000_000
+  const value = Number(BigInt(micros)) / 1_000_000
+  return Number.isFinite(value) ? value : null
 }
 
 // "$1,234.56" exactly (BigInt, truncated to cents); a positive amount below one cent reads "<$0.01", never zero.
@@ -485,6 +551,18 @@ export function formatUtcHour(iso: string): string {
 
 export function formatUtcHourRange(start: string, end: string): string {
   return `${formatUtcHour(start)}-${formatUtcHour(end)} UTC`
+}
+
+// "Oct 3" (UTC), for daily chart labels.
+export function formatUtcDay(iso: string): string {
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? '' : `${date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} ${date.getUTCDate()}`
+}
+
+// The exact range of one chart period: "13:00-14:00 UTC" for an hour, "Oct 2, 14:00 to Oct 3, 14:00 UTC" for a 24-hour period.
+export function formatUtcPeriodRange(start: string, end: string, period: 'hour' | 'day'): string {
+  if (period === 'hour') return formatUtcHourRange(start, end)
+  return `${formatUtcDateTime(start).replace(/ UTC$/, '')} to ${formatUtcDateTime(end)}`
 }
 
 export function formatUtcDateTime(iso: string): string {

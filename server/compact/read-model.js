@@ -14,16 +14,21 @@ import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
-import { poolVolumeUsd, PRICE_POLICY, PRICEABLE_TOKENS, VALUATION_VERSIONS } from './valuation.js';
+import { poolTvlUsd, TVL_VERSION } from './tvl.js';
+import { anchorDecimals, poolVolumeUsd, PRICE_POLICY, priceableDecimals, PRICEABLE_TOKENS, usdMicrosOf, VALUATION_VERSIONS } from './valuation.js';
 import { sumWindow, WindowError } from './windows.js';
 
 export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1';
 export const TIMESERIES_SCHEMA = 'machina.intelligence.timeseries.v1';
 export const POOLS_SCHEMA = 'machina.intelligence.pools.v1';
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1';
-export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24 });
-export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24 });
-export const POOLS_WINDOWS = Object.freeze({ '24h': 24 });
+// 7D and 30D follow exactly the same rule as 24H: available only when every hour of the window is stored and verified.
+// Unique active addresses over 7D/30D are not_supported (identities are kept for 24 hours only); everything additive is
+// summed from hourly rows. 7D/30D timeseries come as 24-hour buckets ending at the checkpoint.
+export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
+export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
+export const POOLS_WINDOWS = Object.freeze({ '24h': 24, '7d': 168, '30d': 720 });
+const DAILY_BUCKET_HOURS = 24;
 export const ACTIVITY_TYPES = Object.freeze({ all: null, swaps: 'swap', adds: 'add', removes: 'remove' });
 // lagHours counts complete UTC hours that are not yet committed. In normal operation it is 0, or 1 between the end of an
 // hour and its commit (safety delay plus about five minutes of indexing). 2 or more means an hour has been overdue for
@@ -99,6 +104,41 @@ const contractMetadataOf = (row) => (row && typeof row.symbol === 'string' && ME
   && row.decimals >= 0 && row.decimals <= 36 && (row.name === null || typeof row.name === 'string')
   ? { symbol: row.symbol, name: row.name, decimals: row.decimals } : null);
 const USD_DIGITS = /^\d+$/;
+// V4 Swap To: the Swap event records no recipient, and the public Arc RPC has no trace methods (debug_traceTransaction,
+// trace_transaction and ots_* answer -32601). Even a trace could not tie a PoolManager take to one swap of a multi-hop
+// transaction (flash accounting nets them). So To stays null with this exact reason; tx.to, a router, the PoolManager or the
+// event sender is never used instead.
+export const V4_SWAP_TO_BLOCKER = 'v4_swap_recipient_not_emitted_and_trace_unavailable';
+
+// USD value of the other protocols' amounts, per action and never added across actions, legs or protocols: every hour's
+// raw amount of a token times that hour's value of the token (USDC exactly; another verified asset only with a verified price
+// of that hour), summed over the window. Token units are never mixed: an amount is valued only in its own token's verified
+// decimals (an Aave reserve whose stated decimals differ from the verified asset's is not valued). Any non-zero amount that
+// cannot be valued leaves that protocol's USD unavailable for the window, never partial.
+const USDC_ERC20 = ARC_USDC.address;
+const usdcAmounts = (fields) => (metrics, value) => Object.fromEntries(fields.map(([out, field]) => [out, [value(USDC_ERC20, metrics[field])]]));
+const tallyAmounts = (tally, fields, tokenOf, decimalsOf = () => null) => (metrics, value) => Object.fromEntries(fields.map(([out, field, side]) => [out,
+  Object.values(metrics[tally] ?? {}).map((entry) => value(tokenOf(entry, side), entry[field], decimalsOf(entry)))]));
+export const PROTOCOL_USD = Object.freeze({
+  cctp: { section: 'crossChain', amounts: usdcAmounts([['outboundUsdMicros', 'outboundAmountRaw'], ['inboundUsdMicros', 'inboundAmountRaw'],
+    ['inboundFeeUsdMicros', 'inboundFeeCollectedRaw']]) },
+  gateway: { section: 'crossChain', amounts: usdcAmounts([['depositUsdMicros', 'depositAmountRaw'], ['outboundBurnUsdMicros', 'outboundBurnAmountRaw'],
+    ['outboundBurnFeeUsdMicros', 'outboundBurnFeeRaw'], ['inboundMintUsdMicros', 'inboundMintAmountRaw'], ['withdrawalUsdMicros', 'withdrawalAmountRaw']]) },
+  across: { section: 'crossChain', amounts: (metrics, value) => ({
+    depositUsdMicros: Object.entries(metrics.depositByToken ?? {}).map(([token, entry]) => value(token, entry.inputAmountRaw)),
+    fillUsdMicros: Object.entries(metrics.fillByToken ?? {}).map(([token, entry]) => value(token, entry.outputAmountRaw)) }) },
+  aaveV4: { section: 'lending', amounts: tallyAmounts('reserves', [['suppliedUsdMicros', 'suppliedRaw'], ['withdrawnUsdMicros', 'withdrawnRaw'],
+    ['borrowedUsdMicros', 'borrowedRaw'], ['repaidUsdMicros', 'repaidRaw'], ['liquidatedDebtUsdMicros', 'liquidatedDebtRaw'],
+    ['liquidatedCollateralUsdMicros', 'liquidatedCollateralRaw']], (entry) => entry.underlying, (entry) => entry.decimals) },
+  morphoBlue: { section: 'lending', amounts: tallyAmounts('markets', [['suppliedUsdMicros', 'suppliedRaw', 'loan'], ['withdrawnUsdMicros', 'withdrawnRaw', 'loan'],
+    ['borrowedUsdMicros', 'borrowedRaw', 'loan'], ['repaidUsdMicros', 'repaidRaw', 'loan'], ['collateralSuppliedUsdMicros', 'collateralSuppliedRaw', 'collateral'],
+    ['collateralWithdrawnUsdMicros', 'collateralWithdrawnRaw', 'collateral'], ['liquidationRepaidUsdMicros', 'liquidationRepaidRaw', 'loan'],
+    ['liquidationSeizedUsdMicros', 'liquidationSeizedRaw', 'collateral'], ['badDebtUsdMicros', 'badDebtRaw', 'loan']],
+  (entry, side) => (side === 'loan' ? entry.loanToken : entry.collateralToken)) },
+  morphoVaultsV2: { section: 'lending', amounts: tallyAmounts('vaults', [['depositedUsdMicros', 'depositedAssetsRaw'], ['withdrawnUsdMicros', 'withdrawnAssetsRaw']],
+    (entry) => entry.asset) },
+});
+
 // Machine-readable valuation rules beside every USD amount (valuation.js).
 const VALUATION_DEFINITION = Object.freeze({
   versions: VALUATION_VERSIONS,
@@ -110,6 +150,12 @@ const VALUATION_DEFINITION = Object.freeze({
   pricePolicy: Object.freeze({ minSwaps: PRICE_POLICY.minSwaps, minCoverageBps: PRICE_POLICY.minCoverageBps,
     minDepthUsdMicros: PRICE_POLICY.minDepthUsdMicros.toString(10), maxDivergenceBps: PRICE_POLICY.maxDivergenceBps }),
   volume: 'each swap valued once by one side: the USDC side, otherwise the side with a verified hourly price; unpriced swaps are counted as unvalued',
+  liquidity: `${TVL_VERSION}: V3 token.balanceOf(pool); V4 estimated principal reserves from PoolManager pool state (tick sweep reproducing the in-range liquidity, excludes uncollected fees and per-position rounding); `
+    + 'valued with the same hour\'s prices; top pools only; never from add or remove activity',
+  protocolUsd: 'per protocol and action: each hour\'s raw amount of a token times that hour\'s USD value of the token (USDC exactly, other verified '
+    + 'assets only with a verified hourly price), summed; never added across actions, legs or protocols; unavailable when any amount cannot be valued',
+  swapFees: 'estimated pool swap fees on the input amount (V3 fee tier; V4 fee recorded by each Swap event); excludes per-step integer rounding; valued by the volume side rule; '
+    + 'swaps in V4 pools whose hook may return swap deltas are unvalued; hook-taken fees are never included; average = total / valued swaps',
 });
 const isDigits = (value) => typeof value === 'string' && DIGITS.test(value);
 const isSignedDigits = (value) => typeof value === 'string' && /^-?\d+$/.test(value);
@@ -200,7 +246,11 @@ const SQL = Object.freeze({
   // Valuations and token metadata (store.js). Optional tables: a database written before them still serves everything
   // else, and these reads report valuation_not_ready (or no contract metadata).
   optionalTables: `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('compact_valuation_hours', 'compact_dex_volume_hours',
-    'compact_token_price_hours', 'compact_token_metadata')`,
+    'compact_token_price_hours', 'compact_token_metadata', 'compact_dex_fee_hours', 'compact_pool_tvl_hours')`,
+  poolTvlRows: `SELECT pool, status, reason, amount0_raw, amount1_raw, block_number FROM compact_pool_tvl_hours WHERE hour_start = ? AND protocol = ?
+    ORDER BY pool`,
+  dexFeeRows: `SELECT hour_start, protocol, fee_usd_micros, valued_swaps, unvalued_swaps FROM compact_dex_fee_hours
+    WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, protocol`,
   valuationStatusRows: `SELECT h.hour_start, v.status, v.reason FROM compact_hours h
     LEFT JOIN compact_valuation_hours v ON v.hour_start = h.hour_start AND v.valuation = ?
     WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
@@ -425,6 +475,90 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       byProtocol: { uniswapV3: totals.uniswap_v3.toString(10), uniswapV4: totals.uniswap_v4.toString(10) }, valuedSwaps, unvaluedSwaps };
   }
 
+  // Swap fees of the window (valuation.js hourFeesOf): what swaps paid to Uniswap pools, valued in USD, and the average per
+  // valued swap. Hook-taken fees are never included; swaps whose fee cannot be valued are counted, never zero.
+  function feeWindow(from, to, hours, tables) {
+    const range = { start: iso(from), end: iso(to + HOUR) };
+    const status = tables.has('compact_dex_fee_hours') ? valuationWindow('dex_fees', from, to, hours, tables)
+      : { status: 'unavailable', reason: 'valuation_not_ready', reasons: ['valuation_not_ready'], unavailableHours: [] };
+    const base = { ...status, ...range, calculation: 'estimated', basis: VALUATION_VERSIONS.dex_fees,
+      totalFeeUsdMicros: null, byProtocol: null, valuedSwaps: null, unvaluedSwaps: null, averageFeeUsdMicros: null };
+    if (status.status !== 'available') return base;
+    const byHour = new Map();
+    for (const row of statement('dexFeeRows').all(int(from), int(to))) {
+      if (!USD_DIGITS.test(row.fee_usd_micros) || !Number.isSafeInteger(row.valued_swaps) || !Number.isSafeInteger(row.unvalued_swaps)) {
+        throw new ReadModelError('inconsistent_state', 'dex_fee_malformed');
+      }
+      if (!byHour.has(row.hour_start)) byHour.set(row.hour_start, {});
+      byHour.get(row.hour_start)[row.protocol] = row;
+    }
+    const totals = { uniswap_v3: 0n, uniswap_v4: 0n };
+    let valuedSwaps = 0;
+    let unvaluedSwaps = 0;
+    for (let hour = from; hour <= to; hour += HOUR) {
+      const entry = byHour.get(hour);
+      if (!entry?.uniswap_v3 || !entry?.uniswap_v4) throw new ReadModelError('inconsistent_state', 'dex_fee_missing');
+      for (const protocol of Object.keys(totals)) {
+        totals[protocol] += BigInt(entry[protocol].fee_usd_micros);
+        valuedSwaps += entry[protocol].valued_swaps;
+        unvaluedSwaps += entry[protocol].unvalued_swaps;
+      }
+    }
+    const total = totals.uniswap_v3 + totals.uniswap_v4;
+    return { ...base, totalFeeUsdMicros: total.toString(10), byProtocol: { uniswapV3: totals.uniswap_v3.toString(10),
+      uniswapV4: totals.uniswap_v4.toString(10) }, valuedSwaps, unvaluedSwaps,
+    averageFeeUsdMicros: valuedSwaps ? (total / BigInt(valuedSwaps)).toString(10) : null };
+  }
+
+  // USD of every other protocol over the window (PROTOCOL_USD). Prices are read only when a non-USDC token has an amount.
+  function protocolUsdWindow(from, to, hours, tables) {
+    const range = { start: iso(from), end: iso(to + HOUR) };
+    let prices = null;
+    const pricesOf = () => {
+      if (prices) return prices;
+      prices = { byHour: new Map(), valued: new Set() };
+      if (!valuationReady(tables)) return prices;
+      for (const row of statement('valuationStatusRows').all('token_prices', int(from), int(to))) if (row.status === 'available') prices.valued.add(row.hour_start);
+      for (const row of statement('tokenPriceRows').all(int(from), int(to))) {
+        if (!prices.byHour.has(row.hour_start)) prices.byHour.set(row.hour_start, new Map());
+        prices.byHour.get(row.hour_start).set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
+      }
+      return prices;
+    };
+    return Object.fromEntries(Object.entries(PROTOCOL_USD).map(([name, spec]) => {
+      const rows = statement('familyRows').all(name, int(from), int(to));
+      const unavailable = (reason, extra = {}) => [name, { status: 'unavailable', reason, ...range, values: null, ...extra }];
+      if (rows.length !== hours) return unavailable('insufficient_coverage');
+      const gap = rows.find((row) => row.status !== 'available');
+      if (gap) return unavailable('family_hour_unavailable', { unavailableHours: rows.filter((row) => row.status !== 'available').map((row) => iso(row.hour_start)) });
+      const totals = {};
+      let failure = null;
+      for (const row of rows) {
+        const value = (token, raw, declaredDecimals = null) => {
+          const address = typeof token === 'string' ? token.toLowerCase() : '';
+          if (typeof raw !== 'string' || !DIGITS.test(raw)) throw new ReadModelError('inconsistent_state', `${name}_amount_malformed`);
+          const amount = BigInt(raw);
+          if (amount === 0n) return 0n;
+          const verifiedDecimals = anchorDecimals(address) ?? priceableDecimals(address);
+          if (verifiedDecimals === null) { failure ??= 'unverified_token'; return null; }
+          if (declaredDecimals !== null && declaredDecimals !== verifiedDecimals) { failure ??= 'decimals_mismatch'; return null; }
+          if (anchorDecimals(address) !== null) return usdMicrosOf(address, amount, null);
+          const book = pricesOf();
+          if (!book.valued.has(row.hour_start)) { failure ??= 'prices_unavailable'; return null; }
+          const usd = usdMicrosOf(address, amount, book.byHour.get(row.hour_start));
+          if (usd === null) failure ??= 'no_verified_price';
+          return usd;
+        };
+        for (const [field, values] of Object.entries(spec.amounts(JSON.parse(row.metrics_json), value))) {
+          totals[field] ??= 0n;
+          for (const usd of values) if (usd !== null) totals[field] += usd;
+        }
+        if (failure) return unavailable(failure, { failedHour: iso(row.hour_start) });
+      }
+      return [name, { status: 'available', reason: null, ...range, values: Object.fromEntries(Object.entries(totals).map(([field, total]) => [field, total.toString(10)])) }];
+    }));
+  }
+
   // Verified token prices of one hour (the checkpoint hour in the summary), with their source pool.
   function hourPrices(hour, tables) {
     const status = valuationWindow('token_prices', hour, hour, 1, tables);
@@ -458,14 +592,18 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const tables = optionalTables();
     const usdVolume = volumeWindow(from, to, hours, tables);
     usdVolume.previous = volumeWindow(previousFrom, previousTo, hours, tables);
+    const swapFees = feeWindow(from, to, hours, tables);
+    swapFees.previous = feeWindow(previousFrom, previousTo, hours, tables);
+    const protocolUsd = protocolUsdWindow(from, to, hours, tables);
     return {
       window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) },
       anchor: state,
       network,
       assets: { usdc: families.usdc, verifiedAssets: families.assets },
-      dex: { uniswapV3: families.uniswapV3, uniswapV4: families.uniswapV4, officialV3Pools, usdVolume,
+      dex: { uniswapV3: families.uniswapV3, uniswapV4: families.uniswapV4, officialV3Pools, usdVolume, swapFees,
         usdPrices: hourPrices(state.hour, tables) },
       lending: { aaveV4: families.aaveV4, morphoBlue: families.morphoBlue, morphoVaultsV2: families.morphoVaultsV2 },
+      protocolUsd,
       crossChain: { cctp: families.cctp, gateway: families.gateway, across: families.across },
       coverage: {
         firstStoredHour: iso(state.firstHour),
@@ -528,7 +666,48 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         dexUsdVolume: dexUsdVolume(hour),
       });
     }
-    return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, buckets };
+    if (hours <= 24) return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, bucketHours: 1, buckets };
+    return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, bucketHours: DAILY_BUCKET_HOURS,
+      buckets: dailyBuckets(buckets) };
+  }
+
+  // 24-hour buckets of hourly buckets (oldest first). A bucket is committed only when all 24 hours are; its family and USD
+  // values only when every hour's is (sums of the additive fields), otherwise unavailable with the first gap's reason. Unique
+  // active addresses per day are not_supported: hourly uniques never add up and identities are kept for 24 hours only.
+  function dailyBuckets(hourly) {
+    const out = [];
+    for (let index = 0; index < hourly.length; index += DAILY_BUCKET_HOURS) {
+      const day = hourly.slice(index, index + DAILY_BUCKET_HOURS);
+      const range = { start: day[0].start, end: day.at(-1).end };
+      const stored = day.filter((bucket) => bucket.status === 'committed');
+      if (stored.length < DAILY_BUCKET_HOURS) {
+        out.push({ ...range, status: stored.length ? 'incomplete' : 'not_stored', storedHours: stored.length, network: null, families: null, dexUsdVolume: null });
+        continue;
+      }
+      const blocks = stored.reduce((total, bucket) => total + bucket.network.blocks, 0);
+      const transactions = stored.reduce((total, bucket) => total + bucket.network.transactions, 0);
+      const network = { blocks, transactions, transactionsPerSecond: transactions / (DAILY_BUCKET_HOURS * HOUR), averageTransactionsPerBlock: blocks ? transactions / blocks : null,
+        gasUsedRaw: stored.reduce((total, bucket) => total + BigInt(bucket.network.gasUsedRaw), 0n).toString(10), uniqueActiveAddresses: null,
+        uniqueActiveAddressesStatus: { status: 'not_supported', reason: 'identity_retention_exceeded' } };
+      const families = Object.fromEntries(TIMESERIES_FAMILIES.map((name) => {
+        const gap = stored.find((bucket) => bucket.families[name].status !== 'available');
+        if (gap) return [name, { status: 'unavailable', reason: gap.families[name].reason }];
+        try {
+          return [name, { status: 'available', ...sumWindow(scalarSpec(FAMILY_WINDOWS[name]), stored.map((bucket) => bucket.families[name])) }];
+        } catch (error) {
+          if (!(error instanceof WindowError)) throw error;
+          return [name, { status: 'unavailable', reason: error.code }];
+        }
+      }));
+      const volumeGap = stored.find((bucket) => bucket.dexUsdVolume.status !== 'available');
+      const sum = (field) => stored.reduce((total, bucket) => total + BigInt(bucket.dexUsdVolume[field]), 0n).toString(10);
+      const count = (field) => stored.reduce((total, bucket) => total + bucket.dexUsdVolume[field], 0);
+      const dexUsdVolume = volumeGap ? { status: 'unavailable', reason: volumeGap.dexUsdVolume.reason }
+        : { status: 'available', totalUsdMicros: sum('totalUsdMicros'), uniswapV3UsdMicros: sum('uniswapV3UsdMicros'),
+          uniswapV4UsdMicros: sum('uniswapV4UsdMicros'), valuedSwaps: count('valuedSwaps'), unvaluedSwaps: count('unvaluedSwaps') };
+      out.push({ ...range, status: 'committed', storedHours: DAILY_BUCKET_HOURS, network, families, dexUsdVolume });
+    }
+    return out;
   }
 
   function freshness(state, nowMs) {
@@ -639,6 +818,28 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         } else entry.unvalued = true;
       }
     }
+    // Pool liquidity: the snapshot of the checkpoint hour (tvl.js, pool state at the hour's last block), valued with that
+    // hour's stored prices. Never derived from add or remove activity; a held token without a price leaves it unavailable.
+    const tvlRows = tables.has('compact_pool_tvl_hours') ? new Map(statement('poolTvlRows').all(int(to), spec.protocol).map((row) => [row.pool, row]))
+      : new Map();
+    const checkpointPrices = new Map();
+    if (tables.has('compact_valuation_hours') && valuationWindow('token_prices', to, to, 1, tables).status === 'available') {
+      for (const row of statement('tokenPriceRows').all(int(to), int(to))) checkpointPrices.set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
+    }
+    const liquidityOf = (pool) => {
+      const row = tvlRows.get(pool);
+      const calculation = v3 ? 'balance_snapshot' : 'estimated_principal_reserves';
+      const missing = { status: 'unavailable', usdMicros: null, amount0Raw: null, amount1Raw: null, asOfBlock: null };
+      if (!row) return { ...missing, reason: tvlRows.size ? 'tvl_not_collected_for_pool' : 'tvl_not_collected' };
+      if (row.status !== 'available') return { ...missing, reason: row.reason, asOfBlock: row.block_number };
+      if (!isDigits(row.amount0_raw) || !isDigits(row.amount1_raw)) throw new ReadModelError('inconsistent_state', 'pool_tvl_malformed');
+      const { token0, token1 } = detailsOf(pool);
+      const usdMicros = poolTvlUsd({ token0: token0.address, token1: token1.address, amount0: BigInt(row.amount0_raw), amount1: BigInt(row.amount1_raw) },
+        checkpointPrices);
+      const amounts = { calculation, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, asOfBlock: row.block_number };
+      return usdMicros === null ? { status: 'unavailable', reason: 'no_verified_price', usdMicros: null, ...amounts }
+        : { status: 'available', reason: null, usdMicros: usdMicros.toString(10), ...amounts };
+    };
     const raw = (values) => values.map((value) => value.toString(10));
     const usdVolumeOf = (entry) => {
       if (valuation.status !== 'available') return { status: 'unavailable', reason: valuation.reason, usdMicros: null, basis: null };
@@ -651,13 +852,17 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       const [addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw] = raw(entry.liquidity);
       return { ...detailsOf(pool), swapCount: entry.swapCount, flowsRaw: { token0In, token0Out, token1In, token1Out },
         usdVolume: usdVolumeOf(entry),
+        liquidityUsd: liquidityOf(pool),
         liquidityActivity: { addCount: entry.add, removeCount: entry.remove, pokeCount: entry.poke,
           amounts: v3 ? { status: 'available', addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw }
             : { status: 'not_supported', reason: 'v4_token_amounts_unavailable', addAmount0Raw: null, addAmount1Raw: null, removeAmount0Raw: null,
               removeAmount1Raw: null } } };
     });
     return { ...base, ...counts, status: 'available', reason: null, reasons: [], unavailableHours: [], pools,
-      usdVolume: { status: valuation.status, reason: valuation.reason, reasons: valuation.reasons } };
+      usdVolume: { status: valuation.status, reason: valuation.reason, reasons: valuation.reasons },
+      liquidityUsd: { status: pools.some((pool) => pool.liquidityUsd.status === 'available') ? 'available' : 'unavailable',
+        reason: pools.some((pool) => pool.liquidityUsd.status === 'available') ? null : pools.find((pool) => pool.liquidityUsd.reason)?.liquidityUsd.reason ?? 'tvl_not_collected',
+        asOfHour: iso(to) } };
   }
 
   // One activity row with the exact semantics of the projection: from is the verified transaction sender; to is only the
@@ -677,7 +882,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     }
     return { time: iso(row.block_timestamp), blockNumber: row.block_number, logIndex: row.log_index, txHash: row.tx_hash, protocol: row.protocol,
       kind: row.kind, pool: row.pool, pair: { token0, token1, fee, tickSpacing, hooks }, amounts, from: row.tx_from, to: row.counterparty,
-      toKind: row.counterparty_kind };
+      toKind: row.counterparty_kind, toReason: row.counterparty_kind === 'none' ? V4_SWAP_TO_BLOCKER : null };
   }
 
   // The newest rows (block DESC, log index DESC), only while the checkpoint hour itself holds verified activity: a feed
@@ -732,12 +937,13 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       if (typeof windowKey !== 'string' || !Object.hasOwn(SUMMARY_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
       const core = cached(`summary:${windowKey}`, () => snapshot(() => buildSummary(windowKey, SUMMARY_WINDOWS[windowKey])));
       return { schema: SUMMARY_SCHEMA, chain, window: core.window, freshness: freshness(core.anchor, now()), network: core.network,
-        assets: core.assets, dex: core.dex, lending: core.lending, crossChain: core.crossChain, coverage: core.coverage, definitions };
+        assets: core.assets, dex: core.dex, lending: core.lending, crossChain: core.crossChain, protocolUsd: core.protocolUsd, coverage: core.coverage,
+        definitions };
     },
     timeseries(windowKey) {
       if (typeof windowKey !== 'string' || !Object.hasOwn(TIMESERIES_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
       const core = cached(`timeseries:${windowKey}`, () => snapshot(() => buildTimeseries(windowKey, TIMESERIES_WINDOWS[windowKey])));
-      return { schema: TIMESERIES_SCHEMA, chain, window: core.window, freshness: freshness(core.anchor, now()),
+      return { schema: TIMESERIES_SCHEMA, chain, window: core.window, freshness: freshness(core.anchor, now()), bucketHours: core.bucketHours,
         units: { 'usdc.amountRaw': { decimalsField: 'rawDecimals', source: 'persisted_raw_decimals' }, cctp: FAMILY_UNITS.cctp,
           gateway: FAMILY_UNITS.gateway }, buckets: core.buckets, definitions };
     },
@@ -748,7 +954,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       return { schema: POOLS_SCHEMA, chain, protocol: protocolKey, window: core.window, freshness: freshness(core.anchor, now()), status: core.status,
         reason: core.reason, reasons: core.reasons, unavailableHours: core.unavailableHours,
         ranking: { by: 'swap_count', usdVolume: core.usdVolume ?? { status: 'unavailable', reason: core.reason, reasons: core.reasons },
-          liquidityUsd: { status: 'source_pending' } },
+          liquidityUsd: core.liquidityUsd ?? { status: 'unavailable', reason: core.reason } },
         poolsTracked: core.poolsTracked, newPools: core.newPools, pools: core.pools };
     },
     activity(typeKey) {

@@ -23,13 +23,15 @@ import { createHash } from 'node:crypto';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import {
   ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, POOL_PROJECTIONS, poolHourCutoff, PRICE_PATH_PROJECTIONS, PROJECTION_REASONS, PROJECTION_VERSIONS,
-  PROJECTIONS, reconcilePoolRows, reconcilePricePaths, sha256Of, V4_POOL_KIND, validActivityRow, validPoolRow, validPricePathRow, validV4Record,
+  PROJECTIONS, reconcilePoolRows, reconcilePricePaths, sha256Of, V4_POOL_KIND, validActivityRow, validPoolRow, validPricePathRow, validSwapFeeRow,
+  validV4Record,
 } from './projections.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { metadataExempt, TOKEN_METADATA_VERSION } from './token-metadata.js';
-import { hourVolumeOf, tokenPricesOf, VALUATION_REASONS, VALUATION_VERSIONS, VALUATIONS } from './valuation.js';
+import { TVL_POOLS_PER_PROTOCOL, TVL_REASONS, TVL_VERSION } from './tvl.js';
+import { hourFeesOf, hourVolumeOf, tokenPricesOf, VALUATION_REASONS, VALUATION_VERSIONS, VALUATIONS } from './valuation.js';
 import { sumWindow } from './windows.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
@@ -193,6 +195,37 @@ CREATE TABLE IF NOT EXISTS compact_dex_volume_hours (
   unvalued_swaps INTEGER NOT NULL CHECK (unvalued_swaps >= 0),
   PRIMARY KEY (hour_start, protocol)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_pool_fee_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  pool TEXT NOT NULL,
+  swap_count INTEGER NOT NULL CHECK (swap_count > 0),
+  fee_in0_e6 TEXT NOT NULL,
+  fee_in1_e6 TEXT NOT NULL,
+  fee_out0_e12 TEXT NOT NULL,
+  fee_out1_e12 TEXT NOT NULL,
+  PRIMARY KEY (hour_start, pool)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_dex_fee_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  fee_usd_micros TEXT NOT NULL,
+  valued_swaps INTEGER NOT NULL CHECK (valued_swaps >= 0),
+  unvalued_swaps INTEGER NOT NULL CHECK (unvalued_swaps >= 0),
+  PRIMARY KEY (hour_start, protocol)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_pool_tvl_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  pool TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  amount0_raw TEXT,
+  amount1_raw TEXT,
+  block_number INTEGER NOT NULL,
+  PRIMARY KEY (hour_start, protocol, pool),
+  CHECK ((status = 'available' AND reason IS NULL AND amount0_raw IS NOT NULL AND amount1_raw IS NOT NULL)
+    OR (status = 'unavailable' AND reason IS NOT NULL AND amount0_raw IS NULL AND amount1_raw IS NULL))
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS compact_token_metadata (
   token TEXT PRIMARY KEY CHECK (length(token) = 42),
   verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
@@ -313,6 +346,18 @@ function normalizeProjections(projections, range, families) {
     out[name] = reason || (entry.rowsSha256 !== undefined && entry.rowsSha256 !== sha) ? unavailableProjection(reason ?? 'projection_error')
       : { status: 'available', rows, sha };
   }
+  // V4 swap fees: the same reconciliation as the V4 price paths.
+  const fees = projections?.uniswap_v4_swap_fees;
+  if (fees?.status !== 'available') out.uniswap_v4_swap_fees = unavailableProjection(fees?.reason);
+  else if (!Array.isArray(fees.rows) || !fees.rows.every(validSwapFeeRow) || new Set(fees.rows.map((row) => row.pool)).size !== fees.rows.length) {
+    out.uniswap_v4_swap_fees = unavailableProjection('projection_error');
+  } else {
+    const { rows } = fees;
+    const reason = reconcilePricePaths(rows, families?.uniswapV4, out.uniswap_v4_pools.status === 'available' ? out.uniswap_v4_pools.rows : null);
+    const sha = sha256Of({ rows });
+    out.uniswap_v4_swap_fees = reason || (fees.rowsSha256 !== undefined && fees.rowsSha256 !== sha) ? unavailableProjection(reason ?? 'projection_error')
+      : { status: 'available', rows, sha };
+  }
   return out;
 }
 
@@ -357,6 +402,10 @@ export function createCompactStore(db) {
     setMeta.run('token_metadata_version', TOKEN_METADATA_VERSION);
     if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get('token_metadata_version')?.value !== TOKEN_METADATA_VERSION) {
       throw new StoreError('token_metadata_definition_mismatch');
+    }
+    setMeta.run('tvl_version', TVL_VERSION);
+    if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get('tvl_version')?.value !== TVL_VERSION) {
+      throw new StoreError('tvl_definition_mismatch');
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -437,6 +486,22 @@ export function createCompactStore(db) {
     insertDexVolume: db.prepare(`INSERT INTO compact_dex_volume_hours (hour_start, protocol, volume_usd_micros, valued_swaps, unvalued_swaps)
       VALUES (?, ?, ?, ?, ?)`),
     dexVolume: db.prepare('SELECT * FROM compact_dex_volume_hours WHERE hour_start = ? ORDER BY protocol'),
+    insertSwapFee: db.prepare(`INSERT INTO compact_pool_fee_hours (hour_start, pool, swap_count, fee_in0_e6, fee_in1_e6, fee_out0_e12, fee_out1_e12)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`),
+    swapFees: db.prepare('SELECT * FROM compact_pool_fee_hours WHERE hour_start = ? ORDER BY pool'),
+    pruneSwapFees: db.prepare('DELETE FROM compact_pool_fee_hours WHERE hour_start <= ?'),
+    insertDexFee: db.prepare(`INSERT INTO compact_dex_fee_hours (hour_start, protocol, fee_usd_micros, valued_swaps, unvalued_swaps)
+      VALUES (?, ?, ?, ?, ?)`),
+    dexFees: db.prepare('SELECT * FROM compact_dex_fee_hours WHERE hour_start = ? ORDER BY protocol'),
+    pruneDexFees: db.prepare('DELETE FROM compact_dex_fee_hours WHERE hour_start <= ?'),
+    // Pool liquidity snapshots (tvl.js): one row per top pool and hour, written once.
+    insertPoolTvl: db.prepare(`INSERT OR IGNORE INTO compact_pool_tvl_hours (hour_start, protocol, pool, status, reason, amount0_raw, amount1_raw,
+      block_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+    poolTvl: db.prepare('SELECT * FROM compact_pool_tvl_hours WHERE hour_start = ? AND protocol = ? ORDER BY pool'),
+    prunePoolTvl: db.prepare('DELETE FROM compact_pool_tvl_hours WHERE hour_start <= ?'),
+    // The read model's 24H top pools (by summed swap count, ties by pool), for the liquidity snapshot of the same pools.
+    topPools: db.prepare(`SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3
+      GROUP BY pool HAVING total > 0 ORDER BY total DESC, pool ASC LIMIT ?4`),
     pruneValuationHours: db.prepare('DELETE FROM compact_valuation_hours WHERE hour_start <= ?'),
     pruneTokenPrices: db.prepare('DELETE FROM compact_token_price_hours WHERE hour_start <= ?'),
     pruneDexVolume: db.prepare('DELETE FROM compact_dex_volume_hours WHERE hour_start <= ?'),
@@ -565,8 +630,8 @@ export function createCompactStore(db) {
     })) {
       projections.uniswap_v4_pools = unavailableProjection('duplicate_v4_initialize');
       if (projections.dex_activity.status === 'available') projections.dex_activity = unavailableProjection('projection_inputs_unavailable');
-      if (projections.uniswap_v4_price_paths.status === 'available') {
-        projections.uniswap_v4_price_paths = unavailableProjection('projection_inputs_unavailable');
+      for (const name of ['uniswap_v4_price_paths', 'uniswap_v4_swap_fees']) {
+        if (projections[name].status === 'available') projections[name] = unavailableProjection('projection_inputs_unavailable');
       }
     }
     for (const name of names) {
@@ -585,6 +650,10 @@ export function createCompactStore(db) {
         for (const row of entry.rows) {
           sql.insertActivity.run(int(row.blockNumber), int(row.logIndex), hour, int(row.blockTimestamp), row.txHash, row.txFrom, row.protocol,
             row.kind, row.pool, row.amount0Raw, row.amount1Raw, row.amountBasis, row.counterparty, row.counterpartyKind);
+        }
+      } else if (name === 'uniswap_v4_swap_fees') {
+        for (const row of entry.rows) {
+          sql.insertSwapFee.run(hour, row.pool, int(row.swapCount), row.feeIn0E6, row.feeIn1E6, row.feeOut0E12, row.feeOut1E12);
         }
       } else if (Object.hasOwn(PRICE_PATH_PROJECTIONS, name)) {
         for (const row of entry.rows) {
@@ -617,7 +686,7 @@ export function createCompactStore(db) {
   // Pool-hours, price paths, projection status rows and valuations share one retention (projections.js).
   function pruneHours(cutoff) {
     for (const statement of [sql.prunePoolHours, sql.prunePricePaths, sql.pruneProjectionHours, sql.pruneValuationHours, sql.pruneTokenPrices,
-      sql.pruneDexVolume]) statement.run(int(cutoff));
+      sql.pruneDexVolume, sql.pruneSwapFees, sql.pruneDexFees, sql.prunePoolTvl]) statement.run(int(cutoff));
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -633,7 +702,8 @@ export function createCompactStore(db) {
     const [token0, token1] = v4 ? [meta?.currency0, meta?.currency1] : [meta?.token0, meta?.token1];
     const hooks = v4 ? meta?.hooks : null;
     if (![token0, token1, ...(v4 ? [hooks] : [])].every((value) => typeof value === 'string' && ADDRESS.test(value))) return null;
-    return { token0, token1, hooks };
+    if (!Number.isSafeInteger(meta.fee) || meta.fee < 0) return null;
+    return { token0, token1, hooks, fee: meta.fee };
   }
 
   const pricePathRowsOf = (hour, protocol) => sql.pricePaths.all(hour, protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
@@ -666,9 +736,14 @@ export function createCompactStore(db) {
     }
   }
 
+  const swapFeeRowsOf = (hour) => sql.swapFees.all(hour).map((row) => ({ pool: row.pool, swapCount: row.swap_count, feeIn0E6: row.fee_in0_e6,
+    feeIn1E6: row.fee_in1_e6, feeOut0E12: row.fee_out0_e12, feeOut1E12: row.fee_out1_e12 }));
+
+  // Token prices, then DEX USD volume, then swap fees; each valuation is independent and an available one is never redone.
   function deriveHourValuations(hour, stored) {
     const range = sql.hourRange.get(hour);
     const projection = new Map(sql.projections.all(hour).map((row) => [row.projection, row.status]));
+    const available = (names) => names.every((name) => projection.get(name) === 'available');
     const pools = new Map();
     const poolOf = (protocol, pool) => {
       const key = `${protocol}:${pool}`;
@@ -677,7 +752,7 @@ export function createCompactStore(db) {
     };
     let prices = null;
     if (stored.get('token_prices')?.status === 'available') prices = storedPrices(hour);
-    else if (Object.keys(PRICE_PATH_PROJECTIONS).every((name) => projection.get(name) === 'available')) {
+    else if (available(Object.keys(PRICE_PATH_PROJECTIONS))) {
       ({ prices } = tokenPricesOf({ pricePaths: Object.fromEntries(VALUATION_PROTOCOLS.map((protocol) => [protocol, pricePathRowsOf(hour, protocol)])),
         poolOf, hourBlocks: range.last_block - range.first_block + 1 }));
       const rows = [...prices].map(([token, price]) => ({ token, priceUsdE18: price.priceUsdE18.toString(10), sourceProtocol: price.protocol,
@@ -687,21 +762,48 @@ export function createCompactStore(db) {
       }
       setValuation(hour, 'token_prices', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
     } else setValuation(hour, 'token_prices', unavailableValuation('price_paths_unavailable'));
-    if (stored.get('dex_usd_volume')?.status === 'available') return;
-    if (!Object.keys(POOL_PROJECTIONS).every((name) => projection.get(name) === 'available')) {
-      setValuation(hour, 'dex_usd_volume', unavailableValuation('pool_projections_unavailable'));
-      return;
+
+    if (stored.get('dex_usd_volume')?.status !== 'available') {
+      if (!available(Object.keys(POOL_PROJECTIONS))) setValuation(hour, 'dex_usd_volume', unavailableValuation('pool_projections_unavailable'));
+      else {
+        const { needsPrices, totals } = hourVolumeOf({ poolRows: Object.fromEntries(VALUATION_PROTOCOLS.map((protocol) => [protocol,
+          poolRowsOf(hour, protocol)])), poolOf, prices });
+        if (needsPrices) setValuation(hour, 'dex_usd_volume', unavailableValuation('prices_unavailable'));
+        else {
+          const rows = VALUATION_PROTOCOLS.map((protocol) => ({ protocol, volumeUsdMicros: totals[protocol].usdMicros.toString(10),
+            valuedSwaps: totals[protocol].valuedSwaps, unvaluedSwaps: totals[protocol].unvaluedSwaps }));
+          for (const row of rows) sql.insertDexVolume.run(hour, row.protocol, row.volumeUsdMicros, int(row.valuedSwaps), int(row.unvaluedSwaps));
+          setValuation(hour, 'dex_usd_volume', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
+        }
+      }
     }
-    const { needsPrices, totals } = hourVolumeOf({ poolRows: Object.fromEntries(VALUATION_PROTOCOLS.map((protocol) => [protocol, poolRowsOf(hour, protocol)])),
-      poolOf, prices });
-    if (needsPrices) {
-      setValuation(hour, 'dex_usd_volume', unavailableValuation('prices_unavailable'));
-      return;
+
+    // Swap fees need the V3 pool rows (fixed fee tiers), the V4 swap-fee rows (fees the events applied) and, like volume,
+    // prices only for pools without a USDC side.
+    if (stored.get('dex_fees')?.status !== 'available') {
+      if (!available([...Object.keys(POOL_PROJECTIONS), 'uniswap_v4_swap_fees'])) {
+        setValuation(hour, 'dex_fees', unavailableValuation(available(Object.keys(POOL_PROJECTIONS)) ? 'fee_inputs_unavailable'
+          : 'pool_projections_unavailable'));
+      } else {
+        const { needsPrices, totals } = hourFeesOf({ poolRows: { uniswap_v3: poolRowsOf(hour, 'uniswap_v3') },
+          feeRows: { uniswap_v4: swapFeeRowsOf(hour) }, poolOf, prices });
+        if (needsPrices) setValuation(hour, 'dex_fees', unavailableValuation('prices_unavailable'));
+        else {
+          const rows = VALUATION_PROTOCOLS.map((protocol) => ({ protocol, feeUsdMicros: totals[protocol].feeUsdMicros.toString(10),
+            valuedSwaps: totals[protocol].valuedSwaps, unvaluedSwaps: totals[protocol].unvaluedSwaps }));
+          for (const row of rows) sql.insertDexFee.run(hour, row.protocol, row.feeUsdMicros, int(row.valuedSwaps), int(row.unvaluedSwaps));
+          setValuation(hour, 'dex_fees', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
+        }
+      }
     }
-    const rows = VALUATION_PROTOCOLS.map((protocol) => ({ protocol, volumeUsdMicros: totals[protocol].usdMicros.toString(10),
-      valuedSwaps: totals[protocol].valuedSwaps, unvaluedSwaps: totals[protocol].unvaluedSwaps }));
-    for (const row of rows) sql.insertDexVolume.run(hour, row.protocol, row.volumeUsdMicros, int(row.valuedSwaps), int(row.unvaluedSwaps));
-    setValuation(hour, 'dex_usd_volume', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
+  }
+
+  // Re-derives one stored hour's valuations from what is stored now (the valuation backfill, after its projections are
+  // written, or for an hour whose inputs were already complete). Never touches anything but valuation rows.
+  function rederiveValuations(hourStart) {
+    if (!sql.hourRange.get(int(hourStart))) throw new StoreError('hour_missing');
+    transaction(() => deriveValuations(hourStart));
+    return sql.valuations.all(int(hourStart)).map((row) => ({ valuation: row.valuation, status: row.status, reason: row.reason }));
   }
 
   // The bounded pass for stored hours that have no valuation status yet (hours stored before valuations existed), newest
@@ -737,6 +839,39 @@ export function createCompactStore(db) {
       }
     }
     return tokens;
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Pool liquidity snapshots (tvl.js).
+
+  // The top `limit` pools of a protocol over the 24 hours ending at hourStart (the read model's ranking), with the registry
+  // identity the snapshot needs. A pool without a well-formed registry row is left out (it is never shown either).
+  function topPoolsOf(protocol, hourStart, limit) {
+    const from = hourStart - (ADDRESS_WINDOW_HOURS - 1) * HOUR;
+    return sql.topPools.all(protocol, int(from), int(hourStart), int(limit)).map((row) => ({ pool: row.pool, ...registryPool(protocol, row.pool) }))
+      .filter((pool) => pool.token0)
+      .map((pool) => ({ ...pool, tickSpacing: JSON.parse(sql.registryMeta.get(protocol === 'uniswap_v4' ? V4_POOL_KIND : V3_POOL_KIND, pool.pool).meta_json).tickSpacing }));
+  }
+
+  // Writes one hour's snapshot rows once; an existing row of the hour is never replaced.
+  function recordPoolTvl(hourStart, protocol, rows, { blockNumber }) {
+    if (!Number.isSafeInteger(blockNumber) || !['uniswap_v3', 'uniswap_v4'].includes(protocol)
+      || !Array.isArray(rows) || rows.length > TVL_POOLS_PER_PROTOCOL || new Set(rows.map((row) => row.pool)).size !== rows.length) {
+      throw new StoreError('invalid_tvl_snapshot');
+    }
+    return transaction(() => {
+      const hour = sql.hourRange.get(int(hourStart));
+      if (!hour) throw new StoreError('hour_missing');
+      if (blockNumber !== hour.last_block) throw new StoreError('invalid_tvl_snapshot');
+      for (const row of rows) {
+        if (!registryPool(protocol, row.pool) || !['available', 'unavailable'].includes(row.status)) throw new StoreError('invalid_tvl_snapshot');
+        const available = row.status === 'available';
+        if (available ? typeof row.amount0 !== 'bigint' || typeof row.amount1 !== 'bigint' || row.amount0 < 0n || row.amount1 < 0n
+          : !TVL_REASONS.includes(row.reason)) throw new StoreError('invalid_tvl_snapshot');
+        sql.insertPoolTvl.run(int(hourStart), protocol, row.pool, row.status, available ? null : row.reason, available ? row.amount0.toString(10) : null,
+          available ? row.amount1.toString(10) : null, int(blockNumber));
+      }
+    });
   }
 
   // Each row is written once (INSERT OR IGNORE): cached metadata is never replaced.
@@ -905,12 +1040,21 @@ export function createCompactStore(db) {
     pricePaths: (hourStart, protocol) => pricePathRowsOf(int(hourStart), protocol),
     // Valuations (never families, never projections).
     derivePendingValuations,
+    rederiveValuations,
+    swapFees: (hourStart) => swapFeeRowsOf(int(hourStart)),
+    dexFees: (hourStart) => sql.dexFees.all(int(hourStart)).map((row) => ({ protocol: row.protocol, feeUsdMicros: row.fee_usd_micros,
+      valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
     valuationStatus: (hourStart) => sql.valuations.all(int(hourStart)).map((row) => ({ valuation: row.valuation, status: row.status, reason: row.reason,
       rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
     tokenPrices: (hourStart) => sql.tokenPrices.all(int(hourStart)).map((row) => ({ token: row.token, priceUsdE18: row.price_usd_e18,
       sourceProtocol: row.source_protocol, sourcePool: row.source_pool, depthUsdMicros: row.depth_usd_micros, sourceCount: row.source_count })),
     dexVolume: (hourStart) => sql.dexVolume.all(int(hourStart)).map((row) => ({ protocol: row.protocol, volumeUsdMicros: row.volume_usd_micros,
       valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
+    // Pool liquidity snapshots.
+    topPoolsOf,
+    recordPoolTvl,
+    poolTvl: (hourStart, protocol) => sql.poolTvl.all(int(hourStart), protocol).map((row) => ({ pool: row.pool, status: row.status, reason: row.reason,
+      amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, blockNumber: row.block_number })),
     // Token metadata cache.
     tokensNeedingMetadata,
     recordTokenMetadata,

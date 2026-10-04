@@ -18,6 +18,7 @@ import {
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { bootstrapV4Registry, catchUpV4Registry, locateDeploymentBlock } from '../server/compact/registry.js';
 import { COMPACT_SCHEMA_VERSION, createCompactStore } from '../server/compact/store.js';
+import { acquireWriterLock } from '../server/compact/writer-lock.js';
 import { MIN_RPC_INTERVAL_MS, SAFE_HEAD_MARGIN_BLOCKS } from './run-compact-hour.mjs';
 
 export const EXECUTE_CONFIRMATION = 'yes';
@@ -91,6 +92,8 @@ export async function runBackfillTool({ config, DatabaseSync, providerFactory, p
     return summary;
   }
 
+  // One writer at a time: refuses (writer_lock_held) while the scheduler's child or another backfill is writing.
+  const lock = acquireWriterLock(config.sqlitePath, { owner: 'backfill-compact-projections' });
   const writer = new DatabaseSync(config.sqlitePath);
   try {
     const store = createCompactStore(writer);
@@ -111,6 +114,7 @@ export async function runBackfillTool({ config, DatabaseSync, providerFactory, p
     }
   } finally {
     writer.close();
+    lock.release();
   }
   print(`RESULT EXECUTED rpc_requests=${summary.rpcRequests()}`);
   return summary;

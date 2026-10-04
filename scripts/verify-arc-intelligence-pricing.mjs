@@ -384,7 +384,8 @@ const LIVE = await syntheticHour(true);
 
 await test('existing projections unaffected: same versions, same pool rows and activity; price paths are two new projections', async () => {
   assert.deepEqual(PROJECTION_VERSIONS, { uniswap_v3_pools: 'uniswap-v3-pool-hours-v1', uniswap_v4_pools: 'uniswap-v4-pool-hours-v1+initialize-pool-id-keccak',
-    dex_activity: 'uniswap-dex-activity-v1', uniswap_v3_price_paths: 'uniswap-v3-pool-price-path-v1', uniswap_v4_price_paths: 'uniswap-v4-pool-price-path-v1' });
+    dex_activity: 'uniswap-dex-activity-v1', uniswap_v3_price_paths: 'uniswap-v3-pool-price-path-v1', uniswap_v4_price_paths: 'uniswap-v4-pool-price-path-v1',
+    uniswap_v4_swap_fees: 'uniswap-v4-swap-fees-v1' });
   assert.deepEqual(PROJECTIONS.slice(0, 3), ['uniswap_v3_pools', 'uniswap_v4_pools', 'dex_activity'], 'the Phase 1A projections keep their order');
   assert.deepEqual(PRICE_PATH_OF_POOLS, { uniswap_v3_pools: 'uniswap_v3_price_paths', uniswap_v4_pools: 'uniswap_v4_price_paths' });
   assert.deepEqual(Object.values(PRICE_PATH_PROJECTIONS), ['uniswap_v3', 'uniswap_v4']);
@@ -500,6 +501,8 @@ if (!sqlite) {
           path(i, P.wethMoon, 4, Q96, 10n ** 18n, 10n ** 18n), path(i, P.moonZap, 2, Q96, 1n, 1n)].sort((left, right) => (left.pool < right.pool ? -1 : 1)) },
         uniswap_v4_price_paths: { status: 'available', rows: [path(i, V4.nativeEurc, 5, Q96, 1n, 1n), path(i, V4.usdcMoon, 3, Q96, 1n, 1n)]
           .sort((left, right) => (left.pool < right.pool ? -1 : 1)) },
+        uniswap_v4_swap_fees: { status: 'available', rows: [V4.nativeEurc, V4.usdcMoon].map((pool) => ({ pool, swapCount: pool === V4.nativeEurc ? 5 : 3,
+          feeIn0E6: '0', feeIn1E6: '0', feeOut0E12: '0', feeOut1E12: '0' })).sort((left, right) => (left.pool < right.pool ? -1 : 1)) },
       } : {}),
     };
     return { definitionVersion: COMPACT_DEFINITION_VERSION, chainId: ARC_CHAIN_ID,
@@ -542,7 +545,7 @@ if (!sqlite) {
 
     await test('sqlite: an hour\'s token prices and DEX USD volume are derived in its own commit, exactly, from stored rows only', async () => {
       const { db, store } = buildDatabase('derive', 1);
-      assert.deepEqual(statusOf(store, BASE), { dex_usd_volume: 'available', token_prices: 'available' });
+      assert.deepEqual(statusOf(store, BASE), { dex_fees: 'available', dex_usd_volume: 'available', token_prices: 'available' });
       assert.deepEqual(store.tokenPrices(BASE), [{ token: WETH, priceUsdE18: WETH_PRICE.toString(), sourceProtocol: 'uniswap_v3', sourcePool: P.wethUsdc,
         depthUsdMicros: '50000000000', sourceCount: 1 }], 'only WETH has a qualified USDC pool; shallow, hooked and unverified pools set no price');
       assert.equal(WETH_PRICE, (10n ** 30n) / (2n ** 32n), 'WETH = 10^12 / 2^32 USD, independently');
@@ -557,21 +560,24 @@ if (!sqlite) {
 
     await test('sqlite: without price paths an hour that needs a price is not valued; once its paths arrive it is', async () => {
       const { db, store } = buildDatabase('no-paths', 1, () => ({ withPaths: false }));
-      assert.deepEqual(statusOf(store, BASE), { dex_usd_volume: 'unavailable(prices_unavailable)', token_prices: 'unavailable(price_paths_unavailable)' });
+      assert.deepEqual(statusOf(store, BASE), { dex_fees: 'unavailable(fee_inputs_unavailable)', dex_usd_volume: 'unavailable(prices_unavailable)',
+        token_prices: 'unavailable(price_paths_unavailable)' });
       assert.deepEqual(store.dexVolume(BASE), [], 'no partial volume');
       store.commitProjectionHour(BASE, hourResult(0).projections);
-      assert.deepEqual(statusOf(store, BASE), { dex_usd_volume: 'available', token_prices: 'available' });
+      assert.deepEqual(statusOf(store, BASE), { dex_fees: 'available', dex_usd_volume: 'available', token_prices: 'available' });
       assert.equal(store.dexVolume(BASE)[0].volumeUsdMicros, HOUR_V3.toString(), 'the same value a live hour gets');
       db.close();
     });
 
     await test('sqlite: stored hours from before valuations get them from a bounded pass with no RPC, newest first', async () => {
       const { db, store } = buildDatabase('pass', 6);
-      db.exec('DELETE FROM compact_valuation_hours; DELETE FROM compact_token_price_hours; DELETE FROM compact_dex_volume_hours');
+      db.exec('DELETE FROM compact_valuation_hours; DELETE FROM compact_token_price_hours; DELETE FROM compact_dex_volume_hours; DELETE FROM compact_dex_fee_hours');
       assert.deepEqual(store.derivePendingValuations({ limit: 4 }).hours, [5, 4, 3, 2].map((i) => BASE + i * HOUR));
       assert.deepEqual(store.derivePendingValuations({ limit: 4 }).hours, [1, 0].map((i) => BASE + i * HOUR));
       assert.deepEqual(store.derivePendingValuations({ limit: 4 }).hours, [], 'nothing left');
-      for (let i = 0; i < 6; i++) assert.deepEqual(statusOf(store, BASE + i * HOUR), { dex_usd_volume: 'available', token_prices: 'available' });
+      for (let i = 0; i < 6; i++) {
+        assert.deepEqual(statusOf(store, BASE + i * HOUR), { dex_fees: 'available', dex_usd_volume: 'available', token_prices: 'available' });
+      }
       assert.throws(() => store.derivePendingValuations({ limit: 0 }), (error) => error.code === 'invalid_valuation_limit');
       db.close();
     });
@@ -581,7 +587,8 @@ if (!sqlite) {
       const hour = hourResult(0);
       hour.registry.uniswapV3.created = hour.registry.uniswapV3.created.filter((pool) => pool.address !== P.moonZap);
       assert.equal(store.commitHour(hour).outcome, 'inserted');
-      assert.deepEqual(statusOf(store, BASE), { dex_usd_volume: 'unavailable(pool_registry_missing)', token_prices: 'unavailable(pool_registry_missing)' });
+      assert.deepEqual(statusOf(store, BASE), { dex_fees: 'unavailable(pool_registry_missing)', dex_usd_volume: 'unavailable(pool_registry_missing)',
+        token_prices: 'unavailable(pool_registry_missing)' });
       assert.equal(store.checkpoint().hourStart, BASE, 'the hour and its checkpoint commit');
       db.close();
     });

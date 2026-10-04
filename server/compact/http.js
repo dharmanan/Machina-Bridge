@@ -1,5 +1,5 @@
 // Compact engine: public read-only Intelligence HTTP API on the built-in node:http server. Exact request strings only: a
-// route is one of twelve fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
+// route is one of twenty fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
 // no request body, bounded URL and response sizes, fixed error bodies (no messages, stack traces, paths or environment).
 // Nothing here calls Arc RPC, indexes, or writes: every answer comes from the read-only model. No CORS headers: browsers
 // reach this API through the Vercel proxy, not directly. `authorize` is the seam for a future auth header.
@@ -22,6 +22,14 @@ const ROUTES = new Map([
   ['/v1/intelligence/activity?type=swaps', { kind: 'activity', type: 'swaps' }],
   ['/v1/intelligence/activity?type=adds', { kind: 'activity', type: 'adds' }],
   ['/v1/intelligence/activity?type=removes', { kind: 'activity', type: 'removes' }],
+  ['/v1/intelligence/summary?window=7d', { kind: 'summary', window: '7d' }],
+  ['/v1/intelligence/summary?window=30d', { kind: 'summary', window: '30d' }],
+  ['/v1/intelligence/timeseries?window=7d', { kind: 'timeseries', window: '7d' }],
+  ['/v1/intelligence/timeseries?window=30d', { kind: 'timeseries', window: '30d' }],
+  ['/v1/intelligence/pools?protocol=v3&window=7d', { kind: 'pools', protocol: 'v3', window: '7d' }],
+  ['/v1/intelligence/pools?protocol=v3&window=30d', { kind: 'pools', protocol: 'v3', window: '30d' }],
+  ['/v1/intelligence/pools?protocol=v4&window=7d', { kind: 'pools', protocol: 'v4', window: '7d' }],
+  ['/v1/intelligence/pools?protocol=v4&window=30d', { kind: 'pools', protocol: 'v4', window: '30d' }],
 ]);
 const KNOWN_PATHS = new Set([
   '/health',

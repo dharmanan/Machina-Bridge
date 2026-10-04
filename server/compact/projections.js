@@ -26,10 +26,14 @@
 //   is exact: block-weighted sums of the square-root price and of the two virtual reserves. Blocks before the hour's first
 //   swap are not covered (the opening price would need another hour). Only data of the hour itself, so a live hour and a
 //   logs-only re-read give identical rows. valuation.js turns qualified paths into token prices; nothing here is a price.
+// - V4 swap fees: per V4 pool and hour, the fee every Swap event says it applied (protocol plus LP fee, in pips) times the
+//   swap's input amount (feeIn*E6 = sum of in * fee), and for the side paid out the input fee converted at the swap's own
+//   rate (feeOut*E12 = sum of floor(out * fee * 1e12 / (1e6 - fee))). Exact integer sums of event fields only; valuation.js
+//   values them. V3 needs no such projection: its fee is the pool's fixed fee tier.
 import { createHash } from 'node:crypto';
 import { decodeV4Initialize } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { keccak256 } from './keccak.js';
-import { blockState, validSqrtPrice } from './valuation.js';
+import { blockState, outFeeE12, validSqrtPrice } from './valuation.js';
 
 export const PROJECTION_VERSIONS = Object.freeze({
   uniswap_v3_pools: 'uniswap-v3-pool-hours-v1',
@@ -37,12 +41,17 @@ export const PROJECTION_VERSIONS = Object.freeze({
   dex_activity: 'uniswap-dex-activity-v1',
   uniswap_v3_price_paths: 'uniswap-v3-pool-price-path-v1',
   uniswap_v4_price_paths: 'uniswap-v4-pool-price-path-v1',
+  uniswap_v4_swap_fees: 'uniswap-v4-swap-fees-v1',
 });
 export const PROJECTIONS = Object.freeze(Object.keys(PROJECTION_VERSIONS));
 export const POOL_PROJECTIONS = Object.freeze({ uniswap_v3_pools: 'uniswap_v3', uniswap_v4_pools: 'uniswap_v4' });
 export const PRICE_PATH_PROJECTIONS = Object.freeze({ uniswap_v3_price_paths: 'uniswap_v3', uniswap_v4_price_paths: 'uniswap_v4' });
 // The price path built from the same stream as each pool projection (a re-read of one stream rebuilds both).
 export const PRICE_PATH_OF_POOLS = Object.freeze({ uniswap_v3_pools: 'uniswap_v3_price_paths', uniswap_v4_pools: 'uniswap_v4_price_paths' });
+// Every valuation input built from the same stream as each pool projection: price paths and V4 swap fees.
+export const VALUATION_INPUTS_OF_POOLS = Object.freeze({ uniswap_v3_pools: Object.freeze(['uniswap_v3_price_paths']),
+  uniswap_v4_pools: Object.freeze(['uniswap_v4_price_paths', 'uniswap_v4_swap_fees']) });
+export const VALUATION_INPUT_PROJECTIONS = Object.freeze(Object.values(VALUATION_INPUTS_OF_POOLS).flat());
 export const V4_POOL_KIND = 'uniswap_v4_pool';
 // Pool-hours are kept for 35 days (groundwork for 7D/30D); recent activity is bounded per kind.
 export const POOL_HOUR_RETENTION_HOURS = 35 * 24;
@@ -54,7 +63,7 @@ export const COUNTERPARTY_KINDS = Object.freeze(['swap_recipient', 'liquidity_ow
 export const AMOUNT_BASES = Object.freeze(['v3_pool_delta', 'v3_liquidity_amount', 'v4_swap_delta', 'none']);
 export const PROJECTION_REASONS = Object.freeze(['family_unavailable', 'reconciliation_mismatch', 'v4_pool_id_mismatch',
   'duplicate_v4_initialize', 'malformed_v4_initialize', 'activity_spine_missing', 'projection_inputs_unavailable', 'projection_error',
-  'price_path_invalid', 'price_path_out_of_order']);
+  'price_path_invalid', 'price_path_out_of_order', 'swap_fee_invalid']);
 
 const HOUR = 3600;
 const ADDRESS = /^0x[0-9a-f]{40}$/;
@@ -176,6 +185,11 @@ export function validPricePathRow(row, protocol, { firstBlock, lastBlock }) {
   return validSqrtPrice(BigInt(row.closeSqrtPriceX96)) && validSqrtPrice(BigInt(row.sqrtPriceBlockSum) / BigInt(row.pricedBlocks));
 }
 
+export function validSwapFeeRow(row) {
+  if (!row || !POOL_ID.test(row.pool) || !Number.isSafeInteger(row.swapCount) || row.swapCount < 1) return false;
+  return ['feeIn0E6', 'feeIn1E6', 'feeOut0E12', 'feeOut1E12'].every((field) => typeof row[field] === 'string' && UINT.test(row[field]));
+}
+
 // Price paths reconcile with the family's swap counter and, when given, with the same hour's pool rows (exactly the pools
 // with swaps, with the same swap counts). Returns null when exact, else a reason.
 export function reconcilePricePaths(rows, family, poolRows = null) {
@@ -263,10 +277,11 @@ function pricePathRow(pool, path, firstBlock, lastBlock) {
 export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND } = {}) {
   const pools = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const paths = { uniswap_v3: new Map(), uniswap_v4: new Map() };
+  const fees = new Map();
   const created = [];
   const createdIds = new Set();
   const failures = { uniswap_v3_pools: null, uniswap_v4_pools: null, dex_activity: activity ? null : 'projection_inputs_unavailable',
-    uniswap_v3_price_paths: null, uniswap_v4_price_paths: null };
+    uniswap_v3_price_paths: null, uniswap_v4_price_paths: null, uniswap_v4_swap_fees: null };
   const rings = { swap: [], add: [], remove: [] };
   const fail = (projection, error) => { failures[projection] ??= reasonOf(error); };
   const poolOf = (protocol, key) => {
@@ -274,6 +289,23 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
     if (!entry) pools[protocol].set(key, (entry = newPool()));
     return entry;
   };
+
+  // One V4 Swap event's fee: amounts are the caller-side delta (negative = paid into the pool), fee in pips.
+  function swapFee(poolId, event) {
+    if (failures.uniswap_v4_swap_fees) return;
+    try {
+      const fee = BigInt(event.fee);
+      let entry = fees.get(poolId);
+      if (!entry) fees.set(poolId, (entry = { swapCount: 0, in0: 0n, in1: 0n, out0: 0n, out1: 0n }));
+      for (const [amount, inKey, outKey] of [[BigInt(event.amount0Raw), 'in0', 'out0'], [BigInt(event.amount1Raw), 'in1', 'out1']]) {
+        if (amount < 0n) entry[inKey] += -amount * fee;
+        else entry[outKey] += outFeeE12(amount, fee);
+      }
+      entry.swapCount += 1;
+    } catch {
+      fail('uniswap_v4_swap_fees', new ProjectionError('swap_fee_invalid'));
+    }
+  }
 
   // One Swap event of a pool's price path. Events must arrive in (block, logIndex) order, as every stream yields them;
   // anything else, or a price outside Uniswap's range, makes the protocol's price paths unavailable for the hour.
@@ -387,7 +419,10 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
         fail('uniswap_v4_pools', error);
         return;
       }
-      if (kind === 'swap') pricePath('uniswap_v4', event.poolId, log, event);
+      if (kind === 'swap') {
+        pricePath('uniswap_v4', event.poolId, log, event);
+        swapFee(event.poolId, event);
+      }
       if (!activityKind) return;
       record('uniswap_v4', activityKind, log, window, { pool: event.poolId, row: activityKind === 'swap'
         ? { amount0Raw: event.amount0Raw, amount1Raw: event.amount1Raw, amountBasis: 'v4_swap_delta', counterparty: null, counterpartyKind: 'none' }
@@ -423,6 +458,16 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
       }
       out[name] = reason ? { status: 'unavailable', reason } : { status: 'available', rows, rowsSha256: sha256Of({ rows }) };
     }
+    const family = families.uniswapV4;
+    const pool = out.uniswap_v4_pools;
+    let reason = family?.status !== 'available' ? 'family_unavailable' : failures.uniswap_v4_swap_fees;
+    let rows = [];
+    if (!reason) {
+      rows = [...fees.entries()].sort(([left], [right]) => (left < right ? -1 : 1)).map(([key, entry]) => ({ pool: key, swapCount: entry.swapCount,
+        feeIn0E6: entry.in0.toString(10), feeIn1E6: entry.in1.toString(10), feeOut0E12: entry.out0.toString(10), feeOut1E12: entry.out1.toString(10) }));
+      reason = reconcilePricePaths(rows, family, pool.status === 'available' ? pool.rows : null);
+    }
+    out.uniswap_v4_swap_fees = reason ? { status: 'unavailable', reason } : { status: 'available', rows, rowsSha256: sha256Of({ rows }) };
   }
 
   function finishProjections({ families, hourStart = null, firstBlock = null, lastBlock = null }) {

@@ -5,9 +5,9 @@
 // eth_getLogs), after checking the stored first/last block hashes, and writes them through store.js, which reconciles
 // them exactly with the hour's STORED family counters (a mismatch stays unavailable). Recent activity is never rebuilt:
 // it needs the spine's transaction senders and comes from live hours only. A registry that is missing or behind the hour
-// blocks that projection (v3_registry_*, v4_registry_*) with no RPC request; it is never bootstrapped from here. The pool
-// price path built from the same stream is written with each rebuilt pool projection (no extra request), and the hour's
-// valuations are derived from the result in the same commit.
+// blocks that projection (v3_registry_*, v4_registry_*) with no RPC request; it is never bootstrapped from here. The
+// valuation inputs built from the same stream (pool price paths, V4 swap fees) are written with each rebuilt pool
+// projection (no extra request), and the hour's valuations are derived from the result in the same commit.
 // Strict arguments: exactly one exact UTC hour ISO string, no flags, no bulk mode (bulk work stays with the operator-only
 // scripts/backfill-compact-projections.mjs). Exit 0 only when every repairable projection of the hour ends available.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
@@ -19,10 +19,11 @@ import { LogError } from '../server/compact/logs.js';
 import {
   backfillProjectionHour, planProjectionRepair, readProjectionRepairInput, verifyStoredBoundaries,
 } from '../server/compact/projection-backfill.js';
-import { PRICE_PATH_OF_POOLS } from '../server/compact/projections.js';
+import { VALUATION_INPUTS_OF_POOLS } from '../server/compact/projections.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { assertHourIso } from '../server/compact/scheduler.js';
 import { COMPACT_SCHEMA_VERSION, createCompactStore } from '../server/compact/store.js';
+import { acquireWriterLock, WriterLockError } from '../server/compact/writer-lock.js';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
 
 export class RepairConfigError extends Error {
@@ -51,9 +52,12 @@ export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync
   print(`PROJECTION_REPAIR_HOUR ${summary.hour}`);
   let provider = null;
   let db = null;
+  let lock = null;
   try {
     // An existing compact database only: this child never creates one.
     if (!existsSync(sqlitePath)) throw new RepairConfigError('database_missing');
+    // One writer at a time: an operator backfill holding the lock makes this child refuse before any request or write.
+    lock = acquireWriterLock(sqlitePath, { owner: 'repair-compact-projection-hour' });
     db = new DatabaseSync(sqlitePath);
     const store = createCompactStore(db);
     const input = readProjectionRepairInput(db, hourStart, { schemaVersion: COMPACT_SCHEMA_VERSION });
@@ -68,7 +72,7 @@ export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync
       const v3Pools = plan.needs.uniswap_v3_pools ? store.v3Registry()?.pools ?? new Set() : new Set();
       const projections = await backfillProjectionHour({ provider, hour: { ...input.hour, needs: plan.needs }, v3Pools });
       summary.outcomes = store.commitProjectionHour(hourStart, projections,
-        { only: [...summary.needs, ...summary.needs.map((name) => PRICE_PATH_OF_POOLS[name])] });
+        { only: [...summary.needs, ...summary.needs.flatMap((name) => VALUATION_INPUTS_OF_POOLS[name])] });
     }
     summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
     const notRepaired = summary.needs.filter((name) => summary.projections[name] !== 'available');
@@ -78,8 +82,10 @@ export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync
     summary.reason = error?.code ?? `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}`;
     if (error instanceof ProviderError) summary.diagnostics = { httpStatus: error.httpStatus, rpcCode: error.rpcCode };
     else if (error instanceof LogError) summary.diagnostics = { blockNumber: error.blockNumber };
+    else if (error instanceof WriterLockError) summary.diagnostics = { holder: error.holder?.owner ?? null };
   } finally {
     db?.close();
+    lock?.release();
   }
   summary.requests = provider?.stats.requests ?? 0;
   print(`NEEDS ${summary.needs?.length ? summary.needs.join(',') : 'none'}`);

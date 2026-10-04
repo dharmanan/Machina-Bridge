@@ -595,9 +595,10 @@ if (!sqlite) {
   const rows = (db) => db.prepare('SELECT hour_start, network_sha256 FROM compact_hours ORDER BY hour_start').all()
     .map((row) => `${row.hour_start}:${row.network_sha256}`);
   const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
-  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_volume_hours', 'compact_family_hours', 'compact_hour_addresses', 'compact_hours',
-    'compact_meta', 'compact_pool_hours', 'compact_pool_price_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage',
-    'compact_token_metadata', 'compact_token_price_hours', 'compact_valuation_hours'];
+  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+    'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
+    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_metadata', 'compact_token_price_hours',
+    'compact_valuation_hours'];
   const metricsOf = (family, name) => Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, family[field]]));
   try {
     await test('sqlite: schema v2 is created with WAL, synchronous=NORMAL and busy_timeout=5000; reopening keeps it', async () => {

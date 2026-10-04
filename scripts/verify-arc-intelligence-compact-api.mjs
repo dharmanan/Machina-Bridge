@@ -79,7 +79,7 @@ function fakeReadModel(overrides = {}) {
   };
 }
 
-// The twelve exact read routes, each with the read-model call it must make.
+// The twenty exact read routes, each with the read-model call it must make (7D/30D appended).
 const ROUTE_CALLS = [
   ['/health', 'health'],
   ['/v1/intelligence/summary?window=1h', 'summary:1h'],
@@ -93,10 +93,18 @@ const ROUTE_CALLS = [
   ['/v1/intelligence/activity?type=swaps', 'activity:swaps'],
   ['/v1/intelligence/activity?type=adds', 'activity:adds'],
   ['/v1/intelligence/activity?type=removes', 'activity:removes'],
+  ['/v1/intelligence/summary?window=7d', 'summary:7d'],
+  ['/v1/intelligence/summary?window=30d', 'summary:30d'],
+  ['/v1/intelligence/timeseries?window=7d', 'timeseries:7d'],
+  ['/v1/intelligence/timeseries?window=30d', 'timeseries:30d'],
+  ['/v1/intelligence/pools?protocol=v3&window=7d', 'pools:v3:7d'],
+  ['/v1/intelligence/pools?protocol=v3&window=30d', 'pools:v3:30d'],
+  ['/v1/intelligence/pools?protocol=v4&window=7d', 'pools:v4:7d'],
+  ['/v1/intelligence/pools?protocol=v4&window=30d', 'pools:v4:30d'],
 ];
 const VALID = ROUTE_CALLS.map(([path]) => path);
 
-await test('http: only the twelve exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
+await test('http: only the twenty exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
   const model = fakeReadModel();
   await withServer({ readModel: model }, async (port) => {
     for (const path of VALID) {
@@ -132,7 +140,8 @@ await test('http: arbitrary windows, extra or repeated parameters and SQL-like i
       "/v1/intelligence/summary?window=24h'%20OR%201=1--", '/v1/intelligence/summary?window=24h;DROP%20TABLE%20compact_hours',
       '/v1/intelligence/summary?window=24h#x', '/health?x=1', '/health?',
       // pools: protocol v3 or v4, window 24h, in exactly this order
-      '/v1/intelligence/pools?protocol=v2&window=24h', '/v1/intelligence/pools?protocol=v3&window=6h', '/v1/intelligence/pools?protocol=v3&window=7d',
+      '/v1/intelligence/pools?protocol=v2&window=24h', '/v1/intelligence/pools?protocol=v3&window=6h', '/v1/intelligence/pools?protocol=v3&window=7D',
+      '/v1/intelligence/summary?window=7D', '/v1/intelligence/summary?window=1w', '/v1/intelligence/timeseries?window=30D', '/v1/intelligence/pools?protocol=v3&window=90d',
       '/v1/intelligence/pools?window=24h&protocol=v3', '/v1/intelligence/pools?protocol=v3&window=24h&x=1', '/v1/intelligence/pools?x=1&protocol=v3&window=24h',
       '/v1/intelligence/pools?protocol=v3&protocol=v4&window=24h', '/v1/intelligence/pools?protocol=v3&window=24h&window=24h',
       '/v1/intelligence/pools?protocol=v3', '/v1/intelligence/pools?window=24h', '/v1/intelligence/pools', '/v1/intelligence/pools?',
@@ -299,7 +308,7 @@ await test('static: the HTTP and read paths cannot write SQLite, call Arc RPC, r
   for (const match of read.matchAll(/\.exec\(([`'])([^`']*)\1\)/g)) {
     assert.match(match[2], /^(PRAGMA (query_only = ON|busy_timeout = \$\{busyTimeoutMs\})|BEGIN|COMMIT|ROLLBACK)$/, match[2]);
   }
-  // Only the twelve routes exist, and no route takes a free-form value.
+  // Only the twenty routes exist, and no route takes a free-form value.
   assert.deepEqual([...http.matchAll(/^ {2}\['(\/[^']*)'/gm)].map((match) => match[1]), VALID);
 });
 
@@ -796,7 +805,8 @@ if (!sqlite) {
       'v3', 'available', null, [], []]);
     assert.deepEqual(v3.window, { key: '24h', hours: 24, start: iso(BASE + 2 * HOUR), end: iso(BASE + 26 * HOUR) });
     // Every pool of this fixture has a USDC side, so every hour is valued from stored flows alone (no price needed).
-    assert.deepEqual(v3.ranking, { by: 'swap_count', usdVolume: { status: 'available', reason: null, reasons: [] }, liquidityUsd: { status: 'source_pending' } });
+    assert.deepEqual(v3.ranking, { by: 'swap_count', usdVolume: { status: 'available', reason: null, reasons: [] },
+      liquidityUsd: { status: 'unavailable', reason: 'tvl_not_collected', asOfHour: iso(BASE + 25 * HOUR) } }, 'no liquidity snapshot in this fixture');
     assert.deepEqual([v3.poolsTracked, v3.newPools], [13, 1], 'all registry pools through the checkpoint; pool C was created inside the window');
     assert.deepEqual(v3.pools.map((row) => [row.pool, row.swapCount]), [[POOL_C, 600], ...[12, 11, 10, 9, 8, 7, 6, 5, 4].map((n) => [V3_POOLS[n - 1], 24 * n])],
       'at most 10 pools, ranked by summed swap count');
@@ -808,13 +818,15 @@ if (!sqlite) {
     assert.deepEqual(twelve.usdVolume, { status: 'available', reason: null, usdMicros: (BIG * 288n + 288n).toString(), basis: 'usd_anchor' },
       'the USDC side of every swap (paid in plus paid out), exact, never both sides');
     assert.deepEqual(v3.pools[0].usdVolume, { status: 'available', reason: null, usdMicros: '6', basis: 'usd_anchor' }, 'pool C: six hours of one raw unit');
-    assert.deepEqual({ ...twelve, flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined }, { pool: V3_POOLS[11],
-      createdBlock: firstBlockOf(0), token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null, flowsRaw: undefined,
-      liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined });
+    assert.deepEqual(twelve.liquidityUsd, { status: 'unavailable', reason: 'tvl_not_collected', usdMicros: null, amount0Raw: null, amount1Raw: null,
+      asOfBlock: null }, 'never filled from add or remove activity');
+    assert.deepEqual({ ...twelve, flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined, liquidityUsd: undefined },
+      { pool: V3_POOLS[11], createdBlock: firstBlockOf(0), token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null,
+        flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined, liquidityUsd: undefined });
     assert.deepEqual(v3.pools[0].token1, token(UNKNOWN, null, null), 'an unknown token keeps its address, no symbol or decimals are guessed');
     const keys = [...JSON.stringify(v3.pools).matchAll(/"([^"]+)":/g)].map((match) => match[1]);
-    assert.ok(!keys.some((key) => /usd|tvl|volume|price/i.test(key) && !['usdVolume', 'usdMicros'].includes(key)),
-      'the only USD fields are the valued swap volume; no TVL or price field is produced');
+    assert.ok(!keys.some((key) => /usd|tvl|volume|price/i.test(key) && !['usdVolume', 'usdMicros', 'liquidityUsd'].includes(key)),
+      'the only USD fields are the valued swap volume and the pool liquidity value; no other price field is produced');
     assert.ok(Buffer.byteLength(JSON.stringify(v3)) < MAX_RESPONSE_BYTES);
     assert.equal(fileHash(projected.path), before, 'reading never changes the file');
     assert.equal(fetchCalls, 0);
@@ -855,8 +867,9 @@ if (!sqlite) {
     assert.deepEqual(v3Swap, { time: iso(BASE + 25 * HOUR), blockNumber: firstBlockOf(25), logIndex: 0, txHash: hash(0xaa000 + 2500), protocol: 'uniswap_v3',
       kind: 'swap', pool: V3_POOLS[11], pair: { token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null },
       amounts: { status: 'available', basis: 'v3_pool_delta', amount0Raw: '1', amount1Raw: `-${BIG}` }, from: txFromOf(25, 0), to: address(0xe000),
-      toKind: 'swap_recipient' });
+      toKind: 'swap_recipient', toReason: null });
     const v4Swap = byKey(1);
+    assert.equal(v4Swap.toReason, 'v4_swap_recipient_not_emitted_and_trace_unavailable', 'the exact blocker, never a fake recipient');
     assert.deepEqual([v4Swap.from, v4Swap.to, v4Swap.toKind, v4Swap.pair.token0, v4Swap.amounts], [txFromOf(25, 1), null, 'none', NATIVE_USDC,
       { status: 'available', basis: 'v4_swap_delta', amount0Raw: '-1', amount1Raw: String(BIG) }], 'a V4 swap has no recipient: To stays null');
     assert.deepEqual([byKey(20).to, byKey(20).toKind, byKey(20).amounts], [address(0xd000 + 20), 'liquidity_owner',
@@ -939,7 +952,7 @@ if (!sqlite) {
   await test('http + read model: pools and activity over HTTP with 304 revalidation', async () => {
     const model = openProjected();
     await withServer({ readModel: model }, async (port) => {
-      for (const path of VALID.slice(6)) {
+      for (const path of VALID.slice(6, 12)) {
         const res = await send(port, { path });
         assert.equal(res.status, 200, path);
         assert.equal(res.json.status, 'available', path);

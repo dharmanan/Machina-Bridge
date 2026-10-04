@@ -686,8 +686,8 @@ await test('repair child: strict arguments (exactly one UTC hour, no flags, no b
     assert.doesNotMatch(text, /processHour\(|processBlockRange\(|spineWindows|hour\.js'|eth_getTransactionReceipt|eth_getBlockReceipts|\[hex\([^)]*\), true\]/);
   }
   assert.doesNotMatch(repairSource, /--execute|COMPACT_PROJECTION_EXECUTE|readBackfillInputs|runProjectionBackfill|bootstrapV4Registry|catchUpV4Registry/);
-  assert.match(repairSource, /commitProjectionHour\(hourStart, projections,\s*\{ only: \[\.\.\.summary\.needs, \.\.\.summary\.needs\.map\(\(name\) => PRICE_PATH_OF_POOLS\[name\]\)\] \}\)/,
-    'writes only the rebuilt projections and the price paths read from the same streams');
+  assert.match(repairSource, /commitProjectionHour\(hourStart, projections,\s*\{ only: \[\.\.\.summary\.needs, \.\.\.summary\.needs\.flatMap\(\(name\) => VALUATION_INPUTS_OF_POOLS\[name\]\)\] \}\)/,
+    'writes only the rebuilt projections and the valuation inputs read from the same streams');
 });
 
 const sqlite = await import('node:sqlite').catch(() => null);
@@ -742,9 +742,10 @@ if (!sqlite) {
         dex_activity: { status: 'available', rows: activity },
       } };
   }
-  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_volume_hours', 'compact_family_hours', 'compact_hour_addresses', 'compact_hours',
-    'compact_meta', 'compact_pool_hours', 'compact_pool_price_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage',
-    'compact_token_metadata', 'compact_token_price_hours', 'compact_valuation_hours'];
+  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+    'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
+    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_metadata', 'compact_token_price_hours',
+    'compact_valuation_hours'];
   try {
     await test('sqlite: additive projection tables, activity index and projection_version meta rows; a changed version is refused', async () => {
       const db = open('schema.sqlite');
@@ -763,13 +764,15 @@ if (!sqlite) {
       const db = open('live.sqlite');
       const store = createCompactStore(db);
       const committed = store.commitHour(LIVE);
-      assert.deepEqual([committed.outcome, committed.projections], ['inserted', { uniswap_v3_pools: 'inserted', uniswap_v4_pools: 'inserted', dex_activity: 'inserted', uniswap_v3_price_paths: 'inserted', uniswap_v4_price_paths: 'inserted' }]);
+      assert.deepEqual([committed.outcome, committed.projections], ['inserted', { uniswap_v3_pools: 'inserted', uniswap_v4_pools: 'inserted', dex_activity: 'inserted', uniswap_v3_price_paths: 'inserted', uniswap_v4_price_paths: 'inserted', uniswap_v4_swap_fees: 'inserted' }]);
       assert.deepEqual(store.projectionStatus(HOUR).map((row) => [row.projection, row.status, row.rowCount, row.rowsSha256]), [
         ['dex_activity', 'available', LIVE.projections.dex_activity.rows.length, LIVE.projections.dex_activity.rowsSha256],
         ['uniswap_v3_pools', 'available', LIVE.projections.uniswap_v3_pools.rows.length, LIVE.projections.uniswap_v3_pools.rowsSha256],
         ['uniswap_v3_price_paths', 'available', LIVE.projections.uniswap_v3_price_paths.rows.length, LIVE.projections.uniswap_v3_price_paths.rowsSha256],
         ['uniswap_v4_pools', 'available', LIVE.projections.uniswap_v4_pools.rows.length, LIVE.projections.uniswap_v4_pools.rowsSha256],
-        ['uniswap_v4_price_paths', 'available', LIVE.projections.uniswap_v4_price_paths.rows.length, LIVE.projections.uniswap_v4_price_paths.rowsSha256]]);
+        ['uniswap_v4_price_paths', 'available', LIVE.projections.uniswap_v4_price_paths.rows.length, LIVE.projections.uniswap_v4_price_paths.rowsSha256],
+        ['uniswap_v4_swap_fees', 'available', LIVE.projections.uniswap_v4_swap_fees.rows.length, LIVE.projections.uniswap_v4_swap_fees.rowsSha256]]);
+      assert.deepEqual(store.swapFees(HOUR), LIVE.projections.uniswap_v4_swap_fees.rows);
       assert.deepEqual(store.pricePaths(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_price_paths.rows);
       assert.deepEqual(store.pricePaths(HOUR, 'uniswap_v4'), LIVE.projections.uniswap_v4_price_paths.rows);
       assert.deepEqual(store.poolHours(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_pools.rows);
@@ -793,7 +796,7 @@ if (!sqlite) {
       const before = ['compact_pool_hours', 'compact_dex_activity', 'compact_projection_hours', 'compact_registry'].map((table) => count(db, table));
       const again = store.commitHour(LIVE);
       assert.deepEqual([again.outcome, again.projections], ['unchanged', { uniswap_v3_pools: 'unchanged', uniswap_v4_pools: 'unchanged', dex_activity: 'unchanged',
-        uniswap_v3_price_paths: 'unchanged', uniswap_v4_price_paths: 'unchanged' }]);
+        uniswap_v3_price_paths: 'unchanged', uniswap_v4_price_paths: 'unchanged', uniswap_v4_swap_fees: 'unchanged' }]);
       assert.deepEqual(['compact_pool_hours', 'compact_dex_activity', 'compact_projection_hours', 'compact_registry'].map((table) => count(db, table)), before);
       const [row] = store.recentActivity('swap', 1);
       assert.throws(() => db.prepare(`INSERT INTO compact_dex_activity (block_number, log_index, hour_start, block_timestamp, tx_hash, tx_from, protocol,
@@ -812,7 +815,7 @@ if (!sqlite) {
       assert.equal(store.commitHour(tampered).outcome, 'inserted');
       assert.deepEqual(statusOf(store, HOUR), { dex_activity: 'unavailable(projection_inputs_unavailable)',
         uniswap_v3_pools: 'unavailable(reconciliation_mismatch)', uniswap_v4_pools: 'available', uniswap_v3_price_paths: 'available',
-        uniswap_v4_price_paths: 'available' }, 'price paths reconcile on their own with the family counter');
+        uniswap_v4_price_paths: 'available', uniswap_v4_swap_fees: 'available' }, 'price paths and fees reconcile on their own with the family counter');
       assert.deepEqual([store.poolHours(HOUR, 'uniswap_v3'), count(db, 'compact_dex_activity')], [[], 0], 'nothing partial');
       assert.deepEqual(hourState(db), hourState(clean), 'hour, families, addresses and checkpoint identical to a clean commit');
       const duplicate = open('duplicate.sqlite');
@@ -833,10 +836,10 @@ if (!sqlite) {
       assert.deepEqual(hourState(db), hourState(clean));
       assert.deepEqual(statusOf(store, HOUR), { dex_activity: 'unavailable(projection_error)', uniswap_v3_pools: 'unavailable(projection_error)',
         uniswap_v4_pools: 'unavailable(projection_error)', uniswap_v3_price_paths: 'unavailable(projection_error)',
-        uniswap_v4_price_paths: 'unavailable(projection_error)' });
+        uniswap_v4_price_paths: 'unavailable(projection_error)', uniswap_v4_swap_fees: 'unavailable(projection_error)' });
       const upgraded = store.commitHour(LIVE);
       assert.deepEqual([upgraded.outcome, upgraded.projections], ['unchanged', { uniswap_v3_pools: 'upgraded', uniswap_v4_pools: 'upgraded', dex_activity: 'upgraded',
-        uniswap_v3_price_paths: 'upgraded', uniswap_v4_price_paths: 'upgraded' }]);
+        uniswap_v3_price_paths: 'upgraded', uniswap_v4_price_paths: 'upgraded', uniswap_v4_swap_fees: 'upgraded' }]);
       assert.deepEqual(store.poolHours(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_pools.rows);
       const different = unhashed(LIVE, (projections) => { projections.uniswap_v3_pools.rows[0].token0InRaw = '1'; });
       assert.deepEqual(store.commitHour(different).projections.uniswap_v3_pools, 'conflict');
@@ -925,8 +928,9 @@ if (!sqlite) {
       assert.deepEqual([report.committed, report.skipped], [1, []]);
       assert.equal(provider.stats.requests, plan.totalRequests, 'exactly the planned requests');
       assert.deepEqual(statusOf(store, HOUR), { dex_activity: 'unavailable(projection_inputs_unavailable)', uniswap_v3_pools: 'available',
-        uniswap_v4_pools: 'available', uniswap_v3_price_paths: 'available', uniswap_v4_price_paths: 'available' });
+        uniswap_v4_pools: 'available', uniswap_v3_price_paths: 'available', uniswap_v4_price_paths: 'available', uniswap_v4_swap_fees: 'available' });
       assert.deepEqual(store.pricePaths(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_price_paths.rows, 'the logs-only re-read gives the live price path');
+      assert.deepEqual(store.swapFees(HOUR), LIVE.projections.uniswap_v4_swap_fees.rows, 'and the live V4 swap fees');
       assert.deepEqual(store.pricePaths(HOUR, 'uniswap_v4'), LIVE.projections.uniswap_v4_price_paths.rows);
       assert.deepEqual(store.poolHours(HOUR, 'uniswap_v3'), LIVE.projections.uniswap_v3_pools.rows);
       assert.deepEqual(store.poolHours(HOUR, 'uniswap_v4'), LIVE.projections.uniswap_v4_pools.rows);
@@ -1043,7 +1047,8 @@ if (!sqlite) {
       assert.deepEqual([run.summary.needs, run.summary.blocked, run.summary.ok, run.lines.at(-1)], [['uniswap_v4_pools'], {}, true, 'RESULT PASS']);
       assert.equal(run.filters.length, chunks);
       assert(run.filters.every((filter) => JSON.stringify(filter.address) === JSON.stringify([PM])), 'v4 only');
-      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'available', uniswap_v4_pools: 'available', uniswap_v4_price_paths: 'available' });
+      assert.deepEqual(statusOf(store, HOUR), { uniswap_v3_pools: 'available', uniswap_v4_pools: 'available', uniswap_v4_price_paths: 'available',
+        uniswap_v4_swap_fees: 'available' });
       assert.deepEqual(store.poolHours(HOUR, 'uniswap_v4'), LIVE.projections.uniswap_v4_pools.rows);
       assert.deepEqual(store.v4Registry(), { coverage: { fromBlock: ORIGIN.originNumber, through: LIVE.range.lastBlock, throughHash: LIVE.range.lastHash },
         pools: 3 });

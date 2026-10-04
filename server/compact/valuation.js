@@ -19,15 +19,25 @@
 // both sides are anchors), otherwise the side with a verified hourly price (the mean of both when both have one). A side is
 // the pool's directional raw flows summed (paid in plus paid out), so a swap is never counted from both of its sides.
 // Pools with neither an anchor nor a priced side are not valued; their swaps are reported as unvalued.
+//
+// Swap fees: the fee a swap pays to its pool (LP fee, including any protocol share), charged on the input amount: fee pips
+// of 1,000,000. Uniswap V3 charges the pool's fee tier (its protocol fee is a share of that tier, never added on top). Uniswap V4
+// records the fee it applied (protocol plus LP) in every Swap event (projections.js uniswap_v4_swap_fees). Per token side the
+// fee is that token's input times the fee, plus, for swaps where the token was paid out, the input-side fee converted at the
+// swap's execution rate: out * fee / (1,000,000 - fee). These are estimates: hourly flows do not retain the per-step
+// integer rounding of the executed swap. The fee is valued with the same side rule as volume. A V4 pool whose hook may
+// return swap deltas (hook address flags) can charge outside the pool fee, so its fees are
+// never valued; fees a hook takes are never part of these numbers.
 import { ARC_ASSETS_BY_ADDRESS, ARC_VERIFIED_ASSETS } from '../../api/_lib/arc-intelligence/assets.js';
 
 export const VALUATION_VERSIONS = Object.freeze({
   token_prices: 'usdc-anchor-pool-twap-v1',
   dex_usd_volume: 'one-side-usd-swap-volume-v1',
+  dex_fees: 'input-side-estimated-swap-fees-v1',
 });
 export const VALUATIONS = Object.freeze(Object.keys(VALUATION_VERSIONS));
 export const VALUATION_REASONS = Object.freeze(['price_paths_unavailable', 'pool_projections_unavailable', 'prices_unavailable',
-  'pool_registry_missing', 'valuation_error']);
+  'pool_registry_missing', 'valuation_error', 'fee_inputs_unavailable']);
 
 export const PRICE_POLICY = Object.freeze({
   minSwaps: 3,
@@ -198,6 +208,72 @@ export function hourVolumeOf({ poolRows, poolOf, prices }) {
       } else total.unvaluedSwaps += row.swapCount;
     }
     totals[protocol] = total;
+  }
+  return { needsPrices, totals };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Swap fees.
+
+export const FEE_PIPS = 1_000_000n;
+const E12 = 10n ** 12n;
+// Hook permission bits are encoded in the hook address: BEFORE_SWAP_RETURNS_DELTA (1 << 3) and AFTER_SWAP_RETURNS_DELTA (1 << 2).
+export const HOOK_SWAP_DELTA_FLAGS = 0b1100n;
+export const hookCanTakeSwapDeltas = (hooks) => typeof hooks === 'string' && hooks !== ZERO_ADDRESS && (BigInt(hooks) & HOOK_SWAP_DELTA_FLAGS) !== 0n;
+
+// The output-side term of one fee: out * fee / (1e6 - fee), scaled by 1e12 (floor). Throws on an impossible fee.
+export function outFeeE12(outRaw, fee) {
+  if (fee < 0n || fee > FEE_PIPS || (fee === FEE_PIPS && outRaw > 0n)) throw new ValuationError('swap_fee_invalid');
+  return outRaw === 0n ? 0n : (outRaw * fee * E12) / (FEE_PIPS - fee);
+}
+
+// One token side's fee, in that token's raw units scaled by 1e12, for a static fee (Uniswap V3 fee tier).
+export function staticSideFeeE12({ inRaw, outRaw, fee }) {
+  return inRaw * fee * MICROS + outFeeE12(outRaw, fee);
+}
+
+// USD value (micro-USD, floor) of one pool's fee sides (raw units x 1e12), by the volume side rule; null when not valuable.
+export function poolFeeUsd({ token0, token1, side0E12, side1E12 }, prices) {
+  const value = poolVolumeUsd({ token0, token1, side0Raw: side0E12, side1Raw: side1E12 }, prices);
+  return value && { usdMicros: value.usdMicros / E12, basis: value.basis };
+}
+
+const raw = (value) => {
+  if (typeof value !== 'string' || !DIGITS.test(value)) throw new ValuationError('malformed_flow');
+  return BigInt(value);
+};
+
+// Swap fees of one hour. poolRows.uniswap_v3: V3 pool-hour rows (flows); feeRows.uniswap_v4: V4 swap-fee rows
+// (projections.js). poolOf(protocol, pool) -> { token0, token1, hooks, fee }. Returns { needsPrices, totals } where
+// totals[protocol] = { feeUsdMicros, valuedSwaps, unvaluedSwaps }; the same price rule as hourVolumeOf.
+export function hourFeesOf({ poolRows, feeRows, poolOf, prices }) {
+  let needsPrices = false;
+  const totals = { uniswap_v3: { feeUsdMicros: 0n, valuedSwaps: 0, unvaluedSwaps: 0 }, uniswap_v4: { feeUsdMicros: 0n, valuedSwaps: 0, unvaluedSwaps: 0 } };
+  const add = (protocol, meta, swapCount, sides) => {
+    if (!sides) {
+      totals[protocol].unvaluedSwaps += swapCount; // never valuable, whatever the prices
+      return;
+    }
+    if (prices === null && needsPrice(meta.token0, meta.token1)) needsPrices = true;
+    const value = poolFeeUsd({ token0: meta.token0, token1: meta.token1, side0E12: sides[0], side1E12: sides[1] }, prices);
+    if (value) {
+      totals[protocol].feeUsdMicros += value.usdMicros;
+      totals[protocol].valuedSwaps += swapCount;
+    } else totals[protocol].unvaluedSwaps += swapCount;
+  };
+  for (const row of poolRows.uniswap_v3 ?? []) {
+    if (!row.swapCount) continue;
+    const meta = poolOf('uniswap_v3', row.pool);
+    if (!meta || !Number.isSafeInteger(meta.fee)) throw new ValuationError('pool_registry_missing');
+    const fee = BigInt(meta.fee);
+    add('uniswap_v3', meta, row.swapCount, [staticSideFeeE12({ inRaw: raw(row.token0InRaw), outRaw: raw(row.token0OutRaw), fee }),
+      staticSideFeeE12({ inRaw: raw(row.token1InRaw), outRaw: raw(row.token1OutRaw), fee })]);
+  }
+  for (const row of feeRows.uniswap_v4 ?? []) {
+    const meta = poolOf('uniswap_v4', row.pool);
+    if (!meta) throw new ValuationError('pool_registry_missing');
+    add('uniswap_v4', meta, row.swapCount, hookCanTakeSwapDeltas(meta.hooks) ? null
+      : [raw(row.feeIn0E6) * MICROS + raw(row.feeOut0E12), raw(row.feeIn1E6) * MICROS + raw(row.feeOut1E12)]);
   }
   return { needsPrices, totals };
 }

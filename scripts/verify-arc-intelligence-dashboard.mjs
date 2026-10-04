@@ -41,6 +41,14 @@ const MAPPING = [
   [{ view: 'activity', type: 'swaps' }, '/v1/intelligence/activity?type=swaps'],
   [{ view: 'activity', type: 'adds' }, '/v1/intelligence/activity?type=adds'],
   [{ view: 'activity', type: 'removes' }, '/v1/intelligence/activity?type=removes'],
+  [{ view: 'summary', window: '7d' }, '/v1/intelligence/summary?window=7d'],
+  [{ view: 'summary', window: '30d' }, '/v1/intelligence/summary?window=30d'],
+  [{ view: 'timeseries', window: '7d' }, '/v1/intelligence/timeseries?window=7d'],
+  [{ view: 'timeseries', window: '30d' }, '/v1/intelligence/timeseries?window=30d'],
+  [{ view: 'pools', protocol: 'v3', window: '7d' }, '/v1/intelligence/pools?protocol=v3&window=7d'],
+  [{ view: 'pools', protocol: 'v3', window: '30d' }, '/v1/intelligence/pools?protocol=v3&window=30d'],
+  [{ view: 'pools', protocol: 'v4', window: '7d' }, '/v1/intelligence/pools?protocol=v4&window=7d'],
+  [{ view: 'pools', protocol: 'v4', window: '30d' }, '/v1/intelligence/pools?protocol=v4&window=30d'],
 ];
 const ALLOWED_URLS = new Set(MAPPING.map(([, path]) => `${ORIGIN}${path}`));
 
@@ -83,11 +91,11 @@ function upstream({ status = 200, body = null, text = undefined, headers = {}, t
 
 const summaryBody = (window = '24h', extra = {}) => ({ schema: SUMMARY_SCHEMA, window: { key: window }, freshness: { stale: false }, ...extra });
 const timeseriesBody = (window = '24h') => ({ schema: TIMESERIES_SCHEMA, window: { key: window }, buckets: [] });
-const poolsBody = (protocol = 'v3') => ({ schema: POOLS_SCHEMA, protocol, window: { key: '24h' }, status: 'available', pools: [] });
+const poolsBody = (protocol = 'v3', window = '24h') => ({ schema: POOLS_SCHEMA, protocol, window: { key: window }, status: 'available', pools: [] });
 const activityBody = (type = 'all') => ({ schema: ACTIVITY_SCHEMA, type, status: 'available', limit: 25, rows: [] });
 const bodyFor = (query) => (query.view === 'health' ? { status: 'ok', checkpointHour: '2026-10-03T08:00:00.000Z' }
   : query.view === 'summary' ? summaryBody(query.window) : query.view === 'timeseries' ? timeseriesBody(query.window)
-    : query.view === 'pools' ? poolsBody(query.protocol) : activityBody(query.type));
+    : query.view === 'pools' ? poolsBody(query.protocol, query.window) : activityBody(query.type));
 
 async function withFetch(fetchDouble, work, env = {}) {
   const originalFetch = globalThis.fetch;
@@ -107,7 +115,7 @@ async function withFetch(fetchDouble, work, env = {}) {
 
 const noFetch = async () => { throw new Error('fetch must not run for a rejected request'); };
 
-await test('1-12 the twelve exact requests map to twelve fixed upstream URLs and return the upstream body unchanged', async () => {
+await test('1-20 the twenty exact requests map to twenty fixed upstream URLs and return the upstream body unchanged', async () => {
   await withFetch(async (url) => {
     const query = MAPPING.find(([, path]) => `${ORIGIN}${path}` === url)[0];
     return upstream({ body: bodyFor(query) });
@@ -120,7 +128,7 @@ await test('1-12 the twelve exact requests map to twelve fixed upstream URLs and
       assert.equal(seen.at(-1).url, `${ORIGIN}${path}`);
     }
     assert.ok(seen.every(({ options }) => options.method === 'GET' && options.headers.accept === 'application/json' && options.redirect === 'manual'));
-    assert.equal(seen.length, 12);
+    assert.equal(seen.length, 20);
   });
 });
 
@@ -142,7 +150,8 @@ await test('11-13 extra, missing, repeated or unknown parameters and windows are
       { view: 'health', window: '1h' }, { view: 'health', x: '1' }, { view: 'summary', window: '24h', path: '/x' },
       { view: 'summary', window: '24h', url: 'https://evil.example' }, { view: 'summary' }, { view: 'timeseries' },
       { view: 'summary', window: '2h' }, { view: 'summary', window: '48h' }, { view: 'summary', window: '24H' },
-      { view: 'summary', window: '' }, { view: 'summary', window: '7d' }, { view: 'summary', window: '24h ' },
+      { view: 'summary', window: '' }, { view: 'summary', window: '7D' }, { view: 'summary', window: '1w' }, { view: 'summary', window: '90d' },
+      { view: 'summary', window: '24h ' }, { view: 'timeseries', window: '1h' }, { view: 'pools', protocol: 'v3', window: '30D' },
       { view: 'summary', window: "24h' OR 1=1--" }, { view: 'summary', window: '24h;DROP TABLE compact_hours' },
       { view: 'summary', window: '../../health' }, { view: 'summary', window: ['24h', '6h'] }, { view: ['summary', 'health'] },
       { view: 'timeseries', window: '1h' }, { view: 'timeseries', window: '24h', window2: '6h' },
@@ -539,18 +548,19 @@ const FAMILY_METRICS = {
       [UNKNOWN_TOKEN]: { depositCount: 1, inputAmountRaw: '123', units: { symbol: null, decimals: null, verified: false } } },
     fillByToken: { [USDC]: { fillCount: 4, outputAmountRaw: '3990000', units: { symbol: 'USDC', decimals: 6, verified: true } } } },
 };
-function summaryFixture({ families = {}, network = {}, storedHours = 48, usdVolume } = {}) {
+function summaryFixture({ families = {}, network = {}, storedHours = 48, usdVolume, swapFees, protocolUsd, window = '24h', hours = 24 } = {}) {
   const family = (name) => (Object.hasOwn(families, name) ? families[name] : available(FAMILY_METRICS[name]));
   return {
-    schema: SUMMARY_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: '24h', hours: 24, ...WINDOW_RANGE }, freshness,
+    schema: SUMMARY_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: window, hours, start: isoAt(END - hours * HOUR_MS), end: isoAt(END) }, freshness,
     network: { status: 'available', ...WINDOW_RANGE, blocks: 86_400, transactions: 1_234_567, transactionsPerSecond: 1_234_567 / 86_400,
       averageTransactionsPerBlock: 1_234_567 / 86_400, gasUsedRaw: '987654321000', uniqueActiveAddresses: { status: 'available', value: 45_678 },
       previous: { status: 'available', blocks: 86_400, transactions: 1_000_000, transactionsPerSecond: 1_000_000 / 86_400, averageTransactionsPerBlock: 11.5,
         gasUsedRaw: '900000000000', uniqueActiveAddresses: { status: 'not_supported', reason: 'identity_retention_exceeded', value: null } }, ...network },
     assets: { usdc: family('usdc'), verifiedAssets: family('assets') },
     dex: { uniswapV3: family('uniswapV3'), uniswapV4: family('uniswapV4'), officialV3Pools: { status: 'available', count: 87, throughBlock: 4_200_000 },
-      ...(usdVolume ? { usdVolume } : {}) },
+      ...(usdVolume ? { usdVolume } : {}), ...(swapFees ? { swapFees } : {}) },
     lending: { aaveV4: family('aaveV4'), morphoBlue: family('morphoBlue'), morphoVaultsV2: family('morphoVaultsV2') },
+    ...(protocolUsd ? { protocolUsd } : {}),
     crossChain: { cctp: family('cctp'), gateway: family('gateway'), across: family('across') },
     coverage: { firstStoredHour: isoAt(END - storedHours * HOUR_MS), storedHours, checkpointHour: freshness.checkpointHour,
       verifiedThrough: freshness.verifiedThrough, checkpointBlock: 4_200_000, families: {} },
@@ -672,7 +682,70 @@ const USD_COLLECTING_DATA = { ...USD_DATA, summary: summaryFixture({ usdVolume: 
 const USD_UNAVAILABLE_DATA = { ...USD_DATA, summary: summaryFixture({ usdVolume: usdUnavailable(['prices_unavailable']) }),
   timeseries: timeseriesFixture({ usd: () => ({ status: 'unavailable', reason: 'prices_unavailable' }) }),
   pools: usdPools(usdRanking('unavailable', ['prices_unavailable'])) };
-const USD_STATES = ['ready-usd', 'usd-swaps-tab', 'usd-collecting', 'usd-unavailable'];
+// Swap fees, other protocols' USD and pool liquidity, exactly as the read model serves them once valued.
+const feesWindow = (totalFeeUsdMicros, valuedSwaps, { unvaluedSwaps = 0, previousAverage = '250000' } = {}) => ({ status: 'available', reason: null, reasons: [],
+  calculation: 'estimated', basis: 'input-side-estimated-swap-fees-v1', unavailableHours: [], ...WINDOW_RANGE,
+  totalFeeUsdMicros, byProtocol: { uniswapV3: totalFeeUsdMicros, uniswapV4: '0' }, valuedSwaps, unvaluedSwaps,
+  averageFeeUsdMicros: (BigInt(totalFeeUsdMicros) / BigInt(valuedSwaps)).toString(),
+  previous: { status: 'available', reason: null, reasons: [], totalFeeUsdMicros: '1250000000', byProtocol: null, valuedSwaps: 5000, unvaluedSwaps: 0,
+    averageFeeUsdMicros: previousAverage } });
+const PROTOCOL_USD_READY = {
+  cctp: { status: 'available', reason: null, ...WINDOW_RANGE, values: { outboundUsdMicros: '9000000', inboundUsdMicros: '11000000', inboundFeeUsdMicros: '0' } },
+  gateway: { status: 'available', reason: null, ...WINDOW_RANGE, values: { depositUsdMicros: '2000000', outboundBurnUsdMicros: '1000000', outboundBurnFeeUsdMicros: '0',
+    inboundMintUsdMicros: '3000000', withdrawalUsdMicros: '500000' } },
+  across: { status: 'unavailable', reason: 'unverified_token', ...WINDOW_RANGE, values: null, failedHour: isoAt(END - 3 * HOUR_MS) },
+  aaveV4: { status: 'available', reason: null, ...WINDOW_RANGE, values: { suppliedUsdMicros: '5000000000', withdrawnUsdMicros: '0', borrowedUsdMicros: '2000000000',
+    repaidUsdMicros: '0', liquidatedDebtUsdMicros: '0', liquidatedCollateralUsdMicros: '0' } },
+  morphoBlue: { status: 'unavailable', reason: 'unverified_token', ...WINDOW_RANGE, values: null, failedHour: isoAt(END - 5 * HOUR_MS) },
+  morphoVaultsV2: { status: 'available', reason: null, ...WINDOW_RANGE, values: { depositedUsdMicros: '7000000', withdrawnUsdMicros: '1000000' } },
+};
+const liquidity = (usdMicros, extra = {}) => ({ status: 'available', reason: null, usdMicros, amount0Raw: '1000000', amount1Raw: '2000000', asOfBlock: 4_200_000, ...extra });
+const noLiquidity = (reason, extra = {}) => ({ status: 'unavailable', reason, usdMicros: null, amount0Raw: null, amount1Raw: null, asOfBlock: null, ...extra });
+const completePools = () => {
+  const ranking = { ...usdRanking(), liquidityUsd: { status: 'available', reason: null, asOfHour: isoAt(END - HOUR_MS) } };
+  const pools = usdPools(ranking);
+  pools.v3.pools[0].liquidityUsd = liquidity('3500000000000');
+  pools.v3.pools[1].liquidityUsd = noLiquidity('no_verified_price', { amount0Raw: '5', amount1Raw: '6', asOfBlock: 4_200_000 });
+  pools.v4.pools[0].liquidityUsd = liquidity('820000000', { calculation: 'estimated_principal_reserves' });
+  pools.v4.pools[1].liquidityUsd = noLiquidity('hook_may_hold_pool_value', { asOfBlock: 4_200_000 });
+  return pools;
+};
+const COMPLETE_DATA = { ...USD_DATA, summary: summaryFixture({ usdVolume: usdWindow('1234567890123', { unvaluedSwaps: 7 }),
+  swapFees: feesWindow('1650000000', 5500, { unvaluedSwaps: 12 }), protocolUsd: PROTOCOL_USD_READY }), pools: completePools(),
+  activity: { ...ACTIVITY_READY, all: activityFixture('all', ACTIVITY_READY.all.rows.map((row) => ({ ...row, toReason: row.toKind === 'none' ? lib.V4_SWAP_TO_BLOCKER : null }))) } };
+// 7D and 30D while history fills (52 of 168 or 720 hours stored): totals collecting, daily buckets with honest gaps.
+const STORED_HOURS = 52;
+const longSummary = (window, hours) => summaryFixture({ window, hours, families: insufficient, network: collectingNetwork, storedHours: STORED_HOURS,
+  usdVolume: { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], unavailableHours: [], totalUsdMicros: null, byProtocol: null,
+    valuedSwaps: null, unvaluedSwaps: null },
+  swapFees: { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], unavailableHours: [], totalFeeUsdMicros: null, byProtocol: null,
+    valuedSwaps: null, unvaluedSwaps: null, averageFeeUsdMicros: null },
+  protocolUsd: Object.fromEntries(Object.keys(PROTOCOL_USD_READY).map((name) => [name, { status: 'unavailable', reason: 'insufficient_coverage', values: null }])) });
+function dailyTimeseries(window, days) {
+  const buckets = Array.from({ length: days }, (_, index) => {
+    const range = { start: isoAt(END - (days - index) * 24 * HOUR_MS), end: isoAt(END - (days - 1 - index) * 24 * HOUR_MS) };
+    const fromEnd = days - 1 - index;
+    if (fromEnd >= 3) return { ...range, status: 'not_stored', storedHours: 0, network: null, families: null, dexUsdVolume: null };
+    if (fromEnd === 2) return { ...range, status: 'incomplete', storedHours: STORED_HOURS - 48, network: null, families: null, dexUsdVolume: null };
+    return { ...range, status: 'committed', storedHours: 24,
+      network: { blocks: 86_400, transactions: 1_200_000 + index, transactionsPerSecond: 13.9, averageTransactionsPerBlock: 13.9, gasUsedRaw: '980000000000',
+        uniqueActiveAddresses: null, uniqueActiveAddressesStatus: { status: 'not_supported', reason: 'identity_retention_exceeded' } },
+      families: { uniswapV3: { status: 'available', swapCount: 4000 + index, poolCreatedCount: 1, mintCount: 9, burnCount: 4, foreignEventCount: 0 },
+        uniswapV4: { status: 'available', swapCount: 1000, initializeCount: 0, modifyLiquidityCount: 3 } },
+      dexUsdVolume: fromEnd === 1 ? { status: 'unavailable', reason: 'valuation_not_processed' }
+        : { status: 'available', totalUsdMicros: '36000000000', uniswapV3UsdMicros: '24000000000', uniswapV4UsdMicros: '12000000000', valuedSwaps: 5000, unvaluedSwaps: 3 } };
+  });
+  return { schema: TIMESERIES_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: window, hours: days * 24, start: isoAt(END - days * 24 * HOUR_MS), end: isoAt(END) },
+    freshness, bucketHours: 24, buckets };
+}
+const longPools = (window, hours) => Object.fromEntries(['v3', 'v4'].map((protocol) => [protocol, { ...POOLS_COLLECTING[protocol],
+  window: { key: window, hours, start: isoAt(END - hours * HOUR_MS), end: isoAt(END) } }]));
+const longData = (window, days) => ({ window, summary: longSummary(window, days * 24), timeseries: dailyTimeseries(window, days), failed: false,
+  pools: longPools(window, days * 24), activity: ACTIVITY_READY });
+const SEVEN_DAY_DATA = longData('7d', 7);
+const THIRTY_DAY_DATA = longData('30d', 30);
+const USD_STATES = ['ready-usd', 'usd-swaps-tab', 'usd-collecting', 'usd-unavailable', 'ready-complete', '7d', '7d-swaps', '30d'];
+const LOADING_STATES = ['loading', '7d-loading', '7d-with-24h-data'];
 const BORROW_UNAVAILABLE = { status: 'unavailable' };
 const STATES = {
   // Swaps view, so the chart assertions see the hourly bars; the default view (Volume) is checked separately.
@@ -687,10 +760,14 @@ const STATES = {
     pools: { v3: null, v4: POOLS_READY.v4 }, activity: { ...ACTIVITY_READY, swaps: null } } },
   failed: { selectedWindow: '24h', borrowMarket: BORROW_UNAVAILABLE, data: { window: '24h', summary: null, timeseries: null, failed: true } },
   loading: { selectedWindow: '24h', data: null },
-  '7d': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: null },
-  '30d': { selectedWindow: '30d', borrowMarket: BORROW_UNAVAILABLE, data: null },
-  // A 24H result handed to the 7D view must be ignored, never shown as 7D.
+  '7d': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: SEVEN_DAY_DATA },
+  '7d-swaps': { selectedWindow: '7d', initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE, data: SEVEN_DAY_DATA },
+  '30d': { selectedWindow: '30d', borrowMarket: BORROW_UNAVAILABLE, data: THIRTY_DAY_DATA },
+  '7d-loading': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: null },
+  // A 24H result handed to the 7D view must be ignored, never shown as 7D: the 7D view keeps loading its own data.
   '7d-with-24h-data': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: READY_DATA },
+  // Everything valued: DEX volume, swap fees, pool liquidity, other protocols' USD and the V4 To reason.
+  'ready-complete': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: COMPLETE_DATA },
   'ready-swaps-tab': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: READY_DATA, initialActivityType: 'swaps',
     explorerUrl: 'https://explorer.arc.io' },
   // The API with USD valuation: available, still being valued, and unavailable (prices missing for some hour).
@@ -722,8 +799,8 @@ await test('UI 1 manifest: the thirteen stable sections in order (Borrow after l
 
 await test('UI 2 every manifest section and item is rendered, in its own section, in every data state', async () => {
   for (const [name, { tree }] of Object.entries(rendered)) {
-    const statuses = checkScope(tree, SCOPE, { allowLoading: name === 'loading' });
-    if (name !== 'loading') assert.ok(![...statuses.values()].includes('loading'), name);
+    const statuses = checkScope(tree, SCOPE, { allowLoading: LOADING_STATES.includes(name) });
+    if (!LOADING_STATES.includes(name)) assert.ok(![...statuses.values()].includes('loading'), name);
   }
 });
 
@@ -736,8 +813,8 @@ await test('UI 3 header, window selector, refresh, KPI cards, chart tabs, activi
   assert.match(button('7D').attrs.class, /border-slate-300 bg-white/);
   assert.equal(button('24H').attrs['aria-selected'], 'true');
   const text = textOf(tree);
-  for (const label of ['Arc Intelligence', 'Verified Arc network activity', 'Verified through Oct 3, 14:00 UTC', 'Active Addresses', 'Transactions', 'Total Volume',
-    'Average Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'Newly launched tokens',
+  for (const label of ['Arc Intelligence', 'Verified Arc network activity', 'Verified through Oct 3, 14:00 UTC', 'Active Addresses', 'Transactions', 'DEX Volume',
+    'Average Swap Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'Newly launched tokens',
     'Borrow on Arc', 'Powered by Circle Borrow Kit on Arc', 'Aave', 'Morpho Blue', 'Morpho Vaults', 'CCTP', 'Gateway', 'Across', 'RWA',
     'Other Verified Protocols', 'Exchange flows', 'Other verified Arc protocols', 'Hours in UTC']) {
     assert.ok(text.includes(label), label);
@@ -795,7 +872,9 @@ await test('UI 5 missing data never appears as a number or as zero, in any state
   // Without verified window data no window value exists. Borrow markets are current product terms read from Borrow Kit,
   // not a window metric, so they are the only values a 7D or 30D view may carry.
   const windowValues = (tree) => byAttr(tree, 'data-intel-value').map((node) => node.attrs['data-intel-item']).filter((id) => !id.startsWith('borrow.'));
-  for (const name of ['failed', 'loading', '7d', '30d', '7d-with-24h-data']) assert.deepEqual(windowValues(rendered[name].tree), [], name);
+  for (const name of ['failed', ...LOADING_STATES]) assert.deepEqual(windowValues(rendered[name].tree), [], name);
+  // 7D and 30D while history fills: only complete days and the pool registry carry values; window totals stay collecting.
+  for (const name of ['7d', '30d']) assert.deepEqual(windowValues(rendered[name].tree), ['volume-chart.latest', 'top-pools-v3.pool-count'], name);
   // While the 24H totals are still being collected, only hour-level and registry values exist: the verified hours.
   assert.deepEqual(windowValues(rendered.collecting.tree), ['active-addresses-chart.latest', 'top-pools-v3.pool-count']);
   // The collecting state still draws every verified hour (18 of 24), and says so in plain words.
@@ -805,18 +884,22 @@ await test('UI 5 missing data never appears as a number or as zero, in any state
   assert.match(textOf(item(rendered.collecting.tree, 'network.transactions')), /Collecting History is still being collected/);
 });
 
-await test('UI 6 without the API\'s USD valuation no USD value exists; Average Fee and the protocol USD ranking are never filled', async () => {
-  const VOLUME = ['network.total-volume', 'volume-chart.volume', 'top-pools-v3.volume', 'top-pools-v4.volume'];
+await test('UI 6 without the API\'s USD valuation no USD value exists; the protocol USD ranking stays blocked with its reason', async () => {
+  const VOLUME = ['network.total-volume', 'network.average-fee', 'volume-chart.volume', 'top-pools-v3.volume', 'top-pools-v4.volume', 'top-pools-v3.liquidity',
+    'top-pools-v4.liquidity', 'lending.aave-usd', 'lending.morpho-blue-usd', 'lending.morpho-vaults-usd', 'cross-chain.cctp-usd', 'cross-chain.gateway-usd',
+    'cross-chain.across-usd'];
   for (const [name, { tree, html }] of Object.entries(rendered)) {
-    for (const id of ['network.average-fee', 'top-protocols.volume-ranking']) assert.equal(item(tree, id).attrs['data-intel-status'], 'source_pending', `${name} ${id}`);
+    assert.equal(item(tree, 'top-protocols.volume-ranking').attrs['data-intel-status'], 'source_pending', `${name} ranking`);
     if (USD_STATES.includes(name)) continue;
     for (const id of VOLUME) assert.notEqual(item(tree, id).attrs['data-intel-status'], 'available', `${name} ${id}`);
-    assert.doesNotMatch(textOf(item(tree, 'network.total-volume')), /USDC|\d/, name);
+    assert.equal(item(tree, 'network.total-volume').attrs['data-intel-value'], undefined, `${name}: no financial value`);
     assert.doesNotMatch(html, /\$\s?\d|\d\s?USD\b|US\$/, `${name}: no USD amount`);
   }
   // An API without valuation (the ready fixtures carry none) reads as not available yet, never as zero or unavailable.
   for (const id of VOLUME) assert.equal(statusIn('ready', id), 'source_pending', id);
   assert.equal(statusIn('ready-default-view', 'volume-chart.volume'), 'source_pending');
+  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Estimated Average Swap Fee Not available yet Verified data does not include estimated swap fees yet\./);
+  assert.match(textOf(item(rendered.ready.tree, 'network.total-volume')), /DEX Volume Not available yet USD-valued Uniswap V3 and V4 swaps on Arc\. Verified data does not include DEX USD valuations yet\./);
 });
 
 const UI_SOURCES = [COMPONENT_PATH, LIB_PATH, SCOPE_PATH].map((file) => [file, readFileSync(file, 'utf8')]);
@@ -851,38 +934,44 @@ await test('UI 8 no removed receipt metrics, no runtime views, no engineering wo
   assert.doesNotMatch(componentSource, /\bdark:|bg-(slate|gray|zinc|neutral)-(900|950)\b|purple|violet|indigo|fuchsia/, 'light Machina theme only');
 });
 
-await test('UI 9 only the eight 24H requests exist; 7D and 30D make no request at all', async () => {
-  const REQUESTS_24H = ['/api/intelligence?view=summary&window=24h', '/api/intelligence?view=timeseries&window=24h',
-    '/api/intelligence?view=pools&protocol=v3&window=24h', '/api/intelligence?view=pools&protocol=v4&window=24h', '/api/intelligence?view=activity&type=all',
-    '/api/intelligence?view=activity&type=swaps', '/api/intelligence?view=activity&type=adds', '/api/intelligence?view=activity&type=removes'];
-  assert.deepEqual(Object.values(lib.ARC_INTELLIGENCE_REQUESTS), REQUESTS_24H);
+await test('UI 9 every window reads exactly its own summary, timeseries and pools plus the shared activity; nothing else is requested', async () => {
+  const requests = (window) => [`/api/intelligence?view=summary&window=${window}`, `/api/intelligence?view=timeseries&window=${window}`,
+    `/api/intelligence?view=pools&protocol=v3&window=${window}`, `/api/intelligence?view=pools&protocol=v4&window=${window}`,
+    ...['all', 'swaps', 'adds', 'removes'].map((type) => `/api/intelligence?view=activity&type=${type}`)];
+  assert.deepEqual(Object.values(lib.ARC_INTELLIGENCE_REQUESTS).sort(), [...new Set(['24h', '7d', '30d'].flatMap(requests))].sort());
   for (const url of Object.values(lib.ARC_INTELLIGENCE_REQUESTS)) {
     const parsed = new URL(url, 'https://machina.example');
     assert.equal(parsed.pathname, '/api/intelligence');
     assert.ok(resolveIntelligenceRoute(Object.fromEntries(parsed.searchParams)), `${url} is an exact proxy route`);
   }
-  const calls = [];
-  const fetchImpl = async (url, init) => {
-    calls.push([url, init.method]);
-    return { ok: true, json: async () => (url.includes('timeseries') ? timeseriesFixture() : summaryFixture()) };
-  };
-  for (const window of ['7d', '30d']) {
+  assert.deepEqual({ ...scopeModule.ARC_INTELLIGENCE_BACKEND_WINDOWS }, { '24h': true, '7d': true, '30d': true });
+  const DATA = { '24h': READY_DATA, '7d': SEVEN_DAY_DATA, '30d': THIRTY_DAY_DATA };
+  for (const window of ['24h', '7d', '30d']) {
+    const calls = [];
+    const body = (url) => {
+      const query = Object.fromEntries(new URL(url, 'https://machina.example').searchParams);
+      if (query.view === 'activity') return DATA[window].activity[query.type];
+      if (query.view === 'pools') return DATA[window].pools[query.protocol];
+      return DATA[window][query.view];
+    };
+    const fetchImpl = async (url, init) => {
+      calls.push([url, init.method]);
+      return { ok: true, json: async () => structuredClone(body(url)) };
+    };
     const result = await lib.loadArcIntelligence(window, { fetchImpl });
-    assert.deepEqual(result, { window, summary: null, timeseries: null, failed: false });
+    assert.deepEqual(calls.map(([url, method]) => `${method} ${url}`).sort(), requests(window).map((url) => `GET ${url}`).sort(), `${window}: its eight exact requests`);
+    assert.deepEqual([result.window, result.failed, result.summary.window.key, result.timeseries.window.key], [window, false, window, window]);
+    assert.ok(result.pools.v3 && result.pools.v4 && result.activity.all, `${window}: pools and activity parsed`);
   }
-  assert.deepEqual(calls, [], '7D and 30D never reach the network');
-  const result = await lib.loadArcIntelligence('24h', { fetchImpl });
-  assert.equal(result.failed, false);
-  assert.equal(result.summary.schema, SUMMARY_SCHEMA);
-  assert.deepEqual(calls.sort(), REQUESTS_24H.map((url) => [url, 'GET']).sort(), 'the 24H view reads exactly its eight exact requests');
+  assert.equal(lib.parseArcPools(POOLS_READY.v3, 'v3', '7d'), null, 'a pools answer for another window is never accepted');
   assert.doesNotMatch(componentSource, /\bfetch\(/, 'the component only loads through loadArcIntelligence');
   assert.match(componentSource, /if \(!ARC_INTELLIGENCE_BACKEND_WINDOWS\[target\]\) return/);
-  assert.deepEqual({ ...scopeModule.ARC_INTELLIGENCE_BACKEND_WINDOWS }, { '24h': true, '7d': false, '30d': false });
-  for (const name of ['7d', '30d', '7d-with-24h-data']) {
-    assert.match(textOf(rendered[name].tree), /History is still being collected/, name);
+  for (const [name, hours] of [['7d', 168], ['30d', 720]]) {
+    assert.match(textOf(rendered[name].tree), new RegExp(`History is still being collected \\(${STORED_HOURS} of ${hours} hours so far\\)\\. ${name.toUpperCase()} totals appear once every hour of the window is verified; the daily charts already show each complete day\\.`), name);
     assert.equal(statusIn(name, 'network.transactions'), 'collecting', name);
-    assert.equal(statusIn(name, 'active-addresses-chart.series'), 'collecting', name);
+    assert.equal(statusIn(name, 'active-addresses-chart.series'), 'unavailable', `${name}: daily unique addresses are never summed`);
   }
+  for (const name of ['7d-loading', '7d-with-24h-data']) assert.equal(statusIn(name, 'network.transactions'), 'loading', `${name}: never shows another window's data`);
   const originalFetch = globalThis.fetch;
   globalThis.fetch = () => { throw new Error('server rendering must not fetch'); };
   try {
@@ -1069,7 +1158,7 @@ await test('UI 19 lower sections stay present and compact: one status badge per 
       assert.ok(![...walk(section)].some((node) => /\bmin-h-/.test(node.attrs.class ?? '')), `${name} ${id}: no tall empty panel`);
     }
   }
-  for (const name of ['collecting', 'failed', 'loading', '7d', '30d', '7d-with-24h-data']) {
+  for (const name of ['collecting', 'failed', ...LOADING_STATES, '7d', '30d']) {
     assert.equal(byAttr(rendered[name].tree, 'data-activity-bar').length, 0, `${name}: no activity bar without verified counts`);
     assert.equal(byAttr(rendered[name].tree, 'data-mix-segment').length, 0, `${name}: no event mix without verified counts`);
   }
@@ -1111,7 +1200,7 @@ await test('UI 20 Volume is the primary DEX view, Swaps the secondary verified v
   }
 });
 
-await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fee, swaps; without valuation, volume and liquidity stay source_pending', async () => {
+await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fee, swaps; without valuation, volume and liquidity stay not available yet', async () => {
   const v3 = sectionNode(rendered.ready.tree, 'top-pools-v3');
   const v3Rows = byAttr(v3, 'data-pool-row');
   assert.deepEqual(v3Rows.map((node) => node.attrs['data-pool-row']), [V3_POOL_A, V3_POOL_B], 'kept in the ranked order the service returns');
@@ -1131,8 +1220,8 @@ await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fe
   assert.match(textOf(sectionNode(rendered.mixed.tree, 'top-pools-v3')), /Pool data is not verified for this window Rankings appear once every hour/);
   assert.equal(statusIn('mixed', 'top-pools-v4.swaps'), 'available', 'one failed read never hides the other');
   assert.equal(statusIn('collecting', 'top-pools-v3.swaps'), 'collecting');
-  for (const name of ['failed', 'loading', '7d', '30d', '7d-with-24h-data']) {
-    assert.equal(byAttr(rendered[name].tree, 'data-pool-row').length, 0, `${name}: no pool rows without a ready 24H read`);
+  for (const name of ['failed', ...LOADING_STATES, '7d', '30d']) {
+    assert.equal(byAttr(rendered[name].tree, 'data-pool-row').length, 0, `${name}: no pool rows without a ready, complete window read`);
   }
 });
 
@@ -1639,20 +1728,25 @@ await test('Contract 2 From is the transaction sender; To is only an exact event
     /router or tx\.to is presented as the recipient|To semantics note missing/, 'labelling the router as the recipient is caught');
 });
 
-await test('Contract 3 Liquidity means value held in the pool: source_pending, never filled from add or remove activity', async () => {
-  assert.match(SEMANTICS['top-pools.liquidity'].meaning, /actual pool liquidity: value held in the pool/);
-  for (const forbidden of ['add or remove event count', 'mint, burn or modifyLiquidity activity', 'liquidity activity']) {
+await test('Contract 3 Liquidity uses V3 balances or clearly estimated V4 principal, never add/remove activity', async () => {
+  assert.match(SEMANTICS['top-pools.liquidity'].meaning, /V3 token balances; V4 estimated principal reserves/);
+  assert.match(SEMANTICS['top-pools.liquidity'].source, /pool state at the last block of the latest verified hour/);
+  for (const forbidden of ['add or remove event count', 'mint, burn or modifyLiquidity activity', 'liquidity activity', 'in-range liquidity units',
+    'external or guessed price', 'unpriced tokens counted as zero']) {
     assert.ok(SEMANTICS['top-pools.liquidity'].forbidden.includes(forbidden), forbidden);
   }
   for (const id of LIQUIDITY_IDS) {
-    assert.equal(scopeItem(id).backend, 'pending', id);
-    assert.match(scopeItem(id).label, /value held in the pool/);
+    assert.equal(scopeItem(id).backend, 'live', id);
+    assert.match(scopeItem(id).label, /value held in the pool|Estimated principal reserves/);
     assert.doesNotMatch(scopeItem(id).label, /activity/i, `${id} is not liquidity activity`);
   }
   for (const [name, { tree }] of Object.entries(rendered)) {
-    assertPendingField(tree, LIQUIDITY_IDS, name);
-    for (const id of ['top-pools-v3', 'top-pools-v4']) assert.match(textOf(sectionNode(tree, id)), /Liquidity is the value held in the pool\./, `${name} ${id}`);
+    assert.match(textOf(sectionNode(tree, 'top-pools-v3')), /Liquidity uses token balances held by the pool\./, name);
+    assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /Liquidity uses estimated principal reserves from pool state\./, name);
   }
+  // Available only when the pools read itself carries pool state; an API without it is not available yet.
+  assertPendingField(rendered.ready.tree, LIQUIDITY_IDS, 'ready');
+  for (const id of LIQUIDITY_IDS) assert.equal(statusIn('ready-complete', id), 'available', id);
   assert.equal(LIQUIDITY_FROM_ACTIVITY.exec(componentSource), null, 'no Liquidity value comes from add or remove counts');
   const mutated = componentSource.replace(NEW_POOLS_TILE, `${NEW_POOLS_TILE}
         <StatTile marker={markerProps(\`\${id}.liquidity\`, 'available', metricSum(family, ['mintCount', 'burnCount']))} label="Liquidity" cell={newPools} />`);
@@ -1683,16 +1777,18 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
       for (const row of byAttr(sectionNode(tree, id), 'data-pool-row')) {
         assert.match(textOf(row), / [\d,]+ swaps$/, `${name} ${id}: a pool's count is always shown as swaps`);
         assert.doesNotMatch(textOf(row), /liquidity/i, `${name} ${id}: a pool row never carries a liquidity value`);
-        if (!volumeAvailable) assert.doesNotMatch(textOf(row), /volume|USD\b|\$/i, `${name} ${id}: no volume without the valuation`);
+        if (!volumeAvailable) {
+          assert.doesNotMatch(textOf(row).replace(/Holds \S+/, ''), /volume|USD\b|\$/i, `${name} ${id}: no volume without the valuation`);
+        }
       }
-      assert.match(text, /Liquidity Not available yet/, `${name} ${id}: liquidity keeps its place, stated once`);
+      assert.match(text, /Liquidity (Not available yet|Available|Collecting|Unavailable|Loading)/, `${name} ${id}: liquidity keeps its place, stated once`);
     }
     const protocols = textOf(sectionNode(tree, 'top-protocols'));
-    assert.match(protocols, /Ranked by USD volume Primary ranking\. Fixed order until every protocol has a verified USD measure\./, name);
+    assert.match(protocols, /Ranked by USD volume Not available: lending and bridge USD values are kept per action \(supplied, borrowed, sent\), so protocols share no comparable USD volume\. Listed in a fixed order\./, name);
     assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
   }
   // The ready fixtures carry no valuation: their Volume (USD) line says so once, beside Liquidity.
-  assert.match(textOf(sectionNode(rendered.ready.tree, 'top-pools-v3')), /Volume \(USD\) Not available yet Liquidity Not available yet/);
+  assert.match(textOf(sectionNode(rendered.ready.tree, 'top-pools-v3')), /Volume \(USD\) Not available yet Verified data does not include pool USD valuations yet\. Liquidity Not available yet/);
   const unitOf = (node) => textOf(node).match(/(swaps|lending actions|market actions|vault actions)$/)?.[1];
   for (const node of byAttr(sectionNode(rendered.ready.tree, 'top-protocols'), 'data-intel-value')) {
     assert.ok(unitOf(node), `${node.attrs['data-intel-item']}: a count is always shown with its unit`);
@@ -1714,17 +1810,20 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
 // ---------------------------------------------------------------------------------------------------------------------
 // USD volume (server/compact/valuation.js through summary.v1, timeseries.v1 and pools.v1).
 
-await test('Volume 1 Total Volume is the exact window value from the API, with its unit, period, change and unvalued swaps stated', async () => {
+await test('Volume 1 DEX Volume is the exact window value from the API, with its unit, period, change and unvalued swaps stated', async () => {
   const kpi = item(rendered['ready-usd'].tree, 'network.total-volume');
   assert.equal(kpi.attrs['data-intel-status'], 'available');
   assert.equal(kpi.attrs['data-intel-value'], '1234567890123', 'the exact micro-USD amount the API served');
-  assert.equal(textOf(kpi), 'Total Volume $1.2M Uniswap V3 and V4 swaps, last 24H. 7 swaps without a verified price excluded. +23.5% vs previous 24H');
+  assert.equal(textOf(kpi), 'DEX Volume $1.2M USD-valued Uniswap V3 and V4 swaps on Arc. Total, last 24H. 7 swaps without a verified price excluded. +23.5% vs previous 24H');
   assert.equal([...walk(kpi)].find((node) => node.attrs.title)?.attrs.title, '$1,234,567.89', 'the exact amount stays on hover');
   const noPrevious = render({ ...STATES['ready-usd'], data: { ...USD_DATA, summary: summaryFixture({ usdVolume: usdWindow('5000000', { previous: null }) }) } }).tree;
-  assert.equal(textOf(item(noPrevious, 'network.total-volume')), 'Total Volume $5 Uniswap V3 and V4 swaps, last 24H.',
+  assert.equal(textOf(item(noPrevious, 'network.total-volume')), 'DEX Volume $5 USD-valued Uniswap V3 and V4 swaps on Arc. Total, last 24H.',
     'no change without an exactly comparable previous window, no unvalued note without unvalued swaps');
   assert.equal(statusIn('usd-collecting', 'network.total-volume'), 'collecting');
-  assert.match(textOf(item(rendered['usd-collecting'].tree, 'network.total-volume')), /USD volume appears once every hour of the window is valued/);
+  assert.match(textOf(item(rendered['usd-collecting'].tree, 'network.total-volume')),
+    /DEX Volume Collecting USD-valued Uniswap V3 and V4 swaps on Arc\. Some hours of this window are not valued yet\./);
+  assert.match(textOf(item(rendered['usd-unavailable'].tree, 'network.total-volume')),
+    /DEX Volume Unavailable USD-valued Uniswap V3 and V4 swaps on Arc\. No verified price for a token in some hour of this window\./, 'the exact reason, never a vague gap');
   assert.equal(statusIn('usd-unavailable', 'network.total-volume'), 'unavailable');
   for (const name of ['usd-collecting', 'usd-unavailable']) assert.doesNotMatch(rendered[name].html, /\$\s?\d/, `${name}: no USD amount without a valued window`);
 });
@@ -1739,22 +1838,23 @@ await test('Volume 2 the DEX Volume chart draws only valued hours, keeps the unv
   const labels = [...walk(section)].filter((node) => node.tag === 'button' && node.attrs['aria-label']).map((node) => node.attrs['aria-label']);
   assert.equal(labels.length, 24);
   assert.deepEqual(labels.slice(0, 2), ['14:00-15:00 UTC: no verified data', '15:00-16:00 UTC: no verified data'], 'hours not stored stay gaps');
-  assert.equal(labels[USD_GAP_AT], '02:00-03:00 UTC: no verified data', 'an hour without a verified value is a gap, never zero');
+  assert.equal(labels[USD_GAP_AT], '02:00-03:00 UTC: no verified price', 'an hour without a verified value is a gap with its reason, never zero');
   assert.equal(labels[23], '13:00-14:00 UTC: $1.5K', 'each bar is the hour\'s V3 plus V4 value');
   assert.equal(valueIn('ready-usd', 'volume-chart.latest'), '1523', 'latest complete hour, in dollars');
   assert.match(textOf(item(tree, 'volume-chart.latest')), /Latest complete hour \$1\.5K 13:00-14:00 UTC Peak hour in window \$1\.5K 13:00-14:00 UTC/);
-  assert.match(textOf(section), /USD value of swaps per UTC hour across all verified Uniswap V3 and V4 pairs, last 24H\. Each swap is counted once\./);
+  assert.match(textOf(section), /USD-valued Uniswap V3 and V4 swaps on Arc\. USD value per UTC hour across all verified pairs, last 24H\. Each swap is counted once\./);
   assert.match(textOf(section), /Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools\. 7 swaps between tokens without a verified price are not included\./);
   assert.match(textOf(sectionNode(rendered['usd-swaps-tab'].tree, 'volume-chart')), /Counts, not amounts/, 'the Swaps view stays counts');
   assert.equal(statusIn('usd-collecting', 'volume-chart.volume'), 'collecting');
   assert.match(textOf(sectionNode(rendered['usd-collecting'].tree, 'volume-chart')), /DEX volume is still being collected Hours appear here once their swaps are valued\./);
   assert.equal(statusIn('usd-unavailable', 'volume-chart.volume'), 'unavailable');
-  assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, 'volume-chart')), /Hourly DEX volume is not available right now/);
+  assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, 'volume-chart')),
+    /DEX volume per hour is not available right now No verified price for a token in some hour of this window\./);
 });
 
 await test('Volume 3 pool volume is each listed pool\'s exact USD value; a pool without a verified price says so; ranking stays by swaps', async () => {
   const v3Rows = byAttr(sectionNode(rendered['ready-usd'].tree, 'top-pools-v3'), 'data-pool-row');
-  assert.deepEqual(v3Rows.map(textOf), ['1 USDC / 0xabcd...1234 0.05% $2K volume 4,321 swaps', '2 EURC / MOON 0.3% No price 56 swaps']);
+  assert.deepEqual(v3Rows.map(textOf), ['1 USDC / 0xabcd...1234 0.05% $2K volume 4,321 swaps', '2 EURC / MOON 0.3% No verified price 56 swaps']);
   assert.equal([...walk(v3Rows[0])].find((node) => node.attrs.title?.startsWith('$'))?.attrs.title, '$2,000.00');
   const v4Rows = byAttr(sectionNode(rendered['ready-usd'].tree, 'top-pools-v4'), 'data-pool-row');
   assert.deepEqual(v4Rows.map(textOf), ['1 USDC / EURC 0.05% $1.2K volume 1,234 swaps', '2 USDC / MOON Dynamic fee Hooks <$0.01 volume 12 swaps'],
@@ -1764,9 +1864,69 @@ await test('Volume 3 pool volume is each listed pool\'s exact USD value; a pool 
       ['available', 'available', 'available', 'source_pending'], id);
     assert.equal(statusIn('usd-collecting', `${id}.volume`), 'collecting');
     assert.equal(statusIn('usd-unavailable', `${id}.volume`), 'unavailable');
-    assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, id)), /Volume \(USD\) Unavailable Liquidity Not available yet/);
-    for (const row of byAttr(sectionNode(rendered['usd-collecting'].tree, id), 'data-pool-row')) assert.doesNotMatch(textOf(row), /\$|volume/i);
+    assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, id)),
+      /Volume \(USD\) Unavailable No verified price for a token in some hour of this window\. Liquidity Not available yet/);
+    for (const row of byAttr(sectionNode(rendered['usd-collecting'].tree, id), 'data-pool-row')) {
+      assert.doesNotMatch(textOf(row), /\$|volume/i);
+      assert.match(textOf(row), /Not valued yet/, 'a row says why its value is missing, never an endless placeholder');
+    }
   }
+});
+
+await test('Completion 1 fee estimate, state-based liquidity and protocol USD remain visible with their exact source or blocker', async () => {
+  const tree = rendered['ready-complete'].tree;
+  assert.equal(statusIn('ready-complete', 'network.average-fee'), 'available');
+  assert.equal(valueIn('ready-complete', 'network.average-fee'), '300000');
+  assert.match(textOf(item(tree, 'network.average-fee')), /Estimated Average Swap Fee \$0\.3/);
+  assert.match(textOf(item(tree, 'network.average-fee')), /Does not include per step rounding or hook fees/);
+  assert.match(textOf(sectionNode(tree, 'top-pools-v3')), /Holds \$3\.5M/);
+  assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /Estimated reserves \$820/);
+  assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /excluding uncollected fees and position rounding/);
+  assert.match(textOf(sectionNode(tree, 'recent-activity')), /V4 swap recipient is not emitted by the event and trace data is unavailable\./);
+  for (const id of ['lending.aave-usd', 'lending.morpho-vaults-usd', 'cross-chain.cctp-usd', 'cross-chain.gateway-usd']) {
+    assert.equal(item(tree, id).attrs['data-intel-status'], 'available', id);
+  }
+  assert.match(textOf(item(tree, 'lending.morpho-blue-usd')), /not a verified Arc asset/);
+  assert.equal(lib.usdMicrosToNumber('9'.repeat(400)), null, 'unrepresentable chart values never become Infinity or zero');
+});
+
+await test('Completion 2 fully valued 7D and 30D render their own daily USD bars and pool values', async () => {
+  for (const [window, days] of [['7d', 7], ['30d', 30]]) {
+    const hours = days * 24;
+    const summary = summaryFixture({ window, hours, storedHours: hours, usdVolume: usdWindow('1234567890123'),
+      swapFees: feesWindow('1650000000', 5500), protocolUsd: PROTOCOL_USD_READY,
+      network: { uniqueActiveAddresses: { status: 'not_supported', reason: 'identity_retention_exceeded', value: null } } });
+    const series = dailyTimeseries(window, days);
+    series.buckets = series.buckets.map((bucket) => ({ ...bucket, status: 'committed', storedHours: 24,
+      network: { blocks: 86400, transactions: 12345, transactionsPerSecond: 12345 / 86400, gasUsedRaw: '1000',
+        uniqueActiveAddresses: null, uniqueActiveAddressesStatus: { status: 'not_supported', reason: 'identity_retention_exceeded' } },
+      families: { uniswapV3: { status: 'available', swapCount: 3000, mintCount: 0, burnCount: 0 },
+        uniswapV4: { status: 'available', swapCount: 1000, initializeCount: 0, modifyLiquidityCount: 0 } },
+      dexUsdVolume: { status: 'available', totalUsdMicros: '36000000000', uniswapV3UsdMicros: '24000000000', uniswapV4UsdMicros: '12000000000',
+        valuedSwaps: 4000, unvaluedSwaps: 0 } }));
+    const pools = completePools();
+    for (const protocol of ['v3', 'v4']) pools[protocol].window = summary.window;
+    const data = { ...COMPLETE_DATA, window, summary, timeseries: series, pools };
+    const { tree } = render({ selectedWindow: window, data, borrowMarket: BORROW_AVAILABLE });
+    checkScope(tree, SCOPE);
+    assert.equal(item(tree, 'network.total-volume').attrs['data-intel-status'], 'available', window);
+    assert.equal(item(tree, 'volume-chart.volume').attrs['data-intel-status'], 'available', window);
+    assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable', 'long-window uniques are not guessed');
+    const bars = [...walk(sectionNode(tree, 'volume-chart'))].filter((node) => node.tag === 'button' && node.attrs['aria-label']);
+    assert.equal(bars.length, days, window);
+    assert.ok(bars.every((bar) => /\$/.test(bar.attrs['aria-label'])), 'only actually valued daily bins have values');
+    assert.equal(item(tree, 'top-pools-v3.volume').attrs['data-intel-status'], 'available', window);
+  }
+});
+
+await test('Completion 3 older missing valuations explain the bounded backfill limit instead of an endless placeholder', async () => {
+  const summary = summaryFixture({ window: '7d', hours: 168, storedHours: 168,
+    usdVolume: { ...usdUnavailable(['prices_unavailable']), unavailableHours: [isoAt(END - 120 * HOUR_MS)] } });
+  const { tree } = render({ selectedWindow: '7d', data: { ...SEVEN_DAY_DATA, summary }, borrowMarket: BORROW_UNAVAILABLE });
+  const kpi = item(tree, 'network.total-volume');
+  assert.equal(kpi.attrs['data-intel-value'], undefined);
+  assert.match(textOf(kpi), /Some hourly valuations are missing in this window/);
+  assert.match(textOf(kpi), /backfill covers the latest 72 hours at most/);
 });
 
 await test('Tokens 1 a token\'s own contract metadata reads as an unverified label, never as a verified identity', async () => {

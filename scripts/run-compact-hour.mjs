@@ -9,7 +9,10 @@
 // families, so their status is reported but never makes the run fail or triggers a repair. The hour's valuations (token
 // prices, DEX USD volume) are derived from stored rows in the same commit; afterwards a bounded pass derives them for stored
 // hours that have none yet (no RPC), and a bounded step reads ERC-20 metadata of at most METADATA_TOKENS_PER_RUN newly met
-// pool tokens (at most two batched eth_call requests). Neither step can fail the run.
+// pool tokens (at most two batched eth_call requests), and the liquidity of the 24H top pools is read from pool state at the
+// new hour's last block (tvl.js: at most one V3 and three V4 batched eth_call requests). None of these steps can fail the run.
+// One writer at a time (server/compact/writer-lock.js): while an operator backfill holds the writer lock this run refuses
+// with writer_lock_held before any request or write, and the scheduler simply retries the hour later.
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
@@ -21,7 +24,10 @@ import { locateHour, processHour } from '../server/compact/hour.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { bootstrapV3Registry, catchUpV3Registry } from '../server/compact/registry.js';
 import { createCompactStore } from '../server/compact/store.js';
+import { acquireWriterLock, WriterLockError } from '../server/compact/writer-lock.js';
 import { METADATA_TOKENS_PER_RUN, refreshTokenMetadata } from '../server/compact/token-metadata.js';
+import { collectPoolTvl } from '../server/compact/tvl.js';
+import { UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
 
 // First block with official V3 factory code on Arc mainnet (eth_getCode: none at 1948018, present at 1948019). The
 // bootstrap still proves it: bootstrapV3Registry refuses a start that is not before the factory deployment.
@@ -58,11 +64,13 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   const started = performance.now();
   const summary = { targetHour: iso(hourStart), sqlitePath, hourMode: null, repairFamilies: null, registryMode: null, registryBefore: null,
     registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, valuations: null, valuationPass: null,
-    metadata: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
+    metadata: null, tvl: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
   print(`TARGET_HOUR ${summary.targetHour}`);
   print(`SQLITE_PATH ${sqlitePath}`);
   let db = null;
+  let lock = null;
   try {
+    lock = acquireWriterLock(sqlitePath, { owner: 'run-compact-hour' });
     const { DatabaseSync } = await import('node:sqlite');
     db = new DatabaseSync(sqlitePath);
     const store = createCompactStore(db);
@@ -103,6 +111,11 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
       summary.hourOutcome = store.commitHour(result).outcome;
       // Display metadata of newly met pool tokens, read at the safe head. Never fails the run.
       summary.metadata = await refreshTokenMetadata({ store, provider, blockNumber: safeHead, limit: METADATA_TOKENS_PER_RUN });
+      // Liquidity of the 24H top pools at the new hour's last block (a repaired older hour keeps what it has). Never fails the run.
+      if (!repair) {
+        summary.tvl = await collectPoolTvl({ store, provider, hourStart, blockNumber: bounds.last.number,
+          poolManager: UNISWAP_REGISTRY.v4PoolManager.address });
+      }
     }
     // Valuations of stored hours that have none yet (hours stored before valuations existed). No RPC; never fails the run.
     try {
@@ -126,9 +139,10 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     summary.reason = error?.code ?? `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}`;
     if (error instanceof ProviderError) {
       summary.diagnostics = { endpoint: error.endpoint, httpStatus: error.httpStatus, rpcCode: error.rpcCode, detail: error.detail };
-    }
+    } else if (error instanceof WriterLockError) summary.diagnostics = { holder: error.holder?.owner ?? null, since: error.holder?.since ?? null };
   } finally {
     db?.close();
+    lock?.release();
   }
   summary.provider = { requests: provider.stats.requests, retries: provider.stats.retries, calls: { ...provider.stats.calls },
     responseMbDecoded: mb(provider.stats.responseBytes) };
@@ -150,6 +164,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   print(`TOKEN_METADATA ${summary.metadata ? `candidates=${summary.metadata.candidates} verified=${summary.metadata.verified} `
     + `rejected=${summary.metadata.rejected} skipped=${summary.metadata.skipped} requests=${summary.metadata.requests}`
     + `${summary.metadata.error ? ` error=${summary.metadata.error}` : ''}` : 'not_run'}`);
+  print(`POOL_TVL ${summary.tvl ? `v3=${summary.tvl.v3} v4=${summary.tvl.v4}${summary.tvl.error ? ` error=${summary.tvl.error}` : ''}` : 'not_run'}`);
   print(`CHECKPOINT ${summary.checkpoint ? `${summary.checkpoint.hour} last_block=${summary.checkpoint.lastBlock}` : 'none'}`);
   print(`PROVIDER requests=${summary.provider.requests} retries=${summary.provider.retries} response_mb=${summary.provider.responseMbDecoded} `
     + `calls=${JSON.stringify(summary.provider.calls)}`);
