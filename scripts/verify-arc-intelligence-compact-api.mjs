@@ -11,8 +11,10 @@ import { join } from 'node:path';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from '../server/compact/families.js';
 import { createIntelligenceServer, MAX_RESPONSE_BYTES, MAX_URL_LENGTH } from '../server/compact/http.js';
 import { ARC_CHAIN_ID } from '../server/compact/provider.js';
+import { v4PoolIdOf, V4_POOL_KIND } from '../server/compact/projections.js';
 import {
-  createCompactReadModel, ReadModelError, STALE_LAG_HOURS, SUMMARY_SCHEMA, SUMMARY_WINDOWS, TIMESERIES_SCHEMA, TIMESERIES_WINDOWS,
+  ACTIVITY_SCHEMA, createCompactReadModel, POOLS_SCHEMA, ReadModelError, STALE_LAG_HOURS, SUMMARY_SCHEMA, SUMMARY_WINDOWS, TIMESERIES_SCHEMA,
+  TIMESERIES_WINDOWS,
 } from '../server/compact/read-model.js';
 import { V3_POOL_KIND } from '../server/compact/registry.js';
 import { createScheduler } from '../server/compact/scheduler.js';
@@ -69,13 +71,32 @@ function fakeReadModel(overrides = {}) {
     health() { calls.push('health'); return overrides.health ? overrides.health() : { status: 'ok', checkpointHour: '2026-10-02T09:00:00.000Z' }; },
     summary(window) { calls.push(`summary:${window}`); return overrides.summary ? overrides.summary(window) : { schema: SUMMARY_SCHEMA, window: { key: window }, version }; },
     timeseries(window) { calls.push(`timeseries:${window}`); return overrides.timeseries ? overrides.timeseries(window) : { schema: TIMESERIES_SCHEMA, window: { key: window }, version }; },
+    pools(protocol, window) {
+      calls.push(`pools:${protocol}:${window}`);
+      return overrides.pools ? overrides.pools(protocol, window) : { schema: POOLS_SCHEMA, protocol, window: { key: window }, version };
+    },
+    activity(type) { calls.push(`activity:${type}`); return overrides.activity ? overrides.activity(type) : { schema: ACTIVITY_SCHEMA, type, version }; },
   };
 }
 
-const VALID = ['/health', '/v1/intelligence/summary?window=1h', '/v1/intelligence/summary?window=6h', '/v1/intelligence/summary?window=24h',
-  '/v1/intelligence/timeseries?window=6h', '/v1/intelligence/timeseries?window=24h'];
+// The twelve exact read routes, each with the read-model call it must make.
+const ROUTE_CALLS = [
+  ['/health', 'health'],
+  ['/v1/intelligence/summary?window=1h', 'summary:1h'],
+  ['/v1/intelligence/summary?window=6h', 'summary:6h'],
+  ['/v1/intelligence/summary?window=24h', 'summary:24h'],
+  ['/v1/intelligence/timeseries?window=6h', 'timeseries:6h'],
+  ['/v1/intelligence/timeseries?window=24h', 'timeseries:24h'],
+  ['/v1/intelligence/pools?protocol=v3&window=24h', 'pools:v3:24h'],
+  ['/v1/intelligence/pools?protocol=v4&window=24h', 'pools:v4:24h'],
+  ['/v1/intelligence/activity?type=all', 'activity:all'],
+  ['/v1/intelligence/activity?type=swaps', 'activity:swaps'],
+  ['/v1/intelligence/activity?type=adds', 'activity:adds'],
+  ['/v1/intelligence/activity?type=removes', 'activity:removes'],
+];
+const VALID = ROUTE_CALLS.map(([path]) => path);
 
-await test('http: only the six exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
+await test('http: only the twelve exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
   const model = fakeReadModel();
   await withServer({ readModel: model }, async (port) => {
     for (const path of VALID) {
@@ -90,10 +111,13 @@ await test('http: only the six exact read routes answer 200; health is no-store,
       } else {
         assert.equal(res.headers['cache-control'], 'no-cache');
         assert.match(res.headers.etag, /^"[0-9a-f]{40}"$/);
-        assert.equal(res.json.window.key, path.split('=')[1]);
+        const [kind, ...args] = ROUTE_CALLS.find(([candidate]) => candidate === path)[1].split(':');
+        if (kind === 'pools') assert.deepEqual([res.json.schema, res.json.protocol, res.json.window.key], [POOLS_SCHEMA, ...args]);
+        else if (kind === 'activity') assert.deepEqual([res.json.schema, res.json.type], [ACTIVITY_SCHEMA, ...args]);
+        else assert.equal(res.json.window.key, args[0]);
       }
     }
-    assert.deepEqual(model.calls, ['health', 'summary:1h', 'summary:6h', 'summary:24h', 'timeseries:6h', 'timeseries:24h']);
+    assert.deepEqual(model.calls, ROUTE_CALLS.map(([, call]) => call), 'each route calls exactly its read-model method with its fixed arguments');
   });
 });
 
@@ -107,6 +131,19 @@ await test('http: arbitrary windows, extra or repeated parameters and SQL-like i
       '/v1/intelligence/summary?window=', '/v1/intelligence/summary', '/v1/intelligence/summary?', '/v1/intelligence/timeseries',
       "/v1/intelligence/summary?window=24h'%20OR%201=1--", '/v1/intelligence/summary?window=24h;DROP%20TABLE%20compact_hours',
       '/v1/intelligence/summary?window=24h#x', '/health?x=1', '/health?',
+      // pools: protocol v3 or v4, window 24h, in exactly this order
+      '/v1/intelligence/pools?protocol=v2&window=24h', '/v1/intelligence/pools?protocol=v3&window=6h', '/v1/intelligence/pools?protocol=v3&window=7d',
+      '/v1/intelligence/pools?window=24h&protocol=v3', '/v1/intelligence/pools?protocol=v3&window=24h&x=1', '/v1/intelligence/pools?x=1&protocol=v3&window=24h',
+      '/v1/intelligence/pools?protocol=v3&protocol=v4&window=24h', '/v1/intelligence/pools?protocol=v3&window=24h&window=24h',
+      '/v1/intelligence/pools?protocol=v3', '/v1/intelligence/pools?window=24h', '/v1/intelligence/pools', '/v1/intelligence/pools?',
+      '/v1/intelligence/pools?protocol=V3&window=24h', '/v1/intelligence/pools?Protocol=v3&window=24h', '/v1/intelligence/pools?protocol=v3&window=24H',
+      '/v1/intelligence/pools?protocol=%76%33&window=24h', '/v1/intelligence/pools?protocol=v3%26window=24h', '/v1/intelligence/pools?protocol=v3&amp;window=24h',
+      '/v1/intelligence/pools?protocol=v3;&window=24h', "/v1/intelligence/pools?protocol=v3'--&window=24h",
+      // activity: one of all, swaps, adds, removes
+      '/v1/intelligence/activity?type=mints', '/v1/intelligence/activity?type=swap', '/v1/intelligence/activity?type=Swaps',
+      '/v1/intelligence/activity?type=ALL', '/v1/intelligence/activity?type=all&type=swaps', '/v1/intelligence/activity?type=all&limit=100',
+      '/v1/intelligence/activity?limit=25&type=all', '/v1/intelligence/activity?type=%61ll', '/v1/intelligence/activity?type=',
+      '/v1/intelligence/activity', '/v1/intelligence/activity?', '/v1/intelligence/activity?Type=all',
     ];
     for (const path of rejected) {
       const res = await send(port, { path });
@@ -121,7 +158,9 @@ await test('http: unknown routes are 404, absolute-form and oversized URLs are r
   const model = fakeReadModel();
   await withServer({ readModel: model }, async (port) => {
     for (const path of ['/', '/v1/intelligence/latest', '/v1/intelligence/coverage', '/v1/intelligence/runtime', '/v1/intelligence/status',
-      '/health/', '/v1/intelligence/summary/', '/v1/intelligence/../../health', '/db', '/data/arc-compact.sqlite', '/debug']) {
+      '/health/', '/v1/intelligence/summary/', '/v1/intelligence/../../health', '/db', '/data/arc-compact.sqlite', '/debug',
+      '/v1/intelligence/pool?protocol=v3&window=24h', '/v1/intelligence/pools/', '/v1/intelligence/Pools?protocol=v3&window=24h',
+      '/v1/intelligence/activity/', '/v1/intelligence/activities?type=all', '/v1/intelligence/swaps', '/v2/intelligence/pools?protocol=v3&window=24h']) {
       const res = await send(port, { path });
       assert.equal(res.status, 404, path);
       assert.deepEqual(res.json, { error: 'not_found' });
@@ -139,10 +178,12 @@ await test('http: GET only; any request body is refused', async () => {
   const model = fakeReadModel();
   await withServer({ readModel: model }, async (port) => {
     for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
-      const res = await send(port, { method, path: '/v1/intelligence/summary?window=24h' });
-      assert.equal(res.status, 405, method);
-      assert.equal(res.headers.allow, 'GET');
-      assert.deepEqual(res.json, { error: 'method_not_allowed' });
+      for (const path of ['/v1/intelligence/summary?window=24h', '/v1/intelligence/pools?protocol=v3&window=24h', '/v1/intelligence/activity?type=all']) {
+        const res = await send(port, { method, path });
+        assert.equal(res.status, 405, `${method} ${path}`);
+        assert.equal(res.headers.allow, 'GET');
+        assert.deepEqual(res.json, { error: 'method_not_allowed' });
+      }
     }
     const head = await send(port, { method: 'HEAD', path: '/health' });
     assert.equal(head.status, 405);
@@ -151,6 +192,10 @@ await test('http: GET only; any request body is refused', async () => {
     assert.deepEqual(withBody.json, { error: 'body_not_allowed' });
     const chunked = await send(port, { path: '/health', headers: { 'transfer-encoding': 'chunked' }, body: 'hello' });
     assert.equal(chunked.status, 400);
+    for (const path of ['/v1/intelligence/pools?protocol=v4&window=24h', '/v1/intelligence/activity?type=removes']) {
+      const res = await send(port, { path, headers: { 'content-length': '2' }, body: '{}' });
+      assert.deepEqual([res.status, res.json], [400, { error: 'body_not_allowed' }], path);
+    }
     assert.deepEqual(model.calls, []);
   });
 });
@@ -179,6 +224,15 @@ await test('http: read failures become fixed sanitized errors; incompatible data
     const health = await send(port, { path: '/health' });
     assert.equal(health.status, 200, 'one failing route never stops the server');
   });
+  // The pools and activity routes share the same sanitization: nothing of an internal error reaches the client.
+  const leaking = () => { throw Object.assign(new Error('SQLITE_ERROR: no such table compact_pool_hours at /data/arc-compact.sqlite'), { code: 'ERR_SQLITE_ERROR' }); };
+  const pools = fakeReadModel({ pools: leaking, activity: () => { throw new ReadModelError('inconsistent_state', 'pool_registry_metadata_malformed'); } });
+  await withServer({ readModel: pools }, async (port) => {
+    for (const path of ['/v1/intelligence/pools?protocol=v3&window=24h', '/v1/intelligence/activity?type=all']) {
+      const res = await send(port, { path });
+      assert.deepEqual([res.status, res.text, res.headers['cache-control']], [503, '{"error":"unavailable"}', 'no-store'], path);
+    }
+  });
 });
 
 await test('http: ETag is the hash of the exact body; If-None-Match gives 304; changed data gives a new tag', async () => {
@@ -201,6 +255,15 @@ await test('http: ETag is the hash of the exact body; If-None-Match gives 304; c
     const changed = await send(port, { path, headers: { 'if-none-match': expected } });
     assert.equal(changed.status, 200, 'a changed body is never answered with 304');
     assert.notEqual(changed.headers.etag, expected);
+    // The pools and activity data routes carry the same validator contract.
+    for (const dataPath of ['/v1/intelligence/pools?protocol=v4&window=24h', '/v1/intelligence/activity?type=swaps']) {
+      const res = await send(port, { path: dataPath });
+      assert.equal(res.headers.etag, `"${createHash('sha256').update(res.text).digest('hex').slice(0, 40)}"`, dataPath);
+      assert.equal(res.headers['cache-control'], 'no-cache');
+      assert.equal((await send(port, { path: dataPath, headers: { 'if-none-match': res.headers.etag } })).status, 304, dataPath);
+      model.bump();
+      assert.equal((await send(port, { path: dataPath, headers: { 'if-none-match': res.headers.etag } })).status, 200, dataPath);
+    }
   });
 });
 
@@ -236,8 +299,8 @@ await test('static: the HTTP and read paths cannot write SQLite, call Arc RPC, r
   for (const match of read.matchAll(/\.exec\(([`'])([^`']*)\1\)/g)) {
     assert.match(match[2], /^(PRAGMA (query_only = ON|busy_timeout = \$\{busyTimeoutMs\})|BEGIN|COMMIT|ROLLBACK)$/, match[2]);
   }
-  // Only the six routes exist, and no route takes a free-form value.
-  assert.equal((http.match(/^ {2}\['\//gm) ?? []).length, 6);
+  // Only the twelve routes exist, and no route takes a free-form value.
+  assert.deepEqual([...http.matchAll(/^ {2}\['(\/[^']*)'/gm)].map((match) => match[1]), VALID);
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -288,7 +351,9 @@ if (!sqlite) {
       return [field, 50 + k]; // per-hour unique counts
     }));
   }
-  function hourResult(i, { unavailable = {}, pools = [] } = {}) {
+  // overrides: family fields replaced for this hour (projection fixtures reconcile with them); projections: the hour's
+  // projection set, omitted entirely when undefined (an hour stored without projections).
+  function hourResult(i, { unavailable = {}, pools = [], overrides = {}, projections = undefined } = {}) {
     const hourStart = BASE + i * HOUR;
     const firstBlock = firstBlockOf(i);
     const lastBlock = firstBlock + blocksOf(i) - 1;
@@ -296,6 +361,7 @@ if (!sqlite) {
     const families = Object.fromEntries(Object.keys(FAMILY_FIELDS).map((name) => [name, unavailable[name]
       ? { status: 'unavailable', reason: unavailable[name], ...Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, null])) }
       : { status: 'available', ...familyMetrics(name, i) }]));
+    for (const [name, values] of Object.entries(overrides)) if (families[name].status === 'available') Object.assign(families[name], values);
     return {
       definitionVersion: COMPACT_DEFINITION_VERSION,
       chainId: ARC_CHAIN_ID,
@@ -308,6 +374,7 @@ if (!sqlite) {
       complete: Object.values(families).every((family) => family.status === 'available'),
       activeAddresses: addresses,
       registry: { uniswapV3: families.uniswapV3.status === 'available' ? { through: lastBlock, throughHash: hash(lastBlock), created: pools } : null },
+      ...(projections === undefined ? {} : { projections }),
     };
   }
   const pool = (i, n) => ({ address: address(0x9000 + n), createdBlock: firstBlockOf(i), createdLogIndex: n, createdTx: hash(0x7000 + n),
@@ -631,6 +698,253 @@ if (!sqlite) {
     });
     brokenModel.close();
     assert.equal(fatal, 1);
+    assert.equal(fetchCalls, 0);
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Pools (pools.v1) and recent activity (activity.v1) over the Phase 1A projection tables.
+  // Fixture: hours 0..25 (checkpoint 25, 24H = hours 2..25). Twelve V3 pools (USDC/EURC) created at hour 0 swap n times
+  // per hour (pool n); pool C (USDC/unknown token) is created at hour 20 and swaps 100 times per hour from then on. V4: pool X
+  // (native USDC/EURC) and the hooked pool Y (USDC/unknown) are initialized at hour 0, pool Z (USDC/cirBTC) at hour 21.
+  // Activity rows exist in hours 24 and 25 (25 per hour).
+  const ZERO = `0x${'0'.repeat(40)}`;
+  const UNKNOWN = '0xabcdef0123456789abcdef0123456789abcd1234';
+  const HOOKS = address(0x4000);
+  const V3_POOLS = Array.from({ length: 12 }, (_, index) => address(0x9100 + index + 1));
+  const POOL_C = address(0x9200);
+  const V4_KEYS = [
+    { currency0: ZERO, currency1: EURC, fee: 500, tickSpacing: 10, hooks: ZERO },
+    { currency0: USDC, currency1: UNKNOWN, fee: 3000, tickSpacing: 60, hooks: HOOKS },
+    { currency0: USDC, currency1: CIRBTC, fee: 100, tickSpacing: 1, hooks: ZERO },
+  ];
+  const [POOL_X, POOL_Y, POOL_Z] = V4_KEYS.map(v4PoolIdOf);
+  const v3Created = (pool, i, n, token1 = EURC) => ({ address: pool, createdBlock: firstBlockOf(i), createdLogIndex: n, createdTx: hash(0x7100 + i * 100 + n),
+    token0: USDC, token1, fee: 500, tickSpacing: 10 });
+  const v4Created = (keyIndex, i, n) => ({ poolId: v4PoolIdOf(V4_KEYS[keyIndex]), createdBlock: firstBlockOf(i), createdLogIndex: n,
+    createdTx: hash(0x7300 + i * 100 + n), ...V4_KEYS[keyIndex] });
+  const v3Row = (pool, swapCount, flows, liquidity = [0n, 0n, 0n, 0n], counts = [0, 0, 0]) => ({ pool, swapCount, token0InRaw: flows[0].toString(),
+    token0OutRaw: flows[1].toString(), token1InRaw: flows[2].toString(), token1OutRaw: flows[3].toString(), addCount: counts[0], removeCount: counts[1],
+    pokeCount: counts[2], addAmount0Raw: liquidity[0].toString(), addAmount1Raw: liquidity[1].toString(), removeAmount0Raw: liquidity[2].toString(),
+    removeAmount1Raw: liquidity[3].toString() });
+  const v4Row = (pool, swapCount, flows, addCount = 0) => ({ pool, swapCount, token0InRaw: flows[0].toString(), token0OutRaw: flows[1].toString(),
+    token1InRaw: flows[2].toString(), token1OutRaw: flows[3].toString(), addCount, removeCount: 0, pokeCount: 0, addAmount0Raw: null, addAmount1Raw: null,
+    removeAmount0Raw: null, removeAmount1Raw: null });
+  // Activity of one hour: k 0..19 swaps (even V3 on pool 12, odd V4 on X), 20..21 V3 adds, 22 V4 add, 23 V3 remove, 24 V4 remove.
+  const txFromOf = (i, k) => address(0xf000 + i * 100 + k);
+  function activityOf(i) {
+    const hourStart = BASE + i * HOUR;
+    return Array.from({ length: 25 }, (_, k) => {
+      const base = { blockNumber: firstBlockOf(i) + Math.floor(k / 5), logIndex: k % 5, hourStart, blockTimestamp: hourStart + k,
+        txHash: hash(0xaa000 + i * 100 + k), txFrom: txFromOf(i, k) };
+      const v3Pool = V3_POOLS[11];
+      if (k < 20 && k % 2 === 0) {
+        return { ...base, protocol: 'uniswap_v3', kind: 'swap', pool: v3Pool, amount0Raw: String(k + 1), amount1Raw: `-${BIG * BigInt(k + 1)}`,
+          amountBasis: 'v3_pool_delta', counterparty: address(0xe000 + k), counterpartyKind: 'swap_recipient' };
+      }
+      if (k < 20) {
+        return { ...base, protocol: 'uniswap_v4', kind: 'swap', pool: POOL_X, amount0Raw: `-${k}`, amount1Raw: String(BIG), amountBasis: 'v4_swap_delta',
+          counterparty: null, counterpartyKind: 'none' };
+      }
+      if (k === 22 || k === 24) {
+        return { ...base, protocol: 'uniswap_v4', kind: k === 22 ? 'add' : 'remove', pool: POOL_X, amount0Raw: null, amount1Raw: null, amountBasis: 'none',
+          counterparty: address(0xc000 + k), counterpartyKind: 'event_sender' };
+      }
+      return { ...base, protocol: 'uniswap_v3', kind: k === 23 ? 'remove' : 'add', pool: v3Pool, amount0Raw: '5', amount1Raw: '6',
+        amountBasis: 'v3_liquidity_amount', counterparty: address(0xd000 + k), counterpartyKind: 'liquidity_owner' };
+    });
+  }
+  // One projection hour that reconciles exactly with its (overridden) Uniswap family counters.
+  function projectionHour(i) {
+    const v3Rows = V3_POOLS.map((pool, index) => {
+      const n = BigInt(index + 1);
+      return index === 11
+        ? v3Row(pool, 12, [BIG * n, n, 0n, BIG * n * 2n], [BIG, BIG * 2n, 3n, 4n], [1, 1, 1])
+        : v3Row(pool, index + 1, [BIG * n, n, 0n, BIG * n * 2n]);
+    });
+    if (i >= 20) v3Rows.push(v3Row(POOL_C, 100, [1n, 0n, 0n, 1n]));
+    const registry = i === 0 ? [v4Created(0, 0, 0), v4Created(1, 0, 1)] : i === 21 ? [v4Created(2, 21, 0)] : [];
+    const v4Rows = [v4Row(POOL_X, 3, [7n, 0n, 0n, BIG], 1), v4Row(POOL_Y, 1, [0n, 1n, 1n, 0n]), ...(i >= 21 ? [v4Row(POOL_Z, 2, [2n, 0n, 0n, 2n])] : [])];
+    return {
+      pools: i === 0 ? V3_POOLS.map((pool, n) => v3Created(pool, 0, n)) : i === 20 ? [v3Created(POOL_C, 20, 0, UNKNOWN)] : [],
+      overrides: { uniswapV3: { swapCount: 78 + (i >= 20 ? 100 : 0), mintCount: 1, burnCount: 2 },
+        uniswapV4: { swapCount: 4 + (i >= 21 ? 2 : 0), modifyLiquidityCount: 1, initializeCount: registry.length } },
+      projections: { uniswap_v3_pools: { status: 'available', rows: v3Rows }, uniswap_v4_pools: { status: 'available', rows: v4Rows, registry },
+        dex_activity: { status: 'available', rows: i >= 24 ? activityOf(i) : [] } },
+    };
+  }
+  function buildProjectionDatabase(name, { count = 26, hour = projectionHour, v4Registry = true } = {}) {
+    const path = join(workdir, `${name}.sqlite`);
+    const db = new DatabaseSync(path);
+    const store = createCompactStore(db);
+    store.extendRegistry({ kind: V3_POOL_KIND, fromBlock: 1, through: 999, throughHash: hash(999), previousThrough: null, created: [] });
+    if (v4Registry) store.extendV4Registry({ kind: V4_POOL_KIND, fromBlock: 1, through: 999, throughHash: hash(999), previousThrough: null, created: [] });
+    for (let i = 0; i < count; i++) store.commitHour(hourResult(i, hour(i)));
+    return { path, db, store };
+  }
+  const projected = buildProjectionDatabase('projections');
+  projected.db.close();
+  const openProjected = (path = projected.path) => open(path, { now: () => (BASE + 26 * HOUR + 600) * 1000 });
+  const token = (address, symbol, decimals) => ({ address, symbol, decimals, verified: symbol !== null, native: false });
+  const NATIVE_USDC = { address: ZERO, symbol: 'USDC', decimals: 18, verified: true, native: true };
+
+  await test('read model pools: V3 24H ranks by summed swap count, top 10, exact BigInt flows, registry pair and V3 liquidity amounts', () => {
+    const before = fileHash(projected.path);
+    const model = openProjected();
+    const v3 = model.pools('v3', '24h');
+    model.close();
+    assert.deepEqual([v3.schema, v3.chain, v3.protocol, v3.status, v3.reason, v3.reasons, v3.unavailableHours], [POOLS_SCHEMA, { id: 5042, name: 'Arc' },
+      'v3', 'available', null, [], []]);
+    assert.deepEqual(v3.window, { key: '24h', hours: 24, start: iso(BASE + 2 * HOUR), end: iso(BASE + 26 * HOUR) });
+    assert.deepEqual(v3.ranking, { by: 'swap_count', usdVolume: { status: 'source_pending' }, liquidityUsd: { status: 'source_pending' } });
+    assert.deepEqual([v3.poolsTracked, v3.newPools], [13, 1], 'all registry pools through the checkpoint; pool C was created inside the window');
+    assert.deepEqual(v3.pools.map((row) => [row.pool, row.swapCount]), [[POOL_C, 600], ...[12, 11, 10, 9, 8, 7, 6, 5, 4].map((n) => [V3_POOLS[n - 1], 24 * n])],
+      'at most 10 pools, ranked by summed swap count');
+    const twelve = v3.pools[1];
+    assert.deepEqual(twelve.flowsRaw, { token0In: (BIG * 12n * 24n).toString(), token0Out: '288', token1In: '0', token1Out: (BIG * 24n * 24n).toString() });
+    assert.ok(BigInt(twelve.flowsRaw.token0In) > BigInt(Number.MAX_SAFE_INTEGER), 'exact beyond 2^53');
+    assert.deepEqual(twelve.liquidityActivity, { addCount: 24, removeCount: 24, pokeCount: 24, amounts: { status: 'available',
+      addAmount0Raw: (BIG * 24n).toString(), addAmount1Raw: (BIG * 48n).toString(), removeAmount0Raw: '72', removeAmount1Raw: '96' } });
+    assert.deepEqual({ ...twelve, flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined }, { pool: V3_POOLS[11], createdBlock: firstBlockOf(0),
+      token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null, flowsRaw: undefined, liquidityActivity: undefined,
+      swapCount: undefined });
+    assert.deepEqual(v3.pools[0].token1, token(UNKNOWN, null, null), 'an unknown token keeps its address, no symbol or decimals are guessed');
+    const keys = [...JSON.stringify(v3.pools).matchAll(/"([^"]+)":/g)].map((match) => match[1]);
+    assert.ok(!keys.some((key) => /usd|tvl|volume|price/i.test(key)), 'no USD, TVL, price or volume field is produced');
+    assert.ok(Buffer.byteLength(JSON.stringify(v3)) < MAX_RESPONSE_BYTES);
+    assert.equal(fileHash(projected.path), before, 'reading never changes the file');
+    assert.equal(fetchCalls, 0);
+  });
+
+  await test('read model pools: V4 keeps native USDC (18 decimals), hooks and PoolKey; V4 token amounts are not_supported', () => {
+    const model = openProjected();
+    const v4 = model.pools('v4', '24h');
+    model.close();
+    assert.deepEqual([v4.status, v4.poolsTracked, v4.newPools], ['available', 3, 1]);
+    assert.deepEqual(v4.pools.map((row) => [row.pool, row.swapCount]), [[POOL_X, 72], [POOL_Y, 24], [POOL_Z, 10]]);
+    const [x, y] = v4.pools;
+    assert.deepEqual([x.token0, x.token1, x.fee, x.tickSpacing, x.hooks], [NATIVE_USDC, token(EURC, 'EURC', 6), 500, 10, ZERO]);
+    assert.deepEqual([y.token1, y.hooks], [token(UNKNOWN, null, null), HOOKS], 'hooked pools keep their hooks');
+    assert.deepEqual(x.flowsRaw, { token0In: '168', token0Out: '0', token1In: '0', token1Out: (BIG * 24n).toString() });
+    assert.deepEqual(x.liquidityActivity, { addCount: 24, removeCount: 0, pokeCount: 0, amounts: { status: 'not_supported',
+      reason: 'v4_token_amounts_unavailable', addAmount0Raw: null, addAmount1Raw: null, removeAmount0Raw: null, removeAmount1Raw: null } });
+  });
+
+  await test('read model activity: newest 25 rows, block DESC then log index DESC; real type filters; exact From and To semantics', () => {
+    const model = openProjected();
+    const feeds = Object.fromEntries(['all', 'swaps', 'adds', 'removes'].map((type) => [type, model.activity(type)]));
+    model.close();
+    for (const [type, feed] of Object.entries(feeds)) {
+      assert.deepEqual([feed.schema, feed.type, feed.status, feed.reason, feed.limit], [ACTIVITY_SCHEMA, type, 'available', null, 25], type);
+      for (let index = 1; index < feed.rows.length; index++) {
+        const [previous, row] = [feed.rows[index - 1], feed.rows[index]];
+        assert.ok(previous.blockNumber > row.blockNumber || (previous.blockNumber === row.blockNumber && previous.logIndex > row.logIndex), type);
+      }
+    }
+    assert.equal(feeds.all.rows.length, 25);
+    assert.ok(feeds.all.rows.every((row) => row.blockNumber >= firstBlockOf(25)), 'the newest hour first');
+    assert.deepEqual([feeds.swaps.rows.length, feeds.adds.rows.length, feeds.removes.rows.length], [25, 6, 4]);
+    assert.ok(feeds.swaps.rows.every((row) => row.kind === 'swap') && feeds.adds.rows.every((row) => row.kind === 'add')
+      && feeds.removes.rows.every((row) => row.kind === 'remove'));
+    const byKey = (k) => feeds.all.rows.find((row) => row.txHash === hash(0xaa000 + 25 * 100 + k));
+    const v3Swap = byKey(0);
+    assert.deepEqual(v3Swap, { time: iso(BASE + 25 * HOUR), blockNumber: firstBlockOf(25), logIndex: 0, txHash: hash(0xaa000 + 2500), protocol: 'uniswap_v3',
+      kind: 'swap', pool: V3_POOLS[11], pair: { token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null },
+      amounts: { status: 'available', basis: 'v3_pool_delta', amount0Raw: '1', amount1Raw: `-${BIG}` }, from: txFromOf(25, 0), to: address(0xe000),
+      toKind: 'swap_recipient' });
+    const v4Swap = byKey(1);
+    assert.deepEqual([v4Swap.from, v4Swap.to, v4Swap.toKind, v4Swap.pair.token0, v4Swap.amounts], [txFromOf(25, 1), null, 'none', NATIVE_USDC,
+      { status: 'available', basis: 'v4_swap_delta', amount0Raw: '-1', amount1Raw: String(BIG) }], 'a V4 swap has no recipient: To stays null');
+    assert.deepEqual([byKey(20).to, byKey(20).toKind, byKey(20).amounts], [address(0xd000 + 20), 'liquidity_owner',
+      { status: 'available', basis: 'v3_liquidity_amount', amount0Raw: '5', amount1Raw: '6' }]);
+    assert.deepEqual([byKey(22).to, byKey(22).toKind, byKey(22).amounts], [address(0xc000 + 22), 'event_sender',
+      { status: 'not_supported', reason: 'v4_token_amounts_unavailable', basis: 'none', amount0Raw: null, amount1Raw: null }]);
+    for (const row of feeds.all.rows) assert.equal(row.from, txFromOf(25, Number(BigInt(row.txHash)) - (0xaa000 + 2500)), 'From is the stored transaction sender');
+  });
+
+  await test('read model pools and activity fail closed: a missing or unavailable projection hour, a registry gap, malformed metadata', () => {
+    const tampered = (i) => {
+      const spec = projectionHour(i);
+      if (i === 10) spec.projections.uniswap_v3_pools.rows[0].swapCount += 1; // no longer reconciles: stored unavailable
+      if (i === 12) delete spec.projections; // stored without any projection
+      if (i === 25) spec.projections.dex_activity = { status: 'unavailable', reason: 'activity_spine_missing' };
+      return spec;
+    };
+    const gaps = buildProjectionDatabase('projection-gaps', { hour: tampered });
+    gaps.db.close();
+    const model = openProjected(gaps.path);
+    const v3 = model.pools('v3', '24h');
+    assert.deepEqual([v3.status, v3.reason, v3.reasons, v3.unavailableHours, v3.pools, v3.poolsTracked],
+      ['unavailable', 'projection_hour_unavailable', ['projection_not_processed', 'reconciliation_mismatch'], [iso(BASE + 10 * HOUR), iso(BASE + 12 * HOUR)], [], 13]);
+    const v4 = model.pools('v4', '24h');
+    assert.deepEqual([v4.status, v4.reason, v4.pools], ['unavailable', 'registry_behind_checkpoint', []], 'V4 coverage stops at the unprojected hour');
+    assert.deepEqual([model.activity('all').status, model.activity('all').reason, model.activity('all').rows], ['unavailable', 'activity_spine_missing', []],
+      'the checkpoint hour has no verified activity: the feed is unavailable, never an older list');
+    model.close();
+    const noV4 = buildProjectionDatabase('no-v4-registry', { v4Registry: false });
+    noV4.db.close();
+    const noV4Model = openProjected(noV4.path);
+    assert.deepEqual([noV4Model.pools('v4', '24h').status, noV4Model.pools('v4', '24h').reason], ['unavailable', 'registry_missing']);
+    noV4Model.close();
+    const malformed = buildProjectionDatabase('malformed-registry');
+    malformed.db.prepare("UPDATE compact_registry SET meta_json = '{\"token0\":\"usdc\"}' WHERE kind = 'uniswap_v3_pool' AND address = ?").run(POOL_C);
+    malformed.db.close();
+    const malformedModel = openProjected(malformed.path);
+    assert.throws(() => malformedModel.pools('v3', '24h'), (error) => error.code === 'inconsistent_state' && error.detail === 'pool_registry_metadata_malformed');
+    assert.equal(malformedModel.pools('v4', '24h').status, 'available', 'only the answer that needs the broken row fails');
+    malformedModel.close();
+    const smallFixture = buildDatabase('pools-small', 3);
+    smallFixture.db.close();
+    const small = open(smallFixture.path);
+    assert.deepEqual([small.pools('v3', '24h').status, small.pools('v3', '24h').reason], ['unavailable', 'insufficient_coverage']);
+    small.close();
+    const direct = openProjected();
+    for (const [read, code] of [[() => direct.pools('v2', '24h'), 'unsupported_protocol'], [() => direct.pools('v3', '6h'), 'unsupported_window'],
+      [() => direct.pools('__proto__', '24h'), 'unsupported_protocol'], [() => direct.activity('mints'), 'unsupported_activity_type'],
+      [() => direct.activity('constructor'), 'unsupported_activity_type'], [() => direct.activity(null), 'unsupported_activity_type']]) {
+      assert.throws(read, (error) => error instanceof ReadModelError && error.code === code, code);
+    }
+    direct.close();
+  });
+
+  await test('read model: without the optional projection tables, health, summary and timeseries work and pools/activity are not ready', () => {
+    const legacy = buildDatabase('legacy-no-projections', 26);
+    legacy.db.exec('DROP TABLE compact_dex_activity; DROP TABLE compact_pool_hours; DROP TABLE compact_projection_hours;');
+    legacy.db.close();
+    const model = open(legacy.path, { now: () => (BASE + 26 * HOUR + 600) * 1000 });
+    assert.equal(model.health().status, 'ok');
+    assert.equal(model.summary('24h').network.status, 'available');
+    assert.equal(model.timeseries('24h').buckets.length, 24);
+    for (const protocol of ['v3', 'v4']) {
+      const pools = model.pools(protocol, '24h');
+      assert.deepEqual([pools.status, pools.reason, pools.reasons, pools.pools, pools.poolsTracked, pools.newPools],
+        ['unavailable', 'projection_not_ready', ['projection_not_ready'], [], null, null], protocol);
+    }
+    assert.deepEqual([model.activity('all').status, model.activity('all').reason, model.activity('all').rows], ['unavailable', 'projection_not_ready', []]);
+    model.close();
+    // Tables present but nothing projected yet (the main fixture): every hour is reported, nothing is filled in.
+    const main24 = open(main.path);
+    const v3 = main24.pools('v3', '24h');
+    assert.deepEqual([v3.status, v3.reason, v3.reasons, v3.unavailableHours.length, v3.pools], ['unavailable', 'projection_hour_unavailable',
+      ['projection_not_processed'], 24, []]);
+    assert.equal(main24.pools('v4', '24h').reason, 'registry_missing');
+    assert.equal(main24.activity('swaps').reason, 'projection_not_processed');
+    main24.close();
+  });
+
+  await test('http + read model: pools and activity over HTTP with 304 revalidation', async () => {
+    const model = openProjected();
+    await withServer({ readModel: model }, async (port) => {
+      for (const path of VALID.slice(6)) {
+        const res = await send(port, { path });
+        assert.equal(res.status, 200, path);
+        assert.equal(res.json.status, 'available', path);
+        assert.ok(Buffer.byteLength(res.text) <= MAX_RESPONSE_BYTES, path);
+        assert.equal((await send(port, { path, headers: { 'if-none-match': res.headers.etag } })).status, 304, path);
+      }
+      assert.equal((await send(port, { path: '/v1/intelligence/pools?protocol=v3&window=24h' })).json.pools.length, 10);
+      assert.equal((await send(port, { path: '/v1/intelligence/activity?type=adds' })).json.rows.length, 6);
+    });
+    model.close();
     assert.equal(fetchCalls, 0);
   });
 

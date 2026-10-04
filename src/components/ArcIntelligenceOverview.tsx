@@ -30,15 +30,21 @@ import {
   metricSum,
   percentChange,
   shortenAddress,
+  shortenHash,
   shortenMarketId,
   verifiedAssetItems,
   windowStatus,
+  type ArcActivity,
+  type ArcActivityRow,
+  type ArcActivityType,
   type ArcIntelligenceLoad,
+  type ArcPools,
   type BorrowMarketState,
   type ArcSummary,
   type ArcTimeseries,
   type FamilyWindow,
   type IntelligenceDataStatus,
+  type PoolToken,
 } from '../lib/arcIntelligence'
 
 // Arc Intelligence section of the Mainnet Dashboard. Every capability of src/config/arcIntelligenceUiScope.ts has a
@@ -58,6 +64,11 @@ type ViewContext = {
   summary: ArcSummary | null
   timeseries: ArcTimeseries | null
   collectingNote: string
+  // 24H pools and recent activity reads (null when a read failed or the view is not ready)
+  pools: { v3: ArcPools | null; v4: ArcPools | null } | null
+  activity: Partial<Record<ArcActivityType, ArcActivity | null>> | null
+  // Arc explorer base URL for transaction links, passed in by the page; without it a hash is shown as text
+  explorerUrl: string | null
 }
 
 type Cell = { status: DisplayStatus; raw?: string | number; text?: string; note?: string }
@@ -629,19 +640,21 @@ function StatTile({ label, cell, unit, marker }: { label: string; cell: Cell; un
   )
 }
 
-// A table whose rows do not exist yet: column headings stay (chips on phones, where rows become stacked cards), and the
-// first rows will replace the compact empty line in place.
-function ShellTable({ columns, gridClass, children }: { columns: { item: string; label: string }[]; gridClass: string; children: ReactNode }) {
+// A table with permanent column headings (chips below the lg breakpoint, where rows become stacked cards). Each heading carries the
+// status of its own column: a column without its verified source stays source_pending even when rows are shown.
+type ShellColumn = { item: string; label: string; status?: DisplayStatus }
+
+function ShellTable({ columns, gridClass, children }: { columns: ShellColumn[]; gridClass: string; children: ReactNode }) {
   return (
     <div className="mt-3">
-      <div className={`hidden gap-3 border-b border-slate-100 pb-1.5 md:grid ${gridClass}`}>
+      <div className={`hidden gap-3 border-b border-slate-100 pb-1.5 lg:grid ${gridClass}`}>
         {columns.map((column) => (
-          <span key={column.item} {...markerProps(column.item, 'source_pending')} className={LABEL}>{column.label}</span>
+          <span key={column.item} {...markerProps(column.item, column.status ?? 'source_pending')} className={LABEL}>{column.label}</span>
         ))}
       </div>
-      <div className="flex flex-wrap gap-1.5 md:hidden">
+      <div className="flex flex-wrap gap-1.5 lg:hidden">
         {columns.map((column) => (
-          <span key={column.item} {...markerProps(column.item, 'source_pending')}
+          <span key={column.item} {...markerProps(column.item, column.status ?? 'source_pending')}
             className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-500">
             {column.label}
           </span>
@@ -739,6 +752,31 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
   )
 }
 
+// Display state of a pools or activity read; outside a ready 24H view the view state decides.
+function readStatus(ctx: ViewContext, entry: { status: string; reason: string | null } | null | undefined): DisplayStatus {
+  if (ctx.mode !== 'ready') return liveStatus(ctx, null)
+  return entry ? windowStatus({ status: entry.status, reason: entry.reason ?? undefined }) : 'unavailable'
+}
+
+const poolTokenName = (token: PoolToken) => token.symbol ?? shortenAddress(token.address)
+const pairName = (pair: { token0: PoolToken; token1: PoolToken }) => `${poolTokenName(pair.token0)} / ${poolTokenName(pair.token1)}`
+// Uniswap fees are in hundredths of a basis point (500 = 0.05%); V4 pools may instead use a dynamic fee set by their hook.
+const V4_DYNAMIC_FEE = 0x800000
+const feeText = (fee: number) => (fee === V4_DYNAMIC_FEE ? 'Dynamic fee' : `${(fee / 10_000).toLocaleString('en-US', { maximumFractionDigits: 4 })}%`)
+const ZERO_HOOKS = `0x${'0'.repeat(40)}`
+// Pool fields without a verified source yet: always source_pending, never filled from counts or activity.
+const PENDING_POOL_FIELDS = [['volume', 'Volume (USD)'], ['liquidity', 'Liquidity']] as const
+
+// Title and detail of the empty table, by status. No number is ever shown in place of a missing ranking.
+function poolsEmpty(ctx: ViewContext, status: DisplayStatus): [string, string] {
+  if (status === 'available') return ['No swaps in verified pools in this window', 'Pools appear here once they swap.']
+  if (status === 'loading') return ['Loading verified pools', 'Loading verified data']
+  if (status === 'collecting') return ['History is still being collected', ctx.mode === 'history' ? ctx.historyNote
+    : 'Pool rankings appear once every hour of the window is verified.']
+  return ['Pool data is not verified for this window', ctx.mode === 'failed' ? 'Could not be loaded right now. Try Refresh in a moment.'
+    : 'Rankings appear once every hour of the window is verified.']
+}
+
 function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | 'v4' }) {
   const id = version === 'v3' ? 'top-pools-v3' : 'top-pools-v4'
   const family = ctx.summary ? (version === 'v3' ? ctx.summary.dex.uniswapV3 : ctx.summary.dex.uniswapV4) : null
@@ -749,27 +787,52 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
   const poolCount: Cell = poolCountStatus === 'available' && registry && isFiniteNumber(registry.count)
     ? { status: 'available', raw: registry.count, text: formatCount(registry.count) } : { status: poolCountStatus }
   const label = version === 'v3' ? 'V3' : 'V4'
+  const data = ctx.pools?.[version] ?? null
+  const status = readStatus(ctx, data)
+  const rows = status === 'available' && data ? data.pools : []
+  const [emptyTitle, emptyDetail] = poolsEmpty(ctx, status)
   return (
     <section data-intel-section={id} aria-label={`Top Pools (Uniswap ${label})`} className={`${CARD} min-w-0`}>
-      <CardHeader title={`Top Pools (Uniswap ${label})`} subtitle={`All verified ${label} pairs, last ${ctx.windowLabel}`} />
+      <CardHeader title={`Top Pools (Uniswap ${label})`} subtitle={`All verified ${label} pairs, ranked by swap count, last ${ctx.windowLabel}`} />
       <div className={`mt-3 grid gap-2 ${version === 'v3' ? 'grid-cols-2' : 'grid-cols-1'}`}>
         <StatTile marker={markerProps(`${id}.new-pools`, newPools.status, newPools.raw)} label={`New pools, ${ctx.windowLabel}`} cell={newPools} />
         {version === 'v3' && (
           <StatTile marker={markerProps('top-pools-v3.pool-count', poolCount.status, poolCount.raw)} label="Verified pools tracked" cell={poolCount} />
         )}
       </div>
-      <ShellTable
-        gridClass="grid-cols-[1.4fr_1fr_1fr_1fr]"
-        columns={[
-          { item: `${id}.all-pairs`, label: 'Pair' },
-          { item: `${id}.volume`, label: 'Volume' },
-          { item: `${id}.swaps`, label: 'Swaps' },
-          { item: `${id}.liquidity`, label: 'Liquidity' },
-        ]}
-      >
-        <EmptyRows status="source_pending" title="Pool rankings by USD volume will appear here"
-          detail={`Every verified Uniswap ${label} pair will be listed here, not only USDC pairs. Tokens without verified details show their shortened address. Liquidity is the value held in the pool.`} />
-      </ShellTable>
+      <div className="mt-3 flex items-center justify-between gap-3 border-b border-slate-100 pb-1.5">
+        <span {...markerProps(`${id}.all-pairs`, status)} className={LABEL}>Pair</span>
+        <span {...markerProps(`${id}.swaps`, status)} className={LABEL}>Swaps</span>
+      </div>
+      {rows.length ? (
+        <ol>
+          {rows.map((pool) => (
+            <li key={pool.pool} data-pool-row={pool.pool} className="flex items-center justify-between gap-3 border-b border-slate-50 py-2 last:border-0">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold text-slate-900" title={`${pool.token0.address} / ${pool.token1.address}`}>{pairName(pool)}</p>
+                <p className="mt-0.5 flex flex-wrap gap-1">
+                  <Chip>{feeText(pool.fee)}</Chip>
+                  {pool.hooks && pool.hooks !== ZERO_HOOKS && <Chip>Hooks</Chip>}
+                </p>
+              </div>
+              <p className="shrink-0 text-sm font-semibold tabular-nums text-slate-950">{formatCount(pool.swapCount)} <span className="text-[11px] font-normal text-slate-500">swaps</span></p>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <EmptyRows status={status === 'available' ? undefined : status} title={emptyTitle} detail={emptyDetail} />
+      )}
+      {/* Volume and liquidity have no verified source yet: they keep their place with a status, never a number. */}
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 rounded-lg border border-dashed border-slate-200 px-3 py-1.5">
+        {PENDING_POOL_FIELDS.map(([field, text]) => (
+          <span key={field} {...markerProps(`${id}.${field}`, 'source_pending')} className="flex items-center gap-1.5 text-[11px] text-slate-600">
+            {text} <InlineStatus status="source_pending" />
+          </span>
+        ))}
+      </div>
+      <p className="mt-1 text-[11px] leading-4 text-slate-400">
+        Every verified Uniswap {label} pair is ranked, not only USDC pairs. Ranked by swap count, not by USD volume: volume and liquidity need verified USD pricing and are not available yet. Tokens without verified details show their shortened address. Liquidity is the value held in the pool.
+      </p>
     </section>
   )
 }
@@ -790,32 +853,107 @@ const RECENT_ACTIVITY_COLUMNS = [
   { item: 'recent-activity.transaction-links', label: 'Tx' },
 ]
 
-function RecentActivitySection({ ctx }: { ctx: ViewContext }) {
-  const [tab, setTab] = useState<'all' | 'swaps' | 'adds' | 'removes'>('all')
-  const tabs = [['all', 'All'], ['swaps', 'Swaps'], ['adds', 'Adds'], ['removes', 'Removes']] as const
+const ACTIVITY_TABS: readonly (readonly [ArcActivityType, string])[] = [['all', 'All'], ['swaps', 'Swaps'], ['adds', 'Adds'], ['removes', 'Removes']]
+const KIND_TEXT: Record<ArcActivityRow['kind'], string> = { swap: 'Swap', add: 'Add', remove: 'Remove' }
+// Eight columns from the lg breakpoint (shortened addresses and hashes need their width); stacked cards below it.
+const ACTIVITY_GRID = 'lg:grid-cols-[0.9fr_0.6fr_0.8fr_1.2fr_1.4fr_1fr_1fr_1fr]'
+const PROTOCOL_TEXT: Record<ArcActivityRow['protocol'], string> = { uniswap_v3: 'Uniswap V3', uniswap_v4: 'Uniswap V4' }
+
+// A raw integer amount in its token's verified decimals; without verified decimals the exact raw units are shown with
+// the token's shortened address, never a guessed precision.
+function tokenAmountText(raw: string, token: PoolToken): string {
+  return token.decimals === null ? `${BigInt(raw).toLocaleString('en-US')} raw units of ${shortenAddress(token.address)}`
+    : `${formatAmount(raw, token.decimals)} ${token.symbol}`
+}
+
+// Token amounts of one event. Swaps are pool deltas as emitted (V3: positive is paid into the pool; V4: negative is paid
+// into the pool), shown from the pool's side; V3 liquidity changes are exact token amounts; V4 liquidity changes carry
+// none. null: the event records no token amounts.
+function activityAmounts(row: ArcActivityRow): string[] | null {
+  const { amounts, pair } = row
+  if (amounts.status !== 'available' || amounts.amount0Raw === null || amounts.amount1Raw === null) return null
+  const sides: [string, PoolToken][] = [[amounts.amount0Raw, pair.token0], [amounts.amount1Raw, pair.token1]]
+  if (row.kind !== 'swap') return sides.map(([raw, token]) => tokenAmountText(raw, token))
+  const toPool = (raw: string) => (amounts.basis === 'v3_pool_delta' ? !raw.startsWith('-') : raw.startsWith('-'))
+  return sides.filter(([raw]) => BigInt(raw) !== 0n)
+    .map(([raw, token]) => `${tokenAmountText(raw.replace(/^-/, ''), token)} ${toPool(raw) ? 'to pool' : 'from pool'}`)
+}
+
+function ActivityCell({ label, children, className = '' }: { label: string; children: ReactNode; className?: string }) {
+  return (
+    <div className={`min-w-0 ${className}`}>
+      <span className="block text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-400 lg:hidden">{label}</span>
+      {children}
+    </div>
+  )
+}
+
+function ActivityRowView({ row, explorerUrl }: { row: ArcActivityRow; explorerUrl: string | null }) {
+  const amounts = activityAmounts(row)
+  const hash = shortenHash(row.txHash)
+  return (
+    <li data-activity-row={row.txHash} className={`grid grid-cols-2 gap-x-3 gap-y-1.5 border-b border-slate-50 py-2 text-xs last:border-0 lg:items-center ${ACTIVITY_GRID}`}>
+      <ActivityCell label="Time (UTC)"><span className="tabular-nums text-slate-600">{formatUtcDateTime(row.time)}</span></ActivityCell>
+      <ActivityCell label="Type"><span className="font-semibold text-slate-900">{KIND_TEXT[row.kind]}</span></ActivityCell>
+      <ActivityCell label="Protocol"><span className="text-slate-700">{PROTOCOL_TEXT[row.protocol]}</span></ActivityCell>
+      <ActivityCell label="Pair"><span className="block truncate font-medium text-slate-900" title={`${row.pair.token0.address} / ${row.pair.token1.address}`}>{pairName(row.pair)}</span></ActivityCell>
+      <ActivityCell label="Amount" className="col-span-2 lg:col-span-1">
+        {amounts
+          ? amounts.map((text) => <span key={text} className="block break-words tabular-nums text-slate-700">{text}</span>)
+          : <span className="text-slate-400">Token amounts not recorded</span>}
+      </ActivityCell>
+      <ActivityCell label="From"><span className="font-mono text-slate-700" title={row.from}>{shortenAddress(row.from)}</span></ActivityCell>
+      <ActivityCell label="To">
+        {row.to ? <span className="font-mono text-slate-700" title={row.to}>{shortenAddress(row.to)}</span> : <InlineStatus status="unavailable" />}
+      </ActivityCell>
+      <ActivityCell label="Tx">
+        {explorerUrl
+          ? <a href={`${explorerUrl}/tx/${row.txHash}`} target="_blank" rel="noopener noreferrer" className="font-mono text-[#2F6E0C] hover:underline">{hash}</a>
+          : <span className="font-mono text-slate-700" title={row.txHash}>{hash}</span>}
+      </ActivityCell>
+    </li>
+  )
+}
+
+const ACTIVITY_DESCRIPTION = 'Each swap, add and remove appears here with its time, protocol, pair, token amounts, sender, recipient where the event '
+  + 'records one, and a link to the transaction on the Arc explorer.'
+
+function activityEmpty(ctx: ViewContext, status: DisplayStatus): [string, string] {
+  if (status === 'available') return ['No events of this type yet', ACTIVITY_DESCRIPTION]
+  if (status === 'loading') return ['Loading verified activity', ACTIVITY_DESCRIPTION]
+  if (status === 'collecting') return ['Recent activity is shown in the 24H view', ACTIVITY_DESCRIPTION]
+  return ['The verified activity feed is not available right now', ctx.mode === 'failed' ? 'Could not be loaded right now. Try Refresh in a moment.'
+    : 'It returns once the latest verified hour includes its activity.']
+}
+
+function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initialType: ArcActivityType }) {
+  const [tab, setTab] = useState<ArcActivityType>(initialType)
+  const statusOf = (type: ArcActivityType) => readStatus(ctx, ctx.activity?.[type] ?? null)
+  const status = statusOf(tab)
+  const feed = ctx.activity?.[tab] ?? null
+  const rows = status === 'available' && feed ? feed.rows : []
   return (
     <section data-intel-section="recent-activity" aria-label="Recent Activity" className={CARD}>
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
         <div className="min-w-[10rem] flex-1">
           <h4 className="text-base font-semibold text-slate-950">Latest DEX activity</h4>
-          <p className="text-xs leading-5 text-slate-500">Swaps and liquidity changes across all verified pairs, last {ctx.windowLabel}</p>
+          <p className="text-xs leading-5 text-slate-500">Newest swaps and liquidity changes across all verified Uniswap pairs, newest first</p>
         </div>
         <div role="tablist" aria-label="Activity type" className="flex flex-wrap gap-1.5">
-          {tabs.map(([key, label]) => (
-            <TabButton key={key} selected={tab === key} onClick={() => setTab(key)} marker={markerProps(`recent-activity.${key}`, 'source_pending')}>{label}</TabButton>
+          {ACTIVITY_TABS.map(([key, label]) => (
+            <TabButton key={key} selected={tab === key} onClick={() => setTab(key)} marker={markerProps(`recent-activity.${key}`, statusOf(key))}>{label}</TabButton>
           ))}
         </div>
       </div>
-      <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-100 bg-[#f8faf7] px-3 py-1.5">
-        <StatusPill status="source_pending" />
-        <p className="text-xs text-slate-600">Verified DEX activity feed is being completed</p>
-      </div>
       <ShellTable
-        gridClass="grid-cols-[1fr_0.8fr_0.9fr_1.3fr_1.4fr_1fr_1fr_0.7fr]"
-        columns={RECENT_ACTIVITY_COLUMNS}
+        gridClass={ACTIVITY_GRID}
+        columns={RECENT_ACTIVITY_COLUMNS.map((column) => ({ ...column, status }))}
       >
-        <EmptyRows title="No activity rows yet"
-          detail="Each swap, add and remove will appear here with its time, protocol, pair, token amounts, sender, recipient where the event records one, and a link to the transaction on the Arc explorer." />
+        {rows.length ? (
+          <ol className="mt-1">{rows.map((row) => <ActivityRowView key={`${row.blockNumber}:${row.logIndex}`} row={row} explorerUrl={ctx.explorerUrl} />)}</ol>
+        ) : (
+          <EmptyRows status={status === 'available' ? undefined : status} title={activityEmpty(ctx, status)[0]} detail={activityEmpty(ctx, status)[1]} />
+        )}
       </ShellTable>
       <p className="mt-1 text-[11px] leading-4 text-slate-400">
         From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.
@@ -1436,10 +1574,13 @@ export type ArcIntelligenceDashboardProps = {
   // Read only Borrow Kit market for the Borrow card; not tied to the selected window.
   borrowMarket?: BorrowMarketState
   initialDexView?: 'volume' | 'swaps'
+  // Arc explorer base URL for transaction links (the page passes its configured Arc explorer)
+  explorerUrl?: string | null
+  initialActivityType?: ArcActivityType
 }
 
 export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = false, lastVerifiedThrough = null, onWindowChange,
-  onRefresh, borrowMarket = { status: 'loading' }, initialDexView = 'volume' }: ArcIntelligenceDashboardProps) {
+  onRefresh, borrowMarket = { status: 'loading' }, initialDexView = 'volume', explorerUrl = null, initialActivityType = 'all' }: ArcIntelligenceDashboardProps) {
   const windowLabel = ARC_INTELLIGENCE_WINDOWS.find((entry) => entry.id === selectedWindow)?.label ?? selectedWindow
   const supported = ARC_INTELLIGENCE_BACKEND_WINDOWS[selectedWindow]
   const loaded = supported && data && data.window === selectedWindow ? data : null
@@ -1452,7 +1593,8 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   const days = selectedWindow === '30d' ? 30 : 7
   const historyNote = `The ${windowLabel} view fills in once ${days} full days of verified history are stored.`
   const ctx: ViewContext = { mode, windowLabel, period: supported ? 'hour' : 'day', historyNote, summary, timeseries,
-    collectingNote: 'History is still being collected' }
+    collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
+    activity: mode === 'ready' ? loaded?.activity ?? null : null, explorerUrl }
   const verifiedThrough = summary?.freshness.verifiedThrough ?? timeseries?.freshness.verifiedThrough ?? lastVerifiedThrough
   const networkCollecting = mode === 'ready' && windowStatus(summary?.network) === 'collecting'
 
@@ -1512,7 +1654,7 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
         <TopPoolsSection ctx={ctx} version="v4" />
       </div>
       <GroupHeader title="Recent Activity" />
-      <RecentActivitySection ctx={ctx} />
+      <RecentActivitySection ctx={ctx} initialType={initialActivityType} />
       <GroupHeader title="Assets" icon={Coins} />
       <AssetsSection ctx={ctx} />
       <GroupHeader title="New Token Launches" icon={Rocket} />
@@ -1529,7 +1671,7 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   )
 }
 
-export default function ArcIntelligenceOverview() {
+export default function ArcIntelligenceOverview({ explorerUrl = null }: { explorerUrl?: string | null } = {}) {
   const [selectedWindow, setSelectedWindow] = useState<ArcIntelligenceWindow>('24h')
   const [loads, setLoads] = useState<Partial<Record<ArcIntelligenceWindow, ArcIntelligenceLoad>>>({})
   const [refreshing, setRefreshing] = useState(false)
@@ -1578,6 +1720,7 @@ export default function ArcIntelligenceOverview() {
       onWindowChange={setSelectedWindow}
       onRefresh={() => void load(selectedWindow)}
       borrowMarket={borrowMarket}
+      explorerUrl={explorerUrl}
     />
   )
 }

@@ -1,5 +1,5 @@
 // Compact engine: public read-only Intelligence HTTP API on the built-in node:http server. Exact request strings only: a
-// route is one of six fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
+// route is one of twelve fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
 // no request body, bounded URL and response sizes, fixed error bodies (no messages, stack traces, paths or environment).
 // Nothing here calls Arc RPC, indexes, or writes: every answer comes from the read-only model. No CORS headers: browsers
 // reach this API through the Vercel proxy, not directly. `authorize` is the seam for a future auth header.
@@ -16,8 +16,20 @@ const ROUTES = new Map([
   ['/v1/intelligence/summary?window=24h', { kind: 'summary', window: '24h' }],
   ['/v1/intelligence/timeseries?window=6h', { kind: 'timeseries', window: '6h' }],
   ['/v1/intelligence/timeseries?window=24h', { kind: 'timeseries', window: '24h' }],
+  ['/v1/intelligence/pools?protocol=v3&window=24h', { kind: 'pools', protocol: 'v3', window: '24h' }],
+  ['/v1/intelligence/pools?protocol=v4&window=24h', { kind: 'pools', protocol: 'v4', window: '24h' }],
+  ['/v1/intelligence/activity?type=all', { kind: 'activity', type: 'all' }],
+  ['/v1/intelligence/activity?type=swaps', { kind: 'activity', type: 'swaps' }],
+  ['/v1/intelligence/activity?type=adds', { kind: 'activity', type: 'adds' }],
+  ['/v1/intelligence/activity?type=removes', { kind: 'activity', type: 'removes' }],
 ]);
-const KNOWN_PATHS = new Set(['/health', '/v1/intelligence/summary', '/v1/intelligence/timeseries']);
+const KNOWN_PATHS = new Set([
+  '/health',
+  '/v1/intelligence/summary',
+  '/v1/intelligence/timeseries',
+  '/v1/intelligence/pools',
+  '/v1/intelligence/activity',
+]);
 // Read-model failures that may be named publicly; everything else is reported as `unavailable`.
 const PUBLIC_READ_ERRORS = new Set(['not_ready']);
 
@@ -34,7 +46,8 @@ function ifNoneMatchHits(header, etag) {
 export function createIntelligenceHandler({ readModel, authorize = null, onFatal = null, maxResponseBytes = MAX_RESPONSE_BYTES,
   log = () => {} }) {
   if (!readModel || typeof readModel.health !== 'function' || typeof readModel.summary !== 'function'
-    || typeof readModel.timeseries !== 'function') throw new Error('read_model_required');
+    || typeof readModel.timeseries !== 'function' || typeof readModel.pools !== 'function'
+    || typeof readModel.activity !== 'function') throw new Error('read_model_required');
 
   function send(res, status, body, headers = {}) {
     const text = JSON.stringify(body);
@@ -66,8 +79,12 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
       }
       if (authorize && authorize(req) !== true) return send(res, 401, { error: 'unauthorized' });
 
-      const payload = route.kind === 'health' ? readModel.health()
-        : route.kind === 'summary' ? readModel.summary(route.window) : readModel.timeseries(route.window);
+      let payload;
+      if (route.kind === 'health') payload = readModel.health();
+      else if (route.kind === 'summary') payload = readModel.summary(route.window);
+      else if (route.kind === 'timeseries') payload = readModel.timeseries(route.window);
+      else if (route.kind === 'pools') payload = readModel.pools(route.protocol, route.window);
+      else payload = readModel.activity(route.type);
       const text = JSON.stringify(payload);
       const bytes = Buffer.byteLength(text);
       if (bytes > maxResponseBytes) {

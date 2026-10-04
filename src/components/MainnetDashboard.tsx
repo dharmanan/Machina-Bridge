@@ -382,7 +382,7 @@ export default function MainnetDashboard() {
           </p>
         </div>
 
-        <ArcIntelligenceOverview />
+        <ArcIntelligenceOverview explorerUrl={MAINNET_NETWORKS.arc.explorerUrl} />
 
         {!isConnected ? (
           <Card className="text-center">

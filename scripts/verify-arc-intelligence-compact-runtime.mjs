@@ -451,7 +451,8 @@ await test('service: a malformed COMPACT_SCHEDULER_ENABLED stops the real servic
 });
 
 const fakeReadModel = () => ({ health: () => ({ status: 'ok', checkpointHour: null, verifiedThrough: null }),
-  summary: () => { throw Object.assign(new Error('not_ready'), { code: 'not_ready' }); }, timeseries: () => ({}), close: () => {} });
+  summary: () => { throw Object.assign(new Error('not_ready'), { code: 'not_ready' }); }, timeseries: () => ({}), pools: () => ({}), activity: () => ({}),
+  close: () => {} });
 async function serviceWith(schedulerEnabled) {
   const calls = [];
   const logs = [];

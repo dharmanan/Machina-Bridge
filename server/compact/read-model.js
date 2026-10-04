@@ -18,19 +18,31 @@ import { sumWindow, WindowError } from './windows.js';
 
 export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1';
 export const TIMESERIES_SCHEMA = 'machina.intelligence.timeseries.v1';
+export const POOLS_SCHEMA = 'machina.intelligence.pools.v1';
+export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1';
 export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24 });
 export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24 });
+export const POOLS_WINDOWS = Object.freeze({ '24h': 24 });
+export const ACTIVITY_TYPES = Object.freeze({ all: null, swaps: 'swap', adds: 'add', removes: 'remove' });
 // lagHours counts complete UTC hours that are not yet committed. In normal operation it is 0, or 1 between the end of an
 // hour and its commit (safety delay plus about five minutes of indexing). 2 or more means an hour has been overdue for
 // more than a full hour, which is never normal: the data is stale.
 export const STALE_LAG_HOURS = 2;
 export const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const HOUR = 3600;
+const ACTIVITY_LIMIT = 25;
+const POOL_LIMIT = 10;
 const FAMILIES = Object.keys(FAMILY_FIELDS);
 const TABLES = Object.freeze(['compact_meta', 'compact_hours', 'compact_family_hours', 'compact_hour_addresses', 'compact_registry',
   'compact_registry_coverage', 'compact_checkpoint']);
 const FAMILY_VERSION_PREFIX = 'family_version:';
 const DIGITS = /^\d+$/;
+const ADDRESS = /^0x[0-9a-f]{40}$/;
+const ZERO_ADDRESS = `0x${'0'.repeat(40)}`;
+const POOL_PROTOCOLS = Object.freeze({
+  v3: Object.freeze({ protocol: 'uniswap_v3', projection: 'uniswap_v3_pools', registryKind: V3_POOL_KIND }),
+  v4: Object.freeze({ protocol: 'uniswap_v4', projection: 'uniswap_v4_pools', registryKind: V4_POOL_KIND }),
+});
 
 const ARC_USDC = ARC_ASSETS_BY_ADDRESS.get(CIRCLE_ARC.usdc);
 // Arc leg amounts of CCTP and Gateway are in the Arc USDC ERC-20 interface units (protocols/circle.js). The canonical USDC
@@ -73,6 +85,14 @@ const HOUR_ONLY_FIELDS = Object.freeze(Object.fromEntries(FAMILIES.map((name) =>
   return [name, Object.freeze(FAMILY_FIELDS[name].filter((field) => !windowed.has(field)))];
 })));
 const TIMESERIES_FAMILIES = Object.freeze(FAMILIES.filter((name) => scalarFields(FAMILY_WINDOWS[name]).length > 0));
+
+// A pool token: the verified asset registry names known tokens, and Uniswap V4's currency 0x0 is Arc's native USDC
+// (the registry's native interface, 18 decimals). Any other address stays unnamed: no token metadata is fetched or guessed.
+const poolToken = (address) => (address === ZERO_ADDRESS
+  ? { address, symbol: ARC_USDC.symbol, decimals: ARC_USDC.interfaces.nativeDecimals, verified: true, native: true }
+  : { address, ...tokenUnit(address), native: false });
+const isDigits = (value) => typeof value === 'string' && DIGITS.test(value);
+const isSignedDigits = (value) => typeof value === 'string' && /^-?\d+$/.test(value);
 
 const tokenUnit = (address) => {
   const asset = typeof address === 'string' ? ARC_ASSETS_BY_ADDRESS.get(address.toLowerCase()) : undefined;
@@ -137,6 +157,29 @@ const SQL = Object.freeze({
     WHERE hour_start BETWEEN ? AND ?`,
   registryCoverage: 'SELECT through_block FROM compact_registry_coverage WHERE kind = ?',
   poolCount: 'SELECT COUNT(*) AS count FROM compact_registry WHERE kind = ? AND created_block <= ?',
+  // Pools and recent activity (pools.v1 / activity.v1). The projection tables are optional: an older database without
+  // them still serves health, summary and timeseries, and these reads report projection_not_ready.
+  registryCreatedCount: 'SELECT COUNT(*) AS count FROM compact_registry WHERE kind = ? AND created_block BETWEEN ? AND ?',
+  registryMeta: 'SELECT created_block, meta_json FROM compact_registry WHERE kind = ? AND address = ?',
+  windowBlocks: `SELECT MIN(first_block) AS first_block, MAX(last_block) AS last_block, COUNT(*) AS hours
+    FROM compact_hours WHERE hour_start BETWEEN ? AND ?`,
+  projectionDataTables: `SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table'
+    AND name IN ('compact_projection_hours', 'compact_pool_hours', 'compact_dex_activity')`,
+  projectionStatusRows: `SELECT h.hour_start, p.status, p.reason FROM compact_hours h
+    LEFT JOIN compact_projection_hours p ON p.hour_start = h.hour_start AND p.projection = ?
+    WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
+  projectionHour: 'SELECT status, reason FROM compact_projection_hours WHERE hour_start = ? AND projection = ?',
+  // The top pools by summed swap count (ties by pool id), then only their own hourly rows: bounded by the pool limit, never
+  // every pool of the window in memory. Raw token totals are summed in BigInt afterwards, never in SQL.
+  topPoolRows: `WITH top AS (SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours
+      WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3 GROUP BY pool HAVING total > 0 ORDER BY total DESC, pool ASC LIMIT ?4)
+    SELECT p.pool, top.total, p.token0_in_raw, p.token0_out_raw, p.token1_in_raw, p.token1_out_raw, p.add_count, p.remove_count,
+      p.poke_count, p.add_amount0_raw, p.add_amount1_raw, p.remove_amount0_raw, p.remove_amount1_raw
+    FROM compact_pool_hours p JOIN top ON top.pool = p.pool
+    WHERE p.protocol = ?1 AND p.hour_start BETWEEN ?2 AND ?3 ORDER BY top.total DESC, p.pool ASC, p.hour_start ASC`,
+  activityRows: `SELECT block_number, log_index, block_timestamp, tx_hash, tx_from, protocol, kind, pool, amount0_raw, amount1_raw,
+    amount_basis, counterparty, counterparty_kind FROM compact_dex_activity WHERE (?1 IS NULL OR kind = ?1)
+    ORDER BY block_number DESC, log_index DESC LIMIT ?2`,
   // Projection repair state per stored hour: primary-key lookups only (compact_hours by hour, family and projection rows by
   // their (hour_start, name) keys), so a 35-day scan stays a bounded index read.
   projectionTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_projection_hours'",
@@ -372,6 +415,115 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       latestCompleteHour: iso(latestCompleteHour), lagHours, stale: lagHours >= STALE_LAG_HOURS, staleRule: `lagHours >= ${STALE_LAG_HOURS}` };
   }
 
+  const projectionDataReady = () => statement('projectionDataTables').get().count === 3;
+
+  // Projection status of every hour of the window: available only when each hour is; a gap is never a partial window.
+  function projectionWindow(name, from, to, hours) {
+    const rows = statement('projectionStatusRows').all(name, int(from), int(to));
+    if (rows.length !== hours) return { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], unavailableHours: [] };
+    const gaps = rows.filter((row) => row.status !== 'available');
+    if (!gaps.length) return { status: 'available', reason: null, reasons: [], unavailableHours: [] };
+    return { status: 'unavailable', reason: 'projection_hour_unavailable',
+      reasons: [...new Set(gaps.map((row) => (row.status === null ? 'projection_not_processed' : row.reason ?? 'projection_unavailable')))].sort(),
+      unavailableHours: gaps.map((row) => iso(row.hour_start)) };
+  }
+
+  // Exact identity of a registry pool. Malformed or missing metadata fails the whole answer closed, never a guessed pair.
+  function registryDetails(kind, pool) {
+    const row = statement('registryMeta').get(kind, pool);
+    if (!row) throw new ReadModelError('inconsistent_state', 'pool_registry_missing');
+    let meta = null;
+    try { meta = JSON.parse(row.meta_json); } catch { /* reported below */ }
+    const v4 = kind === V4_POOL_KIND;
+    const [token0, token1] = v4 ? [meta?.currency0, meta?.currency1] : [meta?.token0, meta?.token1];
+    if (![token0, token1, ...(v4 ? [meta?.hooks] : [])].every((value) => typeof value === 'string' && ADDRESS.test(value))
+      || !Number.isSafeInteger(meta.fee) || !Number.isSafeInteger(meta.tickSpacing)) {
+      throw new ReadModelError('inconsistent_state', 'pool_registry_metadata_malformed');
+    }
+    return { pool, createdBlock: row.created_block, token0: poolToken(token0), token1: poolToken(token1), fee: meta.fee,
+      tickSpacing: meta.tickSpacing, hooks: v4 ? meta.hooks : null };
+  }
+
+  // Top pools of one protocol over the window, ranked by swap count (the only verified ranking: USD volume and liquidity
+  // are source_pending). Available only when every hour of the window holds that protocol's pool projection and the
+  // registry covers the checkpoint; flows and V3 liquidity amounts are exact raw integer strings.
+  function buildPools(protocolKey, windowKey, hours) {
+    const state = anchor();
+    const spec = POOL_PROTOCOLS[protocolKey];
+    const to = state.hour;
+    const from = to - (hours - 1) * HOUR;
+    const base = { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, poolsTracked: null, newPools: null,
+      pools: [] };
+    const unavailable = (reason) => ({ ...base, status: 'unavailable', reason, reasons: [reason], unavailableHours: [] });
+    const blocks = statement('windowBlocks').get(int(from), int(to));
+    if (blocks.hours !== hours) return unavailable('insufficient_coverage');
+    if (!projectionDataReady()) return unavailable('projection_not_ready');
+    const registry = statement('registryCoverage').get(spec.registryKind);
+    if (!registry || registry.through_block < state.block) return unavailable(registry ? 'registry_behind_checkpoint' : 'registry_missing');
+    const counts = { poolsTracked: statement('poolCount').get(spec.registryKind, int(state.block)).count,
+      newPools: statement('registryCreatedCount').get(spec.registryKind, int(blocks.first_block), int(blocks.last_block)).count };
+    const projection = projectionWindow(spec.projection, from, to, hours);
+    if (projection.status !== 'available') return { ...base, ...counts, ...projection };
+    const v3 = spec.protocol === 'uniswap_v3';
+    const totals = new Map();
+    for (const row of statement('topPoolRows').all(spec.protocol, int(from), int(to), int(POOL_LIMIT))) {
+      const flows = [row.token0_in_raw, row.token0_out_raw, row.token1_in_raw, row.token1_out_raw];
+      const liquidity = [row.add_amount0_raw, row.add_amount1_raw, row.remove_amount0_raw, row.remove_amount1_raw];
+      if (!flows.every(isDigits) || !(v3 ? liquidity.every(isDigits) : liquidity.every((value) => value === null))
+        || !Number.isSafeInteger(row.total)) throw new ReadModelError('inconsistent_state', 'pool_projection_malformed');
+      let entry = totals.get(row.pool);
+      if (!entry) totals.set(row.pool, (entry = { swapCount: row.total, flows: [0n, 0n, 0n, 0n], liquidity: [0n, 0n, 0n, 0n], add: 0, remove: 0, poke: 0 }));
+      flows.forEach((value, index) => { entry.flows[index] += BigInt(value); });
+      if (v3) liquidity.forEach((value, index) => { entry.liquidity[index] += BigInt(value); });
+      entry.add += row.add_count;
+      entry.remove += row.remove_count;
+      entry.poke += row.poke_count;
+    }
+    const raw = (values) => values.map((value) => value.toString(10));
+    const pools = [...totals].map(([pool, entry]) => {
+      const [token0In, token0Out, token1In, token1Out] = raw(entry.flows);
+      const [addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw] = raw(entry.liquidity);
+      return { ...registryDetails(spec.registryKind, pool), swapCount: entry.swapCount, flowsRaw: { token0In, token0Out, token1In, token1Out },
+        liquidityActivity: { addCount: entry.add, removeCount: entry.remove, pokeCount: entry.poke,
+          amounts: v3 ? { status: 'available', addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw }
+            : { status: 'not_supported', reason: 'v4_token_amounts_unavailable', addAmount0Raw: null, addAmount1Raw: null, removeAmount0Raw: null,
+              removeAmount1Raw: null } } };
+    });
+    return { ...base, ...counts, status: 'available', reason: null, reasons: [], unavailableHours: [], pools };
+  }
+
+  // One activity row with the exact semantics of the projection: from is the verified transaction sender; to is only the
+  // event's own recipient (V3 swap), owner (V3 mint/burn) or sender (V4 modifyLiquidity), and null for a V4 swap.
+  function activityRow(row) {
+    const kind = row.protocol === 'uniswap_v3' ? V3_POOL_KIND : row.protocol === 'uniswap_v4' ? V4_POOL_KIND : null;
+    if (!kind) throw new ReadModelError('inconsistent_state', 'activity_protocol_unknown');
+    const { token0, token1, fee, tickSpacing, hooks } = registryDetails(kind, row.pool);
+    let amounts;
+    if (row.amount_basis === 'none') {
+      if (row.amount0_raw !== null || row.amount1_raw !== null) throw new ReadModelError('inconsistent_state', 'activity_amount_malformed');
+      amounts = { status: 'not_supported', reason: 'v4_token_amounts_unavailable', basis: 'none', amount0Raw: null, amount1Raw: null };
+    } else {
+      const amount = row.amount_basis === 'v3_liquidity_amount' ? isDigits : isSignedDigits;
+      if (!amount(row.amount0_raw) || !amount(row.amount1_raw)) throw new ReadModelError('inconsistent_state', 'activity_amount_malformed');
+      amounts = { status: 'available', basis: row.amount_basis, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw };
+    }
+    return { time: iso(row.block_timestamp), blockNumber: row.block_number, logIndex: row.log_index, txHash: row.tx_hash, protocol: row.protocol,
+      kind: row.kind, pool: row.pool, pair: { token0, token1, fee, tickSpacing, hooks }, amounts, from: row.tx_from, to: row.counterparty,
+      toKind: row.counterparty_kind };
+  }
+
+  // The newest rows (block DESC, log index DESC), only while the checkpoint hour itself holds verified activity: a feed
+  // whose latest hour is missing or unavailable is unavailable, never an older list presented as current.
+  function buildActivity(typeKey) {
+    const state = anchor();
+    const unavailable = (reason) => ({ anchor: state, status: 'unavailable', reason, rows: [] });
+    if (!projectionDataReady()) return unavailable('projection_not_ready');
+    const latest = statement('projectionHour').get(int(state.hour), 'dex_activity');
+    if (latest?.status !== 'available') return unavailable(latest ? latest.reason : 'projection_not_processed');
+    return { anchor: state, status: 'available', reason: null,
+      rows: statement('activityRows').all(ACTIVITY_TYPES[typeKey], int(ACTIVITY_LIMIT)).map(activityRow) };
+  }
+
   // Projection state of every stored hour in [fromHour, toHour], oldest first (see projections.js projectionRepairState).
   // Before the writer has created the projection tables nothing is stored yet, and nothing is reported.
   function projectionStates(fromHour, toHour) {
@@ -419,6 +571,21 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       return { schema: TIMESERIES_SCHEMA, chain, window: core.window, freshness: freshness(core.anchor, now()),
         units: { 'usdc.amountRaw': { decimalsField: 'rawDecimals', source: 'persisted_raw_decimals' }, cctp: FAMILY_UNITS.cctp,
           gateway: FAMILY_UNITS.gateway }, buckets: core.buckets, definitions };
+    },
+    pools(protocolKey, windowKey) {
+      if (typeof protocolKey !== 'string' || !Object.hasOwn(POOL_PROTOCOLS, protocolKey)) throw new ReadModelError('unsupported_protocol');
+      if (typeof windowKey !== 'string' || !Object.hasOwn(POOLS_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
+      const core = cached(`pools:${protocolKey}:${windowKey}`, () => snapshot(() => buildPools(protocolKey, windowKey, POOLS_WINDOWS[windowKey])));
+      return { schema: POOLS_SCHEMA, chain, protocol: protocolKey, window: core.window, freshness: freshness(core.anchor, now()), status: core.status,
+        reason: core.reason, reasons: core.reasons, unavailableHours: core.unavailableHours,
+        ranking: { by: 'swap_count', usdVolume: { status: 'source_pending' }, liquidityUsd: { status: 'source_pending' } },
+        poolsTracked: core.poolsTracked, newPools: core.newPools, pools: core.pools };
+    },
+    activity(typeKey) {
+      if (typeof typeKey !== 'string' || !Object.hasOwn(ACTIVITY_TYPES, typeKey)) throw new ReadModelError('unsupported_activity_type');
+      const core = cached(`activity:${typeKey}`, () => snapshot(() => buildActivity(typeKey)));
+      return { schema: ACTIVITY_SCHEMA, chain, type: typeKey, freshness: freshness(core.anchor, now()), status: core.status, reason: core.reason,
+        limit: ACTIVITY_LIMIT, rows: core.rows };
     },
     // For the scheduler: the committed checkpoint, or null for a missing file or an empty store. Never a guess.
     checkpoint() {

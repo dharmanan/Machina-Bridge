@@ -14,9 +14,10 @@ import borrowHandler from '../api/borrow-markets.js';
 import { BORROW_CACHE_CONTROL, BORROW_COLLATERAL_ASSET, BORROW_LOAN_ASSET, BORROW_MARKETS_SCHEMA as PROXY_BORROW_SCHEMA,
   BORROW_MARKETS_UPSTREAM_URL, compatibleBorrowMarkets, handleBorrowMarketsProxy, normalizeBorrowMarketsPage } from '../api/_lib/borrow-markets-proxy.js';
 import { ARC_VERIFIED_ASSETS } from '../api/_lib/arc-intelligence/assets.js';
-import { DATA_CACHE_CONTROL, NO_STORE, resolveIntelligenceRoute, SUMMARY_SCHEMA, TIMESERIES_SCHEMA } from '../api/_lib/intelligence-proxy.js';
+import { ACTIVITY_SCHEMA, DATA_CACHE_CONTROL, NO_STORE, POOLS_SCHEMA, resolveIntelligenceRoute, SUMMARY_SCHEMA, TIMESERIES_SCHEMA } from '../api/_lib/intelligence-proxy.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
-import { SUMMARY_SCHEMA as BACKEND_SUMMARY_SCHEMA, TIMESERIES_SCHEMA as BACKEND_TIMESERIES_SCHEMA } from '../server/compact/read-model.js';
+import { ACTIVITY_SCHEMA as BACKEND_ACTIVITY_SCHEMA, POOLS_SCHEMA as BACKEND_POOLS_SCHEMA, SUMMARY_SCHEMA as BACKEND_SUMMARY_SCHEMA,
+  TIMESERIES_SCHEMA as BACKEND_TIMESERIES_SCHEMA } from '../server/compact/read-model.js';
 
 const tests = [];
 async function test(name, work) {
@@ -34,6 +35,12 @@ const MAPPING = [
   [{ view: 'summary', window: '24h' }, '/v1/intelligence/summary?window=24h'],
   [{ view: 'timeseries', window: '6h' }, '/v1/intelligence/timeseries?window=6h'],
   [{ view: 'timeseries', window: '24h' }, '/v1/intelligence/timeseries?window=24h'],
+  [{ view: 'pools', protocol: 'v3', window: '24h' }, '/v1/intelligence/pools?protocol=v3&window=24h'],
+  [{ view: 'pools', protocol: 'v4', window: '24h' }, '/v1/intelligence/pools?protocol=v4&window=24h'],
+  [{ view: 'activity', type: 'all' }, '/v1/intelligence/activity?type=all'],
+  [{ view: 'activity', type: 'swaps' }, '/v1/intelligence/activity?type=swaps'],
+  [{ view: 'activity', type: 'adds' }, '/v1/intelligence/activity?type=adds'],
+  [{ view: 'activity', type: 'removes' }, '/v1/intelligence/activity?type=removes'],
 ];
 const ALLOWED_URLS = new Set(MAPPING.map(([, path]) => `${ORIGIN}${path}`));
 
@@ -76,8 +83,11 @@ function upstream({ status = 200, body = null, text = undefined, headers = {}, t
 
 const summaryBody = (window = '24h', extra = {}) => ({ schema: SUMMARY_SCHEMA, window: { key: window }, freshness: { stale: false }, ...extra });
 const timeseriesBody = (window = '24h') => ({ schema: TIMESERIES_SCHEMA, window: { key: window }, buckets: [] });
+const poolsBody = (protocol = 'v3') => ({ schema: POOLS_SCHEMA, protocol, window: { key: '24h' }, status: 'available', pools: [] });
+const activityBody = (type = 'all') => ({ schema: ACTIVITY_SCHEMA, type, status: 'available', limit: 25, rows: [] });
 const bodyFor = (query) => (query.view === 'health' ? { status: 'ok', checkpointHour: '2026-10-03T08:00:00.000Z' }
-  : query.view === 'summary' ? summaryBody(query.window) : timeseriesBody(query.window));
+  : query.view === 'summary' ? summaryBody(query.window) : query.view === 'timeseries' ? timeseriesBody(query.window)
+    : query.view === 'pools' ? poolsBody(query.protocol) : activityBody(query.type));
 
 async function withFetch(fetchDouble, work, env = {}) {
   const originalFetch = globalThis.fetch;
@@ -97,7 +107,7 @@ async function withFetch(fetchDouble, work, env = {}) {
 
 const noFetch = async () => { throw new Error('fetch must not run for a rejected request'); };
 
-await test('1-6 the six exact requests map to six fixed upstream URLs and return the upstream body unchanged', async () => {
+await test('1-12 the twelve exact requests map to twelve fixed upstream URLs and return the upstream body unchanged', async () => {
   await withFetch(async (url) => {
     const query = MAPPING.find(([, path]) => `${ORIGIN}${path}` === url)[0];
     return upstream({ body: bodyFor(query) });
@@ -110,7 +120,7 @@ await test('1-6 the six exact requests map to six fixed upstream URLs and return
       assert.equal(seen.at(-1).url, `${ORIGIN}${path}`);
     }
     assert.ok(seen.every(({ options }) => options.method === 'GET' && options.headers.accept === 'application/json' && options.redirect === 'manual'));
-    assert.equal(seen.length, 6);
+    assert.equal(seen.length, 12);
   });
 });
 
@@ -136,6 +146,15 @@ await test('11-13 extra, missing, repeated or unknown parameters and windows are
       { view: 'summary', window: "24h' OR 1=1--" }, { view: 'summary', window: '24h;DROP TABLE compact_hours' },
       { view: 'summary', window: '../../health' }, { view: 'summary', window: ['24h', '6h'] }, { view: ['summary', 'health'] },
       { view: 'timeseries', window: '1h' }, { view: 'timeseries', window: '24h', window2: '6h' },
+      // pools: exactly protocol v3 or v4 and window 24h; activity: exactly one type
+      { view: 'pools', protocol: 'v2', window: '24h' }, { view: 'pools', protocol: 'v3', window: '6h' }, { view: 'pools', protocol: 'v3' },
+      { view: 'pools', window: '24h' }, { view: 'pools', protocol: 'v3', window: '24h', x: '1' }, { view: 'pools', protocol: ['v3', 'v4'], window: '24h' },
+      { view: 'pools', protocol: 'v3', window: ['24h', '24h'] }, { view: 'pools', protocol: 'V3', window: '24h' }, { view: 'pools', protocol: 'v3', window: '24H' },
+      { view: 'pools', protocol: '%76%33', window: '24h' }, { view: 'pools', protocol: 'v3&window=24h' }, { view: 'pools', protocol: 'v3 ', window: '24h' },
+      { view: 'pools', protocol: '__proto__', window: '24h' }, { view: 'pools', protocol: 'v3', window: 'constructor' }, { view: 'pools', type: 'all' },
+      { view: 'activity', type: 'mints' }, { view: 'activity', type: 'swap' }, { view: 'activity', type: 'Swaps' }, { view: 'activity', type: 'ALL' },
+      { view: 'activity', type: ['all', 'swaps'] }, { view: 'activity', type: 'all', limit: '100' }, { view: 'activity' }, { view: 'activity', type: '' },
+      { view: 'activity', type: '%61ll' }, { view: 'activity', window: '24h' }, { view: 'activity', type: 'toString' }, { view: 'activity', type: 'all', window: '24h' },
     ];
     for (const query of rejected) {
       const res = await call({ query });
@@ -196,6 +215,11 @@ await test('18-20 malformed, non-object and wrong-schema upstream bodies are a s
     [{ view: 'timeseries', window: '6h' }, { body: { buckets: [] } }],
     [{ view: 'health' }, { body: { status: 'degraded' } }],
     [{ view: 'health' }, { body: { checkpointHour: null } }],
+    // a pools or activity body must also be the requested protocol, window or type
+    [{ view: 'pools', protocol: 'v3', window: '24h' }, { body: poolsBody('v4') }],
+    [{ view: 'pools', protocol: 'v4', window: '24h' }, { body: { ...poolsBody('v4'), window: { key: '6h' } } }],
+    [{ view: 'activity', type: 'all' }, { body: activityBody('swaps') }],
+    [{ view: 'activity', type: 'adds' }, { body: { ...activityBody('adds'), schema: 'machina.intelligence.activity.v2' } }],
     [{ view: 'summary', window: '24h' }, { text: `{"schema":"${SUMMARY_SCHEMA}","pad":"${'x'.repeat(600 * 1024)}"}` }],
   ];
   // Every route checks its own schema: each one gets every other route's valid body, and a body with no schema at all.
@@ -298,6 +322,8 @@ await test('28 no user input can alter the upstream origin or path', async () =>
     { view: 'summary', window: '24h', host: 'evil.example' }, { view: '//evil.example/health' }, { view: 'summary', window: '24h@evil.example' },
     { view: 'summary', window: '24h/../../admin' }, { view: 'summary', window: '24h?window=6h' }, { view: 'summary', window: '24h#' },
     { view: 'timeseries', window: '6h&view=health' }, { view: 'health?x=1' }, { view: 'summary', window: '%32%34h' },
+    { view: 'pools', protocol: 'v3/../../health', window: '24h' }, { view: 'pools', protocol: 'v3', window: '24h@evil.example' },
+    { view: 'activity', type: 'all&type=swaps' }, { view: 'activity', type: '//evil.example' },
   ];
   await withFetch(async (url) => upstream({ body: bodyFor(MAPPING.find(([, path]) => `${ORIGIN}${path}` === url)?.[0] ?? { view: 'health' }) }), async (seen) => {
     for (const query of hostile) assert.equal((await call({ query })).statusCode, 400, JSON.stringify(query));
@@ -305,7 +331,8 @@ await test('28 no user input can alter the upstream origin or path', async () =>
     assert.ok(seen.every(({ url }) => ALLOWED_URLS.has(url)), seen.map(({ url }) => url).join(' '));
     assert.equal(seen.length, MAPPING.length);
   });
-  for (const query of [{ view: 'summary', window: 'constructor' }, { view: 'summary', window: '__proto__' }, { view: 'toString' }, { view: 'hasOwnProperty' }]) {
+  for (const query of [{ view: 'summary', window: 'constructor' }, { view: 'summary', window: '__proto__' }, { view: 'toString' }, { view: 'hasOwnProperty' },
+    { view: 'pools', protocol: 'hasOwnProperty', window: '24h' }, { view: 'activity', type: '__proto__' }]) {
     assert.equal(resolveIntelligenceRoute(query), null, JSON.stringify(query));
   }
 });
@@ -313,12 +340,14 @@ await test('28 no user input can alter the upstream origin or path', async () =>
 await test('contract: proxy schemas and upstream paths are exactly the compact backend\'s', async () => {
   assert.equal(SUMMARY_SCHEMA, BACKEND_SUMMARY_SCHEMA);
   assert.equal(TIMESERIES_SCHEMA, BACKEND_TIMESERIES_SCHEMA);
+  assert.equal(POOLS_SCHEMA, BACKEND_POOLS_SCHEMA);
+  assert.equal(ACTIVITY_SCHEMA, BACKEND_ACTIVITY_SCHEMA);
   const backend = await readFile(new URL('../server/compact/http.js', import.meta.url), 'utf8');
   const backendRoutes = [...backend.matchAll(/^ {2}\['(\/[^']+)'/gm)].map((match) => match[1]).sort();
   assert.deepEqual(backendRoutes, MAPPING.map(([, path]) => path).sort());
   const proxy = await readFile(new URL('../api/_lib/intelligence-proxy.js', import.meta.url), 'utf8');
   assert.match(proxy, /url = `\$\{upstreamOrigin\(env\)\}\$\{route\.path\}`/);
-  assert.doesNotMatch(proxy, /\$\{(query|view|window)\b/, 'no user input is interpolated into a URL');
+  assert.doesNotMatch(proxy, /\$\{(query|view|window|protocol|type)\b/, 'no user input is interpolated into a URL');
 });
 
 await test('end to end: the real compact HTTP server behind the proxy gives 200, then 304 for the same ETag', async () => {
@@ -326,6 +355,8 @@ await test('end to end: the real compact HTTP server behind the proxy gives 200,
     health: () => ({ status: 'ok', checkpointHour: '2026-10-03T08:00:00.000Z', verifiedThrough: '2026-10-03T09:00:00.000Z' }),
     summary: (window) => summaryBody(window, { network: { status: 'unavailable', reason: 'insufficient_coverage' } }),
     timeseries: (window) => timeseriesBody(window),
+    pools: (protocol, window) => ({ ...poolsBody(protocol), window: { key: window } }),
+    activity: (type) => activityBody(type),
   };
   const server = createIntelligenceServer({ readModel });
   await new Promise((done) => server.listen(0, '127.0.0.1', done));
@@ -554,25 +585,77 @@ const borrowMarketFixture = (overrides = {}) => ({
   liquidity: { token: 'USDC', tokenAddress: USDC, amount: '1234567.891', decimals: 6 }, refreshedAt: '2026-10-03T13:30:00.000Z', ...overrides,
 });
 const BORROW_AVAILABLE = { status: 'available', markets: [borrowMarketFixture()] };
+// pools.v1 and activity.v1 fixtures, shaped exactly like server/compact/read-model.js answers.
+const EURC = '0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1';
+const ZERO_ADDRESS = `0x${'0'.repeat(40)}`;
+const poolToken = (address, symbol = null, decimals = null, native = false) => ({ address, symbol, decimals, verified: symbol !== null, native });
+const T_USDC = poolToken(USDC, 'USDC', 6);
+const T_EURC = poolToken(EURC, 'EURC', 6);
+const T_UNKNOWN = poolToken(UNKNOWN_TOKEN);
+const T_NATIVE = poolToken(ZERO_ADDRESS, 'USDC', 18, true);
+const V3_POOL_A = `0x${'91'.repeat(20)}`;
+const V3_POOL_B = `0x${'92'.repeat(20)}`;
+const V4_POOL_X = `0x${'d1'.repeat(32)}`;
+const V4_POOL_Y = `0x${'d2'.repeat(32)}`;
+const HOOKS = `0x${'40'.repeat(20)}`;
+const poolEntry = (pool, token0, token1, swapCount, extra = {}) => ({ pool, createdBlock: 4_100_000, token0, token1, fee: 500, tickSpacing: 10, hooks: null,
+  swapCount, flowsRaw: { token0In: '1000000', token0Out: '0', token1In: '0', token1Out: '5' }, liquidityActivity: { addCount: 1, removeCount: 0, pokeCount: 0,
+    amounts: { status: 'not_supported', reason: 'v4_token_amounts_unavailable', addAmount0Raw: null, addAmount1Raw: null, removeAmount0Raw: null, removeAmount1Raw: null } },
+  ...extra });
+const poolsFixture = (protocol, pools, extra = {}) => ({ schema: lib.POOLS_SCHEMA, chain: { id: 5042, name: 'Arc' }, protocol, window: { key: '24h', hours: 24, ...WINDOW_RANGE },
+  freshness, status: 'available', reason: null, reasons: [], unavailableHours: [], ranking: { by: 'swap_count', usdVolume: { status: 'source_pending' },
+    liquidityUsd: { status: 'source_pending' } }, poolsTracked: 87, newPools: 3, pools, ...extra });
+const POOLS_READY = {
+  v3: poolsFixture('v3', [poolEntry(V3_POOL_A, T_USDC, T_UNKNOWN, 4321), poolEntry(V3_POOL_B, T_USDC, T_EURC, 56, { fee: 3000, tickSpacing: 60 })]),
+  v4: poolsFixture('v4', [poolEntry(V4_POOL_X, T_NATIVE, T_EURC, 1234, { hooks: ZERO_ADDRESS }), poolEntry(V4_POOL_Y, T_USDC, T_UNKNOWN, 12, { hooks: HOOKS, fee: 0x800000 })]),
+};
+const POOLS_COLLECTING = Object.fromEntries(['v3', 'v4'].map((protocol) => [protocol, poolsFixture(protocol, [], { status: 'unavailable',
+  reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], poolsTracked: null, newPools: null })]));
+const TX = (n) => `0x${n.toString(16).padStart(64, '0')}`;
+const SENDER = `0x${'5e'.repeat(20)}`;
+const RECIPIENT = `0x${'7e'.repeat(20)}`;
+const OWNER = `0x${'0e'.repeat(20)}`;
+const LP_SENDER = `0x${'5a'.repeat(20)}`;
+const V3_PAIR = { token0: T_USDC, token1: T_EURC, fee: 500, tickSpacing: 10, hooks: null };
+const V3_UNKNOWN_PAIR = { token0: T_USDC, token1: T_UNKNOWN, fee: 500, tickSpacing: 10, hooks: null };
+const V4_PAIR = { token0: T_NATIVE, token1: T_EURC, fee: 500, tickSpacing: 10, hooks: ZERO_ADDRESS };
+const activityRow = (n, kind, protocol, pool, pair, amounts, to, toKind) => ({ time: isoAt(END - HOUR_MS + n * 60_000), blockNumber: 4_200_000 - n, logIndex: 0,
+  txHash: TX(0xab00 + n), protocol, kind, pool, pair, amounts, from: SENDER, to, toKind });
+const ROWS = {
+  v3Swap: activityRow(1, 'swap', 'uniswap_v3', V3_POOL_B, V3_PAIR, { status: 'available', basis: 'v3_pool_delta', amount0Raw: '1500000', amount1Raw: '-1400000' },
+    RECIPIENT, 'swap_recipient'),
+  v4Swap: activityRow(2, 'swap', 'uniswap_v4', V4_POOL_X, V4_PAIR, { status: 'available', basis: 'v4_swap_delta', amount0Raw: '-2000000000000000000',
+    amount1Raw: '1900000' }, null, 'none'),
+  v3Add: activityRow(3, 'add', 'uniswap_v3', V3_POOL_A, V3_UNKNOWN_PAIR, { status: 'available', basis: 'v3_liquidity_amount', amount0Raw: '2500000', amount1Raw: '123' },
+    OWNER, 'liquidity_owner'),
+  v4Remove: activityRow(4, 'remove', 'uniswap_v4', V4_POOL_X, V4_PAIR, { status: 'not_supported', reason: 'v4_token_amounts_unavailable', basis: 'none',
+    amount0Raw: null, amount1Raw: null }, LP_SENDER, 'event_sender'),
+};
+const activityFixture = (type, rows, extra = {}) => ({ schema: lib.ACTIVITY_SCHEMA, chain: { id: 5042, name: 'Arc' }, type, freshness, status: 'available', reason: null,
+  limit: 25, rows, ...extra });
+const ACTIVITY_READY = { all: activityFixture('all', [ROWS.v3Swap, ROWS.v4Swap, ROWS.v3Add, ROWS.v4Remove]), swaps: activityFixture('swaps', [ROWS.v3Swap, ROWS.v4Swap]),
+  adds: activityFixture('adds', [ROWS.v3Add]), removes: activityFixture('removes', [ROWS.v4Remove]) };
+const READY_DATA = { window: '24h', summary: summaryFixture(), timeseries: timeseriesFixture(), failed: false, pools: POOLS_READY, activity: ACTIVITY_READY };
 const BORROW_UNAVAILABLE = { status: 'unavailable' };
 const STATES = {
   // Swaps view, so the chart assertions see the hourly bars; the default view (Volume) is checked separately.
-  ready: { selectedWindow: '24h', initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE,
-    data: { window: '24h', summary: summaryFixture(), timeseries: timeseriesFixture(), failed: false } },
-  'ready-default-view': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE,
-    data: { window: '24h', summary: summaryFixture(), timeseries: timeseriesFixture(), failed: false } },
+  ready: { selectedWindow: '24h', initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE, data: READY_DATA },
+  'ready-default-view': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: READY_DATA },
   collecting: { selectedWindow: '24h', borrowMarket: BORROW_UNAVAILABLE,
     data: { window: '24h', summary: summaryFixture({ families: insufficient, network: collectingNetwork, storedHours: 18 }),
-      timeseries: timeseriesFixture({ notStored: 6, v4GapAt: -1 }), failed: false } },
+      timeseries: timeseriesFixture({ notStored: 6, v4GapAt: -1 }), failed: false, pools: POOLS_COLLECTING, activity: ACTIVITY_READY } },
+  // One pools read and one activity filter failed: only those parts read unavailable.
   mixed: { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: { window: '24h', timeseries: timeseriesFixture(), failed: false,
-    summary: summaryFixture({ families: { aaveV4: unavailableFamily('family_hour_unavailable'), across: unavailableFamily('window_constant_mismatch') } }) } },
+    summary: summaryFixture({ families: { aaveV4: unavailableFamily('family_hour_unavailable'), across: unavailableFamily('window_constant_mismatch') } }),
+    pools: { v3: null, v4: POOLS_READY.v4 }, activity: { ...ACTIVITY_READY, swaps: null } } },
   failed: { selectedWindow: '24h', borrowMarket: BORROW_UNAVAILABLE, data: { window: '24h', summary: null, timeseries: null, failed: true } },
   loading: { selectedWindow: '24h', data: null },
   '7d': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: null },
   '30d': { selectedWindow: '30d', borrowMarket: BORROW_UNAVAILABLE, data: null },
   // A 24H result handed to the 7D view must be ignored, never shown as 7D.
-  '7d-with-24h-data': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE,
-    data: { window: '24h', summary: summaryFixture(), timeseries: timeseriesFixture(), failed: false } },
+  '7d-with-24h-data': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: READY_DATA },
+  'ready-swaps-tab': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: READY_DATA, initialActivityType: 'swaps',
+    explorerUrl: 'https://explorer.arc.io' },
 };
 const rendered = Object.fromEntries(Object.entries(STATES).map(([name, props]) => [name, render(props)]));
 const statusIn = (state, id) => item(rendered[state].tree, id).attrs['data-intel-status'];
@@ -701,9 +784,11 @@ await test('UI 7 Top Pools, Recent Activity and swaps cover all pairs, never onl
     assert.match(SCOPE.flatMap((section) => section.items).find((entry) => entry.id === id).label, /not only USDC pairs/);
   }
   const text = textOf(rendered.ready.tree);
-  assert.match(text, /Every verified Uniswap V3 pair will be listed here, not only USDC pairs/);
-  assert.match(text, /Every verified Uniswap V4 pair will be listed here, not only USDC pairs/);
+  assert.match(text, /Every verified Uniswap V3 pair is ranked, not only USDC pairs/);
+  assert.match(text, /Every verified Uniswap V4 pair is ranked, not only USDC pairs/);
   assert.match(text, /Tokens without verified details show their shortened address/);
+  assert.match(textOf(byAttr(rendered.ready.tree, 'data-intel-section', 'top-pools-v3')[0]), /USDC \/ 0xabcd\.\.\.1234/,
+    'a non-USDC side is listed by its shortened address');
 });
 
 await test('UI 8 no removed receipt metrics, no runtime views, no engineering words, no em dashes in the UI', async () => {
@@ -720,8 +805,11 @@ await test('UI 8 no removed receipt metrics, no runtime views, no engineering wo
   assert.doesNotMatch(componentSource, /\bdark:|bg-(slate|gray|zinc|neutral)-(900|950)\b|purple|violet|indigo|fuchsia/, 'light Machina theme only');
 });
 
-await test('UI 9 only the two 24H requests exist; 7D and 30D make no request at all', async () => {
-  assert.deepEqual(Object.values(lib.ARC_INTELLIGENCE_REQUESTS), ['/api/intelligence?view=summary&window=24h', '/api/intelligence?view=timeseries&window=24h']);
+await test('UI 9 only the eight 24H requests exist; 7D and 30D make no request at all', async () => {
+  const REQUESTS_24H = ['/api/intelligence?view=summary&window=24h', '/api/intelligence?view=timeseries&window=24h',
+    '/api/intelligence?view=pools&protocol=v3&window=24h', '/api/intelligence?view=pools&protocol=v4&window=24h', '/api/intelligence?view=activity&type=all',
+    '/api/intelligence?view=activity&type=swaps', '/api/intelligence?view=activity&type=adds', '/api/intelligence?view=activity&type=removes'];
+  assert.deepEqual(Object.values(lib.ARC_INTELLIGENCE_REQUESTS), REQUESTS_24H);
   for (const url of Object.values(lib.ARC_INTELLIGENCE_REQUESTS)) {
     const parsed = new URL(url, 'https://machina.example');
     assert.equal(parsed.pathname, '/api/intelligence');
@@ -740,7 +828,7 @@ await test('UI 9 only the two 24H requests exist; 7D and 30D make no request at 
   const result = await lib.loadArcIntelligence('24h', { fetchImpl });
   assert.equal(result.failed, false);
   assert.equal(result.summary.schema, SUMMARY_SCHEMA);
-  assert.deepEqual(calls.sort(), [['/api/intelligence?view=summary&window=24h', 'GET'], ['/api/intelligence?view=timeseries&window=24h', 'GET']]);
+  assert.deepEqual(calls.sort(), REQUESTS_24H.map((url) => [url, 'GET']).sort(), 'the 24H view reads exactly its eight exact requests');
   assert.doesNotMatch(componentSource, /\bfetch\(/, 'the component only loads through loadArcIntelligence');
   assert.match(componentSource, /if \(!ARC_INTELLIGENCE_BACKEND_WINDOWS\[target\]\) return/);
   assert.deepEqual({ ...scopeModule.ARC_INTELLIGENCE_BACKEND_WINDOWS }, { '24h': true, '7d': false, '30d': false });
@@ -975,6 +1063,98 @@ await test('UI 20 Volume is the primary DEX view, Swaps the secondary verified v
     assert.match(textOf(sectionNode(stateTree, 'top-pools-v3')), /not only USDC pairs/, name);
     assert.match(textOf(sectionNode(stateTree, 'top-pools-v4')), /not only USDC pairs/, name);
   }
+});
+
+await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fee, swaps; volume and liquidity stay source_pending', async () => {
+  const v3 = sectionNode(rendered.ready.tree, 'top-pools-v3');
+  const v3Rows = byAttr(v3, 'data-pool-row');
+  assert.deepEqual(v3Rows.map((node) => node.attrs['data-pool-row']), [V3_POOL_A, V3_POOL_B], 'kept in the ranked order the service returns');
+  assert.equal(textOf(v3Rows[0]), 'USDC / 0xabcd...1234 0.05% 4,321 swaps');
+  assert.equal(textOf(v3Rows[1]), 'USDC / EURC 0.3% 56 swaps');
+  const v4Rows = byAttr(sectionNode(rendered.ready.tree, 'top-pools-v4'), 'data-pool-row');
+  assert.equal(textOf(v4Rows[0]), 'USDC / EURC 0.05% 1,234 swaps', 'native USDC is named from the verified registry');
+  assert.equal(textOf(v4Rows[1]), 'USDC / 0xabcd...1234 Dynamic fee Hooks 12 swaps');
+  for (const id of ['top-pools-v3', 'top-pools-v4']) {
+    assert.deepEqual(['all-pairs', 'swaps', 'volume', 'liquidity'].map((column) => statusIn('ready', `${id}.${column}`)),
+      ['available', 'available', 'source_pending', 'source_pending'], id);
+  }
+  assert.equal(statusIn('mixed', 'top-pools-v3.swaps'), 'unavailable', 'a failed pools read is unavailable, never empty or zero');
+  assert.equal(byAttr(sectionNode(rendered.mixed.tree, 'top-pools-v3'), 'data-pool-row').length, 0);
+  assert.match(textOf(sectionNode(rendered.mixed.tree, 'top-pools-v3')), /Pool data is not verified for this window Rankings appear once every hour/);
+  assert.equal(statusIn('mixed', 'top-pools-v4.swaps'), 'available', 'one failed read never hides the other');
+  assert.equal(statusIn('collecting', 'top-pools-v3.swaps'), 'collecting');
+  for (const name of ['failed', 'loading', '7d', '30d', '7d-with-24h-data']) {
+    assert.equal(byAttr(rendered[name].tree, 'data-pool-row').length, 0, `${name}: no pool rows without a ready 24H read`);
+  }
+});
+
+await test('Activity 1 Recent Activity rows: type, protocol, pair, exact token amounts, From sender, To only from the event, Tx', async () => {
+  const section = sectionNode(rendered.ready.tree, 'recent-activity');
+  const rows = byAttr(section, 'data-activity-row');
+  assert.deepEqual(rows.map((node) => node.attrs['data-activity-row']), [TX(0xab01), TX(0xab02), TX(0xab03), TX(0xab04)], 'newest first, as served');
+  const cells = (node) => textOf(node);
+  assert.equal(cells(rows[0]), 'Time (UTC) Oct 3, 13:01 UTC Type Swap Protocol Uniswap V3 Pair USDC / EURC Amount 1.5 USDC to pool 1.4 EURC from pool '
+    + 'From 0x5e5e...5e5e To 0x7e7e...7e7e Tx 0x0000...ab01');
+  assert.equal(cells(rows[1]), 'Time (UTC) Oct 3, 13:02 UTC Type Swap Protocol Uniswap V4 Pair USDC / EURC Amount 2 USDC to pool 1.9 EURC from pool '
+    + 'From 0x5e5e...5e5e To Unavailable Tx 0x0000...ab02', 'a V4 swap records no recipient: To reads unavailable');
+  assert.equal(cells(rows[2]), 'Time (UTC) Oct 3, 13:03 UTC Type Add Protocol Uniswap V3 Pair USDC / 0xabcd...1234 Amount 2.5 USDC 123 raw units of 0xabcd...1234 '
+    + 'From 0x5e5e...5e5e To 0x0e0e...0e0e Tx 0x0000...ab03', 'an unverified token keeps its exact raw units');
+  assert.equal(cells(rows[3]), 'Time (UTC) Oct 3, 13:04 UTC Type Remove Protocol Uniswap V4 Pair USDC / EURC Amount Token amounts not recorded '
+    + 'From 0x5e5e...5e5e To 0x5a5a...5a5a Tx 0x0000...ab04', 'V4 liquidity changes carry no token amounts');
+  assert.equal(byAttr(section, 'href').length, 0, 'without the page explorer URL no link is invented');
+  const linked = sectionNode(rendered['ready-swaps-tab'].tree, 'recent-activity');
+  const links = [...walk(linked)].filter((node) => node.tag === 'a');
+  assert.deepEqual(links.map((node) => [node.attrs.href, node.attrs.rel, node.attrs.target]), [[`https://explorer.arc.io/tx/${TX(0xab01)}`, 'noopener noreferrer', '_blank'],
+    [`https://explorer.arc.io/tx/${TX(0xab02)}`, 'noopener noreferrer', '_blank']]);
+  assert.doesNotMatch(textOf(section), /\$|USD\b/, 'no USD conversion');
+});
+
+await test('Activity 2 the All, Swaps, Adds and Removes tabs read their own exact filters; a failed filter is unavailable on its own', async () => {
+  const swapsTab = rendered['ready-swaps-tab'].tree;
+  assert.deepEqual(byAttr(sectionNode(swapsTab, 'recent-activity'), 'data-activity-row').map((node) => node.attrs['data-activity-row']), [TX(0xab01), TX(0xab02)]);
+  const selected = [...walk(sectionNode(swapsTab, 'recent-activity'))].filter((node) => node.tag === 'button' && node.attrs['aria-selected'] === 'true').map(textOf);
+  assert.deepEqual(selected, ['Swaps']);
+  for (const type of ['all', 'swaps', 'adds', 'removes']) assert.equal(statusIn('ready', `recent-activity.${type}`), 'available', type);
+  assert.deepEqual(['all', 'swaps', 'adds', 'removes'].map((type) => statusIn('mixed', `recent-activity.${type}`)), ['available', 'unavailable', 'available', 'available']);
+  const failedSwaps = render({ ...STATES.mixed, initialActivityType: 'swaps' }).tree;
+  assert.equal(byAttr(sectionNode(failedSwaps, 'recent-activity'), 'data-activity-row').length, 0);
+  assert.match(textOf(sectionNode(failedSwaps, 'recent-activity')), /The verified activity feed is not available right now/);
+  assert.equal(item(failedSwaps, 'recent-activity.time').attrs['data-intel-status'], 'unavailable');
+  for (const [type, url] of [['all', 'activityAll'], ['swaps', 'activitySwaps'], ['adds', 'activityAdds'], ['removes', 'activityRemoves']]) {
+    const parsed = new URL(lib.ARC_INTELLIGENCE_REQUESTS[url], 'https://machina.example');
+    assert.deepEqual(Object.fromEntries(parsed.searchParams), { view: 'activity', type });
+    assert.ok(resolveIntelligenceRoute(Object.fromEntries(parsed.searchParams)), `${type} is an exact proxy route`);
+  }
+});
+
+await test('Pools and activity loader: exact shapes only; any malformed field, wrong filter or invented recipient fails that read closed', async () => {
+  const bodies = new Map([[lib.ARC_INTELLIGENCE_REQUESTS.summary24h, summaryFixture()], [lib.ARC_INTELLIGENCE_REQUESTS.timeseries24h, timeseriesFixture()],
+    [lib.ARC_INTELLIGENCE_REQUESTS.poolsV3_24h, POOLS_READY.v3], [lib.ARC_INTELLIGENCE_REQUESTS.poolsV4_24h, POOLS_READY.v4],
+    ...['all', 'swaps', 'adds', 'removes'].map((type) => [lib.ARC_INTELLIGENCE_REQUESTS[`activity${type[0].toUpperCase()}${type.slice(1)}`], ACTIVITY_READY[type]])]);
+  const serve = (override = {}) => async (url) => (Object.hasOwn(override, url) && override[url] === 'down'
+    ? { ok: false, json: async () => ({}) } : { ok: true, json: async () => structuredClone(Object.hasOwn(override, url) ? override[url] : bodies.get(url)) });
+  const loaded = await lib.loadArcIntelligence('24h', { fetchImpl: serve() });
+  assert.deepEqual([loaded.failed, loaded.pools.v3.pools.length, loaded.pools.v4.pools.length, loaded.activity.all.rows.length, loaded.activity.removes.rows.length],
+    [false, 2, 2, 4, 1]);
+  const one = (url, body) => lib.loadArcIntelligence('24h', { fetchImpl: serve({ [url]: body }) });
+  const R = lib.ARC_INTELLIGENCE_REQUESTS;
+  const v3 = (mutate) => { const body = structuredClone(POOLS_READY.v3); mutate(body); return body; };
+  const all = (mutate) => { const body = structuredClone(ACTIVITY_READY.all); mutate(body); return body; };
+  const poolCases = [v3((body) => { body.pools[0].flowsRaw.token0In = '1.5'; }), v3((body) => { body.protocol = 'v4'; }), v3((body) => { body.window.key = '6h'; }),
+    v3((body) => { body.pools[0].token1.symbol = 'USDC'; }), v3((body) => { body.pools[0].hooks = HOOKS; }), v3((body) => { body.ranking.by = 'volume'; }),
+    v3((body) => { body.pools = [...body.pools, ...Array.from({ length: 9 }, () => body.pools[1])]; }), 'down'];
+  for (const body of poolCases) {
+    const result = await one(R.poolsV3_24h, body);
+    assert.equal(result.pools.v3, null, JSON.stringify(body).slice(0, 80));
+    assert.ok(result.pools.v4 && result.activity.all && result.summary, 'only the failed read is null');
+  }
+  const activityCases = [all((body) => { body.rows[1].to = RECIPIENT; }), all((body) => { body.rows[0].to = null; }), all((body) => { body.rows[0].from = 'router'; }),
+    all((body) => { body.rows[3].amounts = { status: 'available', basis: 'none', amount0Raw: '1', amount1Raw: '1' }; }),
+    all((body) => { body.rows[2].amounts.amount0Raw = '-5'; }), all((body) => { body.type = 'swaps'; }), all((body) => { body.rows[0].toKind = 'event_sender'; })];
+  for (const body of activityCases) assert.equal((await one(R.activityAll, body)).activity.all, null, JSON.stringify(body).slice(0, 80));
+  assert.equal((await one(R.activitySwaps, activityFixture('swaps', [ROWS.v3Swap, ROWS.v3Add]))).activity.swaps, null, 'a filter must only hold its own kind');
+  const unavailable = activityFixture('all', [], { status: 'unavailable', reason: 'projection_not_processed' });
+  assert.deepEqual((await one(R.activityAll, unavailable)).activity.all, unavailable, 'an unavailable feed is kept as such, never shown as empty activity');
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1339,20 +1519,27 @@ const NEW_POOLS_TILE = '<StatTile marker={markerProps(`${id}.new-pools`, newPool
 
 await test('Contract 1 Recent Activity keeps Time, Type, Protocol, Pair, Amount, From, To and Tx, in that order, in every state', async () => {
   const items = SCOPE.find((section) => section.id === 'recent-activity').items;
-  for (const id of ['recent-activity.protocol', 'recent-activity.from', 'recent-activity.to']) assert.equal(scopeItem(id)?.backend, 'pending', id);
+  for (const id of ['recent-activity.protocol', 'recent-activity.from', 'recent-activity.to']) assert.equal(scopeItem(id)?.backend, 'live', id);
   assert.deepEqual(items.map((entry) => entry.id).filter((id) => RECENT_COLUMNS.some(([column]) => column === id)), RECENT_COLUMNS.map(([id]) => id),
     'manifest keeps the column order');
   for (const tab of ['all', 'swaps', 'adds', 'removes']) assert.ok(scopeItem(`recent-activity.${tab}`), tab);
   for (const [name, { tree }] of Object.entries(rendered)) {
     const section = sectionNode(tree, 'recent-activity');
-    for (const variant of ['md:grid', 'md:hidden']) {
+    for (const variant of ['lg:grid', 'lg:hidden']) {
       const row = [...walk(section)].find((node) => (node.attrs.class ?? '').includes(variant)
         && node.children.some((child) => child.attrs['data-intel-item'] === 'recent-activity.time'));
       assert.ok(row, `${name} ${variant}`);
       assert.deepEqual(row.children.map((child) => [child.attrs['data-intel-item'], textOf(child)]), RECENT_COLUMNS, `${name} ${variant} columns`);
     }
-    assertPendingField(tree, RECENT_COLUMNS.map(([id]) => id), name);
+    // Every column follows the feed of the selected tab; a column is never available without that feed, never carries a value.
+    const tab = STATES[name].initialActivityType ?? 'all';
+    for (const [id] of RECENT_COLUMNS) {
+      assert.equal(statusIn(name, id), statusIn(name, `recent-activity.${tab}`), `${name} ${id}`);
+      assert.equal(item(tree, id).attrs['data-intel-value'], undefined, `${name} ${id}`);
+    }
   }
+  assert.equal(statusIn('ready', 'recent-activity.time'), 'available');
+  assert.equal(statusIn('failed', 'recent-activity.time'), 'unavailable');
   for (const id of ['recent-activity.protocol', 'recent-activity.from', 'recent-activity.to']) {
     const line = componentSource.split('\n').find((entry) => entry.includes(`item: '${id}'`));
     const mutated = loadMutated(COMPONENT_PATH, componentSource.replace(`${line}\n`, ''));
@@ -1404,19 +1591,29 @@ await test('Contract 3 Liquidity means value held in the pool: source_pending, n
     /filled without its exact source/, 'filling Liquidity from mint and burn counts is caught');
 });
 
-await test('Contract 4 Volume stays the primary ranking and source_pending; swap counts appear only as labelled secondary data', async () => {
+await test('Contract 4 Volume stays source_pending and never comes from counts; pools rank by swap count, always labelled as swaps', async () => {
   for (const forbidden of ['swap count', 'event count', 'raw token sum', 'usdc-only flow']) {
     assert.ok(SEMANTICS['top-pools.volume'].forbidden.includes(forbidden), forbidden);
   }
-  assert.match(SEMANTICS['top-pools.volume'].meaning, /primary ranking/);
-  assert.match(SEMANTICS['top-pools.swaps'].meaning, /secondary and labelled as a count/);
+  assert.match(SEMANTICS['top-pools.volume'].meaning, /primary ranking once verified USD pricing exists/);
+  assert.match(SEMANTICS['top-pools.swaps'].meaning, /labelled as a count: the interim ranking until USD volume is verified/);
+  for (const forbidden of ['labelled or shown as volume', 'shown in USD']) assert.ok(SEMANTICS['top-pools.swaps'].forbidden.includes(forbidden), forbidden);
   for (const version of ['v3', 'v4']) {
-    assert.match(scopeItem(`top-pools-${version}.volume`).label, /USD, the primary ranking/);
-    assert.match(scopeItem(`top-pools-${version}.swaps`).label, /secondary and labelled as a count/);
+    assert.match(scopeItem(`top-pools-${version}.volume`).label, /USD, the primary ranking once verified/);
+    assert.equal(scopeItem(`top-pools-${version}.volume`).backend, 'pending');
+    assert.match(scopeItem(`top-pools-${version}.swaps`).label, /labelled as a count/);
   }
   for (const [name, { tree }] of Object.entries(rendered)) {
     assertPendingField(tree, VOLUME_IDS, name);
-    for (const id of ['top-pools-v3', 'top-pools-v4']) assert.match(textOf(sectionNode(tree, id)), /Pool rankings by USD volume will appear here/, `${name} ${id}`);
+    for (const id of ['top-pools-v3', 'top-pools-v4']) {
+      const text = textOf(sectionNode(tree, id));
+      assert.match(text, /Ranked by swap count, not by USD volume: volume and liquidity need verified USD pricing and are not available yet\./, `${name} ${id}`);
+      for (const row of byAttr(sectionNode(tree, id), 'data-pool-row')) {
+        assert.match(textOf(row), / [\d,]+ swaps$/, `${name} ${id}: a pool's count is always shown as swaps`);
+        assert.doesNotMatch(textOf(row), /volume|liquidity|USD\b|\$/i, `${name} ${id}: a pool row never carries a volume or liquidity value`);
+      }
+      assert.match(text, /Volume \(USD\) Source pending Liquidity Source pending/, `${name} ${id}: both pending fields keep their place`);
+    }
     const protocols = textOf(sectionNode(tree, 'top-protocols'));
     assert.match(protocols, /Ranked by USD volume Primary ranking\. Fixed order until volume is verified\./, name);
     assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
