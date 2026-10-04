@@ -160,7 +160,7 @@ export async function processBlockRange({ provider, first, last, before, after =
         ? { through: lastBlock.number, throughHash: lastBlock.hash, created: families.uniswapV3.accumulator.createdPools() } : null,
     },
     // Not families: separate status, storage and versions (store.js). Present only when computed.
-    ...(projection ? { projections: projection.finish({ families: results, hourStart }) } : {}),
+    ...(projection ? { projections: projection.finish({ families: results, hourStart, firstBlock: first, lastBlock: last }) } : {}),
   };
 }
 

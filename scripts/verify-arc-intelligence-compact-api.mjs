@@ -784,8 +784,8 @@ if (!sqlite) {
   const projected = buildProjectionDatabase('projections');
   projected.db.close();
   const openProjected = (path = projected.path) => open(path, { now: () => (BASE + 26 * HOUR + 600) * 1000 });
-  const token = (address, symbol, decimals) => ({ address, symbol, decimals, verified: symbol !== null, native: false });
-  const NATIVE_USDC = { address: ZERO, symbol: 'USDC', decimals: 18, verified: true, native: true };
+  const token = (address, symbol, decimals) => ({ address, symbol, decimals, verified: symbol !== null, native: false, contractMetadata: null });
+  const NATIVE_USDC = { address: ZERO, symbol: 'USDC', decimals: 18, verified: true, native: true, contractMetadata: null };
 
   await test('read model pools: V3 24H ranks by summed swap count, top 10, exact BigInt flows, registry pair and V3 liquidity amounts', () => {
     const before = fileHash(projected.path);
@@ -795,7 +795,8 @@ if (!sqlite) {
     assert.deepEqual([v3.schema, v3.chain, v3.protocol, v3.status, v3.reason, v3.reasons, v3.unavailableHours], [POOLS_SCHEMA, { id: 5042, name: 'Arc' },
       'v3', 'available', null, [], []]);
     assert.deepEqual(v3.window, { key: '24h', hours: 24, start: iso(BASE + 2 * HOUR), end: iso(BASE + 26 * HOUR) });
-    assert.deepEqual(v3.ranking, { by: 'swap_count', usdVolume: { status: 'source_pending' }, liquidityUsd: { status: 'source_pending' } });
+    // Every pool of this fixture has a USDC side, so every hour is valued from stored flows alone (no price needed).
+    assert.deepEqual(v3.ranking, { by: 'swap_count', usdVolume: { status: 'available', reason: null, reasons: [] }, liquidityUsd: { status: 'source_pending' } });
     assert.deepEqual([v3.poolsTracked, v3.newPools], [13, 1], 'all registry pools through the checkpoint; pool C was created inside the window');
     assert.deepEqual(v3.pools.map((row) => [row.pool, row.swapCount]), [[POOL_C, 600], ...[12, 11, 10, 9, 8, 7, 6, 5, 4].map((n) => [V3_POOLS[n - 1], 24 * n])],
       'at most 10 pools, ranked by summed swap count');
@@ -804,12 +805,16 @@ if (!sqlite) {
     assert.ok(BigInt(twelve.flowsRaw.token0In) > BigInt(Number.MAX_SAFE_INTEGER), 'exact beyond 2^53');
     assert.deepEqual(twelve.liquidityActivity, { addCount: 24, removeCount: 24, pokeCount: 24, amounts: { status: 'available',
       addAmount0Raw: (BIG * 24n).toString(), addAmount1Raw: (BIG * 48n).toString(), removeAmount0Raw: '72', removeAmount1Raw: '96' } });
-    assert.deepEqual({ ...twelve, flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined }, { pool: V3_POOLS[11], createdBlock: firstBlockOf(0),
-      token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null, flowsRaw: undefined, liquidityActivity: undefined,
-      swapCount: undefined });
+    assert.deepEqual(twelve.usdVolume, { status: 'available', reason: null, usdMicros: (BIG * 288n + 288n).toString(), basis: 'usd_anchor' },
+      'the USDC side of every swap (paid in plus paid out), exact, never both sides');
+    assert.deepEqual(v3.pools[0].usdVolume, { status: 'available', reason: null, usdMicros: '6', basis: 'usd_anchor' }, 'pool C: six hours of one raw unit');
+    assert.deepEqual({ ...twelve, flowsRaw: undefined, liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined }, { pool: V3_POOLS[11],
+      createdBlock: firstBlockOf(0), token0: token(USDC, 'USDC', 6), token1: token(EURC, 'EURC', 6), fee: 500, tickSpacing: 10, hooks: null, flowsRaw: undefined,
+      liquidityActivity: undefined, swapCount: undefined, usdVolume: undefined });
     assert.deepEqual(v3.pools[0].token1, token(UNKNOWN, null, null), 'an unknown token keeps its address, no symbol or decimals are guessed');
     const keys = [...JSON.stringify(v3.pools).matchAll(/"([^"]+)":/g)].map((match) => match[1]);
-    assert.ok(!keys.some((key) => /usd|tvl|volume|price/i.test(key)), 'no USD, TVL, price or volume field is produced');
+    assert.ok(!keys.some((key) => /usd|tvl|volume|price/i.test(key) && !['usdVolume', 'usdMicros'].includes(key)),
+      'the only USD fields are the valued swap volume; no TVL or price field is produced');
     assert.ok(Buffer.byteLength(JSON.stringify(v3)) < MAX_RESPONSE_BYTES);
     assert.equal(fileHash(projected.path), before, 'reading never changes the file');
     assert.equal(fetchCalls, 0);

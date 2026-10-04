@@ -50,13 +50,30 @@ export type ArcFreshness = {
   stale: boolean
 }
 
+// DEX USD volume of a window (server/compact/valuation.js): every swap valued once, by its USDC side or by the side with a
+// verified hourly on-chain price; swaps without one are counted as unvalued, never as zero. Amounts are exact micro-USD
+// integer strings. Absent when the API predates USD valuation (shown as not available yet).
+export type UsdVolumeWindow = {
+  status: 'available' | 'unavailable'
+  reason: string | null
+  reasons?: string[]
+  unavailableHours?: string[]
+  start?: string
+  end?: string
+  totalUsdMicros: string | null
+  byProtocol: { uniswapV3: string; uniswapV4: string } | null
+  valuedSwaps: number | null
+  unvaluedSwaps: number | null
+  previous?: UsdVolumeWindow
+}
+
 export type ArcSummary = {
   schema: typeof SUMMARY_SCHEMA
   window: { key: string; hours: number; start: string; end: string }
   freshness: ArcFreshness
   network: NetworkWindow
   assets: { usdc: FamilyWindow; verifiedAssets: FamilyWindow }
-  dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null } }
+  dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null }; usdVolume?: UsdVolumeWindow }
   lending: { aaveV4: FamilyWindow; morphoBlue: FamilyWindow; morphoVaultsV2: FamilyWindow }
   crossChain: { cctp: FamilyWindow; gateway: FamilyWindow; across: FamilyWindow }
   coverage: { firstStoredHour: string; storedHours: number; checkpointHour: string; verifiedThrough: string }
@@ -64,12 +81,17 @@ export type ArcSummary = {
 
 export type TimeseriesFamily = { status: 'available' | 'unavailable'; reason?: string } & Record<string, unknown>
 
+// One hour's DEX USD volume (exact micro-USD strings), or unavailable with its reason.
+export type HourUsdVolume = { status: 'available' | 'unavailable'; reason?: string; totalUsdMicros?: string; uniswapV3UsdMicros?: string;
+  uniswapV4UsdMicros?: string; valuedSwaps?: number; unvaluedSwaps?: number }
+
 export type TimeseriesBucket = {
   start: string
   end: string
   status: 'committed' | 'not_stored'
   network: { blocks: number; transactions: number; uniqueActiveAddresses: number; gasUsedRaw: string } | null
   families: Record<string, TimeseriesFamily> | null
+  dexUsdVolume?: HourUsdVolume | null
 }
 
 export type ArcTimeseries = {
@@ -80,8 +102,12 @@ export type ArcTimeseries = {
 }
 
 // A pool side. symbol and decimals come only from the verified Arc asset registry (native: Uniswap V4's currency 0x0, Arc's
-// native USDC with 18 decimals); any other token keeps null and is shown by its shortened address.
-export type PoolToken = { address: string; symbol: string | null; decimals: number | null; verified: boolean; native: boolean }
+// native USDC with 18 decimals); any other token keeps null. contractMetadata: what an unverified token's own contract
+// answered (read once by the indexer), shown as an unverified label, never as a verified identity; null when unread or
+// rejected, in which case the token is shown by its shortened address.
+export type ContractMetadata = { symbol: string; name: string | null; decimals: number }
+export type PoolToken = { address: string; symbol: string | null; decimals: number | null; verified: boolean; native: boolean;
+  contractMetadata?: ContractMetadata | null }
 
 export type ArcPool = {
   pool: string
@@ -94,9 +120,11 @@ export type ArcPool = {
   // swap events of the pool in the window: the interim ranking, always shown as a count
   swapCount: number
   flowsRaw: { token0In: string; token0Out: string; token1In: string; token1Out: string }
+  // USD value of the pool's swaps in the window (each swap once); unavailable when any of its swap hours has no verified value
+  usdVolume?: { status: 'available' | 'unavailable'; reason: string | null; usdMicros: string | null; basis: string | null }
 }
 
-// Top pools of one Uniswap version, ranked by swap count. USD volume and USD liquidity are source_pending.
+// Top pools of one Uniswap version, ranked by swap count. USD volume is shown beside the count; USD liquidity is source_pending.
 export type ArcPools = {
   schema: typeof POOLS_SCHEMA
   protocol: 'v3' | 'v4'
@@ -104,7 +132,8 @@ export type ArcPools = {
   freshness: ArcFreshness
   status: 'available' | 'unavailable'
   reason: string | null
-  ranking: { by: 'swap_count'; usdVolume: { status: 'source_pending' }; liquidityUsd: { status: 'source_pending' } }
+  ranking: { by: 'swap_count'; usdVolume: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; reasons?: string[] };
+    liquidityUsd: { status: 'source_pending' } }
   poolsTracked: number | null
   newPools: number | null
   pools: ArcPool[]
@@ -213,12 +242,32 @@ const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as num
 const isNullableCount = (value: unknown) => value === null || isCount(value)
 const isRawUnsigned = (value: unknown) => typeof value === 'string' && UNSIGNED.test(value)
 
+const CONTRACT_SYMBOL = /^[A-Za-z0-9][A-Za-z0-9._+$-]{0,19}$/
+const isDecimals0to36 = (value: unknown) => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 36
+
+function isContractMetadata(value: unknown): value is ContractMetadata {
+  return isRecord(value) && typeof value.symbol === 'string' && CONTRACT_SYMBOL.test(value.symbol) && isDecimals0to36(value.decimals)
+    && (value.name === null || (typeof value.name === 'string' && value.name.length <= 64))
+}
+
 function isPoolToken(value: unknown): value is PoolToken {
   if (!isRecord(value) || typeof value.address !== 'string' || !HEX_ADDRESS_LOWER.test(value.address) || typeof value.verified !== 'boolean'
     || typeof value.native !== 'boolean') return false
+  // Contract metadata only ever belongs to an unverified token; absent (older API) is the same as null.
+  const metadata = value.contractMetadata
+  if (metadata !== undefined && metadata !== null && (value.verified || !isContractMetadata(metadata))) return false
   return value.verified
-    ? typeof value.symbol === 'string' && value.symbol.length > 0 && Number.isInteger(value.decimals) && (value.decimals as number) >= 0 && (value.decimals as number) <= 36
+    ? typeof value.symbol === 'string' && value.symbol.length > 0 && isDecimals0to36(value.decimals)
     : value.symbol === null && value.decimals === null
+}
+
+const isUsdMicros = (value: unknown) => typeof value === 'string' && UNSIGNED.test(value)
+function isPoolUsdVolume(value: unknown) {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+  return value.status === 'available'
+    ? isUsdMicros(value.usdMicros) && typeof value.basis === 'string'
+    : value.status === 'unavailable' && value.usdMicros === null
 }
 
 function isPairFields(value: Record<string, unknown>, protocol: 'v3' | 'v4') {
@@ -230,7 +279,7 @@ function isArcPool(value: unknown, protocol: 'v3' | 'v4'): value is ArcPool {
   if (!isRecord(value) || typeof value.pool !== 'string' || !(protocol === 'v3' ? HEX_ADDRESS_LOWER : HEX_POOL_ID).test(value.pool)) return false
   const flows = value.flowsRaw
   return isPairFields(value, protocol) && isCount(value.createdBlock) && isCount(value.swapCount) && isRecord(flows)
-    && ['token0In', 'token0Out', 'token1In', 'token1Out'].every((field) => isRawUnsigned(flows[field]))
+    && ['token0In', 'token0Out', 'token1In', 'token1Out'].every((field) => isRawUnsigned(flows[field])) && isPoolUsdVolume(value.usdVolume)
 }
 
 export function parseArcPools(value: unknown, protocol: 'v3' | 'v4'): ArcPools | null {
@@ -302,6 +351,42 @@ export async function loadArcIntelligence(
     activity: Object.fromEntries(ARC_ACTIVITY_TYPES.map((type, index) => [type, parseArcActivity(settledObject(activity[index]), type)])) as
       Record<ArcActivityType, ArcActivity | null>,
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// USD volume (exact micro-USD strings from the API).
+
+const USD_MICROS = /^\d+$/
+
+// Display state of a USD volume entry. Absent (an API without USD valuation) is not available yet; hours not valued yet,
+// or a window still filling, are collecting; anything else is unavailable.
+export function usdVolumeStatus(entry: { status: string; reason?: string | null; reasons?: string[] } | null | undefined): IntelligenceDataStatus {
+  if (!entry) return 'source_pending'
+  if (entry.status === 'available') return 'available'
+  if (entry.reason === 'insufficient_coverage') return 'collecting'
+  const reasons = entry.reasons ?? (entry.reason ? [entry.reason] : [])
+  return reasons.length > 0 && reasons.every((reason) => reason === 'valuation_not_processed') ? 'collecting' : 'unavailable'
+}
+
+// A micro-USD amount as a number of dollars (for charts and comparisons only; displays use the exact string).
+export function usdMicrosToNumber(micros: string | null | undefined): number | null {
+  if (typeof micros !== 'string' || !USD_MICROS.test(micros)) return null
+  return Number(BigInt(micros)) / 1_000_000
+}
+
+// "$1,234.56" exactly (BigInt, truncated to cents); a positive amount below one cent reads "<$0.01", never zero.
+export function formatUsdMicros(micros: string): string {
+  const value = BigInt(micros)
+  const whole = value / 1_000_000n
+  const cents = (value % 1_000_000n) / 10_000n
+  if (value > 0n && whole === 0n && cents === 0n) return '<$0.01'
+  return `$${whole.toLocaleString('en-US')}.${cents.toString().padStart(2, '0')}`
+}
+
+// "$1.2M" style for tiles and axes.
+export function formatUsdCompact(value: number): string {
+  if (value > 0 && value < 0.01) return '<$0.01'
+  return `$${new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: value < 1000 ? 2 : 1 }).format(value)}`
 }
 
 // Display state of one backend window entry. insufficient_coverage means the window is still filling with history.

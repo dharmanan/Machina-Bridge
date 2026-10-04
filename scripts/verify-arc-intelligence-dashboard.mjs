@@ -539,7 +539,7 @@ const FAMILY_METRICS = {
       [UNKNOWN_TOKEN]: { depositCount: 1, inputAmountRaw: '123', units: { symbol: null, decimals: null, verified: false } } },
     fillByToken: { [USDC]: { fillCount: 4, outputAmountRaw: '3990000', units: { symbol: 'USDC', decimals: 6, verified: true } } } },
 };
-function summaryFixture({ families = {}, network = {}, storedHours = 48 } = {}) {
+function summaryFixture({ families = {}, network = {}, storedHours = 48, usdVolume } = {}) {
   const family = (name) => (Object.hasOwn(families, name) ? families[name] : available(FAMILY_METRICS[name]));
   return {
     schema: SUMMARY_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: '24h', hours: 24, ...WINDOW_RANGE }, freshness,
@@ -548,7 +548,8 @@ function summaryFixture({ families = {}, network = {}, storedHours = 48 } = {}) 
       previous: { status: 'available', blocks: 86_400, transactions: 1_000_000, transactionsPerSecond: 1_000_000 / 86_400, averageTransactionsPerBlock: 11.5,
         gasUsedRaw: '900000000000', uniqueActiveAddresses: { status: 'not_supported', reason: 'identity_retention_exceeded', value: null } }, ...network },
     assets: { usdc: family('usdc'), verifiedAssets: family('assets') },
-    dex: { uniswapV3: family('uniswapV3'), uniswapV4: family('uniswapV4'), officialV3Pools: { status: 'available', count: 87, throughBlock: 4_200_000 } },
+    dex: { uniswapV3: family('uniswapV3'), uniswapV4: family('uniswapV4'), officialV3Pools: { status: 'available', count: 87, throughBlock: 4_200_000 },
+      ...(usdVolume ? { usdVolume } : {}) },
     lending: { aaveV4: family('aaveV4'), morphoBlue: family('morphoBlue'), morphoVaultsV2: family('morphoVaultsV2') },
     crossChain: { cctp: family('cctp'), gateway: family('gateway'), across: family('across') },
     coverage: { firstStoredHour: isoAt(END - storedHours * HOUR_MS), storedHours, checkpointHour: freshness.checkpointHour,
@@ -556,11 +557,12 @@ function summaryFixture({ families = {}, network = {}, storedHours = 48 } = {}) 
     definitions: {},
   };
 }
-function timeseriesFixture({ notStored = 2, v4GapAt = 10 } = {}) {
+// usd: hourly DEX USD volume as the read model serves it (a function of the bucket index), absent for an older API.
+function timeseriesFixture({ notStored = 2, v4GapAt = 10, usd } = {}) {
   const buckets = Array.from({ length: 24 }, (_, index) => {
     const range = { start: isoAt(END - (24 - index) * HOUR_MS), end: isoAt(END - (23 - index) * HOUR_MS) };
-    if (index < notStored) return { ...range, status: 'not_stored', network: null, families: null };
-    return { ...range, status: 'committed',
+    if (index < notStored) return { ...range, status: 'not_stored', network: null, families: null, ...(usd ? { dexUsdVolume: null } : {}) };
+    return { ...range, status: 'committed', ...(usd ? { dexUsdVolume: usd(index) } : {}),
       network: { blocks: 3600, transactions: 50_000 + index, transactionsPerSecond: 13.9, averageTransactionsPerBlock: 13.9, gasUsedRaw: '41000000000',
         uniqueActiveAddresses: 1000 + index * 10 },
       families: {
@@ -636,6 +638,41 @@ const activityFixture = (type, rows, extra = {}) => ({ schema: lib.ACTIVITY_SCHE
 const ACTIVITY_READY = { all: activityFixture('all', [ROWS.v3Swap, ROWS.v4Swap, ROWS.v3Add, ROWS.v4Remove]), swaps: activityFixture('swaps', [ROWS.v3Swap, ROWS.v4Swap]),
   adds: activityFixture('adds', [ROWS.v3Add]), removes: activityFixture('removes', [ROWS.v4Remove]) };
 const READY_DATA = { window: '24h', summary: summaryFixture(), timeseries: timeseriesFixture(), failed: false, pools: POOLS_READY, activity: ACTIVITY_READY };
+// USD valuation as the read model serves it (server/compact/valuation.js): exact micro-USD strings, unvalued swaps counted.
+const usdWindow = (totalUsdMicros, { unvaluedSwaps = 0, previous = '1000000000000' } = {}) => ({ status: 'available', reason: null, reasons: [], unavailableHours: [],
+  ...WINDOW_RANGE, totalUsdMicros, byProtocol: { uniswapV3: '1000000000000', uniswapV4: (BigInt(totalUsdMicros) - 1_000_000_000_000n).toString() },
+  valuedSwaps: 5500, unvaluedSwaps, previous: previous === null ? { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'],
+    totalUsdMicros: null, byProtocol: null, valuedSwaps: null, unvaluedSwaps: null }
+    : { status: 'available', reason: null, reasons: [], totalUsdMicros: previous, byProtocol: null, valuedSwaps: 5000, unvaluedSwaps: 0 } });
+const usdUnavailable = (reasons) => ({ status: 'unavailable', reason: 'valuation_hour_unavailable', reasons, unavailableHours: [isoAt(END - HOUR_MS)], ...WINDOW_RANGE,
+  totalUsdMicros: null, byProtocol: null, valuedSwaps: null, unvaluedSwaps: null });
+const USD_GAP_AT = 12;
+const usdHour = (index) => (index === USD_GAP_AT ? { status: 'unavailable', reason: 'prices_unavailable' }
+  : { status: 'available', totalUsdMicros: String((1500 + index) * 1_000_000), uniswapV3UsdMicros: String((1000 + index) * 1_000_000),
+    uniswapV4UsdMicros: '500000000', valuedSwaps: 150, unvaluedSwaps: index === 20 ? 7 : 0 });
+const usdRanking = (status = 'available', reasons = []) => ({ by: 'swap_count', usdVolume: { status, reason: status === 'available' ? null : 'valuation_hour_unavailable', reasons },
+  liquidityUsd: { status: 'source_pending' } });
+const T_MOON = { ...poolToken(`0x${'3c'.repeat(20)}`), contractMetadata: { symbol: 'MOON', name: 'Moon Token', decimals: 18 } };
+const usdPools = (ranking = usdRanking()) => ({
+  v3: poolsFixture('v3', [poolEntry(V3_POOL_A, T_USDC, T_UNKNOWN, 4321, { usdVolume: { status: 'available', reason: null, usdMicros: '2000000000', basis: 'usd_anchor' } }),
+    poolEntry(V3_POOL_B, T_EURC, T_MOON, 56, { fee: 3000, tickSpacing: 60, usdVolume: { status: 'unavailable', reason: 'no_verified_price', usdMicros: null, basis: null } })],
+  { ranking }),
+  v4: poolsFixture('v4', [poolEntry(V4_POOL_X, T_NATIVE, T_EURC, 1234, { hooks: ZERO_ADDRESS, usdVolume: { status: 'available', reason: null, usdMicros: '1234560000', basis: 'usd_anchor' } }),
+    poolEntry(V4_POOL_Y, T_USDC, T_MOON, 12, { hooks: HOOKS, fee: 0x800000, usdVolume: { status: 'available', reason: null, usdMicros: '4500', basis: 'usd_anchor' } })],
+  { ranking }),
+});
+const MOON_ROW = activityRow(5, 'swap', 'uniswap_v3', V3_POOL_A, { token0: T_USDC, token1: T_MOON, fee: 500, tickSpacing: 10, hooks: null },
+  { status: 'available', basis: 'v3_pool_delta', amount0Raw: '-3250000', amount1Raw: '1873749079602007177928126' }, RECIPIENT, 'swap_recipient');
+const USD_DATA = { window: '24h', summary: summaryFixture({ usdVolume: usdWindow('1234567890123', { unvaluedSwaps: 7 }) }),
+  timeseries: timeseriesFixture({ usd: usdHour }), failed: false, pools: usdPools(),
+  activity: { ...ACTIVITY_READY, all: activityFixture('all', [MOON_ROW, ...ACTIVITY_READY.all.rows]) } };
+const notProcessed = ['valuation_not_processed'];
+const USD_COLLECTING_DATA = { ...USD_DATA, summary: summaryFixture({ usdVolume: usdUnavailable(notProcessed) }),
+  timeseries: timeseriesFixture({ usd: () => ({ status: 'unavailable', reason: 'valuation_not_processed' }) }), pools: usdPools(usdRanking('unavailable', notProcessed)) };
+const USD_UNAVAILABLE_DATA = { ...USD_DATA, summary: summaryFixture({ usdVolume: usdUnavailable(['prices_unavailable']) }),
+  timeseries: timeseriesFixture({ usd: () => ({ status: 'unavailable', reason: 'prices_unavailable' }) }),
+  pools: usdPools(usdRanking('unavailable', ['prices_unavailable'])) };
+const USD_STATES = ['ready-usd', 'usd-swaps-tab', 'usd-collecting', 'usd-unavailable'];
 const BORROW_UNAVAILABLE = { status: 'unavailable' };
 const STATES = {
   // Swaps view, so the chart assertions see the hourly bars; the default view (Volume) is checked separately.
@@ -656,6 +693,11 @@ const STATES = {
   '7d-with-24h-data': { selectedWindow: '7d', borrowMarket: BORROW_AVAILABLE, data: READY_DATA },
   'ready-swaps-tab': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: READY_DATA, initialActivityType: 'swaps',
     explorerUrl: 'https://explorer.arc.io' },
+  // The API with USD valuation: available, still being valued, and unavailable (prices missing for some hour).
+  'ready-usd': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: USD_DATA },
+  'usd-swaps-tab': { selectedWindow: '24h', initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE, data: USD_DATA },
+  'usd-collecting': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: USD_COLLECTING_DATA },
+  'usd-unavailable': { selectedWindow: '24h', borrowMarket: BORROW_AVAILABLE, data: USD_UNAVAILABLE_DATA },
 };
 const rendered = Object.fromEntries(Object.entries(STATES).map(([name, props]) => [name, render(props)]));
 const statusIn = (state, id) => item(rendered[state].tree, id).attrs['data-intel-status'];
@@ -763,14 +805,18 @@ await test('UI 5 missing data never appears as a number or as zero, in any state
   assert.match(textOf(item(rendered.collecting.tree, 'network.transactions')), /Collecting History is still being collected/);
 });
 
-await test('UI 6 Total Volume and Average Fee are never filled in, and no USD value is shown anywhere', async () => {
+await test('UI 6 without the API\'s USD valuation no USD value exists; Average Fee and the protocol USD ranking are never filled', async () => {
+  const VOLUME = ['network.total-volume', 'volume-chart.volume', 'top-pools-v3.volume', 'top-pools-v4.volume'];
   for (const [name, { tree, html }] of Object.entries(rendered)) {
-    for (const id of ['network.total-volume', 'network.average-fee', 'volume-chart.volume', 'top-protocols.volume-ranking', 'top-pools-v3.volume', 'top-pools-v4.volume']) {
-      assert.equal(item(tree, id).attrs['data-intel-status'], 'source_pending', `${name} ${id}`);
-    }
+    for (const id of ['network.average-fee', 'top-protocols.volume-ranking']) assert.equal(item(tree, id).attrs['data-intel-status'], 'source_pending', `${name} ${id}`);
+    if (USD_STATES.includes(name)) continue;
+    for (const id of VOLUME) assert.notEqual(item(tree, id).attrs['data-intel-status'], 'available', `${name} ${id}`);
     assert.doesNotMatch(textOf(item(tree, 'network.total-volume')), /USDC|\d/, name);
     assert.doesNotMatch(html, /\$\s?\d|\d\s?USD\b|US\$/, `${name}: no USD amount`);
   }
+  // An API without valuation (the ready fixtures carry none) reads as not available yet, never as zero or unavailable.
+  for (const id of VOLUME) assert.equal(statusIn('ready', id), 'source_pending', id);
+  assert.equal(statusIn('ready-default-view', 'volume-chart.volume'), 'source_pending');
 });
 
 const UI_SOURCES = [COMPONENT_PATH, LIB_PATH, SCOPE_PATH].map((file) => [file, readFileSync(file, 'utf8')]);
@@ -784,8 +830,8 @@ await test('UI 7 Top Pools, Recent Activity and swaps cover all pairs, never onl
     assert.match(SCOPE.flatMap((section) => section.items).find((entry) => entry.id === id).label, /not only USDC pairs/);
   }
   const text = textOf(rendered.ready.tree);
-  assert.match(text, /Every verified Uniswap V3 pair is ranked, not only USDC pairs/);
-  assert.match(text, /Every verified Uniswap V4 pair is ranked, not only USDC pairs/);
+  assert.match(text, /Every verified Uniswap V3 pair is ranked by swaps, not only USDC pairs/);
+  assert.match(text, /Every verified Uniswap V4 pair is ranked by swaps, not only USDC pairs/);
   assert.match(text, /Tokens without verified details show their shortened address/);
   assert.match(textOf(byAttr(rendered.ready.tree, 'data-intel-section', 'top-pools-v3')[0]), /USDC \/ 0xabcd\.\.\.1234/,
     'a non-USDC side is listed by its shortened address');
@@ -1065,15 +1111,17 @@ await test('UI 20 Volume is the primary DEX view, Swaps the secondary verified v
   }
 });
 
-await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fee, swaps; volume and liquidity stay source_pending', async () => {
+await test('Pools 1 Top Pools rows come from pools.v1 in service order: pair, fee, swaps; without valuation, volume and liquidity stay source_pending', async () => {
   const v3 = sectionNode(rendered.ready.tree, 'top-pools-v3');
   const v3Rows = byAttr(v3, 'data-pool-row');
   assert.deepEqual(v3Rows.map((node) => node.attrs['data-pool-row']), [V3_POOL_A, V3_POOL_B], 'kept in the ranked order the service returns');
-  assert.equal(textOf(v3Rows[0]), 'USDC / 0xabcd...1234 0.05% 4,321 swaps');
-  assert.equal(textOf(v3Rows[1]), 'USDC / EURC 0.3% 56 swaps');
+  assert.equal(textOf(v3Rows[0]), '1 USDC / 0xabcd...1234 0.05% 4,321 swaps');
+  assert.equal(textOf(v3Rows[1]), '2 USDC / EURC 0.3% 56 swaps');
   const v4Rows = byAttr(sectionNode(rendered.ready.tree, 'top-pools-v4'), 'data-pool-row');
-  assert.equal(textOf(v4Rows[0]), 'USDC / EURC 0.05% 1,234 swaps', 'native USDC is named from the verified registry');
-  assert.equal(textOf(v4Rows[1]), 'USDC / 0xabcd...1234 Dynamic fee Hooks 12 swaps');
+  assert.equal(textOf(v4Rows[0]), '1 USDC / EURC 0.05% 1,234 swaps', 'native USDC is named from the verified registry');
+  assert.equal(textOf(v4Rows[1]), '2 USDC / 0xabcd...1234 Dynamic fee Hooks 12 swaps');
+  const unknown = [...walk(v3Rows[0])].find((node) => node.attrs.title?.startsWith(UNKNOWN_TOKEN));
+  assert.equal(unknown.attrs.title, `${UNKNOWN_TOKEN} (token details not verified)`, 'the full address of an unverified token stays on hover');
   for (const id of ['top-pools-v3', 'top-pools-v4']) {
     assert.deepEqual(['all-pairs', 'swaps', 'volume', 'liquidity'].map((column) => statusIn('ready', `${id}.${column}`)),
       ['available', 'available', 'source_pending', 'source_pending'], id);
@@ -1093,13 +1141,13 @@ await test('Activity 1 Recent Activity rows: type, protocol, pair, exact token a
   const rows = byAttr(section, 'data-activity-row');
   assert.deepEqual(rows.map((node) => node.attrs['data-activity-row']), [TX(0xab01), TX(0xab02), TX(0xab03), TX(0xab04)], 'newest first, as served');
   const cells = (node) => textOf(node);
-  assert.equal(cells(rows[0]), 'Time (UTC) Oct 3, 13:01 UTC Type Swap Protocol Uniswap V3 Pair USDC / EURC Amount 1.5 USDC to pool 1.4 EURC from pool '
+  assert.equal(cells(rows[0]), 'Time (UTC) Oct 3, 13:01 Type Swap Protocol Uniswap V3 Pair USDC / EURC Amount 1.5 USDC to pool 1.4 EURC from pool '
     + 'From 0x5e5e...5e5e To 0x7e7e...7e7e Tx 0x0000...ab01');
-  assert.equal(cells(rows[1]), 'Time (UTC) Oct 3, 13:02 UTC Type Swap Protocol Uniswap V4 Pair USDC / EURC Amount 2 USDC to pool 1.9 EURC from pool '
+  assert.equal(cells(rows[1]), 'Time (UTC) Oct 3, 13:02 Type Swap Protocol Uniswap V4 Pair USDC / EURC Amount 2 USDC to pool 1.9 EURC from pool '
     + 'From 0x5e5e...5e5e To Unavailable Tx 0x0000...ab02', 'a V4 swap records no recipient: To reads unavailable');
-  assert.equal(cells(rows[2]), 'Time (UTC) Oct 3, 13:03 UTC Type Add Protocol Uniswap V3 Pair USDC / 0xabcd...1234 Amount 2.5 USDC 123 raw units of 0xabcd...1234 '
-    + 'From 0x5e5e...5e5e To 0x0e0e...0e0e Tx 0x0000...ab03', 'an unverified token keeps its exact raw units');
-  assert.equal(cells(rows[3]), 'Time (UTC) Oct 3, 13:04 UTC Type Remove Protocol Uniswap V4 Pair USDC / EURC Amount Token amounts not recorded '
+  assert.equal(cells(rows[2]), 'Time (UTC) Oct 3, 13:03 Type Add Protocol Uniswap V3 Pair USDC / 0xabcd...1234 Amount 2.5 USDC Raw amount 0xabcd...1234 123 '
+    + 'From 0x5e5e...5e5e To 0x0e0e...0e0e Tx 0x0000...ab03', 'an unverified token keeps its exact raw amount, behind a short label');
+  assert.equal(cells(rows[3]), 'Time (UTC) Oct 3, 13:04 Type Remove Protocol Uniswap V4 Pair USDC / EURC Amount Token amounts not recorded '
     + 'From 0x5e5e...5e5e To 0x5a5a...5a5a Tx 0x0000...ab04', 'V4 liquidity changes carry no token amounts');
   assert.equal(byAttr(section, 'href').length, 0, 'without the page explorer URL no link is invented');
   const linked = sectionNode(rendered['ready-swaps-tab'].tree, 'recent-activity');
@@ -1107,6 +1155,29 @@ await test('Activity 1 Recent Activity rows: type, protocol, pair, exact token a
   assert.deepEqual(links.map((node) => [node.attrs.href, node.attrs.rel, node.attrs.target]), [[`https://explorer.arc.io/tx/${TX(0xab01)}`, 'noopener noreferrer', '_blank'],
     [`https://explorer.arc.io/tx/${TX(0xab02)}`, 'noopener noreferrer', '_blank']]);
   assert.doesNotMatch(textOf(section), /\$|USD\b/, 'no USD conversion');
+});
+
+await test('Activity 3 a huge raw amount stays compact with its exact value one tap away; events of one transaction carry their log number', async () => {
+  const HUGE = '19824699890742085728050';
+  const shared = TX(0xcafe);
+  const first = { ...ROWS.v3Swap, txHash: shared, logIndex: 31, pair: V3_UNKNOWN_PAIR,
+    amounts: { status: 'available', basis: 'v3_pool_delta', amount0Raw: '641423', amount1Raw: `-${HUGE}` } };
+  const second = { ...first, logIndex: 27, amounts: { status: 'available', basis: 'v3_pool_delta', amount0Raw: '550400', amount1Raw: '-489258' } };
+  const { tree } = render({ ...STATES.ready, data: { ...READY_DATA, activity: { ...ACTIVITY_READY, all: activityFixture('all', [first, second, ROWS.v4Swap]) } } });
+  const rows = byAttr(sectionNode(tree, 'recent-activity'), 'data-activity-row');
+  assert.deepEqual(rows.map((node) => node.attrs['data-log-index']), ['31', '27', '0']);
+  assert.match(textOf(rows[0]), /Tx 0x0000\.\.\.cafe Log #31$/);
+  assert.match(textOf(rows[1]), /Tx 0x0000\.\.\.cafe Log #27$/, 'separate events of one transaction are never merged and never look identical');
+  assert.doesNotMatch(textOf(rows[2]), /Log #/, 'a single-event transaction carries no log number');
+  const details = [...walk(rows[0])].find((node) => node.tag === 'details');
+  const summary = details.children.find((node) => node.tag === 'summary');
+  assert.equal(textOf(summary), 'Raw amount 0xabcd...1234 from pool', 'the visible line never prints the huge integer');
+  assert.equal(details.attrs.title, `Exact raw amount: ${HUGE}`);
+  assert.ok(textOf(details).endsWith(HUGE), 'the exact raw integer is kept, one tap away');
+  assert.match(textOf(rows[0]), /Amount 0\.64 USDC to pool Raw amount/, 'a verified stablecoin reads in cents');
+  const visibleText = (node) => (node.tag === 'details' ? textOf(node.children.find((child) => child.tag === 'summary'))
+    : node.tag === '#text' ? node.text : node.children.map(visibleText).join(' ')).replace(/\s+/g, ' ').trim();
+  assert.doesNotMatch(visibleText(sectionNode(tree, 'recent-activity')), /raw units|e\+\d|\d{16}/i, 'no long raw number is printed in the table itself');
 });
 
 await test('Activity 2 the All, Swaps, Adds and Removes tabs read their own exact filters; a failed filter is unavailable on its own', async () => {
@@ -1514,7 +1585,7 @@ function assertPendingField(tree, ids, name) {
 const LIQUIDITY_IDS = ['top-pools-v3.liquidity', 'top-pools-v4.liquidity'];
 const VOLUME_IDS = ['top-pools-v3.volume', 'top-pools-v4.volume', 'top-protocols.volume-ranking', 'volume-chart.volume', 'network.total-volume'];
 const LIQUIDITY_FROM_ACTIVITY = /liquidity[^\n]*(mintCount|burnCount|modifyLiquidityCount|addCount|removeCount|add_count|remove_count)|(mintCount|burnCount|modifyLiquidityCount)[^\n]*liquidity/i;
-const VOLUME_FROM_COUNTS = /\.sort\([^)\n]*swap|markerProps\(`\$\{id\}\.volume`|volume[^\n]*swapCount|swapCount[^\n]*volume/i;
+const VOLUME_FROM_COUNTS = /\.sort\([^)\n]*swap|volume[^\n]*swapCount|swapCount[^\n]*volume/i;
 const NEW_POOLS_TILE = '<StatTile marker={markerProps(`${id}.new-pools`, newPools.status, newPools.raw)} label={`New pools, ${ctx.windowLabel}`} cell={newPools} />';
 
 await test('Contract 1 Recent Activity keeps Time, Type, Protocol, Pair, Amount, From, To and Tx, in that order, in every state', async () => {
@@ -1591,33 +1662,37 @@ await test('Contract 3 Liquidity means value held in the pool: source_pending, n
     /filled without its exact source/, 'filling Liquidity from mint and burn counts is caught');
 });
 
-await test('Contract 4 Volume stays source_pending and never comes from counts; pools rank by swap count, always labelled as swaps', async () => {
-  for (const forbidden of ['swap count', 'event count', 'raw token sum', 'usdc-only flow']) {
+await test('Contract 4 Volume comes only from the USD valuation, never from counts; pools rank by swap count, always labelled as swaps', async () => {
+  for (const forbidden of ['swap count', 'event count', 'raw token sum', 'usdc-only flow', 'both sides of one swap added together', 'external or guessed price',
+    'unpriced swaps counted as zero']) {
     assert.ok(SEMANTICS['top-pools.volume'].forbidden.includes(forbidden), forbidden);
   }
-  assert.match(SEMANTICS['top-pools.volume'].meaning, /primary ranking once verified USD pricing exists/);
-  assert.match(SEMANTICS['top-pools.swaps'].meaning, /labelled as a count: the interim ranking until USD volume is verified/);
+  assert.match(SEMANTICS['top-pools.volume'].meaning, /every swap valued once, by its USDC side or by a verified hourly price/);
+  assert.match(SEMANTICS['top-pools.swaps'].meaning, /labelled as a count: the ranking of the table/);
   for (const forbidden of ['labelled or shown as volume', 'shown in USD']) assert.ok(SEMANTICS['top-pools.swaps'].forbidden.includes(forbidden), forbidden);
   for (const version of ['v3', 'v4']) {
-    assert.match(scopeItem(`top-pools-${version}.volume`).label, /USD, the primary ranking once verified/);
-    assert.equal(scopeItem(`top-pools-${version}.volume`).backend, 'pending');
+    assert.match(scopeItem(`top-pools-${version}.volume`).label, /Pool volume in USD over the window/);
+    assert.equal(scopeItem(`top-pools-${version}.volume`).backend, 'live');
     assert.match(scopeItem(`top-pools-${version}.swaps`).label, /labelled as a count/);
   }
   for (const [name, { tree }] of Object.entries(rendered)) {
-    assertPendingField(tree, VOLUME_IDS, name);
     for (const id of ['top-pools-v3', 'top-pools-v4']) {
       const text = textOf(sectionNode(tree, id));
-      assert.match(text, /Ranked by swap count, not by USD volume: volume and liquidity need verified USD pricing and are not available yet\./, `${name} ${id}`);
+      assert.match(text, /ranked by swap count/, `${name} ${id}`);
+      const volumeAvailable = statusIn(name, `${id}.volume`) === 'available';
       for (const row of byAttr(sectionNode(tree, id), 'data-pool-row')) {
         assert.match(textOf(row), / [\d,]+ swaps$/, `${name} ${id}: a pool's count is always shown as swaps`);
-        assert.doesNotMatch(textOf(row), /volume|liquidity|USD\b|\$/i, `${name} ${id}: a pool row never carries a volume or liquidity value`);
+        assert.doesNotMatch(textOf(row), /liquidity/i, `${name} ${id}: a pool row never carries a liquidity value`);
+        if (!volumeAvailable) assert.doesNotMatch(textOf(row), /volume|USD\b|\$/i, `${name} ${id}: no volume without the valuation`);
       }
-      assert.match(text, /Volume \(USD\) Source pending Liquidity Source pending/, `${name} ${id}: both pending fields keep their place`);
+      assert.match(text, /Liquidity Not available yet/, `${name} ${id}: liquidity keeps its place, stated once`);
     }
     const protocols = textOf(sectionNode(tree, 'top-protocols'));
-    assert.match(protocols, /Ranked by USD volume Primary ranking\. Fixed order until volume is verified\./, name);
+    assert.match(protocols, /Ranked by USD volume Primary ranking\. Fixed order until every protocol has a verified USD measure\./, name);
     assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
   }
+  // The ready fixtures carry no valuation: their Volume (USD) line says so once, beside Liquidity.
+  assert.match(textOf(sectionNode(rendered.ready.tree, 'top-pools-v3')), /Volume \(USD\) Not available yet Liquidity Not available yet/);
   const unitOf = (node) => textOf(node).match(/(swaps|lending actions|market actions|vault actions)$/)?.[1];
   for (const node of byAttr(sectionNode(rendered.ready.tree, 'top-protocols'), 'data-intel-value')) {
     assert.ok(unitOf(node), `${node.attrs['data-intel-item']}: a count is always shown with its unit`);
@@ -1627,11 +1702,92 @@ await test('Contract 4 Volume stays source_pending and never comes from counts; 
         <StatTile marker={markerProps(\`\${id}.volume\`, 'available', metricNumber(family, 'swapCount'))} label="Volume" cell={newPools} />`);
   assert.ok(VOLUME_FROM_COUNTS.test(swapsAsVolume), 'the source check catches the mutation');
   assert.throws(() => assertPendingField(render(STATES.ready, loadMutated(COMPONENT_PATH, swapsAsVolume).ArcIntelligenceDashboard).tree, VOLUME_IDS, 'mutated'),
-    /filled without its exact source/, 'filling Volume from swap counts is caught');
+    /filled without its exact source|inconsistent/, 'filling Volume from swap counts is caught');
+  assert.throws(() => checkScope(render(STATES.ready, loadMutated(COMPONENT_PATH, swapsAsVolume).ArcIntelligenceDashboard).tree, SCOPE), /inconsistent status/,
+    'a second Volume marker beside the pending one is caught by the scope check');
   const unlabelled = componentSource.replace('<p className={LABEL}>Activity, last {ctx.windowLabel}</p>', '<p className={LABEL}>Ranking</p>');
   assert.notEqual(unlabelled, componentSource);
   assert.doesNotMatch(textOf(sectionNode(render(STATES.ready, loadMutated(COMPONENT_PATH, unlabelled).ArcIntelligenceDashboard).tree, 'top-protocols')),
     /Activity, last 24H/, 'removing the secondary Activity label would fail the check above');
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// USD volume (server/compact/valuation.js through summary.v1, timeseries.v1 and pools.v1).
+
+await test('Volume 1 Total Volume is the exact window value from the API, with its unit, period, change and unvalued swaps stated', async () => {
+  const kpi = item(rendered['ready-usd'].tree, 'network.total-volume');
+  assert.equal(kpi.attrs['data-intel-status'], 'available');
+  assert.equal(kpi.attrs['data-intel-value'], '1234567890123', 'the exact micro-USD amount the API served');
+  assert.equal(textOf(kpi), 'Total Volume $1.2M Uniswap V3 and V4 swaps, last 24H. 7 swaps without a verified price excluded. +23.5% vs previous 24H');
+  assert.equal([...walk(kpi)].find((node) => node.attrs.title)?.attrs.title, '$1,234,567.89', 'the exact amount stays on hover');
+  const noPrevious = render({ ...STATES['ready-usd'], data: { ...USD_DATA, summary: summaryFixture({ usdVolume: usdWindow('5000000', { previous: null }) }) } }).tree;
+  assert.equal(textOf(item(noPrevious, 'network.total-volume')), 'Total Volume $5 Uniswap V3 and V4 swaps, last 24H.',
+    'no change without an exactly comparable previous window, no unvalued note without unvalued swaps');
+  assert.equal(statusIn('usd-collecting', 'network.total-volume'), 'collecting');
+  assert.match(textOf(item(rendered['usd-collecting'].tree, 'network.total-volume')), /USD volume appears once every hour of the window is valued/);
+  assert.equal(statusIn('usd-unavailable', 'network.total-volume'), 'unavailable');
+  for (const name of ['usd-collecting', 'usd-unavailable']) assert.doesNotMatch(rendered[name].html, /\$\s?\d/, `${name}: no USD amount without a valued window`);
+});
+
+await test('Volume 2 the DEX Volume chart draws only valued hours, keeps the unvalued hour as a gap, and reads in dollars', async () => {
+  const { tree } = rendered['ready-usd'];
+  const section = sectionNode(tree, 'volume-chart');
+  const tabs = [...walk(section)].filter((node) => node.tag === 'button' && node.attrs.role === 'tab');
+  assert.deepEqual(tabs.map((node) => [textOf(node), node.attrs['aria-selected']]), [['Volume', 'true'], ['Swaps', 'false']], 'Volume is the default view');
+  assert.equal(statusIn('ready-usd', 'volume-chart.volume'), 'available');
+  assert.equal(statusIn('ready-usd', 'volume-chart.swaps'), 'available');
+  const labels = [...walk(section)].filter((node) => node.tag === 'button' && node.attrs['aria-label']).map((node) => node.attrs['aria-label']);
+  assert.equal(labels.length, 24);
+  assert.deepEqual(labels.slice(0, 2), ['14:00-15:00 UTC: no verified data', '15:00-16:00 UTC: no verified data'], 'hours not stored stay gaps');
+  assert.equal(labels[USD_GAP_AT], '02:00-03:00 UTC: no verified data', 'an hour without a verified value is a gap, never zero');
+  assert.equal(labels[23], '13:00-14:00 UTC: $1.5K', 'each bar is the hour\'s V3 plus V4 value');
+  assert.equal(valueIn('ready-usd', 'volume-chart.latest'), '1523', 'latest complete hour, in dollars');
+  assert.match(textOf(item(tree, 'volume-chart.latest')), /Latest complete hour \$1\.5K 13:00-14:00 UTC Peak hour in window \$1\.5K 13:00-14:00 UTC/);
+  assert.match(textOf(section), /USD value of swaps per UTC hour across all verified Uniswap V3 and V4 pairs, last 24H\. Each swap is counted once\./);
+  assert.match(textOf(section), /Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools\. 7 swaps between tokens without a verified price are not included\./);
+  assert.match(textOf(sectionNode(rendered['usd-swaps-tab'].tree, 'volume-chart')), /Counts, not amounts/, 'the Swaps view stays counts');
+  assert.equal(statusIn('usd-collecting', 'volume-chart.volume'), 'collecting');
+  assert.match(textOf(sectionNode(rendered['usd-collecting'].tree, 'volume-chart')), /DEX volume is still being collected Hours appear here once their swaps are valued\./);
+  assert.equal(statusIn('usd-unavailable', 'volume-chart.volume'), 'unavailable');
+  assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, 'volume-chart')), /Hourly DEX volume is not available right now/);
+});
+
+await test('Volume 3 pool volume is each listed pool\'s exact USD value; a pool without a verified price says so; ranking stays by swaps', async () => {
+  const v3Rows = byAttr(sectionNode(rendered['ready-usd'].tree, 'top-pools-v3'), 'data-pool-row');
+  assert.deepEqual(v3Rows.map(textOf), ['1 USDC / 0xabcd...1234 0.05% $2K volume 4,321 swaps', '2 EURC / MOON 0.3% No price 56 swaps']);
+  assert.equal([...walk(v3Rows[0])].find((node) => node.attrs.title?.startsWith('$'))?.attrs.title, '$2,000.00');
+  const v4Rows = byAttr(sectionNode(rendered['ready-usd'].tree, 'top-pools-v4'), 'data-pool-row');
+  assert.deepEqual(v4Rows.map(textOf), ['1 USDC / EURC 0.05% $1.2K volume 1,234 swaps', '2 USDC / MOON Dynamic fee Hooks <$0.01 volume 12 swaps'],
+    'kept in the service\'s swap-count order, a tiny amount never reads as zero');
+  for (const id of ['top-pools-v3', 'top-pools-v4']) {
+    assert.deepEqual(['all-pairs', 'swaps', 'volume', 'liquidity'].map((column) => statusIn('ready-usd', `${id}.${column}`)),
+      ['available', 'available', 'available', 'source_pending'], id);
+    assert.equal(statusIn('usd-collecting', `${id}.volume`), 'collecting');
+    assert.equal(statusIn('usd-unavailable', `${id}.volume`), 'unavailable');
+    assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, id)), /Volume \(USD\) Unavailable Liquidity Not available yet/);
+    for (const row of byAttr(sectionNode(rendered['usd-collecting'].tree, id), 'data-pool-row')) assert.doesNotMatch(textOf(row), /\$|volume/i);
+  }
+});
+
+await test('Tokens 1 a token\'s own contract metadata reads as an unverified label, never as a verified identity', async () => {
+  const section = sectionNode(rendered['ready-usd'].tree, 'recent-activity');
+  const [row] = byAttr(section, 'data-activity-row');
+  assert.equal(textOf(row), 'Time (UTC) Oct 3, 13:05 Type Swap Protocol Uniswap V3 Pair USDC / MOON Amount 3.25 USDC from pool 1,873,749.0796 MOON to pool '
+    + 'From 0x5e5e...5e5e To 0x7e7e...7e7e Tx 0x0000...ab05', 'amounts in the decimals the token contract reports');
+  const label = [...walk(row)].find((node) => node.attrs.title?.includes('Name from the token contract'));
+  assert.equal(label.attrs.title, `Moon Token, ${T_MOON.address}. Name from the token contract, not a verified Arc asset.`);
+  assert.match(label.attrs.class, /decoration-dotted/, 'visibly different from a verified symbol');
+  assert.equal(lib.parseArcPools(usdPools().v3, 'v3')?.pools.length, 2);
+  const withMetadata = (mutate) => { const body = structuredClone(usdPools().v3); mutate(body); return lib.parseArcPools(body, 'v3'); };
+  assert.equal(withMetadata((body) => { body.pools[0].token0.contractMetadata = { symbol: 'USDC', name: null, decimals: 6 }; }), null,
+    'a verified token never carries contract metadata');
+  assert.equal(withMetadata((body) => { body.pools[1].token1.contractMetadata.symbol = 'MOON TOKEN!'; }), null);
+  assert.equal(withMetadata((body) => { body.pools[1].token1.contractMetadata.decimals = 77; }), null);
+  assert.equal(withMetadata((body) => { body.pools[1].token1.symbol = 'MOON'; }), null, 'contract metadata never becomes the verified symbol');
+  assert.equal(withMetadata((body) => { body.pools[0].usdVolume.usdMicros = '1.5'; }), null, 'a malformed USD amount fails the read closed');
+  assert.equal(withMetadata((body) => { body.pools[1].usdVolume = { status: 'unavailable', reason: 'no_verified_price', usdMicros: '0', basis: null }; }), null,
+    'an unavailable USD value never carries an amount');
+  assert.ok(withMetadata((body) => { delete body.pools[0].token1.contractMetadata; delete body.pools[0].usdVolume; }), 'an older API without these fields still loads');
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

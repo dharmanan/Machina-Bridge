@@ -9,19 +9,27 @@
 // before anything is written: a changed definition needs an explicit migration, never a silent mix of old and new rows.
 // A family added later (Stage 3: protocol families) has no row for hours stored before it; replaying such an hour inserts
 // its row (outcome `upgraded`) without touching the hour, its other families or the checkpoint.
-// Projections (projections.js: Uniswap pool-hours, recent DEX activity, the V4 pool registry) are additive and are NOT
-// families: own tables, own status rows (compact_projection_hours), own `projection_version:<name>` meta rows. They are
-// written in the same transaction as their hour, re-validated and re-reconciled here against the hour's family counters,
-// and a projection that fails any check is stored as unavailable, never partially, without blocking its hour.
+// Projections (projections.js: Uniswap pool-hours, pool price paths, recent DEX activity, the V4 pool registry) are
+// additive and are NOT families: own tables, own status rows (compact_projection_hours), own `projection_version:<name>`
+// meta rows. They are written in the same transaction as their hour, re-validated and re-reconciled here against the
+// hour's family counters, and a projection that fails any check is stored as unavailable, never partially, without
+// blocking its hour.
+// Valuations (valuation.js: an hour's token prices and DEX USD volume) are derived here from stored projections and the
+// pool registry, never fetched: own tables, own status rows (compact_valuation_hours), own `valuation_version:<name>` meta
+// rows. They are derived in the transaction that writes their inputs, and for stored hours without them by a bounded pass
+// without any RPC (derivePendingValuations). An available valuation is immutable; a failure never blocks its hour.
+// Token metadata (token-metadata.js) is a read-once cache of ERC-20 symbol, name and decimals, never used for a value.
 import { createHash } from 'node:crypto';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import {
-  ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, POOL_PROJECTIONS, poolHourCutoff, PROJECTION_REASONS, PROJECTION_VERSIONS, PROJECTIONS,
-  reconcilePoolRows, sha256Of, V4_POOL_KIND, validActivityRow, validPoolRow, validV4Record,
+  ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, POOL_PROJECTIONS, poolHourCutoff, PRICE_PATH_PROJECTIONS, PROJECTION_REASONS, PROJECTION_VERSIONS,
+  PROJECTIONS, reconcilePoolRows, reconcilePricePaths, sha256Of, V4_POOL_KIND, validActivityRow, validPoolRow, validPricePathRow, validV4Record,
 } from './projections.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
+import { metadataExempt, TOKEN_METADATA_VERSION } from './token-metadata.js';
+import { hourVolumeOf, tokenPricesOf, VALUATION_REASONS, VALUATION_VERSIONS, VALUATIONS } from './valuation.js';
 import { sumWindow } from './windows.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
@@ -140,7 +148,62 @@ CREATE TABLE IF NOT EXISTS compact_dex_activity (
   PRIMARY KEY (block_number, log_index),
   CHECK ((counterparty_kind = 'none') = (counterparty IS NULL))
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS compact_dex_activity_kind ON compact_dex_activity (kind, block_number DESC, log_index DESC);`;
+CREATE INDEX IF NOT EXISTS compact_dex_activity_kind ON compact_dex_activity (kind, block_number DESC, log_index DESC);
+CREATE TABLE IF NOT EXISTS compact_pool_price_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  pool TEXT NOT NULL,
+  swap_count INTEGER NOT NULL CHECK (swap_count > 0),
+  first_swap_block INTEGER NOT NULL,
+  last_swap_block INTEGER NOT NULL CHECK (last_swap_block >= first_swap_block),
+  priced_blocks INTEGER NOT NULL CHECK (priced_blocks > 0),
+  close_sqrt_price_x96 TEXT NOT NULL,
+  close_liquidity TEXT NOT NULL,
+  sqrt_price_block_sum TEXT NOT NULL,
+  reserve0_block_sum TEXT NOT NULL,
+  reserve1_block_sum TEXT NOT NULL,
+  PRIMARY KEY (hour_start, protocol, pool)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_valuation_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  valuation TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  row_count INTEGER,
+  rows_sha256 TEXT,
+  PRIMARY KEY (hour_start, valuation),
+  CHECK ((status = 'available' AND reason IS NULL AND row_count IS NOT NULL AND rows_sha256 IS NOT NULL)
+    OR (status = 'unavailable' AND reason IS NOT NULL AND row_count IS NULL AND rows_sha256 IS NULL))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_token_price_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  token TEXT NOT NULL,
+  price_usd_e18 TEXT NOT NULL,
+  source_protocol TEXT NOT NULL CHECK (source_protocol IN ('uniswap_v3', 'uniswap_v4')),
+  source_pool TEXT NOT NULL,
+  depth_usd_micros TEXT NOT NULL,
+  source_count INTEGER NOT NULL CHECK (source_count > 0),
+  PRIMARY KEY (hour_start, token)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_dex_volume_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  volume_usd_micros TEXT NOT NULL,
+  valued_swaps INTEGER NOT NULL CHECK (valued_swaps >= 0),
+  unvalued_swaps INTEGER NOT NULL CHECK (unvalued_swaps >= 0),
+  PRIMARY KEY (hour_start, protocol)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_token_metadata (
+  token TEXT PRIMARY KEY CHECK (length(token) = 42),
+  verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+  symbol TEXT,
+  name TEXT,
+  decimals INTEGER,
+  reason TEXT,
+  read_block INTEGER NOT NULL,
+  CHECK ((verified = 1 AND symbol IS NOT NULL AND decimals IS NOT NULL AND reason IS NULL)
+    OR (verified = 0 AND symbol IS NULL AND name IS NULL AND decimals IS NULL AND reason IS NOT NULL))
+) STRICT;`;
 
 // Key-sorted JSON, so a hash depends on values only and never on property order.
 function canonical(value) {
@@ -230,8 +293,31 @@ function normalizeProjections(projections, range, families) {
     out.dex_activity = !valid || (activity.rowsSha256 !== undefined && activity.rowsSha256 !== sha) ? unavailableProjection('projection_error')
       : { status: 'available', rows, sha };
   }
+  // Price paths: every row inside the hour's blocks, reconciled with the family swap counter and with this set's own pool
+  // rows of the same protocol when those are available.
+  for (const [name, protocol] of Object.entries(PRICE_PATH_PROJECTIONS)) {
+    const entry = projections?.[name];
+    if (entry?.status !== 'available') {
+      out[name] = unavailableProjection(entry?.reason);
+      continue;
+    }
+    const { rows } = entry;
+    const valid = Array.isArray(rows) && rows.every((row) => validPricePathRow(row, protocol, range)) && new Set(rows.map((row) => row.pool)).size === rows.length;
+    if (!valid) {
+      out[name] = unavailableProjection('projection_error');
+      continue;
+    }
+    const pools = out[protocol === 'uniswap_v3' ? 'uniswap_v3_pools' : 'uniswap_v4_pools'];
+    const reason = reconcilePricePaths(rows, families?.[PROTOCOL_FAMILY[protocol]], pools.status === 'available' ? pools.rows : null);
+    const sha = sha256Of({ rows });
+    out[name] = reason || (entry.rowsSha256 !== undefined && entry.rowsSha256 !== sha) ? unavailableProjection(reason ?? 'projection_error')
+      : { status: 'available', rows, sha };
+  }
   return out;
 }
+
+const VALUATION_PROTOCOLS = Object.freeze(['uniswap_v3', 'uniswap_v4']);
+const unavailableValuation = (reason) => ({ status: 'unavailable', reason: VALUATION_REASONS.includes(reason) ? reason : 'valuation_error' });
 
 export function createCompactStore(db) {
   // An existing compact database must already be this schema version. Anything else (a Stage 1 file, compact tables
@@ -260,6 +346,17 @@ export function createCompactStore(db) {
       if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get(`projection_version:${name}`)?.value !== version) {
         throw new StoreError('projection_definition_mismatch');
       }
+    }
+    // Valuation and token metadata definitions, the same way: a changed definition is refused, never mixed.
+    for (const [name, version] of Object.entries(VALUATION_VERSIONS)) {
+      setMeta.run(`valuation_version:${name}`, version);
+      if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get(`valuation_version:${name}`)?.value !== version) {
+        throw new StoreError('valuation_definition_mismatch');
+      }
+    }
+    setMeta.run('token_metadata_version', TOKEN_METADATA_VERSION);
+    if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get('token_metadata_version')?.value !== TOKEN_METADATA_VERSION) {
+      throw new StoreError('token_metadata_definition_mismatch');
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -322,6 +419,38 @@ export function createCompactStore(db) {
     checkpoint: db.prepare('SELECT hour_start, last_block, last_hash FROM compact_checkpoint WHERE id = 1'),
     setCheckpoint: db.prepare(`INSERT INTO compact_checkpoint (id, hour_start, last_block, last_hash) VALUES (1, ?, ?, ?)
       ON CONFLICT (id) DO UPDATE SET hour_start = excluded.hour_start, last_block = excluded.last_block, last_hash = excluded.last_hash`),
+    // Price paths, valuations and token metadata.
+    insertPricePath: db.prepare(`INSERT INTO compact_pool_price_hours (hour_start, protocol, pool, swap_count, first_swap_block, last_swap_block,
+      priced_blocks, close_sqrt_price_x96, close_liquidity, sqrt_price_block_sum, reserve0_block_sum, reserve1_block_sum)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    pricePaths: db.prepare('SELECT * FROM compact_pool_price_hours WHERE hour_start = ? AND protocol = ? ORDER BY pool'),
+    prunePricePaths: db.prepare('DELETE FROM compact_pool_price_hours WHERE hour_start <= ?'),
+    valuations: db.prepare(`SELECT valuation, status, reason, row_count, rows_sha256 FROM compact_valuation_hours WHERE hour_start = ?
+      ORDER BY valuation`),
+    // An available valuation is never replaced; an unavailable one is updated (another reason) or upgraded.
+    setValuation: db.prepare(`INSERT INTO compact_valuation_hours (hour_start, valuation, status, reason, row_count, rows_sha256)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (hour_start, valuation) DO UPDATE SET status = excluded.status, reason = excluded.reason,
+      row_count = excluded.row_count, rows_sha256 = excluded.rows_sha256 WHERE compact_valuation_hours.status = 'unavailable'`),
+    insertTokenPrice: db.prepare(`INSERT INTO compact_token_price_hours (hour_start, token, price_usd_e18, source_protocol, source_pool,
+      depth_usd_micros, source_count) VALUES (?, ?, ?, ?, ?, ?, ?)`),
+    tokenPrices: db.prepare('SELECT * FROM compact_token_price_hours WHERE hour_start = ? ORDER BY token'),
+    insertDexVolume: db.prepare(`INSERT INTO compact_dex_volume_hours (hour_start, protocol, volume_usd_micros, valued_swaps, unvalued_swaps)
+      VALUES (?, ?, ?, ?, ?)`),
+    dexVolume: db.prepare('SELECT * FROM compact_dex_volume_hours WHERE hour_start = ? ORDER BY protocol'),
+    pruneValuationHours: db.prepare('DELETE FROM compact_valuation_hours WHERE hour_start <= ?'),
+    pruneTokenPrices: db.prepare('DELETE FROM compact_token_price_hours WHERE hour_start <= ?'),
+    pruneDexVolume: db.prepare('DELETE FROM compact_dex_volume_hours WHERE hour_start <= ?'),
+    // Stored hours inside retention without a status row for every valuation, newest first.
+    pendingValuationHours: db.prepare(`SELECT h.hour_start FROM compact_hours h WHERE h.hour_start > ?1
+      AND (SELECT COUNT(*) FROM compact_valuation_hours v WHERE v.hour_start = h.hour_start) < ?2 ORDER BY h.hour_start DESC LIMIT ?3`),
+    registryMeta: db.prepare('SELECT meta_json FROM compact_registry WHERE kind = ? AND address = ?'),
+    tokenMetadata: db.prepare('SELECT * FROM compact_token_metadata WHERE token = ?'),
+    insertTokenMetadata: db.prepare(`INSERT OR IGNORE INTO compact_token_metadata (token, verified, symbol, name, decimals, reason, read_block)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`),
+    recentActivityPools: db.prepare(`SELECT protocol, pool, MAX(block_number) AS latest FROM compact_dex_activity GROUP BY protocol, pool
+      ORDER BY latest DESC, protocol ASC, pool ASC LIMIT ?`),
+    busiestPools: db.prepare(`SELECT protocol, pool, SUM(swap_count) AS swaps FROM compact_pool_hours WHERE hour_start > ? GROUP BY protocol, pool
+      ORDER BY swaps DESC, protocol ASC, pool ASC LIMIT ?`),
   };
   const checkpoint = () => {
     const row = sql.checkpoint.get();
@@ -436,6 +565,9 @@ export function createCompactStore(db) {
     })) {
       projections.uniswap_v4_pools = unavailableProjection('duplicate_v4_initialize');
       if (projections.dex_activity.status === 'available') projections.dex_activity = unavailableProjection('projection_inputs_unavailable');
+      if (projections.uniswap_v4_price_paths.status === 'available') {
+        projections.uniswap_v4_price_paths = unavailableProjection('projection_inputs_unavailable');
+      }
     }
     for (const name of names) {
       const entry = projections[name];
@@ -454,6 +586,11 @@ export function createCompactStore(db) {
           sql.insertActivity.run(int(row.blockNumber), int(row.logIndex), hour, int(row.blockTimestamp), row.txHash, row.txFrom, row.protocol,
             row.kind, row.pool, row.amount0Raw, row.amount1Raw, row.amountBasis, row.counterparty, row.counterpartyKind);
         }
+      } else if (Object.hasOwn(PRICE_PATH_PROJECTIONS, name)) {
+        for (const row of entry.rows) {
+          sql.insertPricePath.run(hour, PRICE_PATH_PROJECTIONS[name], row.pool, int(row.swapCount), int(row.firstSwapBlock), int(row.lastSwapBlock),
+            int(row.pricedBlocks), row.closeSqrtPriceX96, row.closeLiquidity, row.sqrtPriceBlockSum, row.reserve0BlockSum, row.reserve1BlockSum);
+        }
       } else {
         const protocol = POOL_PROJECTIONS[name];
         for (const row of entry.rows) {
@@ -470,11 +607,149 @@ export function createCompactStore(db) {
       else sql.insertProjection.run(hour, name, 'available', null, int(entry.rows.length), entry.sha);
       report[name] = stored ? 'upgraded' : 'inserted';
     }
+    // The hour's valuations follow from what is stored now (never from what was only offered).
+    deriveValuations(range.hourStart);
     for (const kind of ACTIVITY_KINDS) sql.pruneActivity.run(kind, kind, int(ACTIVITY_ROWS_PER_KIND));
-    const cutoff = poolHourCutoff(sql.newestHour.get().hour_start);
-    sql.prunePoolHours.run(int(cutoff));
-    sql.pruneProjectionHours.run(int(cutoff));
+    pruneHours(poolHourCutoff(sql.newestHour.get().hour_start));
     return report;
+  }
+
+  // Pool-hours, price paths, projection status rows and valuations share one retention (projections.js).
+  function pruneHours(cutoff) {
+    for (const statement of [sql.prunePoolHours, sql.prunePricePaths, sql.pruneProjectionHours, sql.pruneValuationHours, sql.pruneTokenPrices,
+      sql.pruneDexVolume]) statement.run(int(cutoff));
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Valuations (valuation.js), derived from stored rows only. poolOf resolves a pool's tokens from the registry; a pool
+  // without a well-formed registry row makes the derivation fail closed (pool_registry_missing).
+
+  function registryPool(protocol, pool) {
+    const v4 = protocol === 'uniswap_v4';
+    const row = sql.registryMeta.get(v4 ? V4_POOL_KIND : V3_POOL_KIND, pool);
+    if (!row) return null;
+    let meta = null;
+    try { meta = JSON.parse(row.meta_json); } catch { return null; }
+    const [token0, token1] = v4 ? [meta?.currency0, meta?.currency1] : [meta?.token0, meta?.token1];
+    const hooks = v4 ? meta?.hooks : null;
+    if (![token0, token1, ...(v4 ? [hooks] : [])].every((value) => typeof value === 'string' && ADDRESS.test(value))) return null;
+    return { token0, token1, hooks };
+  }
+
+  const pricePathRowsOf = (hour, protocol) => sql.pricePaths.all(hour, protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+    firstSwapBlock: row.first_swap_block, lastSwapBlock: row.last_swap_block, pricedBlocks: row.priced_blocks, closeSqrtPriceX96: row.close_sqrt_price_x96,
+    closeLiquidity: row.close_liquidity, sqrtPriceBlockSum: row.sqrt_price_block_sum, reserve0BlockSum: row.reserve0_block_sum,
+    reserve1BlockSum: row.reserve1_block_sum }));
+  const poolRowsOf = (hour, protocol) => sql.poolHours.all(hour, protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+    token0InRaw: row.token0_in_raw, token0OutRaw: row.token0_out_raw, token1InRaw: row.token1_in_raw, token1OutRaw: row.token1_out_raw }));
+  const storedPrices = (hour) => new Map(sql.tokenPrices.all(hour).map((row) => [row.token, { priceUsdE18: BigInt(row.price_usd_e18),
+    protocol: row.source_protocol, pool: row.source_pool, depthUsdMicros: BigInt(row.depth_usd_micros), sources: row.source_count }]));
+  const setValuation = (hour, name, entry) => sql.setValuation.run(hour, name, entry.status, entry.status === 'available' ? null : entry.reason,
+    entry.status === 'available' ? int(entry.rowCount) : null, entry.status === 'available' ? entry.sha : null);
+
+  // One hour: token prices when both price paths are stored available; DEX USD volume when both pool projections are, with
+  // those prices, or without them when no pool of the hour could use one. Runs in the caller's transaction, inside a
+  // savepoint: a failure rolls back only the valuation rows and leaves the hour, its families and projections as written.
+  function deriveValuations(hourStart) {
+    const hour = int(hourStart);
+    const stored = new Map(sql.valuations.all(hour).map((row) => [row.valuation, row]));
+    if (VALUATIONS.every((name) => stored.get(name)?.status === 'available')) return;
+    db.exec('SAVEPOINT compact_valuations');
+    try {
+      deriveHourValuations(hour, stored);
+      db.exec('RELEASE compact_valuations');
+    } catch (error) {
+      db.exec('ROLLBACK TO compact_valuations');
+      const failed = unavailableValuation(error?.code === 'pool_registry_missing' ? 'pool_registry_missing' : 'valuation_error');
+      for (const name of VALUATIONS) if (stored.get(name)?.status !== 'available') setValuation(hour, name, failed);
+      db.exec('RELEASE compact_valuations');
+    }
+  }
+
+  function deriveHourValuations(hour, stored) {
+    const range = sql.hourRange.get(hour);
+    const projection = new Map(sql.projections.all(hour).map((row) => [row.projection, row.status]));
+    const pools = new Map();
+    const poolOf = (protocol, pool) => {
+      const key = `${protocol}:${pool}`;
+      if (!pools.has(key)) pools.set(key, registryPool(protocol, pool));
+      return pools.get(key);
+    };
+    let prices = null;
+    if (stored.get('token_prices')?.status === 'available') prices = storedPrices(hour);
+    else if (Object.keys(PRICE_PATH_PROJECTIONS).every((name) => projection.get(name) === 'available')) {
+      ({ prices } = tokenPricesOf({ pricePaths: Object.fromEntries(VALUATION_PROTOCOLS.map((protocol) => [protocol, pricePathRowsOf(hour, protocol)])),
+        poolOf, hourBlocks: range.last_block - range.first_block + 1 }));
+      const rows = [...prices].map(([token, price]) => ({ token, priceUsdE18: price.priceUsdE18.toString(10), sourceProtocol: price.protocol,
+        sourcePool: price.pool, depthUsdMicros: price.depthUsdMicros.toString(10), sourceCount: price.sources }));
+      for (const row of rows) {
+        sql.insertTokenPrice.run(hour, row.token, row.priceUsdE18, row.sourceProtocol, row.sourcePool, row.depthUsdMicros, int(row.sourceCount));
+      }
+      setValuation(hour, 'token_prices', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
+    } else setValuation(hour, 'token_prices', unavailableValuation('price_paths_unavailable'));
+    if (stored.get('dex_usd_volume')?.status === 'available') return;
+    if (!Object.keys(POOL_PROJECTIONS).every((name) => projection.get(name) === 'available')) {
+      setValuation(hour, 'dex_usd_volume', unavailableValuation('pool_projections_unavailable'));
+      return;
+    }
+    const { needsPrices, totals } = hourVolumeOf({ poolRows: Object.fromEntries(VALUATION_PROTOCOLS.map((protocol) => [protocol, poolRowsOf(hour, protocol)])),
+      poolOf, prices });
+    if (needsPrices) {
+      setValuation(hour, 'dex_usd_volume', unavailableValuation('prices_unavailable'));
+      return;
+    }
+    const rows = VALUATION_PROTOCOLS.map((protocol) => ({ protocol, volumeUsdMicros: totals[protocol].usdMicros.toString(10),
+      valuedSwaps: totals[protocol].valuedSwaps, unvaluedSwaps: totals[protocol].unvaluedSwaps }));
+    for (const row of rows) sql.insertDexVolume.run(hour, row.protocol, row.volumeUsdMicros, int(row.valuedSwaps), int(row.unvaluedSwaps));
+    setValuation(hour, 'dex_usd_volume', { status: 'available', rowCount: rows.length, sha: sha256Of({ rows }) });
+  }
+
+  // The bounded pass for stored hours that have no valuation status yet (hours stored before valuations existed), newest
+  // first, one transaction per hour, within pool-hour retention. No RPC: everything comes from stored rows.
+  function derivePendingValuations({ limit = 72 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new StoreError('invalid_valuation_limit');
+    const newest = sql.newestHour.get().hour_start;
+    if (newest === null) return { hours: [] };
+    const hours = sql.pendingValuationHours.all(int(poolHourCutoff(newest)), int(VALUATIONS.length), int(limit)).map((row) => row.hour_start);
+    for (const hourStart of hours) transaction(() => deriveValuations(hourStart));
+    return { hours };
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Token metadata cache (token-metadata.js).
+
+  // Tokens of the pools the dashboard shows first (latest activity, then the busiest pools of the newest 24 stored hours)
+  // that have no cached metadata, at most `limit`. Verified assets and the native currency are never candidates.
+  function tokensNeedingMetadata({ limit }) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new StoreError('invalid_metadata_limit');
+    const newest = sql.newestHour.get().hour_start;
+    if (newest === null) return [];
+    const pools = [...sql.recentActivityPools.all(int(100)), ...sql.busiestPools.all(int(newest - ADDRESS_WINDOW_HOURS * HOUR), int(400))];
+    const tokens = [];
+    const seen = new Set();
+    for (const { protocol, pool } of pools) {
+      const meta = registryPool(protocol, pool);
+      for (const token of meta ? [meta.token0, meta.token1] : []) {
+        if (seen.has(token) || metadataExempt(token)) continue;
+        seen.add(token);
+        if (!sql.tokenMetadata.get(token)) tokens.push(token);
+        if (tokens.length >= limit) return tokens;
+      }
+    }
+    return tokens;
+  }
+
+  // Each row is written once (INSERT OR IGNORE): cached metadata is never replaced.
+  function recordTokenMetadata(rows, { readBlock }) {
+    if (!Number.isSafeInteger(readBlock) || readBlock < 0) throw new StoreError('invalid_metadata_block');
+    return transaction(() => {
+      for (const row of rows) {
+        const verified = row.verified === true;
+        if (!ADDRESS.test(row.token) || (verified ? typeof row.symbol !== 'string' || !Number.isSafeInteger(row.decimals) || row.reason !== null
+          : row.symbol !== null || row.name !== null || row.decimals !== null || typeof row.reason !== 'string')) throw new StoreError('invalid_token_metadata');
+        sql.insertTokenMetadata.run(row.token, verified ? 1n : 0n, row.symbol, row.name, verified ? int(row.decimals) : null, row.reason, int(readBlock));
+      }
+    });
   }
 
   // Outcomes: inserted | unchanged | upgraded. A stored hour is immutable except that an unavailable family becomes
@@ -627,5 +902,22 @@ export function createCompactStore(db) {
       blockNumber: row.block_number, logIndex: row.log_index, hourStart: row.hour_start, blockTimestamp: row.block_timestamp, txHash: row.tx_hash,
       txFrom: row.tx_from, protocol: row.protocol, kind: row.kind, pool: row.pool, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw,
       amountBasis: row.amount_basis, counterparty: row.counterparty, counterpartyKind: row.counterparty_kind })),
+    pricePaths: (hourStart, protocol) => pricePathRowsOf(int(hourStart), protocol),
+    // Valuations (never families, never projections).
+    derivePendingValuations,
+    valuationStatus: (hourStart) => sql.valuations.all(int(hourStart)).map((row) => ({ valuation: row.valuation, status: row.status, reason: row.reason,
+      rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
+    tokenPrices: (hourStart) => sql.tokenPrices.all(int(hourStart)).map((row) => ({ token: row.token, priceUsdE18: row.price_usd_e18,
+      sourceProtocol: row.source_protocol, sourcePool: row.source_pool, depthUsdMicros: row.depth_usd_micros, sourceCount: row.source_count })),
+    dexVolume: (hourStart) => sql.dexVolume.all(int(hourStart)).map((row) => ({ protocol: row.protocol, volumeUsdMicros: row.volume_usd_micros,
+      valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
+    // Token metadata cache.
+    tokensNeedingMetadata,
+    recordTokenMetadata,
+    tokenMetadata(token) {
+      const row = sql.tokenMetadata.get(token);
+      return row ? { token: row.token, verified: row.verified === 1, symbol: row.symbol, name: row.name, decimals: row.decimals, reason: row.reason,
+        readBlock: row.read_block } : null;
+    },
   });
 }

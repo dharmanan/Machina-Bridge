@@ -5,7 +5,9 @@
 // eth_getLogs), after checking the stored first/last block hashes, and writes them through store.js, which reconciles
 // them exactly with the hour's STORED family counters (a mismatch stays unavailable). Recent activity is never rebuilt:
 // it needs the spine's transaction senders and comes from live hours only. A registry that is missing or behind the hour
-// blocks that projection (v3_registry_*, v4_registry_*) with no RPC request; it is never bootstrapped from here.
+// blocks that projection (v3_registry_*, v4_registry_*) with no RPC request; it is never bootstrapped from here. The pool
+// price path built from the same stream is written with each rebuilt pool projection (no extra request), and the hour's
+// valuations are derived from the result in the same commit.
 // Strict arguments: exactly one exact UTC hour ISO string, no flags, no bulk mode (bulk work stays with the operator-only
 // scripts/backfill-compact-projections.mjs). Exit 0 only when every repairable projection of the hour ends available.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
@@ -17,6 +19,7 @@ import { LogError } from '../server/compact/logs.js';
 import {
   backfillProjectionHour, planProjectionRepair, readProjectionRepairInput, verifyStoredBoundaries,
 } from '../server/compact/projection-backfill.js';
+import { PRICE_PATH_OF_POOLS } from '../server/compact/projections.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { assertHourIso } from '../server/compact/scheduler.js';
 import { COMPACT_SCHEMA_VERSION, createCompactStore } from '../server/compact/store.js';
@@ -64,7 +67,8 @@ export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync
       // The V3 registry is loaded only when V3 is rebuilt; V4 pool identities come from the hour's own Initialize logs.
       const v3Pools = plan.needs.uniswap_v3_pools ? store.v3Registry()?.pools ?? new Set() : new Set();
       const projections = await backfillProjectionHour({ provider, hour: { ...input.hour, needs: plan.needs }, v3Pools });
-      summary.outcomes = store.commitProjectionHour(hourStart, projections, { only: summary.needs });
+      summary.outcomes = store.commitProjectionHour(hourStart, projections,
+        { only: [...summary.needs, ...summary.needs.map((name) => PRICE_PATH_OF_POOLS[name])] });
     }
     summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
     const notRepaired = summary.needs.filter((name) => summary.projections[name] !== 'available');

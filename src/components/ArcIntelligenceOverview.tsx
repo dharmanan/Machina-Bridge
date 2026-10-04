@@ -19,6 +19,8 @@ import {
   formatRatioPercent,
   formatSignedPercent,
   formatTokenAmount,
+  formatUsdCompact,
+  formatUsdMicros,
   formatUtcDateTime,
   formatUtcHour,
   formatUtcHourRange,
@@ -32,6 +34,8 @@ import {
   shortenAddress,
   shortenHash,
   shortenMarketId,
+  usdMicrosToNumber,
+  usdVolumeStatus,
   verifiedAssetItems,
   windowStatus,
   type ArcActivity,
@@ -45,6 +49,7 @@ import {
   type FamilyWindow,
   type IntelligenceDataStatus,
   type PoolToken,
+  type UsdVolumeWindow,
 } from '../lib/arcIntelligence'
 
 // Arc Intelligence section of the Mainnet Dashboard. Every capability of src/config/arcIntelligenceUiScope.ts has a
@@ -71,13 +76,13 @@ type ViewContext = {
   explorerUrl: string | null
 }
 
-type Cell = { status: DisplayStatus; raw?: string | number; text?: string; note?: string }
+type Cell = { status: DisplayStatus; raw?: string | number; text?: string; note?: string; title?: string }
 
 const STATUS_TEXT: Record<DisplayStatus, string> = {
   available: 'Available',
   collecting: 'Collecting',
   unavailable: 'Unavailable',
-  source_pending: 'Source pending',
+  source_pending: 'Not available yet',
   loading: 'Loading',
 }
 
@@ -265,7 +270,11 @@ function niceMax(value: number): number {
 
 const pointTotal = (point: ChartPoint) => (point.values ? point.values.reduce((sum, value) => sum + value, 0) : null)
 
-function BarChart({ points, series, unit }: { points: ChartPoint[]; series: ChartSeries[]; unit: string }) {
+const withUnit = (text: string, unit: string) => (unit ? `${text} ${unit}` : text)
+
+// format: how one bar value reads (counts by default; USD charts pass a dollar format and no unit).
+function BarChart({ points, series, unit, format = formatCount, axisFormat = formatCompact }: { points: ChartPoint[]; series: ChartSeries[]; unit: string;
+  format?: (value: number) => string; axisFormat?: (value: number) => string }) {
   const [active, setActive] = useState<number | null>(null)
   const totals = points.map(pointTotal)
   const max = niceMax(Math.max(0, ...totals.filter((total): total is number => total !== null)))
@@ -280,7 +289,7 @@ function BarChart({ points, series, unit }: { points: ChartPoint[]; series: Char
       <div className="relative h-44 sm:h-52">
         {[1, 0.5, 0].map((fraction) => (
           <div key={fraction} className="absolute inset-x-0 flex items-center gap-2" style={{ bottom: `${fraction * 100}%`, transform: 'translateY(50%)' }}>
-            <span className="w-9 shrink-0 text-right text-[10px] tabular-nums text-slate-400">{formatCompact(max * fraction)}</span>
+            <span className="w-9 shrink-0 text-right text-[10px] tabular-nums text-slate-400">{axisFormat(max * fraction)}</span>
             <span className="h-px flex-1 bg-slate-100" />
           </div>
         ))}
@@ -288,7 +297,7 @@ function BarChart({ points, series, unit }: { points: ChartPoint[]; series: Char
           {points.map((point, index) => {
             const total = totals[index]
             const label = point.values && total !== null
-              ? `${formatUtcHourRange(point.start, point.end)}: ${formatCount(total)} ${unit}`
+              ? `${formatUtcHourRange(point.start, point.end)}: ${withUnit(format(total), unit)}`
               : `${formatUtcHourRange(point.start, point.end)}: no verified data`
             return (
               <button key={point.start} type="button" aria-label={label} onMouseEnter={() => setActive(index)}
@@ -319,11 +328,11 @@ function BarChart({ points, series, unit }: { points: ChartPoint[]; series: Char
                 {series.length > 1 && activePoint.values.map((value, index) => (
                   <p key={series[index]?.name ?? index} className="flex items-center gap-1.5 text-slate-600">
                     <span className={`h-2 w-2 rounded-sm ${series[index]?.barClass ?? V3_BAR}`} />
-                    {series[index]?.name}: <span className="font-semibold tabular-nums text-slate-900">{formatCount(value)}</span>
+                    {series[index]?.name}: <span className="font-semibold tabular-nums text-slate-900">{format(value)}</span>
                   </p>
                 ))}
                 <p className="text-slate-600">
-                  {series.length > 1 ? 'Total' : series[0]?.name}: <span className="font-semibold tabular-nums text-slate-900">{formatCount(totals[active ?? 0] ?? 0)}</span> {unit}
+                  {series.length > 1 ? 'Total' : series[0]?.name}: <span className="font-semibold tabular-nums text-slate-900">{format(totals[active ?? 0] ?? 0)}</span>{unit && ` ${unit}`}
                 </p>
               </div>
             ) : (
@@ -347,7 +356,8 @@ function BarChart({ points, series, unit }: { points: ChartPoint[]; series: Char
 }
 
 // Latest complete hour (chronologically last verified hour) and peak hour, labeled separately.
-function HourReadout({ item, status, points, unit, period = 'hour' }: { item: string; status: DisplayStatus; points: ChartPoint[]; unit: string; period?: 'hour' | 'day' }) {
+function HourReadout({ item, status, points, unit, period = 'hour', format = formatCount }: { item: string; status: DisplayStatus; points: ChartPoint[]; unit: string;
+  period?: 'hour' | 'day'; format?: (value: number) => string }) {
   const verified = points.filter((point) => point.values)
   const latest = verified[verified.length - 1] ?? null
   const peak = verified.reduce<ChartPoint | null>((best, point) => (best === null || (pointTotal(point) ?? 0) > (pointTotal(best) ?? 0) ? point : best), null)
@@ -361,7 +371,7 @@ function HourReadout({ item, status, points, unit, period = 'hour' }: { item: st
           {shown === 'available' && point ? (
             <>
               <p className="text-sm font-semibold tabular-nums text-slate-950">
-                {formatCount(pointTotal(point) ?? 0)} <span className="font-normal text-slate-500">{unit}</span>
+                {format(pointTotal(point) ?? 0)}{unit && <span className="font-normal text-slate-500"> {unit}</span>}
               </p>
               <p className="text-[11px] text-slate-400">{formatUtcHourRange(point.start, point.end)}</p>
             </>
@@ -390,6 +400,35 @@ function swapPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
   })
 }
 
+// Hourly DEX USD volume [V3, V4] in dollars. null when the API predates USD valuation (no bucket carries it).
+function usdPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
+  if (!timeseries || !timeseries.buckets.some((bucket) => bucket.dexUsdVolume !== undefined)) return null
+  return timeseries.buckets.map((bucket) => {
+    const hour = bucket.status === 'committed' ? bucket.dexUsdVolume : null
+    const v3 = hour?.status === 'available' ? usdMicrosToNumber(hour.uniswapV3UsdMicros) : null
+    const v4 = hour?.status === 'available' ? usdMicrosToNumber(hour.uniswapV4UsdMicros) : null
+    return { start: bucket.start, end: bucket.end, values: v3 !== null && v4 !== null ? [v3, v4] : null }
+  })
+}
+
+// Display state of the hourly USD chart: not available yet before the API values swaps; collecting while no hour is
+// valued yet and every gap is an hour still waiting for its valuation.
+function usdChartStatus(ctx: ViewContext, points: ChartPoint[] | null): DisplayStatus {
+  if (ctx.mode !== 'ready') return liveStatus(ctx, null)
+  if (!ctx.timeseries) return 'unavailable'
+  if (!points) return 'source_pending'
+  if (points.some((point) => point.values)) return 'available'
+  const reasons = ctx.timeseries.buckets.map((bucket) => (bucket.status === 'committed' ? bucket.dexUsdVolume?.reason : 'not_stored'))
+  return reasons.every((reason) => reason === 'valuation_not_processed' || reason === 'not_stored') ? 'collecting' : 'unavailable'
+}
+
+const unvaluedSwapsIn = (timeseries: ArcTimeseries | null) => (timeseries?.buckets ?? []).reduce((total, bucket) => {
+  const hour = bucket.status === 'committed' ? bucket.dexUsdVolume : null
+  return total + (hour?.status === 'available' && isFiniteNumber(hour.unvaluedSwaps) ? hour.unvaluedSwaps : 0)
+}, 0)
+
+const usdText = (value: number) => formatUsdCompact(value)
+
 function addressPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
   if (!timeseries) return null
   return timeseries.buckets.map((bucket) => {
@@ -413,7 +452,7 @@ function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
     <div {...markerProps(item, cell.status, cell.raw)} className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
       <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</p>
       {cell.status === 'available'
-        ? <p className="mt-2 truncate text-2xl font-bold tracking-tight text-slate-950 tabular-nums sm:text-3xl">{cell.text}</p>
+        ? <p className="mt-2 truncate text-2xl font-bold tracking-tight text-slate-950 tabular-nums sm:text-3xl" title={cell.title}>{cell.text}</p>
         : <div className="mt-3"><StatusPill status={cell.status} /></div>}
       <p className="mt-2 text-xs leading-5 text-slate-500">{cell.status === 'available' ? caption : cell.note}</p>
       {cell.status === 'available' && delta !== null && delta !== undefined && (
@@ -423,6 +462,23 @@ function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
       )}
     </div>
   )
+}
+
+// Total DEX USD volume of the window. An API without USD valuation reads as not available yet; a window whose hours are
+// not all valued yet is collecting; anything else missing is unavailable. Never a number without its verified source.
+function usdVolumeCell(ctx: ViewContext, entry: UsdVolumeWindow | null | undefined): Cell {
+  if (ctx.mode !== 'ready') {
+    const status = liveStatus(ctx, null)
+    return { status, note: noteFor(ctx, status) }
+  }
+  const status = usdVolumeStatus(entry)
+  const value = status === 'available' ? usdMicrosToNumber(entry?.totalUsdMicros) : null
+  if (status === 'available' && value !== null && entry?.totalUsdMicros) {
+    return { status, raw: entry.totalUsdMicros, text: usdText(value), title: formatUsdMicros(entry.totalUsdMicros) }
+  }
+  const shown: DisplayStatus = status === 'available' ? 'unavailable' : status
+  if (shown === 'collecting') return { status: shown, note: 'USD volume appears once every hour of the window is valued.' }
+  return { status: shown, note: noteFor(ctx, shown) }
 }
 
 function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }) {
@@ -443,7 +499,13 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
   const gas: Cell = gasStatus === 'available' && network?.gasUsedRaw && /^\d+$/.test(network.gasUsedRaw)
     ? { status: 'available', raw: network.gasUsedRaw, text: formatCompactRaw(network.gasUsedRaw) }
     : { status: gasStatus === 'available' ? 'unavailable' : gasStatus }
-  const volume: Cell = { status: 'source_pending', note: 'Needs verified USD pricing for every pair. Not available yet.' }
+  const usdVolume = ctx.summary?.dex.usdVolume
+  const volume = usdVolumeCell(ctx, usdVolume)
+  const previousVolume = usdVolume?.previous?.status === 'available' ? usdMicrosToNumber(usdVolume.previous.totalUsdMicros) : null
+  const volumeDelta = volume.status === 'available' ? percentChange(usdMicrosToNumber(String(volume.raw)), previousVolume) : null
+  const unvalued = usdVolume?.status === 'available' && isFiniteNumber(usdVolume.unvaluedSwaps) ? usdVolume.unvaluedSwaps : 0
+  const volumeCaption = `Uniswap V3 and V4 swaps, last ${ctx.windowLabel}.${unvalued > 0
+    ? ` ${formatCount(unvalued)} swaps without a verified price excluded.` : ''}`
   const fee: Cell = { status: 'source_pending', note: 'Fee data is not available yet.' }
 
   return (
@@ -455,7 +517,7 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
           caption={`Unique addresses, last ${ctx.windowLabel}`} />
         <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.windowLabel}
           caption={`Total transactions, last ${ctx.windowLabel}`} />
-        <KpiCard item="network.total-volume" label="Total Volume" cell={volume} windowLabel={ctx.windowLabel} caption="" />
+        <KpiCard item="network.total-volume" label="Total Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.windowLabel} caption={volumeCaption} />
         <KpiCard item="network.average-fee" label="Average Fee" cell={fee} windowLabel={ctx.windowLabel} caption="" />
       </div>
       <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
@@ -480,32 +542,51 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
 }
 
 function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialView: 'volume' | 'swaps' }) {
-  // Volume is the primary DEX metric and the default view; Swaps is the secondary, verified view.
+  // Volume is the primary DEX metric and the default view; Swaps is the secondary, verified count view.
   const [tab, setTab] = useState<'volume' | 'swaps'>(initialView)
   const points = ctx.mode === 'ready' ? swapPoints(ctx.timeseries) : null
   const status = chartStatus(ctx, points)
+  const usd = ctx.mode === 'ready' ? usdPoints(ctx.timeseries) : null
+  const usdStatus = usdChartStatus(ctx, usd)
+  const unvalued = usdStatus === 'available' ? unvaluedSwapsIn(ctx.timeseries) : 0
+  const shownStatus = tab === 'volume' ? usdStatus : status
   const series: ChartSeries[] = [{ name: 'Uniswap V3', barClass: V3_BAR }, { name: 'Uniswap V4', barClass: V4_BAR }]
   return (
     <section data-intel-section="volume-chart" aria-label="DEX Activity" className={`${CARD} min-w-0 lg:col-span-3`}>
       <CardTitle
         title={tab === 'volume' ? 'DEX Volume' : 'DEX Swaps'}
         subtitle={tab === 'volume'
-          ? `USD value traded per UTC ${ctx.period} across all verified pairs.`
+          ? `USD value of swaps per UTC ${ctx.period} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Each swap is counted once.`
           : `Swap events per UTC ${ctx.period} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Counts, not amounts.`}
         right={(
           <div role="tablist" aria-label="DEX chart" className="flex gap-1.5">
-            <TabButton selected={tab === 'volume'} onClick={() => setTab('volume')} marker={markerProps('volume-chart.volume', 'source_pending')}>Volume</TabButton>
+            <TabButton selected={tab === 'volume'} onClick={() => setTab('volume')} marker={markerProps('volume-chart.volume', usdStatus)}>Volume</TabButton>
             <TabButton selected={tab === 'swaps'} onClick={() => setTab('swaps')} marker={markerProps('volume-chart.swaps', status)}>Swaps</TabButton>
           </div>
         )}
       />
       {tab === 'volume' ? (
-        <>
-          <HourReadout item="volume-chart.latest" status="source_pending" points={[]} unit="USD" period={ctx.period} />
-          <EmptyState status="source_pending" className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
-            title="DEX volume is not available yet"
-            detail="Volume needs a verified USD price for every traded pair. Swap counts are available in the Swaps tab." />
-        </>
+        usdStatus === 'available' && usd ? (
+          <>
+            <HourReadout item="volume-chart.latest" status={usdStatus} points={usd} unit="" format={usdText} />
+            <BarChart points={usd} series={series} unit="" format={usdText} axisFormat={usdText} />
+            <p className="mt-1 text-[11px] leading-4 text-slate-400">
+              Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools.
+              {unvalued > 0 && ` ${formatCount(unvalued)} swaps between tokens without a verified price are not included.`}
+            </p>
+          </>
+        ) : (
+          <>
+            <HourReadout item="volume-chart.latest" status={usdStatus} points={[]} unit="" period={ctx.period} />
+            <EmptyState status={usdStatus} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
+              title={usdStatus === 'source_pending' ? 'DEX volume is not available yet'
+                : ctx.mode === 'history' ? 'History is still being collected'
+                  : usdStatus === 'collecting' ? 'DEX volume is still being collected' : 'Hourly DEX volume is not available right now'}
+              detail={usdStatus === 'source_pending' ? 'Swap counts are available in the Swaps tab.'
+                : ctx.mode === 'history' ? ctx.historyNote
+                  : usdStatus === 'collecting' ? 'Hours appear here once their swaps are valued.' : noteFor(ctx, usdStatus)} />
+          </>
+        )
       ) : status === 'available' && points ? (
         <>
           <HourReadout item="volume-chart.latest" status={status} points={points} unit="swaps" />
@@ -520,8 +601,8 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
         </>
       )}
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
-        <span {...markerProps('volume-chart.uniswap-v3', status)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V3_BAR}`} />Uniswap V3</span>
-        <span {...markerProps('volume-chart.uniswap-v4', status)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V4_BAR}`} />Uniswap V4</span>
+        <span {...markerProps('volume-chart.uniswap-v3', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V3_BAR}`} />Uniswap V3</span>
+        <span {...markerProps('volume-chart.uniswap-v4', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V4_BAR}`} />Uniswap V4</span>
         <span {...markerProps('volume-chart.other', 'source_pending')} className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2.5 w-2.5 rounded-sm border border-dashed border-slate-300" />Other DEX protocols: not available yet</span>
       </div>
     </section>
@@ -720,7 +801,7 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
         className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-dashed border-slate-200 px-3 py-2">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-slate-700">Ranked by USD volume</p>
-          <p className="text-[11px] leading-4 text-slate-500">Primary ranking. Fixed order until volume is verified.</p>
+          <p className="text-[11px] leading-4 text-slate-500">Primary ranking. Fixed order until every protocol has a verified USD measure.</p>
         </div>
         <StatusPill status="source_pending" />
       </div>
@@ -758,14 +839,34 @@ function readStatus(ctx: ViewContext, entry: { status: string; reason: string | 
   return entry ? windowStatus({ status: entry.status, reason: entry.reason ?? undefined }) : 'unavailable'
 }
 
-const poolTokenName = (token: PoolToken) => token.symbol ?? shortenAddress(token.address)
-const pairName = (pair: { token0: PoolToken; token1: PoolToken }) => `${poolTokenName(pair.token0)} / ${poolTokenName(pair.token1)}`
+// A verified token reads as its symbol. Another token reads as the symbol its own contract reports, marked as not verified
+// (dotted underline, details on hover), or, without one, as its shortened address. Never a guess.
+function TokenLabel({ token }: { token: PoolToken }) {
+  if (token.symbol) return <span className="font-semibold text-slate-900">{token.symbol}</span>
+  const contract = token.contractMetadata
+  if (contract) {
+    return (
+      <span className="font-medium text-slate-700 underline decoration-slate-300 decoration-dotted underline-offset-2"
+        title={`${contract.name ? `${contract.name}, ` : ''}${token.address}. Name from the token contract, not a verified Arc asset.`}>
+        {contract.symbol}
+      </span>
+    )
+  }
+  return <span className="font-mono text-[11px] font-medium text-slate-500" title={`${token.address} (token details not verified)`}>{shortenAddress(token.address)}</span>
+}
+
+// Wraps between the two sides instead of cutting a name off.
+function PairLabel({ pair }: { pair: { token0: PoolToken; token1: PoolToken } }) {
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1">
+      <TokenLabel token={pair.token0} /><span className="text-slate-300">/</span><TokenLabel token={pair.token1} />
+    </span>
+  )
+}
 // Uniswap fees are in hundredths of a basis point (500 = 0.05%); V4 pools may instead use a dynamic fee set by their hook.
 const V4_DYNAMIC_FEE = 0x800000
 const feeText = (fee: number) => (fee === V4_DYNAMIC_FEE ? 'Dynamic fee' : `${(fee / 10_000).toLocaleString('en-US', { maximumFractionDigits: 4 })}%`)
 const ZERO_HOOKS = `0x${'0'.repeat(40)}`
-// Pool fields without a verified source yet: always source_pending, never filled from counts or activity.
-const PENDING_POOL_FIELDS = [['volume', 'Volume (USD)'], ['liquidity', 'Liquidity']] as const
 
 // Title and detail of the empty table, by status. No number is ever shown in place of a missing ranking.
 function poolsEmpty(ctx: ViewContext, status: DisplayStatus): [string, string] {
@@ -775,6 +876,24 @@ function poolsEmpty(ctx: ViewContext, status: DisplayStatus): [string, string] {
     : 'Pool rankings appear once every hour of the window is verified.']
   return ['Pool data is not verified for this window', ctx.mode === 'failed' ? 'Could not be loaded right now. Try Refresh in a moment.'
     : 'Rankings appear once every hour of the window is verified.']
+}
+
+const POOL_GRID = 'grid-cols-[1rem_minmax(0,1fr)_auto_auto]'
+
+// One pool's USD volume over the window. A pool whose swaps cannot all be valued says so; while the table's volume is not
+// available, the cell stays a quiet gap and the status is stated once below the table.
+function PoolVolume({ status, volume }: { status: DisplayStatus; volume: ArcPools['pools'][number]['usdVolume'] }) {
+  if (status !== 'available') return <span className="text-right"><ValueGap /></span>
+  if (volume?.status === 'available' && volume.usdMicros) {
+    const value = usdMicrosToNumber(volume.usdMicros)
+    return (
+      <p className="text-right leading-tight" title={formatUsdMicros(volume.usdMicros)}>
+        <span className="block text-sm font-semibold tabular-nums text-slate-950">{value === null ? '' : usdText(value)}</span>
+        <span className="block text-[11px] text-slate-500">volume</span>
+      </p>
+    )
+  }
+  return <span className="text-right text-[11px] leading-tight text-slate-400" title="No verified USD price for this pair in every hour">No price</span>
 }
 
 function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | 'v4' }) {
@@ -790,6 +909,10 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
   const data = ctx.pools?.[version] ?? null
   const status = readStatus(ctx, data)
   const rows = status === 'available' && data ? data.pools : []
+  // USD volume of the listed pools: from the pools read itself (never from counts); an API without it is not available yet.
+  const ranking = data?.ranking.usdVolume
+  const volumeStatus: DisplayStatus = status !== 'available' ? status
+    : ranking?.status === 'source_pending' ? 'source_pending' : usdVolumeStatus(ranking ?? null)
   const [emptyTitle, emptyDetail] = poolsEmpty(ctx, status)
   return (
     <section data-intel-section={id} aria-label={`Top Pools (Uniswap ${label})`} className={`${CARD} min-w-0`}>
@@ -800,38 +923,47 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
           <StatTile marker={markerProps('top-pools-v3.pool-count', poolCount.status, poolCount.raw)} label="Verified pools tracked" cell={poolCount} />
         )}
       </div>
-      <div className="mt-3 flex items-center justify-between gap-3 border-b border-slate-100 pb-1.5">
-        <span {...markerProps(`${id}.all-pairs`, status)} className={LABEL}>Pair</span>
-        <span {...markerProps(`${id}.swaps`, status)} className={LABEL}>Swaps</span>
+      <div className={`mt-3 grid ${POOL_GRID} gap-x-3 border-b border-slate-100 pb-1.5`}>
+        <span className={LABEL}>#</span>
+        <span {...markerProps(`${id}.all-pairs`, status)} className={LABEL}>Pair and fee</span>
+        <span {...markerProps(`${id}.volume`, volumeStatus)} className={`${LABEL} text-right`}>Volume</span>
+        <span {...markerProps(`${id}.swaps`, status)} className={`${LABEL} text-right`}>Swaps</span>
       </div>
       {rows.length ? (
         <ol>
-          {rows.map((pool) => (
-            <li key={pool.pool} data-pool-row={pool.pool} className="flex items-center justify-between gap-3 border-b border-slate-50 py-2 last:border-0">
+          {rows.map((pool, index) => (
+            <li key={pool.pool} data-pool-row={pool.pool} className={`grid ${POOL_GRID} items-center gap-x-3 border-b border-slate-50 py-2 last:border-0`}>
+              <span className="self-start pt-0.5 text-[11px] tabular-nums text-slate-400">{index + 1}</span>
               <div className="min-w-0">
-                <p className="truncate text-sm font-semibold text-slate-900" title={`${pool.token0.address} / ${pool.token1.address}`}>{pairName(pool)}</p>
+                <p className="text-sm leading-5"><PairLabel pair={pool} /></p>
                 <p className="mt-0.5 flex flex-wrap gap-1">
                   <Chip>{feeText(pool.fee)}</Chip>
                   {pool.hooks && pool.hooks !== ZERO_HOOKS && <Chip>Hooks</Chip>}
                 </p>
               </div>
-              <p className="shrink-0 text-sm font-semibold tabular-nums text-slate-950">{formatCount(pool.swapCount)} <span className="text-[11px] font-normal text-slate-500">swaps</span></p>
+              <PoolVolume status={volumeStatus} volume={pool.usdVolume} />
+              <p className="text-right leading-tight">
+                <span className="block text-sm font-semibold tabular-nums text-slate-950">{formatCount(pool.swapCount)}</span>
+                <span className="block text-[11px] text-slate-500">swaps</span>
+              </p>
             </li>
           ))}
         </ol>
       ) : (
         <EmptyRows status={status === 'available' ? undefined : status} title={emptyTitle} detail={emptyDetail} />
       )}
-      {/* Volume and liquidity have no verified source yet: they keep their place with a status, never a number. */}
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 rounded-lg border border-dashed border-slate-200 px-3 py-1.5">
-        {PENDING_POOL_FIELDS.map(([field, text]) => (
-          <span key={field} {...markerProps(`${id}.${field}`, 'source_pending')} className="flex items-center gap-1.5 text-[11px] text-slate-600">
-            {text} <InlineStatus status="source_pending" />
-          </span>
-        ))}
+      {/* Fields without verified data keep their place in one quiet block, never a number. */}
+      <div className="mt-2 space-y-0.5 rounded-lg bg-slate-50 px-3 py-1.5 text-[11px] text-slate-600">
+        {volumeStatus !== 'available' && rows.length > 0 && (
+          <p className="flex items-center justify-between gap-3"><span>Volume (USD)</span><InlineStatus status={volumeStatus} /></p>
+        )}
+        <p className="flex items-center justify-between gap-3">
+          <span {...markerProps(`${id}.liquidity`, 'source_pending')}>Liquidity</span>
+          <InlineStatus status="source_pending" />
+        </p>
       </div>
       <p className="mt-1 text-[11px] leading-4 text-slate-400">
-        Every verified Uniswap {label} pair is ranked, not only USDC pairs. Ranked by swap count, not by USD volume: volume and liquidity need verified USD pricing and are not available yet. Tokens without verified details show their shortened address. Liquidity is the value held in the pool.
+        Every verified Uniswap {label} pair is ranked by swaps, not only USDC pairs. Volume is the USD value of the pool's swaps, each counted once. Liquidity is the value held in the pool. Tokens without verified details show their shortened address.
       </p>
     </section>
   )
@@ -855,29 +987,54 @@ const RECENT_ACTIVITY_COLUMNS = [
 
 const ACTIVITY_TABS: readonly (readonly [ArcActivityType, string])[] = [['all', 'All'], ['swaps', 'Swaps'], ['adds', 'Adds'], ['removes', 'Removes']]
 const KIND_TEXT: Record<ArcActivityRow['kind'], string> = { swap: 'Swap', add: 'Add', remove: 'Remove' }
-// Eight columns from the lg breakpoint (shortened addresses and hashes need their width); stacked cards below it.
-const ACTIVITY_GRID = 'lg:grid-cols-[0.9fr_0.6fr_0.8fr_1.2fr_1.4fr_1fr_1fr_1fr]'
+// Eight columns from the lg breakpoint (shortened addresses and hashes need their width); stacked cards below it, four
+// cells wide on tablets.
+const ACTIVITY_GRID = 'lg:grid-cols-[0.8fr_0.5fr_0.7fr_1.2fr_2fr_0.85fr_0.85fr_0.9fr]'
 const PROTOCOL_TEXT: Record<ArcActivityRow['protocol'], string> = { uniswap_v3: 'Uniswap V3', uniswap_v4: 'Uniswap V4' }
 
-// A raw integer amount in its token's verified decimals; without verified decimals the exact raw units are shown with
-// the token's shortened address, never a guessed precision.
-function tokenAmountText(raw: string, token: PoolToken): string {
-  return token.decimals === null ? `${BigInt(raw).toLocaleString('en-US')} raw units of ${shortenAddress(token.address)}`
-    : `${formatAmount(raw, token.decimals)} ${token.symbol}`
-}
+// Stablecoins read in cents; other tokens keep four decimals when they have 8 or more.
+const amountDigits = (token: PoolToken, decimals: number) => (ASSET_CATEGORY[token.symbol ?? ''] === 'Stablecoin' ? 2 : shownDigits(decimals))
+
+type AmountSide = { raw: string; token: PoolToken; direction: 'to pool' | 'from pool' | null }
 
 // Token amounts of one event. Swaps are pool deltas as emitted (V3: positive is paid into the pool; V4: negative is paid
 // into the pool), shown from the pool's side; V3 liquidity changes are exact token amounts; V4 liquidity changes carry
 // none. null: the event records no token amounts.
-function activityAmounts(row: ArcActivityRow): string[] | null {
+function activitySides(row: ArcActivityRow): AmountSide[] | null {
   const { amounts, pair } = row
   if (amounts.status !== 'available' || amounts.amount0Raw === null || amounts.amount1Raw === null) return null
   const sides: [string, PoolToken][] = [[amounts.amount0Raw, pair.token0], [amounts.amount1Raw, pair.token1]]
-  if (row.kind !== 'swap') return sides.map(([raw, token]) => tokenAmountText(raw, token))
+  if (row.kind !== 'swap') return sides.map(([raw, token]) => ({ raw, token, direction: null }))
   const toPool = (raw: string) => (amounts.basis === 'v3_pool_delta' ? !raw.startsWith('-') : raw.startsWith('-'))
   return sides.filter(([raw]) => BigInt(raw) !== 0n)
-    .map(([raw, token]) => `${tokenAmountText(raw.replace(/^-/, ''), token)} ${toPool(raw) ? 'to pool' : 'from pool'}`)
+    .map(([raw, token]) => ({ raw: raw.replace(/^-/, ''), token, direction: toPool(raw) ? 'to pool' : 'from pool' }))
 }
+
+// A verified token reads in its own decimals; another token in the decimals its own contract reports, with its unverified
+// label. A token without either has no known decimals, so no decimal amount is invented: the line says "Raw amount" and
+// the exact integer stays one tap away (and in the hover title).
+function AmountLine({ side }: { side: AmountSide }) {
+  const direction = side.direction && <span className="text-slate-400"> {side.direction}</span>
+  const decimals = side.token.decimals ?? side.token.contractMetadata?.decimals ?? null
+  if (decimals !== null) {
+    return (
+      <span className="block tabular-nums text-slate-700">
+        {formatTokenAmount(side.raw, decimals, amountDigits(side.token, decimals))} {side.token.symbol ?? <TokenLabel token={side.token} />}{direction}
+      </span>
+    )
+  }
+  return (
+    <details className="block text-slate-700" title={`Exact raw amount: ${side.raw}`}>
+      <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+        <span className="font-medium">Raw amount</span> <TokenLabel token={side.token} />{direction}
+      </summary>
+      <span className="block break-all font-mono text-[10px] text-slate-500">{side.raw}</span>
+    </details>
+  )
+}
+
+// Compact UTC time; the column heading already says UTC.
+const activityTime = (iso: string) => formatUtcDateTime(iso).replace(/ UTC$/, '')
 
 function ActivityCell({ label, children, className = '' }: { label: string; children: ReactNode; className?: string }) {
   return (
@@ -888,28 +1045,42 @@ function ActivityCell({ label, children, className = '' }: { label: string; chil
   )
 }
 
-function ActivityRowView({ row, explorerUrl }: { row: ArcActivityRow; explorerUrl: string | null }) {
-  const amounts = activityAmounts(row)
+const ADDRESS_TEXT = 'tabular-nums text-slate-700'
+
+// sharedTx: this transaction emitted more than one listed event, so each row names its own log (never merged).
+function ActivityRowView({ row, explorerUrl, sharedTx }: { row: ArcActivityRow; explorerUrl: string | null; sharedTx: boolean }) {
+  const sides = activitySides(row)
   const hash = shortenHash(row.txHash)
   return (
-    <li data-activity-row={row.txHash} className={`grid grid-cols-2 gap-x-3 gap-y-1.5 border-b border-slate-50 py-2 text-xs last:border-0 lg:items-center ${ACTIVITY_GRID}`}>
-      <ActivityCell label="Time (UTC)"><span className="tabular-nums text-slate-600">{formatUtcDateTime(row.time)}</span></ActivityCell>
+    <li data-activity-row={row.txHash} data-log-index={row.logIndex}
+      className={`grid grid-cols-2 gap-x-3 gap-y-1.5 border-b border-slate-50 py-2 text-xs last:border-0 md:grid-cols-4 lg:items-center ${ACTIVITY_GRID}`}>
+      <ActivityCell label="Time (UTC)"><span className="tabular-nums text-slate-600">{activityTime(row.time)}</span></ActivityCell>
       <ActivityCell label="Type"><span className="font-semibold text-slate-900">{KIND_TEXT[row.kind]}</span></ActivityCell>
       <ActivityCell label="Protocol"><span className="text-slate-700">{PROTOCOL_TEXT[row.protocol]}</span></ActivityCell>
-      <ActivityCell label="Pair"><span className="block truncate font-medium text-slate-900" title={`${row.pair.token0.address} / ${row.pair.token1.address}`}>{pairName(row.pair)}</span></ActivityCell>
+      <ActivityCell label="Pair"><PairLabel pair={row.pair} /></ActivityCell>
       <ActivityCell label="Amount" className="col-span-2 lg:col-span-1">
-        {amounts
-          ? amounts.map((text) => <span key={text} className="block break-words tabular-nums text-slate-700">{text}</span>)
+        {sides
+          ? sides.map((side) => <AmountLine key={`${side.token.address}:${side.direction}`} side={side} />)
           : <span className="text-slate-400">Token amounts not recorded</span>}
       </ActivityCell>
-      <ActivityCell label="From"><span className="font-mono text-slate-700" title={row.from}>{shortenAddress(row.from)}</span></ActivityCell>
+      <ActivityCell label="From"><span className={ADDRESS_TEXT} title={row.from}>{shortenAddress(row.from)}</span></ActivityCell>
       <ActivityCell label="To">
-        {row.to ? <span className="font-mono text-slate-700" title={row.to}>{shortenAddress(row.to)}</span> : <InlineStatus status="unavailable" />}
+        {row.to ? <span className={ADDRESS_TEXT} title={row.to}>{shortenAddress(row.to)}</span> : <InlineStatus status="unavailable" />}
       </ActivityCell>
       <ActivityCell label="Tx">
         {explorerUrl
-          ? <a href={`${explorerUrl}/tx/${row.txHash}`} target="_blank" rel="noopener noreferrer" className="font-mono text-[#2F6E0C] hover:underline">{hash}</a>
-          : <span className="font-mono text-slate-700" title={row.txHash}>{hash}</span>}
+          ? (
+            <a href={`${explorerUrl}/tx/${row.txHash}`} target="_blank" rel="noopener noreferrer" title={row.txHash}
+              className="inline-flex items-center gap-0.5 tabular-nums text-[#2F6E0C] hover:underline">
+              {hash}<ArrowUpRight aria-hidden="true" className="h-3 w-3" />
+            </a>
+          )
+          : <span className={ADDRESS_TEXT} title={row.txHash}>{hash}</span>}
+        {sharedTx && (
+          <span className="block text-[10px] text-slate-400" title="This transaction emitted several events; each one is listed on its own row.">
+            {`Log #${row.logIndex}`}
+          </span>
+        )}
       </ActivityCell>
     </li>
   )
@@ -932,6 +1103,8 @@ function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initial
   const status = statusOf(tab)
   const feed = ctx.activity?.[tab] ?? null
   const rows = status === 'available' && feed ? feed.rows : []
+  const txCounts = new Map<string, number>()
+  for (const row of rows) txCounts.set(row.txHash, (txCounts.get(row.txHash) ?? 0) + 1)
   return (
     <section data-intel-section="recent-activity" aria-label="Recent Activity" className={CARD}>
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
@@ -950,7 +1123,11 @@ function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initial
         columns={RECENT_ACTIVITY_COLUMNS.map((column) => ({ ...column, status }))}
       >
         {rows.length ? (
-          <ol className="mt-1">{rows.map((row) => <ActivityRowView key={`${row.blockNumber}:${row.logIndex}`} row={row} explorerUrl={ctx.explorerUrl} />)}</ol>
+          <ol className="mt-1">
+            {rows.map((row) => (
+              <ActivityRowView key={`${row.blockNumber}:${row.logIndex}`} row={row} explorerUrl={ctx.explorerUrl} sharedTx={(txCounts.get(row.txHash) ?? 0) > 1} />
+            ))}
+          </ol>
         ) : (
           <EmptyRows status={status === 'available' ? undefined : status} title={activityEmpty(ctx, status)[0]} detail={activityEmpty(ctx, status)[1]} />
         )}
@@ -981,7 +1158,7 @@ function LaunchesSection({ ctx }: { ctx: ViewContext }) {
             <div className="min-w-0">
               <p className="text-xs font-semibold text-slate-800">{title}</p>
               <p className="text-[11px] leading-4 text-slate-500">{detail}</p>
-              <p className="mt-0.5 text-[11px] font-medium text-slate-400">Source pending</p>
+              <p className="mt-0.5 text-[11px] font-medium text-slate-400">Not available yet</p>
             </div>
           </div>
         ))}

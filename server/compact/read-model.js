@@ -14,6 +14,7 @@ import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
+import { poolVolumeUsd, PRICE_POLICY, PRICEABLE_TOKENS, VALUATION_VERSIONS } from './valuation.js';
 import { sumWindow, WindowError } from './windows.js';
 
 export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1';
@@ -87,10 +88,29 @@ const HOUR_ONLY_FIELDS = Object.freeze(Object.fromEntries(FAMILIES.map((name) =>
 const TIMESERIES_FAMILIES = Object.freeze(FAMILIES.filter((name) => scalarFields(FAMILY_WINDOWS[name]).length > 0));
 
 // A pool token: the verified asset registry names known tokens, and Uniswap V4's currency 0x0 is Arc's native USDC
-// (the registry's native interface, 18 decimals). Any other address stays unnamed: no token metadata is fetched or guessed.
-const poolToken = (address) => (address === ZERO_ADDRESS
-  ? { address, symbol: ARC_USDC.symbol, decimals: ARC_USDC.interfaces.nativeDecimals, verified: true, native: true }
-  : { address, ...tokenUnit(address), native: false });
+// (the registry's native interface, 18 decimals). Any other address keeps symbol and decimals null (unverified). Its
+// contractMetadata is what the token contract itself answered (symbol, name, decimals), read once by the indexer and
+// cached in SQLite (token-metadata.js), or null: display data only, never a verified identity and never used for a value.
+const poolToken = (address, contractMetadata = null) => (address === ZERO_ADDRESS
+  ? { address, symbol: ARC_USDC.symbol, decimals: ARC_USDC.interfaces.nativeDecimals, verified: true, native: true, contractMetadata: null }
+  : { address, ...tokenUnit(address), native: false, contractMetadata: tokenUnit(address).verified ? null : contractMetadata });
+const METADATA_SYMBOL = /^[A-Za-z0-9][A-Za-z0-9._+$-]{0,19}$/;
+const contractMetadataOf = (row) => (row && typeof row.symbol === 'string' && METADATA_SYMBOL.test(row.symbol) && Number.isSafeInteger(row.decimals)
+  && row.decimals >= 0 && row.decimals <= 36 && (row.name === null || typeof row.name === 'string')
+  ? { symbol: row.symbol, name: row.name, decimals: row.decimals } : null);
+const USD_DIGITS = /^\d+$/;
+// Machine-readable valuation rules beside every USD amount (valuation.js).
+const VALUATION_DEFINITION = Object.freeze({
+  versions: VALUATION_VERSIONS,
+  unit: 'usd_micros',
+  anchors: Object.freeze(['0x3600000000000000000000000000000000000000 (Arc USDC ERC-20, 6 decimals) = 1 USD',
+    '0x0000000000000000000000000000000000000000 (Arc native USDC in Uniswap V4, 18 decimals) = 1 USD']),
+  pricedTokens: Object.freeze([...PRICEABLE_TOKENS]),
+  priceSource: 'block-weighted mean square-root price of verified USDC pools of the same hour (official V3 pools, V4 pools without hooks)',
+  pricePolicy: Object.freeze({ minSwaps: PRICE_POLICY.minSwaps, minCoverageBps: PRICE_POLICY.minCoverageBps,
+    minDepthUsdMicros: PRICE_POLICY.minDepthUsdMicros.toString(10), maxDivergenceBps: PRICE_POLICY.maxDivergenceBps }),
+  volume: 'each swap valued once by one side: the USDC side, otherwise the side with a verified hourly price; unpriced swaps are counted as unvalued',
+});
 const isDigits = (value) => typeof value === 'string' && DIGITS.test(value);
 const isSignedDigits = (value) => typeof value === 'string' && /^-?\d+$/.test(value);
 
@@ -173,10 +193,22 @@ const SQL = Object.freeze({
   // every pool of the window in memory. Raw token totals are summed in BigInt afterwards, never in SQL.
   topPoolRows: `WITH top AS (SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours
       WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3 GROUP BY pool HAVING total > 0 ORDER BY total DESC, pool ASC LIMIT ?4)
-    SELECT p.pool, top.total, p.token0_in_raw, p.token0_out_raw, p.token1_in_raw, p.token1_out_raw, p.add_count, p.remove_count,
-      p.poke_count, p.add_amount0_raw, p.add_amount1_raw, p.remove_amount0_raw, p.remove_amount1_raw
+    SELECT p.pool, top.total, p.hour_start, p.swap_count, p.token0_in_raw, p.token0_out_raw, p.token1_in_raw, p.token1_out_raw, p.add_count,
+      p.remove_count, p.poke_count, p.add_amount0_raw, p.add_amount1_raw, p.remove_amount0_raw, p.remove_amount1_raw
     FROM compact_pool_hours p JOIN top ON top.pool = p.pool
     WHERE p.protocol = ?1 AND p.hour_start BETWEEN ?2 AND ?3 ORDER BY top.total DESC, p.pool ASC, p.hour_start ASC`,
+  // Valuations and token metadata (store.js). Optional tables: a database written before them still serves everything
+  // else, and these reads report valuation_not_ready (or no contract metadata).
+  optionalTables: `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('compact_valuation_hours', 'compact_dex_volume_hours',
+    'compact_token_price_hours', 'compact_token_metadata')`,
+  valuationStatusRows: `SELECT h.hour_start, v.status, v.reason FROM compact_hours h
+    LEFT JOIN compact_valuation_hours v ON v.hour_start = h.hour_start AND v.valuation = ?
+    WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
+  dexVolumeRows: `SELECT hour_start, protocol, volume_usd_micros, valued_swaps, unvalued_swaps FROM compact_dex_volume_hours
+    WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, protocol`,
+  tokenPriceRows: `SELECT hour_start, token, price_usd_e18, source_protocol, source_pool, depth_usd_micros, source_count
+    FROM compact_token_price_hours WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, token`,
+  tokenMetadata: 'SELECT symbol, name, decimals FROM compact_token_metadata WHERE token = ? AND verified = 1',
   activityRows: `SELECT block_number, log_index, block_timestamp, tx_hash, tx_from, protocol, kind, pool, amount0_raw, amount1_raw,
     amount_basis, counterparty, counterparty_kind FROM compact_dex_activity WHERE (?1 IS NULL OR kind = ?1)
     ORDER BY block_number DESC, log_index DESC LIMIT ?2`,
@@ -335,6 +367,77 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     return window;
   }
 
+  const optionalTables = () => new Set(statement('optionalTables').all().map((row) => row.name));
+  const valuationReady = (tables) => tables.has('compact_valuation_hours') && tables.has('compact_dex_volume_hours')
+    && tables.has('compact_token_price_hours');
+
+  // Valuation status of every hour of [from, to]: available only when each hour is; a gap is never a partial window.
+  function valuationWindow(name, from, to, hours, tables) {
+    if (!valuationReady(tables)) return { status: 'unavailable', reason: 'valuation_not_ready', reasons: ['valuation_not_ready'], unavailableHours: [] };
+    const rows = statement('valuationStatusRows').all(name, int(from), int(to));
+    if (rows.length !== hours) return { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], unavailableHours: [] };
+    const gaps = rows.filter((row) => row.status !== 'available');
+    if (!gaps.length) return { status: 'available', reason: null, reasons: [], unavailableHours: [] };
+    return { status: 'unavailable', reason: 'valuation_hour_unavailable',
+      reasons: [...new Set(gaps.map((row) => (row.status === null ? 'valuation_not_processed' : row.reason ?? 'valuation_unavailable')))].sort(),
+      unavailableHours: gaps.map((row) => iso(row.hour_start)) };
+  }
+
+  // Stored DEX USD volume rows of [from, to] per hour: { uniswap_v3, uniswap_v4 } with exact BigInt values. Every stored
+  // available hour holds exactly one row per protocol; anything else is inconsistent and fails closed.
+  function dexVolumeByHour(from, to) {
+    const byHour = new Map();
+    for (const row of statement('dexVolumeRows').all(int(from), int(to))) {
+      if (!USD_DIGITS.test(row.volume_usd_micros) || !Number.isSafeInteger(row.valued_swaps) || !Number.isSafeInteger(row.unvalued_swaps)) {
+        throw new ReadModelError('inconsistent_state', 'dex_volume_malformed');
+      }
+      if (!byHour.has(row.hour_start)) byHour.set(row.hour_start, {});
+      byHour.get(row.hour_start)[row.protocol] = { usdMicros: BigInt(row.volume_usd_micros), valuedSwaps: row.valued_swaps,
+        unvaluedSwaps: row.unvalued_swaps };
+    }
+    return byHour;
+  }
+  const hourVolume = (entry) => {
+    if (!entry?.uniswap_v3 || !entry?.uniswap_v4) throw new ReadModelError('inconsistent_state', 'dex_volume_missing');
+    return entry;
+  };
+
+  // DEX USD volume of the window: each swap valued once (valuation.js); swaps without a verified price are reported as
+  // unvalued, never as zero. Amounts are exact micro-USD integer strings.
+  function volumeWindow(from, to, hours, tables) {
+    const range = { start: iso(from), end: iso(to + HOUR) };
+    const status = valuationWindow('dex_usd_volume', from, to, hours, tables);
+    const base = { ...status, ...range, totalUsdMicros: null, byProtocol: null, valuedSwaps: null, unvaluedSwaps: null };
+    if (status.status !== 'available') return base;
+    const byHour = dexVolumeByHour(from, to);
+    const totals = { uniswap_v3: 0n, uniswap_v4: 0n };
+    let valuedSwaps = 0;
+    let unvaluedSwaps = 0;
+    for (let hour = from; hour <= to; hour += HOUR) {
+      const entry = hourVolume(byHour.get(hour));
+      for (const protocol of Object.keys(totals)) {
+        totals[protocol] += entry[protocol].usdMicros;
+        valuedSwaps += entry[protocol].valuedSwaps;
+        unvaluedSwaps += entry[protocol].unvaluedSwaps;
+      }
+    }
+    return { ...base, totalUsdMicros: (totals.uniswap_v3 + totals.uniswap_v4).toString(10),
+      byProtocol: { uniswapV3: totals.uniswap_v3.toString(10), uniswapV4: totals.uniswap_v4.toString(10) }, valuedSwaps, unvaluedSwaps };
+  }
+
+  // Verified token prices of one hour (the checkpoint hour in the summary), with their source pool.
+  function hourPrices(hour, tables) {
+    const status = valuationWindow('token_prices', hour, hour, 1, tables);
+    const base = { hour: iso(hour), status: status.status, reason: status.reason, reasons: status.reasons };
+    if (status.status !== 'available') return { ...base, tokens: [] };
+    const tokens = statement('tokenPriceRows').all(int(hour), int(hour)).map((row) => {
+      if (!USD_DIGITS.test(row.price_usd_e18) || !USD_DIGITS.test(row.depth_usd_micros)) throw new ReadModelError('inconsistent_state', 'token_price_malformed');
+      return { ...poolToken(row.token), priceUsdE18: row.price_usd_e18, sourceProtocol: row.source_protocol, sourcePool: row.source_pool,
+        depthUsdMicros: row.depth_usd_micros, sourceCount: row.source_count };
+    });
+    return { ...base, tokens };
+  }
+
   function buildSummary(windowKey, hours) {
     const state = anchor();
     const to = state.hour;
@@ -352,12 +455,16 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const officialV3Pools = registry && registry.through_block >= state.block
       ? { status: 'available', count: statement('poolCount').get(V3_POOL_KIND, int(state.block)).count, throughBlock: state.block }
       : { status: 'unavailable', reason: registry ? 'registry_behind_checkpoint' : 'registry_missing', count: null, throughBlock: null };
+    const tables = optionalTables();
+    const usdVolume = volumeWindow(from, to, hours, tables);
+    usdVolume.previous = volumeWindow(previousFrom, previousTo, hours, tables);
     return {
       window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) },
       anchor: state,
       network,
       assets: { usdc: families.usdc, verifiedAssets: families.assets },
-      dex: { uniswapV3: families.uniswapV3, uniswapV4: families.uniswapV4, officialV3Pools },
+      dex: { uniswapV3: families.uniswapV3, uniswapV4: families.uniswapV4, officialV3Pools, usdVolume,
+        usdPrices: hourPrices(state.hour, tables) },
       lending: { aaveV4: families.aaveV4, morphoBlue: families.morphoBlue, morphoVaultsV2: families.morphoVaultsV2 },
       crossChain: { cctp: families.cctp, gateway: families.gateway, across: families.across },
       coverage: {
@@ -380,12 +487,27 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const network = new Map(statement('networkRows').all(int(from), int(to)).map((row) => [row.hour_start, row]));
     const familyRows = new Map();
     for (const row of statement('allFamilyRows').all(int(from), int(to))) familyRows.set(`${row.hour_start}:${row.family}`, row);
+    const tables = optionalTables();
+    const volumeStatus = valuationReady(tables)
+      ? new Map(statement('valuationStatusRows').all('dex_usd_volume', int(from), int(to)).map((row) => [row.hour_start, row])) : null;
+    const volumes = volumeStatus ? dexVolumeByHour(from, to) : null;
+    // One hour's DEX USD volume: per protocol and total (exact micro-USD strings), or unavailable with its reason.
+    const dexUsdVolume = (hour) => {
+      if (!volumeStatus) return { status: 'unavailable', reason: 'valuation_not_ready' };
+      const status = volumeStatus.get(hour);
+      if (status?.status !== 'available') return { status: 'unavailable', reason: status?.status ? status.reason : 'valuation_not_processed' };
+      const entry = hourVolume(volumes.get(hour));
+      return { status: 'available', totalUsdMicros: (entry.uniswap_v3.usdMicros + entry.uniswap_v4.usdMicros).toString(10),
+        uniswapV3UsdMicros: entry.uniswap_v3.usdMicros.toString(10), uniswapV4UsdMicros: entry.uniswap_v4.usdMicros.toString(10),
+        valuedSwaps: entry.uniswap_v3.valuedSwaps + entry.uniswap_v4.valuedSwaps,
+        unvaluedSwaps: entry.uniswap_v3.unvaluedSwaps + entry.uniswap_v4.unvaluedSwaps };
+    };
     const buckets = [];
     for (let hour = from; hour <= to; hour += HOUR) {
       const range = { start: iso(hour), end: iso(hour + HOUR) };
       const row = network.get(hour);
       if (!row) {
-        buckets.push({ ...range, status: 'not_stored', network: null, families: null });
+        buckets.push({ ...range, status: 'not_stored', network: null, families: null, dexUsdVolume: null });
         continue;
       }
       const gasUsedRaw = JSON.parse(row.network_json).gasUsedRaw;
@@ -403,6 +525,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
           const metrics = JSON.parse(familyRow.metrics_json);
           return [name, { status: 'available', ...Object.fromEntries(scalarFields(FAMILY_WINDOWS[name]).map((field) => [field, metrics[field]])) }];
         })),
+        dexUsdVolume: dexUsdVolume(hour),
       });
     }
     return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, buckets };
@@ -428,8 +551,16 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       unavailableHours: gaps.map((row) => iso(row.hour_start)) };
   }
 
+  // A pool token with its cached contract metadata when the token is not a verified identity (never for verified assets or
+  // the native currency). A malformed cached row is simply not shown.
+  function tokenOf(address, tables) {
+    const token = poolToken(address);
+    if (token.verified || !tables.has('compact_token_metadata')) return token;
+    return poolToken(address, contractMetadataOf(statement('tokenMetadata').get(address)));
+  }
+
   // Exact identity of a registry pool. Malformed or missing metadata fails the whole answer closed, never a guessed pair.
-  function registryDetails(kind, pool) {
+  function registryDetails(kind, pool, tables = new Set()) {
     const row = statement('registryMeta').get(kind, pool);
     if (!row) throw new ReadModelError('inconsistent_state', 'pool_registry_missing');
     let meta = null;
@@ -440,7 +571,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       || !Number.isSafeInteger(meta.fee) || !Number.isSafeInteger(meta.tickSpacing)) {
       throw new ReadModelError('inconsistent_state', 'pool_registry_metadata_malformed');
     }
-    return { pool, createdBlock: row.created_block, token0: poolToken(token0), token1: poolToken(token1), fee: meta.fee,
+    return { pool, createdBlock: row.created_block, token0: tokenOf(token0, tables), token1: tokenOf(token1, tables), fee: meta.fee,
       tickSpacing: meta.tickSpacing, hooks: v4 ? meta.hooks : null };
   }
 
@@ -465,39 +596,76 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const projection = projectionWindow(spec.projection, from, to, hours);
     if (projection.status !== 'available') return { ...base, ...counts, ...projection };
     const v3 = spec.protocol === 'uniswap_v3';
+    // Pool USD volume: only when the window's DEX USD volume is available (every hour valued). Each hour of a pool is
+    // valued with that hour's own stored prices; a pool with any swap hour it cannot value has no USD volume.
+    const tables = optionalTables();
+    const valuation = valuationWindow('dex_usd_volume', from, to, hours, tables);
+    const prices = new Map();
+    if (valuation.status === 'available') {
+      for (const row of statement('tokenPriceRows').all(int(from), int(to))) {
+        if (!USD_DIGITS.test(row.price_usd_e18)) throw new ReadModelError('inconsistent_state', 'token_price_malformed');
+        if (!prices.has(row.hour_start)) prices.set(row.hour_start, new Map());
+        prices.get(row.hour_start).set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
+      }
+    }
+    const details = new Map();
+    const detailsOf = (pool) => {
+      if (!details.has(pool)) details.set(pool, registryDetails(spec.registryKind, pool, tables));
+      return details.get(pool);
+    };
     const totals = new Map();
     for (const row of statement('topPoolRows').all(spec.protocol, int(from), int(to), int(POOL_LIMIT))) {
       const flows = [row.token0_in_raw, row.token0_out_raw, row.token1_in_raw, row.token1_out_raw];
       const liquidity = [row.add_amount0_raw, row.add_amount1_raw, row.remove_amount0_raw, row.remove_amount1_raw];
       if (!flows.every(isDigits) || !(v3 ? liquidity.every(isDigits) : liquidity.every((value) => value === null))
-        || !Number.isSafeInteger(row.total)) throw new ReadModelError('inconsistent_state', 'pool_projection_malformed');
+        || !Number.isSafeInteger(row.total) || !Number.isSafeInteger(row.swap_count)) throw new ReadModelError('inconsistent_state', 'pool_projection_malformed');
       let entry = totals.get(row.pool);
-      if (!entry) totals.set(row.pool, (entry = { swapCount: row.total, flows: [0n, 0n, 0n, 0n], liquidity: [0n, 0n, 0n, 0n], add: 0, remove: 0, poke: 0 }));
+      if (!entry) {
+        totals.set(row.pool, (entry = { swapCount: row.total, flows: [0n, 0n, 0n, 0n], liquidity: [0n, 0n, 0n, 0n], add: 0, remove: 0, poke: 0,
+          usdMicros: 0n, bases: new Set(), unvalued: false }));
+      }
       flows.forEach((value, index) => { entry.flows[index] += BigInt(value); });
       if (v3) liquidity.forEach((value, index) => { entry.liquidity[index] += BigInt(value); });
       entry.add += row.add_count;
       entry.remove += row.remove_count;
       entry.poke += row.poke_count;
+      if (valuation.status === 'available' && row.swap_count > 0) {
+        const { token0, token1 } = detailsOf(row.pool);
+        const value = poolVolumeUsd({ token0: token0.address, token1: token1.address, side0Raw: BigInt(flows[0]) + BigInt(flows[1]),
+          side1Raw: BigInt(flows[2]) + BigInt(flows[3]) }, prices.get(row.hour_start) ?? new Map());
+        if (value) {
+          entry.usdMicros += value.usdMicros;
+          entry.bases.add(value.basis);
+        } else entry.unvalued = true;
+      }
     }
     const raw = (values) => values.map((value) => value.toString(10));
+    const usdVolumeOf = (entry) => {
+      if (valuation.status !== 'available') return { status: 'unavailable', reason: valuation.reason, usdMicros: null, basis: null };
+      if (entry.unvalued) return { status: 'unavailable', reason: 'no_verified_price', usdMicros: null, basis: null };
+      return { status: 'available', reason: null, usdMicros: entry.usdMicros.toString(10),
+        basis: entry.bases.size === 1 ? [...entry.bases][0] : entry.bases.size ? 'mixed' : 'usd_anchor' };
+    };
     const pools = [...totals].map(([pool, entry]) => {
       const [token0In, token0Out, token1In, token1Out] = raw(entry.flows);
       const [addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw] = raw(entry.liquidity);
-      return { ...registryDetails(spec.registryKind, pool), swapCount: entry.swapCount, flowsRaw: { token0In, token0Out, token1In, token1Out },
+      return { ...detailsOf(pool), swapCount: entry.swapCount, flowsRaw: { token0In, token0Out, token1In, token1Out },
+        usdVolume: usdVolumeOf(entry),
         liquidityActivity: { addCount: entry.add, removeCount: entry.remove, pokeCount: entry.poke,
           amounts: v3 ? { status: 'available', addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw }
             : { status: 'not_supported', reason: 'v4_token_amounts_unavailable', addAmount0Raw: null, addAmount1Raw: null, removeAmount0Raw: null,
               removeAmount1Raw: null } } };
     });
-    return { ...base, ...counts, status: 'available', reason: null, reasons: [], unavailableHours: [], pools };
+    return { ...base, ...counts, status: 'available', reason: null, reasons: [], unavailableHours: [], pools,
+      usdVolume: { status: valuation.status, reason: valuation.reason, reasons: valuation.reasons } };
   }
 
   // One activity row with the exact semantics of the projection: from is the verified transaction sender; to is only the
   // event's own recipient (V3 swap), owner (V3 mint/burn) or sender (V4 modifyLiquidity), and null for a V4 swap.
-  function activityRow(row) {
+  function activityRow(row, tables) {
     const kind = row.protocol === 'uniswap_v3' ? V3_POOL_KIND : row.protocol === 'uniswap_v4' ? V4_POOL_KIND : null;
     if (!kind) throw new ReadModelError('inconsistent_state', 'activity_protocol_unknown');
-    const { token0, token1, fee, tickSpacing, hooks } = registryDetails(kind, row.pool);
+    const { token0, token1, fee, tickSpacing, hooks } = registryDetails(kind, row.pool, tables);
     let amounts;
     if (row.amount_basis === 'none') {
       if (row.amount0_raw !== null || row.amount1_raw !== null) throw new ReadModelError('inconsistent_state', 'activity_amount_malformed');
@@ -520,8 +688,9 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     if (!projectionDataReady()) return unavailable('projection_not_ready');
     const latest = statement('projectionHour').get(int(state.hour), 'dex_activity');
     if (latest?.status !== 'available') return unavailable(latest ? latest.reason : 'projection_not_processed');
+    const tables = optionalTables();
     return { anchor: state, status: 'available', reason: null,
-      rows: statement('activityRows').all(ACTIVITY_TYPES[typeKey], int(ACTIVITY_LIMIT)).map(activityRow) };
+      rows: statement('activityRows').all(ACTIVITY_TYPES[typeKey], int(ACTIVITY_LIMIT)).map((row) => activityRow(row, tables)) };
   }
 
   // Projection state of every stored hour in [fromHour, toHour], oldest first (see projections.js projectionRepairState).
@@ -547,7 +716,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   };
 
   const definitions = Object.freeze({ schemaVersion: COMPACT_SCHEMA_VERSION, hourDefinition: COMPACT_DEFINITION_VERSION,
-    families: FAMILY_VERSIONS, aggregationRules: AGGREGATION_RULES });
+    families: FAMILY_VERSIONS, aggregationRules: AGGREGATION_RULES, valuation: VALUATION_DEFINITION });
   const chain = Object.freeze({ id: ARC_CHAIN_ID, name: 'Arc' });
 
   return Object.freeze({
@@ -578,7 +747,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       const core = cached(`pools:${protocolKey}:${windowKey}`, () => snapshot(() => buildPools(protocolKey, windowKey, POOLS_WINDOWS[windowKey])));
       return { schema: POOLS_SCHEMA, chain, protocol: protocolKey, window: core.window, freshness: freshness(core.anchor, now()), status: core.status,
         reason: core.reason, reasons: core.reasons, unavailableHours: core.unavailableHours,
-        ranking: { by: 'swap_count', usdVolume: { status: 'source_pending' }, liquidityUsd: { status: 'source_pending' } },
+        ranking: { by: 'swap_count', usdVolume: core.usdVolume ?? { status: 'unavailable', reason: core.reason, reasons: core.reasons },
+          liquidityUsd: { status: 'source_pending' } },
         poolsTracked: core.poolsTracked, newPools: core.newPools, pools: core.pools };
     },
     activity(typeKey) {

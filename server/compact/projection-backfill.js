@@ -5,7 +5,8 @@
 // of every stored hour boundary), and hands the decoded official events to the same projection sink the live hour uses.
 // store.js then reconciles the result exactly against the hour's STORED family counters before anything is written;
 // a mismatch is stored as unavailable. Recent activity needs the spine's transaction senders, so a backfilled hour
-// never has activity: it fills from live hours only.
+// never has activity: it fills from live hours only. The pool price paths come from the same two streams (no extra
+// request) and are written with the pool rows; the hour's valuations are then derived from what is stored.
 // Nothing here runs by itself: scripts/backfill-compact-projections.mjs plans by default and writes only on request, and
 // scripts/repair-compact-projection-hour.mjs (the scheduler's self-heal child) repairs exactly one stored hour.
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
@@ -334,7 +335,7 @@ export async function backfillProjectionHour({ provider, hour, v3Pools }) {
       }
     }
   }
-  return sink.finish({ families: hour.families, hourStart: null });
+  return sink.finish({ families: hour.families, hourStart: null, firstBlock: hour.firstBlock, lastBlock: hour.lastBlock });
 }
 
 // Runs a plan: boundary check for every target hour, then one projection commit per hour. A provider failure stops the

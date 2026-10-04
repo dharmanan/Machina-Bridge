@@ -20,17 +20,29 @@
 // - Activity: From is the top-level transaction sender from the verified block spine. The counterparty is only a field
 //   the event itself records: the V3 Swap recipient, the V3 Mint/Burn owner, the V4 ModifyLiquidity sender (the owner of
 //   the PoolManager position). A V4 Swap records no recipient, so it has none; tx.to or a router is never used.
+// - Price paths: per pool and hour, the pool's own price path from its Swap events (each records the pool's square-root
+//   price and in-range liquidity after the swap; mints and burns never move a Uniswap price). The end-of-block state after
+//   the block's last swap holds until the next swap, so from the hour's first swap through the hour's last block the path
+//   is exact: block-weighted sums of the square-root price and of the two virtual reserves. Blocks before the hour's first
+//   swap are not covered (the opening price would need another hour). Only data of the hour itself, so a live hour and a
+//   logs-only re-read give identical rows. valuation.js turns qualified paths into token prices; nothing here is a price.
 import { createHash } from 'node:crypto';
 import { decodeV4Initialize } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { keccak256 } from './keccak.js';
+import { blockState, validSqrtPrice } from './valuation.js';
 
 export const PROJECTION_VERSIONS = Object.freeze({
   uniswap_v3_pools: 'uniswap-v3-pool-hours-v1',
   uniswap_v4_pools: 'uniswap-v4-pool-hours-v1+initialize-pool-id-keccak',
   dex_activity: 'uniswap-dex-activity-v1',
+  uniswap_v3_price_paths: 'uniswap-v3-pool-price-path-v1',
+  uniswap_v4_price_paths: 'uniswap-v4-pool-price-path-v1',
 });
 export const PROJECTIONS = Object.freeze(Object.keys(PROJECTION_VERSIONS));
 export const POOL_PROJECTIONS = Object.freeze({ uniswap_v3_pools: 'uniswap_v3', uniswap_v4_pools: 'uniswap_v4' });
+export const PRICE_PATH_PROJECTIONS = Object.freeze({ uniswap_v3_price_paths: 'uniswap_v3', uniswap_v4_price_paths: 'uniswap_v4' });
+// The price path built from the same stream as each pool projection (a re-read of one stream rebuilds both).
+export const PRICE_PATH_OF_POOLS = Object.freeze({ uniswap_v3_pools: 'uniswap_v3_price_paths', uniswap_v4_pools: 'uniswap_v4_price_paths' });
 export const V4_POOL_KIND = 'uniswap_v4_pool';
 // Pool-hours are kept for 35 days (groundwork for 7D/30D); recent activity is bounded per kind.
 export const POOL_HOUR_RETENTION_HOURS = 35 * 24;
@@ -41,7 +53,8 @@ export const COUNTERPARTY_KINDS = Object.freeze(['swap_recipient', 'liquidity_ow
 // v4_swap_delta: signed V4 PoolManager swap delta as emitted, negative = into the pool, hook deltas excluded.
 export const AMOUNT_BASES = Object.freeze(['v3_pool_delta', 'v3_liquidity_amount', 'v4_swap_delta', 'none']);
 export const PROJECTION_REASONS = Object.freeze(['family_unavailable', 'reconciliation_mismatch', 'v4_pool_id_mismatch',
-  'duplicate_v4_initialize', 'malformed_v4_initialize', 'activity_spine_missing', 'projection_inputs_unavailable', 'projection_error']);
+  'duplicate_v4_initialize', 'malformed_v4_initialize', 'activity_spine_missing', 'projection_inputs_unavailable', 'projection_error',
+  'price_path_invalid', 'price_path_out_of_order']);
 
 const HOUR = 3600;
 const ADDRESS = /^0x[0-9a-f]{40}$/;
@@ -151,6 +164,30 @@ export function validActivityRow(row) {
   return false;
 }
 
+// One price-path row inside its range { firstBlock, lastBlock }: every swap block inside the range, the path closed at the
+// range's last block, exact non-negative integer sums, and valid Uniswap square-root prices.
+export function validPricePathRow(row, protocol, { firstBlock, lastBlock }) {
+  if (!row || (protocol === 'uniswap_v3' ? !ADDRESS.test(row.pool) : !POOL_ID.test(row.pool))) return false;
+  if (!Number.isSafeInteger(row.swapCount) || row.swapCount < 1 || !Number.isSafeInteger(row.firstSwapBlock) || !Number.isSafeInteger(row.lastSwapBlock)
+    || row.firstSwapBlock < firstBlock || row.lastSwapBlock > lastBlock || row.firstSwapBlock > row.lastSwapBlock
+    || row.pricedBlocks !== lastBlock - row.firstSwapBlock + 1) return false;
+  const integers = ['closeSqrtPriceX96', 'closeLiquidity', 'sqrtPriceBlockSum', 'reserve0BlockSum', 'reserve1BlockSum'];
+  if (!integers.every((field) => typeof row[field] === 'string' && UINT.test(row[field]))) return false;
+  return validSqrtPrice(BigInt(row.closeSqrtPriceX96)) && validSqrtPrice(BigInt(row.sqrtPriceBlockSum) / BigInt(row.pricedBlocks));
+}
+
+// Price paths reconcile with the family's swap counter and, when given, with the same hour's pool rows (exactly the pools
+// with swaps, with the same swap counts). Returns null when exact, else a reason.
+export function reconcilePricePaths(rows, family, poolRows = null) {
+  if (family?.status !== 'available') return 'family_unavailable';
+  if (sum(rows, 'swapCount') !== family.swapCount) return 'reconciliation_mismatch';
+  if (poolRows) {
+    const swapping = new Map(poolRows.filter((row) => row.swapCount > 0).map((row) => [row.pool, row.swapCount]));
+    if (swapping.size !== rows.length || rows.some((row) => swapping.get(row.pool) !== row.swapCount)) return 'reconciliation_mismatch';
+  }
+  return null;
+}
+
 // Newest `limit` rows per kind, ordered (block_number DESC, log_index DESC): the bounded recent activity.
 export const activityOrder = (left, right) => right.blockNumber - left.blockNumber || right.logIndex - left.logIndex;
 export function newestActivity(rows, limit = ACTIVITY_ROWS_PER_KIND) {
@@ -205,11 +242,31 @@ export function projectionRepairState({ families, projections, firstBlock, lastB
 const newPool = () => ({ swapCount: 0, token0In: 0n, token0Out: 0n, token1In: 0n, token1Out: 0n, addCount: 0, removeCount: 0, pokeCount: 0,
   add0: 0n, add1: 0n, remove0: 0n, remove1: 0n });
 
+// Adds `blocks` blocks of one end-of-block state to a price path's sums [sqrtPrice, reserve0, reserve1].
+function addSegment(sums, state, blocks) {
+  const weight = BigInt(blocks);
+  sums[0] += state.sqrtPrice * weight;
+  sums[1] += state.reserve0 * weight;
+  sums[2] += state.reserve1 * weight;
+}
+
+// A pool's price path closed at the range's last block (the state after its last swap holds through that block).
+function pricePathRow(pool, path, firstBlock, lastBlock) {
+  if (path.firstBlock < firstBlock || path.block > lastBlock) throw new ProjectionError('price_path_invalid');
+  const sums = [...path.sums];
+  addSegment(sums, path.state, lastBlock - path.block + 1);
+  return { pool, swapCount: path.swapCount, firstSwapBlock: path.firstBlock, lastSwapBlock: path.block, pricedBlocks: lastBlock - path.firstBlock + 1,
+    closeSqrtPriceX96: path.close[0], closeLiquidity: path.close[1], sqrtPriceBlockSum: sums[0].toString(10), reserve0BlockSum: sums[1].toString(10),
+    reserve1BlockSum: sums[2].toString(10) };
+}
+
 export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND } = {}) {
   const pools = { uniswap_v3: new Map(), uniswap_v4: new Map() };
+  const paths = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const created = [];
   const createdIds = new Set();
-  const failures = { uniswap_v3_pools: null, uniswap_v4_pools: null, dex_activity: activity ? null : 'projection_inputs_unavailable' };
+  const failures = { uniswap_v3_pools: null, uniswap_v4_pools: null, dex_activity: activity ? null : 'projection_inputs_unavailable',
+    uniswap_v3_price_paths: null, uniswap_v4_price_paths: null };
   const rings = { swap: [], add: [], remove: [] };
   const fail = (projection, error) => { failures[projection] ??= reasonOf(error); };
   const poolOf = (protocol, key) => {
@@ -217,6 +274,36 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
     if (!entry) pools[protocol].set(key, (entry = newPool()));
     return entry;
   };
+
+  // One Swap event of a pool's price path. Events must arrive in (block, logIndex) order, as every stream yields them;
+  // anything else, or a price outside Uniswap's range, makes the protocol's price paths unavailable for the hour.
+  function pricePath(protocol, key, log, event) {
+    const name = protocol === 'uniswap_v3' ? 'uniswap_v3_price_paths' : 'uniswap_v4_price_paths';
+    if (failures[name]) return;
+    try {
+      let state;
+      try { state = blockState(BigInt(event.sqrtPriceX96Raw), BigInt(event.liquidityRaw)); } catch { throw new ProjectionError('price_path_invalid'); }
+      const path = paths[protocol].get(key);
+      if (!path) {
+        paths[protocol].set(key, { swapCount: 1, firstBlock: log.blockNumber, block: log.blockNumber, logIndex: log.logIndex, state,
+          close: [event.sqrtPriceX96Raw, event.liquidityRaw], sums: [0n, 0n, 0n] });
+        return;
+      }
+      if (log.blockNumber < path.block || (log.blockNumber === path.block && log.logIndex <= path.logIndex)) {
+        throw new ProjectionError('price_path_out_of_order');
+      }
+      if (log.blockNumber > path.block) {
+        addSegment(path.sums, path.state, log.blockNumber - path.block);
+        path.block = log.blockNumber;
+      }
+      path.logIndex = log.logIndex;
+      path.state = state;
+      path.close = [event.sqrtPriceX96Raw, event.liquidityRaw];
+      path.swapCount += 1;
+    } catch (error) {
+      fail(name, error);
+    }
+  }
 
   function record(protocol, kind, log, window, fields) {
     if (!activity || failures.dex_activity) return;
@@ -261,6 +348,7 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
       } catch (error) {
         fail('uniswap_v3_pools', error);
       }
+      if (kind === 'swap') pricePath('uniswap_v3', log.address, log, event);
       if (!activityKind) return;
       record('uniswap_v3', activityKind, log, window, { row: kind === 'swap'
         ? { amount0Raw: event.amount0Raw, amount1Raw: event.amount1Raw, amountBasis: 'v3_pool_delta', counterparty: event.recipient, counterpartyKind: 'swap_recipient' }
@@ -299,13 +387,15 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
         fail('uniswap_v4_pools', error);
         return;
       }
+      if (kind === 'swap') pricePath('uniswap_v4', event.poolId, log, event);
       if (!activityKind) return;
       record('uniswap_v4', activityKind, log, window, { pool: event.poolId, row: activityKind === 'swap'
         ? { amount0Raw: event.amount0Raw, amount1Raw: event.amount1Raw, amountBasis: 'v4_swap_delta', counterparty: null, counterpartyKind: 'none' }
         : { amount0Raw: null, amount1Raw: null, amountBasis: 'none', counterparty: event.sender, counterpartyKind: 'event_sender' } });
     },
-    // families: the hour's finished family results (authoritative). hourStart: null for a plain block range. Never throws:
-    // the hour processor calls it after the families are final, and nothing here may fail an hour.
+    // families: the hour's finished family results (authoritative). hourStart: null for a plain block range. firstBlock /
+    // lastBlock: the range the events came from (price paths close at lastBlock; without them they are unavailable). Never
+    // throws: the hour processor calls it after the families are final, and nothing here may fail an hour.
     finish(input) {
       try {
         return finishProjections(input);
@@ -315,7 +405,27 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
     },
   });
 
-  function finishProjections({ families, hourStart = null }) {
+  function finishPricePaths(out, { families, firstBlock, lastBlock }) {
+    for (const [name, protocol] of Object.entries(PRICE_PATH_PROJECTIONS)) {
+      const family = families[protocol === 'uniswap_v3' ? 'uniswapV3' : 'uniswapV4'];
+      const pool = out[protocol === 'uniswap_v3' ? 'uniswap_v3_pools' : 'uniswap_v4_pools'];
+      let reason = family?.status !== 'available' ? 'family_unavailable' : failures[name]
+        ?? (!Number.isSafeInteger(firstBlock) || !Number.isSafeInteger(lastBlock) || lastBlock < firstBlock ? 'projection_inputs_unavailable' : null);
+      let rows = [];
+      if (!reason) {
+        try {
+          rows = [...paths[protocol].entries()].sort(([left], [right]) => (left < right ? -1 : 1))
+            .map(([key, path]) => pricePathRow(key, path, firstBlock, lastBlock));
+          reason = reconcilePricePaths(rows, family, pool.status === 'available' ? pool.rows : null);
+        } catch (error) {
+          reason = reasonOf(error);
+        }
+      }
+      out[name] = reason ? { status: 'unavailable', reason } : { status: 'available', rows, rowsSha256: sha256Of({ rows }) };
+    }
+  }
+
+  function finishProjections({ families, hourStart = null, firstBlock = null, lastBlock = null }) {
     const out = {};
     for (const [projection, protocol] of Object.entries(POOL_PROJECTIONS)) {
       const family = families[protocol === 'uniswap_v3' ? 'uniswapV3' : 'uniswapV4'];
@@ -339,6 +449,7 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
       const rows = newestActivity(Object.values(rings).flat(), activityLimit).map((row) => ({ ...row, hourStart }));
       out.dex_activity = { status: 'available', rows, rowsSha256: sha256Of({ rows }) };
     }
+    finishPricePaths(out, { families, firstBlock, lastBlock });
     return out;
   }
 }

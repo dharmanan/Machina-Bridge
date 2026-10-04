@@ -6,7 +6,10 @@
 // only the checkpoint's next hour is processed. An hour already stored with every family available is reported without
 // any RPC request; an hour stored with an unavailable family, or without a row for a family added later, is repaired.
 // Uniswap pool/activity projections (projections.js) come from the same requests and commit with the hour; they are not
-// families, so their status is reported but never makes the run fail or triggers a repair.
+// families, so their status is reported but never makes the run fail or triggers a repair. The hour's valuations (token
+// prices, DEX USD volume) are derived from stored rows in the same commit; afterwards a bounded pass derives them for stored
+// hours that have none yet (no RPC), and a bounded step reads ERC-20 metadata of at most METADATA_TOKENS_PER_RUN newly met
+// pool tokens (at most two batched eth_call requests). Neither step can fail the run.
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
@@ -18,6 +21,7 @@ import { locateHour, processHour } from '../server/compact/hour.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { bootstrapV3Registry, catchUpV3Registry } from '../server/compact/registry.js';
 import { createCompactStore } from '../server/compact/store.js';
+import { METADATA_TOKENS_PER_RUN, refreshTokenMetadata } from '../server/compact/token-metadata.js';
 
 // First block with official V3 factory code on Arc mainnet (eth_getCode: none at 1948018, present at 1948019). The
 // bootstrap still proves it: bootstrapV3Registry refuses a start that is not before the factory deployment.
@@ -25,6 +29,8 @@ export const V3_FACTORY_DEPLOYMENT_BLOCK = 1_948_019;
 export const SAFE_HEAD_MARGIN_BLOCKS = 200;
 export const DEFAULT_RPC_INTERVAL_MS = 1000;
 export const MIN_RPC_INTERVAL_MS = 500; // 250 ms drew HTTP 429 from the primary RPC after 11 requests
+// Stored hours without valuations derived per run, newest first (24 hours of a fresh window come first).
+export const VALUATION_HOURS_PER_RUN = 72;
 const HOUR = 3600;
 const mb = (bytes) => Math.round((bytes / 1048576) * 10) / 10;
 const iso = (seconds) => new Date(seconds * 1000).toISOString();
@@ -51,8 +57,8 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   safeHeadMargin = SAFE_HEAD_MARGIN_BLOCKS, print = console.log }) {
   const started = performance.now();
   const summary = { targetHour: iso(hourStart), sqlitePath, hourMode: null, repairFamilies: null, registryMode: null, registryBefore: null,
-    registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, checkpoint: null, provider: null, elapsedMs: null,
-    sqliteBytes: null, ok: false, reason: null, diagnostics: null };
+    registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, valuations: null, valuationPass: null,
+    metadata: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
   print(`TARGET_HOUR ${summary.targetHour}`);
   print(`SQLITE_PATH ${sqlitePath}`);
   let db = null;
@@ -95,10 +101,19 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
       } else summary.registryMode = 'reused';
       const result = await processHour({ provider, hourStart, safeHead, v3Registry: store.v3Registry(), bounds });
       summary.hourOutcome = store.commitHour(result).outcome;
+      // Display metadata of newly met pool tokens, read at the safe head. Never fails the run.
+      summary.metadata = await refreshTokenMetadata({ store, provider, blockNumber: safeHead, limit: METADATA_TOKENS_PER_RUN });
+    }
+    // Valuations of stored hours that have none yet (hours stored before valuations existed). No RPC; never fails the run.
+    try {
+      summary.valuationPass = { derived: store.derivePendingValuations({ limit: VALUATION_HOURS_PER_RUN }).hours.length, error: null };
+    } catch (error) {
+      summary.valuationPass = { derived: 0, error: error?.code ?? error?.message ?? 'valuation_pass_failed' };
     }
     // What is stored now, which a repair can only improve: an available family is never replaced or downgraded.
     summary.families = Object.fromEntries(store.familyRows(hourStart).map((row) => [row.family, statusOf(row)]));
     summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
+    summary.valuations = Object.fromEntries(store.valuationStatus(hourStart).map((row) => [row.valuation, statusOf(row)]));
     const after = store.v3Registry();
     summary.registryAfter = span(after);
     summary.officialV3Pools = after?.pools.size ?? null;
@@ -129,6 +144,12 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   print(`FAMILIES ${summary.families ? Object.entries(summary.families).map(([name, status]) => `${name}=${status}`).join(' ') : 'unknown'}`);
   print(`PROJECTIONS ${summary.projections && Object.keys(summary.projections).length
     ? Object.entries(summary.projections).map(([name, status]) => `${name}=${status}`).join(' ') : 'none'}`);
+  print(`VALUATIONS ${summary.valuations && Object.keys(summary.valuations).length
+    ? Object.entries(summary.valuations).map(([name, status]) => `${name}=${status}`).join(' ') : 'none'}`);
+  print(`VALUATION_PASS ${summary.valuationPass ? `derived=${summary.valuationPass.derived}${summary.valuationPass.error ? ` error=${summary.valuationPass.error}` : ''}` : 'not_reached'}`);
+  print(`TOKEN_METADATA ${summary.metadata ? `candidates=${summary.metadata.candidates} verified=${summary.metadata.verified} `
+    + `rejected=${summary.metadata.rejected} skipped=${summary.metadata.skipped} requests=${summary.metadata.requests}`
+    + `${summary.metadata.error ? ` error=${summary.metadata.error}` : ''}` : 'not_run'}`);
   print(`CHECKPOINT ${summary.checkpoint ? `${summary.checkpoint.hour} last_block=${summary.checkpoint.lastBlock}` : 'none'}`);
   print(`PROVIDER requests=${summary.provider.requests} retries=${summary.provider.retries} response_mb=${summary.provider.responseMbDecoded} `
     + `calls=${JSON.stringify(summary.provider.calls)}`);
