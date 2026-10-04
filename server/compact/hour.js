@@ -10,6 +10,7 @@ import {
   createUsdcAccumulator, FAMILY_FIELDS, FamilyError,
 } from './families.js';
 import { LogError, streamLogs, validateLogs } from './logs.js';
+import { createProjectionSink } from './projections.js';
 import { PROTOCOL_FAMILIES } from './protocols/index.js';
 import { ARC_CHAIN_ID, ProviderError } from './provider.js';
 import { codeIsPresent } from './registry.js';
@@ -45,15 +46,18 @@ function registryGap(registry, first, before) {
 // v3Registry: { through, throughHash, pools: Set } (registry.js registrySnapshot or store.js v3Registry).
 // streams: a subset only for bounded tests; a family missing any of its streams is unavailable, never zero.
 // onLogs (optional, for validation tooling) sees each validated log response per stream; it must not keep them all.
+// projections: the Uniswap pool/activity projections (projections.js) are fed from the same validated, decoded events the
+// V3/V4 families count, before the logs are released: no extra request. false only to prove that in tests.
 export async function processBlockRange({ provider, first, last, before, after = null, hourStart = null, hourEnd = null,
-  windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null }) {
+  windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null, projections = true }) {
   const network = createNetworkAccumulator();
+  const projection = projections ? createProjectionSink() : null;
   const families = {
     usdc: { accumulator: createUsdcAccumulator(), error: null, codeAddresses: [] },
     assets: { accumulator: createAssetsAccumulator(), error: null, codeAddresses: [] },
-    uniswapV3: { accumulator: createUniswapV3Accumulator({ registry: v3Registry }), error: registryGap(v3Registry, first, before),
+    uniswapV3: { accumulator: createUniswapV3Accumulator({ registry: v3Registry, projection }), error: registryGap(v3Registry, first, before),
       codeAddresses: [UNISWAP_REGISTRY.v3Factory.address] },
-    uniswapV4: { accumulator: createUniswapV4Accumulator(), error: null, codeAddresses: [UNISWAP_REGISTRY.v4PoolManager.address] },
+    uniswapV4: { accumulator: createUniswapV4Accumulator({ projection }), error: null, codeAddresses: [UNISWAP_REGISTRY.v4PoolManager.address] },
     ...Object.fromEntries(PROTOCOL_FAMILIES.map((family) => [family.name,
       { accumulator: family.create(), error: null, codeAddresses: family.codeAddresses }])),
   };
@@ -155,6 +159,8 @@ export async function processBlockRange({ provider, first, last, before, after =
       uniswapV3: results.uniswapV3.status === 'available'
         ? { through: lastBlock.number, throughHash: lastBlock.hash, created: families.uniswapV3.accumulator.createdPools() } : null,
     },
+    // Not families: separate status, storage and versions (store.js). Present only when computed.
+    ...(projection ? { projections: projection.finish({ families: results, hourStart }) } : {}),
   };
 }
 
@@ -191,12 +197,12 @@ export async function locateHour({ provider, hourStart, safeHead }) {
 // any registry that covers the blocks before the hour classifies V3 emitters the same way. `bounds` (from locateHour)
 // skips the boundary search; it is checked again here and the spine re-validates every block against it.
 export async function processHour({ provider, hourStart, safeHead, windowBlocks = DEFAULT_WINDOW_BLOCKS, onLogs = null, v3Registry = null,
-  bounds = null }) {
+  bounds = null, projections = true }) {
   if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
   const hourEnd = hourStart + HOUR_SECONDS;
   const { before, first, last, after } = bounds ? checkedBounds(bounds, hourStart) : await locateHour({ provider, hourStart, safeHead });
   const result = await processBlockRange({ provider, first: first.number, last: last.number, before, after, hourStart, hourEnd,
-    windowBlocks, onLogs, v3Registry });
+    windowBlocks, onLogs, v3Registry, projections });
   if (result.range.firstHash !== first.hash || result.range.lastHash !== last.hash) throw new HourIncompleteError('boundary_hash_mismatch');
   return result;
 }

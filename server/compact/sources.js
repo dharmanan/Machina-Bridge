@@ -55,6 +55,11 @@ export const LOG_STREAMS = Object.freeze([
     ...(stream.dense ? { maxRange: DENSE_LOG_RANGE_BLOCKS } : {}) }))),
 ]);
 
+// Uniswap V4 pool registry only (registry.js): Initialize alone, sparse, so each request may cover the provider maximum
+// (10,000 blocks). Deliberately not in LOG_STREAMS: the hour processor already receives Initialize through `v4`.
+export const V4_INITIALIZE_STREAM = Object.freeze({ key: 'v4Initialize', address: Object.freeze([UNISWAP_REGISTRY.v4PoolManager.address]),
+  topics: Object.freeze([UNISWAP_EVENT_TOPICS.v4Initialize]) });
+
 // Which result family each stream feeds. A family is unavailable as soon as any of its streams is.
 export const FAMILY_STREAMS = Object.freeze({
   usdc: Object.freeze(['usdc']),

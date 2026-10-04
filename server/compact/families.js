@@ -110,7 +110,9 @@ export function createAssetsAccumulator() {
 // registry: { pools: Set of official pool addresses } covering every block before the range (hour.js checks coverage).
 // Pools created inside the range join an in-memory overlay first: the factory stream of a window is always consumed
 // before that window's pool stream, so a pool created and used in the same block is counted.
-export function createUniswapV3Accumulator({ registry }) {
+// projection (optional, projections.js sink): receives each official event already decoded here, before the logs are
+// released. It never throws and never changes anything this accumulator counts; foreign emitters never reach it.
+export function createUniswapV3Accumulator({ registry, projection = null }) {
   let poolCreatedCount = 0, swapCount = 0, mintCount = 0, burnCount = 0, foreignEventCount = 0;
   const created = new Map();
   const traders = new Set();
@@ -137,13 +139,15 @@ export function createUniswapV3Accumulator({ registry }) {
           continue;
         }
         const [kind, decode] = decoders[log.topics[0]];
-        if (!decode(log)) throw new FamilyError('malformed_v3_pool_event');
+        const event = decode(log);
+        if (!event) throw new FamilyError('malformed_v3_pool_event');
         if (kind === 'swap') {
           swapCount += 1;
           traders.add(senderOf(window, log));
           swapPools.add(log.address);
         } else if (kind === 'mint') mintCount += 1;
         else burnCount += 1;
+        projection?.v3(kind, log, event, window);
       }
     },
     // Official pools created inside the range, in chain order: the registry rows this range adds.
@@ -156,7 +160,8 @@ export function createUniswapV3Accumulator({ registry }) {
   };
 }
 
-export function createUniswapV4Accumulator() {
+// projection (optional, projections.js sink): as for V3, every decoded PoolManager event, never affecting these counts.
+export function createUniswapV4Accumulator({ projection = null } = {}) {
   let initializeCount = 0, swapCount = 0, modifyLiquidityCount = 0;
   const traders = new Set();
   const swapPools = new Set();
@@ -170,12 +175,17 @@ export function createUniswapV4Accumulator() {
           swapCount += 1;
           traders.add(senderOf(window, log));
           swapPools.add(event.poolId);
+          projection?.v4('swap', log, event, window);
         } else if (topic === UNISWAP_EVENT_TOPICS.v4ModifyLiquidity) {
-          if (!decodeV4ModifyLiquidity(log)) throw new FamilyError('malformed_v4_modify_liquidity');
+          const event = decodeV4ModifyLiquidity(log);
+          if (!event) throw new FamilyError('malformed_v4_modify_liquidity');
           modifyLiquidityCount += 1;
+          projection?.v4('modify', log, event, window);
         } else if (topic === UNISWAP_EVENT_TOPICS.v4Initialize) {
-          if (!decodeV4Initialize(log)) throw new FamilyError('malformed_v4_initialize');
+          const event = decodeV4Initialize(log);
+          if (!event) throw new FamilyError('malformed_v4_initialize');
           initializeCount += 1;
+          projection?.v4('initialize', log, event, window);
         }
       }
     },

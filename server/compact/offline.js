@@ -5,6 +5,7 @@
 import { USDC_SYSTEM_EMITTER, TRANSFER_TOPIC } from '../../api/_lib/arc-intelligence/usdc.js';
 import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { encodeCall } from './abi.js';
+import { v4PoolIdOf } from './projections.js';
 import { AAVE_V4_ARC, AAVE_V4_EVENTS } from './protocols/aave.js';
 import { ACROSS_ARC, ACROSS_EVENTS } from './protocols/across.js';
 import { CCTP_EVENTS, CIRCLE_ARC, GATEWAY_EVENTS } from './protocols/circle.js';
@@ -83,6 +84,14 @@ const V4_SWAP_DATA = [
 ];
 const V4_POOLS = ['0x96fbcfa73dfb947230681cb211fcd0fba8221fbcddbdb3375c795add2afad714', '0xa5edcec276913c24bb618b5836cbcc44e94f32e80f7fc74a8a4aa597e2af7ac9'];
 const V4_ROUTER = '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1';
+export const SYNTHETIC_V4_HOOKS = address('400c', 1);
+// The PoolKey behind each synthetic Initialize (every 3001st block): native currency (0x0) in every third pool, a hooked
+// pool in every other one, and a tickSpacing unique per block, so every poolId is distinct and equals keccak256(PoolKey).
+export function syntheticV4PoolKey(number) {
+  const n = Math.floor(number / 3001);
+  return { currency0: n % 3 === 0 ? ZERO : SYNTHETIC_CONTRACTS.tokenA, currency1: SYNTHETIC_CONTRACTS.tokenB, fee: 500,
+    tickSpacing: 1 + (n % 32767), hooks: n % 2 === 1 ? SYNTHETIC_V4_HOOKS : ZERO };
+}
 
 // Protocol families (Stage 3): official emitters from protocols/*.js, plus synthetic markets, reserves and vaults.
 const USDC_INTERFACE = CIRCLE_ARC.usdc;
@@ -252,12 +261,13 @@ function protocolCall(target, data) {
 }
 
 // Block spacing in 1/10,000 s: by default 0.5074 s with integer-second timestamps, so neighbours often share a second,
-// like Arc. The official V3 factory has code from factoryDeployedAt; the official pool (validV3Pool) emits nothing before
-// its PoolCreated at poolCreatedAt and swaps in that same block right after it. foreignV3Emitters distinct contracts emit
-// V3-signature swaps every foreignV3Every blocks without ever appearing in a PoolCreated.
+// like Arc. The official V3 factory has code from factoryDeployedAt, the V4 PoolManager from poolManagerDeployedAt; the
+// official pool (validV3Pool) emits nothing before its PoolCreated at poolCreatedAt and swaps in that same block right after
+// it. foreignV3Emitters distinct contracts emit V3-signature swaps every foreignV3Every blocks without ever appearing in a
+// PoolCreated.
 export function createSyntheticChain({ originNumber = 23_000_000, originTimestamp = 1_790_000_000, blockSpacing = 5074, txPerBlock = 6,
   usdcPerBlock = 10, v4PerBlock = 5, senderPool = 4000, recipientPool = 2500, assetEvery = 40, v3Every = 300,
-  factoryDeployedAt = originNumber, poolCreatedAt = originNumber, foreignV3Emitters = 1, foreignV3Every = v3Every,
+  factoryDeployedAt = originNumber, poolManagerDeployedAt = 0, poolCreatedAt = originNumber, foreignV3Emitters = 1, foreignV3Every = v3Every,
   head = originNumber + 20_000, protocols = true, limits = {}, faults = {}, seed = 0x6d61 } = {}) {
   const maxRange = limits.maxRange ?? 10000;
   const maxResults = limits.maxResults ?? Infinity;
@@ -335,9 +345,10 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
           data: `0x${word(-600)}${word(600)}${word(10n ** 15n)}${word(r)}` };
       }
       if (kind === 'v4Initialize') {
+        const key = syntheticV4PoolKey(number);
         return { ...base, address: UNISWAP_REGISTRY.v4PoolManager.address,
-          topics: [UNISWAP_EVENT_TOPICS.v4Initialize, `0x${word(r)}`, topicOf(SYNTHETIC_CONTRACTS.tokenA), topicOf(SYNTHETIC_CONTRACTS.tokenB)],
-          data: `0x${word(500)}${word(10)}${word(0)}${word(1n << 96n)}${word(0)}` };
+          topics: [UNISWAP_EVENT_TOPICS.v4Initialize, v4PoolIdOf(key), topicOf(key.currency0), topicOf(key.currency1)],
+          data: `0x${word(key.fee)}${word(key.tickSpacing)}${word(BigInt(key.hooks))}${word(1n << 96n)}${word(0)}` };
       }
       if (kind === 'v3PoolCreated') {
         return { ...base, address: UNISWAP_REGISTRY.v3Factory.address,
@@ -374,7 +385,7 @@ export function createSyntheticChain({ originNumber = 23_000_000, originTimestam
   // Contract code by block: the V4 PoolManager and the protocol contracts always, the V3 factory from its deployment block.
   function codeAt(target, blockTag) {
     const at = /^0x[0-9a-f]+$/i.test(blockTag ?? '') ? Number(BigInt(blockTag)) : head;
-    const present = target === UNISWAP_REGISTRY.v4PoolManager.address || PROTOCOL_CODE.has(target)
+    const present = (target === UNISWAP_REGISTRY.v4PoolManager.address && at >= poolManagerDeployedAt) || PROTOCOL_CODE.has(target)
       || (target === UNISWAP_REGISTRY.v3Factory.address && at >= factoryDeployedAt);
     return (faults.code ? faults.code(target, present) : present) ? '0x6080604052348015600f57600080fd5b50' : '0x';
   }

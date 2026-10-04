@@ -595,8 +595,8 @@ if (!sqlite) {
   const rows = (db) => db.prepare('SELECT hour_start, network_sha256 FROM compact_hours ORDER BY hour_start').all()
     .map((row) => `${row.hour_start}:${row.network_sha256}`);
   const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
-  const TABLES = ['compact_checkpoint', 'compact_family_hours', 'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_registry',
-    'compact_registry_coverage'];
+  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_family_hours', 'compact_hour_addresses', 'compact_hours', 'compact_meta',
+    'compact_pool_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage'];
   const metricsOf = (family, name) => Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, family[field]]));
   try {
     await test('sqlite: schema v2 is created with WAL, synchronous=NORMAL and busy_timeout=5000; reopening keeps it', async () => {
@@ -818,7 +818,7 @@ if (!sqlite) {
       const extended = store.v3Registry();
       assert.deepEqual([extended.through, extended.throughHash, [...extended.pools]], [expectedLast, hour.range.lastHash, [SYNTHETIC_CONTRACTS.validV3Pool]]);
       assert.equal(store.commitHour(hour).outcome, 'unchanged');
-      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_registry').get().count, 1);
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM compact_registry WHERE kind = 'uniswap_v3_pool'").get().count, 1);
       const next = await processHour({ provider, hourStart: HOUR + 3600, safeHead: ORIGIN.originNumber + 25_000, v3Registry: store.v3Registry() });
       assert.equal(digest(next), digest(hours[1]), 'the next hour runs from the stored registry, with no scan');
       store.commitHour(next);
@@ -873,7 +873,8 @@ if (!sqlite) {
       assert((familyText.match(/0x[0-9a-f]{64}/g) ?? []).every((value) => value in SYNTHETIC_PROTOCOL.morphoMarkets));
       assert(db.prepare('SELECT MAX(LENGTH(metrics_json)) AS size FROM compact_family_hours').get().size < 4096);
       assert(db.prepare('SELECT MAX(LENGTH(network_json)) AS size FROM compact_hours').get().size < 1024);
-      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_registry').get().count, 1, 'one official pool, written once');
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM compact_registry WHERE kind = 'uniswap_v3_pool'").get().count, 1,
+        'one official V3 pool, written once');
       assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_hour_addresses').get().count,
         hours.reduce((sum, hour) => sum + hour.network.uniqueActiveAddresses, 0), 'one 20-byte identity per active address per hour');
       db.close();

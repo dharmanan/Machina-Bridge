@@ -9,8 +9,16 @@
 // before anything is written: a changed definition needs an explicit migration, never a silent mix of old and new rows.
 // A family added later (Stage 3: protocol families) has no row for hours stored before it; replaying such an hour inserts
 // its row (outcome `upgraded`) without touching the hour, its other families or the checkpoint.
+// Projections (projections.js: Uniswap pool-hours, recent DEX activity, the V4 pool registry) are additive and are NOT
+// families: own tables, own status rows (compact_projection_hours), own `projection_version:<name>` meta rows. They are
+// written in the same transaction as their hour, re-validated and re-reconciled here against the hour's family counters,
+// and a projection that fails any check is stored as unavailable, never partially, without blocking its hour.
 import { createHash } from 'node:crypto';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
+import {
+  ACTIVITY_KINDS, ACTIVITY_ROWS_PER_KIND, POOL_PROJECTIONS, poolHourCutoff, PROJECTION_REASONS, PROJECTION_VERSIONS, PROJECTIONS,
+  reconcilePoolRows, sha256Of, V4_POOL_KIND, validActivityRow, validPoolRow, validV4Record,
+} from './projections.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
@@ -80,7 +88,59 @@ CREATE TABLE IF NOT EXISTS compact_checkpoint (
   hour_start INTEGER NOT NULL,
   last_block INTEGER NOT NULL,
   last_hash TEXT NOT NULL
-) STRICT;`;
+) STRICT;
+CREATE TABLE IF NOT EXISTS compact_projection_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  projection TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  row_count INTEGER,
+  rows_sha256 TEXT,
+  PRIMARY KEY (hour_start, projection),
+  CHECK ((status = 'available' AND reason IS NULL AND row_count IS NOT NULL AND rows_sha256 IS NOT NULL)
+    OR (status = 'unavailable' AND reason IS NOT NULL AND row_count IS NULL AND rows_sha256 IS NULL))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_pool_hours (
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  pool TEXT NOT NULL,
+  swap_count INTEGER NOT NULL CHECK (swap_count >= 0),
+  token0_in_raw TEXT NOT NULL,
+  token0_out_raw TEXT NOT NULL,
+  token1_in_raw TEXT NOT NULL,
+  token1_out_raw TEXT NOT NULL,
+  add_count INTEGER NOT NULL CHECK (add_count >= 0),
+  remove_count INTEGER NOT NULL CHECK (remove_count >= 0),
+  poke_count INTEGER NOT NULL CHECK (poke_count >= 0),
+  add_amount0_raw TEXT,
+  add_amount1_raw TEXT,
+  remove_amount0_raw TEXT,
+  remove_amount1_raw TEXT,
+  PRIMARY KEY (hour_start, protocol, pool),
+  CHECK ((protocol = 'uniswap_v3' AND add_amount0_raw IS NOT NULL AND add_amount1_raw IS NOT NULL
+      AND remove_amount0_raw IS NOT NULL AND remove_amount1_raw IS NOT NULL)
+    OR (protocol = 'uniswap_v4' AND add_amount0_raw IS NULL AND add_amount1_raw IS NULL
+      AND remove_amount0_raw IS NULL AND remove_amount1_raw IS NULL))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_dex_activity (
+  block_number INTEGER NOT NULL,
+  log_index INTEGER NOT NULL,
+  hour_start INTEGER NOT NULL REFERENCES compact_hours (hour_start),
+  block_timestamp INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL,
+  tx_from TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol IN ('uniswap_v3', 'uniswap_v4')),
+  kind TEXT NOT NULL CHECK (kind IN ('swap', 'add', 'remove')),
+  pool TEXT NOT NULL,
+  amount0_raw TEXT,
+  amount1_raw TEXT,
+  amount_basis TEXT NOT NULL CHECK (amount_basis IN ('v3_pool_delta', 'v3_liquidity_amount', 'v4_swap_delta', 'none')),
+  counterparty TEXT,
+  counterparty_kind TEXT NOT NULL CHECK (counterparty_kind IN ('swap_recipient', 'liquidity_owner', 'event_sender', 'none')),
+  PRIMARY KEY (block_number, log_index),
+  CHECK ((counterparty_kind = 'none') = (counterparty IS NULL))
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS compact_dex_activity_kind ON compact_dex_activity (kind, block_number DESC, log_index DESC);`;
 
 // Key-sorted JSON, so a hash depends on values only and never on property order.
 function canonical(value) {
@@ -122,7 +182,55 @@ function hourRows(result) {
     throw new StoreError('hour_inconsistent');
   }
   const networkJson = canonical(network);
-  return { families, v3, networkJson, networkSha: sha256(canonical({ definitionVersion: result.definitionVersion, range, network })) };
+  // Projections never make an hour invalid: a missing set is simply not written; a bad one is stored as unavailable.
+  const projections = result.projections === undefined ? null : normalizeProjections(result.projections, range, result.families);
+  return { families, v3, networkJson, networkSha: sha256(canonical({ definitionVersion: result.definitionVersion, range, network })), projections };
+}
+
+const PROTOCOL_FAMILY = Object.freeze({ uniswap_v3: 'uniswapV3', uniswap_v4: 'uniswapV4' });
+const unavailableProjection = (reason) => ({ status: 'unavailable', reason: PROJECTION_REASONS.includes(reason) ? reason : 'projection_error' });
+
+// Re-validates a projection set (from the hour processor or the projection backfill) against its hour before anything is
+// written: row shapes, V4 registry records (poolId = keccak256(PoolKey)), activity rows inside the hour, digests, and an
+// exact reconciliation with the hour's family counters. Anything that fails becomes unavailable; nothing is partial.
+// range: { hourStart, firstBlock, lastBlock }. families: { uniswapV3, uniswapV4 } results or stored metrics with status.
+function normalizeProjections(projections, range, families) {
+  const out = {};
+  for (const [name, protocol] of Object.entries(POOL_PROJECTIONS)) {
+    const entry = projections?.[name];
+    if (entry?.status !== 'available') {
+      out[name] = unavailableProjection(entry?.reason);
+      continue;
+    }
+    const { rows } = entry;
+    const registry = protocol === 'uniswap_v4' ? entry.registry : undefined;
+    const valid = Array.isArray(rows) && rows.every((row) => validPoolRow(row, protocol)) && new Set(rows.map((row) => row.pool)).size === rows.length
+      && (protocol === 'uniswap_v3' || (Array.isArray(registry) && new Set(registry.map((pool) => pool?.poolId)).size === registry.length
+        && registry.every((pool) => validV4Record(pool) && pool.createdBlock >= range.firstBlock && pool.createdBlock <= range.lastBlock)));
+    if (!valid) {
+      out[name] = unavailableProjection('projection_error');
+      continue;
+    }
+    const reason = reconcilePoolRows(name, rows, families?.[PROTOCOL_FAMILY[protocol]], { initializeCount: registry ? registry.length : null });
+    const sha = sha256Of(registry ? { rows, registry } : { rows });
+    if (reason || (entry.rowsSha256 !== undefined && entry.rowsSha256 !== sha)) out[name] = unavailableProjection(reason ?? 'projection_error');
+    else out[name] = { status: 'available', rows, registry, sha };
+  }
+  const activity = projections?.dex_activity;
+  if (activity?.status !== 'available') out.dex_activity = unavailableProjection(activity?.reason);
+  else if (out.uniswap_v3_pools.status !== 'available' || out.uniswap_v4_pools.status !== 'available') {
+    out.dex_activity = unavailableProjection('projection_inputs_unavailable');
+  } else {
+    const { rows } = activity;
+    const valid = Array.isArray(rows) && rows.every((row) => validActivityRow(row) && row.hourStart === range.hourStart
+      && row.blockNumber >= range.firstBlock && row.blockNumber <= range.lastBlock)
+      && new Set(rows.map((row) => `${row.blockNumber}:${row.logIndex}`)).size === rows.length
+      && ACTIVITY_KINDS.every((kind) => rows.filter((row) => row.kind === kind).length <= ACTIVITY_ROWS_PER_KIND);
+    const sha = valid ? sha256Of({ rows }) : null;
+    out.dex_activity = !valid || (activity.rowsSha256 !== undefined && activity.rowsSha256 !== sha) ? unavailableProjection('projection_error')
+      : { status: 'available', rows, sha };
+  }
+  return out;
 }
 
 export function createCompactStore(db) {
@@ -144,6 +252,13 @@ export function createCompactStore(db) {
       setMeta.run(`family_version:${name}`, version);
       if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get(`family_version:${name}`)?.value !== version) {
         throw new StoreError('family_definition_mismatch');
+      }
+    }
+    // Projection definitions, recorded like families but under their own prefix: never a family, never in repair logic.
+    for (const [name, version] of Object.entries(PROJECTION_VERSIONS)) {
+      setMeta.run(`projection_version:${name}`, version);
+      if (db.prepare('SELECT value FROM compact_meta WHERE key = ?').get(`projection_version:${name}`)?.value !== version) {
+        throw new StoreError('projection_definition_mismatch');
       }
     }
     db.exec('COMMIT');
@@ -179,6 +294,30 @@ export function createCompactStore(db) {
     coverage: db.prepare('SELECT from_block, through_block, through_hash FROM compact_registry_coverage WHERE kind = ?'),
     setCoverage: db.prepare(`INSERT INTO compact_registry_coverage (kind, from_block, through_block, through_hash) VALUES (?, ?, ?, ?)
       ON CONFLICT (kind) DO UPDATE SET through_block = excluded.through_block, through_hash = excluded.through_hash`),
+    hourRange: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash FROM compact_hours WHERE hour_start = ?'),
+    uniswapFamilies: db.prepare(`SELECT family, status, metrics_json FROM compact_family_hours WHERE hour_start = ?
+      AND family IN ('uniswapV3', 'uniswapV4')`),
+    projection: db.prepare('SELECT status, rows_sha256 FROM compact_projection_hours WHERE hour_start = ? AND projection = ?'),
+    projections: db.prepare(`SELECT projection, status, reason, row_count, rows_sha256 FROM compact_projection_hours WHERE hour_start = ?
+      ORDER BY projection`),
+    insertProjection: db.prepare(`INSERT INTO compact_projection_hours (hour_start, projection, status, reason, row_count, rows_sha256)
+      VALUES (?, ?, ?, ?, ?, ?)`),
+    upgradeProjection: db.prepare(`UPDATE compact_projection_hours SET status = 'available', reason = NULL, row_count = ?, rows_sha256 = ?
+      WHERE hour_start = ? AND projection = ? AND status = 'unavailable'`),
+    insertPoolHour: db.prepare(`INSERT INTO compact_pool_hours (hour_start, protocol, pool, swap_count, token0_in_raw, token0_out_raw,
+      token1_in_raw, token1_out_raw, add_count, remove_count, poke_count, add_amount0_raw, add_amount1_raw, remove_amount0_raw,
+      remove_amount1_raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    poolHours: db.prepare('SELECT * FROM compact_pool_hours WHERE hour_start = ? AND protocol = ? ORDER BY pool'),
+    insertActivity: db.prepare(`INSERT OR IGNORE INTO compact_dex_activity (block_number, log_index, hour_start, block_timestamp, tx_hash,
+      tx_from, protocol, kind, pool, amount0_raw, amount1_raw, amount_basis, counterparty, counterparty_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    pruneActivity: db.prepare(`DELETE FROM compact_dex_activity WHERE kind = ? AND (block_number, log_index) NOT IN
+      (SELECT block_number, log_index FROM compact_dex_activity WHERE kind = ? ORDER BY block_number DESC, log_index DESC LIMIT ?)`),
+    activity: db.prepare(`SELECT * FROM compact_dex_activity WHERE (?1 IS NULL OR kind = ?1)
+      ORDER BY block_number DESC, log_index DESC LIMIT ?2`),
+    prunePoolHours: db.prepare('DELETE FROM compact_pool_hours WHERE hour_start <= ?'),
+    pruneProjectionHours: db.prepare('DELETE FROM compact_projection_hours WHERE hour_start <= ?'),
+    registryCount: db.prepare('SELECT COUNT(*) AS count FROM compact_registry WHERE kind = ?'),
     checkpoint: db.prepare('SELECT hour_start, last_block, last_hash FROM compact_checkpoint WHERE id = 1'),
     setCheckpoint: db.prepare(`INSERT INTO compact_checkpoint (id, hour_start, last_block, last_hash) VALUES (1, ?, ?, ?)
       ON CONFLICT (id) DO UPDATE SET hour_start = excluded.hour_start, last_block = excluded.last_block, last_hash = excluded.last_hash`),
@@ -188,10 +327,11 @@ export function createCompactStore(db) {
     return row ? { hourStart: row.hour_start, lastBlock: row.last_block, lastHash: row.last_hash } : null;
   };
   const moveCheckpoint = (row) => sql.setCheckpoint.run(int(row.hour_start), int(row.last_block), row.last_hash);
-  const coverage = () => {
-    const row = sql.coverage.get(V3_POOL_KIND);
+  const coverageOf = (kind) => {
+    const row = sql.coverage.get(kind);
     return row ? { fromBlock: row.from_block, through: row.through_block, throughHash: row.through_hash } : null;
   };
+  const coverage = () => coverageOf(V3_POOL_KIND);
 
   function transaction(work, beforeCommit = null) {
     db.exec('BEGIN IMMEDIATE');
@@ -224,29 +364,101 @@ export function createCompactStore(db) {
     sql.pruneAddresses.run(int(horizon));
   }
 
+  // Registry row identity and metadata per kind. V3: the official pool address. V4: the PoolManager poolId, with its full
+  // PoolKey (currency 0x0 is the native currency, hooks kept: hooked pools are part of all-pair coverage).
+  const REGISTRY_ROW = Object.freeze({
+    [V3_POOL_KIND]: (pool) => [pool.address, canonical({ token0: pool.token0, token1: pool.token1, fee: pool.fee, tickSpacing: pool.tickSpacing })],
+    [V4_POOL_KIND]: (pool) => [pool.poolId, canonical({ currency0: pool.currency0, currency1: pool.currency1, fee: pool.fee,
+      tickSpacing: pool.tickSpacing, hooks: pool.hooks })],
+  });
+
   // A pool row is written once; the same pool can never be recorded with another creation log.
-  function insertPools(created) {
+  function insertRegistryRows(kind, created) {
     for (const pool of created) {
-      const stored = sql.pool.get(V3_POOL_KIND, pool.address);
+      const [key, meta] = REGISTRY_ROW[kind](pool);
+      const stored = sql.pool.get(kind, key);
       if (stored) {
         if (stored.created_block !== pool.createdBlock || stored.created_log_index !== pool.createdLogIndex || stored.created_tx !== pool.createdTx) {
           throw new StoreError('registry_conflict');
         }
         continue;
       }
-      sql.insertPool.run(V3_POOL_KIND, pool.address, int(pool.createdBlock), int(pool.createdLogIndex), pool.createdTx,
-        canonical({ token0: pool.token0, token1: pool.token1, fee: pool.fee, tickSpacing: pool.tickSpacing }));
+      sql.insertPool.run(kind, key, int(pool.createdBlock), int(pool.createdLogIndex), pool.createdTx, meta);
     }
+  }
+  const insertPools = (created) => insertRegistryRows(V3_POOL_KIND, created);
+
+  // A range whose creation logs were all validated extends a registry that reaches the block before it (with the same
+  // hash) or into it, through the range's last block. Coverage never skips a gap.
+  function advanceCoverage(kind, range) {
+    const current = coverageOf(kind);
+    if (!current || current.through >= range.lastBlock || current.through < range.firstBlock - 1) return;
+    if (current.through === range.firstBlock - 1 && current.throughHash !== range.parentHash) return;
+    sql.setCoverage.run(kind, int(current.fromBlock), int(range.lastBlock), range.lastHash);
   }
 
   // An hour with V3 available validated all of its PoolCreated logs against its spine, so a registry that reaches the
   // block before the hour (with the same hash) or into the hour becomes complete through the hour's last block.
   function advanceRegistry(range, v3) {
     insertPools(v3.created);
-    const current = coverage();
-    if (!current || current.through >= range.lastBlock || current.through < range.firstBlock - 1) return;
-    if (current.through === range.firstBlock - 1 && current.throughHash !== range.parentHash) return;
-    sql.setCoverage.run(V3_POOL_KIND, int(current.fromBlock), int(range.lastBlock), range.lastHash);
+    advanceCoverage(V3_POOL_KIND, range);
+  }
+
+  // Writes one hour's normalized projections (see normalizeProjections). An available projection is immutable: a later
+  // identical one is `unchanged`, a different one is reported as `conflict` and nothing is replaced. An unavailable one is
+  // upgraded when an available one arrives. Recent activity is idempotent by (block_number, log_index) and pruned to the
+  // newest rows per kind; pool-hours and projection status rows follow the 35-day retention. Returns name -> outcome.
+  function writeProjections(range, normalized) {
+    const hour = int(range.hourStart);
+    const report = {};
+    const projections = { ...normalized };
+    // A poolId already stored with another creation log cannot be initialized twice on one chain: that hour's V4 projection
+    // (and the activity that depends on it) is unavailable, while the hour and its families still commit.
+    const v4 = projections.uniswap_v4_pools;
+    if (v4.status === 'available' && v4.registry.some((pool) => {
+      const stored = sql.pool.get(V4_POOL_KIND, pool.poolId);
+      return stored && (stored.created_block !== pool.createdBlock || stored.created_log_index !== pool.createdLogIndex || stored.created_tx !== pool.createdTx);
+    })) {
+      projections.uniswap_v4_pools = unavailableProjection('duplicate_v4_initialize');
+      if (projections.dex_activity.status === 'available') projections.dex_activity = unavailableProjection('projection_inputs_unavailable');
+    }
+    for (const name of PROJECTIONS) {
+      const entry = projections[name];
+      const stored = sql.projection.get(hour, name);
+      if (stored?.status === 'available') {
+        report[name] = entry.status === 'available' && entry.sha !== stored.rows_sha256 ? 'conflict' : 'unchanged';
+        continue;
+      }
+      if (entry.status !== 'available') {
+        if (!stored) sql.insertProjection.run(hour, name, 'unavailable', entry.reason, null, null);
+        report[name] = stored ? 'unchanged' : 'unavailable';
+        continue;
+      }
+      if (name === 'dex_activity') {
+        for (const row of entry.rows) {
+          sql.insertActivity.run(int(row.blockNumber), int(row.logIndex), hour, int(row.blockTimestamp), row.txHash, row.txFrom, row.protocol,
+            row.kind, row.pool, row.amount0Raw, row.amount1Raw, row.amountBasis, row.counterparty, row.counterpartyKind);
+        }
+      } else {
+        const protocol = POOL_PROJECTIONS[name];
+        for (const row of entry.rows) {
+          sql.insertPoolHour.run(hour, protocol, row.pool, int(row.swapCount), row.token0InRaw, row.token0OutRaw, row.token1InRaw, row.token1OutRaw,
+            int(row.addCount), int(row.removeCount), int(row.pokeCount), row.addAmount0Raw, row.addAmount1Raw, row.removeAmount0Raw, row.removeAmount1Raw);
+        }
+        if (protocol === 'uniswap_v4') {
+          insertRegistryRows(V4_POOL_KIND, entry.registry);
+          advanceCoverage(V4_POOL_KIND, range);
+        }
+      }
+      if (stored) sql.upgradeProjection.run(int(entry.rows.length), entry.sha, hour, name);
+      else sql.insertProjection.run(hour, name, 'available', null, int(entry.rows.length), entry.sha);
+      report[name] = stored ? 'upgraded' : 'inserted';
+    }
+    for (const kind of ACTIVITY_KINDS) sql.pruneActivity.run(kind, kind, int(ACTIVITY_ROWS_PER_KIND));
+    const cutoff = poolHourCutoff(sql.newestHour.get().hour_start);
+    sql.prunePoolHours.run(int(cutoff));
+    sql.pruneProjectionHours.run(int(cutoff));
+    return report;
   }
 
   // Outcomes: inserted | unchanged | upgraded. A stored hour is immutable except that an unavailable family becomes
@@ -291,22 +503,39 @@ export function createCompactStore(db) {
         }
       }
       if (rows.v3) advanceRegistry(range, rows.v3);
-      return { outcome, checkpoint: checkpoint() };
+      // Same transaction as the hour: a crash leaves neither the hour nor its projections.
+      const projections = rows.projections ? writeProjections(range, rows.projections) : null;
+      return { outcome, checkpoint: checkpoint(), projections };
+    }, beforeCommit);
+  }
+
+  // Projection-only commit for an hour that is already stored (the projection backfill): never touches the hour, its
+  // families, the addresses or the checkpoint. The projections are reconciled against the stored family counters.
+  function commitProjectionHour(hourStart, projections, { beforeCommit = null } = {}) {
+    return transaction(() => {
+      const hour = sql.hourRange.get(int(hourStart));
+      if (!hour) throw new StoreError('hour_missing');
+      const families = Object.fromEntries(sql.uniswapFamilies.all(int(hourStart)).map((row) => [row.family,
+        row.status === 'available' ? { status: 'available', ...JSON.parse(row.metrics_json) } : { status: row.status }]));
+      const range = { hourStart, firstBlock: hour.first_block, lastBlock: hour.last_block, parentHash: hour.parent_hash, lastHash: hour.last_hash };
+      return writeProjections(range, normalizeProjections(projections, range, families));
     }, beforeCommit);
   }
 
   // A registry.js scan: the bootstrap (no coverage yet) or a catch-up that starts right after the stored coverage.
-  function extendRegistry(registryScan) {
+  function extendRegistryOf(kind, registryScan) {
     return transaction(() => {
-      const current = coverage();
-      if (registryScan?.kind !== V3_POOL_KIND || (current
+      const current = coverageOf(kind);
+      if (registryScan?.kind !== kind || (current
         ? registryScan.previousThrough !== current.through || registryScan.fromBlock !== current.fromBlock
         : registryScan.previousThrough !== null)) throw new StoreError('registry_discontinuity');
-      insertPools(registryScan.created);
-      sql.setCoverage.run(V3_POOL_KIND, int(registryScan.fromBlock), int(registryScan.through), registryScan.throughHash);
-      return coverage();
+      if (kind === V4_POOL_KIND && !registryScan.created.every(validV4Record)) throw new StoreError('registry_record_invalid');
+      insertRegistryRows(kind, registryScan.created);
+      sql.setCoverage.run(kind, int(registryScan.fromBlock), int(registryScan.through), registryScan.throughHash);
+      return coverageOf(kind);
     });
   }
+  const extendRegistry = (registryScan) => extendRegistryOf(V3_POOL_KIND, registryScan);
 
   // Exact unique active addresses over the `hours` complete hours ending with endHourStart, or null unless every hour is
   // stored and (for 6H/24H) still holds its full identity set. Only 1H, 6H and 24H exist; nothing longer is stored.
@@ -351,5 +580,28 @@ export function createCompactStore(db) {
       const current = coverage();
       return current && { ...current, pools: new Set(sql.pools.all(V3_POOL_KIND).map((row) => row.address)) };
     },
+    // Projections (never families).
+    commitProjectionHour,
+    extendV4Registry: (registryScan) => extendRegistryOf(V4_POOL_KIND, registryScan),
+    // Coverage and size only: V4 pool identities are resolved when read, never loaded whole into the hour processor.
+    v4Registry: () => {
+      const current = coverageOf(V4_POOL_KIND);
+      return { coverage: current, pools: sql.registryCount.get(V4_POOL_KIND).count };
+    },
+    v4Pool(poolId) {
+      const row = sql.pool.get(V4_POOL_KIND, poolId);
+      return row ? { poolId, createdBlock: row.created_block, createdLogIndex: row.created_log_index, createdTx: row.created_tx,
+        ...JSON.parse(db.prepare('SELECT meta_json FROM compact_registry WHERE kind = ? AND address = ?').get(V4_POOL_KIND, poolId).meta_json) } : null;
+    },
+    projectionStatus: (hourStart) => sql.projections.all(int(hourStart)).map((row) => ({ projection: row.projection, status: row.status,
+      reason: row.reason, rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
+    poolHours: (hourStart, protocol) => sql.poolHours.all(int(hourStart), protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+      token0InRaw: row.token0_in_raw, token0OutRaw: row.token0_out_raw, token1InRaw: row.token1_in_raw, token1OutRaw: row.token1_out_raw,
+      addCount: row.add_count, removeCount: row.remove_count, pokeCount: row.poke_count, addAmount0Raw: row.add_amount0_raw,
+      addAmount1Raw: row.add_amount1_raw, removeAmount0Raw: row.remove_amount0_raw, removeAmount1Raw: row.remove_amount1_raw })),
+    recentActivity: (kind = null, limit = ACTIVITY_ROWS_PER_KIND * ACTIVITY_KINDS.length) => sql.activity.all(kind, int(limit)).map((row) => ({
+      blockNumber: row.block_number, logIndex: row.log_index, hourStart: row.hour_start, blockTimestamp: row.block_timestamp, txHash: row.tx_hash,
+      txFrom: row.tx_from, protocol: row.protocol, kind: row.kind, pool: row.pool, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw,
+      amountBasis: row.amount_basis, counterparty: row.counterparty, counterpartyKind: row.counterparty_kind })),
   });
 }

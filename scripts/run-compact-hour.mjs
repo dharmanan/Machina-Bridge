@@ -5,6 +5,8 @@
 // logs advance it through the hour on commit. Strictly forward-only: an empty database accepts any first hour; after that
 // only the checkpoint's next hour is processed. An hour already stored with every family available is reported without
 // any RPC request; an hour stored with an unavailable family, or without a row for a family added later, is repaired.
+// Uniswap pool/activity projections (projections.js) come from the same requests and commit with the hour; they are not
+// families, so their status is reported but never makes the run fail or triggers a repair.
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
@@ -49,7 +51,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   safeHeadMargin = SAFE_HEAD_MARGIN_BLOCKS, print = console.log }) {
   const started = performance.now();
   const summary = { targetHour: iso(hourStart), sqlitePath, hourMode: null, repairFamilies: null, registryMode: null, registryBefore: null,
-    registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, checkpoint: null, provider: null, elapsedMs: null,
+    registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, checkpoint: null, provider: null, elapsedMs: null,
     sqliteBytes: null, ok: false, reason: null, diagnostics: null };
   print(`TARGET_HOUR ${summary.targetHour}`);
   print(`SQLITE_PATH ${sqlitePath}`);
@@ -96,6 +98,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     }
     // What is stored now, which a repair can only improve: an available family is never replaced or downgraded.
     summary.families = Object.fromEntries(store.familyRows(hourStart).map((row) => [row.family, statusOf(row)]));
+    summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
     const after = store.v3Registry();
     summary.registryAfter = span(after);
     summary.officialV3Pools = after?.pools.size ?? null;
@@ -124,6 +127,8 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   print(`V3_OFFICIAL_POOLS ${summary.officialV3Pools ?? 'unknown'}`);
   print(`HOUR_OUTCOME ${summary.hourOutcome ?? 'not_committed'}`);
   print(`FAMILIES ${summary.families ? Object.entries(summary.families).map(([name, status]) => `${name}=${status}`).join(' ') : 'unknown'}`);
+  print(`PROJECTIONS ${summary.projections && Object.keys(summary.projections).length
+    ? Object.entries(summary.projections).map(([name, status]) => `${name}=${status}`).join(' ') : 'none'}`);
   print(`CHECKPOINT ${summary.checkpoint ? `${summary.checkpoint.hour} last_block=${summary.checkpoint.lastBlock}` : 'none'}`);
   print(`PROVIDER requests=${summary.provider.requests} retries=${summary.provider.retries} response_mb=${summary.provider.responseMbDecoded} `
     + `calls=${JSON.stringify(summary.provider.calls)}`);
