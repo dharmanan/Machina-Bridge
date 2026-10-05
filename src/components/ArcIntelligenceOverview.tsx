@@ -563,7 +563,7 @@ function usdVolumeCell(ctx: ViewContext, entry: UsdVolumeWindow | null | undefin
   return { status: shown, note: `${DEX_VOLUME_SCOPE} ${usdNote(ctx, shown, entry, 'Verified data does not include DEX USD valuations yet.')}` }
 }
 
-// Estimated average swap fee: estimated pool fees / valued swaps. Same states as the
+// Average DEX pool fee: estimated Uniswap pool fees / fee-valued swaps. This is not Arc gas. Same states as the
 // volume; a window without a valued swap has no average, never a zero.
 function averageFeeCell(ctx: ViewContext, entry: SwapFeesWindow | null | undefined): Cell {
   if (ctx.mode !== 'ready') {
@@ -616,9 +616,9 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
   const feeDelta = fee.status === 'available' ? percentChange(usdMicrosToNumber(String(fee.raw)), previousFee) : null
   const feeTotal = fee.status === 'available' ? usdMicrosToNumber(swapFees?.totalFeeUsdMicros) : null
   const unvaluedFees = fee.status === 'available' && isFiniteNumber(swapFees?.unvaluedSwaps) ? swapFees.unvaluedSwaps : 0
-  const feeCaption = `Estimated pool fee per valued Uniswap V3 and V4 swap, last ${ctx.windowLabel}. Does not include per step rounding or hook fees.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
-    ? ` ${usdText(feeTotal)} estimated across ${formatCount(swapFees.valuedSwaps)} swaps.` : ''}${unvaluedFees > 0
-    ? ` ${formatCount(unvaluedFees)} swaps without a valued fee excluded.` : ''}`
+  const feeCaption = `Estimated Uniswap V3 and V4 pool fee per fee-valued swap, last ${ctx.windowLabel}. This is not Arc gas or a network transaction fee. Does not include per step rounding or hook fees.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
+    ? ` ${usdText(feeTotal)} estimated pool fees across ${formatCount(swapFees.valuedSwaps)} fee-valued swaps.` : ''}${unvaluedFees > 0
+    ? ` ${formatCount(unvaluedFees)} swaps without a valued fee excluded from this fee estimate.` : ''}`
 
   return (
     <section data-intel-section="network" aria-label="Network Activity" className="space-y-4">
@@ -630,7 +630,7 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
         <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.windowLabel}
           caption={`Total transactions, last ${ctx.windowLabel}`} />
         <KpiCard item="network.total-volume" label="DEX Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.windowLabel} caption={volumeCaption} />
-        <KpiCard item="network.average-fee" label="Estimated Average Swap Fee" cell={fee} delta={feeDelta} windowLabel={ctx.windowLabel} caption={feeCaption} />
+        <KpiCard item="network.average-fee" label="Avg DEX Pool Fee" cell={fee} delta={feeDelta} windowLabel={ctx.windowLabel} caption={feeCaption} />
       </div>
       <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
         {([
