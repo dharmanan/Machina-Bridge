@@ -44,6 +44,8 @@ await test('config: dry run by default for 24 hours; execute needs --execute AND
     mode: 'dry_run' });
   assert.equal(valuationBackfillConfig({ argv: ['--hours', '72'], env: ENV }).hours, 72);
   assert.equal(valuationBackfillConfig({ argv: ['--hours=48'], env: ENV }).hours, 48);
+    assert.equal(valuationBackfillConfig({ argv: ['--before', '2026-10-03T22:00:00.000Z'], env: ENV }).beforeHour, Date.parse('2026-10-03T22:00:00.000Z') / 1000);
+    assert.equal(valuationBackfillConfig({ argv: ['--before=2026-10-03T22:00:00Z'], env: ENV }).beforeHour, Date.parse('2026-10-03T22:00:00.000Z') / 1000);
   const refused = (argv, env, code) => assert.throws(() => valuationBackfillConfig({ argv, env }), (error) => error.code === code, `${argv.join(' ')} ${code}`);
   refused(['--execute'], ENV, 'execute_confirmation_required');
   refused(['--execute'], { ...ENV, COMPACT_VALUATION_BACKFILL_EXECUTE: 'true' }, 'execute_confirmation_required');
@@ -52,6 +54,10 @@ await test('config: dry run by default for 24 hours; execute needs --execute AND
   refused(['--hours=720'], ENV, 'hours_above_maximum');
   for (const value of ['0', '-1', '1.5', 'all', '']) refused(['--hours', value], ENV, 'invalid_hours');
   refused(['--hours', '24', '--hours', '24'], ENV, 'unknown_argument');
+    refused(['--before', '2026-10-03T22:30:00.000Z'], ENV, 'invalid_before_hour');
+    refused(['--before', '2026-10-03T22:00:01.000Z'], ENV, 'invalid_before_hour');
+    refused(['--before', 'not-a-date'], ENV, 'invalid_before_hour');
+    refused(['--before', '2026-10-03T22:00:00.000Z', '--before', '2026-10-03T21:00:00.000Z'], ENV, 'unknown_argument');
   refused(['--all'], ENV, 'unknown_argument');
   refused([], {}, 'sqlite_path_required');
   refused([], { ...ENV, COMPACT_RPC_MIN_INTERVAL_MS: '100' }, 'unsafe_rpc_pacing');

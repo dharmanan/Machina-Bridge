@@ -35,19 +35,58 @@ export function valuationBackfillConfig({ argv = process.argv.slice(2), env = pr
   let hours = DEFAULT_VALUATION_HOURS;
   let execute = false;
   let hoursSeen = false;
+  let beforeHour = null;
+  let beforeSeen = false;
+
+  const parseHours = (raw) => {
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1) throw new ValuationBackfillConfigError('invalid_hours');
+    const parsed = Number(raw);
+    if (parsed > MAX_VALUATION_HOURS) throw new ValuationBackfillConfigError('hours_above_maximum');
+    return parsed;
+  };
+
+  const parseBeforeHour = (raw) => {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:00:00(?:\.000)?Z$/.test(raw)) throw new ValuationBackfillConfigError('invalid_before_hour');
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed) || parsed % 3600000 !== 0) throw new ValuationBackfillConfigError('invalid_before_hour');
+    return Math.floor(parsed / 1000);
+  };
+
   for (let index = 0; index < argv.length; index++) {
     const value = argv[index];
-    let raw = null;
-    if (value === '--execute' && !execute) execute = true;
-    else if (value === '--hours' && !hoursSeen) raw = argv[++index] ?? '';
-    else if (value.startsWith('--hours=') && !hoursSeen) raw = value.slice('--hours='.length);
-    else throw new ValuationBackfillConfigError('unknown_argument');
-    if (raw === null) continue;
-    hoursSeen = true;
-    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1) throw new ValuationBackfillConfigError('invalid_hours');
-    hours = Number(raw);
-    if (hours > MAX_VALUATION_HOURS) throw new ValuationBackfillConfigError('hours_above_maximum');
+
+    if (value === '--execute' && !execute) {
+      execute = true;
+      continue;
+    }
+
+    if (value === '--hours' && !hoursSeen) {
+      hours = parseHours(argv[++index] ?? '');
+      hoursSeen = true;
+      continue;
+    }
+
+    if (value.startsWith('--hours=') && !hoursSeen) {
+      hours = parseHours(value.slice('--hours='.length));
+      hoursSeen = true;
+      continue;
+    }
+
+    if (value === '--before' && !beforeSeen) {
+      beforeHour = parseBeforeHour(argv[++index] ?? '');
+      beforeSeen = true;
+      continue;
+    }
+
+    if (value.startsWith('--before=') && !beforeSeen) {
+      beforeHour = parseBeforeHour(value.slice('--before='.length));
+      beforeSeen = true;
+      continue;
+    }
+
+    throw new ValuationBackfillConfigError('unknown_argument');
   }
+
   if (execute && env.COMPACT_VALUATION_BACKFILL_EXECUTE !== EXECUTE_CONFIRMATION) throw new ValuationBackfillConfigError('execute_confirmation_required');
   const sqlitePath = env.COMPACT_SQLITE_PATH?.trim();
   if (!sqlitePath || sqlitePath === ':memory:' || sqlitePath.startsWith('file:')) throw new ValuationBackfillConfigError('sqlite_path_required');
@@ -57,7 +96,9 @@ export function valuationBackfillConfig({ argv = process.argv.slice(2), env = pr
   if (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < MIN_RPC_INTERVAL_MS || minIntervalMs > 3_600_000) {
     throw new ValuationBackfillConfigError('unsafe_rpc_pacing');
   }
-  return { sqlitePath: resolve(sqlitePath), hours, minIntervalMs, mode: execute ? 'execute' : 'dry_run' };
+  const config = { sqlitePath: resolve(sqlitePath), hours, minIntervalMs, mode: execute ? 'execute' : 'dry_run' };
+  if (beforeHour !== null) config.beforeHour = beforeHour;
+  return config;
 }
 
 function openReadOnly(DatabaseSync, path) {
@@ -110,7 +151,7 @@ export async function runValuationBackfillTool({ config, DatabaseSync, providerF
   const reader = openReadOnly(DatabaseSync, config.sqlitePath);
   let inputs;
   try {
-    inputs = readValuationInputs(reader, { hours: config.hours, schemaVersion: COMPACT_SCHEMA_VERSION });
+    inputs = readValuationInputs(reader, { hours: config.hours, beforeHour: config.beforeHour, schemaVersion: COMPACT_SCHEMA_VERSION });
   } finally {
     reader.close();
   }
@@ -123,13 +164,14 @@ export async function runValuationBackfillTool({ config, DatabaseSync, providerF
   print(`WRITER_LOCK ${holder ? `held by ${holder.owner} pid=${holder.pid} since=${holder.since}` : 'free'}`);
   print(`SQLITE_BYTES_NOW db=${current.db} wal=${current.wal}`);
   const hoursArgument = config.hours === DEFAULT_VALUATION_HOURS ? '' : ` --hours ${config.hours}`;
+  const beforeArgument = config.beforeHour == null ? '' : ` --before ${new Date(config.beforeHour * 1000).toISOString()}`;
   const summary = { mode: config.mode, plan: { ...plan, entries: undefined }, executed: null, sqliteBytes: null,
     rpcRequests: () => provider?.stats.requests ?? 0 };
   const work = plan.missingValuationHours > plan.blockedHours;
   if (config.mode === 'dry_run') {
     print(`SNAPSHOT_PLAN execute writes ${snapshotPathOf(config.sqlitePath, now())} first (VACUUM INTO, about the size of the database)`);
     print(`NEXT_COMMAND ${work && !guard
-      ? `COMPACT_VALUATION_BACKFILL_EXECUTE=yes COMPACT_SQLITE_PATH=${config.sqlitePath} node ${SCRIPT} --execute${hoursArgument}`
+      ? `COMPACT_VALUATION_BACKFILL_EXECUTE=yes COMPACT_SQLITE_PATH=${config.sqlitePath} node ${SCRIPT} --execute${hoursArgument}${beforeArgument}`
       : guard ? `none (${guard})` : 'none (nothing a valuation backfill can do)'}`);
     print(`RESULT DRY_RUN writes=0 rpc_requests=${summary.rpcRequests()}`);
     return summary;
@@ -146,7 +188,7 @@ export async function runValuationBackfillTool({ config, DatabaseSync, providerF
     // holding the lock, before backup or any writes; never carry fact/status snapshots across a persistence boundary.
     const lockedReader = openReadOnly(DatabaseSync, config.sqlitePath);
     try {
-      plan = planValuationBackfill(readValuationInputs(lockedReader, { hours: config.hours, schemaVersion: COMPACT_SCHEMA_VERSION }),
+      plan = planValuationBackfill(readValuationInputs(lockedReader, { hours: config.hours, beforeHour: config.beforeHour, schemaVersion: COMPACT_SCHEMA_VERSION }),
         { pacingMs: config.minIntervalMs });
     } finally { lockedReader.close(); }
     summary.plan = { ...plan, entries: undefined };

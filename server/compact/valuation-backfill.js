@@ -1,4 +1,4 @@
-// Compact engine: historical valuation backfill (Phase 1D.1). For the latest committed hours (24 by default, at most 72)
+// Compact engine: historical valuation backfill (Phase 1D.1). For the latest committed hours, or a bounded window ending at --before (24 by default, at most 72)
 // it makes the hours' valuations (token prices, DEX USD volume, swap fees) exist when they can be made safely:
 // - an hour whose valuation inputs (pool price paths, V4 swap fees) are missing while its pool projections are available
 //   re-reads only the two Uniswap log streams it needs (v3Pools for V3, v4 for V4, 500 blocks per eth_getLogs, after a
@@ -42,7 +42,7 @@ export class ValuationBackfillError extends Error {
 
 const tableSet = (db) => new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'compact_*'").all().map((row) => row.name));
 
-export function readValuationInputs(db, { hours = DEFAULT_VALUATION_HOURS, schemaVersion = '2' } = {}) {
+export function readValuationInputs(db, { hours = DEFAULT_VALUATION_HOURS, beforeHour = null, schemaVersion = '2' } = {}) {
   const tables = tableSet(db);
   if (!tables.has('compact_meta') || !tables.has('compact_hours')) throw new ValuationBackfillError('database_not_compact');
   if (db.prepare("SELECT value FROM compact_meta WHERE key = 'schema_version'").get()?.value !== schemaVersion) {
@@ -50,7 +50,9 @@ export function readValuationInputs(db, { hours = DEFAULT_VALUATION_HOURS, schem
   }
   const checkpoint = db.prepare('SELECT hour_start, last_block FROM compact_checkpoint WHERE id = 1').get();
   if (!checkpoint) throw new ValuationBackfillError('no_checkpoint');
-  const toHour = checkpoint.hour_start;
+  const toHour = beforeHour ?? checkpoint.hour_start;
+  if (!Number.isSafeInteger(toHour) || toHour % HOUR !== 0) throw new ValuationBackfillError('invalid_before_hour');
+  if (toHour > checkpoint.hour_start) throw new ValuationBackfillError('before_after_checkpoint');
   const fromHour = toHour - (hours - 1) * HOUR;
   const statuses = (table, key) => {
     const out = new Map();
