@@ -972,6 +972,15 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         return checkpoint ? { hourStart: checkpoint.hour_start, lastBlock: checkpoint.last_block } : null;
       }, { requireDefinitions: false });
     },
+    // Durable stored-history bounds for the scheduler. Read-only and side-effect free.
+    historyBounds() {
+      if (!existsSync(path)) return null;
+      return snapshot((state) => {
+        if (state.code === 'database_empty') return null;
+        const row = statement('bounds').get();
+        return row.first === null ? null : { first: row.first, last: row.last, count: row.count };
+      }, { requireDefinitions: false });
+    },
     // Committed hours in [fromHour, toHour] that lack an available row for at least one family, newest first.
     repairCandidates({ fromHour, toHour }) {
       if (!Number.isSafeInteger(fromHour) || !Number.isSafeInteger(toHour) || fromHour % HOUR || toHour % HOUR) {

@@ -81,14 +81,42 @@ export function createChildHourRunner({ scriptPath, execPath = process.execPath,
   };
 }
 
-// readModel: { checkpoint(), repairCandidates({ fromHour, toHour }), projectionRepairCandidates({ fromHour, toHour }) }
-// (read-only). runHour(hourIso) / runProjectionRepair(hourIso): { done, terminate }. Without runProjectionRepair there is
-// no projection repair at all.
-export function createScheduler({ readModel, runHour, runProjectionRepair = null, now = () => Date.now(), setTimer = setTimeout,
-  clearTimer = clearTimeout, log = () => {}, onFatal = null, safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS,
-  baseBackoffMs = DEFAULT_BASE_BACKOFF_MS, maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS,
-  repairCooldownMs = REPAIR_COOLDOWN_MS, projectionRepairWindowHours = PROJECTION_REPAIR_WINDOW_HOURS,
-  projectionRepairCooldownMs = PROJECTION_REPAIR_COOLDOWN_MS }) {
+// Service-owned historical runner: exactly one historical hour per child. It is intentionally not detached;
+// the always-on service owns it, so Railway restarts terminate it and the next service process resumes from SQLite.
+export function createChildHistoryRunner({ scriptPath, execPath = process.execPath, env = process.env, spawnImpl = spawn,
+  killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now() }) {
+  if (typeof scriptPath !== 'string' || !scriptPath) throw new Error('script_path_required');
+  return function runHistory() {
+    const startedAt = now();
+    const child = spawnImpl(execPath, [scriptPath, '--execute', '--max-hours=1'], {
+      stdio: ['ignore', 'inherit', 'inherit'], env, shell: false,
+    });
+    let exited = false;
+    const done = new Promise((resolve) => {
+      child.once('error', () => { exited = true; resolve({ exitCode: null, signal: null, error: 'spawn_failed', startedAt, finishedAt: now() }); });
+      child.once('exit', (exitCode, signal) => { exited = true; resolve({ exitCode, signal, error: null, startedAt, finishedAt: now() }); });
+    });
+    async function terminate() {
+      if (!exited) {
+        child.kill('SIGTERM');
+        const timer = setTimeout(() => { if (!exited) child.kill('SIGKILL'); }, killGraceMs);
+        try { return await done; } finally { clearTimeout(timer); }
+      }
+      return done;
+    }
+    return { done, terminate };
+  };
+}
+
+// readModel: { checkpoint(), historyBounds(), repairCandidates({ fromHour, toHour }),
+// projectionRepairCandidates({ fromHour, toHour }) } (read-only).
+// runHour(hourIso) / runProjectionRepair(hourIso): { done, terminate }.
+// runHistoryBackfill(): one historical hour child. Live checkpoint catch-up always has priority.
+export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, historyStartHour = null,
+  now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
+  safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
+  maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS,
+  projectionRepairWindowHours = PROJECTION_REPAIR_WINDOW_HOURS, projectionRepairCooldownMs = PROJECTION_REPAIR_COOLDOWN_MS }) {
   let stopped = false;
   let active = null; // the single in-flight run loop
   let child = null; // the single running child
@@ -104,6 +132,17 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
     const handle = runner(hourIso(hourStart));
     child = { kind, terminate: () => handle.terminate() };
     log(`SCHEDULER_CHILD_START kind=${kind} hour=${handle.hour}`);
+    try {
+      return await handle.done;
+    } finally {
+      child = null;
+    }
+  }
+
+  async function runHistoryChild(targetHour) {
+    const handle = runHistoryBackfill();
+    child = { kind: 'history_backfill', terminate: () => handle.terminate() };
+    log(`SCHEDULER_CHILD_START kind=history_backfill hour=${hourIso(targetHour)}`);
     try {
       return await handle.done;
     } finally {
@@ -136,6 +175,28 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
         + `retry_at=${new Date(retryAt).toISOString()}`);
       return { again: false, wakeAt: retryAt };
     }
+
+    // Live checkpoint is caught up. Historical backfill is service-owned and resumable: one hour per child, then the
+    // loop starts over from the top so a newly due live hour always wins before the next historical hour.
+    if (runHistoryBackfill && Number.isSafeInteger(historyStartHour) && historyStartHour % HOUR_SECONDS === 0
+      && typeof readModel.historyBounds === 'function') {
+      const before = readModel.historyBounds();
+      if (before?.first > historyStartHour) {
+        const targetHour = before.first - HOUR_SECONDS;
+        const outcome = await runHistoryChild(targetHour);
+        if (stopped) return { again: false };
+        const after = readModel.historyBounds();
+        const advanced = Boolean(after) && after.first < before.first;
+        status.lastRun = { kind: 'history_backfill', hour: hourIso(targetHour), advanced, ...outcome };
+        if (advanced) {
+          log(`SCHEDULER_HISTORY_COMMITTED hour=${hourIso(targetHour)} exit=${outcome.exitCode}`);
+          return { again: true };
+        }
+        log(`SCHEDULER_HISTORY_RETRY hour=${hourIso(targetHour)} exit=${outcome.exitCode} signal=${outcome.signal}`);
+        return { again: false, wakeAt: now() + Math.min(tickMs, 60_000) };
+      }
+    }
+
     // Caught up. At most one bounded repair of a recent hour, never ahead of chain catch-up.
     const nowMs = now();
     const fromHour = checkpoint.hourStart - (repairWindowHours - 1) * HOUR_SECONDS;

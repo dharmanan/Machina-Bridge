@@ -6,6 +6,7 @@
   "scripts": {
     "start:intelligence": "node server/arc-intelligence/main.js",
     "railway:intelligence:check": "node scripts/check-arc-intelligence-server.mjs",
+    "verify:arc-dashboard": "node scripts/verify-arc-intelligence-dashboard.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "postinstall": "node scripts/fix-viem-tsconfig.mjs",

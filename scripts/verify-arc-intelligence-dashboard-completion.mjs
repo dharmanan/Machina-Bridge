@@ -332,7 +332,7 @@ try {
     const lib = readFileSync(new URL('../src/lib/arcIntelligence.ts', import.meta.url), 'utf8');
     assert.match(ui, /label="DEX Volume"/);
     assert.match(ui, /USD-valued Uniswap V3 and V4 swaps on Arc\./);
-    assert.match(ui, /label="Estimated Average Swap Fee"/);
+    assert.match(ui, /label="Avg DEX Pool Fee"/);
     assert.match(ui, /Estimated principal reserves/);
     assert.match(lib, /V4 swap recipient is not emitted by the event and trace data is unavailable\./);
     assert.match(ui, /Uniswap V4 swaps: \{V4_SWAP_TO_TEXT\}/);

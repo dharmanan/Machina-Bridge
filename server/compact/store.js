@@ -425,6 +425,7 @@ export function createCompactStore(db) {
     upgradeFamily: db.prepare(`UPDATE compact_family_hours SET status = 'available', reason = NULL, metrics_json = ?, metrics_sha256 = ?
       WHERE hour_start = ? AND family = ? AND status = 'unavailable'`),
     newestHour: db.prepare('SELECT MAX(hour_start) AS hour_start FROM compact_hours'),
+    oldestHour: db.prepare('SELECT hour_start, first_block, parent_hash FROM compact_hours ORDER BY hour_start ASC LIMIT 1'),
     insertAddress: db.prepare('INSERT INTO compact_hour_addresses (hour_start, address) VALUES (?, ?)'),
     pruneAddresses: db.prepare('DELETE FROM compact_hour_addresses WHERE hour_start <= ?'),
     windowHours: db.prepare(`SELECT h.unique_active_addresses AS expected,
@@ -935,6 +936,54 @@ export function createCompactStore(db) {
     }, beforeCommit);
   }
 
+  // Historical prepend for operator backfill only. A new hour must be exactly one UTC hour before the oldest stored
+  // hour and must hash-link directly into it. The live checkpoint never moves backward or changes. This is deliberately
+  // separate from commitHour so the scheduler remains strictly forward-only. Each prepend is one SQLite transaction, so a
+  // stopped backfill resumes from the new oldest durable hour without a sidecar checkpoint.
+  function commitHistoricalHour(result, { beforeCommit = null, requireValuations = false } = {}) {
+    const rows = hourRows(result);
+    const { range, network } = result;
+    return transaction(() => {
+      const existing = sql.hour.get(int(range.hourStart));
+      if (existing) {
+        if (existing.network_sha256 !== rows.networkSha) throw new StoreError('hour_conflict');
+        return { outcome: 'unchanged', checkpoint: checkpoint(), projections: null };
+      }
+      const oldest = sql.oldestHour.get();
+      const currentCheckpoint = checkpoint();
+      if (!oldest || !currentCheckpoint) throw new StoreError('historical_base_missing');
+      if (range.hourStart !== oldest.hour_start - HOUR) throw new StoreError('history_not_adjacent');
+      if (range.lastBlock + 1 !== oldest.first_block || oldest.parent_hash !== range.lastHash) {
+        throw new StoreError('history_discontinuity');
+      }
+
+      const checkpointBefore = { ...currentCheckpoint };
+      sql.insertHour.run(int(range.hourStart), result.definitionVersion, int(range.firstBlock), int(range.lastBlock), range.parentHash,
+        range.firstHash, range.lastHash, int(network.blockCount), int(network.transactionCount), int(network.uniqueActiveAddresses),
+        rows.networkJson, rows.networkSha);
+      for (const family of rows.families) {
+        sql.insertFamily.run(int(range.hourStart), family.name, family.status, family.reason, family.json, family.sha);
+      }
+      storeAddresses(range.hourStart, result.activeAddresses);
+      if (rows.v3) advanceRegistry(range, rows.v3);
+      const projections = rows.projections ? writeProjections(range, rows.projections) : null;
+
+      if (requireValuations) {
+        const valuations = new Map(sql.valuations.all(int(range.hourStart)).map((row) => [row.valuation, row.status]));
+        if (!VALUATIONS.every((name) => valuations.get(name) === 'available')) {
+          throw new StoreError('historical_valuation_unavailable');
+        }
+      }
+
+      const checkpointAfter = checkpoint();
+      if (!checkpointAfter || checkpointAfter.hourStart !== checkpointBefore.hourStart
+        || checkpointAfter.lastBlock !== checkpointBefore.lastBlock || checkpointAfter.lastHash !== checkpointBefore.lastHash) {
+        throw new StoreError('historical_checkpoint_changed');
+      }
+      return { outcome: 'inserted', checkpoint: checkpointAfter, projections };
+    }, beforeCommit);
+  }
+
   // Projection-only commit for an hour that is already stored (the projection backfill and the single-hour repair): never
   // touches the hour, its families, the addresses or the checkpoint. The projections are reconciled against the stored
   // family counters. only: the projections to write (default all); the others keep whatever is stored.
@@ -1003,7 +1052,12 @@ export function createCompactStore(db) {
 
   return Object.freeze({
     commitHour,
+    commitHistoricalHour,
     checkpoint,
+    earliestHour() {
+      const row = sql.oldestHour.get();
+      return row ? { hourStart: row.hour_start, firstBlock: row.first_block, parentHash: row.parent_hash } : null;
+    },
     extendRegistry,
     uniqueActiveAddresses,
     familyWindow,

@@ -814,7 +814,7 @@ await test('UI 3 header, window selector, refresh, KPI cards, chart tabs, activi
   assert.equal(button('24H').attrs['aria-selected'], 'true');
   const text = textOf(tree);
   for (const label of ['Arc Intelligence', 'Verified Arc network activity', 'Verified through Oct 3, 14:00 UTC', 'Active Addresses', 'Transactions', 'DEX Volume',
-    'Average Swap Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'Newly launched tokens',
+    'Avg DEX Pool Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'Newly launched tokens',
     'Borrow on Arc', 'Powered by Circle Borrow Kit on Arc', 'Aave', 'Morpho Blue', 'Morpho Vaults', 'CCTP', 'Gateway', 'Across', 'RWA',
     'Other Verified Protocols', 'Exchange flows', 'Other verified Arc protocols', 'Hours in UTC']) {
     assert.ok(text.includes(label), label);
@@ -898,7 +898,7 @@ await test('UI 6 without the API\'s USD valuation no USD value exists; the proto
   // An API without valuation (the ready fixtures carry none) reads as not available yet, never as zero or unavailable.
   for (const id of VOLUME) assert.equal(statusIn('ready', id), 'source_pending', id);
   assert.equal(statusIn('ready-default-view', 'volume-chart.volume'), 'source_pending');
-  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Estimated Average Swap Fee Not available yet Verified data does not include estimated swap fees yet\./);
+  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Avg DEX Pool Fee Not available yet Verified data does not include estimated swap fees yet\./);
   assert.match(textOf(item(rendered.ready.tree, 'network.total-volume')), /DEX Volume Not available yet USD-valued Uniswap V3 and V4 swaps on Arc\. Verified data does not include DEX USD valuations yet\./);
 });
 
@@ -1877,7 +1877,7 @@ await test('Completion 1 fee estimate, state-based liquidity and protocol USD re
   const tree = rendered['ready-complete'].tree;
   assert.equal(statusIn('ready-complete', 'network.average-fee'), 'available');
   assert.equal(valueIn('ready-complete', 'network.average-fee'), '300000');
-  assert.match(textOf(item(tree, 'network.average-fee')), /Estimated Average Swap Fee \$0\.3/);
+  assert.match(textOf(item(tree, 'network.average-fee')), /Avg DEX Pool Fee \$0\.3/);
   assert.match(textOf(item(tree, 'network.average-fee')), /Does not include per step rounding or hook fees/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v3')), /Holds \$3\.5M/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /Estimated reserves \$820/);

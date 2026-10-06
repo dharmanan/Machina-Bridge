@@ -1,8 +1,9 @@
 // Compact engine: the always-on Machina Intelligence service. One parent process owns a read-only SQLite read model, the
 // public read-only HTTP API, and the deterministic hourly scheduler. The scheduler runs the unchanged
-// scripts/run-compact-hour.mjs as a memory-isolated child for checkpoint + 1 hour until caught up; that child stays the
-// only writer. When caught up it may also run scripts/repair-compact-projection-hour.mjs for one stored hour (projection-only
-// self-heal); never two children at once. Railway: always-on service, Serverless (app sleeping) OFF, no cron schedule,
+// scripts/run-compact-hour.mjs as a memory-isolated child for checkpoint + 1 hour until caught up. Once live is caught
+// up, the same scheduler runs exactly one historical prepend child at a time until the public-mainnet boundary; before
+// every next historical hour it re-checks live catch-up, so live indexing always has priority. After history is complete
+// it may run projection repair. Never two writer children at once. Railway: always-on service, Serverless OFF, no cron,
 // restart ON_FAILURE.
 // COMPACT_SCHEDULER_ENABLED (maintenance gate): unset, empty or "true" runs the scheduler; "false" serves the read API
 // only, starts no indexing child and writes nothing; any other value refuses to start.
@@ -12,11 +13,13 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
-import { createChildHourRunner, createScheduler } from '../server/compact/scheduler.js';
+import { createChildHistoryRunner, createChildHourRunner, createScheduler } from '../server/compact/scheduler.js';
+import { ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR } from './backfill-compact-history.mjs';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
 
 export const RUNNER_SCRIPT = fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url));
 export const PROJECTION_REPAIR_SCRIPT = fileURLToPath(new URL('./repair-compact-projection-hour.mjs', import.meta.url));
+export const HISTORY_BACKFILL_SCRIPT = fileURLToPath(new URL('./backfill-compact-history.mjs', import.meta.url));
 export const DEFAULT_PORT = 8080;
 export const SHUTDOWN_TIMEOUT_MS = 25_000;
 
@@ -109,7 +112,11 @@ async function main() {
   const childEnv = { ...process.env, COMPACT_SQLITE_PATH: config.sqlitePath, COMPACT_RPC_MIN_INTERVAL_MS: String(config.minIntervalMs) };
   const runHour = createChildHourRunner({ scriptPath: RUNNER_SCRIPT, env: childEnv });
   const runProjectionRepair = createChildHourRunner({ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv });
-  const scheduler = createScheduler({ readModel, runHour, runProjectionRepair, log, onFatal: fatal });
+  const runHistoryBackfill = createChildHistoryRunner({ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv });
+  const scheduler = createScheduler({
+    readModel, runHour, runProjectionRepair, runHistoryBackfill,
+    historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
+  });
   const server = createIntelligenceServer({ readModel, log, onFatal: fatal });
   service = startIntelligenceService({ config, readModel, scheduler, server, log });
   process.once('SIGTERM', () => { void service.shutdown(0, 'SIGTERM'); });
