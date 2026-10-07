@@ -1,5 +1,5 @@
-// Vercel /api/intelligence: a strict read-only proxy to the compact Machina Intelligence API on Railway. Twenty exact
-// requests map to twenty fixed upstream URLs from a table; no user input is ever concatenated into a path or origin. The
+// Vercel /api/intelligence: a strict read-only proxy to the compact Machina Intelligence API on Railway. Exact
+// requests map to fixed upstream URLs from a table; no user input is ever concatenated into a path or origin. The
 // upstream body is forwarded byte for byte only after it parses as a JSON object of the expected schema, so a domain-level
 // `unavailable` (for example insufficient_coverage) stays an HTTP 200, while a failure of the upstream itself becomes a
 // fixed, sanitized error. Data routes are CDN-cacheable (completed-hour data; freshness is inside the payload); health and
@@ -13,6 +13,13 @@ export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1'
 export const TIMESERIES_SCHEMA = 'machina.intelligence.timeseries.v1'
 export const POOLS_SCHEMA = 'machina.intelligence.pools.v1'
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1'
+export const ECOSYSTEM_SCHEMA = 'machina.intelligence.ecosystem.v1'
+const isEcosystem = (body, window) => body.schema === ECOSYSTEM_SCHEMA && body.chain?.id === 5042 && body.window?.key === window
+  && typeof body.coverage?.status === 'string' && Array.isArray(body.verifiedAssets) && Array.isArray(body.rwa)
+  && Array.isArray(body.discoveredTokens?.rows) && body.discoveredTokens.rows.length <= 50
+  && Array.isArray(body.contractCandidates?.rows) && body.contractCandidates.rows.length <= 50
+  && Array.isArray(body.launches?.rows) && body.launches.rows.length <= 50
+  && typeof body.exchangeFlows?.status === 'string' && typeof body.otherProtocols?.status === 'string'
 export const DATA_CACHE_CONTROL = 'public, s-maxage=300, stale-while-revalidate=3300, stale-if-error=86400'
 export const NO_STORE = 'no-store'
 const JSON_TYPE = 'application/json; charset=utf-8'
@@ -21,6 +28,11 @@ const JSON_TYPE = 'application/json; charset=utf-8'
 // pools takes exactly a protocol and a window; activity takes exactly a type. 7D and 30D follow the same rules as 24H.
 const HEALTH_ROUTE = Object.freeze({ path: '/health', check: (body) => body.status === 'ok', cacheable: false })
 const WINDOWED_ROUTES = Object.freeze({
+  ecosystem: Object.freeze(Object.fromEntries(['24h', '7d', '30d'].map((window) => [window, Object.freeze({
+    path: `/v1/intelligence/ecosystem?window=${window}`,
+    check: (body) => isEcosystem(body, window),
+    cacheable: true,
+  })]))),
   summary: Object.freeze({
     '1h': Object.freeze({ path: '/v1/intelligence/summary?window=1h', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),
     '6h': Object.freeze({ path: '/v1/intelligence/summary?window=6h', check: (body) => body.schema === SUMMARY_SCHEMA, cacheable: true }),

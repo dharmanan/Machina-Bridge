@@ -1,5 +1,5 @@
 // Compact engine: public read-only Intelligence HTTP API on the built-in node:http server. Exact request strings only: a
-// route is one of twenty fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
+// route is one of the fixed URLs, so no query value, path variant or SQL-like input ever reaches the read model. GET only,
 // no request body, bounded URL and response sizes, fixed error bodies (no messages, stack traces, paths or environment).
 // Nothing here calls Arc RPC, indexes, or writes: every answer comes from the read-only model. No CORS headers: browsers
 // reach this API through the Vercel proxy, not directly. `authorize` is the seam for a future auth header.
@@ -10,6 +10,9 @@ export const MAX_URL_LENGTH = 128;
 export const MAX_RESPONSE_BYTES = 256 * 1024;
 
 const ROUTES = new Map([
+  ['/v1/intelligence/ecosystem?window=24h', { kind: 'ecosystem', window: '24h' }],
+  ['/v1/intelligence/ecosystem?window=7d', { kind: 'ecosystem', window: '7d' }],
+  ['/v1/intelligence/ecosystem?window=30d', { kind: 'ecosystem', window: '30d' }],
   ['/health', { kind: 'health' }],
   ['/v1/intelligence/summary?window=1h', { kind: 'summary', window: '1h' }],
   ['/v1/intelligence/summary?window=6h', { kind: 'summary', window: '6h' }],
@@ -32,6 +35,7 @@ const ROUTES = new Map([
   ['/v1/intelligence/pools?protocol=v4&window=30d', { kind: 'pools', protocol: 'v4', window: '30d' }],
 ]);
 const KNOWN_PATHS = new Set([
+  '/v1/intelligence/ecosystem',
   '/health',
   '/v1/intelligence/summary',
   '/v1/intelligence/timeseries',
@@ -92,6 +96,7 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
       else if (route.kind === 'summary') payload = readModel.summary(route.window);
       else if (route.kind === 'timeseries') payload = readModel.timeseries(route.window);
       else if (route.kind === 'pools') payload = readModel.pools(route.protocol, route.window);
+      else if (route.kind === 'ecosystem') payload = readModel.ecosystem(route.window);
       else payload = readModel.activity(route.type);
       const text = JSON.stringify(payload);
       const bytes = Buffer.byteLength(text);

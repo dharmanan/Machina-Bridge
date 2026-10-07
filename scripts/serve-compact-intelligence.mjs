@@ -13,13 +13,15 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
-import { createChildHistoryRunner, createChildHourRunner, createScheduler } from '../server/compact/scheduler.js';
+import { createChildHistoryRunner, createChildHourRunner, createChildDiscoveryRunner, createScheduler } from '../server/compact/scheduler.js';
 import { ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR } from './backfill-compact-history.mjs';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
 
 export const RUNNER_SCRIPT = fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url));
 export const PROJECTION_REPAIR_SCRIPT = fileURLToPath(new URL('./repair-compact-projection-hour.mjs', import.meta.url));
 export const HISTORY_BACKFILL_SCRIPT = fileURLToPath(new URL('./backfill-compact-history.mjs', import.meta.url));
+export const DISCOVERY_DRAIN_SCRIPT = fileURLToPath(new URL('./drain-compact-discovery.mjs', import.meta.url));
+export const DAILY_ACTIVE_REPLAY_SCRIPT = fileURLToPath(new URL('./replay-compact-dau-hour.mjs', import.meta.url));
 export const DEFAULT_PORT = 8080;
 export const SHUTDOWN_TIMEOUT_MS = 25_000;
 
@@ -113,8 +115,10 @@ async function main() {
   const runHour = createChildHourRunner({ scriptPath: RUNNER_SCRIPT, env: childEnv });
   const runProjectionRepair = createChildHourRunner({ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv });
   const runHistoryBackfill = createChildHistoryRunner({ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv });
+  const runDiscoveryDrain = createChildDiscoveryRunner({ scriptPath: DISCOVERY_DRAIN_SCRIPT, env: childEnv });
+  const runDailyActiveReplay = createChildHourRunner({ scriptPath: DAILY_ACTIVE_REPLAY_SCRIPT, env: childEnv });
   const scheduler = createScheduler({
-    readModel, runHour, runProjectionRepair, runHistoryBackfill,
+    readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay,
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
   });
   const server = createIntelligenceServer({ readModel, log, onFatal: fatal });

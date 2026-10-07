@@ -20,9 +20,11 @@ import { V3_POOL_KIND } from '../server/compact/registry.js';
 import { createScheduler } from '../server/compact/scheduler.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from '../server/compact/sources.js';
 import { createCompactStore } from '../server/compact/store.js';
+import { ECOSYSTEM_SCHEMA } from '../server/compact/intelligence-registry.js';
 
 let passed = 0;
-async function test(name, run) { await run(); passed += 1; console.log(`PASS ${name}`); }
+const TEST_FILTERS = (process.env.COMPACT_API_TEST_FILTER ?? '').split('||').map((value) => value.trim()).filter(Boolean);
+async function test(name, run) { if (TEST_FILTERS.length && TEST_FILTERS.some((value) => name.includes(value)) === false) return; await run(); passed += 1; console.log(`PASS ${name}`); }
 
 // Any Arc RPC (or any network call) from these code paths is a failure.
 let fetchCalls = 0;
@@ -76,11 +78,15 @@ function fakeReadModel(overrides = {}) {
       return overrides.pools ? overrides.pools(protocol, window) : { schema: POOLS_SCHEMA, protocol, window: { key: window }, version };
     },
     activity(type) { calls.push(`activity:${type}`); return overrides.activity ? overrides.activity(type) : { schema: ACTIVITY_SCHEMA, type, version }; },
+    ecosystem(window) { calls.push(`ecosystem:${window}`); return { schema: ECOSYSTEM_SCHEMA, chain: { id: 5042 }, window: { key: window }, version }; },
   };
 }
 
-// The twenty exact read routes, each with the read-model call it must make (7D/30D appended).
+// Existing routes and three additive ecosystem routes, each with the exact read-model call it must make.
 const ROUTE_CALLS = [
+  ['/v1/intelligence/ecosystem?window=24h', 'ecosystem:24h'],
+  ['/v1/intelligence/ecosystem?window=7d', 'ecosystem:7d'],
+  ['/v1/intelligence/ecosystem?window=30d', 'ecosystem:30d'],
   ['/health', 'health'],
   ['/v1/intelligence/summary?window=1h', 'summary:1h'],
   ['/v1/intelligence/summary?window=6h', 'summary:6h'],
@@ -104,7 +110,7 @@ const ROUTE_CALLS = [
 ];
 const VALID = ROUTE_CALLS.map(([path]) => path);
 
-await test('http: only the twenty exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
+await test('http: only the 23 exact read routes answer 200; health is no-store, data routes carry an ETag', async () => {
   const model = fakeReadModel();
   await withServer({ readModel: model }, async (port) => {
     for (const path of VALID) {
@@ -308,7 +314,7 @@ await test('static: the HTTP and read paths cannot write SQLite, call Arc RPC, r
   for (const match of read.matchAll(/\.exec\(([`'])([^`']*)\1\)/g)) {
     assert.match(match[2], /^(PRAGMA (query_only = ON|busy_timeout = \$\{busyTimeoutMs\})|BEGIN|COMMIT|ROLLBACK)$/, match[2]);
   }
-  // Only the twenty routes exist, and no route takes a free-form value.
+  // Only the explicit routes exist, and no route takes a free-form value.
   assert.deepEqual([...http.matchAll(/^ {2}\['(\/[^']*)'/gm)].map((match) => match[1]), VALID);
 });
 
@@ -686,7 +692,7 @@ if (!sqlite) {
       const health = await send(port, { path: '/health' });
       assert.equal(health.status, 200);
       assert.ok(Buffer.byteLength(health.text) < 200, 'health stays tiny');
-      for (const path of VALID.slice(1)) {
+      for (const path of VALID.filter((path) => path !== '/health')) {
         const res = await send(port, { path });
         assert.equal(res.status, 200, path);
         assert.ok(Buffer.byteLength(res.text) <= MAX_RESPONSE_BYTES, path);
@@ -952,7 +958,7 @@ if (!sqlite) {
   await test('http + read model: pools and activity over HTTP with 304 revalidation', async () => {
     const model = openProjected();
     await withServer({ readModel: model }, async (port) => {
-      for (const path of VALID.slice(6, 12)) {
+      for (const path of VALID.filter((path) => path.startsWith('/v1/intelligence/activity?') || (path.startsWith('/v1/intelligence/pools?') && path.endsWith('window=24h')))) {
         const res = await send(port, { path });
         assert.equal(res.status, 200, path);
         assert.equal(res.json.status, 'available', path);

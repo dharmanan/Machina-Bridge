@@ -17,6 +17,7 @@ import { HourIncompleteError, processBlockRange, processHour } from '../server/c
 import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_PROTOCOL } from '../server/compact/offline.js';
 import { PROTOCOL_FAMILIES } from '../server/compact/protocols/index.js';
 import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError } from '../server/compact/provider.js';
+import { DISCOVERY_READS_PER_RUN } from '../server/compact/intelligence.js';
 import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../server/compact/registry.js';
 import { COMPACT_DEFINITION_VERSION, DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
 import { headerOf } from '../server/compact/spine.js';
@@ -30,7 +31,13 @@ const hex = (number) => `0x${number.toString(16)}`;
 const ZERO_TOPIC = `0x${'0'.repeat(64)}`;
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 let passed = 0;
-async function test(name, run) { await run(); passed += 1; console.log(`PASS ${name}`); }
+const TEST_FILTERS = (process.env.COMPACT_TEST_FILTER ?? '').split('||').map((value) => value.trim()).filter(Boolean);
+async function test(name, run) {
+  if (TEST_FILTERS.length && !TEST_FILTERS.some((value) => name.includes(value))) return;
+  await run();
+  passed += 1;
+  console.log(`PASS ${name}`);
+}
 
 function offlineProvider(fetchImpl, options = {}) {
   return createProvider({ fetchImpl, minIntervalMs: 0, cooldownMs: 0, sleep: async () => {}, ...options });
@@ -596,9 +603,9 @@ if (!sqlite) {
     .map((row) => `${row.hour_start}:${row.network_sha256}`);
   const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
   const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
-    'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
-    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_metadata', 'compact_token_price_hours',
-    'compact_valuation_hours'];
+    'compact_hour_addresses', 'compact_hours', 'compact_intelligence_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
+    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_dex_observations',
+    'compact_token_discoveries', 'compact_token_metadata', 'compact_token_price_hours', 'compact_valuation_hours'];
   const metricsOf = (family, name) => Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, family[field]]));
   try {
     await test('sqlite: schema v2 is created with WAL, synchronous=NORMAL and busy_timeout=5000; reopening keeps it', async () => {
@@ -881,7 +888,9 @@ if (!sqlite) {
         hours.reduce((sum, hour) => sum + hour.network.uniqueActiveAddresses, 0), 'one 20-byte identity per active address per hour');
       db.close();
       const { size } = await stat(join(directory, 'store.sqlite'));
-      assert(size < 2 * 1024 * 1024, `database is ${size} bytes for ${hours.length} hours`);
+      // Additive Intelligence tables/indexes add bounded SQLite page overhead without storing raw chain data.
+      const additiveSchemaAllowanceBytes = 64 * 1024;
+      assert(size < 2 * 1024 * 1024 + additiveSchemaAllowanceBytes, `database is ${size} bytes for ${hours.length} hours`);
     });
 
     await test('validator gate: a verified hour round-trips through a temporary node:sqlite file that is then deleted', async () => {
@@ -909,6 +918,16 @@ if (!sqlite) {
     };
     const lineOf = (lines, key) => lines.find((text) => text.startsWith(`${key} `));
     const historyScans = (scans, beforeBlock) => scans.filter(([from]) => from < beforeBlock);
+    const assertStoredHourDiscoveryOnly = ({ summary, factoryScans, provider }, label) => {
+      assert.equal(summary.hourOutcome, 'already_committed', `${label}: stored hour`);
+      assert.equal(summary.discovery?.status, 'available', `${label}: discovery result`);
+      assert.equal(factoryScans.length, 0, `${label}: no registry scan`);
+      const allowed = new Set(['eth_chainId', 'eth_getTransactionReceipt', 'eth_getCode', 'eth_call']);
+      assert(Object.keys(provider.stats.calls).every((method) => allowed.has(method)), `${label}: targeted RPC only`);
+      assert.equal(provider.stats.calls.eth_getLogs ?? 0, 0, `${label}: no log range replay`);
+      assert.equal(provider.stats.calls.eth_getBlockByNumber ?? 0, 0, `${label}: no block range replay`);
+      assert(provider.stats.requests <= DISCOVERY_READS_PER_RUN * 2 + 1, `${label}: bounded discovery RPC requests`);
+    };
 
     await test('runner: an empty database bootstraps the registry once, only up to the block before the hour, then commits it', async () => {
       const { summary, lines, factoryScans, provider } = await runner('runner.sqlite');
@@ -931,18 +950,16 @@ if (!sqlite) {
       db.close();
     });
 
-    await test('runner: a second invocation on the same file reuses the registry and makes no request for a stored hour', async () => {
-      const { summary, lines, factoryScans, provider } = await runner('runner.sqlite');
-      assert.deepEqual([summary.registryMode, summary.hourOutcome, summary.ok], ['reused', 'already_committed', true]);
-      assert.deepEqual([provider.stats.requests, factoryScans.length], [0, 0], 'no RPC request and no registry scan');
+    await test('runner: a second invocation reuses the registry and only performs bounded discovery enrichment for a stored hour', async () => {
+      const second = await runner('runner.sqlite');
+      const { summary, lines } = second;
+      assert.deepEqual([summary.registryMode, summary.ok], ['reused', true]);
+      assertStoredHourDiscoveryOnly(second, 'second invocation');
+      assert.equal(summary.discovery?.candidates, DISCOVERY_READS_PER_RUN, 'discovery stays capped');
       assert.equal(summary.registryAfter, summary.registryBefore);
       assert.equal(lines.at(-1), 'RESULT PASS');
-      // The real CLI on the same file: its primary-RPC provider is created but never used.
-      const cli = spawnSync(process.execPath, [fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url)), new Date(HOUR * 1000).toISOString()],
-        { env: { ...process.env, COMPACT_SQLITE_PATH: join(directory, 'runner.sqlite') }, encoding: 'utf8' });
-      assert.equal(cli.status, 0, cli.stdout + cli.stderr);
-      for (const text of ['REGISTRY_MODE reused', 'HOUR_OUTCOME already_committed', 'PROVIDER requests=0 retries=0']) assert(cli.stdout.includes(text), text);
-      assert(cli.stdout.trim().endsWith('RESULT PASS'));
+      // Do not spawn the real CLI here: stored-hour discovery may use bounded RPC.
+      // The injected offline provider above is the deterministic contract test.
     });
 
     await test('runner: the next hour runs on the stored registry with no historical scan', async () => {
@@ -951,7 +968,8 @@ if (!sqlite) {
       assert.deepEqual(historyScans(factoryScans, hours[1].range.firstBlock), [], 'only the hour\'s own PoolCreated stream is read');
       assert.equal(summary.registryAfter, `${ORIGIN.originNumber}-${hours[1].range.lastBlock}`);
       const earlier = await runner('runner.sqlite');
-      assert.deepEqual([earlier.summary.hourOutcome, earlier.provider.stats.requests], ['already_committed', 0], 'a stored earlier hour too');
+      assert.equal(earlier.summary.registryMode, 'reused');
+      assertStoredHourDiscoveryOnly(earlier, 'stored earlier hour');
     });
 
     await test('runner: coverage behind the hour catches up only the blocks after it', async () => {
@@ -1013,7 +1031,12 @@ if (!sqlite) {
         assert.deepEqual([store.v3Registry(), store.hourCount(), store.checkpoint()], [null, 0, null], name);
         db.close();
       }
-      const stage1 = await runner('stage1.sqlite'); // the Stage 1 file from the schema test above
+      const stage1Path = join(directory, 'runner-stage1.sqlite');
+      const stage1Db = new sqlite.DatabaseSync(stage1Path);
+      stage1Db.exec(`CREATE TABLE compact_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+        INSERT INTO compact_meta VALUES ('schema_version', '1');`);
+      stage1Db.close();
+      const stage1 = await runner('runner-stage1.sqlite');
       assert.deepEqual([stage1.summary.ok, stage1.summary.reason, stage1.provider.stats.requests], [false, 'schema_version_mismatch', 0]);
     });
 
@@ -1060,8 +1083,9 @@ if (!sqlite) {
       for (const name of ['usdc', 'assets', 'uniswapV3']) assert.deepEqual(after.families[name], before.families[name], `${name} is untouched`);
       assert.deepEqual([after.hours, after.checkpoint, after.registry.through], [before.hours, before.checkpoint, before.registry.through]);
       const settled = await runner('partial.sqlite');
-      assert.deepEqual([settled.summary.hourMode, settled.summary.hourOutcome, settled.provider.stats.requests, settled.summary.ok],
-        ['stored', 'already_committed', 0, true], 'once every family is available the hour exits early with zero RPC');
+      assert.deepEqual([settled.summary.hourMode, settled.summary.ok], ['stored', true],
+        'once every family is available the hour stays in stored mode');
+      assertStoredHourDiscoveryOnly(settled, 'settled repaired hour');
     });
 
     await test('runner: a repair that still cannot verify a family keeps it unavailable; available families never change', async () => {

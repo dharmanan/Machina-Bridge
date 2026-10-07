@@ -28,6 +28,7 @@ import { acquireWriterLock, WriterLockError } from '../server/compact/writer-loc
 import { METADATA_TOKENS_PER_RUN, refreshTokenMetadata } from '../server/compact/token-metadata.js';
 import { collectPoolTvl } from '../server/compact/tvl.js';
 import { UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
+import { refreshDiscoverySafely } from '../server/compact/intelligence.js';
 
 // First block with official V3 factory code on Arc mainnet (eth_getCode: none at 1948018, present at 1948019). The
 // bootstrap still proves it: bootstrapV3Registry refuses a start that is not before the factory deployment.
@@ -117,6 +118,9 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
           poolManager: UNISWAP_REGISTRY.v4PoolManager.address });
       }
     }
+    // Candidates survive a crash between hour COMMIT and this bounded historical-tag enrichment step.
+    // Runs on stored hours too: old unresolved candidates remain reachable without an independent indexer.
+    summary.discovery = await refreshDiscoverySafely({ store, provider });
     // Valuations of stored hours that have none yet (hours stored before valuations existed). No RPC; never fails the run.
     try {
       summary.valuationPass = { derived: store.derivePendingValuations({ limit: VALUATION_HOURS_PER_RUN }).hours.length, error: null };

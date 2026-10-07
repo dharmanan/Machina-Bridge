@@ -16,6 +16,8 @@ import { ARC_CHAIN_ID, ProviderError } from './provider.js';
 import { codeIsPresent } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, COMPACT_SOURCE_VERSIONS, DENSE_LOG_RANGE_BLOCKS, FAMILY_STREAMS, LOG_STREAMS } from './sources.js';
 import { headerOf, SpineError, spineWindows } from './spine.js';
+import { createIntelligenceSink } from './intelligence.js';
+import { INTELLIGENCE_REGISTRY, extensionStreams } from './intelligence-registry.js';
 
 export const HOUR_SECONDS = 3600;
 // One spine window per dense log request: a window never holds more blocks than one dense eth_getLogs covers.
@@ -49,9 +51,12 @@ function registryGap(registry, first, before) {
 // projections: the Uniswap pool/activity projections (projections.js) are fed from the same validated, decoded events the
 // V3/V4 families count, before the logs are released: no extra request. false only to prove that in tests.
 export async function processBlockRange({ provider, first, last, before, after = null, hourStart = null, hourEnd = null,
-  windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null, projections = true }) {
+  windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null, projections = true,
+  intelligenceRegistry = INTELLIGENCE_REGISTRY }) {
   const network = createNetworkAccumulator();
-  const projection = projections ? createProjectionSink() : null;
+  const intelligence = createIntelligenceSink({ registry: intelligenceRegistry });
+  const additionalStreams = extensionStreams(intelligenceRegistry);
+  const projection = projections ? createProjectionSink({ onVerifiedDex: intelligence.dex }) : null;
   const families = {
     usdc: { accumulator: createUsdcAccumulator(), error: null, codeAddresses: [] },
     assets: { accumulator: createAssetsAccumulator(), error: null, codeAddresses: [] },
@@ -70,6 +75,7 @@ export async function processBlockRange({ provider, first, last, before, after =
   try {
     for await (const blocks of spineWindows(provider, { first, last, before, hourStart, hourEnd, windowBlocks })) {
       network.addBlocks(blocks);
+      intelligence.blocks(blocks);
       firstBlock ??= edgeOf(blocks[0]);
       lastBlock = edgeOf(blocks.at(-1));
       const fromBlock = blocks[0].number;
@@ -83,12 +89,25 @@ export async function processBlockRange({ provider, first, last, before, after =
           for await (const response of streamLogs(provider, stream, fromBlock, toBlock)) {
             const logs = validateLogs(response, stream, { fromBlock, toBlock, window, seen });
             family.accumulator.add(stream.key, logs, window);
+            if (stream.key === 'v3Factory') for (const record of family.accumulator.createdPools()) {
+              if (record.createdBlock >= fromBlock && record.createdBlock <= toBlock) intelligence.poolCreated(record, window);
+            }
+            if (stream.key === 'usdc' || stream.key === 'assets') intelligence.transfers(logs);
             onLogs?.(stream.key, logs);
           }
         } catch (error) {
           if (!familyFailure(error)) throw error;
           family.error = error.code;
         }
+      }
+      // Only explicit verified source entries add requests. The empty default registries add no log scan.
+      for (const stream of additionalStreams) {
+        try {
+          const extensionSeen = new Set();
+          for await (const response of streamLogs(provider, stream, fromBlock, toBlock)) {
+            intelligence.extension(stream, validateLogs(response, stream, { fromBlock, toBlock, window, seen: extensionSeen }), window);
+          }
+        } catch { intelligence.failExtension(stream); }
       }
     }
   } catch (error) {
@@ -102,7 +121,8 @@ export async function processBlockRange({ provider, first, last, before, after =
 
   // One batched eth_getCode at the range's last block for every official contract a still-available family relies on.
   const blockTag = hex(last);
-  const targets = [...new Set(Object.values(families).filter((family) => !family.error).flatMap((family) => family.codeAddresses))];
+  const targets = [...new Set([...Object.values(families).filter((family) => !family.error).flatMap((family) => family.codeAddresses),
+    ...additionalStreams.flatMap((stream) => stream.entry.addresses)])];
   const present = new Map();
   try {
     for (let offset = 0; offset < targets.length; offset += 50) {
@@ -131,6 +151,7 @@ export async function processBlockRange({ provider, first, last, before, after =
     results[name] = { status: 'unavailable', reason: family.error, ...Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, null])) };
   }
 
+  const projectionResults = projection ? projection.finish({ families: results, hourStart, firstBlock: first, lastBlock: last }) : null;
   return {
     definitionVersion: COMPACT_DEFINITION_VERSION,
     sourceVersions: COMPACT_SOURCE_VERSIONS,
@@ -160,7 +181,9 @@ export async function processBlockRange({ provider, first, last, before, after =
         ? { through: lastBlock.number, throughHash: lastBlock.hash, created: families.uniswapV3.accumulator.createdPools() } : null,
     },
     // Not families: separate status, storage and versions (store.js). Present only when computed.
-    ...(projection ? { projections: projection.finish({ families: results, hourStart, firstBlock: first, lastBlock: last }) } : {}),
+    ...(projectionResults ? { projections: projectionResults } : {}),
+    intelligence: intelligence.finish({ range: { hourStart, firstBlock: first, lastBlock: last, parentHash: before.hash, lastHash: lastBlock.hash },
+      families: results, codePresent: context.codePresent, projections: projectionResults }),
   };
 }
 
@@ -197,12 +220,12 @@ export async function locateHour({ provider, hourStart, safeHead }) {
 // any registry that covers the blocks before the hour classifies V3 emitters the same way. `bounds` (from locateHour)
 // skips the boundary search; it is checked again here and the spine re-validates every block against it.
 export async function processHour({ provider, hourStart, safeHead, windowBlocks = DEFAULT_WINDOW_BLOCKS, onLogs = null, v3Registry = null,
-  bounds = null, projections = true }) {
+  bounds = null, projections = true, intelligenceRegistry = INTELLIGENCE_REGISTRY }) {
   if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
   const hourEnd = hourStart + HOUR_SECONDS;
   const { before, first, last, after } = bounds ? checkedBounds(bounds, hourStart) : await locateHour({ provider, hourStart, safeHead });
   const result = await processBlockRange({ provider, first: first.number, last: last.number, before, after, hourStart, hourEnd,
-    windowBlocks, onLogs, v3Registry, projections });
+    windowBlocks, onLogs, v3Registry, projections, intelligenceRegistry });
   if (result.range.firstHash !== first.hash || result.range.lastHash !== last.hash) throw new HourIncompleteError('boundary_hash_mismatch');
   return result;
 }

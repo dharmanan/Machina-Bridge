@@ -10,10 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { POOL_HOUR_RETENTION_HOURS } from '../server/compact/projections.js';
 import {
-  assertHourIso, backoffMs, CHILD_NODE_ARGS, createChildHourRunner, createScheduler, DEFAULT_SAFETY_DELAY_MS, hourIso, latestSafeHourStart,
+  assertHourIso, backoffMs, CHILD_NODE_ARGS, createChildHourRunner, createChildHistoryRunner, createChildDiscoveryRunner, createScheduler, DEFAULT_SAFETY_DELAY_MS, hourIso, latestSafeHourStart,
   MAX_BACKOFF_MS, PROJECTION_REPAIR_COOLDOWN_MS, PROJECTION_REPAIR_WINDOW_HOURS,
 } from '../server/compact/scheduler.js';
-import { PROJECTION_REPAIR_SCRIPT, RUNNER_SCRIPT, serviceConfig, startIntelligenceService } from './serve-compact-intelligence.mjs';
+import { DISCOVERY_DRAIN_SCRIPT, PROJECTION_REPAIR_SCRIPT, RUNNER_SCRIPT, serviceConfig, startIntelligenceService } from './serve-compact-intelligence.mjs';
 
 let passed = 0;
 async function test(name, run) { await run(); passed += 1; console.log(`PASS ${name}`); }
@@ -27,9 +27,10 @@ const settle = () => new Promise((done) => setImmediate(done));
 // timers that never fire on their own, and a log of every child start. With projectionCandidates, the read model also
 // answers projection repair candidates and the scheduler gets a projection repair runner sharing the same child counters.
 function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit', candidates = () => [], projectionCandidates = null,
-  projectionBehavior = () => 'repair' } = {}) {
+  projectionBehavior = () => 'repair', discovery = null, discoveryBehavior = () => 'repair',
+  historyFirst = null, historyBehavior = () => 'commit' } = {}) {
   const state = { checkpoint, clock, starts: [], kinds: [], running: 0, maxRunning: 0, timers: [], terminated: [], pending: [], logs: [],
-    projectionQueries: [] };
+    projectionQueries: [], historyFirst, discoveryQueries: [] };
   const readModel = {
     checkpoint: () => (state.checkpoint === null ? null : { hourStart: state.checkpoint, lastBlock: 1 }),
     repairCandidates: ({ fromHour, toHour }) => candidates(state).filter((hour) => hour >= fromHour && hour <= toHour),
@@ -41,6 +42,8 @@ function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit'
       return { hours: hours.filter((hour) => hour >= fromHour && hour <= toHour), blocked };
     };
   }
+  if (discovery) readModel.discoveryPending = ({ nowMs }) => { state.discoveryQueries.push(nowMs); return discovery(state); };
+  if (historyFirst !== null) readModel.historyBounds = () => ({ first: state.historyFirst });
   const runnerFor = (kind, decide) => function run(hour) {
     const hourStart = Date.parse(hour) / 1000;
     state.starts.push(hourStart);
@@ -58,6 +61,7 @@ function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit'
       // The real runner refuses anything but checkpoint + 1 (or the first hour of an empty store); a projection repair
       // never commits an hour.
       if (kind === 'hour' && (state.checkpoint === null || hourStart === state.checkpoint + H)) state.checkpoint = hourStart;
+      if (kind === 'history' && hourStart === state.historyFirst - H) state.historyFirst = hourStart;
     };
     if (mode === 'commit') { commit(); complete({ exitCode: 0 }); }
     else if (mode === 'commit-unavailable') { commit(); complete({ exitCode: 1 }); }
@@ -78,6 +82,9 @@ function world({ checkpoint = null, clock = at(10, 6), behavior = () => 'commit'
   let fatal = 0;
   const scheduler = createScheduler({
     readModel, runHour: runnerFor('hour', behavior), runProjectionRepair: projectionCandidates ? runnerFor('projection', projectionBehavior) : null,
+    runDiscoveryDrain: discovery ? () => runnerFor('discovery', discoveryBehavior)(hourIso(state.checkpoint)) : null,
+    runHistoryBackfill: historyFirst !== null ? () => runnerFor('history', historyBehavior)(hourIso(state.historyFirst - H)) : null,
+    historyStartHour: historyFirst !== null ? BASE : null,
     now: () => state.clock, onFatal: () => { fatal += 1; }, log: (line) => state.logs.push(line),
     setTimer: (fn, ms) => { const handle = { fn, ms }; state.timers.push(handle); return handle; },
     clearTimer: (handle) => { state.timers = state.timers.filter((timer) => timer !== handle); },
@@ -372,7 +379,54 @@ await test('projection repair: stop() terminates a running projection child and 
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Real child processes running tiny temporary scripts.
+// Lowest-priority discovery lane with the same deterministic clock/child doubles.
+await test('discovery drain: only due durable work starts a child; one bounded pass yields per tick', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true });
+  await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery']);
+  assert.equal(scheduler.status().lastRun.kind, 'discovery_drain'); assert.equal(scheduler.status().lastRun.ok, true);
+  assert.equal(state.checkpoint, BASE + 9 * H); assert.equal(state.timers.length, 1); assert.equal(state.timers[0].ms, 5 * 60_000);
+  await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery', 'discovery']); assert.equal(state.maxRunning, 1);
+  const idle = world({ checkpoint: BASE + 9 * H, discovery: () => false });
+  await idle.scheduler.tick(); assert.deepEqual(idle.state.kinds, []);
+});
+await test('discovery drain: catch-up, history, family repair and projection repair keep existing priority', async () => {
+  const live = world({ checkpoint: BASE + 8 * H, discovery: () => true });
+  await live.scheduler.tick(); assert.deepEqual(live.state.kinds, ['hour', 'discovery']);
+  const history = world({ checkpoint: BASE + 9 * H, historyFirst: BASE + 2 * H, discovery: () => true });
+  await history.scheduler.tick(); assert.deepEqual(history.state.kinds, ['history', 'history', 'discovery']);
+  assert.equal(history.state.checkpoint, BASE + 9 * H);
+  const family = world({ checkpoint: BASE + 9 * H, candidates: () => [BASE + 8 * H], discovery: () => true });
+  await family.scheduler.tick(); assert.deepEqual(family.state.kinds, ['hour']); assert.equal(family.state.discoveryQueries.length, 0);
+  await family.scheduler.tick(); assert.deepEqual(family.state.kinds, ['hour', 'discovery']);
+  const projection = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [BASE + 8 * H] }), discovery: () => true });
+  await projection.scheduler.tick(); assert.deepEqual(projection.state.kinds, ['projection']); assert.equal(projection.state.discoveryQueries.length, 0);
+  await projection.scheduler.tick(); assert.deepEqual(projection.state.kinds, ['projection', 'discovery']);
+});
+await test('discovery drain: held child never overlaps; next tick checks newly due live hour first', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true,
+    discoveryBehavior: () => 'hold' });
+  const first = scheduler.tick(); await settle();
+  assert.equal(scheduler.status().runningKind, 'discovery_drain');
+  const second = scheduler.tick(); state.clock = at(11, 6);
+  assert.deepEqual(state.kinds, ['discovery']); state.pending.shift().release(); await Promise.all([first, second]);
+  assert.deepEqual(state.kinds, ['discovery']);
+  const next = scheduler.tick(); await settle(); assert.deepEqual(state.kinds, ['discovery', 'hour', 'discovery']);
+  state.pending.shift().release(); await next; assert.equal(state.maxRunning, 1); assert.equal(state.checkpoint, BASE + 10 * H);
+});
+await test('discovery drain: failure is visible and yields, never fake checkpoint progress', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true, discoveryBehavior: () => 'fail' });
+  await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery']);
+  assert.equal(scheduler.status().lastRun.ok, false); assert.equal(scheduler.status().lastRun.exitCode, 1);
+  assert.equal(state.checkpoint, BASE + 9 * H); assert.equal(state.timers[0].ms, 5 * 60_000);
+});
+await test('discovery drain: shutdown terminates the owned child and prevents further work', async () => {
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true, discoveryBehavior: () => 'hold' });
+  const running = scheduler.tick(); await settle(); await scheduler.stop(); await running;
+  assert.equal(state.terminated.length, 1); assert.equal(state.running, 0); assert.equal(state.timers.length, 0);
+  await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery']);
+});
+
+// Real child processes running tiny temporary scripts (Codespace acceptance only).
 const workdir = mkdtempSync(join(tmpdir(), 'compact-runtime-'));
 const script = (name, body) => {
   const path = join(workdir, name);
@@ -401,6 +455,15 @@ await test('child runner: the existing runner command keeps its memory flags, ge
   const source = readFileSync(new URL('../server/compact/scheduler.js', import.meta.url), 'utf8');
   assert.match(source, /shell: false/);
   assert.doesNotMatch(source, /shell: true|execSync|exec\(/);
+});
+
+await test('discovery child is bounded one-pass with existing memory flags, history child arguments unchanged', async () => {
+  assert.ok(DISCOVERY_DRAIN_SCRIPT.endsWith('/scripts/drain-compact-discovery.mjs'));
+  const out = join(workdir, 'discovery.json'); const env = { ...process.env, CHILD_OUT: out };
+  assert.equal((await createChildDiscoveryRunner({ scriptPath: recorder, env })().done).exitCode, 0);
+  assert.deepEqual(JSON.parse(readFileSync(out, 'utf8')), { argv: [], execArgv: [...CHILD_NODE_ARGS] });
+  assert.equal((await createChildHistoryRunner({ scriptPath: recorder, env })().done).exitCode, 0);
+  assert.deepEqual(JSON.parse(readFileSync(out, 'utf8')), { argv: ['--execute', '--max-hours=1'], execArgv: [] });
 });
 
 await test('child runner: an invalid hour never spawns', () => {
@@ -484,7 +547,10 @@ await test('service: with the scheduler disabled the read API still serves, no i
 await test('service: the scheduler gets the strict single-hour projection repair child, never a bulk backfill', () => {
   assert.ok(PROJECTION_REPAIR_SCRIPT.endsWith('/scripts/repair-compact-projection-hour.mjs'));
   const source = readFileSync(new URL('./serve-compact-intelligence.mjs', import.meta.url), 'utf8');
-  assert.match(source, /createScheduler\(\{ readModel, runHour, runProjectionRepair, log, onFatal: fatal \}\)/);
+  assert.match(source, /createChildHourRunner\(\{ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv \}\)/);
+  assert.match(source, /createChildHistoryRunner\(\{ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv \}\)/);
+  assert.match(source, /createChildDiscoveryRunner\(\{ scriptPath: DISCOVERY_DRAIN_SCRIPT, env: childEnv \}\)/);
+  assert.match(source, /createScheduler\(\{\s*readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain,/);
   assert.doesNotMatch(source, /backfill-compact-projections|--execute|COMPACT_PROJECTION_EXECUTE/);
 });
 

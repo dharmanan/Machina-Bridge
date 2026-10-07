@@ -34,6 +34,9 @@ import { TVL_POOLS_PER_PROTOCOL, TVL_REASONS, TVL_VERSION } from './tvl.js';
 import { hourFeesOf, hourVolumeOf, tokenPricesOf, VALUATION_REASONS, VALUATION_VERSIONS, VALUATIONS } from './valuation.js';
 import { sumWindow } from './windows.js';
 
+import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
+import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
+
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
 export const UNIQUE_ADDRESS_WINDOWS = Object.freeze([1, 6, 24]);
@@ -377,6 +380,8 @@ export function createCompactStore(db) {
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(SCHEMA);
+    db.exec(INTELLIGENCE_SQL);
+    db.exec(DAILY_ACTIVE_ADDRESSES_SQL);
     const setMeta = db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)');
     setMeta.run('schema_version', COMPACT_SCHEMA_VERSION);
     for (const [name, version] of Object.entries(FAMILY_VERSIONS)) {
@@ -414,6 +419,8 @@ export function createCompactStore(db) {
   }
   if (versionOf() !== COMPACT_SCHEMA_VERSION) throw new StoreError('schema_version_mismatch');
   const int = (value) => BigInt(value); // bind as SQLite INTEGER, never REAL
+  const intelligence = createIntelligenceRepository(db);
+  const dailyActiveAddresses = createDailyActiveAddressesStore(db);
   const sql = {
     hour: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash, network_sha256 FROM compact_hours WHERE hour_start = ?'),
     insertHour: db.prepare(`INSERT INTO compact_hours (hour_start, definition_version, first_block, last_block, parent_hash, first_hash,
@@ -442,6 +449,26 @@ export function createCompactStore(db) {
     setCoverage: db.prepare(`INSERT INTO compact_registry_coverage (kind, from_block, through_block, through_hash) VALUES (?, ?, ?, ?)
       ON CONFLICT (kind) DO UPDATE SET through_block = excluded.through_block, through_hash = excluded.through_hash`),
     hourRange: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash FROM compact_hours WHERE hour_start = ?'),
+    dauReplayCandidate: db.prepare(`
+      SELECT h.hour_start
+      FROM compact_hours h
+      LEFT JOIN compact_daily_address_hours c ON c.hour_start = h.hour_start
+      LEFT JOIN compact_daily_active_addresses d
+        ON d.day_start = h.hour_start - (h.hour_start % 86400)
+      WHERE c.hour_start IS NULL
+        AND (
+          d.day_start IS NULL
+          OR (d.status = 'unavailable' AND d.reason = 'identity_not_captured')
+        )
+        AND (
+          SELECT COUNT(*)
+          FROM compact_hours x
+          WHERE x.hour_start >= h.hour_start - (h.hour_start % 86400)
+            AND x.hour_start < h.hour_start - (h.hour_start % 86400) + 86400
+        ) = 24
+      ORDER BY h.hour_start - (h.hour_start % 86400) DESC, h.hour_start ASC
+      LIMIT 1
+    `),
     hourByLastBlock: db.prepare('SELECT hour_start FROM compact_hours WHERE last_block = ?'),
     uniswapFamilies: db.prepare(`SELECT family, status, metrics_json FROM compact_family_hours WHERE hour_start = ?
       AND family IN ('uniswapV3', 'uniswapV4')`),
@@ -913,6 +940,7 @@ export function createCompactStore(db) {
           sql.insertFamily.run(int(range.hourStart), family.name, family.status, family.reason, family.json, family.sha);
         }
         storeAddresses(range.hourStart, result.activeAddresses);
+        dailyActiveAddresses.observeHour(range.hourStart, result.activeAddresses);
         advanceCheckpoint(range.hourStart);
       } else {
         for (const family of rows.families) {
@@ -932,6 +960,7 @@ export function createCompactStore(db) {
       if (rows.v3) advanceRegistry(range, rows.v3);
       // Same transaction as the hour: a crash leaves neither the hour nor its projections.
       const projections = rows.projections ? writeProjections(range, rows.projections) : null;
+      intelligence.recordHour(result);
       return { outcome, checkpoint: checkpoint(), projections };
     }, beforeCommit);
   }
@@ -947,6 +976,7 @@ export function createCompactStore(db) {
       const existing = sql.hour.get(int(range.hourStart));
       if (existing) {
         if (existing.network_sha256 !== rows.networkSha) throw new StoreError('hour_conflict');
+        intelligence.recordHour(result);
         return { outcome: 'unchanged', checkpoint: checkpoint(), projections: null };
       }
       const oldest = sql.oldestHour.get();
@@ -965,8 +995,10 @@ export function createCompactStore(db) {
         sql.insertFamily.run(int(range.hourStart), family.name, family.status, family.reason, family.json, family.sha);
       }
       storeAddresses(range.hourStart, result.activeAddresses);
+      dailyActiveAddresses.observeHour(range.hourStart, result.activeAddresses);
       if (rows.v3) advanceRegistry(range, rows.v3);
       const projections = rows.projections ? writeProjections(range, rows.projections) : null;
+      intelligence.recordHour(result);
 
       if (requireValuations) {
         const valuations = new Map(sql.valuations.all(int(range.hourStart)).map((row) => [row.valuation, row.status]));
@@ -1051,12 +1083,33 @@ export function createCompactStore(db) {
   }
 
   return Object.freeze({
+    intelligence,
     commitHour,
     commitHistoricalHour,
     checkpoint,
     earliestHour() {
       const row = sql.oldestHour.get();
       return row ? { hourStart: row.hour_start, firstBlock: row.first_block, parentHash: row.parent_hash } : null;
+    },
+    dailyActiveReplayCandidate() {
+      const row = sql.dauReplayCandidate.get();
+      return row ? row.hour_start : null;
+    },
+    storedHour(hourStart) {
+      const row = sql.hourRange.get(int(hourStart));
+      return row ? {
+        hourStart: row.hour_start,
+        firstBlock: row.first_block,
+        lastBlock: row.last_block,
+        parentHash: row.parent_hash,
+        lastHash: row.last_hash,
+      } : null;
+    },
+    replayDailyActiveAddresses(hourStart, addresses) {
+      return transaction(() => {
+        if (!sql.hourRange.get(int(hourStart))) throw new StoreError('hour_missing');
+        return dailyActiveAddresses.observeHour(hourStart, addresses, { replay: true });
+      });
     },
     extendRegistry,
     uniqueActiveAddresses,

@@ -274,7 +274,7 @@ function pricePathRow(pool, path, firstBlock, lastBlock) {
     reserve1BlockSum: sums[2].toString(10) };
 }
 
-export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND } = {}) {
+export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND, onVerifiedDex = null } = {}) {
   const pools = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const paths = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const fees = new Map();
@@ -356,6 +356,7 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
   return Object.freeze({
     // kind: swap | mint | burn; event: the decodeV3* result the family accumulator just produced for this official log.
     v3(kind, log, event, window) {
+      onVerifiedDex?.('uniswap_v3', kind, log, event, window);
       let activityKind = kind === 'swap' ? 'swap' : kind === 'mint' ? 'add' : null;
       try {
         const pool = poolOf('uniswap_v3', log.address);
@@ -389,6 +390,7 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
     },
     // kind: initialize | swap | modify; event: the decodeV4* result the family accumulator just produced.
     v4(kind, log, event, window) {
+      onVerifiedDex?.('uniswap_v4', kind, log, event, window);
       let activityKind = null;
       try {
         if (kind === 'initialize') {

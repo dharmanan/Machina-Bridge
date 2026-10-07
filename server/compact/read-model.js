@@ -6,6 +6,8 @@
 // Windows are anchored to the committed checkpoint, never to the wall clock. A window is available only when every one
 // of its hours is; missing evidence is reported (unavailable / not_supported), never turned into zero.
 import { existsSync } from 'node:fs';
+import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
+import { ECOSYSTEM_WINDOWS } from './intelligence-registry.js';
 import { ARC_ASSETS_BY_ADDRESS } from '../../api/_lib/arc-intelligence/assets.js';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import { POOL_PROJECTION_FAMILY, projectionRepairState, V4_POOL_KIND } from './projections.js';
@@ -216,6 +218,32 @@ const SQL = Object.freeze({
     (SELECT COUNT(*) FROM compact_hour_addresses a WHERE a.hour_start = h.hour_start) AS stored
     FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ?`,
   identityUnion: 'SELECT COUNT(DISTINCT address) AS count FROM compact_hour_addresses WHERE hour_start BETWEEN ? AND ?',
+  dailyActiveAddressTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_daily_active_addresses'",
+  dailyActiveAddress: `SELECT status, reason, active_addresses FROM compact_daily_active_addresses WHERE day_start = ?`,
+  dauReplayBootstrapCandidate: `SELECT MIN(hour_start) AS hour_start
+    FROM compact_hours
+    GROUP BY (hour_start - (hour_start % 86400))
+    HAVING COUNT(*) = 24
+    ORDER BY (hour_start - (hour_start % 86400)) DESC
+    LIMIT 1`,
+  dauReplayCandidate: `SELECT h.hour_start
+    FROM compact_hours h
+    LEFT JOIN compact_daily_address_hours c ON c.hour_start = h.hour_start
+    LEFT JOIN compact_daily_active_addresses d
+      ON d.day_start = h.hour_start - (h.hour_start % 86400)
+    WHERE c.hour_start IS NULL
+      AND (
+        d.day_start IS NULL
+        OR (d.status = 'unavailable' AND d.reason = 'identity_not_captured')
+      )
+      AND (
+        SELECT COUNT(*)
+        FROM compact_hours x
+        WHERE x.hour_start >= h.hour_start - (h.hour_start % 86400)
+          AND x.hour_start < h.hour_start - (h.hour_start % 86400) + 86400
+      ) = 24
+    ORDER BY h.hour_start - (h.hour_start % 86400) DESC, h.hour_start ASC
+    LIMIT 1`,
   familyRows: `SELECT h.hour_start, f.status, f.reason, f.metrics_json FROM compact_hours h
     LEFT JOIN compact_family_hours f ON f.hour_start = h.hour_start AND f.family = ?
     WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
@@ -364,6 +392,27 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       return { status: 'unavailable', reason: 'identity_incomplete', value: null };
     }
     return { status: 'available', value: statement('identityUnion').get(int(from), int(to)).count };
+  }
+
+  function dailyActiveAddresses(dayStart) {
+    if (!statement('dailyActiveAddressTable').get()) {
+      return { status: 'not_stored', reason: 'daily_identity_not_processed', value: null };
+    }
+
+    const row = statement('dailyActiveAddress').get(int(dayStart));
+    if (!row) {
+      return { status: 'not_stored', reason: 'daily_identity_not_processed', value: null };
+    }
+
+    if (row.status === 'available') {
+      return { status: 'available', value: row.active_addresses };
+    }
+
+    if (row.status === 'unavailable' && typeof row.reason === 'string') {
+      return { status: 'unavailable', reason: row.reason, value: null };
+    }
+
+    throw new ReadModelError('inconsistent_state', 'daily_active_addresses_malformed');
   }
 
   function networkWindow(from, to, hours, newestHour) {
@@ -620,8 +669,11 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
 
   function buildTimeseries(windowKey, hours) {
     const state = anchor();
-    const to = state.hour;
-    const from = to - (hours - 1) * HOUR;
+    const daily = hours > 24;
+    const latestCompleteDayStart = Math.floor((state.hour + HOUR) / (DAILY_BUCKET_HOURS * HOUR))
+      * (DAILY_BUCKET_HOURS * HOUR) - (DAILY_BUCKET_HOURS * HOUR);
+    const to = daily ? latestCompleteDayStart + (DAILY_BUCKET_HOURS - 1) * HOUR : state.hour;
+    const from = daily ? to - (hours - 1) * HOUR : state.hour - (hours - 1) * HOUR;
     const network = new Map(statement('networkRows').all(int(from), int(to)).map((row) => [row.hour_start, row]));
     const familyRows = new Map();
     for (const row of statement('allFamilyRows').all(int(from), int(to))) familyRows.set(`${row.hour_start}:${row.family}`, row);
@@ -672,8 +724,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   }
 
   // 24-hour buckets of hourly buckets (oldest first). A bucket is committed only when all 24 hours are; its family and USD
-  // values only when every hour's is (sums of the additive fields), otherwise unavailable with the first gap's reason. Unique
-  // active addresses per day are not_supported: hourly uniques never add up and identities are kept for 24 hours only.
+  // values only when every hour's is (sums of the additive fields), otherwise unavailable with the first gap's reason.
+  // Daily active addresses come only from an exact persisted UTC-day distinct count; missing history is never zero-filled.
   function dailyBuckets(hourly) {
     const out = [];
     for (let index = 0; index < hourly.length; index += DAILY_BUCKET_HOURS) {
@@ -686,9 +738,13 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       }
       const blocks = stored.reduce((total, bucket) => total + bucket.network.blocks, 0);
       const transactions = stored.reduce((total, bucket) => total + bucket.network.transactions, 0);
-      const network = { blocks, transactions, transactionsPerSecond: transactions / (DAILY_BUCKET_HOURS * HOUR), averageTransactionsPerBlock: blocks ? transactions / blocks : null,
-        gasUsedRaw: stored.reduce((total, bucket) => total + BigInt(bucket.network.gasUsedRaw), 0n).toString(10), uniqueActiveAddresses: null,
-        uniqueActiveAddressesStatus: { status: 'not_supported', reason: 'identity_retention_exceeded' } };
+      const dayStart = Date.parse(range.start) / 1000;
+      const dau = dailyActiveAddresses(dayStart);
+      const network = { blocks, transactions, transactionsPerSecond: transactions / (DAILY_BUCKET_HOURS * HOUR),
+        averageTransactionsPerBlock: blocks ? transactions / blocks : null,
+        gasUsedRaw: stored.reduce((total, bucket) => total + BigInt(bucket.network.gasUsedRaw), 0n).toString(10),
+        uniqueActiveAddresses: dau.status === 'available' ? dau.value : null,
+        uniqueActiveAddressesStatus: dau };
       const families = Object.fromEntries(TIMESERIES_FAMILIES.map((name) => {
         const gap = stored.find((bucket) => bucket.families[name].status !== 'available');
         if (gap) return [name, { status: 'unavailable', reason: gap.families[name].reason }];
@@ -925,6 +981,10 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   const chain = Object.freeze({ id: ARC_CHAIN_ID, name: 'Arc' });
 
   return Object.freeze({
+    ecosystem(windowKey) {
+      if (typeof windowKey !== 'string' || !Object.hasOwn(ECOSYSTEM_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
+      return snapshot(() => { anchor(); return readEcosystem(connection(), windowKey); });
+    },
     // Process alive, file readable, schema and family versions valid. No checkpoint yet is still healthy (empty store).
     health() {
       return snapshot(() => {
@@ -964,6 +1024,12 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         limit: ACTIVITY_LIMIT, rows: core.rows };
     },
     // For the scheduler: the committed checkpoint, or null for a missing file or an empty store. Never a guess.
+    dailyActiveReplayCandidate() {
+      if (statement('dailyActiveAddressTable').get()) {
+        return statement('dauReplayCandidate').get()?.hour_start ?? null;
+      }
+      return statement('dauReplayBootstrapCandidate').get()?.hour_start ?? null;
+    },
     checkpoint() {
       if (!existsSync(path)) return null;
       return snapshot((state) => {
@@ -971,6 +1037,12 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         const checkpoint = statement('checkpoint').get();
         return checkpoint ? { hourStart: checkpoint.hour_start, lastBlock: checkpoint.last_block } : null;
       }, { requireDefinitions: false });
+    },
+    // Internal eligibility only: no RPC, no writes; old DBs without the new table have no candidate work.
+    discoveryPending({ nowMs }) {
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new ReadModelError('invalid_time');
+      if (!existsSync(path)) return false;
+      return snapshot((state) => state.code === 'database_empty' ? false : discoveryWorkDue(connection(), nowMs), { requireDefinitions: false });
     },
     // Durable stored-history bounds for the scheduler. Read-only and side-effect free.
     historyBounds() {

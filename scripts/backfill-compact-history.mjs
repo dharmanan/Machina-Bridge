@@ -21,6 +21,7 @@ import { HOUR_SECONDS, locateHour, processHour } from '../server/compact/hour.js
 import { createProvider, ProviderError } from '../server/compact/provider.js';
 import { createCompactStore } from '../server/compact/store.js';
 import { acquireWriterLock, WriterLockError } from '../server/compact/writer-lock.js';
+import { refreshDiscoverySafely } from '../server/compact/intelligence.js';
 
 export const SAFE_HEAD_MARGIN_BLOCKS = 200;
 export const DEFAULT_RPC_INTERVAL_MS = 1000;
@@ -176,7 +177,8 @@ export async function probeNextHour({ sqlitePath, provider }) {
 export async function executeHistoryBackfill({ config, provider, print = console.log }) {
   const lock = acquireWriterLock(config.sqlitePath, { owner: 'compact-history-backfill' });
   let db = null;
-  const report = { committed: 0, historyStart: null, startEarliest: null, endEarliest: null, remaining: null };
+  const report = { committed: 0, historyStart: null, startEarliest: null, endEarliest: null, remaining: null, discovery: null };
+  let discoveryRefreshed = false;
   try {
     const history = await discoverHistoryStart(provider);
     report.historyStart = history.firstCompleteHour;
@@ -218,6 +220,13 @@ export async function executeHistoryBackfill({ config, provider, print = console
 
       report.committed += 1;
       report.endEarliest = target;
+      // At most one bounded pass per child/invocation, even with --all. Hour COMMIT is already durable;
+      // targeted RPC reads run outside its transaction, under the same writer lock and provider pacing.
+      if (!discoveryRefreshed) {
+        discoveryRefreshed = true;
+        report.discovery = await refreshDiscoverySafely({ store, provider });
+        print(`BACKFILL_DISCOVERY ${JSON.stringify(report.discovery)}`);
+      }
       const unavailableFamilies = Object.entries(result.families).filter(([, entry]) => entry.status !== 'available')
         .map(([name, entry]) => `${name}:${entry.reason}`);
       const valuations = store.valuationStatus(target);

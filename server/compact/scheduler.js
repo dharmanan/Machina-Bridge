@@ -7,8 +7,8 @@
 // Only after the chain is caught up, at most one recent hour with an unavailable family is repaired per tick. Only when no
 // family repair is due either, at most one stored hour whose Uniswap pool projection is missing or unavailable is repaired
 // per tick by a projection-only child (scripts/repair-compact-projection-hour.mjs): never processHour, never the hour,
-// its families or the checkpoint. Every child (catch-up, family repair, projection repair) is the single child of the
-// single run loop, so no two ever overlap.
+// its families or the checkpoint. After those priorities, discovery-only enrichment may drain durable candidates.
+// Every child is the single child of the single run loop, so no two ever overlap.
 import { spawn } from 'node:child_process';
 
 export const HOUR_MS = 3_600_000;
@@ -83,12 +83,12 @@ export function createChildHourRunner({ scriptPath, execPath = process.execPath,
 
 // Service-owned historical runner: exactly one historical hour per child. It is intentionally not detached;
 // the always-on service owns it, so Railway restarts terminate it and the next service process resumes from SQLite.
-export function createChildHistoryRunner({ scriptPath, execPath = process.execPath, env = process.env, spawnImpl = spawn,
+function createChildTaskRunner({ scriptPath, args, execPath = process.execPath, env = process.env, spawnImpl = spawn,
   killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now() }) {
   if (typeof scriptPath !== 'string' || !scriptPath) throw new Error('script_path_required');
-  return function runHistory() {
+  return function runTask() {
     const startedAt = now();
-    const child = spawnImpl(execPath, [scriptPath, '--execute', '--max-hours=1'], {
+    const child = spawnImpl(execPath, [...args.beforeScript, scriptPath, ...args.afterScript], {
       stdio: ['ignore', 'inherit', 'inherit'], env, shell: false,
     });
     let exited = false;
@@ -108,11 +108,21 @@ export function createChildHistoryRunner({ scriptPath, execPath = process.execPa
   };
 }
 
+export function createChildHistoryRunner(options) {
+  return createChildTaskRunner({ ...options, args: { beforeScript: [], afterScript: ['--execute', '--max-hours=1'] } });
+}
+
+export function createChildDiscoveryRunner(options) {
+  return createChildTaskRunner({ ...options, args: { beforeScript: CHILD_NODE_ARGS, afterScript: [] } });
+}
+
 // readModel: { checkpoint(), historyBounds(), repairCandidates({ fromHour, toHour }),
-// projectionRepairCandidates({ fromHour, toHour }) } (read-only).
+// projectionRepairCandidates({ fromHour, toHour }), discoveryPending({ nowMs }) } (read-only).
 // runHour(hourIso) / runProjectionRepair(hourIso): { done, terminate }.
-// runHistoryBackfill(): one historical hour child. Live checkpoint catch-up always has priority.
-export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, historyStartHour = null,
+// runHistoryBackfill(): one historical hour child. runDiscoveryDrain(): one capped enrichment pass, lowest priority.
+// Live checkpoint catch-up always has priority.
+export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, runDiscoveryDrain = null,
+  runDailyActiveReplay = null, historyStartHour = null,
   now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
   safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
   maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS,
@@ -126,6 +136,7 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
   const repairAttempts = new Map(); // hour start -> last attempt (ms)
   const projectionAttempts = new Map(); // hour start -> last projection repair attempt (ms)
   let blockedSummary = '';
+  let backgroundTurn = 'dau';
   const status = { lastRun: null, consecutiveFailures: 0, retryAt: null, projectionRepairBlocked: null };
 
   async function runChild(hourStart, kind, runner = runHour) {
@@ -176,25 +187,65 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
       return { again: false, wakeAt: retryAt };
     }
 
-    // Live checkpoint is caught up. Historical backfill is service-owned and resumable: one hour per child, then the
-    // loop starts over from the top so a newly due live hour always wins before the next historical hour.
+    // Live is caught up. Alternate one historical hour with one DAU replay hour so neither
+    // background backfill can starve the other. Every child remains service-owned and non-overlapping.
+    let historyPending = false;
+    let historyBefore = null;
+
     if (runHistoryBackfill && Number.isSafeInteger(historyStartHour) && historyStartHour % HOUR_SECONDS === 0
       && typeof readModel.historyBounds === 'function') {
-      const before = readModel.historyBounds();
-      if (before?.first > historyStartHour) {
-        const targetHour = before.first - HOUR_SECONDS;
-        const outcome = await runHistoryChild(targetHour);
-        if (stopped) return { again: false };
-        const after = readModel.historyBounds();
-        const advanced = Boolean(after) && after.first < before.first;
-        status.lastRun = { kind: 'history_backfill', hour: hourIso(targetHour), advanced, ...outcome };
-        if (advanced) {
-          log(`SCHEDULER_HISTORY_COMMITTED hour=${hourIso(targetHour)} exit=${outcome.exitCode}`);
-          return { again: true };
-        }
-        log(`SCHEDULER_HISTORY_RETRY hour=${hourIso(targetHour)} exit=${outcome.exitCode} signal=${outcome.signal}`);
-        return { again: false, wakeAt: now() + Math.min(tickMs, 60_000) };
+      historyBefore = readModel.historyBounds();
+      historyPending = Boolean(historyBefore?.first > historyStartHour);
+    }
+
+    const dauHour = runDailyActiveReplay && typeof readModel.dailyActiveReplayCandidate === 'function'
+      ? readModel.dailyActiveReplayCandidate()
+      : null;
+    const dauPending = Number.isSafeInteger(dauHour);
+
+    if (historyPending && (backgroundTurn === 'history' || dauPending === false)) {
+      const targetHour = historyBefore.first - HOUR_SECONDS;
+      const outcome = await runHistoryChild(targetHour);
+      if (stopped) return { again: false };
+
+      const after = readModel.historyBounds();
+      const advanced = Boolean(after) && after.first < historyBefore.first;
+      status.lastRun = { kind: 'history_backfill', hour: hourIso(targetHour), advanced, ...outcome };
+
+      if (advanced) {
+        if (dauPending) backgroundTurn = 'dau';
+        log(`SCHEDULER_HISTORY_COMMITTED hour=${hourIso(targetHour)} exit=${outcome.exitCode}`);
+        return { again: true };
       }
+
+      log(`SCHEDULER_HISTORY_RETRY hour=${hourIso(targetHour)} exit=${outcome.exitCode} signal=${outcome.signal}`);
+      return { again: false, wakeAt: now() + Math.min(tickMs, 60_000) };
+    }
+
+    if (dauPending) {
+      const checkpointBefore = readModel.checkpoint();
+      const outcome = await runChild(dauHour, 'daily_active_replay', runDailyActiveReplay);
+      if (stopped) return { again: false };
+
+      const checkpointAfter = readModel.checkpoint();
+      const checkpointUnchanged =
+        checkpointBefore?.hourStart === checkpointAfter?.hourStart &&
+        checkpointBefore?.lastBlock === checkpointAfter?.lastBlock;
+
+      if (checkpointUnchanged === false) throw new Error('dau_replay_checkpoint_changed');
+
+      const nextDauHour = readModel.dailyActiveReplayCandidate();
+      const advanced = nextDauHour !== dauHour;
+      status.lastRun = { kind: 'daily_active_replay', hour: hourIso(dauHour), advanced, ...outcome };
+
+      if (outcome.exitCode === 0 && outcome.error === null && advanced) {
+        if (historyPending) backgroundTurn = 'history';
+        log(`SCHEDULER_DAU_REPLAY_DONE hour=${hourIso(dauHour)}`);
+        return { again: true };
+      }
+
+      log(`SCHEDULER_DAU_REPLAY_RETRY hour=${hourIso(dauHour)} exit=${outcome.exitCode} signal=${outcome.signal}`);
+      return { again: false, wakeAt: now() + Math.min(tickMs, 60_000) };
     }
 
     // Caught up. At most one bounded repair of a recent hour, never ahead of chain catch-up.
@@ -212,18 +263,39 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
       return { again: false, wakeAt: nextHourDue };
     }
     // Caught up and no family repair due: at most one projection-only repair, oldest eligible hour first.
-    if (!runProjectionRepair) return { again: false, wakeAt: nextHourDue };
-    const projectionFrom = checkpoint.hourStart - (projectionRepairWindowHours - 1) * HOUR_SECONDS;
-    const { hours, blocked } = readModel.projectionRepairCandidates({ fromHour: projectionFrom, toHour: checkpoint.hourStart });
-    for (const hour of projectionAttempts.keys()) if (hour < projectionFrom) projectionAttempts.delete(hour);
-    noteBlocked(blocked);
-    const projectionHour = hours.find((hour) => nowMs - (projectionAttempts.get(hour) ?? -Infinity) >= projectionRepairCooldownMs);
-    if (projectionHour === undefined) return { again: false, wakeAt: nextHourDue };
-    projectionAttempts.set(projectionHour, nowMs);
-    const outcome = await runChild(projectionHour, 'projection_repair', runProjectionRepair);
-    if (stopped) return { again: false };
-    status.lastRun = { kind: 'projection_repair', hour: hourIso(projectionHour), ...outcome };
-    log(`SCHEDULER_PROJECTION_REPAIR_DONE hour=${hourIso(projectionHour)} exit=${outcome.exitCode}`);
+    if (runProjectionRepair) {
+      const projectionFrom = checkpoint.hourStart - (projectionRepairWindowHours - 1) * HOUR_SECONDS;
+      const { hours, blocked } = readModel.projectionRepairCandidates({ fromHour: projectionFrom, toHour: checkpoint.hourStart });
+      for (const hour of projectionAttempts.keys()) if (hour < projectionFrom) projectionAttempts.delete(hour);
+      noteBlocked(blocked);
+      const projectionHour = hours.find((hour) => nowMs - (projectionAttempts.get(hour) ?? -Infinity) >= projectionRepairCooldownMs);
+      if (projectionHour !== undefined) {
+        projectionAttempts.set(projectionHour, nowMs);
+        const outcome = await runChild(projectionHour, 'projection_repair', runProjectionRepair);
+        if (stopped) return { again: false };
+        status.lastRun = { kind: 'projection_repair', hour: hourIso(projectionHour), ...outcome };
+        log(`SCHEDULER_PROJECTION_REPAIR_DONE hour=${hourIso(projectionHour)} exit=${outcome.exitCode}`);
+        return { again: false, wakeAt: nextHourDue };
+      }
+    }
+    // Lowest priority, same single child. One pass per tick, then yield even if unresolved work remains.
+    // A newly due live hour is checked at the top of the next iteration; no independent timer/daemon.
+    if (runDiscoveryDrain && readModel.discoveryPending?.({ nowMs: now() })) {
+      const handle = runDiscoveryDrain();
+      child = { kind: 'discovery_drain', terminate: () => handle.terminate() };
+      log('SCHEDULER_CHILD_START kind=discovery_drain');
+      let outcome;
+      try { outcome = await handle.done; } finally { child = null; }
+      if (stopped) return { again: false };
+      const after = readModel.checkpoint();
+      if (!after || after.hourStart !== checkpoint.hourStart || after.lastBlock !== checkpoint.lastBlock) {
+        throw new Error('discovery_checkpoint_changed');
+      }
+      status.lastRun = { kind: 'discovery_drain', ok: outcome.exitCode === 0 && !outcome.error, ...outcome };
+      log(`SCHEDULER_DISCOVERY_DONE exit=${outcome.exitCode}`);
+      return { again: false, wakeAt: Math.min(nextHourDue, now() + tickMs) };
+    }
+
     return { again: false, wakeAt: nextHourDue };
   }
 
