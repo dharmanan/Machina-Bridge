@@ -4,11 +4,12 @@ import { ARC_VERIFIED_ASSETS, validateVerifiedAssetRegistry } from '../../api/_l
 import { defineEvent } from './abi.js';
 import { PROTOCOL_FAMILIES } from './protocols/index.js';
 import { createHash } from 'node:crypto';
+import { COMPACT_LAUNCH_SOURCES, matchesOfficialLaunchSource } from './launch-sources.js';
 
 export const INTELLIGENCE_VERSION = 'arc-compact-ecosystem-v1';
 export const ECOSYSTEM_SCHEMA = 'machina.intelligence.ecosystem.v1';
 export const ECOSYSTEM_WINDOWS = Object.freeze({ '24h': 24, '7d': 168, '30d': 720 });
-export const VERIFIED_LAUNCH_SOURCES = Object.freeze([]);
+export const VERIFIED_LAUNCH_SOURCES = COMPACT_LAUNCH_SOURCES;
 export const VERIFIED_EXCHANGE_ADDRESSES = Object.freeze([]);
 export const ADDITIONAL_VERIFIED_PROTOCOLS = Object.freeze([]);
 export const addressOf = (value) => typeof value === 'string' && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : null;
@@ -32,7 +33,8 @@ export function intelligenceRegistry({ launches = VERIFIED_LAUNCH_SOURCES, excha
     const address = addressOf(entry.address);
     if (entry.chainId !== 5042 || !address || !nonempty(entry.id) || !nonempty(entry.version)
       || !nonempty(entry.source) || !nonempty(entry.verificationBasis)
-      || !Number.isSafeInteger(entry.validFromBlock) || entry.validFromBlock < 0) throw new Error('invalid_intelligence_registry');
+      || !(Number.isSafeInteger(entry.validFromBlock) && entry.validFromBlock >= 0
+        || kind === 'launch' && entry.validFromBlock === null && matchesOfficialLaunchSource(entry))) throw new Error('invalid_intelligence_registry');
     const key = `${kind}:${address}`;
     if (seen.has(key)) throw new Error('duplicate_intelligence_registry');
     seen.add(key);
@@ -51,7 +53,10 @@ export function intelligenceRegistry({ launches = VERIFIED_LAUNCH_SOURCES, excha
       const event = defineEvent(spec.declaration);
       if (kind === 'launch') {
         if (!['verified_factory', 'verified_launchpad'].includes(entry.classification)
-          || !event.inputs.some((field) => field.name === spec.tokenField && field.type === 'address')) throw new Error('invalid_launch_definition');
+          || !event.inputs.some((field) => field.name === spec.tokenField && field.type === 'address')
+          || spec.creatorField != null && !event.inputs.some(field => field.name === spec.creatorField && field.type === 'address')
+          || entry.verificationStatus !== undefined && entry.verificationStatus !== 'source_verified_candidate'
+          || entry.factoryVerification !== undefined && !matchesOfficialLaunchSource(entry)) throw new Error('invalid_launch_definition');
       } else {
         if (!/^[a-z][a-z0-9_]{0,63}$/.test(spec.metric ?? '') || ['constructor', 'prototype'].includes(spec.metric)
           || !['count', 'per_asset_raw_sum'].includes(spec.aggregation)) throw new Error('invalid_protocol_definition');

@@ -100,7 +100,7 @@ export async function processBlockRange({ provider, first, last, before, after =
           family.error = error.code;
         }
       }
-      // Only explicit verified source entries add requests. The empty default registries add no log scan.
+      // Only explicit source definitions add requests; launch factories still require historical runtime verification.
       for (const stream of additionalStreams) {
         try {
           const extensionSeen = new Set();
@@ -122,7 +122,7 @@ export async function processBlockRange({ provider, first, last, before, after =
   // One batched eth_getCode at the range's last block for every official contract a still-available family relies on.
   const blockTag = hex(last);
   const targets = [...new Set([...Object.values(families).filter((family) => !family.error).flatMap((family) => family.codeAddresses),
-    ...additionalStreams.flatMap((stream) => stream.entry.addresses)])];
+    ...additionalStreams.filter(stream => !stream.entry.factoryVerification).flatMap(stream => stream.entry.addresses)])];
   const present = new Map();
   try {
     for (let offset = 0; offset < targets.length; offset += 50) {
@@ -151,6 +151,7 @@ export async function processBlockRange({ provider, first, last, before, after =
     results[name] = { status: 'unavailable', reason: family.error, ...Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, null])) };
   }
 
+  await intelligence.verifyLaunchSources(provider, { firstBlock: first, lastBlock: last });
   const projectionResults = projection ? projection.finish({ families: results, hourStart, firstBlock: first, lastBlock: last }) : null;
   return {
     definitionVersion: COMPACT_DEFINITION_VERSION,

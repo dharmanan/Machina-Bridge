@@ -167,7 +167,8 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     verifiedAssets: registry.assets.map((asset) => ({ ...asset, classification: 'verified_registry_asset', promotionFromDiscovery: false })),
     rwa: registry.assets.filter((asset) => asset.category === 'tokenized_fund' || asset.category === 'rwa').map((asset) => ({ ...asset })),
     existingProtocols: existingProtocolDefinitions(), launchSources: registry.launches.map(({ events, ...entry }) => ({ ...entry,
-      events: events.map((spec) => ({ signature: spec.event.signature, tokenField: spec.tokenField })) })) };
+      events: events.map((spec) => ({ declaration: spec.declaration, signature: spec.event.signature, topic: spec.event.topic,
+        tokenField: spec.tokenField, creatorField: spec.creatorField ?? null })) })) };
   const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
   const empty = (reason) => ({ ...base, coverage: { ...unavailable(reason), requiredHours: hours, availableHours: 0 },
     discoveredTokens: { ...unavailable(reason), rows: [] }, contractCandidates: { ...unavailable(reason), rows: [] }, launches: { ...unavailable(reason), rows: [] },
@@ -204,7 +205,9 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     if (launch?.observedAt !== undefined) launch = { ...launch, observedAt: iso(launch.observedAt) };
     if (['verified_factory', 'verified_launchpad'].includes(launch?.status)
       && !registry.launches.some((entry) => entry.id === launch.source && entry.version === result.launchEvidence?.version
-        && entry.addresses.includes(result.launchEvidence.emitter))) launch = { status: 'unknown_source', source: null,
+        && entry.addresses.includes(result.launchEvidence.emitter)
+        && entry.events.some(spec => spec.event.signature === result.launchEvidence.eventSignature)
+        && (!entry.factoryVerification || result.launchEvidence.factoryEvidence?.status === 'verified'))) launch = { status: 'unknown_source', source: null,
       reason: 'registry_definition_not_current', provenance: null };
     return { address: row.address, status: row.status, reason: row.reason, verifiedAsset: false,
       symbol: result?.symbol ?? null, name: result?.name ?? null, decimals: result?.decimals ?? null,

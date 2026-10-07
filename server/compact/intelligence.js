@@ -5,6 +5,7 @@ import { codeIsPresent } from './registry.js';
 import { decodeAbiText } from './token-metadata.js';
 import { INTELLIGENCE_REGISTRY, INTELLIGENCE_VERSION, addressOf, registryDigest } from './intelligence-registry.js';
 import { usdMicrosOf, anchorDecimals, priceableDecimals } from './valuation.js';
+import { verifyCompactLaunchSource } from './launch-sources.js';
 
 export const DISCOVERY_LIMIT_PER_HOUR = 2048;
 export const DISCOVERY_READS_PER_RUN = 16;
@@ -21,12 +22,26 @@ const hexAnswer = (answer) => typeof answer?.result === 'string' && /^0x[0-9a-f]
 const codeOutcome = (answer) => !hexAnswer(answer) ? 'retry' : codeIsPresent(answer.result) ? 'ok' : 'rejected';
 const viewOutcome = (answer) => hexAnswer(answer) ? (decodeResult(['uint256'], answer.result) ? 'ok' : 'rejected') : reverted(answer) ? 'rejected' : 'retry';
 const probeOutcome = (answer) => hexAnswer(answer) ? (answer.result === '0x' ? 'ok' : 'rejected') : reverted(answer) ? 'ok' : 'retry';
+const launchInRange = (source, block) => source.validFromBlock === null || block >= source.validFromBlock;
+const launchSourceOf = (candidate, registry) => candidate.launchEvidence && registry.launches.find(entry =>
+  entry.addresses.includes(candidate.launchEvidence.emitter) && entry.version === candidate.launchEvidence.version
+  && entry.events.some(spec => spec.event.signature === candidate.launchEvidence.eventSignature)
+  && launchInRange(entry, candidate.blockNumber));
+const factoryEvidence = (result, blockNumber) => ({ blockTag: hex(blockNumber), status: result.status,
+  codePresent: result.codePresent ?? null, eventTopic: result.eventTopic ?? null,
+  eventTopicInBytecode: result.eventTopicInBytecode === true, viewVerified: result.viewVerified === true,
+  viewResult: result.viewResult ?? null, reason: result.verificationReason ?? null });
 
 export function classifyLaunch(candidate, registry = INTELLIGENCE_REGISTRY) {
-  const source = candidate.launchEvidence && registry.launches.find((entry) => entry.addresses.includes(candidate.launchEvidence.emitter)
-    && entry.version === candidate.launchEvidence.version && candidate.blockNumber >= entry.validFromBlock);
-  if (source && candidate.launchEvidence.codeVerified === true) return { status: source.classification, source: source.id,
+  const source = launchSourceOf(candidate, registry);
+  if (source && candidate.launchEvidence.codeVerified === true
+    && (!source.factoryVerification || candidate.launchEvidence.factoryEvidence?.status === 'verified')) return { status: source.classification, source: source.id,
+    protocol: source.protocol ?? null, version: source.version, sourceDefinitionVersion: source.sourceDefinitionVersion ?? null,
     observedAt: candidate.timestamp, blockNumber: candidate.blockNumber,
+    logIndex: candidate.launchEvidence.logIndex, transactionHash: candidate.txHash,
+    creator: source.events.find(spec => spec.event.signature === candidate.launchEvidence.eventSignature)?.creatorField
+      && addressOf(candidate.launchEvidence.creator) ? { status: 'available', address: candidate.launchEvidence.creator, basis: 'official_event_field' }
+      : { status: 'unavailable', reason: 'creator_not_in_official_event' },
     provenance: { source: source.source, verificationBasis: source.verificationBasis, evidence: candidate.launchEvidence,
       transactionHash: candidate.txHash, blockHash: candidate.blockHash } };
   if (candidate.directDeploymentVerified === true) return { status: 'direct_deployment', source: null,
@@ -41,6 +56,7 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
   const first = new Map();
   const flows = new Map();
   const extensions = new Map();
+  const launchProofs = new Map();
   let capped = false;
   let dexCapped = false;
   let transferError = false;
@@ -81,6 +97,16 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
     if (!previous || row.blockNumber < previous.blockNumber || row.blockNumber === previous.blockNumber && row.logIndex < previous.logIndex) first.set(key, row);
   };
   return Object.freeze({
+    async verifyLaunchSources(provider, { firstBlock, lastBlock }) {
+      for (const entry of registry.launches.filter(entry => entry.factoryVerification)) {
+        const end = factoryEvidence(await verifyCompactLaunchSource(provider, entry, lastBlock), lastBlock);
+        // A missing deployment boundary is not genesis evidence. Establish code/topic/view at both window edges.
+        const start = entry.validFromBlock === null && end.status === 'verified'
+          ? factoryEvidence(await verifyCompactLaunchSource(provider, entry, firstBlock), firstBlock) : null;
+        launchProofs.set(entry.id, { firstBlock, lastBlock, end, start,
+          status: end.status === 'verified' && (entry.validFromBlock !== null || start?.status === 'verified') ? 'verified' : 'unavailable' });
+      }
+    },
     blocks(blocks) {
       for (const block of blocks) for (let index = 0; index < block.txTo.length; index++) if (block.txTo[index] === null) {
         addCandidate({ kind: 'creation', address: null, ...evidenceOf(block, index) });
@@ -120,16 +146,20 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
       const row = mark(stream.kind, stream.entry);
       if (row.status !== 'available') return;
       for (const log of logs) {
-        if (log.blockNumber < stream.entry.validFromBlock) continue;
+        if (!stream.entry.addresses.includes(log.address)) { row.status = 'unavailable'; row.reason = 'registered_emitter_mismatch'; return; }
+        if (stream.entry.validFromBlock !== null && log.blockNumber < stream.entry.validFromBlock) continue;
         const spec = stream.entry.events.find((item) => item.event.topic === log.topics[0]);
         const event = spec?.event.decode(log);
         if (!event) { row.status = 'unavailable'; row.reason = 'malformed_registered_event'; return; }
         if (stream.kind === 'launch') {
           const block = window.get(log.blockNumber);
+          if (!block || !addressOf(event[spec.tokenField]) || event[spec.tokenField] === ZERO) {
+            row.status = 'unavailable'; row.reason = 'invalid_launch_identity'; return;
+          }
           addCandidate({ kind: 'source', address: event[spec.tokenField], ...evidenceOf(block, log.transactionIndex),
             caller: block.txFrom[log.transactionIndex], deployer: null,
             launchEvidence: { emitter: log.address, version: stream.entry.version, logIndex: log.logIndex,
-              eventSignature: spec.event.signature, codeVerified: false } });
+              eventSignature: spec.event.signature, creator: spec.creatorField ? event[spec.creatorField] : null, codeVerified: false } });
         } else {
           row.counts[spec.metric] = (row.counts[spec.metric] ?? 0) + 1;
           if (spec.aggregation === 'per_asset_raw_sum') {
@@ -144,13 +174,27 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
     },
     failExtension(stream) { const row = mark(stream.kind, stream.entry); row.status = 'unavailable'; row.reason = 'registered_stream_unavailable'; },
     finish({ range, families, codePresent, projections }) {
-      for (const stream of extensions.values()) if (!(registry[stream.kind === 'launch' ? 'launches' : 'protocols']
-        .find((entry) => entry.id === stream.id)?.addresses.every(codePresent))) {
-        stream.status = 'unavailable'; stream.reason = 'registered_code_unavailable';
+      for (const stream of extensions.values()) {
+        const entry = registry[stream.kind === 'launch' ? 'launches' : 'protocols'].find(entry => entry.id === stream.id);
+        if (!entry?.factoryVerification && !entry?.addresses.every(codePresent)) {
+          stream.status = 'unavailable'; stream.reason = 'registered_code_unavailable';
+        }
       }
       for (const stream of extensions.values()) if (registry[stream.kind === 'launch' ? 'launches' : 'protocols']
         .find((entry) => entry.id === stream.id)?.validFromBlock > range.firstBlock) {
         stream.status = 'unavailable'; stream.reason = 'registry_not_valid_for_entire_range';
+      }
+      for (const stream of extensions.values()) if (stream.kind === 'launch') {
+        const entry = registry.launches.find(entry => entry.id === stream.id);
+        if (!entry.factoryVerification) continue;
+        const proof = launchProofs.get(entry.id);
+        stream.factoryEvidence = proof ?? { status: 'unavailable', reason: 'factory_verification_not_run' };
+        stream.validFromBlock = entry.validFromBlock; stream.validityBasis = entry.validityBasis;
+        stream.protocol = entry.protocol; stream.sourceDefinitionVersion = entry.sourceDefinitionVersion;
+        if (stream.status === 'available' && (proof?.status !== 'verified'
+          || proof.firstBlock !== range.firstBlock || proof.lastBlock !== range.lastBlock)) {
+          stream.status = 'unavailable'; stream.reason = 'registered_factory_unverified';
+        }
       }
       const registryInRange = registry.exchanges.every((entry) => entry.validFromBlock <= range.firstBlock);
       const transferComplete = registryInRange && !transferError && families.usdc?.status === 'available' && families.assets?.status === 'available';
@@ -208,9 +252,8 @@ export async function verifyTokenCandidate(provider, candidate, { registry = INT
     const tag = hex(candidate.readBlock);
     const calls = [['eth_getCode', [out.address, tag]], ...['totalSupply()', 'balanceOf(address)', 'symbol()', 'name()', 'decimals()'].map((signature) =>
       ['eth_call', [{ to: out.address, data: encodeCall(signature, signature === 'balanceOf(address)' ? [['address', ZERO]] : []) }, tag]])];
-    const source = candidate.launchEvidence && registry.launches.find((entry) => entry.addresses.includes(candidate.launchEvidence.emitter)
-      && entry.version === candidate.launchEvidence.version);
-    if (source) calls.push(['eth_getCode', [candidate.launchEvidence.emitter, tag]]);
+    const source = launchSourceOf(candidate, registry);
+    if (source && !source.factoryVerification) calls.push(['eth_getCode', [candidate.launchEvidence.emitter, tag]]);
     // Negative control: a generic fallback returning uint256 for every selector is not token behavior.
     const probeIndex = calls.length;
     calls.push(['eth_call', [{ to: out.address, data: encodeCall('machinaIntelligenceUnknownSelector()') }, tag]]);
@@ -228,7 +271,10 @@ export async function verifyTokenCandidate(provider, candidate, { registry = INT
     out.status = 'verified_erc20_like'; out.reason = null;
     out.verification = { basis: 'historical_code_totalSupply_balanceOf_with_negative_control', blockTag: tag,
       scope: 'erc20_like_not_full_standard_or_proxy_identity' };
-    if (source) out.launchEvidence = { ...candidate.launchEvidence, codeVerified: codeIsPresent(answers[6]?.result) };
+    if (source?.factoryVerification) {
+      const proof = factoryEvidence(await verifyCompactLaunchSource(provider, source, candidate.readBlock), candidate.readBlock);
+      out.launchEvidence = { ...candidate.launchEvidence, codeVerified: proof.status === 'verified', factoryEvidence: proof };
+    } else if (source) out.launchEvidence = { ...candidate.launchEvidence, codeVerified: codeIsPresent(answers[6]?.result) };
     out.launch = classifyLaunch(out, registry);
     return out;
   } catch { return { ...out, reason: 'candidate_rpc_unavailable' }; }

@@ -13,11 +13,12 @@ import { USDC_ERC20_ADDRESS, USDC_SYSTEM_EMITTER } from '../api/_lib/arc-intelli
 import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
 import { locateHourBlocks } from '../server/compact/boundary.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
-import { HourIncompleteError, processBlockRange, processHour } from '../server/compact/hour.js';
+import { HourIncompleteError, processBlockRange as processBlockRangeEngine, processHour as processHourEngine } from '../server/compact/hour.js';
 import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_PROTOCOL } from '../server/compact/offline.js';
 import { PROTOCOL_FAMILIES } from '../server/compact/protocols/index.js';
 import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError } from '../server/compact/provider.js';
 import { DISCOVERY_READS_PER_RUN } from '../server/compact/intelligence.js';
+import { intelligenceRegistry } from '../server/compact/intelligence-registry.js';
 import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../server/compact/registry.js';
 import { COMPACT_DEFINITION_VERSION, DENSE_LOG_RANGE_BLOCKS, LOG_STREAMS } from '../server/compact/sources.js';
 import { headerOf } from '../server/compact/spine.js';
@@ -49,6 +50,13 @@ async function rejectsWith(promise, code) {
   assert.equal(error.code, code, `expected ${code}, got ${error.code ?? error.message}`);
   return error;
 }
+
+// Generic engine fixtures and recorded Stage 2 calls do not contain launch-source evidence.
+// Keep them independent of default launch activation; P8 tests exercise that registry explicitly.
+// The real validator/runner below still use the production default registry.
+const genericIntelligenceRegistry = intelligenceRegistry({ launches: [] });
+const processHour = (options) => processHourEngine({ intelligenceRegistry: genericIntelligenceRegistry, ...options });
+const processBlockRange = (options) => processBlockRangeEngine({ intelligenceRegistry: genericIntelligenceRegistry, ...options });
 
 // Synthetic hour: aligned UTC hour, origin 1000 s before it, safe head ~25 minutes after it.
 const HOUR = 1_790_006_400;
@@ -525,7 +533,10 @@ async function validateOffline({ expectedValues = syntheticTruth, secondaryFetch
 await test('validator gate: an equal hour prints EXPECTED / ACTUAL / MATCH for every metric and passes', async () => {
   const { report, lines } = await validateOffline();
   assert.equal(report.ok, true, lines.join('\n'));
-  assert.equal(digest(report.result), digest(cleanResult));
+  // validateHour intentionally uses the activated production registry, so compare its full payload on that same scope.
+  const productionReference = await processHourEngine({ provider: offlineProvider(chainOf().fetchImpl), hourStart: HOUR,
+    safeHead: SAFE_HEAD, v3Registry: V3 });
+  assert.equal(digest(report.result), digest(productionReference));
   for (const metric of ['blocks', 'transactions', 'uniqueActiveAddresses', 'canonicalUsdcTransfers', 'canonicalUsdcMints', 'canonicalUsdcBurns']) {
     assert(lines.some((text) => text.startsWith(`${metric} `) && text.includes(' EXPECTED ') && text.includes(' ACTUAL ') && text.endsWith(' MATCH')), metric);
   }
@@ -602,7 +613,7 @@ if (!sqlite) {
   const rows = (db) => db.prepare('SELECT hour_start, network_sha256 FROM compact_hours ORDER BY hour_start').all()
     .map((row) => `${row.hour_start}:${row.network_sha256}`);
   const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
-  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
     'compact_hour_addresses', 'compact_hours', 'compact_intelligence_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
     'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_dex_observations',
     'compact_token_discoveries', 'compact_token_metadata', 'compact_token_price_hours', 'compact_valuation_hours'];
@@ -835,7 +846,7 @@ if (!sqlite) {
       db.close();
     });
 
-    await test('sqlite: rolling 24H unique active addresses are exact; only 1H, 6H and 24H exist; nothing older is kept', async () => {
+    await test('sqlite: rolling address identity retention stays at 24H with exact 1H, 6H and 24H unions', async () => {
       // One block per minute keeps 25 consecutive hours small.
       const slowOrigin = { originNumber: ORIGIN.originNumber, originTimestamp: HOUR - 120, blockSpacing: 600_000 };
       const slow = createSyntheticChain({ ...slowOrigin, senderPool: 900, recipientPool: 600 });
@@ -867,7 +878,7 @@ if (!sqlite) {
       for (const span of [2, 168, 720]) assert.throws(() => store.uniqueActiveAddresses(last, span), (error) => error.code === 'unsupported_window');
       const kept = db.prepare('SELECT COUNT(DISTINCT hour_start) AS hours, MIN(hour_start) AS first FROM compact_hour_addresses').get();
       assert.deepEqual([kept.hours, kept.first], [ADDRESS_WINDOW_HOURS, last - 23 * 3600]);
-      assert.deepEqual(tables(db), TABLES, 'no daily, weekly or monthly address storage');
+      assert.deepEqual(tables(db), TABLES, 'exact schema includes the separate accepted DAU tables');
       db.close();
     });
 
@@ -886,11 +897,21 @@ if (!sqlite) {
         'one official V3 pool, written once');
       assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_hour_addresses').get().count,
         hours.reduce((sum, hour) => sum + hour.network.uniqueActiveAddresses, 0), 'one 20-byte identity per active address per hour');
+      // The accepted DAU baseline also stages one exact address union until its UTC day is complete.
+      assert.equal(new Set(hours.map((hour) => Math.floor(hour.range.hourStart / 86400))).size, 1, 'this budget covers one unfinished UTC day');
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_daily_address_stage').get().count,
+        new Set(hours.flatMap((hour) => hour.activeAddresses)).size, 'one 20-byte DAU identity per address, not per hour');
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_daily_address_hours').get().count, hours.length);
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM compact_daily_active_addresses').get().count, 0, 'no complete UTC day yet');
       db.close();
       const { size } = await stat(join(directory, 'store.sqlite'));
-      // Additive Intelligence tables/indexes add bounded SQLite page overhead without storing raw chain data.
       const additiveSchemaAllowanceBytes = 64 * 1024;
-      assert(size < 2 * 1024 * 1024 + additiveSchemaAllowanceBytes, `database is ${size} bytes for ${hours.length} hours`);
+      // Same 6,500-address fixture, accepted baseline DDL: isolated Python SQLite DAU allocation adds
+      // 233,472 bytes (57 x 4 KiB pages). Reserve 64 pages for that bounded union and its two small tables.
+      // Keep the existing core/projection/Intelligence budget; this is not a per-row or unlimited allowance.
+      const dailyAddressAllowanceBytes = 256 * 1024;
+      const storageBudgetBytes = 2 * 1024 * 1024 + additiveSchemaAllowanceBytes + dailyAddressAllowanceBytes;
+      assert(size < storageBudgetBytes, `database is ${size} bytes for ${hours.length} hours; budget ${storageBudgetBytes}`);
     });
 
     await test('validator gate: a verified hour round-trips through a temporary node:sqlite file that is then deleted', async () => {

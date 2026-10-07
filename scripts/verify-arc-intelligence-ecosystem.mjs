@@ -6,9 +6,9 @@ import { defineEvent, selectorOf } from '../server/compact/abi.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { COMPACT_DEFINITION_VERSION } from '../server/compact/sources.js';
 import { createCompactStore } from '../server/compact/store.js';
-import { createIntelligenceSink, classifyLaunch, verifyTokenCandidate, refreshDiscovery, refreshDiscoverySafely, valueExchangeFlow } from '../server/compact/intelligence.js';
+import { createIntelligenceSink as createSink, classifyLaunch, verifyTokenCandidate, refreshDiscovery, refreshDiscoverySafely, valueExchangeFlow } from '../server/compact/intelligence.js';
 import { intelligenceRegistry, INTELLIGENCE_REGISTRY, INTELLIGENCE_VERSION, ECOSYSTEM_SCHEMA, registryDigest, extensionStreams } from '../server/compact/intelligence-registry.js';
-import { readEcosystem, correlateDex, sumExchange, sumProtocols, discoveryWorkDue } from '../server/compact/intelligence-store.js';
+import { readEcosystem as readModel, correlateDex as dexModel, sumExchange, sumProtocols, discoveryWorkDue } from '../server/compact/intelligence-store.js';
 import { createIntelligenceHandler } from '../server/compact/http.js';
 import { resolveIntelligenceRoute, handleIntelligenceProxy } from '../api/_lib/intelligence-proxy.js';
 import { USDC_SYSTEM_EMITTER } from '../api/_lib/arc-intelligence/usdc.js';
@@ -28,6 +28,11 @@ const TOKEN = address(800); const DEPLOYER = address(900); const EXCHANGE = addr
 const BASE = Date.parse('2026-10-05T09:00:00Z') / 1000;
 const regEntry = { id: 'fixture', address: SOURCE, chainId: 5042, version: 'fixture-v1', source: 'synthetic_official_fixture',
   verificationBasis: 'synthetic_test_only', validFromBlock: 0, codeAssumption: 'present_at_window_end' };
+// Existing generic discovery fixtures intentionally omit launch streams. P8 has its own official-source acceptance.
+const discoveryRegistry = intelligenceRegistry({ launches: [] });
+const createIntelligenceSink = (options = {}) => createSink({ registry: discoveryRegistry, ...options });
+const readEcosystem = (db, windowKey, options = {}) => readModel(db, windowKey, { registry: discoveryRegistry, ...options });
+const correlateDex = (db, token, through, options = {}) => dexModel(db, token, through, { registry: discoveryRegistry, ...options });
 const registry = intelligenceRegistry({ exchanges: [{ ...regEntry, address: EXCHANGE }], launches: [{ ...regEntry,
   classification: 'verified_factory', events: [{ declaration: 'event Created(address indexed token)', tokenField: 'token' }] }],
   protocols: [{ ...regEntry, events: [{ declaration: 'event Supplied(address indexed asset, uint256 amount)', metric: 'supply',
@@ -64,11 +69,13 @@ const finish = (sink, changes = {}) => sink.finish({ range, families, codePresen
 const block = { number: 101, hash: hash(101), timestamp: BASE + 10, txHashes: [hash(101)], txFrom: [DEPLOYER], txTo: [null] };
 const window = new Map([[101, block]]);
 
-await test('registry keeps official assets and tokenized fund provenance; new sources honestly empty', () => {
+await test('registry keeps official assets and tokenized fund provenance; only approved launches activated', () => {
   assert.equal(INTELLIGENCE_REGISTRY.assets.length, 5);
   assert.equal(INTELLIGENCE_REGISTRY.assets.find((asset) => asset.symbol === 'USYC').category, 'tokenized_fund');
-  assert.equal(extensionStreams(INTELLIGENCE_REGISTRY).length, 0);
+  assert.equal(extensionStreams(INTELLIGENCE_REGISTRY).length, 4);
+  assert.deepEqual(INTELLIGENCE_REGISTRY.launches.map(source => source.protocol).sort(), ['Archemist V2', 'Argus', 'Openlaunch', 'Tolly']);
   assert.equal(INTELLIGENCE_REGISTRY.exchanges.length, 0);
+  assert.equal(INTELLIGENCE_REGISTRY.protocols.length, 0);
 });
 await test('registry requires chain, provenance, event fields and version; rejects duplicate case-insensitive addresses', () => {
   assert.throws(() => intelligenceRegistry({ exchanges: [{ ...regEntry, source: '' }] }), /registry/);
@@ -207,7 +214,8 @@ function hour(index = 0, { observation = true } = {}) {
     network: { status: 'available', blockCount: 10, transactionCount: 1, uniqueActiveAddresses: 0 }, activeAddresses: [],
     families: Object.fromEntries(Object.entries(FAMILY_FIELDS).map(([name, fields]) => [name, { status: 'unavailable', reason: 'fixture',
       ...Object.fromEntries(fields.map((field) => [field, null])) }])), registry: { uniswapV3: null }, complete: false,
-    intelligence: finish(sink, { range, families: {} }) };
+    // Generic discovery uses the helper's available family/projection evidence and isolated discoveryRegistry.
+    intelligence: finish(sink, { range }) };
 }
 function fixture() { const db = new DatabaseSync(':memory:'); const store = createCompactStore(db); return { db, store }; }
 await test('schema2 additive migration idempotent; empty/old new-layer state unavailable', () => {
@@ -398,7 +406,10 @@ await test('all legacy stored hours without discovery stay insufficient for 24h/
 });
 await test('unresolved outside selected 24h window does not change current scoped candidate verification', () => {
   const { db, store } = fixture(); for (let i = 0; i <= 24; i++) store.commitHour(hour(i));
+  assert.deepEqual(db.prepare('SELECT DISTINCT registry_digest FROM compact_intelligence_hours').all().map(row => row.registry_digest),
+    [registryDigest(discoveryRegistry)]);
   const day = readEcosystem(db, '24h'); assert.equal(day.coverage.unresolvedCandidateCount, 0);
+  assert.equal(day.coverage.requiredHours, 24); assert.equal(day.coverage.availableHours, 24);
   assert.equal(day.coverage.candidateVerificationComplete, true);
   assert.equal(readEcosystem(db, '7d').coverage.candidateVerificationComplete, false); db.close();
 });
@@ -503,10 +514,13 @@ await test('new layer is read-only, GET proxy matrix bounded with old routes una
   assert.equal(response.status, 502);
 });
 await test('new asset/RWA and multiple official emitters fit explicit registries without promotion', () => {
-  const expanded = intelligenceRegistry({ assets: [...INTELLIGENCE_REGISTRY.assets, { chainId: 5042, address: TOKEN, symbol: 'FIXTURE', decimals: 8,
+  const expanded = intelligenceRegistry({ launches: [], assets: [...discoveryRegistry.assets, { chainId: 5042, address: TOKEN, symbol: 'FIXTURE', decimals: 8,
     category: 'rwa', verification: { type: 'synthetic_official_fixture', source: 'fixture_only_not_a_live_asset' } }],
     protocols: [{ ...regEntry, addresses: [SOURCE, address(903)], events: [{ declaration: 'event Counted(uint256 amount)', metric: 'events', aggregation: 'count' }] }] });
-  assert.equal(expanded.assets.length, 6); assert.equal(extensionStreams(expanded)[0].address.length, 2);
+  const streams = extensionStreams(expanded);
+  assert.equal(expanded.assets.length, 6); assert.equal(expanded.launches.length, 0); assert.equal(streams.length, 1);
+  assert.equal(streams[0].kind, 'protocol'); assert.equal(streams[0].entry.id, regEntry.id);
+  assert.equal(streams[0].address.length, 2); assert.deepEqual(streams[0].address, [SOURCE, address(903)]);
   assert.throws(() => intelligenceRegistry({ exchanges: [{ ...regEntry, address: EXCHANGE }, { ...regEntry, address: address(904), version: 'other' }] }), /mixed/);
 });
 await test('source code failure retains a verified token but does not invent launch provenance', async () => {
@@ -568,13 +582,13 @@ await test('new proxy forwards genuine ecosystem schema and rejects arbitrary SQ
   assert.equal(new URL(requested).pathname, '/v1/intelligence/ecosystem');
   assert.equal(resolveIntelligenceRoute({ view: 'ecosystem', window: '24h', blockTag: 'latest' }), null); db.close();
 });
-await test('processor uses identical deterministic observations across spine window sizes and no extra default RPC', async () => {
+await test('processor uses identical generic observations across spine window sizes with no receipt RPC', async () => {
   const origin = 23000000;
   const run = async (windowBlocks) => {
     const chain = createSyntheticChain({ originNumber: origin, poolCreatedAt: origin, protocols: false });
     const provider = createProvider({ fetchImpl: chain.fetchImpl, minIntervalMs: 0, cooldownMs: 0, sleep: async () => {} });
     const result = await processBlockRange({ provider, first: origin, last: origin + 99,
-      before: headerOf(chain.rawBlock(origin - 1), origin - 1), windowBlocks,
+      before: headerOf(chain.rawBlock(origin - 1), origin - 1), windowBlocks, intelligenceRegistry: discoveryRegistry,
       v3Registry: { through: origin - 1, throughHash: chain.blockHash(origin - 1), pools: new Set() } });
     assert.equal(provider.stats.calls.eth_getTransactionReceipt ?? 0, 0);
     return result;
@@ -598,7 +612,7 @@ await test('hourly exchange summaries/timeseries and protocol sums require every
   const weaker = readEcosystem(db,'24h',{registry}); assert.equal(weaker.exchangeFlows.status,'unavailable'); assert.equal(weaker.exchangeFlows.rows,null); db.close();
 });
 await test('registry valid-from and USD raw-decimal mismatch fail closed', () => {
-  const future = intelligenceRegistry({ exchanges: [{ ...regEntry, address: EXCHANGE, validFromBlock: 105 }] });
+  const future = intelligenceRegistry({ launches: [], exchanges: [{ ...regEntry, address: EXCHANGE, validFromBlock: 105 }] });
   assert.equal(finish(createIntelligenceSink({ registry: future })).exchange.reason, 'registry_not_valid_for_entire_range');
   const row = { entity: 'x', asset: usdc.address, emitter: USDC_SYSTEM_EMITTER.toLowerCase(), direction: 'inbound', count: 1, decimals: 6, amountRaw: '1000000' };
   assert.equal(valueExchangeFlow(row,null).usd.status, 'unavailable');

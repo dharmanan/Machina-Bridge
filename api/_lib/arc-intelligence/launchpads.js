@@ -1,13 +1,14 @@
 import { ARC_CHAIN_ID, ARC_RPC_URL, createArcRpcClient } from './rpc.js';
 import { P1A_LAUNCHPAD_CANDIDATES } from './p1a-registry.js';
-import { decodeOfficialEvent, eventIdentity, eventTopic, readView, snapshotContext } from './circle-common.js';
+import { decodeOfficialEvent, eventIdentity, eventTopic, snapshotContext } from './circle-common.js';
 import { mapConcurrent, verifyErc20Metadata } from './tokens.js';
 import { ARGUS_ADAPTER } from './launchpad-adapters/argus.js';
 import { TOLLY_ADAPTER } from './launchpad-adapters/tolly.js';
 import { OPENLAUNCH_ADAPTER } from './launchpad-adapters/openlaunch.js';
 import { ARCHEMIST_V2_ADAPTER } from './launchpad-adapters/archemist-v2.js';
+import { LAUNCHPADS_DEFINITION_VERSION, verifyFactory } from './launchpad-adapters/common.js';
 
-export const LAUNCHPADS_DEFINITION_VERSION = 'arc-intelligence-launchpads-v1';
+export { LAUNCHPADS_DEFINITION_VERSION, verifyFactory };
 export const MAX_LAUNCHPAD_TOKEN_METADATA = 25;
 const ADDRESS = /^0x[0-9a-f]{40}$/i;
 const NONZERO_ADDRESS = /^0x(?!0{40}$)[0-9a-f]{40}$/i;
@@ -30,34 +31,6 @@ export function decodeVerifiedLaunch(log, candidate, adapter) {
   } catch {
     return null;
   }
-}
-
-async function verifyFactory(candidate, adapter, rpc, blockTag) {
-  const topic = eventTopic(adapter.abi);
-  let codePresent = null;
-  let eventTopicInBytecode = false;
-  try {
-    const code = await rpc.request('eth_getCode', [candidate.address, blockTag]);
-    if (typeof code !== 'string' || !/^0x(?:[0-9a-f]{2})*$/i.test(code)) throw new Error('Malformed code response');
-    codePresent = code.length > 2 && !/^0x0+$/.test(code.toLowerCase());
-    eventTopicInBytecode = codePresent && code.toLowerCase().includes(topic.slice(2));
-  } catch {
-    // Transient RPC failures must stay unavailable, never rejected.
-  }
-  const viewValue = adapter.view && codePresent && eventTopicInBytecode
-    ? await readView(rpc, candidate.address, adapter.view.signature, adapter.view.functionName, [], blockTag)
-    : null;
-  const viewVerified = !adapter.view || adapter.view.verify(viewValue);
-  const verified = codePresent === true && eventTopicInBytecode && viewVerified;
-  return {
-    ...candidate, status: verified ? 'verified' : 'unavailable',
-    codePresent, eventTopic: topic, eventTopicInBytecode,
-    viewResult: typeof viewValue === 'bigint' ? viewValue.toString(10) : viewValue,
-    viewVerified, eventScanComplete: false, malformedEventCount: 0,
-    verificationReason: verified ? null : codePresent === null ? 'code_read_unavailable'
-      : !codePresent ? 'code_absent_at_requested_end'
-        : !eventTopicInBytecode ? 'official_event_topic_not_in_bytecode' : 'required_view_unavailable_or_mismatch',
-  };
 }
 
 export async function buildLaunchpadSnapshot({ phase1aSnapshot, rpc = createArcRpcClient() } = {}) {
