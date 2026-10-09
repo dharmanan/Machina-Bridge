@@ -234,6 +234,84 @@ export type ArcIntelligenceLoad = {
   pools?: { v3: ArcPools | null; v4: ArcPools | null }
   activity?: Record<ArcActivityType, ArcActivity | null>
   ecosystem?: ArcEcosystem | null
+  readErrors?: Partial<Record<ArcReadSection, 'request_failed' | 'invalid_response'>>
+  refresh?: Partial<Record<ArcReadSection, {
+    lastSuccessAt: string | null
+    verifiedThrough: string | null
+    error: 'request_failed' | 'invalid_response' | null
+    retained: boolean
+  }>>
+}
+
+export const ARC_READ_SECTIONS = ['summary', 'timeseries', 'poolsV3', 'poolsV4', 'ecosystem',
+  'activity:all', 'activity:swaps', 'activity:adds', 'activity:removes'] as const
+export type ArcReadSection = typeof ARC_READ_SECTIONS[number]
+
+function sectionValue(load: ArcIntelligenceLoad, section: ArcReadSection) {
+  if (section === 'poolsV3' || section === 'poolsV4') return load.pools?.[section === 'poolsV3' ? 'v3' : 'v4'] ?? null
+  if (section.startsWith('activity:')) return load.activity?.[section.slice(9) as ArcActivityType] ?? null
+  return load[section as 'summary' | 'timeseries' | 'ecosystem'] ?? null
+}
+
+export function hasArcIntelligenceData(load: ArcIntelligenceLoad): boolean {
+  return ARC_READ_SECTIONS.some((section) => sectionValue(load, section) !== null)
+}
+
+// Retain only schema-validated responses from this exact window. A successful response containing genuine
+// unavailable metrics replaces the old response; transport/schema failure alone retains the previous value.
+export function retainArcIntelligenceLoad(previous: ArcIntelligenceLoad | undefined, incoming: ArcIntelligenceLoad,
+  now = new Date().toISOString()): ArcIntelligenceLoad {
+  const prior = previous?.window === incoming.window ? previous : undefined
+  const result: ArcIntelligenceLoad = { ...incoming, pools: { v3: null, v4: null },
+    activity: {} as Record<ArcActivityType, ArcActivity | null>, refresh: {} }
+  for (const section of ARC_READ_SECTIONS) {
+    const next = sectionValue(incoming, section)
+    const old = prior ? sectionValue(prior, section) : null
+    const value = next ?? old
+    if (section === 'poolsV3' || section === 'poolsV4') result.pools![section === 'poolsV3' ? 'v3' : 'v4'] = value as ArcPools | null
+    else if (section.startsWith('activity:')) result.activity![section.slice(9) as ArcActivityType] = value as ArcActivity | null
+    else if (section === 'summary') result.summary = value as ArcSummary | null
+    else if (section === 'timeseries') result.timeseries = value as ArcTimeseries | null
+    else result.ecosystem = value as ArcEcosystem | null
+    result.refresh![section] = next ? { lastSuccessAt: now, verifiedThrough: 'freshness' in next ? next.freshness?.verifiedThrough ?? null : null,
+      error: null, retained: false } : { lastSuccessAt: prior?.refresh?.[section]?.lastSuccessAt ?? null,
+      verifiedThrough: prior?.refresh?.[section]?.verifiedThrough ?? (old && 'freshness' in old ? old.freshness?.verifiedThrough ?? null : null),
+      error: incoming.readErrors?.[section] ?? 'request_failed', retained: old !== null }
+  }
+  result.failed = !result.summary
+  return result
+}
+
+// One active refresh batch: repeated timer/manual refreshes coalesce; a window switch cancels the old batch.
+// Identity checks also reject late results from transports that do not honor AbortSignal.
+export function createArcIntelligenceRefresh({ onResult, onRefreshing, loader = loadArcIntelligence }: {
+  onResult: (result: ArcIntelligenceLoad) => void
+  onRefreshing: (value: boolean) => void
+  loader?: typeof loadArcIntelligence
+}) {
+  let active: { window: ArcIntelligenceWindow; controller: AbortController; promise: Promise<void> } | null = null
+  const cancel = () => { const old = active; active = null; old?.controller.abort() }
+  return {
+    cancel,
+    refresh(window: ArcIntelligenceWindow): Promise<void> {
+      if (active?.window === window) return active.promise
+      cancel()
+      const task = { window, controller: new AbortController(), promise: Promise.resolve() }
+      active = task
+      onRefreshing(true)
+      task.promise = (async () => {
+        try {
+          const result = await loader(window, { signal: task.controller.signal })
+          if (active === task && !task.controller.signal.aborted) onResult(result)
+        } catch {
+          if (active === task && !task.controller.signal.aborted) onResult({ window, summary: null, timeseries: null, failed: true })
+        } finally {
+          if (active === task) { active = null; onRefreshing(false) }
+        }
+      })()
+      return task.promise
+    },
+  }
 }
 
 export type DiscoveryActivity = { firstProven: boolean; reason: string | null;
@@ -496,19 +574,28 @@ export async function loadArcIntelligence(
   if (!requests) return { window: selected, summary: null, timeseries: null, failed: false }
   const request = fetchImpl ?? (fetch as unknown as FetchLike)
   const read = (url: string) => fetchObject(url, request, signal)
-  const [summary, timeseries, poolsV3, poolsV4, ecosystem, ...activity] = await Promise.allSettled([
-    read(requests.summary),
-    read(requests.timeseries),
-    read(requests.poolsV3),
-    read(requests.poolsV4),
-    read(requests.ecosystem),
-    ...ARC_ACTIVITY_TYPES.map((type) => read(ACTIVITY_REQUESTS[type])),
-  ])
-  const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA && validWindowCoverage(summary.value.window)
+  const urls = [requests.summary, requests.timeseries, requests.poolsV3, requests.poolsV4, requests.ecosystem,
+    ...ARC_ACTIVITY_TYPES.map((type) => ACTIVITY_REQUESTS[type])]
+  const settled: PromiseSettledResult<Record<string, unknown>>[] = new Array(urls.length)
+  let cursor = 0
+  // Long-window SQLite reads share one server event loop. Avoid a nine-request burst on every refresh.
+  await Promise.all([0, 1].map(async () => {
+    while (cursor < urls.length) {
+      const index = cursor++
+      try {
+        if (signal?.aborted) throw new Error('refresh_cancelled')
+        settled[index] = { status: 'fulfilled', value: await read(urls[index]) }
+      } catch (reason) { settled[index] = { status: 'rejected', reason } }
+    }
+  }))
+  const [summary, timeseries, poolsV3, poolsV4, ecosystem, ...activity] = settled
+  const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA
+    && isRecord(summary.value.window) && summary.value.window.key === selected && validWindowCoverage(summary.value.window)
     ? summary.value as unknown as ArcSummary : null
-  const timeseriesValue = timeseries.status === 'fulfilled' && timeseries.value.schema === TIMESERIES_SCHEMA && validWindowCoverage(timeseries.value.window)
+  const timeseriesValue = timeseries.status === 'fulfilled' && timeseries.value.schema === TIMESERIES_SCHEMA
+    && isRecord(timeseries.value.window) && timeseries.value.window.key === selected && validWindowCoverage(timeseries.value.window)
     ? timeseries.value as unknown as ArcTimeseries : null
-  return {
+  const result: ArcIntelligenceLoad = {
     window: selected,
     ecosystem: parseArcEcosystem(settledObject(ecosystem), selected),
     summary: summaryValue,
@@ -518,6 +605,9 @@ export async function loadArcIntelligence(
     activity: Object.fromEntries(ARC_ACTIVITY_TYPES.map((type, index) => [type, parseArcActivity(settledObject(activity[index]), type)])) as
       Record<ArcActivityType, ArcActivity | null>,
   }
+  result.readErrors = Object.fromEntries(ARC_READ_SECTIONS.flatMap((section, index) => sectionValue(result, section) !== null ? []
+    : [[section, settled[index].status === 'rejected' ? 'request_failed' : 'invalid_response']]))
+  return result
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

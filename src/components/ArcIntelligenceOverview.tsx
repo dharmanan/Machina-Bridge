@@ -27,7 +27,9 @@ import {
   formatUtcPeriodRange,
   isFiniteNumber,
   loadArcBorrowMarkets,
-  loadArcIntelligence,
+  createArcIntelligenceRefresh,
+  retainArcIntelligenceLoad,
+  hasArcIntelligenceData,
   metricAmount,
   metricNumber,
   metricSum,
@@ -49,6 +51,7 @@ import {
   type ArcActivityRow,
   type ArcActivityType,
   type ArcIntelligenceLoad,
+  type ArcReadSection,
   type ArcPools,
   type BorrowMarketState,
   type ArcSummary,
@@ -2081,12 +2084,48 @@ export type ArcIntelligenceDashboardProps = {
   initialActivityType?: ArcActivityType
 }
 
+const READ_SECTION_LABELS: Record<ArcReadSection, string> = {
+  summary: 'Summary', timeseries: 'Timeseries', poolsV3: 'V3 Pools', poolsV4: 'V4 Pools', ecosystem: 'Ecosystem',
+  'activity:all': 'Activity (all)', 'activity:swaps': 'Activity (swaps)', 'activity:adds': 'Activity (adds)', 'activity:removes': 'Activity (removes)',
+}
+
+function RefreshStatus({ data }: { data: ArcIntelligenceLoad | null }) {
+  const entries = Object.entries(data?.refresh ?? {}) as [ArcReadSection, NonNullable<ArcIntelligenceLoad['refresh']>[ArcReadSection]][]
+  if (!entries.length) return null
+  const failures = entries.filter(([, state]) => state?.error)
+  return <>
+    {failures.length > 0 && <Banner tone="warn">
+      Refresh failed for {failures.map(([section]) => READ_SECTION_LABELS[section]).join(', ')}.
+      {failures.some(([, state]) => state?.retained) && ' Previously verified responses are retained and marked stale; they may not reflect the latest window.'}
+      {failures.some(([, state]) => !state?.retained) && ' Sections without a previous successful response remain unavailable.'}
+      {failures.map(([section, state]) => state && <span key={section} className="block text-xs">
+        {READ_SECTION_LABELS[section]} — {state.retained ? 'stale retained response' : 'unavailable'}.
+        {' '}Last successfully validated response: {state.lastSuccessAt ? formatUtcDateTime(state.lastSuccessAt) : 'none'}.
+        {state.verifiedThrough && <> Verified through {formatUtcDateTime(state.verifiedThrough)}.</>}
+        {state.error === 'invalid_response' && ' Latest response failed schema validation.'}
+      </span>)}
+    </Banner>}
+    <details className="text-xs text-slate-600">
+      <summary className="cursor-pointer">Response status and last successful validation times</summary>
+      <ul className="mt-1 space-y-1">
+        {entries.map(([section, state]) => state && <li key={section} data-refresh-section={section}
+          data-refresh-status={state.error ? state.retained ? 'stale' : 'unavailable' : 'refreshed'}>
+          <strong>{READ_SECTION_LABELS[section]}</strong>: {state.error ? state.retained ? 'Stale retained response' : 'Response unavailable' : 'Last request succeeded'}.
+          {' '}Last successfully validated response: {state.lastSuccessAt ? formatUtcDateTime(state.lastSuccessAt) : 'none'}.
+          {state.verifiedThrough && <> Verified through {formatUtcDateTime(state.verifiedThrough)}.</>}
+          {state.error === 'invalid_response' && ' Latest response failed schema validation.'}
+        </li>)}
+      </ul>
+    </details>
+  </>
+}
+
 export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = false, lastVerifiedThrough = null, onWindowChange,
   onRefresh, borrowMarket = { status: 'loading' }, initialDexView = 'volume', explorerUrl = null, initialActivityType = 'all' }: ArcIntelligenceDashboardProps) {
   const windowLabel = ARC_INTELLIGENCE_WINDOWS.find((entry) => entry.id === selectedWindow)?.label ?? selectedWindow
   const supported = ARC_INTELLIGENCE_BACKEND_WINDOWS[selectedWindow]
   const loaded = supported && data && data.window === selectedWindow ? data : null
-  const mode: Mode = !supported ? 'history' : !loaded ? 'loading' : loaded.failed || !loaded.summary ? 'failed' : 'ready'
+  const mode: Mode = !supported ? 'history' : !loaded ? 'loading' : !hasArcIntelligenceData(loaded) ? 'failed' : 'ready'
   const summary = mode === 'ready' ? loaded?.summary ?? null : null
   const timeseries = mode === 'ready' ? loaded?.timeseries ?? null : null
   const windowHours = summary?.window.hours ?? (selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24)
@@ -2139,6 +2178,7 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
         <Banner tone="info">History is still being collected. {historyNote}</Banner>
       )}
       {mode === 'failed' && <Banner tone="warn">Arc Intelligence data could not be loaded right now. The layout stays in place; try Refresh in a moment.</Banner>}
+      <RefreshStatus data={loaded} />
       {coverage && (
         <Banner tone="info"><span data-history-coverage={coverage.status}>
           <strong>{partialHistory ? 'Partial history' : 'Full 30D history'}</strong>: {coverage.availableHours} / {coverage.expectedHours} verified hours.
@@ -2192,28 +2232,27 @@ export default function ArcIntelligenceOverview({ explorerUrl = null }: { explor
   const [loads, setLoads] = useState<Partial<Record<ArcIntelligenceWindow, ArcIntelligenceLoad>>>({})
   const [refreshing, setRefreshing] = useState(false)
   const [borrowMarket, setBorrowMarket] = useState<BorrowMarketState>({ status: 'loading' })
-  const controller = useRef<AbortController | null>(null)
+  const coordinator = useRef<ReturnType<typeof createArcIntelligenceRefresh> | null>(null)
+  if (!coordinator.current) coordinator.current = createArcIntelligenceRefresh({
+    onResult: (result) => setLoads((previous) => ({ ...previous,
+      [result.window]: retainArcIntelligenceLoad(previous[result.window], result) })),
+    onRefreshing: setRefreshing,
+  })
 
   // Keep the selected view fresh as new stored hours arrive; GET reads start no indexing work.
-  const load = useCallback(async (target: ArcIntelligenceWindow) => {
+  const load = useCallback((target: ArcIntelligenceWindow) => {
     if (!ARC_INTELLIGENCE_BACKEND_WINDOWS[target]) return
-    controller.current?.abort()
-    const current = new AbortController()
-    controller.current = current
-    setRefreshing(true)
-    const result = await loadArcIntelligence(target, { signal: current.signal })
-    if (current.signal.aborted) return
-    setLoads((previous) => ({ ...previous, [target]: result }))
-    setRefreshing(false)
+    return coordinator.current!.refresh(target)
   }, [])
 
   useEffect(() => {
-    if (!loads[selectedWindow]) void load(selectedWindow)
+    void load(selectedWindow)
     const interval = selectedWindow === '30d' ? window.setInterval(() => void load(selectedWindow), 60_000) : null
-    return () => { if (interval !== null) window.clearInterval(interval) }
-  }, [selectedWindow])
-
-  useEffect(() => () => controller.current?.abort(), [])
+    return () => {
+      if (interval !== null) window.clearInterval(interval)
+      coordinator.current?.cancel()
+    }
+  }, [selectedWindow, load])
 
   // Borrow card: one read only market listing through the existing Borrow Kit boundary. No wallet, no write.
   useEffect(() => {
@@ -2226,15 +2265,11 @@ export default function ArcIntelligenceOverview({ explorerUrl = null }: { explor
     }
   }, [])
 
-  const lastVerifiedThrough = Object.values(loads).map((entry) => entry?.summary?.freshness.verifiedThrough ?? null)
-    .filter((value): value is string => Boolean(value)).sort().pop() ?? null
-
   return (
     <ArcIntelligenceDashboard
       selectedWindow={selectedWindow}
       data={loads[selectedWindow] ?? null}
       refreshing={refreshing}
-      lastVerifiedThrough={lastVerifiedThrough}
       onWindowChange={setSelectedWindow}
       onRefresh={() => void load(selectedWindow)}
       borrowMarket={borrowMarket}

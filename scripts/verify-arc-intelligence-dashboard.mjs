@@ -2146,4 +2146,181 @@ await test('Completion both 7D and 30D daily-active charts preserve persisted co
     assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable');
   }
 });
+const refreshTime = '2026-10-09T17:00:00.000Z';
+const recoveryTime = '2026-10-09T17:02:00.000Z';
+const refreshFixture = (window = '24h') => {
+  const data = structuredClone(window === '24h' ? READY_DATA : longData(window, window === '7d' ? 7 : 30));
+  data.summary.network = structuredClone(READY_DATA.summary.network);
+  if (window === '30d') {
+    const end = Date.parse(data.summary.window.end), start = end - 560 * HOUR_MS;
+    data.summary.window.coverage = { status: 'partial', expectedHours: 720, availableHours: 560, missingHours: 160,
+      start: isoAt(start), end: isoAt(end), completedUtcDays: Math.floor(end / (24 * HOUR_MS)) - Math.ceil(start / (24 * HOUR_MS)) };
+    data.summary.coverage.storedHours = 560;
+  }
+  data.ecosystem = completionEcosystem(); data.ecosystem.window = data.summary.window;
+  return data;
+};
+const refreshSection = (data, section) => section === 'poolsV3' ? data.pools?.v3 : section === 'poolsV4' ? data.pools?.v4
+  : section.startsWith('activity:') ? data.activity?.[section.slice(9)] : data[section];
+const removeRefreshSection = (data, section) => {
+  if (section === 'poolsV3' || section === 'poolsV4') data.pools[section === 'poolsV3' ? 'v3' : 'v4'] = null;
+  else if (section.startsWith('activity:')) data.activity[section.slice(9)] = null;
+  else data[section] = null;
+};
+const refreshFetch = (data, mutate = (_, body) => body) => async (url) => {
+  const query = new URL(url, 'https://fixture.invalid').searchParams;
+  const section = query.get('view') === 'pools' ? query.get('protocol') === 'v3' ? 'poolsV3' : 'poolsV4'
+    : query.get('view') === 'activity' ? `activity:${query.get('type')}` : query.get('view');
+  return { ok: true, json: async () => mutate(section, structuredClone(refreshSection(data, section))) };
+};
+
+await test('Refresh 1 success validates each section independently and limits concurrent GETs to two', async () => {
+  for (const window of ['24h', '7d', '30d']) {
+    let inFlight = 0, peak = 0, count = 0;
+    const data = refreshFixture(window), serve = refreshFetch(data);
+    const result = await lib.loadArcIntelligence(window, { fetchImpl: async (...args) => {
+      count++; inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(resolve => setImmediate(resolve));
+      inFlight--; return serve(...args);
+    } });
+    assert.equal(count, 9); assert.equal(peak, 2);
+    const retained = lib.retainArcIntelligenceLoad(undefined, result, refreshTime);
+    assert.equal(retained.failed, false);
+    for (const section of lib.ARC_READ_SECTIONS) {
+      assert.ok(refreshSection(retained, section), `${window}:${section}`);
+      assert.equal(retained.refresh[section].lastSuccessAt, refreshTime);
+      assert.equal(retained.refresh[section].error, null);
+      assert.equal(retained.refresh[section].retained, false);
+    }
+  }
+});
+
+await test('Refresh 2 a failed 30D reload preserves every verified section and shows stale response timestamps', async () => {
+  const previous = lib.retainArcIntelligenceLoad(undefined, refreshFixture('30d'), refreshTime);
+  const failure = await lib.loadArcIntelligence('30d', { fetchImpl: async () => { throw new TypeError('offline'); } });
+  const kept = lib.retainArcIntelligenceLoad(previous, failure, recoveryTime);
+  assert.equal(kept.failed, false);
+  for (const section of lib.ARC_READ_SECTIONS) {
+    assert.strictEqual(refreshSection(kept, section), refreshSection(previous, section));
+    assert.deepEqual(kept.refresh[section], { ...previous.refresh[section], error: 'request_failed', retained: true });
+  }
+  const tree = render({ selectedWindow: '30d', data: kept }).tree;
+  assert.equal(item(tree, 'network.transactions').attrs['data-intel-status'], 'available');
+  assert.equal(byAttr(tree, 'data-refresh-section', 'summary')[0].attrs['data-refresh-status'], 'stale');
+  assert.match(textOf(tree), /560 \/ 720 verified hours/);
+  assert.match(textOf(tree), /Refresh failed for Summary, Timeseries/);
+  assert.match(textOf(tree), /Previously verified responses are retained and marked stale/);
+  assert.match(textOf(tree), /Last successfully validated response: Oct 9, 17:00 UTC/);
+  assert.doesNotMatch(textOf(tree), /Last successfully validated response: Oct 9, 17:02 UTC/);
+});
+
+await test('Refresh 3 each partial API failure retains only that section while successful peers advance', async () => {
+  const previous = lib.retainArcIntelligenceLoad(undefined, refreshFixture(), refreshTime);
+  for (const failedSection of lib.ARC_READ_SECTIONS) {
+    const result = await lib.loadArcIntelligence('24h', { fetchImpl: refreshFetch(refreshFixture(), (section, body) => {
+      if (section === failedSection) throw new TypeError('one section failed'); return body;
+    }) });
+    const kept = lib.retainArcIntelligenceLoad(previous, result, recoveryTime);
+    for (const section of lib.ARC_READ_SECTIONS) {
+      assert.equal(kept.refresh[section].retained, section === failedSection);
+      assert.equal(kept.refresh[section].lastSuccessAt, section === failedSection ? refreshTime : recoveryTime);
+      if (section === failedSection) assert.strictEqual(refreshSection(kept, section), refreshSection(previous, section));
+      else assert.notStrictEqual(refreshSection(kept, section), refreshSection(previous, section));
+    }
+    assert.equal(kept.failed, false);
+  }
+});
+
+await test('Refresh 4 a first-load Summary failure does not hide successful Timeseries Pools Ecosystem or Activity', async () => {
+  const result = await lib.loadArcIntelligence('24h', { fetchImpl: refreshFetch(refreshFixture(), (section, body) => {
+    if (section === 'summary') throw new TypeError('summary failed'); return body;
+  }) });
+  const data = lib.retainArcIntelligenceLoad(undefined, result, refreshTime);
+  assert.equal(data.summary, null); assert.ok(data.timeseries); assert.equal(lib.hasArcIntelligenceData(data), true);
+  const tree = render({ selectedWindow: '24h', data }).tree;
+  assert.equal(item(tree, 'network.transactions').attrs['data-intel-status'], 'unavailable');
+  for (const id of ['top-pools-v3.swaps', 'top-pools-v4.swaps', 'assets.new-tokens', 'recent-activity.all', 'volume-chart.swaps']) {
+    assert.equal(item(tree, id).attrs['data-intel-status'], 'available', id);
+  }
+  assert.match(textOf(tree), /Sections without a previous successful response remain unavailable/);
+});
+
+await test('Refresh 5 recovery replaces retained responses and clears errors with new success timestamps', async () => {
+  let data = lib.retainArcIntelligenceLoad(undefined, refreshFixture(), refreshTime);
+  const failure = { window: '24h', summary: null, timeseries: null, failed: true };
+  data = lib.retainArcIntelligenceLoad(data, failure, recoveryTime);
+  const fresh = refreshFixture(); fresh.summary.network.transactions = 76543;
+  data = lib.retainArcIntelligenceLoad(data, fresh, recoveryTime);
+  assert.equal(data.summary.network.transactions, 76543);
+  for (const section of lib.ARC_READ_SECTIONS) {
+    assert.equal(data.refresh[section].error, null); assert.equal(data.refresh[section].retained, false);
+    assert.equal(data.refresh[section].lastSuccessAt, recoveryTime);
+  }
+  const tree = render({ selectedWindow: '24h', data }).tree;
+  assert.doesNotMatch(textOf(tree), /Refresh failed|Stale retained response/);
+  assert.equal(byAttr(tree, 'data-refresh-section', 'summary')[0].attrs['data-refresh-status'], 'refreshed');
+});
+
+await test('Refresh 6 caches remain separate on window switching and never borrow another window timestamp or data', async () => {
+  const cache = {};
+  for (const window of ['24h', '7d', '30d']) cache[window] = lib.retainArcIntelligenceLoad(undefined, refreshFixture(window), refreshTime);
+  for (const window of ['30d', '24h', '7d', '30d']) {
+    const old = cache[window];
+    cache[window] = lib.retainArcIntelligenceLoad(old, { window, summary: null, timeseries: null, failed: true }, recoveryTime);
+    assert.strictEqual(cache[window].summary, old.summary);
+    assert.equal(cache[window].summary.window.key, window);
+    assert.equal(cache[window].refresh.summary.lastSuccessAt, refreshTime);
+  }
+  const freshWindow = lib.retainArcIntelligenceLoad(cache['24h'], { window: '30d', summary: null, timeseries: null, failed: true }, recoveryTime);
+  assert.equal(freshWindow.summary, null); assert.equal(freshWindow.refresh.summary.lastSuccessAt, null);
+});
+
+await test('Refresh 7 timer and manual reloads coalesce and late aborted window responses cannot publish or clear new state', async () => {
+  const pending = [], updates = [], busy = [];
+  const coordinator = lib.createArcIntelligenceRefresh({ onResult: result => updates.push(result.window),
+    onRefreshing: value => busy.push(value), loader: (window, { signal }) => new Promise(resolve => pending.push({ window, signal, resolve })) });
+  const first = coordinator.refresh('30d');
+  assert.strictEqual(coordinator.refresh('30d'), first); assert.equal(pending.length, 1);
+  const second = coordinator.refresh('24h'); assert.equal(pending[0].signal.aborted, true);
+  pending[0].resolve(refreshFixture('30d')); await first;
+  assert.deepEqual(updates, []); assert.deepEqual(busy, [true, true]);
+  pending[1].resolve(refreshFixture()); await second;
+  assert.deepEqual(updates, ['24h']); assert.deepEqual(busy, [true, true, false]);
+  const third = coordinator.refresh('7d'); coordinator.cancel();
+  pending[2].resolve(refreshFixture('7d')); await third;
+  assert.deepEqual(updates, ['24h']); assert.equal(pending[2].signal.aborted, true);
+  assert.match(componentSource, /setInterval\(\(\) => void load\(selectedWindow\), 60_000\)/);
+  assert.match(componentSource, /coordinator\.current\?\.cancel\(\)/);
+});
+
+await test('Refresh 8 malformed and wrong-window responses retain verified data but genuine unavailable responses replace it', async () => {
+  const previous = lib.retainArcIntelligenceLoad(undefined, refreshFixture(), refreshTime);
+  const invalid = await lib.loadArcIntelligence('24h', { fetchImpl: refreshFetch(refreshFixture(), (section, body) => {
+    if (section === 'summary' || section === 'timeseries') body.window.key = '30d';
+    if (section === 'ecosystem') body.discoveredTokens.rows[0].verifiedAsset = true;
+    if (section === 'poolsV3') body.pools[0].swapCount = 'guessed';
+    return body;
+  }) });
+  const kept = lib.retainArcIntelligenceLoad(previous, invalid, recoveryTime);
+  for (const section of ['summary', 'timeseries', 'ecosystem', 'poolsV3']) {
+    assert.equal(kept.refresh[section].error, 'invalid_response'); assert.equal(kept.refresh[section].retained, true);
+  }
+  const genuine = refreshFixture();
+  genuine.summary.network = { status: 'unavailable', reason: 'insufficient_coverage' };
+  genuine.pools.v3 = { ...genuine.pools.v3, status: 'unavailable', reason: 'not_ready', pools: [] };
+  const replacement = lib.retainArcIntelligenceLoad(previous,
+    await lib.loadArcIntelligence('24h', { fetchImpl: refreshFetch(genuine) }), recoveryTime);
+  assert.equal(replacement.summary.network.status, 'unavailable');
+  assert.equal(replacement.pools.v3.status, 'unavailable');
+  assert.equal(replacement.refresh.summary.retained, false); assert.equal(replacement.refresh.poolsV3.error, null);
+});
+
+await test('Refresh 9 cancellation stops queued section requests without issuing the remaining seven GETs', async () => {
+  const controller = new AbortController(); let calls = 0;
+  const result = lib.loadArcIntelligence('30d', { signal: controller.signal, fetchImpl: (_, { signal }) => {
+    calls++; return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+  } });
+  assert.equal(calls, 2); controller.abort(); await result; assert.equal(calls, 2);
+});
+
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);
