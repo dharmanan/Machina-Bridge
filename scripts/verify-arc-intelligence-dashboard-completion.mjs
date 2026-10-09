@@ -307,21 +307,125 @@ try {
     } finally { data.db.close(); }
   });
 
-  await test('missing long-window history is an explicit gap; the bounded valuation backfill never promises 168/720 hours', async () => {
+  await test('7D still needs full coverage; 30D shows stored verified history without backfill', async () => {
     const short = fixture('short', 24);
     const model = short.model();
     try {
-      for (const key of ['7d', '30d']) {
+      for (const key of ['7d']) {
         assert.equal(model.summary(key).dex.usdVolume.status, 'unavailable');
         assert.equal(model.summary(key).dex.usdVolume.reason, 'insufficient_coverage');
         assert.equal(model.summary(key).dex.usdVolume.totalUsdMicros, null);
         assert.ok(model.timeseries(key).buckets.some((bucket) => bucket.status === 'not_stored'));
       }
+      const partial = model.summary('30d');
+      assert.equal(partial.window.hours, 720);
+      assert.equal(partial.window.coverage.availableHours, 24);
+      assert.equal(partial.window.coverage.status, 'partial');
+      assert.equal(partial.dex.usdVolume.totalUsdMicros, '144000000');
       const plan = planValuationBackfill(readValuationInputs(short.db, { hours: 72 }));
       assert.equal(MAX_VALUATION_HOURS, 72);
       assert.equal(plan.targetHours, 24);
       assert.equal(storageGuard(plan), null);
     } finally { model.close(); short.db.close(); }
+  });
+
+  await test('549 verified hours immediately expose all additive 30D metrics and 22 completed UTC days', async () => {
+    const data = fixture('partial-549', 549);
+    const model = data.model();
+    try {
+      const before = facts(data.db);
+      const summary = model.summary('30d');
+      assert.deepEqual(summary.window.coverage, { status: 'partial', expectedHours: 720, availableHours: 549, missingHours: 171,
+        start: iso(BASE), end: iso(BASE + 549 * HOUR), completedUtcDays: 22 });
+      assert.equal(summary.window.start, iso(BASE - 171 * HOUR), 'selected window remains 30D');
+      assert.equal(summary.network.start, iso(BASE), 'metric interval is actual verified history');
+      assert.equal(summary.network.blocks, 54900);
+      assert.equal(summary.network.transactions, 5490);
+      assert.equal(summary.network.gasUsedRaw, '549000');
+      assert.equal(summary.network.transactionsPerSecond, 10 / HOUR, 'TPS uses 549 hours, not 720');
+      assert.equal(summary.network.averageTransactionsPerBlock, 0.1);
+      assert.equal(summary.network.uniqueActiveAddresses.reason, 'identity_retention_exceeded');
+      assert.equal(summary.network.previous.status, 'unavailable', 'no comparison to a full previous period');
+      for (const section of [summary.assets, summary.lending, summary.crossChain]) {
+        for (const entry of Object.values(section)) assert.equal(entry.status, 'available');
+      }
+      for (const name of ['uniswapV3', 'uniswapV4']) assert.equal(summary.dex[name].metrics.swapCount, 549 * 3);
+      assert.equal(summary.dex.usdVolume.totalUsdMicros, (549n * 6_000_000n).toString());
+      assert.equal(summary.dex.swapFees.totalFeeUsdMicros, (549n * 3000n).toString());
+      assert.equal(summary.protocolUsd.cctp.values.outboundUsdMicros, '549000000');
+      assert.equal(summary.protocolUsd.gateway.values.depositUsdMicros, '1647000000');
+      assert.equal(summary.protocolUsd.aaveV4.values.suppliedUsdMicros, '3294000000');
+      assert.equal(summary.protocolUsd.morphoVaultsV2.values.depositedUsdMicros, '4392000000');
+      const series = model.timeseries('30d');
+      assert.deepEqual(series.window, summary.window);
+      assert.equal(series.buckets.filter((bucket) => bucket.status === 'committed').length, 22);
+      assert.equal(series.buckets.at(-1).status, 'incomplete');
+      assert.equal(series.buckets.at(-1).storedHours, 21);
+      assert.equal(series.buckets.at(-1).network, null, 'unfinished day is never a zero-filled day total');
+      const completed = series.buckets.filter((bucket) => bucket.status === 'committed');
+      assert.ok(completed.every((bucket) => bucket.network.transactions === 240 && bucket.network.uniqueActiveAddresses === 1));
+      for (const protocol of ['v3', 'v4']) {
+        const pools = model.pools(protocol, '30d');
+        assert.deepEqual(pools.window, summary.window);
+        assert.equal(pools.status, 'available');
+        assert.equal(pools.pools[0].swapCount, 549 * 3);
+        assert.equal(pools.pools[0].usdVolume.usdMicros, (549n * 3_000_000n).toString());
+      }
+      assert.deepEqual(facts(data.db), before, 'GET models do not change stored facts');
+      data.store.commitHour(hourResult(549));
+      assert.equal(model.summary('30d').window.coverage.availableHours, 550, 'cache sees newly committed hour');
+      assert.equal(model.summary('30d').network.transactions, 5500);
+      assert.equal(model.timeseries('30d').buckets.at(-1).storedHours, 22);
+      assert.equal(model.pools('v3', '30d').pools[0].swapCount, 550 * 3);
+    } finally { model.close(); data.db.close(); }
+  });
+
+  await test('719 to 720 hours becomes full 30D automatically; rolling coverage never exceeds 720', async () => {
+    const data = fixture('partial-to-full', 719);
+    const model = data.model();
+    try {
+      assert.equal(model.summary('30d').window.coverage.status, 'partial');
+      assert.equal(model.summary('30d').network.transactions, 7190);
+      data.store.commitHour(hourResult(719));
+      assert.deepEqual(model.summary('30d').window.coverage, { status: 'complete', expectedHours: 720, availableHours: 720, missingHours: 0,
+        start: iso(BASE), end: iso(BASE + 720 * HOUR), completedUtcDays: 30 });
+      assert.equal(model.summary('30d').network.transactions, 7200);
+      assert.equal(model.timeseries('30d').buckets.filter((bucket) => bucket.status === 'committed').length, 30);
+      data.store.commitHour(hourResult(720));
+      const summary = model.summary('30d');
+      assert.equal(summary.window.coverage.start, iso(BASE + HOUR));
+      assert.equal(summary.window.coverage.availableHours, 720);
+      assert.equal(summary.network.transactions, 7200, 'oldest hour is excluded');
+      const buckets = model.timeseries('30d').buckets;
+      assert.equal(buckets[0].status, 'incomplete');
+      assert.equal(buckets[0].storedHours, 23, 'rolling boundary never includes an out-of-window hour');
+      assert.equal(buckets.at(-1).storedHours, 1);
+      assert.equal(buckets.filter((bucket) => bucket.status === 'committed').length, 29);
+    } finally { model.close(); data.db.close(); }
+  });
+
+  await test('partial 30D preserves family, valuation, token and price blockers without inventing zeroes', async () => {
+    const data = fixture('partial-blockers', 48, { unknown: true });
+    const model = data.model();
+    try {
+      assert.equal(model.summary('30d').protocolUsd.aaveV4.reason, 'unverified_token');
+      assert.equal(model.summary('30d').protocolUsd.aaveV4.values, null);
+      data.db.prepare("UPDATE compact_family_hours SET status='unavailable',reason='test_family_unverified',metrics_json=NULL,metrics_sha256=NULL WHERE family='across' AND hour_start=?").run(BigInt(BASE));
+      data.db.prepare("UPDATE compact_valuation_hours SET status='unavailable',reason='prices_unavailable',row_count=NULL,rows_sha256=NULL WHERE valuation='dex_usd_volume' AND hour_start=?").run(BigInt(BASE));
+      const summary = model.summary('30d');
+      assert.equal(summary.window.coverage.availableHours, 48);
+      assert.equal(summary.network.transactions, 480);
+      assert.equal(summary.crossChain.across.reason, 'family_hour_unavailable');
+      assert.ok(summary.crossChain.across.reasons.includes('test_family_unverified'));
+      assert.equal(summary.crossChain.across.metrics, null);
+      assert.equal(summary.dex.usdVolume.totalUsdMicros, null);
+      assert.ok(summary.dex.usdVolume.reasons.includes('prices_unavailable'));
+      assert.equal(model.timeseries('30d').buckets.filter((bucket) => bucket.status === 'committed')[0].dexUsdVolume.status, 'unavailable');
+      assert.equal(model.pools('v3', '30d').pools[0].usdVolume.usdMicros, null);
+      data.db.exec('PRAGMA foreign_keys=OFF');
+      data.db.prepare('DELETE FROM compact_hours WHERE hour_start=?').run(BigInt(BASE + HOUR));
+      assert.throws(() => model.summary('30d'), (error) => error.code === 'inconsistent_state', 'broken contiguous evidence fails closed');
+    } finally { model.close(); data.db.close(); }
   });
 
   await test('unverified assets and incorrect Aave units block protocol USD, not other protocols or DEX', async () => {
@@ -356,7 +460,11 @@ try {
           req.on('error', reject); req.end();
         });
         assert.equal(reply.status, 200, path);
-        if (path.includes('summary?window=30d')) assert.equal(reply.body.dex.usdVolume.totalUsdMicros, null);
+        if (path.includes('window=30d')) {
+          assert.equal(reply.body.window.coverage.availableHours, 24);
+          assert.equal(reply.body.window.coverage.status, 'partial');
+        }
+        if (path.includes('summary?window=30d')) assert.equal(reply.body.dex.usdVolume.totalUsdMicros, '144000000');
       }
     } finally {
       server.closeAllConnections?.();

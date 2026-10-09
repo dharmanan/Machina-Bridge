@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { INTELLIGENCE_VERSION, ECOSYSTEM_SCHEMA, ECOSYSTEM_WINDOWS, INTELLIGENCE_REGISTRY, registryDigest,
   existingProtocolDefinitions, addressOf } from './intelligence-registry.js';
 import { DISCOVERY_LIMIT_PER_HOUR, intelligenceJson, valueExchangeFlow } from './intelligence.js';
+import { storedWindow } from './windows.js';
 
 export const INTELLIGENCE_SQL = `
 CREATE TABLE IF NOT EXISTS compact_intelligence_hours (
@@ -158,12 +159,16 @@ export function createIntelligenceRepository(db) {
 // No RPC, no writes. Used inside the existing read-only model's short WAL snapshot transaction.
 export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY } = {}) {
   if (!Object.hasOwn(ECOSYSTEM_WINDOWS, windowKey)) throw new Error('unsupported_window');
-  const hours = ECOSYSTEM_WINDOWS[windowKey];
+  let hours = ECOSYSTEM_WINDOWS[windowKey];
   const checkpoint = db.prepare('SELECT hour_start,last_block FROM compact_checkpoint WHERE id=1').get();
   const to = checkpoint?.hour_start ?? null;
-  const from = to === null ? null : to - (hours - 1) * HOUR;
+  const bounds = windowKey === '30d' && checkpoint ? db.prepare('SELECT MIN(hour_start) AS first, MAX(hour_start) AS last, COUNT(*) AS count FROM compact_hours').get() : null;
+  if (bounds && (bounds.last !== to || bounds.count !== (to - bounds.first) / HOUR + 1)) throw new Error('checkpoint_not_contiguous');
+  const selected = bounds ? storedWindow(windowKey, hours, bounds.first, to) : null;
+  const from = selected?.from ?? (to === null ? null : to - (hours - 1) * HOUR);
+  hours = selected?.hours ?? hours;
   const base = { schema: ECOSYSTEM_SCHEMA, chain: { id: 5042, name: 'Arc' }, definitionVersion: INTELLIGENCE_VERSION,
-    window: { key: windowKey, hours, start: from === null ? null : iso(from), end: to === null ? null : iso(to + HOUR) },
+    window: selected?.window ?? { key: windowKey, hours, start: from === null ? null : iso(from), end: to === null ? null : iso(to + HOUR) },
     verifiedAssets: registry.assets.map((asset) => ({ ...asset, classification: 'verified_registry_asset', promotionFromDiscovery: false })),
     rwa: registry.assets.filter((asset) => asset.category === 'tokenized_fund' || asset.category === 'rwa').map((asset) => ({ ...asset })),
     existingProtocols: existingProtocolDefinitions(), launchSources: registry.launches.map(({ events, ...entry }) => ({ ...entry,

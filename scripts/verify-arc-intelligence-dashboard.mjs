@@ -1919,6 +1919,66 @@ await test('Completion 1 fee estimate, state-based liquidity and protocol USD re
   assert.equal(lib.usdMicrosToNumber('9'.repeat(400)), null, 'unrepresentable chart values never become Infinity or zero');
 });
 
+await test('Partial 30D displays 549 verified hours, all supported numeric sections and completed daily charts', async () => {
+  const hours = 549;
+  const start = END - hours * HOUR_MS;
+  const summary = summaryFixture({ window: '30d', hours: 720, storedHours: hours, usdVolume: usdWindow('3294000000'),
+    swapFees: feesWindow('1647000', 3294), protocolUsd: PROTOCOL_USD_READY,
+    network: { blocks: 54900, transactions: 5490, transactionsPerSecond: 10 / 3600, gasUsedRaw: '549000',
+      previous: { status: 'unavailable', reason: 'insufficient_coverage', transactions: null },
+      uniqueActiveAddresses: { status: 'not_supported', reason: 'identity_retention_exceeded', value: null } } });
+  summary.window.coverage = { status: 'partial', expectedHours: 720, availableHours: hours, missingHours: 171,
+    start: isoAt(start), end: isoAt(END), completedUtcDays: 22 };
+  summary.dex.usdVolume.previous = { status: 'unavailable', reason: 'insufficient_coverage', totalUsdMicros: null };
+  summary.dex.swapFees.previous = { status: 'unavailable', reason: 'insufficient_coverage', averageFeeUsdMicros: null };
+  const buckets = [];
+  const dayMs = 24 * HOUR_MS;
+  for (let day = Math.floor(Date.parse(summary.window.start) / dayMs) * dayMs; day < END; day += dayMs) {
+    const storedHours = Math.max(0, (Math.min(day + dayMs, END) - Math.max(day, start)) / HOUR_MS);
+    const range = { start: isoAt(day), end: isoAt(Math.min(day + dayMs, END)) };
+    if (storedHours < 24) {
+      buckets.push({ ...range, status: storedHours ? 'incomplete' : 'not_stored', storedHours, network: null, families: null, dexUsdVolume: null });
+    } else buckets.push({ ...range, status: 'committed', storedHours: 24,
+      network: { blocks: 2400, transactions: 240, gasUsedRaw: '24000', uniqueActiveAddresses: 1,
+        uniqueActiveAddressesStatus: { status: 'available', value: 1 } },
+      families: { uniswapV3: { status: 'available', swapCount: 72 }, uniswapV4: { status: 'available', swapCount: 72 } },
+      dexUsdVolume: { status: 'available', totalUsdMicros: '144000000', uniswapV3UsdMicros: '72000000', uniswapV4UsdMicros: '72000000' } });
+  }
+  const series = { schema: TIMESERIES_SCHEMA, window: summary.window, freshness, bucketHours: 24, buckets };
+  const pools = completePools();
+  for (const protocol of ['v3', 'v4']) pools[protocol].window = summary.window;
+  const data = { ...COMPLETE_DATA, window: '30d', summary, timeseries: series, pools };
+  const { tree } = render({ selectedWindow: '30d', data, borrowMarket: BORROW_AVAILABLE });
+  checkScope(tree, SCOPE);
+  const text = textOf(tree);
+  assert.match(text, /Partial history : 549 \/ 720 verified hours/);
+  assert.match(text, /22 completed UTC days/);
+  assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.start)));
+  assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.end)));
+  assert.match(text, /Values show available verified history within the selected 30D window/);
+  assert.doesNotMatch(text, /30D totals appear once every hour|Total transactions, last 30D|vs previous 30D/);
+  for (const id of ['network.transactions', 'network.blocks', 'network.tps', 'network.gas-used', 'network.total-volume', 'network.average-fee',
+    'top-protocols.uniswap-v3', 'top-protocols.uniswap-v4', 'top-pools-v3.volume', 'top-pools-v4.volume', 'assets.usdc',
+    'lending.aave', 'lending.morpho-blue', 'lending.morpho-vaults', 'cross-chain.cctp', 'cross-chain.gateway', 'cross-chain.across']) {
+    assert.equal(item(tree, id).attrs['data-intel-status'], 'available', id);
+  }
+  assert.equal(item(tree, 'network.transactions').attrs['data-intel-value'], '5490');
+  assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable');
+  assert.equal(item(tree, 'active-addresses-chart.series').attrs['data-intel-status'], 'available', 'persisted daily distinct counts are displayed');
+  for (const section of ['volume-chart', 'active-addresses-chart']) {
+    const bars = [...walk(sectionNode(tree, section))].filter((node) => node.tag === 'button' && node.attrs['aria-label']);
+    assert.equal(bars.filter((bar) => /hours stored so far/.test(bar.attrs['aria-label'])).length, 2, 'both incomplete boundaries identified');
+    assert.equal(buckets.filter((bucket) => bucket.status === 'committed').length, 22);
+  }
+  assert.ok(lib.parseArcPools(pools.v3, 'v3', '30d'));
+  for (const mutate of [(coverage) => { coverage.status = 'complete'; }, (coverage) => { coverage.availableHours = 720; },
+    (coverage) => { coverage.start = summary.window.start; }, (coverage) => { coverage.completedUtcDays = 30; }]) {
+    const malformed = structuredClone(pools.v3);
+    mutate(malformed.window.coverage);
+    assert.equal(lib.parseArcPools(malformed, 'v3', '30d'), null, 'malformed coverage fails closed');
+  }
+});
+
 await test('Completion 2 fully valued 7D and 30D render their own daily USD bars and pool values', async () => {
   for (const [window, days] of [['7d', 7], ['30d', 30]]) {
     const hours = days * 24;

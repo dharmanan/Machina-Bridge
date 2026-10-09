@@ -8,6 +8,25 @@ export class WindowError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 
+// 30D can expose a shorter verified interval without calling it a completed 30-day total.
+// Callers establish a contiguous committed checkpoint before selecting this interval.
+export function storedWindow(windowKey, expectedHours, firstHour, checkpointHour) {
+  const hour = 3600;
+  const selectedFrom = checkpointHour - (expectedHours - 1) * hour;
+  const from = windowKey === '30d' ? Math.max(selectedFrom, firstHour) : selectedFrom;
+  const hours = (checkpointHour - from) / hour + 1;
+  const end = checkpointHour + hour;
+  const iso = (value) => new Date(value * 1000).toISOString();
+  const coverage = windowKey === '30d' ? {
+    status: hours === expectedHours ? 'complete' : 'partial',
+    expectedHours, availableHours: hours, missingHours: expectedHours - hours,
+    start: iso(from), end: iso(end),
+    completedUtcDays: Math.max(0, Math.floor(end / 86400) - Math.ceil(from / 86400)),
+  } : null;
+  return { from, hours, selectedFrom, window: { key: windowKey, hours: expectedHours,
+    start: iso(selectedFrom), end: iso(end), ...(coverage ? { coverage } : {}) } };
+}
+
 function addInto(target, source, { counts = [], amounts = [], constants = [] }) {
   for (const field of counts) target[field] = (target[field] ?? 0) + source[field];
   for (const field of amounts) target[field] = ((BigInt(target[field] ?? 0) + BigInt(source[field])).toString(10));

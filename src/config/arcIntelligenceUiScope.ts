@@ -12,7 +12,7 @@ export const ARC_INTELLIGENCE_WINDOWS: readonly { id: ArcIntelligenceWindow; lab
 ]
 
 // Windows the current Intelligence API can answer. Others are rendered with a collecting state and never requested.
-// 7D and 30D are answered from stored hours only: until a window holds every one of its hours its totals stay collecting.
+// 7D requires all 168 hours. 30D displays available verified history with its actual coverage.
 export const ARC_INTELLIGENCE_BACKEND_WINDOWS: Readonly<Record<ArcIntelligenceWindow, boolean>> = {
   '24h': true,
   '7d': true,
@@ -56,7 +56,7 @@ export const ARC_INTELLIGENCE_UI_SCOPE: readonly ArcIntelligenceScopeSection[] =
     items: [
       live('window.24h', '24H window'),
       live('window.7d', '7D window: daily buckets, totals once all 168 hours are stored'),
-      live('window.30d', '30D window: daily buckets, totals once all 720 hours are stored'),
+      live('window.30d', '30D window: available verified history and complete UTC-day buckets, with actual coverage'),
       live('network.active-addresses', 'Active Addresses: unique within 24H; not counted over 7D or 30D (identities are kept for one day)'),
       live('network.transactions', 'Transactions'),
       live('network.total-volume', 'DEX Volume: USD-valued Uniswap V3 and V4 swaps on Arc, each swap counted once'),

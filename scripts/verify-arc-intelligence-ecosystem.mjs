@@ -413,6 +413,26 @@ await test('unresolved outside selected 24h window does not change current scope
   assert.equal(day.coverage.candidateVerificationComplete, true);
   assert.equal(readEcosystem(db, '7d').coverage.candidateVerificationComplete, false); db.close();
 });
+
+await test('30D ecosystem reads the verified stored interval without pretending discovery is complete', () => {
+  const { db, store } = fixture();
+  try {
+    for (let i = 0; i < 49; i++) store.commitHour(hour(i));
+    const before = db.prepare('SELECT * FROM compact_checkpoint').get();
+    const data = readEcosystem(db, '30d');
+    assert.equal(data.window.hours, 720);
+    assert.equal(data.window.coverage.status, 'partial');
+    assert.equal(data.window.coverage.availableHours, 49);
+    assert.equal(data.coverage.requiredHours, 49, 'layer verification is scoped to actual stored hours');
+    assert.equal(data.coverage.availableHours, 49);
+    assert.equal(data.coverage.status, 'available');
+    assert.equal(data.coverage.candidateVerificationComplete, false, 'unresolved tokens remain unverified');
+    assert.equal(data.discoveredTokens.status, 'insufficient_coverage');
+    assert.equal(data.launches.status, 'insufficient_coverage');
+    assert.equal(readEcosystem(db, '7d').coverage.status, 'insufficient_coverage');
+    assert.deepEqual(db.prepare('SELECT * FROM compact_checkpoint').get(), before);
+  } finally { db.close(); }
+});
 await test('canonical candidate mismatch rolls back without destroying accepted hour', () => {
   const { db, store } = fixture(); store.commitHour(hour()); const bad = hour();
   bad.intelligence = { ...bad.intelligence, range: { ...bad.intelligence.range, lastHash: hash(999) } };

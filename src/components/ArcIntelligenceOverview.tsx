@@ -498,8 +498,11 @@ const usdText = (value: number) => formatUsdCompact(value)
 function addressPoints(timeseries: ArcTimeseries | null): ChartPoint[] | null {
   if (!timeseries) return null
   return timeseries.buckets.map((bucket) => {
-    const value = bucket.status === 'committed' ? bucket.network?.uniqueActiveAddresses : undefined
-    return { start: bucket.start, end: bucket.end, values: isFiniteNumber(value) ? [value] : null }
+    const daily = timeseries.bucketHours === 24
+    const verified = !daily || bucket.network?.uniqueActiveAddressesStatus?.status === 'available'
+    const value = bucket.status === 'committed' && verified ? bucket.network?.uniqueActiveAddresses : undefined
+    return { start: bucket.start, end: bucket.end, values: isFiniteNumber(value) ? [value] : null,
+      note: bucketNote(bucket) ?? (daily && !verified ? 'No stored verified daily distinct count' : undefined) }
   })
 }
 
@@ -724,29 +727,34 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
   )
 }
 
-// Hourly only: a day's unique addresses cannot be built from hourly counts, and identities are kept for one day only, so 7D
-// and 30D state that instead of drawing a sum.
+// A daily distinct count must come from its own stored verification. 30D can show those
+// counts; the 7D presentation remains unchanged, and hourly counts are never added together.
 function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
   const daily = ctx.period === 'day'
-  const points = ctx.mode === 'ready' && !daily ? addressPoints(ctx.timeseries) : null
-  const status: DisplayStatus = daily && ctx.mode === 'ready' ? 'unavailable' : chartStatus(ctx, points)
+  const storedDaily = ctx.summary?.window.key === '30d'
+  const points = ctx.mode === 'ready' && (!daily || storedDaily) ? addressPoints(ctx.timeseries) : null
+  const status: DisplayStatus = daily && ctx.mode === 'ready'
+    ? points?.some((point) => point.values) ? 'available' : 'unavailable' : chartStatus(ctx, points)
   return (
     <section data-intel-section="active-addresses-chart" aria-label="Active Addresses" className={`${CARD} min-w-0 lg:col-span-2`}>
       <CardTitle title="Active Addresses"
         subtitle={daily
-          ? 'Unique addresses are counted per UTC hour, within the 24H view.'
+          ? storedDaily ? 'Verified distinct addresses per completed UTC day. Daily counts are never added together.'
+            : 'Unique addresses are counted per UTC hour, within the 24H view.'
           : 'Unique addresses active in each UTC hour. Hourly values are not added together.'} />
       <div {...markerProps('active-addresses-chart.series', status)}>
         {status === 'available' && points ? (
           <>
-            <HourReadout item="active-addresses-chart.latest" status={status} points={points} unit="addresses" />
-            <BarChart points={points} series={[{ name: 'Active addresses', barClass: ADDRESS_BAR }]} unit="addresses" />
+            <HourReadout item="active-addresses-chart.latest" status={status} points={points} unit="addresses" period={ctx.period} />
+            <BarChart points={points} series={[{ name: 'Active addresses', barClass: ADDRESS_BAR }]} unit="addresses" period={ctx.period} />
           </>
         ) : daily && ctx.mode === 'ready' ? (
           <>
             <HourReadout item="active-addresses-chart.latest" status={status} points={[]} unit="addresses" period="day" note="Not counted per day" />
             <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
-              title="Daily active addresses are not available" detail={`${reasonText('identity_retention_exceeded')} Switch to 24H for hourly counts.`} />
+              title="Daily active addresses are not available" detail={storedDaily
+                ? 'No stored verified daily distinct counts are available. Hourly unique counts are never added together.'
+                : `${reasonText('identity_retention_exceeded')} Switch to 24H for hourly counts.`} />
           </>
         ) : (
           <>
@@ -2013,10 +2021,13 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   const timeseries = mode === 'ready' ? loaded?.timeseries ?? null : null
   const windowHours = summary?.window.hours ?? (selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24)
   const storedHours = summary ? Math.min(summary.coverage.storedHours, windowHours) : 0
+  const coverage = selectedWindow === '30d' ? summary?.window.coverage : undefined
+  const partialHistory = coverage?.status === 'partial'
   const progress = mode === 'ready' && storedHours > 0 && storedHours < windowHours ? ` (${storedHours} of ${windowHours} hours so far)` : ''
   const days = selectedWindow === '30d' ? 30 : 7
   const historyNote = `The ${windowLabel} view fills in once ${days} full days of verified history are stored.`
-  const ctx: ViewContext = { mode, windowLabel, period: selectedWindow === '24h' ? 'hour' : 'day', windowHours: selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24,
+  const ctx: ViewContext = { mode, windowLabel: partialHistory ? `${coverage.availableHours} verified hours within 30D` : windowLabel,
+    period: selectedWindow === '24h' ? 'hour' : 'day', windowHours: selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24,
     historyNote, summary, timeseries,
     collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
     activity: mode === 'ready' ? loaded?.activity ?? null : null, explorerUrl }
@@ -2058,6 +2069,15 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
         <Banner tone="info">History is still being collected. {historyNote}</Banner>
       )}
       {mode === 'failed' && <Banner tone="warn">Arc Intelligence data could not be loaded right now. The layout stays in place; try Refresh in a moment.</Banner>}
+      {coverage && (
+        <Banner tone="info"><span data-history-coverage={coverage.status}>
+          <strong>{partialHistory ? 'Partial history' : 'Full 30D history'}</strong>: {coverage.availableHours} / {coverage.expectedHours} verified hours.
+          {' '}{formatUtcDateTime(coverage.start)} – {formatUtcDateTime(coverage.end)}.
+          {' '}{coverage.completedUtcDays} completed UTC days.
+          {partialHistory && ' Values show available verified history within the selected 30D window.'}
+          {' '}Incomplete day intervals remain gaps; missing hours are never counted as zero.
+        </span></Banner>
+      )}
       {networkCollecting && (
         <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the {selectedWindow === '24h'
           ? 'hourly charts already show each verified hour' : 'daily charts already show each complete day'}.</Banner>
@@ -2104,7 +2124,7 @@ export default function ArcIntelligenceOverview({ explorerUrl = null }: { explor
   const [borrowMarket, setBorrowMarket] = useState<BorrowMarketState>({ status: 'loading' })
   const controller = useRef<AbortController | null>(null)
 
-  // Only windows the API can answer are ever requested (24H, 7D and 30D); each window is read once and kept.
+  // Keep the selected view fresh as new stored hours arrive; GET reads start no indexing work.
   const load = useCallback(async (target: ArcIntelligenceWindow) => {
     if (!ARC_INTELLIGENCE_BACKEND_WINDOWS[target]) return
     controller.current?.abort()
@@ -2119,6 +2139,8 @@ export default function ArcIntelligenceOverview({ explorerUrl = null }: { explor
 
   useEffect(() => {
     if (!loads[selectedWindow]) void load(selectedWindow)
+    const interval = selectedWindow === '30d' ? window.setInterval(() => void load(selectedWindow), 60_000) : null
+    return () => { if (interval !== null) window.clearInterval(interval) }
   }, [selectedWindow])
 
   useEffect(() => () => controller.current?.abort(), [])

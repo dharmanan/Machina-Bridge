@@ -3,8 +3,8 @@
 // RPC. Every answer is computed inside one short read transaction (a single WAL snapshot), so a response never mixes an
 // hour with another hour's family rows, a half committed hour, or two definition states. Schema and family definition
 // versions are checked inside every snapshot: an incompatible database fails closed instead of being misread.
-// Windows are anchored to the committed checkpoint, never to the wall clock. A window is available only when every one
-// of its hours is; missing evidence is reported (unavailable / not_supported), never turned into zero.
+// Windows are anchored to the committed checkpoint, never to the wall clock. Values require verified evidence for their
+// stated interval; 30D exposes a shorter stored interval with explicit coverage, never missing hours turned into zero.
 import { existsSync } from 'node:fs';
 import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
 import { ECOSYSTEM_WINDOWS } from './intelligence-registry.js';
@@ -18,15 +18,16 @@ import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
 import { poolTvlUsd, TVL_VERSION } from './tvl.js';
 import { anchorDecimals, poolVolumeUsd, PRICE_POLICY, priceableDecimals, PRICEABLE_TOKENS, usdMicrosOf, VALUATION_VERSIONS } from './valuation.js';
-import { sumWindow, WindowError } from './windows.js';
+import { storedWindow, sumWindow, WindowError } from './windows.js';
 
 export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1';
 export const TIMESERIES_SCHEMA = 'machina.intelligence.timeseries.v1';
 export const POOLS_SCHEMA = 'machina.intelligence.pools.v1';
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1';
-// 7D and 30D follow exactly the same rule as 24H: available only when every hour of the window is stored and verified.
+// 24H and 7D require full windows. 30D uses all contiguous committed hours inside the selected window,
+// with an explicit coverage interval; metric-specific verification still fails closed.
 // Unique active addresses over 7D/30D are not_supported (identities are kept for 24 hours only); everything additive is
-// summed from hourly rows. 7D/30D timeseries show complete UTC days ending at the latest verified midnight.
+// summed from hourly rows. Daily timeseries expose completed UTC days; 30D also identifies incomplete boundary days.
 export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const POOLS_WINDOWS = Object.freeze({ '24h': 24, '7d': 168, '30d': 720 });
@@ -624,14 +625,17 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function buildSummary(windowKey, hours) {
     const state = anchor();
     const to = state.hour;
-    const from = to - (hours - 1) * HOUR;
-    const previousTo = from - HOUR;
-    const previousFrom = previousTo - (hours - 1) * HOUR;
+    const selected = storedWindow(windowKey, hours, state.firstHour, to);
+    const from = selected.from;
+    const expectedHours = hours;
+    hours = selected.hours;
+    const previousTo = selected.selectedFrom - HOUR;
+    const previousFrom = previousTo - (expectedHours - 1) * HOUR;
     const network = networkWindow(from, to, hours, state.hour);
-    network.previous = networkWindow(previousFrom, previousTo, hours, state.hour);
+    network.previous = networkWindow(previousFrom, previousTo, expectedHours, state.hour);
     const families = Object.fromEntries(FAMILIES.map((name) => {
       const current = familyWindow(name, from, to, hours, { full: true });
-      current.previous = familyWindow(name, previousFrom, previousTo, hours, { full: false });
+      current.previous = familyWindow(name, previousFrom, previousTo, expectedHours, { full: false });
       return [name, current];
     }));
     const registry = statement('registryCoverage').get(V3_POOL_KIND);
@@ -640,12 +644,12 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       : { status: 'unavailable', reason: registry ? 'registry_behind_checkpoint' : 'registry_missing', count: null, throughBlock: null };
     const tables = optionalTables();
     const usdVolume = volumeWindow(from, to, hours, tables);
-    usdVolume.previous = volumeWindow(previousFrom, previousTo, hours, tables);
+    usdVolume.previous = volumeWindow(previousFrom, previousTo, expectedHours, tables);
     const swapFees = feeWindow(from, to, hours, tables);
-    swapFees.previous = feeWindow(previousFrom, previousTo, hours, tables);
+    swapFees.previous = feeWindow(previousFrom, previousTo, expectedHours, tables);
     const protocolUsd = protocolUsdWindow(from, to, hours, tables);
     return {
-      window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) },
+      window: selected.window,
       anchor: state,
       network,
       assets: { usdc: families.usdc, verifiedAssets: families.assets },
@@ -669,12 +673,17 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
 
   function buildTimeseries(windowKey, hours) {
     const state = anchor();
+    const selected = storedWindow(windowKey, hours, state.firstHour, state.hour);
     const daily = hours > 24;
     const latestCompleteDayStart = Math.floor((state.hour + HOUR) / (DAILY_BUCKET_HOURS * HOUR))
       * (DAILY_BUCKET_HOURS * HOUR) - (DAILY_BUCKET_HOURS * HOUR);
-    const to = daily ? latestCompleteDayStart + (DAILY_BUCKET_HOURS - 1) * HOUR : state.hour;
-    const from = daily ? to - (hours - 1) * HOUR : state.hour - (hours - 1) * HOUR;
-    const network = new Map(statement('networkRows').all(int(from), int(to)).map((row) => [row.hour_start, row]));
+    const to = windowKey === '30d' ? state.hour : daily ? latestCompleteDayStart + (DAILY_BUCKET_HOURS - 1) * HOUR : state.hour;
+    // Include both UTC-day boundaries for 30D. Missing/ongoing hours stay explicit gaps,
+    // and no completed day outside the selected rolling window is counted.
+    const from = windowKey === '30d' ? Math.floor(selected.selectedFrom / 86400) * 86400
+      : daily ? to - (hours - 1) * HOUR : state.hour - (hours - 1) * HOUR;
+    const readFrom = windowKey === '30d' ? selected.selectedFrom : from;
+    const network = new Map(statement('networkRows').all(int(readFrom), int(to)).map((row) => [row.hour_start, row]));
     const familyRows = new Map();
     for (const row of statement('allFamilyRows').all(int(from), int(to))) familyRows.set(`${row.hour_start}:${row.family}`, row);
     const tables = optionalTables();
@@ -719,7 +728,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       });
     }
     if (hours <= 24) return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, bucketHours: 1, buckets };
-    return { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, bucketHours: DAILY_BUCKET_HOURS,
+    return { window: windowKey === '30d' ? selected.window : { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, bucketHours: DAILY_BUCKET_HOURS,
       buckets: dailyBuckets(buckets) };
   }
 
@@ -817,8 +826,10 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const state = anchor();
     const spec = POOL_PROTOCOLS[protocolKey];
     const to = state.hour;
-    const from = to - (hours - 1) * HOUR;
-    const base = { window: { key: windowKey, hours, start: iso(from), end: iso(to + HOUR) }, anchor: state, poolsTracked: null, newPools: null,
+    const selected = storedWindow(windowKey, hours, state.firstHour, to);
+    const from = selected.from;
+    hours = selected.hours;
+    const base = { window: selected.window, anchor: state, poolsTracked: null, newPools: null,
       pools: [] };
     const unavailable = (reason) => ({ ...base, status: 'unavailable', reason, reasons: [reason], unavailableHours: [] });
     const blocks = statement('windowBlocks').get(int(from), int(to));

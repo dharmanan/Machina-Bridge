@@ -12,6 +12,12 @@ export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1'
 
 export type IntelligenceDataStatus = 'available' | 'collecting' | 'unavailable' | 'source_pending'
 
+// Metric availability describes verified values within this interval; coverage describes
+// whether that interval fills the selected window. Partial totals are never full 30D totals.
+export type WindowCoverage = { status: 'partial' | 'complete'; expectedHours: number; availableHours: number;
+  missingHours: number; start: string; end: string; completedUtcDays: number }
+export type IntelligenceWindow = { key: string; hours: number; start: string; end: string; coverage?: WindowCoverage }
+
 type BackendStatus = 'available' | 'unavailable' | 'not_supported'
 
 export type UniqueCount = { status: BackendStatus; reason?: string; value: number | null }
@@ -90,7 +96,7 @@ export type ProtocolUsd = { status: 'available' | 'unavailable'; reason: string 
 
 export type ArcSummary = {
   schema: typeof SUMMARY_SCHEMA
-  window: { key: string; hours: number; start: string; end: string }
+  window: IntelligenceWindow
   freshness: ArcFreshness
   network: NetworkWindow
   assets: { usdc: FamilyWindow; verifiedAssets: FamilyWindow }
@@ -115,14 +121,15 @@ export type TimeseriesBucket = {
   end: string
   status: 'committed' | 'not_stored' | 'incomplete'
   storedHours?: number
-  network: { blocks: number; transactions: number; uniqueActiveAddresses: number | null; gasUsedRaw: string } | null
+  network: { blocks: number; transactions: number; uniqueActiveAddresses: number | null; gasUsedRaw: string;
+    uniqueActiveAddressesStatus?: { status: string; reason?: string; value: number | null } } | null
   families: Record<string, TimeseriesFamily> | null
   dexUsdVolume?: HourUsdVolume | null
 }
 
 export type ArcTimeseries = {
   schema: typeof TIMESERIES_SCHEMA
-  window: { key: string; hours: number; start: string; end: string }
+  window: IntelligenceWindow
   freshness: ArcFreshness
   bucketHours?: number
   buckets: TimeseriesBucket[]
@@ -159,7 +166,7 @@ export type ArcPool = {
 export type ArcPools = {
   schema: typeof POOLS_SCHEMA
   protocol: 'v3' | 'v4'
-  window: { key: string; hours: number; start: string; end: string }
+  window: IntelligenceWindow
   freshness: ArcFreshness
   status: 'available' | 'unavailable'
   reason: string | null
@@ -294,6 +301,25 @@ const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as num
 const isNullableCount = (value: unknown) => value === null || isCount(value)
 const isRawUnsigned = (value: unknown) => typeof value === 'string' && UNSIGNED.test(value)
 
+// Older APIs may omit coverage. A supplied partial contract must be internally consistent
+// before any of its values can be described as verified history.
+function validWindowCoverage(window: unknown): boolean {
+  if (!isRecord(window)) return false
+  if (window.coverage === undefined) return true
+  const coverage = window.coverage
+  if (!isRecord(coverage) || window.key !== '30d' || window.hours !== 720 || coverage.expectedHours !== 720
+    || !isCount(coverage.availableHours) || !isCount(coverage.missingHours) || !isCount(coverage.completedUtcDays)
+    || (coverage.availableHours as number) < 1 || (coverage.availableHours as number) + (coverage.missingHours as number) !== 720) return false
+  const date = (value: unknown) => typeof value === 'string' ? Date.parse(value) : NaN
+  const start = date(coverage.start), end = date(coverage.end), selectedStart = date(window.start)
+  return Number.isFinite(start) && Number.isFinite(end) && Number.isFinite(selectedStart)
+    && start >= selectedStart && end === date(window.end) && end - selectedStart === 720 * 3600_000
+    && end - start === (coverage.availableHours as number) * 3600_000
+    && [start, end].every((value) => value % 3600_000 === 0)
+    && coverage.status === (coverage.availableHours === 720 ? 'complete' : 'partial')
+    && coverage.completedUtcDays === Math.max(0, Math.floor(end / 86400_000) - Math.ceil(start / 86400_000))
+}
+
 const CONTRACT_SYMBOL = /^[A-Za-z0-9][A-Za-z0-9._+$-]{0,19}$/
 const isDecimals0to36 = (value: unknown) => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 36
 
@@ -348,7 +374,7 @@ function isArcPool(value: unknown, protocol: 'v3' | 'v4'): value is ArcPool {
 export function parseArcPools(value: unknown, protocol: 'v3' | 'v4', window: ArcIntelligenceWindow = '24h'): ArcPools | null {
   if (!isRecord(value) || value.schema !== POOLS_SCHEMA || value.protocol !== protocol || !isRecord(value.window) || value.window.key !== window
     || !isRecord(value.ranking) || value.ranking.by !== 'swap_count' || !isNullableCount(value.poolsTracked) || !isNullableCount(value.newPools)
-    || !Array.isArray(value.pools) || value.pools.length > 10) return null
+    || !Array.isArray(value.pools) || value.pools.length > 10 || !validWindowCoverage(value.window)) return null
   if (value.status === 'available') return value.pools.every((pool) => isArcPool(pool, protocol)) ? value as unknown as ArcPools : null
   return value.status === 'unavailable' && value.pools.length === 0 ? value as unknown as ArcPools : null
 }
@@ -403,9 +429,9 @@ export async function loadArcIntelligence(
     read(requests.poolsV4),
     ...ARC_ACTIVITY_TYPES.map((type) => read(ACTIVITY_REQUESTS[type])),
   ])
-  const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA
+  const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA && validWindowCoverage(summary.value.window)
     ? summary.value as unknown as ArcSummary : null
-  const timeseriesValue = timeseries.status === 'fulfilled' && timeseries.value.schema === TIMESERIES_SCHEMA
+  const timeseriesValue = timeseries.status === 'fulfilled' && timeseries.value.schema === TIMESERIES_SCHEMA && validWindowCoverage(timeseries.value.window)
     ? timeseries.value as unknown as ArcTimeseries : null
   return {
     window: selected,
