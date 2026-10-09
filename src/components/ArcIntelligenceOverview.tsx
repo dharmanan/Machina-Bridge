@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Activity, AlertCircle, ArrowDown, ArrowDownLeft, ArrowLeftRight, ArrowRight, ArrowUpRight, Banknote, Building2, Clock, Coins,
-  Droplets, Landmark, Layers, Radar, RefreshCw, Rocket, Search, Store,
+  Droplets, Landmark, Layers, Radar, RefreshCw, Rocket, Store,
 } from 'lucide-react'
 import {
   ARC_INTELLIGENCE_BACKEND_WINDOWS,
@@ -48,6 +48,7 @@ import {
   windowStatus,
   type ArcActivity,
   type ArcEcosystem,
+  type DiscoveredToken,
   type ArcActivityRow,
   type ArcActivityType,
   type ArcIntelligenceLoad,
@@ -1349,12 +1350,6 @@ function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initial
   )
 }
 
-const LAUNCH_CAPABILITIES = [
-  { icon: Search, title: 'Token discovery', detail: 'New tokens created on Arc' },
-  { icon: Rocket, title: 'Launch source', detail: 'Where and how each token launched' },
-  { icon: Droplets, title: 'First pool + DEX activity', detail: 'First trading pair and early swaps' },
-]
-
 function ExplorerLink({ ctx, hash }: { ctx: ViewContext; hash: string }) {
   return ctx.explorerUrl ? <a href={`${ctx.explorerUrl}/tx/${hash}`} target="_blank" rel="noopener noreferrer" title={hash}
     className="text-[#2F6E0C] underline">{shortenHash(hash)}</a> : <span title={hash}>{shortenHash(hash)}</span>
@@ -1371,63 +1366,160 @@ function FamilyCoverage({ family }: { family: FamilyWindow | null }) {
 }
 
 const launchFieldProps = (field: string, status: DisplayStatus) => ({ 'data-launch-field': field, 'data-launch-status': status })
-function LaunchesSection({ ctx }: { ctx: ViewContext }) {
-  const ecosystem = ctx.ecosystem
-  const rows = ecosystem?.launches.rows ?? []
-  const status: DisplayStatus = rows.length ? 'available' : ecosystem ? 'unavailable' : 'source_pending'
-  const activityOf = (row: typeof rows[number]) => row.dex.firstDexActivity?.firstObserved
-  const firstPoolOf = (row: typeof rows[number]) => row.dex.firstPool ?? row.dex.observedPools?.[0]
-  const columns = [
-    ['launches.token', 'Token'], ['launches.symbol-address', 'Symbol and address'], ['launches.source', 'Launched via'],
-    ['launches.time', 'Launch time'], ['launches.transaction', 'Transaction'], ['launches.initial-pool', 'First pool'],
-    ['launches.dex-activity', 'DEX activity'], ['launches.status', 'Status'],
-  ] as const
-  return (
-    <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
-      <CardHeader title="Newly launched tokens" subtitle={`Verified launch records within ${ctx.windowLabel}`} right={<StatusPill status={status} />} />
-      {ecosystem && <p className="mt-2 text-xs text-slate-500">
-        {rows.length} verified records shown{ecosystem.launches.truncated ? ' (latest 50; list capped)' : ''}.
-        Discovery coverage: {ecosystem.coverage.availableHours} / {ecosystem.coverage.requiredHours} hours.
-        Incomplete discovery does not hide proven launches. ERC-20 metadata does not establish a verified asset identity.
-      </p>}
-      <div className="mt-3 grid gap-2 sm:grid-cols-3">
-        {LAUNCH_CAPABILITIES.map(({ icon: Icon, title, detail }) => <div key={title} className="flex items-start gap-2.5 rounded-lg border border-slate-100 px-3 py-2">
-          <Icon className="h-4 w-4 text-slate-500" /><div><p className="text-xs font-semibold">{title}</p>
-            <p className="text-[11px] text-slate-500">{detail}</p><p className="text-[11px] text-slate-500">{rows.length ? 'Verified records below' : STATUS_TEXT[status]}</p></div>
-        </div>)}
+const TOKEN_PAGE_SIZE = 10
+const TOKEN_CONTROL = 'rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6E0C] disabled:cursor-default disabled:opacity-40'
+const launchType = (row: DiscoveredToken) => ({ direct_deployment: 'Direct deployment', verified_factory: 'Verified factory',
+  verified_launchpad: 'Verified launchpad', unknown_source: 'Source unproven' }[row.launch.status] ?? 'Source unproven')
+const firstTokenPool = (row: DiscoveredToken) => row.dex.firstPool ?? row.dex.observedPools?.[0]
+const tokenDexStatus = (row: DiscoveredToken) => row.dex.firstDexActivity?.firstObserved
+  ? row.dex.firstDexActivity.status === 'available' ? 'Proven first activity' : 'First observed activity'
+  : 'Activity not observed'
+
+function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind: 'launches' | 'discoveredTokens' }) {
+  const list = ecosystem[kind]
+  return <div className="mt-3 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
+    <p className="font-semibold text-slate-800">Discovery coverage: {ecosystem.coverage.availableHours} / {ecosystem.coverage.requiredHours} hours.</p>
+    <p>{list.rows.length} {kind === 'launches' ? 'launch' : 'discovered token'} records returned{list.truncated ? ' (list capped)' : ''}.
+      {' '}{list.truncated ? 'Capped results are not the total number of launches or tokens.' : 'Incomplete discovery does not establish a chain-wide total.'}</p>
+    {ecosystem.coverage.status !== 'available' && <p>Incomplete discovery does not hide proven launches. {ecosystem.coverage.reason}</p>}
+  </div>
+}
+
+function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredToken; kind: 'launches' | 'discoveredTokens' }) {
+  const pool = firstTokenPool(row), activity = row.dex.firstDexActivity?.firstObserved
+  const transaction = (hash: string | undefined, reason: string) => hash
+    ? ctx.explorerUrl ? <a href={`${ctx.explorerUrl}/tx/${hash}`} target="_blank" rel="noopener noreferrer" className="break-all text-[#2F6E0C] underline">{hash}</a>
+      : <span className="break-all">{hash}</span> : reason
+  return <div data-token-evidence={row.address} className="space-y-3 rounded-lg bg-[#f8faf7] p-3 text-xs text-slate-600">
+    <div className="grid gap-3 md:grid-cols-2">
+      <div><p className="font-semibold text-slate-800">Contract and identity</p><p className="break-all">{row.address}</p>
+        <p>Verified ERC-20-like contract; unverified asset identity.</p>
+        <p>{row.name ?? 'Contract name unavailable'} · {row.symbol ?? 'Contract symbol unavailable'}</p>
+        <p>Decimals: {row.decimals ?? 'Unavailable'}</p>
+        <p>Discovered {formatUtcDateTime(row.discoveredAt)} · observed block {formatCount(row.observedBlock)}</p></div>
+      <div {...launchFieldProps('launches.transaction', row.deployment.transactionHash ? 'available' : 'unavailable')}>
+        <p className="font-semibold text-slate-800">Deployment evidence</p>
+        <p>{transaction(row.deployment.transactionHash, row.deployment.reason ?? 'Deployment not proven')}</p>
+        <p>{row.deployment.timestamp ? formatUtcDateTime(row.deployment.timestamp) : 'Deployment time not proven'}</p>
+        {row.deployment.blockNumber !== undefined && <p>Deployment block {formatCount(row.deployment.blockNumber)}</p>}
+        {row.deployment.deployer && <p className="break-all">Deployer {row.deployment.deployer}</p>}
+        <p>{launchType(row)}{row.launch.source && ` · ${row.launch.source}`}</p>
+        {row.launch.observedAt && <p>Launch observed {formatUtcDateTime(row.launch.observedAt)}</p>}
+        {row.launch.reason && <p>{row.launch.reason}</p>}</div>
+      <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')}>
+        <p className="font-semibold text-slate-800">{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p>
+        <p>{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p>
+        {pool ? <><p className="break-all">{pool.protocol} · {pool.pool}</p><p>Block {formatCount(pool.creationBlock)}</p>
+          <p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
+          : <p>{row.dex.reason ?? 'No verified pool record'}</p>}</div>
+      <div {...launchFieldProps('launches.dex-activity', activity ? 'available' : 'unavailable')}>
+        <p className="font-semibold text-slate-800">{tokenDexStatus(row)}</p>
+        {activity && <><p>{formatUtcDateTime(activity.timestamp)} · block {formatCount(activity.blockNumber)}</p>
+          <p>{transaction(activity.txHash, 'Activity transaction unavailable')}</p></>}
+        {row.dex.firstDexActivity?.status !== 'available' && <p>Lifetime first unproven: {row.dex.firstDexActivity?.reason ?? row.dex.reason ?? 'Activity not observed'}</p>}
+        {pool?.earlyActivity.status === 'available' && <p>{pool.earlyActivity.swapCount} swaps in pool creation UTC hour</p>}
+        <p>{row.dex.reason}</p></div>
+    </div>
+    {(row.dex.observedPools ?? []).map((observedPool) => <details key={observedPool.pool} className="rounded-lg border border-slate-200 px-3 py-2">
+      <summary className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#2F6E0C]">{observedPool.protocol} pool evidence · {shortenHash(observedPool.pool)}</summary>
+      <div className="mt-2 space-y-1 break-all"><p>{observedPool.pool}</p><p>Paired token {observedPool.pairedToken}</p>
+        <p>Creation block {formatCount(observedPool.creationBlock)} · {observedPool.creationTimestamp ? formatUtcDateTime(observedPool.creationTimestamp) : 'Creation timestamp unavailable'}</p>
+        <p>Creation transaction: {transaction(observedPool.creationTxHash, 'Unavailable')}</p>
+        {(['firstSwap', 'firstLiquidity'] as const).map((key) => {
+          const evidence = observedPool[key]
+          return <div key={key}><p className="font-medium">{key === 'firstSwap' ? 'Swap' : 'Liquidity'}: {evidence.firstObserved ? evidence.firstProven ? 'Proven first activity' : 'First observed activity' : 'Activity not observed'}</p>
+            {evidence.firstObserved && <><p>{formatUtcDateTime(evidence.firstObserved.timestamp)} · block {formatCount(evidence.firstObserved.blockNumber)} · log {evidence.firstObserved.logIndex}</p>
+              <p>{transaction(evidence.firstObserved.txHash, 'Unavailable')}</p></>}
+            {evidence.reason && <p>{evidence.reason}</p>}</div>
+        })}
+        <p>{observedPool.earlyActivity.status === 'available' ? `${observedPool.earlyActivity.swapCount} swaps in pool creation UTC hour` : observedPool.earlyActivity.reason}</p>
+        {observedPool.earlyActivity.hourStart && <p>Creation UTC hour: {formatUtcDateTime(observedPool.earlyActivity.hourStart)}</p>}
       </div>
-      <ShellTable gridClass="grid-cols-8" columns={columns.map(([item, label]) => ({ item, label, status }))}>
-        {rows.length ? <div className="divide-y divide-slate-100">{rows.map((row) => {
-          const pool = firstPoolOf(row), activity = activityOf(row)
-          const timestamp = row.deployment.timestamp ?? row.launch.observedAt
-          const hash = row.deployment.transactionHash
-          return <div key={row.address} data-launch-token={row.address} className="grid grid-cols-2 gap-3 py-3 text-[11px] lg:grid-cols-8">
-            <div {...launchFieldProps('launches.token', 'available')}><span className="font-semibold">{row.symbol || shortenAddress(row.address)}</span><p>ERC-20-like</p></div>
-            <div {...launchFieldProps('launches.symbol-address', 'available')} title={row.address}><p>{row.symbol ?? 'No contract symbol'}</p>
-              <p>{shortenAddress(row.address)}</p><p className="text-slate-400">Unverified asset identity</p></div>
-            <div {...launchFieldProps('launches.source', 'available')}><p>{row.launch.source ?? 'Direct deployment'}</p><p>{row.launch.status.replace(/_/g, ' ')}</p></div>
-            <div {...launchFieldProps('launches.time', timestamp ? 'available' : 'unavailable')}><p>{timestamp ? formatUtcDateTime(timestamp) : 'Deployment time not proven'}</p>
-              <p>Observed block {formatCount(row.observedBlock)}</p></div>
-            <div {...launchFieldProps('launches.transaction', hash ? 'available' : 'unavailable')} title={hash}><p>{hash ? <ExplorerLink ctx={ctx} hash={hash} /> : row.deployment.reason ?? 'Deployment not proven'}</p></div>
-            <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')} title={pool?.pool}>
-              {pool ? <><p>{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p><p>{pool.protocol} {shortenHash(pool.pool)}</p>
-                <p>Block {formatCount(pool.creationBlock)}</p><p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
-                : <p>{row.dex.reason ?? 'No verified pool record'}</p>}
-            </div>
-            <div {...launchFieldProps('launches.dex-activity', activity ? 'available' : 'unavailable')}>
-              {activity ? <><p>{row.dex.firstDexActivity?.status === 'available' ? 'Proven first activity' : 'First observed activity'}</p>
-                <p>{formatUtcDateTime(activity.timestamp)}</p><p>Block {formatCount(activity.blockNumber)}</p>
-                <ExplorerLink ctx={ctx} hash={activity.txHash} />
-                {row.dex.firstDexActivity?.status !== 'available' && <p className="text-slate-400">Lifetime first unproven: {row.dex.firstDexActivity?.reason}</p>}</>
-                : <p>{row.dex.firstDexActivity?.reason ?? 'Activity not observed'}</p>}
-              {pool?.earlyActivity.status === 'available' && <p>{pool.earlyActivity.swapCount} swaps in pool creation UTC hour</p>}
-            </div>
-            <div {...launchFieldProps('launches.status', 'available')}><p>Verified launch</p><p className="text-slate-400">{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p></div>
-          </div>
-        })}</div> : <EmptyRows title="No launches listed yet" detail={ecosystem?.coverage.reason ?? 'Launches appear here once token discovery is verified. No sample tokens are shown.'} />}
-      </ShellTable>
-    </section>
-  )
+    </details>)}
+    {row.launch.provenance != null && <details className="text-xs"><summary className="cursor-pointer">Launch source evidence</summary>
+      <pre className="mt-2 whitespace-pre-wrap break-all">{JSON.stringify(row.launch.provenance, null, 2)}</pre></details>}
+    {ctx.ecosystem && <TokenListCoverage ecosystem={ctx.ecosystem} kind={kind} />}
+  </div>
+}
+
+// Each list owns its page and one expanded record. Window-keyed callers reset navigation on a window switch.
+export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'launches' | 'discoveredTokens' }) {
+  const rows = ctx.ecosystem?.[kind].rows ?? []
+  const [selection, setSelection] = useState({ page: 0, expanded: null as string | null })
+  const pages = Math.max(1, Math.ceil(rows.length / TOKEN_PAGE_SIZE))
+  const page = Math.min(selection.page, pages - 1), start = page * TOKEN_PAGE_SIZE
+  const visible = rows.slice(start, start + TOKEN_PAGE_SIZE)
+  const launches = kind === 'launches'
+  const status: DisplayStatus = rows.length ? 'available' : ctx.ecosystem ? 'unavailable' : 'source_pending'
+  const title = launches ? 'New Token Launches' : 'Newly Discovered Tokens'
+  const tableId = `${kind}-${ctx.windowHours}`
+  const marker = (item: string) => launches ? markerProps(item, status) : {}
+  return <div className="mt-3 min-w-0" data-token-list={kind}>
+    {ctx.ecosystem && <TokenListCoverage ecosystem={ctx.ecosystem} kind={kind} />}
+    <p className="mt-2 text-[11px] text-slate-500" {...marker('launches.status')}>
+      {launches ? 'Verified launch evidence; token asset identities remain unverified.' : ctx.ecosystem
+        ? `${rows.length} verified ERC-20-like records; asset identities remain unverified` : 'Discovery evidence unavailable; asset identities remain unverified.'}
+    </p>
+    {launches && <span className="sr-only" {...marker('launches.transaction')}>Deployment transaction in expandable evidence</span>}
+    <table id={tableId} aria-label={title} className="mt-3 block w-full text-left text-xs md:table md:table-fixed">
+      <thead className="sr-only md:not-sr-only md:table-header-group"><tr className="border-b border-slate-100 text-slate-500">
+        <th scope="col" className="pb-2 font-medium md:w-[28%]" {...marker('launches.token')}>Token <span {...marker('launches.symbol-address')}>and address</span></th>
+        <th scope="col" className="pb-2 font-medium md:w-[25%]" {...marker('launches.time')}>{launches ? 'Launch time (UTC)' : 'Discovered (UTC)'}</th>
+        <th scope="col" className="pb-2 font-medium" {...marker('launches.source')}>Launch type</th>
+        <th scope="col" className="pb-2 font-medium" {...marker('launches.initial-pool')}>Pool</th>
+        <th scope="col" className="pb-2 font-medium" {...marker('launches.dex-activity')}>DEX activity</th>
+      </tr></thead>
+      <tbody className="block md:table-row-group">{visible.map((row) => {
+        const expanded = selection.expanded === row.address
+        const evidenceId = `${tableId}-${row.address}`
+        const timestamp = launches ? row.launch.observedAt ?? row.deployment.timestamp : row.discoveredAt
+        return <TokenListRow key={row.address} row={row} expanded={expanded} evidenceId={evidenceId} timestamp={timestamp} ctx={ctx}
+          launches={launches} onToggle={() => setSelection({ page, expanded: expanded ? null : row.address })} />
+      })}</tbody>
+    </table>
+    {!rows.length && <EmptyRows title={launches ? 'No launches listed yet' : 'No discovered tokens listed yet'}
+      detail={ctx.ecosystem?.coverage.reason ?? 'Records appear once token discovery is verified. No sample tokens are shown.'} />}
+    {!!rows.length && <nav aria-label={`${title} pagination`} className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
+      <span role="status" aria-live="polite" aria-atomic="true" className="text-xs tabular-nums text-slate-500">{start + 1}–{start + visible.length} of {rows.length} returned · Page {page + 1} of {pages}</span>
+      <div className="flex gap-2"><button type="button" className={TOKEN_CONTROL} disabled={page === 0} aria-controls={tableId}
+        onClick={() => setSelection({ page: Math.max(0, page - 1), expanded: null })}>Previous</button>
+        <button type="button" className={TOKEN_CONTROL} disabled={page === pages - 1} aria-controls={tableId}
+          onClick={() => setSelection({ page: Math.min(pages - 1, page + 1), expanded: null })}>Next</button></div>
+    </nav>}
+  </div>
+}
+
+function TokenListRow({ row, expanded, evidenceId, timestamp, ctx, launches, onToggle }: {
+  row: DiscoveredToken; expanded: boolean; evidenceId: string; timestamp: string | undefined;
+  ctx: ViewContext; launches: boolean; onToggle: () => void
+}) {
+  const pool = firstTokenPool(row)
+  return <>
+    <tr {...(launches ? { 'data-launch-token': row.address } : { 'data-discovered-token': row.address })}
+      className="mb-2 grid grid-cols-2 gap-x-3 gap-y-2 rounded-lg border border-slate-100 p-3 md:mb-0 md:table-row md:rounded-none md:border-0 md:border-b md:p-0 [&>td]:min-w-0 md:[&>td]:py-3 md:[&>td]:pr-3 md:[&>td]:align-top">
+      <td className="col-span-2 block md:table-cell"><p className="truncate font-semibold text-slate-900" title={row.symbol ?? undefined}>{row.symbol || 'No contract symbol'}</p>
+        <p className="text-slate-500" title={row.address}>{shortenAddress(row.address)}</p>
+        <button type="button" aria-expanded={expanded} aria-controls={evidenceId} aria-label={`${expanded ? 'Hide' : 'View'} evidence for ${row.symbol || 'token'} ${shortenAddress(row.address)}`}
+          onClick={onToggle} className="mt-1 rounded text-[11px] font-medium text-[#2F6E0C] underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6E0C]">{expanded ? 'Hide evidence' : 'View evidence'}</button></td>
+      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">{launches ? 'Launch time (UTC)' : 'Discovered (UTC)'}</span>
+        {timestamp ? formatUtcDateTime(timestamp) : 'Time not proven'}</td>
+      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">Launch type</span>{launchType(row)}</td>
+      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">Pool</span>{pool ? row.dex.firstPool ? 'Verified first pool' : 'Observed pool' : 'Not observed'}</td>
+      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">DEX activity</span>{tokenDexStatus(row)}</td>
+    </tr>
+    {expanded && <tr className="block md:table-row"><td colSpan={5} className="block pb-3 md:table-cell">
+      <div id={evidenceId} role="region" aria-label={`Evidence for ${shortenAddress(row.address)}`}><TokenEvidence ctx={ctx} row={row} kind={launches ? 'launches' : 'discoveredTokens'} /></div>
+    </td></tr>}
+  </>
+}
+
+function LaunchesSection({ ctx }: { ctx: ViewContext }) {
+  const rows = ctx.ecosystem?.launches.rows ?? []
+  const status: DisplayStatus = rows.length ? 'available' : ctx.ecosystem ? 'unavailable' : 'source_pending'
+  return <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
+    <CardHeader title="New Token Launches" subtitle={`Verified launch records within ${ctx.windowLabel}`} right={<StatusPill status={status} />} />
+    <EcosystemTokenList key={ctx.windowHours} ctx={ctx} kind="launches" />
+  </section>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1464,7 +1556,6 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
   const maxTransfers = Math.max(0, ...rows.map((row) => row.transfers ?? 0))
   const pendingRows = [
     { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: ctx.ecosystem ? 'Additional verified asset contracts, identities and units are required in the registry.' : 'More assets as they are verified' },
-    { item: 'assets.new-tokens', label: 'Newly discovered tokens', detail: ctx.ecosystem ? `${ctx.ecosystem.discoveredTokens.rows.length} verified ERC-20-like records; asset identities remain unverified` : 'Shown with a shortened address until verified' },
   ]
   const grid = 'md:grid-cols-[1.5fr_1.6fr_0.6fr_0.6fr_1.4fr]'
   return (
@@ -1516,23 +1607,21 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
           </li>
         ))}
         {pendingRows.map((row) => (
-          <li key={row.item} {...markerProps(row.item, row.item === 'assets.new-tokens' && ctx.ecosystem ? ctx.ecosystem.discoveredTokens.rows.length ? 'available' : 'unavailable' : 'source_pending')}
+          <li key={row.item} {...markerProps(row.item, 'source_pending')}
             className={`flex items-center justify-between gap-3 rounded-xl border border-dashed border-slate-200 p-3 md:grid md:gap-4 md:rounded-none md:border-0 md:border-b md:border-dashed md:px-0 md:py-2.5 ${grid}`}>
             <div className="flex min-w-0 items-center gap-2.5">
               <span aria-hidden="true" className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-dashed border-slate-300 text-xs font-semibold text-slate-400">+</span>
-              <div className="min-w-0">
-                <p className="text-sm font-semibold text-slate-500">{row.label}</p>
-                <p className="text-[11px] text-slate-400">{row.detail}</p>
-              </div>
+              <div className="min-w-0"><p className="text-sm font-semibold text-slate-500">{row.label}</p><p className="text-[11px] text-slate-400">{row.detail}</p></div>
             </div>
-            <div className="shrink-0 md:col-span-4 md:text-right">{row.item === 'assets.new-tokens' && ctx.ecosystem
-              ? <details className="text-xs text-slate-500"><summary>{ctx.ecosystem.discoveredTokens.rows.length} stored verified records{ctx.ecosystem.discoveredTokens.truncated ? ' (list capped)' : ''}</summary>
-                {ctx.ecosystem.discoveredTokens.rows.map((token) => <p key={token.address} title={token.address}>{token.symbol ?? 'No symbol'} · {shortenAddress(token.address)} · observed {formatUtcDateTime(token.discoveredAt)} · block {formatCount(token.observedBlock)} · unverified asset identity</p>)}
-                <p>Discovery coverage {ctx.ecosystem.coverage.availableHours} / {ctx.ecosystem.coverage.requiredHours} hours. Incomplete discovery is not an empty chain.</p>
-              </details> : <InlineStatus status="source_pending" />}</div>
+            <div className="shrink-0 md:col-span-4 md:text-right"><InlineStatus status="source_pending" /></div>
           </li>
         ))}
       </ul>
+      <div {...markerProps('assets.new-tokens', ctx.ecosystem ? ctx.ecosystem.discoveredTokens.rows.length ? 'available' : 'unavailable' : 'source_pending')}
+        className="mt-4 border-t border-slate-100 pt-3">
+        <h4 className="text-sm font-semibold text-slate-900">Newly Discovered Tokens</h4>
+        <EcosystemTokenList key={ctx.windowHours} ctx={ctx} kind="discoveredTokens" />
+      </div>
     </section>
   )
 }

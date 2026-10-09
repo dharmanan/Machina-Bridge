@@ -844,7 +844,7 @@ await test('UI 3 header, window selector, refresh, KPI cards, chart tabs, activi
   assert.equal(button('24H').attrs['aria-selected'], 'true');
   const text = textOf(tree);
   for (const label of ['Arc Intelligence', 'Verified Arc network activity', 'Verified through Oct 3, 14:00 UTC', 'Active Addresses', 'Transactions', 'DEX Volume',
-    'Avg DEX Pool Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'Newly launched tokens',
+    'Avg DEX Pool Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'New Token Launches',
     'Borrow on Arc', 'Powered by Circle Borrow Kit on Arc', 'Aave', 'Morpho Blue', 'Morpho Vaults', 'CCTP', 'Gateway', 'Across', 'RWA',
     'Other Verified Protocols', 'Exchange flows', 'Other verified Arc protocols', 'Hours in UTC']) {
     assert.ok(text.includes(label), label);
@@ -2112,11 +2112,11 @@ await test('Completion verified launches and discovery render despite incomplete
   const tree = render({ ...STATES.ready, data }).tree;
   checkScope(tree, SCOPE);
   const launches = textOf(sectionNode(tree, 'launches'));
-  assert.match(launches, /FOUND/); assert.match(launches, /1 verified records shown/);
+  assert.match(launches, /FOUND/); assert.match(launches, /1 launch records returned/);
   assert.match(launches, /Discovery coverage: 1 \/ 24 hours/);
   assert.match(launches, /Direct deployment/); assert.match(launches, /Observed pool/);
-  assert.match(launches, /First observed activity/); assert.match(launches, /Lifetime first unproven/);
-  assert.match(launches, /5 swaps in pool creation UTC hour/);
+  assert.match(launches, /First observed activity/);
+  assert.equal(byAttr(tree, 'data-token-evidence').length, 0, 'technical evidence starts collapsed');
   assert.equal(item(tree, 'assets.new-tokens').attrs['data-intel-status'], 'available');
   assert.match(textOf(sectionNode(tree, 'rwa-other')), /verified_exchange_registry_empty/);
   const corrupt = structuredClone(ecosystem); corrupt.launches.rows[0].dex.observedPools[0].creationTxHash = 'guessed';
@@ -2178,13 +2178,13 @@ for (const window of ['24h', '7d', '30d']) await test(`Ecosystem schema ${window
   const summary = structuredClone(READY_DATA.summary); summary.window = body.window;
   const tree = render({ selectedWindow: window, data: { ...READY_DATA, window, summary, ecosystem: parsed } }).tree;
   assert.match(textOf(sectionNode(tree, 'assets')), /19 verified ERC-20-like records; asset identities remain unverified/);
-  assert.equal(byAttr(tree, 'data-launch-token').length, 50);
+  assert.equal(byAttr(tree, 'data-launch-token').length, 10);
   const launches = textOf(sectionNode(tree, 'launches'));
-  assert.match(launches, /50 verified records shown \(latest 50; list capped\)/);
+  assert.match(launches, /50 launch records returned \(list capped\)/);
   assert.match(launches, new RegExp(`Discovery coverage: 6 / ${body.coverage.requiredHours} hours`));
   assert.match(launches, /Incomplete discovery does not hide proven launches/);
-  assert.match(launches, /First observed activity/); assert.match(launches, /Lifetime first unproven/);
-  assert.match(launches, /first_activity_history_missing/);
+  assert.match(launches, /First observed activity/);
+  assert.equal(byAttr(tree, 'data-token-evidence').length, 0);
 });
 await test('Ecosystem schema rejects malformed or contradictory activity and token evidence in every window', async () => {
   const mutations = [
@@ -2232,6 +2232,126 @@ await test('Ecosystem schema rejects malformed or contradictory activity and tok
     pool.firstSwap = { ...structuredClone(pool.firstLiquidity), status: 'available', firstProven: true, reason: null };
     assert.ok(lib.parseArcEcosystem(proven, window), 'genuinely proven activity still validates');
   }
+});
+
+// Drive the actual list's hook state and native button handlers without external network or a DOM dependency.
+// Render every state with React so the assertions inspect the resulting table, controls and evidence panels.
+function tokenListHarness(kind, ecosystem = missingActivityEcosystem('30d')) {
+  let state;
+  let ctx = { ecosystem, windowHours: ecosystem.window.hours, windowLabel: ecosystem.window.key.toUpperCase(), explorerUrl: 'https://arcscan.app' };
+  const draw = () => {
+    const original = React.useState;
+    React.useState = initial => {
+      if (state === undefined) state = typeof initial === 'function' ? initial() : initial;
+      return [state, next => { state = typeof next === 'function' ? next(state) : next; }];
+    };
+    let element;
+    try { element = componentModule.EcosystemTokenList({ ctx, kind }); }
+    finally { React.useState = original; }
+    const output = render({}, () => element);
+    function* elements(node) {
+      if (Array.isArray(node)) { for (const child of node) yield* elements(child); return; }
+      if (!React.isValidElement(node)) return;
+      yield node;
+      if (typeof node.type === 'function') yield* elements(node.type(node.props));
+      else yield* elements(node.props.children);
+    }
+    return { ...output, controls: [...elements(element)].filter(node => node.type === 'button') };
+  };
+  return { draw, replace: ecosystem => { ctx = { ...ctx, ecosystem }; },
+    click: label => {
+      const control = draw().controls.find(node => node.props.children === label);
+      assert.ok(control, label); assert.equal(control.props.type, 'button');
+      if (!control.props.disabled) control.props.onClick();
+    },
+    expand: address => {
+      const control = draw().controls.find(node => node.props['aria-controls']?.endsWith(address));
+      assert.ok(control, `expand ${address}`); control.props.onClick();
+    } };
+}
+await test('Token list UX compact defaults, coverage and capped counts keep both lists bounded', async () => {
+  const ecosystem = missingActivityEcosystem('30d'); ecosystem.coverage.requiredHours = 561;
+  ecosystem.window.coverage.availableHours = 561; ecosystem.window.coverage.missingHours = 159;
+  ecosystem.window.coverage.start = isoAt(END - 561 * HOUR_MS);
+  const summary = structuredClone(READY_DATA.summary); summary.window = ecosystem.window;
+  const { tree } = render({ selectedWindow: '30d', data: { ...READY_DATA, window: '30d', summary, ecosystem }, borrowMarket: BORROW_UNAVAILABLE });
+  checkScope(tree, SCOPE);
+  assert.equal(byAttr(tree, 'data-launch-token').length, 10);
+  assert.equal(byAttr(tree, 'data-discovered-token').length, 10);
+  assert.equal(byAttr(tree, 'data-token-evidence').length, 0);
+  for (const kind of ['launches', 'discoveredTokens']) {
+    const list = byAttr(tree, 'data-token-list', kind)[0], text = textOf(list);
+    assert.match(text, /Discovery coverage: 6 \/ 561 hours/);
+    assert.match(text, /Capped results are not the total number of launches or tokens/);
+    assert.match(text, /asset identities remain unverified/);
+    assert.match(text, kind === 'launches' ? /50 launch records returned/ : /19 discovered token records returned/);
+    const table = [...walk(list)].find(node => node.tag === 'table');
+    assert.ok(table); assert.match(table.attrs.class, /md:table/);
+    assert.equal([...walk(table)].filter(node => node.tag === 'th' && node.attrs.scope === 'col').length, 5);
+    const rows = byAttr(list, kind === 'launches' ? 'data-launch-token' : 'data-discovered-token');
+    assert.ok(rows.every(row => /grid-cols-2/.test(row.attrs.class) && /md:table-row/.test(row.attrs.class)));
+  }
+});
+await test('Token list UX Previous and Next visit every returned record once and isolate list navigation', async () => {
+  const ecosystem = missingActivityEcosystem('30d');
+  const launches = tokenListHarness('launches', ecosystem), discoveries = tokenListHarness('discoveredTokens', ecosystem);
+  const visited = [];
+  assert.equal(launches.draw().controls.find(node => node.props.children === 'Previous').props.disabled, true);
+  for (let page = 0; page < 5; page++) {
+    const { tree } = launches.draw();
+    const rows = byAttr(tree, 'data-launch-token'); assert.equal(rows.length, 10);
+    visited.push(...rows.map(row => row.attrs['data-launch-token']));
+    assert.match(textOf(tree), new RegExp(`Page ${page + 1} of 5`));
+    launches.click('Next');
+  }
+  assert.deepEqual(visited, ecosystem.launches.rows.map(row => row.address));
+  assert.equal(launches.draw().controls.find(node => node.props.children === 'Next').props.disabled, true);
+  launches.click('Previous'); assert.match(textOf(launches.draw().tree), /Page 4 of 5/);
+  assert.match(textOf(discoveries.draw().tree), /Page 1 of 2/);
+  discoveries.click('Next');
+  assert.equal(byAttr(discoveries.draw().tree, 'data-discovered-token').length, 9);
+  assert.match(textOf(discoveries.draw().tree), /11–19 of 19 returned/);
+  const smaller = structuredClone(ecosystem); smaller.launches.rows = smaller.launches.rows.slice(0, 3);
+  launches.replace(smaller); assert.match(textOf(launches.draw().tree), /1–3 of 3 returned · Page 1 of 1/);
+  launches.click('Previous'); assert.equal(byAttr(launches.draw().tree, 'data-launch-token').length, 3);
+});
+await test('Token list UX expansion reveals real evidence, remains single-row and closes on pagination', async () => {
+  const ecosystem = missingActivityEcosystem('30d'), rows = ecosystem.launches.rows;
+  const harness = tokenListHarness('launches', ecosystem);
+  assert.equal(byAttr(harness.draw().tree, 'data-token-evidence').length, 0);
+  harness.expand(rows[0].address);
+  let output = harness.draw();
+  assert.deepEqual(byAttr(output.tree, 'data-token-evidence').map(node => node.attrs['data-token-evidence']), [rows[0].address]);
+  assert.match(textOf(output.tree), new RegExp(rows[0].address));
+  assert.match(textOf(output.tree), new RegExp(rows[0].deployment.transactionHash));
+  assert.match(textOf(output.tree), /Deployment block 100/);
+  assert.match(textOf(output.tree), new RegExp(rows[0].dex.firstPool.pool));
+  assert.match(textOf(output.tree), /First observed activity/); assert.match(textOf(output.tree), /Lifetime first unproven/);
+  assert.match(textOf(output.tree), /activity_not_stored/);
+  const toggle = output.controls.find(node => node.props['aria-expanded'] === true);
+  assert.ok(byAttr(output.tree, 'id', toggle.props['aria-controls']).length);
+  assert.equal(toggle.props.type, 'button'); assert.match(toggle.props['aria-label'], /Hide evidence for/);
+  const region = byAttr(output.tree, 'role', 'region')[0]; assert.match(region.attrs['aria-label'], /Evidence for/);
+  for (const button of output.controls) assert.ok(button.props.className.includes('focus-visible:outline'));
+  harness.expand(rows[1].address);
+  assert.deepEqual(byAttr(harness.draw().tree, 'data-token-evidence').map(node => node.attrs['data-token-evidence']), [rows[1].address]);
+  harness.expand(rows[1].address); assert.equal(byAttr(harness.draw().tree, 'data-token-evidence').length, 0);
+  harness.expand(rows[0].address); harness.click('Next');
+  assert.equal(byAttr(harness.draw().tree, 'data-token-evidence').length, 0);
+  const discovery = tokenListHarness('discoveredTokens', ecosystem); discovery.expand(ecosystem.discoveredTokens.rows[3].address);
+  assert.match(textOf(discovery.draw().tree), /Source unproven/);
+});
+await test('Token list UX unavailable and unsupported data stay explicit without sample rows', async () => {
+  const empty = missingActivityEcosystem('24h'); empty.launches.rows = []; empty.discoveredTokens.rows = [];
+  for (const kind of ['launches', 'discoveredTokens']) {
+    const harness = tokenListHarness(kind, empty), output = harness.draw();
+    assert.equal(output.controls.length, 0); assert.equal(byAttr(output.tree, 'data-token-evidence').length, 0);
+    assert.match(textOf(output.tree), /No .* listed yet/);
+    harness.replace(null); assert.match(textOf(harness.draw().tree), /Records appear once token discovery is verified/);
+    assert.doesNotMatch(textOf(harness.draw().tree), /0 (verified|launch|discovered token) records/, 'a missing response never becomes a zero count');
+  }
+  assert.match(componentSource, /<EcosystemTokenList key=\{ctx.windowHours\} ctx=\{ctx\} kind="launches"/);
+  assert.match(componentSource, /<EcosystemTokenList key=\{ctx.windowHours\} ctx=\{ctx\} kind="discoveredTokens"/);
 });
 await test('Completion both 7D and 30D daily-active charts preserve persisted completed-day values', async () => {
   for (const [window, days] of [['7d', 7], ['30d', 30]]) {
