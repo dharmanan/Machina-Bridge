@@ -1,4 +1,5 @@
 // No network. Codespace Node 24 acceptance, real in-memory node:sqlite; no production file or provider is opened.
+import { boundEcosystemResponse } from '../server/compact/intelligence-store.js';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
@@ -672,5 +673,35 @@ await test('integration keeps old family versions; no separate DEX fetch or raw 
   const hour = readFileSync(new URL('../server/compact/hour.js', import.meta.url), 'utf8');
   assert.match(hour, /onVerifiedDex: intelligence.dex/);
   assert.equal(INTELLIGENCE_VERSION, 'arc-compact-ecosystem-v1');
+});
+await test('verified discoveries are not crowded out by a later unresolved candidate queue', async () => {
+  const { db, store } = fixture(); store.commitHour(hour());
+  const [candidate] = store.intelligence.pending({ now: 100, limit: 16 });
+  store.intelligence.recordVerification(await verifyTokenCandidate(rpcDouble(), candidate), { now: 100 });
+  const source = db.prepare('SELECT * FROM compact_token_discoveries LIMIT 1').get();
+  const fields = Object.keys(source);
+  const insert = db.prepare(`INSERT INTO compact_token_discoveries (${fields.join(',')}) VALUES (${fields.map(() => '?').join(',')})`);
+  for (let i = 0; i < 60; i++) {
+    const row = { ...source, candidate_key: `queued-${i}`, address: address(1000 + i), status: 'unverified', reason: 'provider_rate_limited',
+      result_json: null, block_number: source.block_number + i + 1 };
+    insert.run(...fields.map((field) => row[field]));
+  }
+  const data = readEcosystem(db, '30d');
+  assert.equal(data.discoveredTokens.rows.some((row) => row.address === TOKEN), true);
+  assert.equal(data.launches.rows.some((row) => row.address === TOKEN), true);
+  assert.equal(data.contractCandidates.rows.length, 50);
+  assert.equal(data.coverage.candidateVerificationComplete, false);
+  db.close();
+});
+await test('combined bounded lists retain proven launches and explicit verified discovery subsets', () => {
+  const rows = () => Array.from({ length: 50 }, (_, i) => ({ address: address(i), proof: 'x'.repeat(3500) }));
+  const out = { contractCandidates: { rows: rows(), truncated: false }, discoveredTokens: { rows: rows(), truncated: false },
+    launches: { rows: rows(), truncated: false } };
+  const bounded = boundEcosystemResponse(out);
+  assert.ok(bounded); assert.equal(bounded.launches.rows.length, 50);
+  assert.ok(bounded.discoveredTokens.rows.length > 0);
+  assert.equal(bounded.discoveredTokens.truncated, true);
+  assert.equal(bounded.discoveredTokens.reason, 'bounded_response_limit');
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 240 * 1024);
 });
 console.log(`VERIFIER PASS arc-intelligence-ecosystem ${passed} tests (no network, real SQLite)`);

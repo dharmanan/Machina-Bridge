@@ -114,11 +114,12 @@ async function main() {
   const childEnv = { ...process.env, COMPACT_SQLITE_PATH: config.sqlitePath, COMPACT_RPC_MIN_INTERVAL_MS: String(config.minIntervalMs) };
   const runHour = createChildHourRunner({ scriptPath: RUNNER_SCRIPT, env: childEnv });
   const runProjectionRepair = createChildHourRunner({ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv });
+  const runGatewayRepair = createChildHourRunner({ scriptPath: new URL('./repair-compact-gateway-hour.mjs', import.meta.url).pathname, env: childEnv });
   const runHistoryBackfill = createChildHistoryRunner({ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv });
   const runDiscoveryDrain = createChildDiscoveryRunner({ scriptPath: DISCOVERY_DRAIN_SCRIPT, env: childEnv });
   const runDailyActiveReplay = createChildHourRunner({ scriptPath: DAILY_ACTIVE_REPLAY_SCRIPT, env: childEnv });
   const scheduler = createScheduler({
-    readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay,
+    readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair,
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
   });
   const server = createIntelligenceServer({ readModel, log, onFatal: fatal });

@@ -31,6 +31,9 @@ import {
   metricAmount,
   metricNumber,
   metricSum,
+  familyMetrics,
+  protocolActions,
+  verifiedFamilyCoverage,
   percentChange,
   shortenAddress,
   shortenHash,
@@ -42,6 +45,7 @@ import {
   verifiedAssetItems,
   windowStatus,
   type ArcActivity,
+  type ArcEcosystem,
   type ArcActivityRow,
   type ArcActivityType,
   type ArcIntelligenceLoad,
@@ -79,6 +83,7 @@ type ViewContext = {
   // Pools of the selected window and recent activity (null when a read failed or the view is not ready)
   pools: { v3: ArcPools | null; v4: ArcPools | null } | null
   activity: Partial<Record<ArcActivityType, ArcActivity | null>> | null
+  ecosystem?: ArcEcosystem | null
   // Arc explorer base URL for transaction links, passed in by the page; without it a hash is shown as text
   explorerUrl: string | null
 }
@@ -731,7 +736,7 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
 // counts; the 7D presentation remains unchanged, and hourly counts are never added together.
 function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
   const daily = ctx.period === 'day'
-  const storedDaily = ctx.summary?.window.key === '30d'
+  const storedDaily = ctx.summary?.window.key === '30d' || ctx.summary?.window.key === '7d'
   const points = ctx.mode === 'ready' && (!daily || storedDaily) ? addressPoints(ctx.timeseries) : null
   const status: DisplayStatus = daily && ctx.mode === 'ready'
     ? points?.some((point) => point.values) ? 'available' : 'unavailable' : chartStatus(ctx, points)
@@ -1042,26 +1047,28 @@ function PoolVolume({ status, volume, reason }: { status: DisplayStatus; volume:
 
 type PoolLiquidity = ArcPools['pools'][number]['liquidityUsd']
 
-// Value held in one pool at the end of the latest verified hour, from pool state (never from add or remove activity).
+// Value held in one pool at its latest stored snapshot hour, explicitly dated (never from add or remove activity).
 function PoolLiquidityLine({ liquidity }: { liquidity: PoolLiquidity }) {
   if (!liquidity) return null
   if (liquidity.status === 'available' && liquidity.usdMicros) {
     const value = usdMicrosToNumber(liquidity.usdMicros)
     return (
       <p className="mt-0.5 text-[11px] text-slate-500" title={formatUsdMicros(liquidity.usdMicros)}>
-        {liquidity.calculation === 'estimated_principal_reserves' ? 'Estimated reserves ' : 'Holds '}<span className="font-semibold tabular-nums text-slate-800">{value === null ? '' : usdText(value)}</span>
+        {liquidity.calculation === 'estimated_principal_reserves' ? 'Estimated reserves ' : 'Holds '}<span className="font-semibold tabular-nums text-slate-800">{value === null ? formatUsdMicros(liquidity.usdMicros) : usdText(value)}</span>
+        {liquidity.snapshotStatus === 'older_stored_snapshot' && liquidity.asOfHour && <span> · Snapshot hour {formatUtcDateTime(liquidity.asOfHour)} ({liquidity.ageHours} hours old)</span>}
       </p>
     )
   }
   const text = POOL_HOLDINGS_TEXT[liquidity.reason ?? ''] ?? 'Holdings not stated'
-  return <p className="mt-0.5 text-[11px] leading-4 text-slate-400" title={reasonText(liquidity.reason)}>{text}</p>
+  return <p className="mt-0.5 text-[11px] leading-4 text-slate-400" title={[reasonText(liquidity.reason), ...(liquidity.blockedTokens ?? []).map((token) => `${token.token}: ${token.reason}`)].join('; ')}>{text}
+    {(liquidity.blockedTokens ?? []).map((token) => <span key={token.token} className="block">{shortenAddress(token.token)}: {token.reason.replace(/_/g, ' ')}</span>)}</p>
 }
 
 // Why one pool's holdings are not stated, in a few words (the full reason is on hover).
 const POOL_HOLDINGS_TEXT: Record<string, string> = {
   no_verified_price: 'Holdings: no verified price',
-  tvl_not_collected: 'Holdings not read at the latest verified hour end block',
-  tvl_not_collected_for_pool: 'Holdings not read: only the top pools of the latest hour are read',
+  tvl_not_collected: 'No holdings snapshot stored within this window',
+  tvl_not_collected_for_pool: 'No snapshot for this pool: only the top pools of each hour are read',
   hook_may_hold_pool_value: 'Holdings not stated: its hook may hold part of the value',
   tvl_scan_unbounded: 'Holdings not stated: too many price ranges to read exactly',
   balance_unreadable: 'Holdings not stated: a token balance could not be read',
@@ -1070,7 +1077,7 @@ const POOL_HOLDINGS_TEXT: Record<string, string> = {
   tick_out_of_range: 'Holdings not stated: pool state could not be read consistently',
 }
 
-// Status of the Liquidity column: from the pools read itself (pool state of the latest verified hour); not read yet is
+// Status of the Liquidity column: from the pools read itself (dated stored snapshots); not read yet is
 // collecting, an API without it is not available yet.
 function liquidityStatus(status: DisplayStatus, ranking: ArcPools['ranking']['liquidityUsd'] | undefined): DisplayStatus {
   if (status !== 'available') return status
@@ -1102,7 +1109,9 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
   const holdingsStatus = liquidityStatus(status, holdings)
   const asOf = holdings?.asOfHour && !Number.isNaN(Date.parse(holdings.asOfHour)) ? new Date(Date.parse(holdings.asOfHour) + 3_600_000).toISOString() : null
   const holdingsText = holdingsStatus === 'available'
-    ? `${version === 'v4' ? 'Estimated principal reserves, excluding uncollected fees and position rounding' : 'Token balances held by each pool'} at ${asOf ? formatUtcDateTime(asOf) : 'the end of the latest verified hour'}, valued with that hour's verified prices.`
+    ? holdings?.snapshotScope === 'per_pool_latest_stored_snapshot' && !asOf
+      ? 'Latest stored snapshot of each pool, dated individually and valued only with its own hour’s verified prices. These are not simultaneous current holdings.'
+      : `${version === 'v4' ? 'Estimated principal reserves, excluding uncollected fees and position rounding' : 'Token balances held by each pool'} at ${asOf ? formatUtcDateTime(asOf) : 'the end of the latest verified hour'}, valued with that hour's verified prices.`
     : holdingsStatus === 'source_pending' ? 'Verified data does not include pool balance or reserve snapshots yet.' : reasonText(holdings?.reason)
   const [emptyTitle, emptyDetail] = poolsEmpty(ctx, status)
   return (
@@ -1343,38 +1352,76 @@ const LAUNCH_CAPABILITIES = [
   { icon: Droplets, title: 'First pool + DEX activity', detail: 'First trading pair and early swaps' },
 ]
 
+function ExplorerLink({ ctx, hash }: { ctx: ViewContext; hash: string }) {
+  return ctx.explorerUrl ? <a href={`${ctx.explorerUrl}/tx/${hash}`} target="_blank" rel="noopener noreferrer" title={hash}
+    className="text-[#2F6E0C] underline">{shortenHash(hash)}</a> : <span title={hash}>{shortenHash(hash)}</span>
+}
+function FamilyCoverage({ family }: { family: FamilyWindow | null }) {
+  const coverage = verifiedFamilyCoverage(family)
+  if (!coverage) return null
+  return <div className="mt-2 text-[11px] leading-4 text-slate-500">
+    <p>Partial history: {coverage.availableHours} / {coverage.expectedHours} verified hours. Values exclude {coverage.missingHours} missing hours.</p>
+    <details><summary className="cursor-pointer">Missing hours and reasons</summary>
+      <p>{family?.reasons?.join(', ')}</p><p>{family?.unavailableHours?.map(formatUtcDateTime).join('; ')}</p>
+    </details>
+  </div>
+}
+
+const launchFieldProps = (field: string, status: DisplayStatus) => ({ 'data-launch-field': field, 'data-launch-status': status })
 function LaunchesSection({ ctx }: { ctx: ViewContext }) {
+  const ecosystem = ctx.ecosystem
+  const rows = ecosystem?.launches.rows ?? []
+  const status: DisplayStatus = rows.length ? 'available' : ecosystem ? 'unavailable' : 'source_pending'
+  const activityOf = (row: typeof rows[number]) => row.dex.firstDexActivity?.firstObserved
+  const firstPoolOf = (row: typeof rows[number]) => row.dex.firstPool ?? row.dex.observedPools?.[0]
+  const columns = [
+    ['launches.token', 'Token'], ['launches.symbol-address', 'Symbol and address'], ['launches.source', 'Launched via'],
+    ['launches.time', 'Launch time'], ['launches.transaction', 'Transaction'], ['launches.initial-pool', 'First pool'],
+    ['launches.dex-activity', 'DEX activity'], ['launches.status', 'Status'],
+  ] as const
   return (
     <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
-      <CardHeader title="Newly launched tokens" subtitle={`Tokens launched on Arc, last ${ctx.windowLabel}`} right={<StatusPill status="source_pending" />} />
+      <CardHeader title="Newly launched tokens" subtitle={`Verified launch records within ${ctx.windowLabel}`} right={<StatusPill status={status} />} />
+      {ecosystem && <p className="mt-2 text-xs text-slate-500">
+        {rows.length} verified records shown{ecosystem.launches.truncated ? ' (latest 50; list capped)' : ''}.
+        Discovery coverage: {ecosystem.coverage.availableHours} / {ecosystem.coverage.requiredHours} hours.
+        Incomplete discovery does not hide proven launches. ERC-20 metadata does not establish a verified asset identity.
+      </p>}
       <div className="mt-3 grid gap-2 sm:grid-cols-3">
-        {LAUNCH_CAPABILITIES.map(({ icon: Icon, title, detail }) => (
-          <div key={title} className="flex items-start gap-2.5 rounded-lg border border-slate-100 bg-[#f8faf7] px-3 py-2">
-            <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500 ring-1 ring-slate-200">
-              <Icon className="h-3.5 w-3.5" />
-            </span>
-            <div className="min-w-0">
-              <p className="text-xs font-semibold text-slate-800">{title}</p>
-              <p className="text-[11px] leading-4 text-slate-500">{detail}</p>
-              <p className="mt-0.5 text-[11px] font-medium text-slate-400">Not available yet</p>
-            </div>
-          </div>
-        ))}
+        {LAUNCH_CAPABILITIES.map(({ icon: Icon, title, detail }) => <div key={title} className="flex items-start gap-2.5 rounded-lg border border-slate-100 px-3 py-2">
+          <Icon className="h-4 w-4 text-slate-500" /><div><p className="text-xs font-semibold">{title}</p>
+            <p className="text-[11px] text-slate-500">{detail}</p><p className="text-[11px] text-slate-500">{rows.length ? 'Verified records below' : STATUS_TEXT[status]}</p></div>
+        </div>)}
       </div>
-      <ShellTable
-        gridClass="grid-cols-8"
-        columns={[
-          { item: 'launches.token', label: 'Token' },
-          { item: 'launches.symbol-address', label: 'Symbol and address' },
-          { item: 'launches.source', label: 'Launched via' },
-          { item: 'launches.time', label: 'Launch time' },
-          { item: 'launches.transaction', label: 'Transaction' },
-          { item: 'launches.initial-pool', label: 'First pool' },
-          { item: 'launches.dex-activity', label: 'DEX activity' },
-          { item: 'launches.status', label: 'Status' },
-        ]}
-      >
-        <EmptyRows title="No launches listed yet" detail="Launches appear here once token discovery is verified. No sample tokens are shown." />
+      <ShellTable gridClass="grid-cols-8" columns={columns.map(([item, label]) => ({ item, label, status }))}>
+        {rows.length ? <div className="divide-y divide-slate-100">{rows.map((row) => {
+          const pool = firstPoolOf(row), activity = activityOf(row)
+          const timestamp = row.deployment.timestamp ?? row.launch.observedAt
+          const hash = row.deployment.transactionHash
+          return <div key={row.address} data-launch-token={row.address} className="grid grid-cols-2 gap-3 py-3 text-[11px] lg:grid-cols-8">
+            <div {...launchFieldProps('launches.token', 'available')}><span className="font-semibold">{row.symbol || shortenAddress(row.address)}</span><p>ERC-20-like</p></div>
+            <div {...launchFieldProps('launches.symbol-address', 'available')} title={row.address}><p>{row.symbol ?? 'No contract symbol'}</p>
+              <p>{shortenAddress(row.address)}</p><p className="text-slate-400">Unverified asset identity</p></div>
+            <div {...launchFieldProps('launches.source', 'available')}><p>{row.launch.source ?? 'Direct deployment'}</p><p>{row.launch.status.replace(/_/g, ' ')}</p></div>
+            <div {...launchFieldProps('launches.time', timestamp ? 'available' : 'unavailable')}><p>{timestamp ? formatUtcDateTime(timestamp) : 'Deployment time not proven'}</p>
+              <p>Observed block {formatCount(row.observedBlock)}</p></div>
+            <div {...launchFieldProps('launches.transaction', hash ? 'available' : 'unavailable')} title={hash}><p>{hash ? <ExplorerLink ctx={ctx} hash={hash} /> : row.deployment.reason ?? 'Deployment not proven'}</p></div>
+            <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')} title={pool?.pool}>
+              {pool ? <><p>{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p><p>{pool.protocol} {shortenHash(pool.pool)}</p>
+                <p>Block {formatCount(pool.creationBlock)}</p><p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
+                : <p>{row.dex.reason ?? 'No verified pool record'}</p>}
+            </div>
+            <div {...launchFieldProps('launches.dex-activity', activity ? 'available' : 'unavailable')}>
+              {activity ? <><p>{row.dex.firstDexActivity?.status === 'available' ? 'Proven first activity' : 'First observed activity'}</p>
+                <p>{formatUtcDateTime(activity.timestamp)}</p><p>Block {formatCount(activity.blockNumber)}</p>
+                <ExplorerLink ctx={ctx} hash={activity.txHash} />
+                {row.dex.firstDexActivity?.status !== 'available' && <p className="text-slate-400">Lifetime first unproven: {row.dex.firstDexActivity?.reason}</p>}</>
+                : <p>{row.dex.firstDexActivity?.reason ?? 'Activity not observed'}</p>}
+              {pool?.earlyActivity.status === 'available' && <p>{pool.earlyActivity.swapCount} swaps in pool creation UTC hour</p>}
+            </div>
+            <div {...launchFieldProps('launches.status', 'available')}><p>Verified launch</p><p className="text-slate-400">{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p></div>
+          </div>
+        })}</div> : <EmptyRows title="No launches listed yet" detail={ecosystem?.coverage.reason ?? 'Launches appear here once token discovery is verified. No sample tokens are shown.'} />}
       </ShellTable>
     </section>
   )
@@ -1413,8 +1460,8 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
   const shared = sharedStatus(rows.map((row) => row.cell.status))
   const maxTransfers = Math.max(0, ...rows.map((row) => row.transfers ?? 0))
   const pendingRows = [
-    { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: 'More assets as they are verified' },
-    { item: 'assets.new-tokens', label: 'Newly discovered tokens', detail: 'Shown with a shortened address until verified' },
+    { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: ctx.ecosystem ? 'Additional verified asset contracts, identities and units are required in the registry.' : 'More assets as they are verified' },
+    { item: 'assets.new-tokens', label: 'Newly discovered tokens', detail: ctx.ecosystem ? `${ctx.ecosystem.discoveredTokens.rows.length} verified ERC-20-like records; asset identities remain unverified` : 'Shown with a shortened address until verified' },
   ]
   const grid = 'md:grid-cols-[1.5fr_1.6fr_0.6fr_0.6fr_1.4fr]'
   return (
@@ -1435,6 +1482,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-slate-900">{row.symbol}</p>
                 <Chip tone={toneFor(row.symbol)}>{ASSET_CATEGORY[row.symbol]}</Chip>
+                {row.item === 'assets.usdc' && <FamilyCoverage family={usdc} />}
               </div>
             </div>
             {row.cell.status !== 'available' ? (
@@ -1465,7 +1513,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
           </li>
         ))}
         {pendingRows.map((row) => (
-          <li key={row.item} {...markerProps(row.item, 'source_pending')}
+          <li key={row.item} {...markerProps(row.item, row.item === 'assets.new-tokens' && ctx.ecosystem ? ctx.ecosystem.discoveredTokens.rows.length ? 'available' : 'unavailable' : 'source_pending')}
             className={`flex items-center justify-between gap-3 rounded-xl border border-dashed border-slate-200 p-3 md:grid md:gap-4 md:rounded-none md:border-0 md:border-b md:border-dashed md:px-0 md:py-2.5 ${grid}`}>
             <div className="flex min-w-0 items-center gap-2.5">
               <span aria-hidden="true" className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-dashed border-slate-300 text-xs font-semibold text-slate-400">+</span>
@@ -1474,7 +1522,11 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
                 <p className="text-[11px] text-slate-400">{row.detail}</p>
               </div>
             </div>
-            <div className="shrink-0 md:col-span-4 md:text-right"><InlineStatus status="source_pending" /></div>
+            <div className="shrink-0 md:col-span-4 md:text-right">{row.item === 'assets.new-tokens' && ctx.ecosystem
+              ? <details className="text-xs text-slate-500"><summary>{ctx.ecosystem.discoveredTokens.rows.length} stored verified records{ctx.ecosystem.discoveredTokens.truncated ? ' (list capped)' : ''}</summary>
+                {ctx.ecosystem.discoveredTokens.rows.map((token) => <p key={token.address} title={token.address}>{token.symbol ?? 'No symbol'} · {shortenAddress(token.address)} · observed {formatUtcDateTime(token.discoveredAt)} · block {formatCount(token.observedBlock)} · unverified asset identity</p>)}
+                <p>Discovery coverage {ctx.ecosystem.coverage.availableHours} / {ctx.ecosystem.coverage.requiredHours} hours. Incomplete discovery is not an empty chain.</p>
+              </details> : <InlineStatus status="source_pending" />}</div>
           </li>
         ))}
       </ul>
@@ -1675,9 +1727,9 @@ function TokenFlows({ flows, labels, title = 'Amounts by token' }: { flows: Toke
 type UsdField = readonly [label: string, field: string]
 const PROTOCOL_USD_FIELDS: Record<'aaveV4' | 'morphoBlue' | 'morphoVaultsV2' | 'cctp' | 'gateway' | 'across', readonly UsdField[]> = {
   aaveV4: [['Supplied', 'suppliedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros'], ['Borrowed', 'borrowedUsdMicros'], ['Repaid', 'repaidUsdMicros'],
-    ['Debt liquidated', 'liquidatedDebtUsdMicros']],
+    ['Debt liquidated', 'liquidatedDebtUsdMicros'], ['Collateral liquidated', 'liquidatedCollateralUsdMicros']],
   morphoBlue: [['Supplied', 'suppliedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros'], ['Borrowed', 'borrowedUsdMicros'], ['Repaid', 'repaidUsdMicros'],
-    ['Collateral added', 'collateralSuppliedUsdMicros'], ['Collateral removed', 'collateralWithdrawnUsdMicros']],
+    ['Collateral added', 'collateralSuppliedUsdMicros'], ['Collateral removed', 'collateralWithdrawnUsdMicros'], ['Liquidation repaid', 'liquidationRepaidUsdMicros'], ['Liquidation seized', 'liquidationSeizedUsdMicros'], ['Bad debt', 'badDebtUsdMicros']],
   morphoVaultsV2: [['Deposited', 'depositedUsdMicros'], ['Withdrawn', 'withdrawnUsdMicros']],
   cctp: [['Outbound', 'outboundUsdMicros'], ['Inbound', 'inboundUsdMicros']],
   gateway: [['Deposit', 'depositUsdMicros'], ['Sent', 'outboundBurnUsdMicros'], ['Received', 'inboundMintUsdMicros'], ['Withdraw', 'withdrawalUsdMicros']],
@@ -1694,31 +1746,40 @@ function protocolUsdStatus(ctx: ViewContext, entry: ProtocolUsd | null | undefin
 function UsdValues({ ctx, item, name }: { ctx: ViewContext; item: string; name: keyof typeof PROTOCOL_USD_FIELDS }) {
   const entry = ctx.summary?.protocolUsd?.[name]
   const status = protocolUsdStatus(ctx, entry)
-  const values = status === 'available' ? entry?.values ?? null : null
-  const rows = PROTOCOL_USD_FIELDS[name].map(([label, field]) => [label, values?.[field]] as const)
-    .filter(([label, micros]) => typeof micros === 'string' && /^\d+$/.test(micros) && (micros !== '0' || !label.startsWith('Debt')))
+  const numeric = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value)
+  const scoped = ctx.mode === 'ready' ? protocolActions(entry) : null
+  const rows = PROTOCOL_USD_FIELDS[name].map(([label, field]) => ({ label, field, action: scoped?.[field],
+    micros: scoped?.[field]?.usdMicros ?? (status === 'available' ? entry?.values?.[field] : null) }))
+  const hasValues = rows.some((row) => numeric(row.micros))
+  const shown = hasValues ? 'available' : status
+  const partial = rows.some((row) => row.action && row.action.status !== 'complete')
   const note = status === 'collecting' ? collectingText(ctx) : status === 'source_pending' ? 'Verified data does not include protocol USD valuations yet.'
-    : status === 'unavailable' && ctx.mode === 'ready' ? reasonText(entry?.reason) : noteFor(ctx, status)
-  return (
-    <div {...markerProps(item, status)} className="mt-3 rounded-lg border border-slate-100 px-2.5 py-2">
-      <div className="flex items-center justify-between gap-2">
-        <p className={LABEL}>USD value, last {ctx.windowLabel}</p>
-        {status !== 'available' && <InlineStatus status={status} />}
-      </div>
-      {values ? (
-        <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5">
-          {rows.map(([label, micros]) => (
-            <div key={label} className="flex items-baseline justify-between gap-2 text-[11px]">
-              <dt className="truncate text-slate-500">{label}</dt>
-              <dd className="font-semibold tabular-nums text-slate-900" title={formatUsdMicros(micros as string)}>{usdMicrosToNumber(micros) === null
-                ? formatUsdMicros(micros as string) : usdText(usdMicrosToNumber(micros) as number)}</dd>
-            </div>
-          ))}
-        </dl>
-      ) : status === 'loading' ? <p className="pt-1"><ValueGap /></p> : <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{note}</p>}
-      {values && <p className="mt-1 text-[10px] leading-4 text-slate-400">Each action is valued on its own with that hour's verified prices and never added together.</p>}
+    : ctx.mode === 'ready' ? reasonText(entry?.reason) : noteFor(ctx, status)
+  return <div {...markerProps(item, shown)} className="mt-3 rounded-lg border border-slate-100 px-2.5 py-2">
+    <div className="flex items-center justify-between gap-2"><p className={LABEL}>USD value, last {ctx.windowLabel}</p>
+      {partial ? <Chip>Verified subset</Chip> : shown !== 'available' && <InlineStatus status={shown} />}
     </div>
-  )
+    {hasValues ? <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1">
+      {rows.map(({ label, field, micros, action }) => <div key={field} className="text-[11px]">
+        <div className="flex items-baseline justify-between gap-2"><dt className="text-slate-500">{label}</dt>
+          <dd data-usd-action={field} data-usd-micros={numeric(micros) ? micros : undefined} className="font-semibold tabular-nums text-slate-900">
+            {numeric(micros) ? formatUsdMicros(micros) : 'Unavailable'}</dd></div>
+        {action && action.status !== 'complete' && <p className="text-[10px] text-slate-500">Verified priced subset · {action.coverage.fullyValuedHours} / {action.coverage.expectedHours} fully valued hours</p>}
+      </div>)}
+    </dl> : <p className="mt-1 text-[11px] text-slate-500">{note}</p>}
+    {scoped && <details className="mt-2 text-[10px] text-slate-500"><summary className="cursor-pointer">Asset amounts, coverage and missing dependencies</summary>
+      {rows.map(({ label, field, action }) => action && <div key={field} className="mt-2"><p className="font-semibold">{label}</p>
+        {action.assets.map((asset) => <div key={asset.token} className="mt-1 break-all">
+          <p>{asset.verified ? asset.symbol : 'Unverified token'} · {asset.token}</p>
+          <p>{asset.decimals === null ? `${asset.amountRaw} raw units (decimals unverified)` : `${formatTokenAmount(asset.amountRaw, asset.decimals)} ${asset.symbol}`}.
+            Verified priced value: {numeric(asset.usdMicros) ? formatUsdMicros(asset.usdMicros) : 'Unavailable'}.</p>
+          {asset.blockers.map((blocker) => <p key={blocker.reason}>Excluded {blocker.amountRaw ?? asset.unvaluedAmountRaw} raw units: {blocker.reason.replace(/_/g, ' ')};
+            {blocker.hours} affected hours, {formatUtcDateTime(blocker.firstHour)} – {formatUtcDateTime(blocker.lastHour)}.</p>)}
+        </div>)}
+      </div>)}
+    </details>}
+    {hasValues && <p className="mt-1 text-[10px] leading-4 text-slate-400">{partial ? 'Only verified priced amounts are included. Unvalued amounts are excluded; this is not a full protocol total. ' : ''}Each action is valued on its own with that hour's verified prices and never added together.</p>}
+  </div>
 }
 
 function ProtocolCard({ item, cell, title, subtitle, category, children }: {
@@ -1747,7 +1808,7 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
       item: 'lending.aave', usdItem: 'lending.aave-usd', usd: 'aaveV4' as const, title: 'Aave', category: 'Lending market',
       subtitle: `Lending events, last ${ctx.windowLabel}`, family: aave,
       total: metricSum(aave, AAVE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY], secondary: [LIQUIDATIONS],
-      flows: tokenFlows(objectEntries(aave?.metrics?.reserves).map(([, entry]) => ({ token: entry.underlying, decimals: entry.decimals,
+      flows: tokenFlows(objectEntries(familyMetrics(aave)?.reserves).map(([, entry]) => ({ token: entry.underlying, decimals: entry.decimals,
         amounts: [entry.suppliedRaw, entry.borrowedRaw] }))),
       flowLabels: ['Supplied', 'Borrowed'],
     },
@@ -1757,7 +1818,7 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
       total: metricSum(blue, MORPHO_BLUE_ACTIONS), primary: [SUPPLY, WITHDRAW, BORROW, REPAY],
       secondary: [{ label: 'Collateral +', field: 'supplyCollateralCount', dot: 'bg-teal-500' }, { label: 'Collateral -', field: 'withdrawCollateralCount', dot: 'bg-teal-200' },
         LIQUIDATIONS, { label: 'New markets', field: 'marketCreatedCount', dot: 'bg-slate-300' }],
-      flows: tokenFlows(objectEntries(blue?.metrics?.markets).map(([, entry]) => {
+      flows: tokenFlows(objectEntries(familyMetrics(blue)?.markets).map(([, entry]) => {
         const unit = (entry.units as { loanToken?: { symbol?: unknown; decimals?: unknown } } | undefined)?.loanToken
         return { token: entry.loanToken, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry.suppliedRaw, entry.borrowedRaw] }
       })),
@@ -1769,7 +1830,7 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
       total: metricSum(vaults, MORPHO_VAULT_ACTIONS),
       primary: [{ label: 'Deposits', field: 'depositCount', dot: 'bg-[#2F6E0C]' }, { label: 'Withdrawals', field: 'withdrawCount', dot: 'bg-[#9CCB7F]' }],
       secondary: [] as EventField[],
-      flows: tokenFlows(objectEntries(vaults?.metrics?.vaults).map(([, entry]) => {
+      flows: tokenFlows(objectEntries(familyMetrics(vaults)?.vaults).map(([, entry]) => {
         const unit = (entry.units as { asset?: { symbol?: unknown; decimals?: unknown } } | undefined)?.asset
         return { token: entry.asset, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry.depositedAssetsRaw, entry.withdrawnAssetsRaw] }
       })),
@@ -1802,6 +1863,7 @@ function LendingSection({ ctx }: { ctx: ViewContext }) {
             {available && <EventMix fields={[...card.primary, ...card.secondary]} family={card.family} />}
             {available && <TokenFlows flows={card.flows} labels={card.flowLabels} />}
             <UsdValues ctx={ctx} item={card.usdItem} name={card.usd} />
+            <FamilyCoverage family={card.family} />
           </ProtocolCard>
         )
       })}
@@ -1816,7 +1878,7 @@ type Leg = { cell: Cell; amount: string | null }
 
 function usdcLeg(ctx: ViewContext, family: FamilyWindow | null, countField: string, amountField: string): Leg {
   const cell = numberCell(ctx, family, metricNumber(family, countField), formatCount)
-  const units = family?.metrics?.units as { decimals?: unknown; symbol?: unknown } | undefined
+  const units = familyMetrics(family)?.units as { decimals?: unknown; symbol?: unknown } | undefined
   const raw = metricAmount(family, amountField)
   const amount = cell.status === 'available' && raw !== null && isFiniteNumber(units?.decimals) && typeof units?.symbol === 'string'
     ? `${formatTokenAmount(raw, units.decimals)} ${units.symbol}` : null
@@ -1880,7 +1942,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
   const outbound = usdcLeg(ctx, cctp, 'outboundTransferCount', 'outboundAmountRaw')
   const inbound = usdcLeg(ctx, cctp, 'inboundMintCount', 'inboundAmountRaw')
   const cctpMax = Math.max(0, ...[outbound, inbound].map((leg) => (leg.cell.status === 'available' ? Number(leg.cell.raw) : 0)))
-  const acrossFlows = (field: string, amountField: string) => tokenFlows(objectEntries(across?.metrics?.[field]).map(([token, entry]) => {
+  const acrossFlows = (field: string, amountField: string) => tokenFlows(objectEntries(familyMetrics(across)?.[field]).map(([token, entry]) => {
     const unit = entry.units as { symbol?: unknown; decimals?: unknown } | undefined
     return { token, symbol: unit?.symbol, decimals: unit?.decimals, amounts: [entry[amountField]] }
   }))
@@ -1899,6 +1961,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
         </div>
         <p className="mt-1 text-[11px] leading-4 text-slate-400">Directions are shown separately and are never added together.</p>
         <UsdValues ctx={ctx} item="cross-chain.cctp-usd" name="cctp" />
+        <FamilyCoverage family={cctp} />
       </ProtocolCard>
       <ProtocolCard item="cross-chain.gateway" cell={gatewayCell} title="Gateway" subtitle={`Unified USDC balance activity on Arc, last ${ctx.windowLabel}`} category="Unified balance">
         <div className="mt-3 grid grid-cols-2 gap-2">
@@ -1908,6 +1971,9 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
           <LegCell label="Withdraw" leg={usdcLeg(ctx, gateway, 'withdrawalCompletedCount', 'withdrawalAmountRaw')} />
         </div>
         <UsdValues ctx={ctx} item="cross-chain.gateway-usd" name="gateway" />
+        <FamilyCoverage family={gateway} />
+        {gatewayCell.status === 'available' && <p className="mt-2 text-[10px] text-slate-500">USDC interface only (6 decimals). Unexpected tokens fail verification; their amounts are never included.</p>}
+
       </ProtocolCard>
       <ProtocolCard item="cross-chain.across" cell={acrossCell} title="Across" subtitle={`Bridge deposits and fills on Arc, last ${ctx.windowLabel}`} category="Bridge">
         <div className="mt-3 space-y-2">
@@ -1924,6 +1990,7 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
           ))}
         </div>
         <UsdValues ctx={ctx} item="cross-chain.across-usd" name="across" />
+        <FamilyCoverage family={across} />
       </ProtocolCard>
     </section>
   )
@@ -1977,13 +2044,16 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
         </div>
       </div>
       <div className={`${CARD} min-w-0`}>
-        <CardHeader title="Other Verified Protocols" subtitle="Permanent places for further verified Arc sources" right={<StatusPill status="source_pending" />} />
+        <CardHeader title="Other Verified Protocols" subtitle="Verified source dependencies" right={<StatusPill status={ctx.ecosystem ? 'unavailable' : 'source_pending'} />} />
         <div className="mt-3 grid gap-2 sm:grid-cols-3">
           {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => (
             <div key={item} {...markerProps(item, 'source_pending')} className="min-w-0 rounded-lg border border-dashed border-slate-200 px-3 py-2.5">
               <Icon className="h-4 w-4 text-slate-400" />
               <p className="mt-1.5 text-xs font-semibold text-slate-700">{title}</p>
-              <p className="text-[11px] leading-4 text-slate-500">{detail}</p>
+              <p className="text-[11px] leading-4 text-slate-500">{ctx.ecosystem
+                ? item.includes('exchange') ? `${ctx.ecosystem.exchangeFlows.reason ?? 'verified_exchange_registry_empty'}: verified exchange labels are required; P9 remains deferred.`
+                  : `${ctx.ecosystem.otherProtocols.reason ?? 'verified_protocol_registry_empty'}: an explicit contract, ABI, deployment and asset definition is required.`
+                : detail}</p>
             </div>
           ))}
         </div>
@@ -2030,7 +2100,7 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
     period: selectedWindow === '24h' ? 'hour' : 'day', windowHours: selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24,
     historyNote, summary, timeseries,
     collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
-    activity: mode === 'ready' ? loaded?.activity ?? null : null, explorerUrl }
+    activity: mode === 'ready' ? loaded?.activity ?? null : null, ecosystem: mode === 'ready' ? loaded?.ecosystem ?? null : null, explorerUrl }
   const verifiedThrough = summary?.freshness.verifiedThrough ?? timeseries?.freshness.verifiedThrough ?? lastVerifiedThrough
   const networkCollecting = mode === 'ready' && windowStatus(summary?.network) === 'collecting'
 

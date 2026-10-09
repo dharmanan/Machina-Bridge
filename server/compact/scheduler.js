@@ -122,7 +122,7 @@ export function createChildDiscoveryRunner(options) {
 // runHistoryBackfill(): one historical hour child. runDiscoveryDrain(): one capped enrichment pass, lowest priority.
 // Live checkpoint catch-up always has priority.
 export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, runDiscoveryDrain = null,
-  runDailyActiveReplay = null, historyStartHour = null,
+  runDailyActiveReplay = null, runGatewayRepair = null, historyStartHour = null,
   now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
   safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
   maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS,
@@ -136,8 +136,9 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
   const repairAttempts = new Map(); // hour start -> last attempt (ms)
   const projectionAttempts = new Map(); // hour start -> last projection repair attempt (ms)
   let blockedSummary = '';
+  let familyBlockedSummary = '';
   let backgroundTurn = 'dau';
-  const status = { lastRun: null, consecutiveFailures: 0, retryAt: null, projectionRepairBlocked: null };
+  const status = { lastRun: null, consecutiveFailures: 0, retryAt: null, projectionRepairBlocked: null, familyRepairBlocked: [] };
 
   async function runChild(hourStart, kind, runner = runHour) {
     const handle = runner(hourIso(hourStart));
@@ -251,14 +252,34 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
     // Caught up. At most one bounded repair of a recent hour, never ahead of chain catch-up.
     const nowMs = now();
     const fromHour = checkpoint.hourStart - (repairWindowHours - 1) * HOUR_SECONDS;
-    const candidate = readModel.repairCandidates({ fromHour, toHour: checkpoint.hourStart })
-      .find((hour) => nowMs - (repairAttempts.get(hour) ?? -Infinity) >= repairCooldownMs);
+    const repairState = typeof readModel.familyRepairPlans === 'function'
+      ? readModel.familyRepairPlans({ fromHour, toHour: checkpoint.hourStart })
+      : { plans: readModel.repairCandidates({ fromHour, toHour: checkpoint.hourStart })
+        .map((hourStart) => ({ hourStart, families: [], cooldownMs: repairCooldownMs })), blocked: [] };
+    status.familyRepairBlocked = repairState.blocked;
+    const blockedCounts = {};
+    for (const item of repairState.blocked) {
+      const key = `${item.family}:${item.reason}`;
+      blockedCounts[key] = (blockedCounts[key] ?? 0) + 1;
+    }
+    const blockedHours = [...new Set(repairState.blocked.map((item) => item.hourStart))].sort();
+    const blockedKey = JSON.stringify({ counts: blockedCounts, hours: blockedHours });
+    if (blockedKey !== familyBlockedSummary) {
+      if (repairState.blocked.length || familyBlockedSummary) log(`SCHEDULER_FAMILY_REPAIR_BLOCKED counts=${JSON.stringify(blockedCounts)} `
+        + `hours=${blockedHours.map(hourIso).join(',') || 'none'}`);
+      familyBlockedSummary = blockedKey;
+    }
+    const plan = repairState.plans.find((item) => nowMs - (repairAttempts.get(item.hourStart) ?? -Infinity)
+      >= Math.max(repairCooldownMs, item.cooldownMs));
+    const candidate = plan?.hourStart;
     for (const hour of repairAttempts.keys()) if (hour < fromHour) repairAttempts.delete(hour);
     const nextHourDue = (target + 2 * HOUR_SECONDS) * 1000 + safetyDelayMs;
     if (candidate !== undefined) {
       repairAttempts.set(candidate, nowMs);
-      const outcome = await runChild(candidate, 'repair');
-      status.lastRun = { kind: 'repair', hour: hourIso(candidate), ...outcome };
+      const gatewayOnly = runGatewayRepair && plan.families.length === 1 && plan.families[0] === 'gateway';
+      const kind = gatewayOnly ? 'gateway_repair' : 'repair';
+      const outcome = await runChild(candidate, kind, gatewayOnly ? runGatewayRepair : runHour);
+      status.lastRun = { kind, hour: hourIso(candidate), ...outcome };
       log(`SCHEDULER_REPAIR_DONE hour=${hourIso(candidate)} exit=${outcome.exitCode}`);
       return { again: false, wakeAt: nextHourDue };
     }

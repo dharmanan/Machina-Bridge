@@ -79,7 +79,11 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
     try { return JSON.parse(text); } catch { throw fail('invalid_response', { httpStatus: response.status ?? null, detail: text }); }
   }
 
-  const rpcFailure = (error) => fail(classifyRpcError(error), { rpcCode: error.code ?? null, detail: String(error.message ?? '') });
+  const rpcFailure = (error) => {
+    const code = classifyRpcError(error);
+    if (code === 'rate_limited') nextStart = Math.max(nextStart, now() + cooldownMs);
+    return fail(code, { rpcCode: error.code ?? null, detail: String(error.message ?? '') });
+  };
 
   function single(body) {
     if (!validEnvelope(body) || body.id !== 1) throw fail('invalid_response');
@@ -111,13 +115,14 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
   }
 
   // Bounded retries with backoff on this one endpoint. Limit errors and a wrong chain propagate to the caller at once.
-  async function run(execute) {
+  async function run(execute, { retryRateLimited = true } = {}) {
     for (let attempt = 1; ; attempt++) {
       try {
         await ensureChain();
         return await execute();
       } catch (error) {
-        if (!(error instanceof ProviderError) || !RETRYABLE.has(error.code) || attempt >= maxAttempts) throw error;
+        if (!(error instanceof ProviderError) || !RETRYABLE.has(error.code) || attempt >= maxAttempts
+          || (error.code === 'rate_limited' && !retryRateLimited)) throw error;
         stats.retries++;
         await sleep(error.code === 'rate_limited' ? cooldownMs : 1000 * attempt);
       }
@@ -130,10 +135,10 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
     request(method, params = []) {
       return run(async () => single(await post({ jsonrpc: '2.0', id: 1, method, params })));
     },
-    batch(calls, { allowItemErrors = false } = {}) {
+    batch(calls, { allowItemErrors = false, retryRateLimited = true } = {}) {
       if (!Array.isArray(calls) || !calls.length || calls.length > 50) throw new Error('invalid_batch');
       const payload = calls.map(([method, params], index) => ({ jsonrpc: '2.0', id: index + 1, method, params }));
-      return run(async () => batch(await post(payload), calls.length, allowItemErrors));
+      return run(async () => batch(await post(payload), calls.length, allowItemErrors), { retryRateLimited });
     },
   });
 }

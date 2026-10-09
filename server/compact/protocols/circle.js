@@ -95,33 +95,42 @@ function createGatewayAccumulator() {
   const bySource = createTally({ limit: DOMAIN_LIMIT, code: 'gateway_domain_limit', counts: ['transferCount'], amounts: ['amountRaw'] });
   const depositors = new Set();
   const inboundRecipients = new Set();
-  const usdcOnly = (event) => { if (event.token !== CIRCLE_ARC.usdc) throw new FamilyError('gateway_unexpected_token'); return event; };
+  // Preserve the strict USDC guard until the actual unexpected event has been independently explained.
+  // Attach exactly one bounded raw event to the error for the read-only evidence command; never value it as USDC.
+  const usdcOnly = (event, log) => {
+    if (event.token !== CIRCLE_ARC.usdc) throw new FamilyError('gateway_unexpected_token', {
+      decodedToken: event.token, expectedToken: CIRCLE_ARC.usdc, emitter: log.address,
+      blockNumber: log.blockNumber, blockHash: log.blockHash, transactionHash: log.transactionHash,
+      transactionIndex: log.transactionIndex, logIndex: log.logIndex, topics: log.topics, data: log.data,
+    });
+    return event;
+  };
   return {
     add(_stream, logs) {
       for (const log of logs) {
         const topic = log.topics[0];
         if (topic === GATEWAY_EVENTS.deposited.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.deposited, log, 'gateway', CIRCLE_ARC.gatewayWallet));
+          const event = usdcOnly(decoded(GATEWAY_EVENTS.deposited, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
           depositCount += 1;
           depositAmount += event.value;
           depositors.add(event.depositor);
         } else if (topic === GATEWAY_EVENTS.gatewayBurned.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.gatewayBurned, log, 'gateway', CIRCLE_ARC.gatewayWallet));
+          const event = usdcOnly(decoded(GATEWAY_EVENTS.gatewayBurned, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
           outboundBurnCount += 1;
           outboundBurnAmount += event.value;
           outboundBurnFee += event.fee;
           byDestination.add(String(event.destinationDomain), { transferCount: 1, amountRaw: event.value });
         } else if (topic === GATEWAY_EVENTS.attestationUsed.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.attestationUsed, log, 'gateway', CIRCLE_ARC.gatewayMinter));
+          const event = usdcOnly(decoded(GATEWAY_EVENTS.attestationUsed, log, 'gateway', CIRCLE_ARC.gatewayMinter), log);
           inboundMintCount += 1;
           inboundMintAmount += event.value;
           bySource.add(String(event.sourceDomain), { transferCount: 1, amountRaw: event.value });
           inboundRecipients.add(event.recipient);
         } else if (topic === GATEWAY_EVENTS.withdrawalInitiated.topic) {
-          usdcOnly(decoded(GATEWAY_EVENTS.withdrawalInitiated, log, 'gateway', CIRCLE_ARC.gatewayWallet));
+          usdcOnly(decoded(GATEWAY_EVENTS.withdrawalInitiated, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
           withdrawalInitiatedCount += 1;
         } else {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.withdrawalCompleted, log, 'gateway', CIRCLE_ARC.gatewayWallet));
+          const event = usdcOnly(decoded(GATEWAY_EVENTS.withdrawalCompleted, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
           withdrawalCompletedCount += 1;
           withdrawalAmount += event.value;
         }

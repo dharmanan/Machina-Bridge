@@ -97,7 +97,7 @@ export function metadataOf(token, { symbol: symbolItem, name: nameItem, decimals
 // Reads the metadata of `tokens` (lowercase addresses, none exempt) at `blockTag`. Returns { rows, skipped, requests }:
 // rows to cache (verified or rejected), skipped tokens with a transient answer. A batch-level provider failure stops the
 // run and is thrown after `onBatch` has already received every finished batch.
-export async function readTokenMetadata(provider, tokens, { blockTag, onBatch = () => {} }) {
+export async function readTokenMetadata(provider, tokens, { blockTag, onBatch = () => {}, onRequest = () => {} }) {
   if (!tokens.every((token) => ADDRESS.test(token) && !metadataExempt(token))) throw new Error('invalid_metadata_tokens');
   if (typeof blockTag !== 'string' || !/^0x[0-9a-f]+$/.test(blockTag)) throw new Error('invalid_metadata_block');
   const rows = [];
@@ -107,7 +107,8 @@ export async function readTokenMetadata(provider, tokens, { blockTag, onBatch = 
     const chunk = tokens.slice(offset, offset + METADATA_TOKENS_PER_BATCH);
     const calls = chunk.flatMap((token) => ['symbol', 'name', 'decimals'].map((method) => ['eth_call', [{ to: token, data: SELECTORS[method] }, blockTag]]));
     requests += 1;
-    const answers = await provider.batch(calls, { allowItemErrors: true });
+    onRequest();
+    const answers = await provider.batch(calls, { allowItemErrors: true, retryRateLimited: false });
     const batch = [];
     chunk.forEach((token, index) => {
       const [symbol, name, decimals] = answers.slice(index * 3, index * 3 + 3);
@@ -133,8 +134,7 @@ export async function refreshTokenMetadata({ store, provider, blockNumber, limit
     report.candidates = tokens.length;
     if (!tokens.length) return report;
     const blockTag = `0x${blockNumber.toString(16)}`;
-    const result = await readTokenMetadata(provider, tokens, { blockTag, onBatch: (batch) => {
-      report.requests += 1;
+    const result = await readTokenMetadata(provider, tokens, { blockTag, onRequest: () => { report.requests += 1; }, onBatch: (batch) => {
       if (batch.length) store.recordTokenMetadata(batch, { readBlock: blockNumber });
       for (const row of batch) report[row.verified ? 'verified' : 'rejected'] += 1;
     } });

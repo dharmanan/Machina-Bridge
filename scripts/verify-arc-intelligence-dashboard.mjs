@@ -22,6 +22,7 @@ import { ACTIVITY_SCHEMA as BACKEND_ACTIVITY_SCHEMA, POOLS_SCHEMA as BACKEND_POO
 
 const tests = [];
 async function test(name, work) {
+  if (process.env.ARC_DASHBOARD_TEST_FILTER && !name.includes(process.env.ARC_DASHBOARD_TEST_FILTER)) return;
   await work();
   tests.push(name);
   console.log(`PASS ${name}`);
@@ -966,6 +967,7 @@ await test('UI 8 no removed receipt metrics, no runtime views, no engineering wo
 await test('UI 9 every window reads exactly its own summary, timeseries and pools plus the shared activity; nothing else is requested', async () => {
   const requests = (window) => [`/api/intelligence?view=summary&window=${window}`, `/api/intelligence?view=timeseries&window=${window}`,
     `/api/intelligence?view=pools&protocol=v3&window=${window}`, `/api/intelligence?view=pools&protocol=v4&window=${window}`,
+    `/api/intelligence?view=ecosystem&window=${window}`,
     ...['all', 'swaps', 'adds', 'removes'].map((type) => `/api/intelligence?view=activity&type=${type}`)];
   assert.deepEqual(Object.values(lib.ARC_INTELLIGENCE_REQUESTS).sort(), [...new Set(['24h', '7d', '30d'].flatMap(requests))].sort());
   for (const url of Object.values(lib.ARC_INTELLIGENCE_REQUESTS)) {
@@ -1759,7 +1761,8 @@ await test('Contract 2 From is the transaction sender; To is only an exact event
 
 await test('Contract 3 Liquidity uses V3 balances or clearly estimated V4 principal, never add/remove activity', async () => {
   assert.match(SEMANTICS['top-pools.liquidity'].meaning, /V3 token balances; V4 estimated principal reserves/);
-  assert.match(SEMANTICS['top-pools.liquidity'].source, /pool state at the last block of the latest verified hour/);
+  assert.match(SEMANTICS['top-pools.liquidity'].source, /pool state at the last block of the latest stored snapshot hour inside the selected window/);
+  assert.match(SEMANTICS['top-pools.liquidity'].source, /dated per pool.*snapshot hour's verified prices/);
   for (const forbidden of ['add or remove event count', 'mint, burn or modifyLiquidity activity', 'liquidity activity', 'in-range liquidity units',
     'external or guessed price', 'unpriced tokens counted as zero']) {
     assert.ok(SEMANTICS['top-pools.liquidity'].forbidden.includes(forbidden), forbidden);
@@ -2046,4 +2049,101 @@ await test('Tokens 1 a token\'s own contract metadata reads as an unverified lab
   assert.ok(withMetadata((body) => { delete body.pools[0].token1.contractMetadata; delete body.pools[0].usdVolume; }), 'an older API without these fields still loads');
 });
 
+const completionEcosystem = () => {
+  const observed = { timestamp: isoAt(END - HOUR_MS), blockNumber: 101, logIndex: 0, txHash: `0x${'91'.repeat(32)}` };
+  const activity = { firstProven: false, firstObserved: observed, reason: 'first_activity_history_missing' };
+  const pool = { protocol: 'uniswap_v4', pool: `0x${'92'.repeat(32)}`, pairedToken: USDC, creationBlock: 100,
+    creationTxHash: `0x${'93'.repeat(32)}`, creationTimestamp: observed.timestamp, firstSwap: activity, firstLiquidity: activity,
+    earlyActivity: { status: 'available', reason: null, hourStart: observed.timestamp, swapCount: 5, basis: 'pool_creation_UTC_hour' } };
+  const token = { address: `0x${'94'.repeat(20)}`, status: 'verified_erc20_like', verifiedAsset: false, symbol: 'FOUND', name: 'Fixture discovery',
+    decimals: 18, discoveredAt: observed.timestamp, observedBlock: 100,
+    deployment: { transactionHash: `0x${'95'.repeat(32)}`, timestamp: observed.timestamp, blockNumber: 100 },
+    launch: { status: 'direct_deployment', source: null }, dex: { status: 'insufficient_coverage', reason: 'pool_registry_history_incomplete_or_limit',
+      firstPool: null, observedPools: [pool], firstDexActivity: { status: 'insufficient_coverage', reason: 'first_activity_history_missing',
+        firstObserved: { ...observed, firstProven: false } } } };
+  return { schema: 'machina.intelligence.ecosystem.v1', window: READY_DATA.summary.window,
+    coverage: { status: 'insufficient_coverage', reason: 'discovery_hour_missing_or_capped', requiredHours: 24, availableHours: 1 },
+    discoveredTokens: { status: 'insufficient_coverage', rows: [token], truncated: true },
+    launches: { status: 'insufficient_coverage', rows: [token], truncated: true },
+    otherProtocols: { status: 'unavailable', reason: 'verified_protocol_registry_empty' },
+    exchangeFlows: { status: 'unavailable', reason: 'verified_exchange_registry_empty' } };
+};
+await test('Completion partial family metrics reconcile actual hour evidence and keep gaps explicit', async () => {
+  const family = { status: 'unavailable', reason: 'family_hour_unavailable', reasons: ['rpc_error'], ...WINDOW_RANGE,
+    unavailableHours: [isoAt(END - HOUR_MS)], metrics: null,
+    verifiedSubset: { status: 'available', scope: 'verified_hours_only', metrics: { transferCount: 123, amountRaw: '123456000000000000000', rawDecimals: 18 },
+      coverage: { expectedHours: 24, availableHours: 23, missingHours: 1,
+        verifiedHours: Array.from({ length: 23 }, (_, i) => isoAt(END - (24 - i) * HOUR_MS)) } } };
+  assert.equal(lib.metricNumber(family, 'transferCount'), 123);
+  assert.equal(lib.metricAmount(family, 'amountRaw'), '123456000000000000000');
+  assert.equal(lib.windowStatus(family), 'available');
+  const data = structuredClone(READY_DATA); data.summary.assets.usdc = family;
+  const tree = render({ ...STATES.ready, data }).tree;
+  assert.match(textOf(sectionNode(tree, 'assets')), /Partial history: 23 \/ 24 verified hours/);
+  for (const mutate of [row => row.verifiedSubset.coverage.verifiedHours[0] = row.unavailableHours[0],
+    row => row.verifiedSubset.coverage.availableHours = 24]) {
+    const bad = structuredClone(family); mutate(bad);
+    assert.equal(lib.metricNumber(bad, 'transferCount'), null); assert.equal(lib.windowStatus(bad), 'unavailable');
+  }
+});
+await test('Completion USD action/asset subtotals display real values and exact excluded token dependencies', async () => {
+  const data = structuredClone(COMPLETE_DATA);
+  const unknown = `0x${'96'.repeat(20)}`;
+  data.summary.protocolUsd.aaveV4 = { status: 'unavailable', reason: 'unverified_token', values: null,
+    actions: { suppliedUsdMicros: { status: 'partial', scope: 'verified_priced_subset', usdMicros: '12000000',
+      coverage: { expectedHours: 24, storedHours: 24, fullyValuedHours: 0 },
+      assets: [{ token: USDC, symbol: 'USDC', verified: true, decimals: 6, amountRaw: '12000000', valuedAmountRaw: '12000000', unvaluedAmountRaw: '0', usdMicros: '12000000', blockers: [] }, { token: unknown, symbol: null, verified: false, decimals: null, amountRaw: '999', valuedAmountRaw: '0', unvaluedAmountRaw: '999', usdMicros: null,
+        blockers: [{ reason: 'unverified_token', firstHour: isoAt(END - HOUR_MS), lastHour: isoAt(END - HOUR_MS), hours: 1 }] }] } } };
+  const forged = structuredClone(data.summary.protocolUsd.aaveV4); forged.actions.suppliedUsdMicros.assets[1].usdMicros = '1';
+  assert.equal(lib.protocolActions(forged), null);
+  const tree = render({ ...STATES['ready-complete'], data }).tree;
+  const node = item(tree, 'lending.aave-usd');
+  assert.equal(node.attrs['data-intel-status'], 'available');
+  assert.match(textOf(node), /\$12.00/); assert.match(textOf(node), /Verified subset/);
+  assert.match(textOf(node), /0 \/ 24 fully valued hours/);
+  assert.match(textOf(node), /Excluded 999 raw units: unverified token/);
+  assert.match(textOf(node), new RegExp(unknown));
+});
+await test('Completion verified launches and discovery render despite incomplete history without claiming lifetime first', async () => {
+  const ecosystem = completionEcosystem();
+  assert.ok(lib.parseArcEcosystem(ecosystem, '24h'));
+  assert.equal(lib.parseArcEcosystem(ecosystem, '7d'), null);
+  const data = { ...READY_DATA, ecosystem };
+  const tree = render({ ...STATES.ready, data }).tree;
+  checkScope(tree, SCOPE);
+  const launches = textOf(sectionNode(tree, 'launches'));
+  assert.match(launches, /FOUND/); assert.match(launches, /1 verified records shown/);
+  assert.match(launches, /Discovery coverage: 1 \/ 24 hours/);
+  assert.match(launches, /Direct deployment/); assert.match(launches, /Observed pool/);
+  assert.match(launches, /First observed activity/); assert.match(launches, /Lifetime first unproven/);
+  assert.match(launches, /5 swaps in pool creation UTC hour/);
+  assert.equal(item(tree, 'assets.new-tokens').attrs['data-intel-status'], 'available');
+  assert.match(textOf(sectionNode(tree, 'rwa-other')), /verified_exchange_registry_empty/);
+  const corrupt = structuredClone(ecosystem); corrupt.launches.rows[0].dex.observedPools[0].creationTxHash = 'guessed';
+  assert.equal(lib.parseArcEcosystem(corrupt, '24h'), null);
+});
+await test('Completion ecosystem GET is isolated from other reads and never accepts a malformed verified token', async () => {
+  const urls = [];
+  const out = await lib.loadArcIntelligence('24h', { fetchImpl: async (url) => {
+    urls.push(url);
+    if (url.includes('view=ecosystem')) return { ok: true, json: async () => completionEcosystem() };
+    return { ok: true, json: async () => url.includes('view=summary') ? READY_DATA.summary : { schema: 'unexpected' } };
+  } });
+  assert.equal(urls.filter(url => url.includes('view=ecosystem')).length, 1);
+  assert.ok(out.ecosystem); assert.equal(out.failed, false);
+  const corrupt = completionEcosystem(); corrupt.discoveredTokens.rows[0].verifiedAsset = true;
+  assert.equal(lib.parseArcEcosystem(corrupt, '24h'), null);
+});
+await test('Completion both 7D and 30D daily-active charts preserve persisted completed-day values', async () => {
+  for (const [window, days] of [['7d', 7], ['30d', 30]]) {
+    const data = longData(window, days);
+    data.timeseries.buckets = data.timeseries.buckets.map(bucket => bucket.status === 'committed' ? { ...bucket,
+      network: { ...bucket.network, uniqueActiveAddresses: 321, uniqueActiveAddressesStatus: { status: 'available', value: 321 } } } : bucket);
+    const tree = render({ selectedWindow: window, data }).tree;
+    const chart = textOf(sectionNode(tree, 'active-addresses-chart'));
+    assert.match(chart, /Verified distinct addresses per completed UTC day/);
+    assert.doesNotMatch(chart, /Daily active addresses are not available/);
+    assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable');
+  }
+});
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

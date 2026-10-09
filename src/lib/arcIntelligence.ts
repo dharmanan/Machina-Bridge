@@ -9,6 +9,7 @@ export const SUMMARY_SCHEMA = 'machina.intelligence.summary.v1'
 export const TIMESERIES_SCHEMA = 'machina.intelligence.timeseries.v1'
 export const POOLS_SCHEMA = 'machina.intelligence.pools.v1'
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1'
+export const ECOSYSTEM_SCHEMA = 'machina.intelligence.ecosystem.v1'
 
 export type IntelligenceDataStatus = 'available' | 'collecting' | 'unavailable' | 'source_pending'
 
@@ -44,6 +45,8 @@ export type FamilyWindow = {
   start?: string
   end?: string
   metrics: Record<string, unknown> | null
+  verifiedSubset?: { status: 'available'; scope: 'verified_hours_only'; metrics: Record<string, unknown>;
+    coverage: { expectedHours: number; availableHours: number; missingHours: number; verifiedHours: string[] } }
   previous?: FamilyWindow
 }
 
@@ -92,7 +95,12 @@ export type SwapFeesWindow = {
 
 // USD value of another protocol's amounts over the window, per action (never added across actions, legs or protocols).
 export type ProtocolUsd = { status: 'available' | 'unavailable'; reason: string | null; values: Record<string, string> | null; failedHour?: string;
-  unavailableHours?: string[] }
+  unavailableHours?: string[]; actions?: Record<string, { status: 'complete' | 'partial' | 'unavailable';
+    scope: 'all_verified_window_amounts' | 'verified_priced_subset'; usdMicros: string | null;
+    coverage: { expectedHours: number; storedHours: number; fullyValuedHours: number };
+    assets: { token: string; symbol: string | null; verified: boolean; decimals: number | null; amountRaw: string;
+      valuedAmountRaw: string; unvaluedAmountRaw: string; usdMicros: string | null;
+      blockers: { reason: string; firstHour: string; lastHour: string; hours: number; amountRaw?: string }[] }[] }> }
 
 export type ArcSummary = {
   schema: typeof SUMMARY_SCHEMA
@@ -159,7 +167,9 @@ export type ArcPool = {
   // Value held in the pool: pool state at the latest verified hour's last block, valued with that hour's prices. Never
   // derived from add or remove activity.
   liquidityUsd?: { status: 'available' | 'unavailable'; reason: string | null; usdMicros: string | null; amount0Raw: string | null;
-    amount1Raw: string | null; asOfBlock: number | null; calculation?: 'balance_snapshot' | 'estimated_principal_reserves' }
+    amount1Raw: string | null; asOfBlock: number | null; calculation?: 'balance_snapshot' | 'estimated_principal_reserves';
+    asOfHour?: string; ageHours?: number; snapshotStatus?: 'latest_hour' | 'older_stored_snapshot';
+    blockedTokens?: { token: string; reason: string }[] }
 }
 
 // Top pools of one Uniswap version, ranked by swap count. USD volume and USD liquidity are shown beside the count.
@@ -171,7 +181,8 @@ export type ArcPools = {
   status: 'available' | 'unavailable'
   reason: string | null
   ranking: { by: 'swap_count'; usdVolume: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; reasons?: string[] };
-    liquidityUsd: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; asOfHour?: string } }
+    liquidityUsd: { status: 'available' | 'unavailable' | 'source_pending'; reason?: string | null; asOfHour?: string | null;
+      snapshotScope?: 'per_pool_latest_stored_snapshot' } }
   poolsTracked: number | null
   newPools: number | null
   pools: ArcPool[]
@@ -222,10 +233,66 @@ export type ArcIntelligenceLoad = {
   // null: the section shows a status, never a guess.
   pools?: { v3: ArcPools | null; v4: ArcPools | null }
   activity?: Record<ArcActivityType, ArcActivity | null>
+  ecosystem?: ArcEcosystem | null
+}
+
+export type DiscoveryActivity = { firstProven: boolean; reason: string | null;
+  firstObserved: { timestamp: string; blockNumber: number; logIndex: number; txHash: string } | null }
+export type DiscoveryPool = { protocol: string; pool: string; pairedToken: string; creationBlock: number;
+  creationTimestamp: string | null; creationTxHash: string; firstSwap: DiscoveryActivity; firstLiquidity: DiscoveryActivity;
+  earlyActivity: { status: string; reason: string | null; hourStart: string | null; swapCount: number | null; basis: string } }
+export type DiscoveredToken = { address: string; status: 'verified_erc20_like'; verifiedAsset: false; symbol: string | null;
+  name: string | null; decimals: number | null; discoveredAt: string; observedBlock: number;
+  deployment: { status?: string; reason?: string; timestamp?: string; transactionHash?: string; blockNumber?: number; deployer?: string };
+  launch: { status: string; source: string | null; reason?: string; provenance?: unknown; observedAt?: string };
+  dex: { status: string; reason?: string; firstPool?: DiscoveryPool | null; observedPools?: DiscoveryPool[];
+    firstDexActivity?: { status: string; reason: string | null; firstObserved: { timestamp: string; blockNumber: number; txHash: string; firstProven: boolean } | null } } }
+export type ArcEcosystem = { schema: typeof ECOSYSTEM_SCHEMA; window: IntelligenceWindow;
+  coverage: { status: string; reason?: string; requiredHours: number; availableHours: number; unresolvedCandidateCount?: number };
+  discoveredTokens: { status: string; truncated?: boolean; rows: DiscoveredToken[] };
+  launches: { status: string; truncated?: boolean; rows: DiscoveredToken[] };
+  otherProtocols: { status: string; reason?: string | null }; exchangeFlows: { status: string; reason?: string | null } }
+
+export function parseArcEcosystem(value: Record<string, unknown> | null, selected: string): ArcEcosystem | null {
+  if (!value || value.schema !== ECOSYSTEM_SCHEMA || !validWindowCoverage(value.window)) return null
+  const data = value as unknown as ArcEcosystem
+  if (data.window?.key !== selected || !data.coverage || !data.discoveredTokens || !data.launches
+    || !data.otherProtocols || !data.exchangeFlows) return null
+  const date = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value))
+  const hash = (value: unknown) => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value)
+  const count = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0
+  const activity = (value: unknown) => isRecord(value) && typeof value.firstProven === 'boolean'
+    && (value.firstObserved === null || isRecord(value.firstObserved) && date(value.firstObserved.timestamp)
+      && count(value.firstObserved.blockNumber) && hash(value.firstObserved.txHash))
+  const pool = (value: unknown) => isRecord(value) && (value.protocol === 'uniswap_v3' || value.protocol === 'uniswap_v4')
+    && typeof value.pool === 'string' && (value.protocol === 'uniswap_v3' ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/).test(value.pool)
+    && count(value.creationBlock) && hash(value.creationTxHash) && activity(value.firstSwap) && activity(value.firstLiquidity)
+    && isRecord(value.earlyActivity) && typeof value.earlyActivity.status === 'string'
+    && (value.earlyActivity.swapCount === null || count(value.earlyActivity.swapCount))
+  if (!count(data.coverage.availableHours) || !count(data.coverage.requiredHours) || data.coverage.requiredHours > 720
+    || data.coverage.availableHours > data.coverage.requiredHours || !date(data.window.start) || !date(data.window.end)) return null
+  const validTokens = (rows: unknown) => Array.isArray(rows) && rows.length <= 50 && rows.every((row) => row
+    && /^0x[0-9a-f]{40}$/.test(row.address) && row.status === 'verified_erc20_like' && row.verifiedAsset === false
+    && typeof row.discoveredAt === 'string' && Number.isFinite(Date.parse(row.discoveredAt))
+    && Number.isSafeInteger(row.observedBlock) && row.deployment && row.launch && row.dex
+    && typeof row.launch.status === 'string' && (row.launch.source === null || typeof row.launch.source === 'string')
+    && (row.deployment.transactionHash === undefined || hash(row.deployment.transactionHash))
+    && (row.deployment.timestamp === undefined || date(row.deployment.timestamp))
+    && (row.dex.firstPool === undefined || row.dex.firstPool === null || pool(row.dex.firstPool))
+    && (row.dex.observedPools === undefined || Array.isArray(row.dex.observedPools) && row.dex.observedPools.length <= 50 && row.dex.observedPools.every(pool))
+    && (row.dex.firstDexActivity?.firstObserved == null || date(row.dex.firstDexActivity.firstObserved.timestamp)
+      && count(row.dex.firstDexActivity.firstObserved.blockNumber) && hash(row.dex.firstDexActivity.firstObserved.txHash))
+    && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 128))
+  if (!validTokens(data.discoveredTokens.rows) || !validTokens(data.launches.rows)
+    || data.launches.rows.some((row) => !['direct_deployment', 'verified_factory', 'verified_launchpad'].includes(row.launch.status))) return null
+  return data
 }
 
 // The only requests the dashboard makes. Windows the API cannot answer (1H, 6H) are never requested at all.
 export const ARC_INTELLIGENCE_REQUESTS = Object.freeze({
+  ecosystem24h: '/api/intelligence?view=ecosystem&window=24h',
+  ecosystem7d: '/api/intelligence?view=ecosystem&window=7d',
+  ecosystem30d: '/api/intelligence?view=ecosystem&window=30d',
   summary24h: '/api/intelligence?view=summary&window=24h',
   timeseries24h: '/api/intelligence?view=timeseries&window=24h',
   poolsV3_24h: '/api/intelligence?view=pools&protocol=v3&window=24h',
@@ -269,13 +336,13 @@ export function shortenHash(hash: string): string {
 }
 
 // Per window: its own summary, timeseries and pools reads. Recent activity has no window and is shared.
-const WINDOW_REQUESTS: Partial<Record<ArcIntelligenceWindow, { summary: string; timeseries: string; poolsV3: string; poolsV4: string }>> = {
+const WINDOW_REQUESTS: Partial<Record<ArcIntelligenceWindow, { summary: string; timeseries: string; poolsV3: string; poolsV4: string; ecosystem: string }>> = {
   '24h': { summary: ARC_INTELLIGENCE_REQUESTS.summary24h, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries24h,
-    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_24h, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_24h },
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_24h, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_24h, ecosystem: ARC_INTELLIGENCE_REQUESTS.ecosystem24h },
   '7d': { summary: ARC_INTELLIGENCE_REQUESTS.summary7d, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries7d,
-    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_7d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_7d },
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_7d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_7d, ecosystem: ARC_INTELLIGENCE_REQUESTS.ecosystem7d },
   '30d': { summary: ARC_INTELLIGENCE_REQUESTS.summary30d, timeseries: ARC_INTELLIGENCE_REQUESTS.timeseries30d,
-    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_30d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_30d },
+    poolsV3: ARC_INTELLIGENCE_REQUESTS.poolsV3_30d, poolsV4: ARC_INTELLIGENCE_REQUESTS.poolsV4_30d, ecosystem: ARC_INTELLIGENCE_REQUESTS.ecosystem30d },
 }
 
 type FetchLike = (url: string, init: { method: 'GET'; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
@@ -345,6 +412,13 @@ function isPoolLiquidity(value: unknown) {
   if (value === undefined) return true
   if (!isRecord(value)) return false
   if (value.calculation !== undefined && value.calculation !== 'balance_snapshot' && value.calculation !== 'estimated_principal_reserves') return false
+  if (value.asOfHour !== undefined && (typeof value.asOfHour !== 'string' || !Number.isFinite(Date.parse(value.asOfHour)))) return false
+  if (value.ageHours !== undefined && !isCount(value.ageHours)) return false
+  if (value.snapshotStatus !== undefined && value.snapshotStatus !== 'latest_hour' && value.snapshotStatus !== 'older_stored_snapshot') return false
+  if (value.snapshotStatus === 'older_stored_snapshot' && (!value.asOfHour || !isCount(value.ageHours) || (value.ageHours as number) < 1)) return false
+  if (value.blockedTokens !== undefined && (!Array.isArray(value.blockedTokens) || value.blockedTokens.length > 2
+    || !value.blockedTokens.every(token => isRecord(token) && typeof token.token === 'string' && HEX_ADDRESS_LOWER.test(token.token)
+      && typeof token.reason === 'string'))) return false
   return value.status === 'available'
     ? isUsdMicros(value.usdMicros) && isRawUnsigned(value.amount0Raw) && isRawUnsigned(value.amount1Raw) && isCount(value.asOfBlock)
     : value.status === 'unavailable' && value.usdMicros === null && typeof value.reason === 'string'
@@ -422,11 +496,12 @@ export async function loadArcIntelligence(
   if (!requests) return { window: selected, summary: null, timeseries: null, failed: false }
   const request = fetchImpl ?? (fetch as unknown as FetchLike)
   const read = (url: string) => fetchObject(url, request, signal)
-  const [summary, timeseries, poolsV3, poolsV4, ...activity] = await Promise.allSettled([
+  const [summary, timeseries, poolsV3, poolsV4, ecosystem, ...activity] = await Promise.allSettled([
     read(requests.summary),
     read(requests.timeseries),
     read(requests.poolsV3),
     read(requests.poolsV4),
+    read(requests.ecosystem),
     ...ARC_ACTIVITY_TYPES.map((type) => read(ACTIVITY_REQUESTS[type])),
   ])
   const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA && validWindowCoverage(summary.value.window)
@@ -435,6 +510,7 @@ export async function loadArcIntelligence(
     ? timeseries.value as unknown as ArcTimeseries : null
   return {
     window: selected,
+    ecosystem: parseArcEcosystem(settledObject(ecosystem), selected),
     summary: summaryValue,
     timeseries: timeseriesValue,
     failed: summaryValue === null,
@@ -453,7 +529,7 @@ const USD_MICROS = /^\d+$/
 // or a window still filling, are collecting; anything else is unavailable.
 export function usdVolumeStatus(entry: { status: string; reason?: string | null; reasons?: string[] } | null | undefined): IntelligenceDataStatus {
   if (!entry) return 'source_pending'
-  if (entry.status === 'available') return 'available'
+  if (entry.status === 'available' || verifiedFamilyCoverage(entry as FamilyWindow)) return 'available'
   if (entry.reason === 'insufficient_coverage') return 'collecting'
   const reasons = entry.reasons ?? (entry.reason ? [entry.reason] : [])
   return reasons.length > 0 && reasons.every((reason) => reason === 'valuation_not_processed') ? 'collecting' : 'unavailable'
@@ -481,10 +557,70 @@ export function formatUsdCompact(value: number): string {
   return `$${new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: value < 1000 ? 2 : 1 }).format(value)}`
 }
 
+// A subset is displayed only when its hour list and missing-hour evidence reconcile exactly.
+export function verifiedFamilyCoverage(family: FamilyWindow | null | undefined) {
+  const subset = family?.verifiedSubset
+  if (!subset || subset.status !== 'available' || subset.scope !== 'verified_hours_only' || !subset.metrics) return null
+  const c = subset.coverage
+  if (!c || !Number.isSafeInteger(c.expectedHours) || !Number.isSafeInteger(c.availableHours) || !Number.isSafeInteger(c.missingHours)
+    || c.availableHours <= 0 || c.missingHours <= 0 || c.expectedHours > 720 || c.availableHours + c.missingHours !== c.expectedHours
+    || !Array.isArray(c.verifiedHours) || c.verifiedHours.length !== c.availableHours
+    || new Set(c.verifiedHours).size !== c.availableHours || family?.unavailableHours?.length !== c.missingHours) return null
+  const start = Date.parse(family.start ?? ''), end = Date.parse(family.end ?? '')
+  if (end - start !== c.expectedHours * 3_600_000) return null
+  const covered = new Set(c.verifiedHours)
+  if ([...c.verifiedHours, ...(family.unavailableHours ?? [])].some((hour) => {
+    const time = Date.parse(hour)
+    return !Number.isFinite(time) || time % 3_600_000 !== 0 || time < start || time >= end
+  }) || family.unavailableHours?.some((hour) => covered.has(hour))
+    || new Set(family.unavailableHours).size !== c.missingHours) return null
+  return c
+}
+export function familyMetrics(family: FamilyWindow | null | undefined): Record<string, unknown> | null {
+  if (!family) return null
+  return family.status === 'available' ? family.metrics : verifiedFamilyCoverage(family) ? family.verifiedSubset!.metrics : null
+}
+
+// Optional scoped valuations fail closed independently of the legacy full-total contract.
+export function protocolActions(entry: ProtocolUsd | null | undefined): ProtocolUsd['actions'] | null {
+  const actions = entry?.actions
+  if (!actions || typeof actions !== 'object' || Object.keys(actions).length > 12) return null
+  const raw = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value)
+  for (const action of Object.values(actions)) {
+    const c = action?.coverage
+    if (!action || !['complete', 'partial', 'unavailable'].includes(action.status)
+      || !['all_verified_window_amounts', 'verified_priced_subset'].includes(action.scope)
+      || !c || !Number.isSafeInteger(c.expectedHours) || c.expectedHours < 1 || c.expectedHours > 720
+      || !Number.isSafeInteger(c.storedHours) || c.storedHours < 0 || c.storedHours > c.expectedHours
+      || !Number.isSafeInteger(c.fullyValuedHours) || c.fullyValuedHours < 0 || c.fullyValuedHours > c.storedHours
+      || !Array.isArray(action.assets) || action.assets.length > 128
+      || (action.usdMicros !== null && !raw(action.usdMicros))) return null
+    let total = 0n
+    for (const asset of action.assets) {
+      const identity = asset?.token === '0x0000000000000000000000000000000000000000' ? { symbol: 'USDC', decimals: 18 } : ARC_KNOWN_TOKENS[asset?.token]
+      if (!asset || !/^0x[0-9a-f]{40}$/.test(asset.token) || !raw(asset.amountRaw) || !raw(asset.valuedAmountRaw) || !raw(asset.unvaluedAmountRaw)
+        || BigInt(asset.amountRaw) !== BigInt(asset.valuedAmountRaw) + BigInt(asset.unvaluedAmountRaw)
+        || (asset.usdMicros !== null && !raw(asset.usdMicros)) || typeof asset.verified !== 'boolean'
+        || (asset.verified ? !identity || asset.symbol !== identity.symbol || asset.decimals !== identity.decimals
+          : asset.symbol !== null || asset.decimals !== null || asset.valuedAmountRaw !== '0' || (asset.usdMicros !== null && asset.usdMicros !== '0'))
+        || !Array.isArray(asset.blockers) || asset.blockers.length > 8) return null
+      for (const blocker of asset.blockers) if (!blocker || typeof blocker.reason !== 'string'
+        || !Number.isSafeInteger(blocker.hours) || blocker.hours < 1 || blocker.hours > c.expectedHours
+        || !Number.isFinite(Date.parse(blocker.firstHour)) || !Number.isFinite(Date.parse(blocker.lastHour))
+        || (blocker.amountRaw !== undefined && !raw(blocker.amountRaw))) return null
+      if (asset.usdMicros !== null) total += BigInt(asset.usdMicros)
+    }
+    if (action.usdMicros !== null && BigInt(action.usdMicros) !== total) return null
+    if (action.status === 'complete' && (c.fullyValuedHours !== c.expectedHours || action.scope !== 'all_verified_window_amounts')) return null
+    if (action.status === 'unavailable' && action.usdMicros !== null) return null
+  }
+  return actions
+}
+
 // Display state of one backend window entry. insufficient_coverage means the window is still filling with history.
 export function windowStatus(entry: { status: string; reason?: string } | null | undefined): IntelligenceDataStatus {
   if (!entry) return 'unavailable'
-  if (entry.status === 'available') return 'available'
+  if (entry.status === 'available' || verifiedFamilyCoverage(entry as FamilyWindow)) return 'available'
   if (entry.reason === 'insufficient_coverage') return 'collecting'
   return 'unavailable'
 }
@@ -495,8 +631,9 @@ export function isFiniteNumber(value: unknown): value is number {
 
 // A family metric, only when the family window is available and the value is a real number.
 export function metricNumber(family: FamilyWindow | null | undefined, field: string): number | null {
-  if (!family || family.status !== 'available' || !family.metrics) return null
-  const value = family.metrics[field]
+  const metrics = familyMetrics(family)
+  if (!metrics) return null
+  const value = metrics[field]
   return isFiniteNumber(value) ? value : null
 }
 
@@ -507,8 +644,9 @@ export function metricSum(family: FamilyWindow | null | undefined, fields: reado
 }
 
 export function metricAmount(family: FamilyWindow | null | undefined, field: string): string | null {
-  if (!family || family.status !== 'available' || !family.metrics) return null
-  const value = family.metrics[field]
+  const metrics = familyMetrics(family)
+  if (!metrics) return null
+  const value = metrics[field]
   return typeof value === 'string' && /^\d+$/.test(value) ? value : null
 }
 
@@ -516,8 +654,9 @@ export type VerifiedAssetItem = { symbol: string; address: string; decimals: num
   burnCount: number; amountRaw: string }
 
 export function verifiedAssetItems(family: FamilyWindow | null | undefined): VerifiedAssetItem[] | null {
-  if (!family || family.status !== 'available' || !family.metrics || !Array.isArray(family.metrics.items)) return null
-  return (family.metrics.items as unknown[]).filter((item): item is VerifiedAssetItem => {
+  const metrics = familyMetrics(family)
+  if (!metrics || !Array.isArray(metrics.items)) return null
+  return (metrics.items as unknown[]).filter((item): item is VerifiedAssetItem => {
     const candidate = item as VerifiedAssetItem
     return Boolean(candidate) && typeof candidate.symbol === 'string' && isFiniteNumber(candidate.transferCount)
       && isFiniteNumber(candidate.mintCount) && isFiniteNumber(candidate.burnCount) && isFiniteNumber(candidate.decimals)

@@ -17,6 +17,7 @@ import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
 import { poolTvlUsd, TVL_VERSION } from './tvl.js';
+import { familyRetryPolicy } from './repair-policy.js';
 import { anchorDecimals, poolVolumeUsd, PRICE_POLICY, priceableDecimals, PRICEABLE_TOKENS, usdMicrosOf, VALUATION_VERSIONS } from './valuation.js';
 import { storedWindow, sumWindow, WindowError } from './windows.js';
 
@@ -117,7 +118,8 @@ export const V4_SWAP_TO_BLOCKER = 'v4_swap_recipient_not_emitted_and_trace_unava
 // raw amount of a token times that hour's value of the token (USDC exactly; another verified asset only with a verified price
 // of that hour), summed over the window. Token units are never mixed: an amount is valued only in its own token's verified
 // decimals (an Aave reserve whose stated decimals differ from the verified asset's is not valued). Any non-zero amount that
-// cannot be valued leaves that protocol's USD unavailable for the window, never partial.
+// cannot be valued leaves the legacy full total unavailable. Action/asset subtotals are separately scoped to amounts
+// that actually have verified units and same-hour prices; each omitted token and its affected hours remains explicit.
 const USDC_ERC20 = ARC_USDC.address;
 const usdcAmounts = (fields) => (metrics, value) => Object.fromEntries(fields.map(([out, field]) => [out, [value(USDC_ERC20, metrics[field])]]));
 const tallyAmounts = (tally, fields, tokenOf, decimalsOf = () => null) => (metrics, value) => Object.fromEntries(fields.map(([out, field, side]) => [out,
@@ -156,7 +158,7 @@ const VALUATION_DEFINITION = Object.freeze({
   liquidity: `${TVL_VERSION}: V3 token.balanceOf(pool); V4 estimated principal reserves from PoolManager pool state (tick sweep reproducing the in-range liquidity, excludes uncollected fees and per-position rounding); `
     + 'valued with the same hour\'s prices; top pools only; never from add or remove activity',
   protocolUsd: 'per protocol and action: each hour\'s raw amount of a token times that hour\'s USD value of the token (USDC exactly, other verified '
-    + 'assets only with a verified hourly price), summed; never added across actions, legs or protocols; unavailable when any amount cannot be valued',
+    + 'assets only with a verified hourly price), summed; never added across actions, legs or protocols; full totals unavailable when any amount cannot be valued; action/asset subtotals explicitly scoped to verified priced amounts',
   swapFees: 'estimated pool swap fees on the input amount (V3 fee tier; V4 fee recorded by each Swap event); excludes per-step integer rounding; valued by the volume side rule; '
     + 'swaps in V4 pools whose hook may return swap deltas are unvalued; hook-taken fees are never included; average = total / valued swaps',
 });
@@ -245,6 +247,7 @@ const SQL = Object.freeze({
       ) = 24
     ORDER BY h.hour_start - (h.hour_start % 86400) DESC, h.hour_start ASC
     LIMIT 1`,
+  gatewayRepairEvidence: 'SELECT value FROM compact_meta WHERE key BETWEEN ? AND ? ORDER BY key',
   familyRows: `SELECT h.hour_start, f.status, f.reason, f.metrics_json FROM compact_hours h
     LEFT JOIN compact_family_hours f ON f.hour_start = h.hour_start AND f.family = ?
     WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
@@ -278,6 +281,9 @@ const SQL = Object.freeze({
     'compact_token_price_hours', 'compact_token_metadata', 'compact_dex_fee_hours', 'compact_pool_tvl_hours')`,
   poolTvlRows: `SELECT pool, status, reason, amount0_raw, amount1_raw, block_number FROM compact_pool_tvl_hours WHERE hour_start = ? AND protocol = ?
     ORDER BY pool`,
+  poolTvlCount: 'SELECT COUNT(*) AS count FROM compact_pool_tvl_hours WHERE protocol = ? AND hour_start BETWEEN ? AND ?',
+  poolTvlLatest: `SELECT hour_start, pool, status, reason, amount0_raw, amount1_raw, block_number FROM compact_pool_tvl_hours
+    WHERE protocol = ? AND pool = ? AND hour_start BETWEEN ? AND ? ORDER BY hour_start DESC LIMIT 1`,
   dexFeeRows: `SELECT hour_start, protocol, fee_usd_micros, valued_swaps, unvalued_swaps FROM compact_dex_fee_hours
     WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, protocol`,
   valuationStatusRows: `SELECT h.hour_start, v.status, v.reason FROM compact_hours h
@@ -441,14 +447,29 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function familyWindow(name, from, to, hours, { full }) {
     const rows = statement('familyRows').all(name, int(from), int(to));
     const range = { start: iso(from), end: iso(to + HOUR) };
+    if (name === 'gateway' && full) {
+      const evidence = statement('gatewayRepairEvidence').all(`family_repair_evidence:gateway:${String(from).padStart(16, '0')}`,
+        `family_repair_evidence:gateway:${String(to).padStart(16, '0')}`).map((row) => JSON.parse(row.value));
+      if (evidence.length) range.repairEvidence = evidence;
+    }
     if (rows.length !== hours) {
       return { status: 'unavailable', reason: 'insufficient_coverage', reasons: ['insufficient_coverage'], unavailableHours: [], ...range, metrics: null };
     }
     const gaps = rows.filter((row) => row.status !== 'available');
     if (gaps.length) {
+      const verified = rows.filter((row) => row.status === 'available');
+      let verifiedSubset = null;
+      if (full && verified.length) {
+        try {
+          verifiedSubset = { status: 'available', scope: 'verified_hours_only',
+            coverage: { availableHours: verified.length, expectedHours: hours, missingHours: gaps.length,
+              verifiedHours: verified.map((row) => iso(row.hour_start)) },
+            metrics: withUnits(name, sumWindow(FAMILY_WINDOWS[name], verified.map((row) => JSON.parse(row.metrics_json)))) };
+        } catch (error) { if (!(error instanceof WindowError)) throw error; }
+      }
       return { status: 'unavailable', reason: 'family_hour_unavailable',
         reasons: [...new Set(gaps.map((row) => (row.status === null ? 'family_not_processed' : row.reason)))].sort(),
-        unavailableHours: gaps.map((row) => iso(row.hour_start)), ...range, metrics: null };
+        unavailableHours: gaps.map((row) => iso(row.hour_start)), ...range, metrics: null, ...(verifiedSubset ? { verifiedSubset } : {}) };
     }
     const hourly = rows.map((row) => JSON.parse(row.metrics_json));
     let metrics;
@@ -579,33 +600,74 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       const rows = statement('familyRows').all(name, int(from), int(to));
       const unavailable = (reason, extra = {}) => [name, { status: 'unavailable', reason, ...range, values: null, ...extra }];
       if (rows.length !== hours) return unavailable('insufficient_coverage');
-      const gap = rows.find((row) => row.status !== 'available');
-      if (gap) return unavailable('family_hour_unavailable', { unavailableHours: rows.filter((row) => row.status !== 'available').map((row) => iso(row.hour_start)) });
-      const totals = {};
-      let failure = null;
+      const gaps = rows.filter((row) => row.status !== 'available');
+      const actions = {};
+      let failure = gaps.length ? 'family_hour_unavailable' : null;
+      let failedHour = gaps.length ? iso(gaps[0].hour_start) : null;
       for (const row of rows) {
+        if (row.status !== 'available') continue;
         const value = (token, raw, declaredDecimals = null) => {
           const address = typeof token === 'string' ? token.toLowerCase() : '';
-          if (typeof raw !== 'string' || !DIGITS.test(raw)) throw new ReadModelError('inconsistent_state', `${name}_amount_malformed`);
+          if (!/^0x[0-9a-f]{40}$/.test(address) || typeof raw !== 'string' || !DIGITS.test(raw)) {
+            throw new ReadModelError('inconsistent_state', `${name}_amount_malformed`);
+          }
           const amount = BigInt(raw);
-          if (amount === 0n) return 0n;
-          const verifiedDecimals = anchorDecimals(address) ?? priceableDecimals(address);
-          if (verifiedDecimals === null) { failure ??= 'unverified_token'; return null; }
-          if (declaredDecimals !== null && declaredDecimals !== verifiedDecimals) { failure ??= 'decimals_mismatch'; return null; }
-          if (anchorDecimals(address) !== null) return usdMicrosOf(address, amount, null);
-          const book = pricesOf();
-          if (!book.valued.has(row.hour_start)) { failure ??= 'prices_unavailable'; return null; }
-          const usd = usdMicrosOf(address, amount, book.byHour.get(row.hour_start));
-          if (usd === null) failure ??= 'no_verified_price';
-          return usd;
+          const decimals = anchorDecimals(address) ?? priceableDecimals(address);
+          let reason = null, usd = null;
+          if (amount === 0n) usd = 0n;
+          else if (decimals === null) reason = 'unverified_token';
+          else if (declaredDecimals !== null && declaredDecimals !== decimals) reason = 'decimals_mismatch';
+          else if (anchorDecimals(address) !== null) usd = usdMicrosOf(address, amount, null);
+          else {
+            const book = pricesOf();
+            if (!book.valued.has(row.hour_start)) reason = 'prices_unavailable';
+            else {
+              usd = usdMicrosOf(address, amount, book.byHour.get(row.hour_start));
+              if (usd === null) reason = 'no_verified_price';
+            }
+          }
+          if (reason) { failure ??= reason; failedHour ??= iso(row.hour_start); }
+          return { address, amount, decimals, usd, reason };
         };
-        for (const [field, values] of Object.entries(spec.amounts(JSON.parse(row.metrics_json), value))) {
-          totals[field] ??= 0n;
-          for (const usd of values) if (usd !== null) totals[field] += usd;
+        for (const [field, entries] of Object.entries(spec.amounts(JSON.parse(row.metrics_json), value))) {
+          const action = actions[field] ??= { total: 0n, valuedHours: 0, hasValue: false, assets: new Map() };
+          if (entries.every((entry) => entry.usd !== null)) action.valuedHours += 1;
+          // An empty verified action is a real zero; a missing family hour never enters this loop.
+          if (!entries.length) action.hasValue = true;
+          for (const entry of entries) {
+            const asset = action.assets.get(entry.address) ?? { token: entry.address, decimals: entry.decimals,
+              amount: 0n, valuedAmount: 0n, unvaluedAmount: 0n, usd: 0n, hasValue: false, blockers: new Map() };
+            asset.amount += entry.amount;
+            if (entry.usd !== null) {
+              action.total += entry.usd; action.hasValue = true;
+              asset.usd += entry.usd; asset.valuedAmount += entry.amount; asset.hasValue = true;
+            } else {
+              asset.unvaluedAmount += entry.amount;
+              const blocker = asset.blockers.get(entry.reason) ?? { reason: entry.reason, firstHour: iso(row.hour_start), lastHour: null, hours: 0, amountRaw: '0' };
+              if (blocker.lastHour !== iso(row.hour_start)) blocker.hours += 1;
+              blocker.lastHour = iso(row.hour_start);
+              blocker.amountRaw = (BigInt(blocker.amountRaw) + entry.amount).toString(10);
+              asset.blockers.set(entry.reason, blocker);
+            }
+            action.assets.set(entry.address, asset);
+          }
         }
-        if (failure) return unavailable(failure, { failedHour: iso(row.hour_start) });
       }
-      return [name, { status: 'available', reason: null, ...range, values: Object.fromEntries(Object.entries(totals).map(([field, total]) => [field, total.toString(10)])) }];
+      const scopedActions = Object.fromEntries(Object.entries(actions).map(([field, action]) => {
+        const complete = action.valuedHours === hours;
+        return [field, { status: complete ? 'complete' : action.hasValue ? 'partial' : 'unavailable',
+          scope: complete ? 'all_verified_window_amounts' : 'verified_priced_subset',
+          usdMicros: action.hasValue ? action.total.toString(10) : null,
+          coverage: { expectedHours: hours, storedHours: rows.length - gaps.length, fullyValuedHours: action.valuedHours },
+          assets: [...action.assets.values()].map((asset) => ({ token: asset.token, ...(anchorDecimals(asset.token) !== null ? { symbol: 'USDC', decimals: asset.decimals, verified: true } : tokenUnit(asset.token)),
+            amountRaw: asset.amount.toString(10), valuedAmountRaw: asset.valuedAmount.toString(10),
+            unvaluedAmountRaw: asset.unvaluedAmount.toString(10), usdMicros: asset.hasValue ? asset.usd.toString(10) : null,
+            blockers: [...asset.blockers.values()] })) }];
+      }));
+      const extra = { actions: scopedActions, ...(gaps.length ? { unavailableHours: gaps.map((row) => iso(row.hour_start)) } : {}) };
+      if (failure) return unavailable(failure, { ...extra, failedHour });
+      return [name, { status: 'available', reason: null, ...range,
+        values: Object.fromEntries(Object.entries(actions).map(([field, action]) => [field, action.total.toString(10)])), ...extra }];
     }));
   }
 
@@ -885,26 +947,36 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         } else entry.unvalued = true;
       }
     }
-    // Pool liquidity: the snapshot of the checkpoint hour (tvl.js, pool state at the hour's last block), valued with that
-    // hour's stored prices. Never derived from add or remove activity; a held token without a price leaves it unavailable.
-    const tvlRows = tables.has('compact_pool_tvl_hours') ? new Map(statement('poolTvlRows').all(int(to), spec.protocol).map((row) => [row.pool, row]))
-      : new Map();
-    const checkpointPrices = new Map();
-    if (tables.has('compact_valuation_hours') && valuationWindow('token_prices', to, to, 1, tables).status === 'available') {
-      for (const row of statement('tokenPriceRows').all(int(to), int(to))) checkpointPrices.set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
-    }
+    // Latest stored snapshot of each ranked pool inside this window, valued only with that snapshot's prices.
+    // No RPC, no larger collection cap, and an older snapshot is explicitly dated rather than called current liquidity.
+    const hasTvlSnapshots = tables.has('compact_pool_tvl_hours') && statement('poolTvlCount').get(spec.protocol, int(from), int(to)).count > 0;
+    const snapshotPrices = new Map();
+    const pricesAt = (hour) => {
+      if (snapshotPrices.has(hour)) return snapshotPrices.get(hour);
+      const book = new Map();
+      if (valuationReady(tables) && valuationWindow('token_prices', hour, hour, 1, tables).status === 'available') {
+        for (const row of statement('tokenPriceRows').all(int(hour), int(hour))) book.set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
+      }
+      snapshotPrices.set(hour, book);
+      return book;
+    };
     const liquidityOf = (pool) => {
-      const row = tvlRows.get(pool);
+      const row = tables.has('compact_pool_tvl_hours') ? statement('poolTvlLatest').get(spec.protocol, pool, int(from), int(to)) : null;
       const calculation = v3 ? 'balance_snapshot' : 'estimated_principal_reserves';
       const missing = { status: 'unavailable', usdMicros: null, amount0Raw: null, amount1Raw: null, asOfBlock: null };
-      if (!row) return { ...missing, reason: tvlRows.size ? 'tvl_not_collected_for_pool' : 'tvl_not_collected' };
-      if (row.status !== 'available') return { ...missing, reason: row.reason, asOfBlock: row.block_number };
+      if (!row) return { ...missing, reason: hasTvlSnapshots ? 'tvl_not_collected_for_pool' : 'tvl_not_collected' };
+      const date = { asOfBlock: row.block_number, asOfHour: iso(row.hour_start), ageHours: (to - row.hour_start) / HOUR,
+        snapshotStatus: row.hour_start === to ? 'latest_hour' : 'older_stored_snapshot' };
+      if (row.status !== 'available') return { ...missing, reason: row.reason, ...date };
       if (!isDigits(row.amount0_raw) || !isDigits(row.amount1_raw)) throw new ReadModelError('inconsistent_state', 'pool_tvl_malformed');
       const { token0, token1 } = detailsOf(pool);
-      const usdMicros = poolTvlUsd({ token0: token0.address, token1: token1.address, amount0: BigInt(row.amount0_raw), amount1: BigInt(row.amount1_raw) },
-        checkpointPrices);
-      const amounts = { calculation, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, asOfBlock: row.block_number };
-      return usdMicros === null ? { status: 'unavailable', reason: 'no_verified_price', usdMicros: null, ...amounts }
+      const book = pricesAt(row.hour_start);
+      const usdMicros = poolTvlUsd({ token0: token0.address, token1: token1.address, amount0: BigInt(row.amount0_raw), amount1: BigInt(row.amount1_raw) }, book);
+      const amounts = { calculation, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, ...date };
+      const blockedTokens = [[token0, row.amount0_raw], [token1, row.amount1_raw]].filter(([token, raw]) => BigInt(raw) !== 0n
+        && usdMicrosOf(token.address, BigInt(raw), book) === null).map(([token]) => ({ token: token.address,
+          reason: (anchorDecimals(token.address) ?? priceableDecimals(token.address)) === null ? 'unverified_token' : 'no_verified_price' }));
+      return usdMicros === null ? { status: 'unavailable', reason: 'no_verified_price', blockedTokens, usdMicros: null, ...amounts }
         : { status: 'available', reason: null, usdMicros: usdMicros.toString(10), ...amounts };
     };
     const raw = (values) => values.map((value) => value.toString(10));
@@ -929,7 +1001,9 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       usdVolume: { status: valuation.status, reason: valuation.reason, reasons: valuation.reasons },
       liquidityUsd: { status: pools.some((pool) => pool.liquidityUsd.status === 'available') ? 'available' : 'unavailable',
         reason: pools.some((pool) => pool.liquidityUsd.status === 'available') ? null : pools.find((pool) => pool.liquidityUsd.reason)?.liquidityUsd.reason ?? 'tvl_not_collected',
-        asOfHour: iso(to) } };
+        asOfHour: pools.some((pool) => pool.liquidityUsd.snapshotStatus === 'older_stored_snapshot') ? null : iso(to),
+        ...(pools.some((pool) => pool.liquidityUsd.snapshotStatus === 'older_stored_snapshot')
+          ? { snapshotScope: 'per_pool_latest_stored_snapshot' } : {}) } };
   }
 
   // One activity row with the exact semantics of the projection: from is the verified transaction sender; to is only the
@@ -1071,6 +1145,24 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       }
       return snapshot(() => statement('availableFamilies').all(int(fromHour), int(toHour))
         .filter((row) => row.available < FAMILIES.length).map((row) => row.hour_start));
+    },
+    familyRepairPlans({ fromHour, toHour }) {
+      checkedRange(fromHour, toHour);
+      return snapshot(() => {
+        const plans = new Map();
+        const blocked = [];
+        for (const name of FAMILIES) for (const row of statement('familyRows').all(name, int(fromHour), int(toHour))) {
+          if (row.status === 'available') continue;
+          const reason = row.status === null ? 'family_not_processed' : row.reason;
+          const policy = familyRetryPolicy(reason);
+          if (!policy.eligible) { blocked.push({ hourStart: row.hour_start, family: name, reason }); continue; }
+          const plan = plans.get(row.hour_start) ?? { hourStart: row.hour_start, families: [], cooldownMs: 0 };
+          plan.families.push(name);
+          plan.cooldownMs = Math.max(plan.cooldownMs, policy.cooldownMs);
+          plans.set(row.hour_start, plan);
+        }
+        return { plans: [...plans.values()].sort((a, b) => b.hourStart - a.hourStart), blocked };
+      });
     },
     // Internal (scheduler and tests only, never an HTTP route): per-hour projection state in [fromHour, toHour].
     projectionStates({ fromHour, toHour }) {

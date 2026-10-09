@@ -1085,6 +1085,39 @@ export function createCompactStore(db) {
   return Object.freeze({
     intelligence,
     commitHour,
+    gatewayRepairInput(hourStart) {
+      const hour = db.prepare('SELECT * FROM compact_hours WHERE hour_start = ?').get(int(hourStart));
+      const family = sql.families.all(int(hourStart)).find((row) => row.family === 'gateway');
+      return hour && family ? { hourStart, firstBlock: hour.first_block, lastBlock: hour.last_block,
+        firstHash: hour.first_hash, lastHash: hour.last_hash, parentHash: hour.parent_hash,
+        networkSha: hour.network_sha256, status: family.status, reason: family.reason } : null;
+    },
+    commitGatewayRepair(input, metrics) {
+      if (!input || !FAMILY_FIELDS.gateway.every((field) => metrics[field] !== undefined && metrics[field] !== null)) {
+        throw new StoreError('gateway_repair_invalid');
+      }
+      // Validate additive/constant/tally values using the existing family rules before the transaction.
+      sumWindow(FAMILY_WINDOWS.gateway, [metrics]);
+      return transaction(() => {
+        const hour = sql.hour.get(int(input.hourStart));
+        const family = sql.families.all(int(input.hourStart)).find((row) => row.family === 'gateway');
+        if (!hour || hour.network_sha256 !== input.networkSha || hour.first_block !== input.firstBlock
+          || hour.last_block !== input.lastBlock || hour.parent_hash !== input.parentHash || hour.last_hash !== input.lastHash) {
+          throw new StoreError('hour_conflict');
+        }
+        if (family?.status === 'available') return 'unchanged';
+        if (!family || family.reason !== input.reason) throw new StoreError('gateway_repair_state_changed');
+        const evidence = { originalReason: input.reason, hourStart: input.hourStart, firstBlock: input.firstBlock, lastBlock: input.lastBlock,
+          firstHash: input.firstHash, lastHash: input.lastHash, networkSha: input.networkSha };
+        const json = canonical(Object.fromEntries(FAMILY_FIELDS.gateway.map((field) => [field, metrics[field]])));
+        sql.upgradeFamily.run(json, sha256(json), int(input.hourStart), 'gateway');
+        // An append-only metadata key preserves the original failure without changing any family definition,
+        // metrics JSON/hash, existing table or successful projection. Older readers ignore this namespace.
+        db.prepare('INSERT OR IGNORE INTO compact_meta (key,value) VALUES (?,?)')
+          .run(`family_repair_evidence:gateway:${String(input.hourStart).padStart(16, '0')}`, canonical(evidence));
+        return 'upgraded';
+      });
+    },
     commitHistoricalHour,
     checkpoint,
     earliestHour() {

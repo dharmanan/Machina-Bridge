@@ -21,10 +21,19 @@ import {
 import { VALUATION_VERSIONS } from '../server/compact/valuation.js';
 import { MAX_VALUATION_HOURS, readValuationInputs, planValuationBackfill, storageGuard } from '../server/compact/valuation-backfill.js';
 
+import { inspectGatewayEvidence } from './inspect-compact-gateway-evidence.mjs';
+import { repairStoredGatewayHour, GATEWAY_REPAIR_LIMITS } from '../server/compact/gateway-repair.js';
+import { familyRetryPolicy } from '../server/compact/repair-policy.js';
+import { GATEWAY_EVENTS, GATEWAY_FAMILY, CIRCLE_ARC } from '../server/compact/protocols/circle.js';
+import { encodeEventLog } from '../server/compact/offline.js';
+import { createScheduler } from '../server/compact/scheduler.js';
+import { createProvider, ProviderError } from '../server/compact/provider.js';
+import { refreshTokenMetadata } from '../server/compact/token-metadata.js';
+
 const { DatabaseSync } = await import('node:sqlite');
 globalThis.fetch = async () => { throw new Error('network forbidden in completion fixtures'); };
 let passed = 0;
-async function test(name, run) { await run(); passed += 1; console.log(`PASS ${name}`); }
+async function test(name, run) { if (process.env.COMPACT_COMPLETION_TEST_FILTER && !new RegExp(process.env.COMPACT_COMPLETION_TEST_FILTER).test(name)) return; await run(); passed += 1; console.log(`PASS ${name}`); }
 const root = mkdtempSync(join(tmpdir(), 'compact-completion-'));
 const HOUR = 3600;
 const BASE = Date.UTC(2026, 8, 1) / 1000;
@@ -440,6 +449,212 @@ try {
         assert.equal(summary.protocolUsd.cctp.status, 'available');
         assert.equal(summary.dex.usdVolume.status, 'available');
       } finally { model.close(); data.db.close(); }
+    }
+  });
+
+  await test('family gaps retain verified numeric subsets; missing hours are never zero-filled', () => {
+    const data = fixture('family-subsets', 24);
+    data.db.prepare("UPDATE compact_family_hours SET status='unavailable',reason='rpc_error',metrics_json=NULL,metrics_sha256=NULL WHERE family='usdc' AND hour_start=?")
+      .run(BigInt(BASE + HOUR));
+    const model = data.model();
+    try {
+      const family = model.summary('30d').assets.usdc;
+      assert.equal(family.status, 'unavailable'); assert.equal(family.metrics, null);
+      assert.equal(family.verifiedSubset.coverage.availableHours, 23);
+      assert.equal(family.verifiedSubset.coverage.expectedHours, 24);
+      assert.equal(family.verifiedSubset.coverage.verifiedHours.includes(iso(BASE + HOUR)), false);
+      assert.equal(family.verifiedSubset.metrics.rawDecimals, 18);
+      assert.deepEqual(family.unavailableHours, [iso(BASE + HOUR)]);
+      const plans = model.familyRepairPlans({ fromHour: BASE, toHour: BASE + 23 * HOUR });
+      assert.deepEqual(plans.plans[0].families, ['usdc']);
+    } finally { model.close(); data.db.close(); }
+  });
+
+  await test('verified USDC lending actions survive unknown collateral and missing EURC prices', () => {
+    const data = fixture('scoped-lending', 2);
+    for (let i = 0; i < 2; i++) {
+      const result = hourResult(i);
+      result.families.morphoBlue.markets = { m: { loanToken: USDC, collateralToken: UNKNOWN,
+        suppliedRaw: '1000000', withdrawnRaw: '0', borrowedRaw: '2000000', repaidRaw: '0', collateralSuppliedRaw: '999',
+        collateralWithdrawnRaw: '0', liquidationRepaidRaw: '0', liquidationSeizedRaw: '0', badDebtRaw: '0' } };
+      const reserves = result.families.aaveV4.reserves;
+      reserves.eurc = { ...reserves.r, underlying: '0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1', suppliedRaw: '9000000' };
+      for (const name of ['morphoBlue', 'aaveV4']) data.db.prepare('UPDATE compact_family_hours SET metrics_json=? WHERE hour_start=? AND family=?')
+        .run(JSON.stringify(result.families[name]), BigInt(BASE + i * HOUR), name);
+    }
+    const model = data.model();
+    try {
+      const summary = model.summary('30d');
+      const blue = summary.protocolUsd.morphoBlue;
+      assert.equal(blue.status, 'unavailable'); assert.equal(blue.values, null);
+      assert.equal(blue.actions.suppliedUsdMicros.usdMicros, '2000000');
+      assert.equal(blue.actions.suppliedUsdMicros.status, 'complete');
+      assert.equal(blue.actions.borrowedUsdMicros.usdMicros, '4000000');
+      assert.equal(blue.actions.collateralSuppliedUsdMicros.usdMicros, null);
+      const unknown = blue.actions.collateralSuppliedUsdMicros.assets[0];
+      assert.equal(unknown.token, UNKNOWN); assert.equal(unknown.decimals, null);
+      assert.equal(unknown.unvaluedAmountRaw, '1998');
+      assert.equal(unknown.blockers[0].reason, 'unverified_token');
+      const aave = summary.protocolUsd.aaveV4.actions.suppliedUsdMicros;
+      assert.equal(aave.status, 'partial'); assert.equal(aave.usdMicros, '12000000');
+      assert.equal(aave.coverage.fullyValuedHours, 0);
+      assert.equal(aave.assets.find((asset) => asset.symbol === 'EURC').blockers[0].reason, 'no_verified_price');
+    } finally { model.close(); data.db.close(); }
+  });
+
+  await test('ranked pools use latest stored balances with same-hour prices and explicit snapshot age', () => {
+    const data = fixture('older-tvl', 24);
+    data.store.recordPoolTvl(BASE, 'uniswap_v3', [{ pool: V3, status: 'available', amount0: 0n, amount1: 7654321n }], { blockNumber: 1099 });
+    const model = data.model();
+    try {
+      const pool = model.pools('v3', '30d').pools.find((row) => row.pool === V3);
+      assert.equal(pool.liquidityUsd.usdMicros, '7654321');
+      assert.equal(pool.liquidityUsd.asOfHour, iso(BASE));
+      assert.equal(pool.liquidityUsd.ageHours, 23);
+      assert.equal(pool.liquidityUsd.snapshotStatus, 'older_stored_snapshot');
+    } finally { model.close(); data.db.close(); }
+  });
+
+  function gatewayFixture(name, { fork = false, malformed = false, rateLimit = false, foreign = false, dense = false } = {}) {
+    const data = fixture(name, 1);
+    data.db.prepare("UPDATE compact_family_hours SET status='unavailable',reason='gateway_unexpected_token',metrics_json=NULL,metrics_sha256=NULL WHERE family='gateway'").run();
+    const log = (token, index, value) => ({ address: CIRCLE_ARC.gatewayWallet, blockNumber: '0x3e9', blockHash: hash(1001),
+      transactionHash: hash(9001), transactionIndex: '0x0', logIndex: `0x${index.toString(16)}`, removed: false,
+      ...encodeEventLog(GATEWAY_EVENTS.deposited, { token, depositor: address(42), sender: address(43), value }) });
+    const logs = [log(USDC, 0, 1234567n)];
+    if (foreign || malformed) logs.push(log(UNKNOWN, 1, 10n ** 30n));
+    if (dense) for (let i = 0; i < 65; i++) logs.push({ ...log(USDC, 2 + i, 1n), blockNumber: `0x${(1000 + i).toString(16)}`, blockHash: hash(1000 + i) });
+    if (malformed) logs[1].topics[1] = `0x${'f'.repeat(64)}`;
+    const requests = [];
+    const request = async (method, params) => {
+      requests.push([method, params]);
+      if (rateLimit) throw new ProviderError('rate_limited');
+      if (method === 'eth_getCode') return '0x6001';
+      if (method === 'eth_getLogs') return logs;
+      assert.equal(method, 'eth_getBlockByNumber'); assert.equal(params[1], false, 'never requests full transaction bodies');
+      const number = Number(BigInt(params[0]));
+      return { number: params[0], hash: fork && number === 1099 ? hash(777) : hash(number), parentHash: hash(number - 1),
+        timestamp: `0x${(number === 999 ? BASE - 1 : number === 1100 ? BASE + HOUR : BASE + Math.floor((number - 1000) * 3599 / 99)).toString(16)}`,
+        transactions: [hash(9001)] };
+    };
+    return { ...data, requests, provider: { request, batch: async (calls) => Promise.all(calls.map(([method, params]) => request(method, params))) } };
+  }
+  await test('narrow Gateway repair of verified USDC preserves original reason and all other projections', async () => {
+    const data = gatewayFixture('gateway-narrow');
+    const before = facts(data.db);
+    try {
+      const out = await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE });
+      assert.equal(out.outcome, 'upgraded'); assert.ok(out.calls <= 12 && out.calls < GATEWAY_REPAIR_LIMITS.calls);
+      const family = data.store.familyRows(BASE).find((row) => row.family === 'gateway');
+      assert.equal(family.metrics.depositCount, 1); assert.equal(family.metrics.depositAmountRaw, '1234567');
+      assert.equal(JSON.parse(data.db.prepare("SELECT value FROM compact_meta WHERE key LIKE 'family_repair_evidence:gateway:%'").get().value).originalReason, 'gateway_unexpected_token');
+      const after = facts(data.db);
+      for (const table of Object.keys(before).filter((name) => name !== 'compact_family_hours')) assert.deepEqual(after[table], before[table], table);
+      assert.deepEqual(after.compact_family_hours.filter((row) => row.family !== 'gateway'), before.compact_family_hours.filter((row) => row.family !== 'gateway'));
+      const count = data.requests.length;
+      assert.equal((await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE })).outcome, 'unchanged');
+      assert.equal(data.requests.length, count, 'available hours are never recounted');
+      const model = data.model();
+      try { assert.equal(model.summary('30d').crossChain.gateway.repairEvidence[0].originalReason, 'gateway_unexpected_token'); } finally { model.close(); }
+    } finally { data.db.close(); }
+  });
+  await test('forks, malformed foreign events and provider limits cannot alter any stored repair evidence', async () => {
+    for (const fault of ['fork', 'malformed', 'rateLimit', 'foreign', 'dense']) {
+      const data = gatewayFixture(`gateway-${fault}`, { [fault]: true });
+      const before = facts(data.db);
+      try {
+        await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }));
+        assert.deepEqual(facts(data.db), before);
+        assert.ok(data.requests.length <= (fault === 'dense' ? 70 : 12));
+      } finally { data.db.close(); }
+    }
+  });
+
+  await test('unexpected Gateway tokens still fail closed and the read-only diagnostic exposes exact event evidence', async () => {
+    const data = gatewayFixture('gateway-evidence', { foreign: true, dense: true });
+    const before = facts(data.db);
+    try {
+      await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE, mode: 'inspect' }), (error) => {
+        assert.equal(error.code, 'gateway_unexpected_token');
+        assert.equal(error.evidence.decodedToken, UNKNOWN);
+        assert.equal(error.evidence.transactionHash, hash(9001));
+        assert.equal(error.evidence.emitter, CIRCLE_ARC.gatewayWallet);
+        assert.equal(error.evidence.topics.length, 4);
+        assert.ok(error.evidence.data.startsWith('0x'));
+        return true;
+      });
+      assert.deepEqual(facts(data.db), before);
+      assert.ok(data.requests.filter(([method]) => method === 'eth_getBlockByNumber').length <= 9, 'dense evidence inspects only the unexpected event block');
+    } finally { data.db.close(); }
+  });
+
+  await test('evidence CLI opens SQLite read-only, extracts one exact failing event, and leaves every row unchanged', async () => {
+    const data = gatewayFixture('gateway-readonly-cli', { foreign: true });
+    const before = facts(data.db);
+    const savedFetch = globalThis.fetch, savedLog = console.log;
+    const output = [];
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      const answer = async (item) => ({ jsonrpc: '2.0', id: item.id, result: item.method === 'eth_chainId' ? '0x13b2'
+        : await data.provider.request(item.method, item.params) });
+      const result = Array.isArray(body) ? await Promise.all(body.map(answer)) : await answer(body);
+      return { ok: true, status: 200, text: async () => JSON.stringify(result) };
+    };
+    console.log = (line) => output.push(JSON.parse(line));
+    try {
+      await inspectGatewayEvidence({ argv: [iso(BASE)], env: { COMPACT_SQLITE_PATH: data.path } });
+      assert.equal(output[0].evidence.decodedToken, UNKNOWN);
+      assert.equal(output.at(-1).readOnly, true);
+      assert.ok(output.at(-1).requests <= 20);
+      assert.deepEqual(facts(data.db), before);
+      assert.equal(data.db.prepare("SELECT COUNT(*) AS n FROM compact_meta WHERE key LIKE 'family_repair_evidence:%'").get().n, 0);
+    } finally { globalThis.fetch = savedFetch; console.log = savedLog; data.db.close(); }
+  });
+
+  await test('durable deterministic retry breaker survives restarts while transient Gateway repair and other work continue', async () => {
+    const data = gatewayFixture('gateway-policy');
+    const model = data.model();
+    try {
+      const plans = model.familyRepairPlans({ fromHour: BASE, toHour: BASE });
+      assert.equal(plans.plans.length, 0); assert.equal(plans.blocked[0].reason, 'gateway_unexpected_token');
+      assert.equal(familyRetryPolicy('malformed_gateway_event').eligible, false);
+      assert.equal(familyRetryPolicy('rate_limited').cooldownMs, 4 * 3_600_000);
+      const calls = [], logs = [];
+      let transient = false;
+      const readModel = { checkpoint: () => ({ hourStart: BASE, lastBlock: 1099 }),
+        familyRepairPlans: () => transient ? { plans: [{ hourStart: BASE, families: ['gateway'], cooldownMs: 4 * 3_600_000 }], blocked: [] } : plans,
+        projectionRepairCandidates: () => ({ hours: [BASE], blocked: [] }) };
+      const handle = (kind, hour) => { calls.push(kind); return { hour, done: Promise.resolve({ exitCode: 0 }), terminate: async () => {} }; };
+      let nowMs = (BASE + HOUR) * 1000;
+      const scheduler = createScheduler({ readModel, runHour: (hour) => handle('full', hour), runGatewayRepair: (hour) => handle('gateway', hour),
+        runProjectionRepair: (hour) => handle('projection', hour), now: () => nowMs, safetyDelayMs: 0, log: line => logs.push(line),
+        setTimer: () => 1, clearTimer: () => {} });
+      await scheduler.tick(); assert.deepEqual(calls, ['projection']);
+      assert.ok(logs.some(line => line.includes('SCHEDULER_FAMILY_REPAIR_BLOCKED') && line.includes('gateway_unexpected_token')));
+      transient = true;
+      await scheduler.tick(); assert.deepEqual(calls, ['projection', 'gateway']);
+      await scheduler.tick(); assert.equal(calls.filter((kind) => kind === 'gateway').length, 1, 'rate-limit cooldown applies');
+      await scheduler.stop();
+    } finally { model.close(); data.db.close(); }
+  });
+
+  await test('metadata rate limits fail fast independently and preserve all previously cached batches', async () => {
+    for (const successfulBatches of [0, 1]) {
+      let attempts = 0;
+      const provider = createProvider({ minIntervalMs: 0, sleep: async () => {}, fetchImpl: async (_url, init) => {
+        const body = JSON.parse(init.body);
+        if (!Array.isArray(body)) return { ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x13b2' }) };
+        attempts += 1;
+        if (attempts > successfulBatches) return { ok: false, status: 429, text: async () => 'limited' };
+        return { ok: true, status: 200, text: async () => JSON.stringify(body.map((item, index) => ({ jsonrpc: '2.0', id: item.id,
+          result: index % 3 === 2 ? `0x${word(18)}` : `0x${Buffer.from(index % 3 ? 'Cached Token' : 'CACHED').toString('hex').padEnd(64, '0')}` }))) };
+      } });
+      const written = [];
+      const store = { tokensNeedingMetadata: () => Array.from({ length: 50 }, (_, i) => address(100 + i)), recordTokenMetadata: (rows) => written.push(rows) };
+      const out = await refreshTokenMetadata({ store, provider, blockNumber: 1000 });
+      assert.equal(out.error, 'provider_rate_limited'); assert.equal(out.requests, successfulBatches + 1);
+      assert.equal(attempts, successfulBatches + 1); assert.equal(provider.stats.retries, 0); assert.equal(written.length, successfulBatches);
+      if (successfulBatches) { assert.ok(written[0].length > 0); assert.equal(out.verified, written[0].length); }
     }
   });
 

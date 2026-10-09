@@ -187,11 +187,16 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     .all(BigInt(from), BigInt(to), INTELLIGENCE_VERSION, registryDigest(registry));
   const payloads = new Map(rows.map((row) => [row.hour_start, parse(row)]));
   const covered = rows.filter((row) => row.discovery_status === 'available').length;
-  const candidates = db.prepare(`SELECT * FROM (SELECT d.*, MIN(hour_start) OVER(PARTITION BY COALESCE(address,candidate_key)) AS first_observed_hour,
+  const candidateSql = `SELECT * FROM (SELECT d.*, MIN(hour_start) OVER(PARTITION BY COALESCE(address,candidate_key)) AS first_observed_hour,
     ROW_NUMBER() OVER(PARTITION BY COALESCE(address,candidate_key)
-    ORDER BY CASE json_extract(result_json,'$.launch.status') WHEN 'verified_factory' THEN 0 WHEN 'verified_launchpad' THEN 0
+    ORDER BY CASE status WHEN 'verified_erc20_like' THEN 0 ELSE 1 END,
+    CASE json_extract(result_json,'$.launch.status') WHEN 'verified_factory' THEN 0 WHEN 'verified_launchpad' THEN 0
     WHEN 'direct_deployment' THEN 1 ELSE 2 END,block_number ASC,candidate_key ASC) AS priority
-    FROM compact_token_discoveries d WHERE hour_start<=?) WHERE priority=1 AND first_observed_hour BETWEEN ? AND ?
+    FROM compact_token_discoveries d WHERE hour_start<=?) WHERE priority=1 AND first_observed_hour BETWEEN ? AND ?`;
+  // Filter BEFORE the bounded limit: a large unresolved queue must not hide existing verified tokens.
+  const candidates = db.prepare(`${candidateSql} AND status='verified_erc20_like'
+    ORDER BY block_number DESC,candidate_key ASC LIMIT 51`).all(BigInt(to), BigInt(from), BigInt(to));
+  const unresolvedCandidates = db.prepare(`${candidateSql} AND status<>'verified_erc20_like'
     ORDER BY block_number DESC,candidate_key ASC LIMIT 51`).all(BigInt(to), BigInt(from), BigInt(to));
   const launchCandidates = db.prepare(`SELECT * FROM (SELECT d.*,ROW_NUMBER() OVER(PARTITION BY address ORDER BY block_number,candidate_key) AS priority
     FROM compact_token_discoveries d WHERE hour_start BETWEEN ? AND ? AND status='verified_erc20_like'
@@ -259,7 +264,7 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     discoveredTokens: { status: full && !unresolved ? 'available' : 'insufficient_coverage', limit: 50, truncated: candidates.length > 50,
       rows: tokens.filter((row) => row.status === 'verified_erc20_like') },
     contractCandidates: { status: unresolved ? 'unverified' : full ? 'available' : 'insufficient_coverage',
-      limit: 50, truncated: candidates.length > 50, rows: tokens.filter((row) => row.status !== 'verified_erc20_like') },
+      limit: 50, truncated: unresolvedCandidates.length > 50, rows: unresolvedCandidates.slice(0,50).map(token) },
     // An unresolved candidate may still be a launch, so the launch list is complete only when every candidate is resolved.
     launches: { status: full && !unresolved ? 'available' : 'insufficient_coverage', definition: 'verified_tokens_with_proven_source_or_direct_deployment_in_window',
       limit: 50, truncated: launchCandidates.length > 50,
@@ -271,8 +276,21 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     exchangeFlows: { status: exchangeComplete ? 'available' : 'unavailable', reason: !registry.exchanges.length ? 'verified_exchange_registry_empty'
       : exchangeComplete ? null : 'insufficient_coverage', definitions: registry.exchanges, unit: 'per_asset_raw',
       rows: exchangeComplete ? sumExchange(exchangeBuckets) : null, buckets: exchangeBuckets } };
-  // Fixed GET routes have no arbitrary SQL pagination. A too-large result is explicitly unavailable, not silently truncated.
-  return Buffer.byteLength(intelligenceJson(out)) > 240 * 1024 ? empty('bounded_response_limit') : out;
+  // Existing per-list caps still apply. An unresolved queue or duplicate discovery details must not blank proven
+  // launches when the combined response exceeds the byte cap. Keep explicit truncated lists, oldest rows last.
+  return boundEcosystemResponse(out) ?? empty('bounded_response_limit');
+}
+
+export function boundEcosystemResponse(out) {
+  const bytes = () => Buffer.byteLength(intelligenceJson(out));
+  // Give proven launches priority, preserve at least one row from each non-empty collection, never invent completeness.
+  for (const name of ['contractCandidates', 'discoveredTokens', 'launches']) {
+    const list = out[name];
+    while (bytes() > 240 * 1024 && list.rows.length > 1) {
+      list.rows.pop(); list.truncated = true; list.reason = 'bounded_response_limit';
+    }
+  }
+  return bytes() > 240 * 1024 ? null : out;
 }
 
 export function sumProtocols(buckets) {
