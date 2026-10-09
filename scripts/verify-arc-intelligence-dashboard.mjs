@@ -2051,7 +2051,7 @@ await test('Tokens 1 a token\'s own contract metadata reads as an unverified lab
 
 const completionEcosystem = () => {
   const observed = { timestamp: isoAt(END - HOUR_MS), blockNumber: 101, logIndex: 0, txHash: `0x${'91'.repeat(32)}` };
-  const activity = { firstProven: false, firstObserved: observed, reason: 'first_activity_history_missing' };
+  const activity = { status: 'insufficient_coverage', firstProven: false, firstObserved: observed, reason: 'first_activity_history_missing' };
   const pool = { protocol: 'uniswap_v4', pool: `0x${'92'.repeat(32)}`, pairedToken: USDC, creationBlock: 100,
     creationTxHash: `0x${'93'.repeat(32)}`, creationTimestamp: observed.timestamp, firstSwap: activity, firstLiquidity: activity,
     earlyActivity: { status: 'available', reason: null, hourStart: observed.timestamp, swapCount: 5, basis: 'pool_creation_UTC_hour' } };
@@ -2133,6 +2133,105 @@ await test('Completion ecosystem GET is isolated from other reads and never acce
   assert.ok(out.ecosystem); assert.equal(out.failed, false);
   const corrupt = completionEcosystem(); corrupt.discoveredTokens.rows[0].verifiedAsset = true;
   assert.equal(lib.parseArcEcosystem(corrupt, '24h'), null);
+});
+
+// Match the production contract: a stored pool can have no retained swap/liquidity event,
+// and a partial 30D response can still contain 19 verified discoveries and 50 proven launches.
+const missingActivityEcosystem = (window) => {
+  const data = completionEcosystem();
+  const hours = { '24h': 24, '7d': 168, '30d': 720 }[window];
+  data.window = { key: window, hours, start: isoAt(END - hours * HOUR_MS), end: isoAt(END) };
+  if (window === '30d') data.window.coverage = { status: 'partial', expectedHours: 720, availableHours: 560,
+    missingHours: 160, start: isoAt(END - 560 * HOUR_MS), end: isoAt(END),
+    completedUtcDays: Math.floor(END / (24 * HOUR_MS)) - Math.ceil((END - 560 * HOUR_MS) / (24 * HOUR_MS)) };
+  data.coverage.requiredHours = window === '30d' ? 560 : hours;
+  data.coverage.availableHours = 6;
+  data.coverage.unresolvedCandidateCount = 142619;
+  const token = data.launches.rows[0];
+  token.dex.observedPools[0].firstSwap = { status: 'unavailable', reason: 'activity_not_stored' };
+  token.dex.observedPools[0].earlyActivity = { status: 'unavailable', reason: 'creation_hour_projection_missing',
+    basis: 'pool_creation_UTC_hour', hourStart: null, swapCount: null };
+  const row = (index) => ({ ...structuredClone(token), address: `0x${(index + 1).toString(16).padStart(40, '0')}` });
+  data.discoveredTokens.rows = Array.from({ length: 19 }, (_, i) => row(i));
+  data.launches.rows = Array.from({ length: 50 }, (_, i) => row(i));
+  // Include both a known first pool with absent activity and a pool lacking any activity at all.
+  for (const list of [data.discoveredTokens, data.launches]) {
+    list.rows[0].dex.firstPool = structuredClone(list.rows[0].dex.observedPools[0]);
+    list.rows[0].dex.status = 'available';
+    list.rows[1].dex.observedPools[0].firstLiquidity = { status: 'unavailable', reason: 'activity_not_stored' };
+    list.rows[1].dex.firstDexActivity = { status: 'insufficient_coverage', reason: 'first_activity_history_missing',
+      value: null, firstObserved: null };
+    list.rows[2].dex = { status: 'unavailable', reason: 'no_verified_pool', firstPool: null, observedPools: [] };
+  }
+  // Unknown launch source is valid discovery evidence but must never enter the proven launch list.
+  data.discoveredTokens.rows[3].launch = { status: 'unknown_source', source: null, provenance: null };
+  return data;
+};
+for (const window of ['24h', '7d', '30d']) await test(`Ecosystem schema ${window} preserves missing activity and renders verified partial lists`, async () => {
+  const body = missingActivityEcosystem(window), original = structuredClone(body);
+  const parsed = lib.parseArcEcosystem(body, window);
+  assert.equal(parsed, body);
+  assert.deepEqual(parsed, original, 'parsing never fabricates an observation, proof, or zero');
+  assert.equal(parsed.discoveredTokens.rows.length, 19); assert.equal(parsed.launches.rows.length, 50);
+  assert.deepEqual(parsed.launches.rows[0].dex.firstPool.firstSwap, { status: 'unavailable', reason: 'activity_not_stored' });
+  assert.equal(lib.parseArcEcosystem(body, window === '24h' ? '7d' : '24h'), null);
+  const summary = structuredClone(READY_DATA.summary); summary.window = body.window;
+  const tree = render({ selectedWindow: window, data: { ...READY_DATA, window, summary, ecosystem: parsed } }).tree;
+  assert.match(textOf(sectionNode(tree, 'assets')), /19 verified ERC-20-like records; asset identities remain unverified/);
+  assert.equal(byAttr(tree, 'data-launch-token').length, 50);
+  const launches = textOf(sectionNode(tree, 'launches'));
+  assert.match(launches, /50 verified records shown \(latest 50; list capped\)/);
+  assert.match(launches, new RegExp(`Discovery coverage: 6 / ${body.coverage.requiredHours} hours`));
+  assert.match(launches, /Incomplete discovery does not hide proven launches/);
+  assert.match(launches, /First observed activity/); assert.match(launches, /Lifetime first unproven/);
+  assert.match(launches, /first_activity_history_missing/);
+});
+await test('Ecosystem schema rejects malformed or contradictory activity and token evidence in every window', async () => {
+  const mutations = [
+    row => row.dex.firstPool.firstSwap.firstProven = true,
+    row => row.dex.firstPool.firstSwap.firstObserved = row.dex.firstPool.firstLiquidity.firstObserved,
+    row => row.dex.firstPool.firstSwap.reason = 'invented_missing_reason',
+    row => row.dex.observedPools[0].firstLiquidity.firstProven = true,
+    row => row.dex.observedPools[0].firstLiquidity.firstObserved = null,
+    row => delete row.dex.observedPools[0].firstLiquidity.firstProven,
+    row => row.dex.observedPools[0].firstLiquidity.firstObserved.txHash = 'guessed',
+    row => row.dex.observedPools[0].firstLiquidity.firstObserved.timestamp = 'invalid',
+    row => row.dex.observedPools[0].firstLiquidity.firstObserved.blockNumber = -1,
+    row => row.dex.observedPools[0].firstLiquidity.firstObserved.logIndex = 1.5,
+    row => row.dex.firstDexActivity.status = 'available',
+    row => delete row.dex.firstDexActivity.firstObserved.firstProven,
+    row => row.dex.firstDexActivity.firstObserved.txHash = 'guessed',
+    row => row.dex.firstPool.pool = `0x${'12'.repeat(20)}`,
+    row => row.dex.firstPool.pairedToken = 'guessed',
+    row => row.dex.firstPool.creationTxHash = 'guessed',
+    row => row.dex.firstPool.creationTimestamp = 'invalid',
+    row => row.address = 'guessed',
+    row => row.status = 'unverified',
+    row => row.verifiedAsset = true,
+    row => row.deployment.transactionHash = 'guessed',
+    row => row.deployment.timestamp = 'invalid',
+    row => row.deployment.blockNumber = -1,
+    row => row.deployment.deployer = 'guessed',
+    row => row.observedBlock = -1,
+    row => row.launch.observedAt = 'invalid',
+    row => row.launch.source = 'guessed_direct_source',
+    row => row.launch = { status: 'verified_factory', source: null },
+    row => row.launch = { status: 'verified_launchpad', source: '' },
+  ];
+  for (const window of ['24h', '7d', '30d']) {
+    for (const list of ['discoveredTokens', 'launches']) for (const mutate of mutations) {
+      const body = missingActivityEcosystem(window); mutate(body[list].rows[0]);
+      assert.equal(lib.parseArcEcosystem(body, window), null, `${window} ${list}: ${mutate}`);
+    }
+    const unknown = missingActivityEcosystem(window); unknown.launches.rows[0].launch = { status: 'unknown_source', source: null };
+    assert.equal(lib.parseArcEcosystem(unknown, window), null);
+    const capped = missingActivityEcosystem(window); capped.launches.rows.push(structuredClone(capped.launches.rows[0]));
+    assert.equal(lib.parseArcEcosystem(capped, window), null);
+    const proven = missingActivityEcosystem(window);
+    const pool = proven.launches.rows[0].dex.firstPool;
+    pool.firstSwap = { ...structuredClone(pool.firstLiquidity), status: 'available', firstProven: true, reason: null };
+    assert.ok(lib.parseArcEcosystem(proven, window), 'genuinely proven activity still validates');
+  }
 });
 await test('Completion both 7D and 30D daily-active charts preserve persisted completed-day values', async () => {
   for (const [window, days] of [['7d', 7], ['30d', 30]]) {

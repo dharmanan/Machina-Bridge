@@ -314,8 +314,10 @@ export function createArcIntelligenceRefresh({ onResult, onRefreshing, loader = 
   }
 }
 
-export type DiscoveryActivity = { firstProven: boolean; reason: string | null;
-  firstObserved: { timestamp: string; blockNumber: number; logIndex: number; txHash: string } | null }
+export type DiscoveryActivity = { status: 'unavailable'; reason: 'activity_not_stored';
+  firstProven?: false; firstObserved?: null } | { status: 'available' | 'insufficient_coverage';
+  firstProven: boolean; reason: string | null;
+  firstObserved: { timestamp: string; blockNumber: number; logIndex: number; txHash: string } }
 export type DiscoveryPool = { protocol: string; pool: string; pairedToken: string; creationBlock: number;
   creationTimestamp: string | null; creationTxHash: string; firstSwap: DiscoveryActivity; firstLiquidity: DiscoveryActivity;
   earlyActivity: { status: string; reason: string | null; hourStart: string | null; swapCount: number | null; basis: string } }
@@ -339,27 +341,48 @@ export function parseArcEcosystem(value: Record<string, unknown> | null, selecte
   const date = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value))
   const hash = (value: unknown) => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value)
   const count = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0
-  const activity = (value: unknown) => isRecord(value) && typeof value.firstProven === 'boolean'
-    && (value.firstObserved === null || isRecord(value.firstObserved) && date(value.firstObserved.timestamp)
-      && count(value.firstObserved.blockNumber) && hash(value.firstObserved.txHash))
+  const observed = (value: unknown): value is Record<string, unknown> => isRecord(value) && date(value.timestamp)
+    && count(value.blockNumber) && count(value.logIndex) && hash(value.txHash)
+  const activity = (value: unknown) => {
+    if (!isRecord(value)) return false
+    // The backend deliberately omits proof/observation fields when no event was stored.
+    // Accept that state as missing evidence, never as an observed or proven first activity.
+    if (value.status === 'unavailable') return value.reason === 'activity_not_stored'
+      && (value.firstProven === undefined || value.firstProven === false)
+      && (value.firstObserved === undefined || value.firstObserved === null)
+    return (value.status === 'available' && value.firstProven === true && value.reason === null
+      || value.status === 'insufficient_coverage' && value.firstProven === false && value.reason === 'first_activity_history_missing')
+      && observed(value.firstObserved)
+  }
   const pool = (value: unknown) => isRecord(value) && (value.protocol === 'uniswap_v3' || value.protocol === 'uniswap_v4')
     && typeof value.pool === 'string' && (value.protocol === 'uniswap_v3' ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/).test(value.pool)
+    && typeof value.pairedToken === 'string' && /^0x[0-9a-f]{40}$/.test(value.pairedToken)
+    && (value.creationTimestamp === null || date(value.creationTimestamp))
     && count(value.creationBlock) && hash(value.creationTxHash) && activity(value.firstSwap) && activity(value.firstLiquidity)
     && isRecord(value.earlyActivity) && typeof value.earlyActivity.status === 'string'
     && (value.earlyActivity.swapCount === null || count(value.earlyActivity.swapCount))
   if (!count(data.coverage.availableHours) || !count(data.coverage.requiredHours) || data.coverage.requiredHours > 720
     || data.coverage.availableHours > data.coverage.requiredHours || !date(data.window.start) || !date(data.window.end)) return null
-  const validTokens = (rows: unknown) => Array.isArray(rows) && rows.length <= 50 && rows.every((row) => row
-    && /^0x[0-9a-f]{40}$/.test(row.address) && row.status === 'verified_erc20_like' && row.verifiedAsset === false
+  const validTokens = (rows: unknown) => Array.isArray(rows) && rows.length <= 50 && rows.every((row) => isRecord(row)
+    && typeof row.address === 'string' && /^0x[0-9a-f]{40}$/.test(row.address) && row.status === 'verified_erc20_like' && row.verifiedAsset === false
     && typeof row.discoveredAt === 'string' && Number.isFinite(Date.parse(row.discoveredAt))
-    && Number.isSafeInteger(row.observedBlock) && row.deployment && row.launch && row.dex
+    && count(row.observedBlock) && isRecord(row.deployment) && isRecord(row.launch) && isRecord(row.dex)
     && typeof row.launch.status === 'string' && (row.launch.source === null || typeof row.launch.source === 'string')
+    && (row.launch.observedAt === undefined || date(row.launch.observedAt))
+    && (row.launch.status !== 'direct_deployment' || row.launch.source === null)
+    && (!['verified_factory', 'verified_launchpad'].includes(row.launch.status)
+      || typeof row.launch.source === 'string' && row.launch.source.length > 0)
     && (row.deployment.transactionHash === undefined || hash(row.deployment.transactionHash))
     && (row.deployment.timestamp === undefined || date(row.deployment.timestamp))
+    && (row.deployment.blockNumber === undefined || count(row.deployment.blockNumber))
+    && (row.deployment.deployer === undefined || typeof row.deployment.deployer === 'string' && /^0x[0-9a-f]{40}$/.test(row.deployment.deployer))
     && (row.dex.firstPool === undefined || row.dex.firstPool === null || pool(row.dex.firstPool))
     && (row.dex.observedPools === undefined || Array.isArray(row.dex.observedPools) && row.dex.observedPools.length <= 50 && row.dex.observedPools.every(pool))
-    && (row.dex.firstDexActivity?.firstObserved == null || date(row.dex.firstDexActivity.firstObserved.timestamp)
-      && count(row.dex.firstDexActivity.firstObserved.blockNumber) && hash(row.dex.firstDexActivity.firstObserved.txHash))
+    && (row.dex.firstDexActivity === undefined || isRecord(row.dex.firstDexActivity)
+      && (row.dex.firstDexActivity.status === 'available' || row.dex.firstDexActivity.status === 'insufficient_coverage')
+      && (row.dex.firstDexActivity.firstObserved === null && row.dex.firstDexActivity.status === 'insufficient_coverage'
+        || observed(row.dex.firstDexActivity.firstObserved) && typeof row.dex.firstDexActivity.firstObserved.firstProven === 'boolean'
+          && (row.dex.firstDexActivity.status !== 'available' || row.dex.firstDexActivity.firstObserved.firstProven === true)))
     && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 128))
   if (!validTokens(data.discoveredTokens.rows) || !validTokens(data.launches.rows)
     || data.launches.rows.some((row) => !['direct_deployment', 'verified_factory', 'verified_launchpad'].includes(row.launch.status))) return null
