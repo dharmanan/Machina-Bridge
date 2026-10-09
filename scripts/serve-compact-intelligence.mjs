@@ -13,6 +13,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
+import { createEcosystemReader } from '../server/compact/ecosystem-reader.js';
 import { createChildHistoryRunner, createChildHourRunner, createChildDiscoveryRunner, createScheduler } from '../server/compact/scheduler.js';
 import { ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR } from './backfill-compact-history.mjs';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
@@ -64,7 +65,7 @@ export function startIntelligenceService({ config, readModel, scheduler, server,
         setTimeout(() => server.closeAllConnections?.(), 2_000).unref?.();
       });
       // 3. The read connection last: nothing can use it any more.
-      try { readModel.close(); } catch { log('SERVICE_READ_MODEL_CLOSE_FAILED'); }
+      try { await readModel.close(); } catch { log('SERVICE_READ_MODEL_CLOSE_FAILED'); }
       clearTimeout(forced);
       exit(code);
     })();
@@ -122,8 +123,11 @@ async function main() {
     readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair,
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
   });
-  const server = createIntelligenceServer({ readModel, log, onFatal: fatal });
-  service = startIntelligenceService({ config, readModel, scheduler, server, log });
+  const ecosystemReader = createEcosystemReader({ path: config.sqlitePath });
+  const httpReadModel = { ...readModel, ecosystem: (window) => ecosystemReader.read(window),
+    async close() { await ecosystemReader.close(); readModel.close(); } };
+  const server = createIntelligenceServer({ readModel: httpReadModel, log, onFatal: fatal });
+  service = startIntelligenceService({ config, readModel: httpReadModel, scheduler, server, log });
   process.once('SIGTERM', () => { void service.shutdown(0, 'SIGTERM'); });
   process.once('SIGINT', () => { void service.shutdown(0, 'SIGINT'); });
   process.on('uncaughtException', (error) => {

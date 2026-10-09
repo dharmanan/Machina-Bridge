@@ -20,7 +20,10 @@ import { headerOf } from '../server/compact/spine.js';
 import { drainDiscovery, discoveryDrainConfig } from './drain-compact-discovery.mjs';
 
 let passed = 0;
-async function test(name, fn) { await fn(); passed += 1; console.log(`PASS ${name}`); }
+async function test(name, fn) {
+  if (process.env.ECOSYSTEM_TEST_FILTER && !name.includes(process.env.ECOSYSTEM_TEST_FILTER)) return;
+  await fn(); passed += 1; console.log(`PASS ${name}`);
+}
 globalThis.fetch = async () => { throw new Error('network_forbidden'); };
 const address = (n) => `0x${n.toString(16).padStart(40, '0')}`;
 const hash = (n) => `0x${n.toString(16).padStart(64, '0')}`;
@@ -703,5 +706,71 @@ await test('combined bounded lists retain proven launches and explicit verified 
   assert.equal(bounded.discoveredTokens.truncated, true);
   assert.equal(bounded.discoveredTokens.reason, 'bounded_response_limit');
   assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 240 * 1024);
+});
+await test('incremental byte budgeting preserves legacy trimming exactly, including Unicode and existing reasons', () => {
+  const reference = (out) => {
+    const bytes = () => Buffer.byteLength(JSON.stringify(out));
+    for (const name of ['contractCandidates','discoveredTokens','launches']) {
+      const list = out[name];
+      while (bytes() > 240 * 1024 && list.rows.length > 1) {
+        list.rows.pop(); list.truncated = true; list.reason = 'bounded_response_limit';
+      }
+    }
+    return bytes() > 240 * 1024 ? null : out;
+  };
+  for (let variant = 0; variant < 24; variant++) {
+    const out = { fixed: 'x'.repeat(variant % 4 === 0 ? 230000 : 1000),
+      ...Object.fromEntries(['contractCandidates','discoveredTokens','launches'].map((name, n) => [name, {
+        rows: Array.from({ length: variant % 7 ? 50 : n }, (_, i) => ({ address: address(i), proof: '🎯"\\'.repeat(100 + variant * 23) })),
+        truncated: variant % 2 === 0, ...(variant % 3 ? {} : { reason: 'initial_reason' }) }])) };
+    assert.deepEqual(boundEcosystemResponse(structuredClone(out)), reference(structuredClone(out)));
+  }
+});
+await test('thin candidate selection preserves earliest identity scope and verified preference in every window', async () => {
+  const { db, store } = fixture();
+  for (let i = 0; i < 560; i++) store.commitHour(hour(i));
+  const verified = await verifyTokenCandidate(rpcDouble(), candidate);
+  const insert = db.prepare(`INSERT INTO compact_token_discoveries
+    (candidate_key,hour_start,block_number,address,candidate_json,result_json,status,reason) VALUES (?,?,?,?,?,?,?,?)`);
+  const add = (key, i, token, status, launchStatus) => {
+    const fact = { ...candidate, timestamp: BASE+i*3600+10, blockNumber: 101+i*10 };
+    const result = status === 'verified_erc20_like' ? { ...verified, ...fact, address: token,
+      launch: { status: launchStatus, source: null }, directDeploymentVerified: true } : null;
+    insert.run(key, BigInt(BASE+i*3600), BigInt(fact.blockNumber), token, JSON.stringify(fact),
+      result && JSON.stringify(result), status, result ? null : 'unverified');
+  };
+  add('early-unverified',0,address(9500),'unverified',null);
+  add('late-verified',559,address(9500),'verified_erc20_like','direct_deployment');
+  add('recent-unverified',559,address(9501),'unverified',null);
+  add('recent-verified',559,address(9501),'verified_erc20_like','direct_deployment');
+  add('earlier-direct',558,address(9502),'verified_erc20_like','direct_deployment');
+  add('preferred-source',559,address(9502),'verified_erc20_like','verified_factory');
+  for (const window of ['24h','7d','30d']) {
+    const data = readEcosystem(db,window);
+    assert.equal(data.discoveredTokens.rows.some(row => row.address===address(9500)),window==='30d');
+    assert.equal(data.discoveredTokens.rows.filter(row=>row.address===address(9501)).length,1);
+    assert.equal(data.contractCandidates.rows.some(row=>row.address===address(9501)),false);
+    const preferred=data.discoveredTokens.rows.find(row=>row.address===address(9502));
+    assert.equal(preferred.observedBlock,5691);
+    assert.equal(preferred.launch.status,'unknown_source','current registry validation remains strict after ranking');
+    assert.equal(data.launches.rows.find(row=>row.address===address(9502)).observedBlock,5681);
+  }
+  db.close();
+});
+await test('async Ecosystem HTTP responses preserve size limits ETags and sanitized errors', async () => {
+  const { db, store } = fixture(); store.commitHour(hour()); const value=readEcosystem(db,'24h');
+  const make = (ecosystem) => createIntelligenceHandler({ readModel: { health() {}, summary() {}, timeseries() {}, pools() {}, activity() {}, ecosystem } });
+  const call = async (handler, headers={}) => {
+    const out = { writeHead(status,headers) { this.status=status; this.headers=headers; }, end(body) { this.body=body; }, destroy() { this.destroyed=true; } };
+    await handler({ method:'GET',url:'/v1/intelligence/ecosystem?window=24h',headers },out); return out;
+  };
+  const handler=make(async ()=>value),first=await call(handler);
+  assert.equal(first.status,200); assert.deepEqual(JSON.parse(first.body),JSON.parse(JSON.stringify(value)));
+  const cached=await call(handler,{'if-none-match':first.headers.ETag}); assert.equal(cached.status,304);
+  const oversized=await call(make(async ()=>({ padding:'x'.repeat(256*1024) })));
+  assert.equal(oversized.status,503); assert.equal(JSON.parse(oversized.body).error,'response_too_large');
+  const rejected=await call(make(async ()=>{throw Object.assign(new Error('private SQL/path'),{code:'ecosystem_read_timeout'});}));
+  assert.equal(rejected.status,503); assert.equal(rejected.headers['Cache-Control'],'no-store');
+  assert.deepEqual(JSON.parse(rejected.body),{error:'unavailable'}); db.close();
 });
 console.log(`VERIFIER PASS arc-intelligence-ecosystem ${passed} tests (no network, real SQLite)`);

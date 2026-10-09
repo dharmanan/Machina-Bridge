@@ -187,29 +187,52 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
     .all(BigInt(from), BigInt(to), INTELLIGENCE_VERSION, registryDigest(registry));
   const payloads = new Map(rows.map((row) => [row.hour_start, parse(row)]));
   const covered = rows.filter((row) => row.discovery_status === 'available').length;
-  const candidateSql = `SELECT * FROM (SELECT d.*, MIN(hour_start) OVER(PARTITION BY COALESCE(address,candidate_key)) AS first_observed_hour,
-    ROW_NUMBER() OVER(PARTITION BY COALESCE(address,candidate_key)
-    ORDER BY CASE status WHEN 'verified_erc20_like' THEN 0 ELSE 1 END,
+  // Rank only thin identity keys in the selected interval. The existing address index proves that an identity
+  // was not observed before this window; full JSON bodies are fetched only after the 51-row limit.
+  const firstInWindow = `NOT EXISTS (SELECT 1 FROM compact_token_discoveries earlier
+    WHERE earlier.address=d.address AND earlier.hour_start<?)`;
+  const candidateSql = (verified) => `WITH ranked AS (SELECT d.candidate_key,d.block_number,
+    ROW_NUMBER() OVER(PARTITION BY COALESCE(d.address,d.candidate_key)
+    ORDER BY
     CASE json_extract(result_json,'$.launch.status') WHEN 'verified_factory' THEN 0 WHEN 'verified_launchpad' THEN 0
-    WHEN 'direct_deployment' THEN 1 ELSE 2 END,block_number ASC,candidate_key ASC) AS priority
-    FROM compact_token_discoveries d WHERE hour_start<=?) WHERE priority=1 AND first_observed_hour BETWEEN ? AND ?`;
+    WHEN 'direct_deployment' THEN 1 ELSE 2 END,d.block_number ASC,d.candidate_key ASC) AS priority
+    FROM compact_token_discoveries d WHERE d.hour_start BETWEEN ? AND ? AND ${firstInWindow}
+    AND d.status${verified ? '=' : '<>'}'verified_erc20_like'
+    ${verified ? '' : `AND NOT EXISTS (SELECT 1 FROM compact_token_discoveries v
+      WHERE v.address=d.address AND v.status='verified_erc20_like' AND v.hour_start<=?)`}),
+    chosen AS (SELECT candidate_key,block_number FROM ranked WHERE priority=1 ORDER BY block_number DESC,candidate_key ASC LIMIT 51)
+    SELECT d.* FROM chosen JOIN compact_token_discoveries d USING(candidate_key) ORDER BY chosen.block_number DESC,chosen.candidate_key ASC`;
   // Filter BEFORE the bounded limit: a large unresolved queue must not hide existing verified tokens.
-  const candidates = db.prepare(`${candidateSql} AND status='verified_erc20_like'
-    ORDER BY block_number DESC,candidate_key ASC LIMIT 51`).all(BigInt(to), BigInt(from), BigInt(to));
-  const unresolvedCandidates = db.prepare(`${candidateSql} AND status<>'verified_erc20_like'
-    ORDER BY block_number DESC,candidate_key ASC LIMIT 51`).all(BigInt(to), BigInt(from), BigInt(to));
-  const launchCandidates = db.prepare(`SELECT * FROM (SELECT d.*,ROW_NUMBER() OVER(PARTITION BY address ORDER BY block_number,candidate_key) AS priority
+  const candidates = db.prepare(candidateSql(true)).all(BigInt(from), BigInt(to), BigInt(from));
+  const unresolvedCandidates = db.prepare(candidateSql(false)).all(BigInt(from), BigInt(to), BigInt(from), BigInt(to));
+  const launchCandidates = db.prepare(`WITH ranked AS (SELECT d.candidate_key,d.block_number,
+    ROW_NUMBER() OVER(PARTITION BY address ORDER BY block_number,candidate_key) AS priority
     FROM compact_token_discoveries d WHERE hour_start BETWEEN ? AND ? AND status='verified_erc20_like'
-    AND json_extract(result_json,'$.launch.status') IN ('verified_factory','verified_launchpad','direct_deployment')) WHERE priority=1
-    ORDER BY block_number DESC,candidate_key ASC LIMIT 51`).all(BigInt(from),BigInt(to));
+    AND json_extract(result_json,'$.launch.status') IN ('verified_factory','verified_launchpad','direct_deployment')),
+    chosen AS (SELECT candidate_key,block_number FROM ranked WHERE priority=1 ORDER BY block_number DESC,candidate_key ASC LIMIT 51)
+    SELECT d.* FROM chosen JOIN compact_token_discoveries d USING(candidate_key)
+    ORDER BY chosen.block_number DESC,chosen.candidate_key ASC`).all(BigInt(from),BigInt(to));
+  const correlate = createDexCorrelator(db, [...candidates.slice(0,50), ...launchCandidates.slice(0,50)].map(row => row.address),
+    checkpoint.last_block, { registry });
+  const metadata = new Map(), tokenRows = new Map();
+  const addresses = [...new Set([...candidates.slice(0,50), ...unresolvedCandidates.slice(0,50), ...launchCandidates.slice(0,50)]
+    .map(row => row.address).filter(Boolean))];
+  if (addresses.length) for (const row of db.prepare(`WITH wanted(address) AS (VALUES ${addresses.map(() => '(?)').join(',')})
+    SELECT w.address,
+    (SELECT candidate_json FROM compact_token_discoveries WHERE address=w.address ORDER BY block_number,candidate_key LIMIT 1) AS first_json,
+    (SELECT result_json FROM compact_token_discoveries WHERE address=w.address AND json_extract(result_json,'$.directDeploymentVerified')=1
+      ORDER BY block_number,candidate_key LIMIT 1) AS deployment_json FROM wanted w`).all(...addresses)) {
+    metadata.set(row.address, { first: row.first_json ? { candidate_json: row.first_json } : null,
+      deployment: row.deployment_json ? { result_json: row.deployment_json } : null });
+  }
   const token = (row) => {
+    if (tokenRows.has(row.candidate_key)) return tokenRows.get(row.candidate_key);
     const candidate = JSON.parse(row.candidate_json);
     const result = row.result_json && JSON.parse(row.result_json);
     const verified = row.status === 'verified_erc20_like';
     const rejected = row.status === 'rejected_not_erc20_like';
     const direct = result?.directDeploymentVerified === true;
-    const deploymentRow = !direct && row.address ? db.prepare(`SELECT result_json FROM compact_token_discoveries WHERE address=?
-      AND json_extract(result_json,'$.directDeploymentVerified')=1 ORDER BY block_number,candidate_key LIMIT 1`).get(row.address) : null;
+    const deploymentRow = !direct ? metadata.get(row.address)?.deployment : null;
     const deployment = direct ? candidate : deploymentRow ? JSON.parse(deploymentRow.result_json) : null;
     let launch = result?.launch;
     if (launch?.observedAt !== undefined) launch = { ...launch, observedAt: iso(launch.observedAt) };
@@ -219,24 +242,26 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
         && entry.events.some(spec => spec.event.signature === result.launchEvidence.eventSignature)
         && (!entry.factoryVerification || result.launchEvidence.factoryEvidence?.status === 'verified'))) launch = { status: 'unknown_source', source: null,
       reason: 'registry_definition_not_current', provenance: null };
-    return { address: row.address, status: row.status, reason: row.reason, verifiedAsset: false,
+    const value = { address: row.address, status: row.status, reason: row.reason, verifiedAsset: false,
       symbol: result?.symbol ?? null, name: result?.name ?? null, decimals: result?.decimals ?? null,
       discoveredAt: (() => {
-        const first = row.address ? db.prepare('SELECT candidate_json FROM compact_token_discoveries WHERE address=? ORDER BY block_number,candidate_key LIMIT 1').get(row.address) : null;
+        const first = metadata.get(row.address)?.first;
         return iso(first ? JSON.parse(first.candidate_json).timestamp : candidate.timestamp);
       })(), observedBlock: candidate.blockNumber,
       deployment: deployment ? { transactionHash: deployment.txHash, blockNumber: deployment.blockNumber, timestamp: iso(deployment.timestamp), deployer: deployment.deployer }
         : { status: 'unavailable', reason: 'deployment_not_proven' },
       verification: result?.verification ?? null,
       launch: verified ? launch : { status: rejected ? 'not_applicable' : 'unverified', source: null, provenance: null },
-      dex: verified ? correlateDex(db, row.address, checkpoint.last_block, { registry }) : unavailable(rejected ? 'rejected_not_erc20_like' : 'token_unverified') };
+      dex: verified ? correlate(row.address) : unavailable(rejected ? 'rejected_not_erc20_like' : 'token_unverified') };
+    tokenRows.set(row.candidate_key, value);
+    return value;
   };
   const tokens = candidates.slice(0, 50).map(token);
   const verificationCounts = db.prepare(`SELECT status,COUNT(*) AS n FROM compact_token_discoveries WHERE hour_start BETWEEN ? AND ? GROUP BY status`)
     .all(BigInt(from), BigInt(to));
   const unresolved = verificationCounts.filter((row) => UNRESOLVED_STATUSES.includes(row.status)).reduce((n, row) => n + row.n, 0);
   const full = covered === hours;
-  const firstDexCoverage = rows.filter((row) => JSON.parse(row.payload_json).firstDexComplete === true).length;
+  const firstDexCoverage = [...payloads.values()].filter((row) => row.firstDexComplete === true).length;
   const exchangeBuckets = [];
   const protocolBuckets = [];
   for (let hour = from; hour <= to; hour += HOUR) {
@@ -282,15 +307,20 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
 }
 
 export function boundEcosystemResponse(out) {
-  const bytes = () => Buffer.byteLength(intelligenceJson(out));
+  const bytes = (value) => Buffer.byteLength(intelligenceJson(value));
+  let total = bytes(out);
   // Give proven launches priority, preserve at least one row from each non-empty collection, never invent completeness.
   for (const name of ['contractCandidates', 'discoveredTokens', 'launches']) {
     const list = out[name];
-    while (bytes() > 240 * 1024 && list.rows.length > 1) {
-      list.rows.pop(); list.truncated = true; list.reason = 'bounded_response_limit';
+    let header = bytes({ ...list, rows: [] });
+    while (total > 240 * 1024 && list.rows.length > 1) {
+      total -= bytes(list.rows.pop()) + 1; // One serialized row and its comma, retaining at least one row.
+      list.truncated = true; list.reason = 'bounded_response_limit';
+      const changed = bytes({ ...list, rows: [] });
+      total += changed - header; header = changed;
     }
   }
-  return bytes() > 240 * 1024 ? null : out;
+  return total > 240 * 1024 ? null : out;
 }
 
 export function sumProtocols(buckets) {
@@ -319,56 +349,134 @@ export function sumExchange(buckets) {
 
 // Registry completeness, not list length, is the prerequisite for a true first pool. Activity additionally needs
 // contiguous retained projections from pool creation through the observation. Earlier missing history never becomes zero.
-export function correlateDex(db, token, endBlock, { registry = INTELLIGENCE_REGISTRY } = {}) {
-  const pools = db.prepare(`SELECT * FROM compact_registry WHERE kind IN ('uniswap_v3_pool','uniswap_v4_pool') AND created_block<=?
-    AND (lower(json_extract(meta_json,'$.token0'))=? OR lower(json_extract(meta_json,'$.token1'))=?
-      OR lower(json_extract(meta_json,'$.currency0'))=? OR lower(json_extract(meta_json,'$.currency1'))=?)
-    ORDER BY created_block,created_log_index,kind,address LIMIT 51`).all(BigInt(endBlock), token, token, token, token);
+function createDexCorrelator(db, tokens, endBlock, { registry }) {
+  let context = null;
+  const results = new Map();
+  return (token) => {
+    if (!context) context = dexReadContext(db, new Set(tokens), endBlock, registry);
+    if (!results.has(token)) results.set(token, correlatedDex(context, token, endBlock));
+    return results.get(token);
+  };
+}
+
+const poolKey = (protocol, pool) => `${protocol}:${pool}`;
+const lowerBound = (rows, value, field = 'hour_start') => {
+  let low = 0, high = rows.length;
+  while (low < high) { const mid = (low + high) >>> 1; if (rows[mid][field] < value) low = mid + 1; else high = mid; }
+  return low;
+};
+
+function dexReadContext(db, tokens, endBlock, registry) {
+  const poolsByToken = new Map([...tokens].map(token => [token, []]));
+  const uniquePools = new Map();
+  // No expression index or migration: one streamed registry pass, parsing each JSON once. Keep only the same
+  // first 51 matches per requested identity as before, in the exact established deterministic order.
+  for (const row of db.prepare(`SELECT * FROM compact_registry WHERE kind IN ('uniswap_v3_pool','uniswap_v4_pool') AND created_block<=?
+    ORDER BY created_block,created_log_index,kind,address`).iterate(BigInt(endBlock))) {
+    const meta = JSON.parse(row.meta_json);
+    for (const token of new Set([meta.token0, meta.token1, meta.currency0, meta.currency1].filter(value => typeof value === 'string').map(value => value.toLowerCase()))) {
+      const matches = poolsByToken.get(token);
+      if (!matches || matches.length >= 51) continue;
+      matches.push({ ...row, meta });
+      if (matches.length <= 50) uniquePools.set(poolKey(row.kind === 'uniswap_v3_pool' ? 'uniswap_v3' : 'uniswap_v4', row.address), row);
+    }
+  }
   const coverages = new Map(db.prepare('SELECT * FROM compact_registry_coverage').all().map((row) => [row.kind, row]));
   const registryComplete = [['uniswap_v3_pool', 1948019], ['uniswap_v4_pool', 1948056]].every(([kind, floor]) => {
     const row = coverages.get(kind); return row && row.from_block <= floor && row.through_block >= endBlock;
   });
+  const context = { poolsByToken, registryComplete, hours: [], projections: new Map(), projectionHours: new Map(),
+    intelligenceHours: [], observations: new Map(), activity: new Map() };
+  if (!uniquePools.size) return context;
+  context.hours = db.prepare('SELECT hour_start,first_block,last_block FROM compact_hours WHERE first_block<=? ORDER BY hour_start').all(BigInt(endBlock));
+  const from = context.hours[0]?.hour_start, to = context.hours.at(-1)?.hour_start;
+  if (from !== undefined) {
+    for (const row of db.prepare(`SELECT hour_start,projection,status FROM compact_projection_hours WHERE hour_start BETWEEN ? AND ?
+      AND projection IN ('uniswap_v3_pools','uniswap_v4_pools') ORDER BY hour_start`).all(BigInt(from), BigInt(to))) {
+      context.projections.set(`${row.projection}:${row.hour_start}`, row.status);
+      if (row.status === 'available') {
+        const list = context.projectionHours.get(row.projection) ?? [];
+        list.push(row); context.projectionHours.set(row.projection, list);
+      }
+    }
+    context.intelligenceHours = db.prepare(`SELECT hour_start FROM compact_intelligence_hours WHERE hour_start BETWEEN ? AND ?
+      AND definition_version=? AND registry_digest=? AND json_extract(payload_json,'$.firstDexComplete')=1 ORDER BY hour_start`)
+      .all(BigInt(from), BigInt(to), INTELLIGENCE_VERSION, registryDigest(registry));
+  }
+  const wanted = [...uniquePools.entries()].map(([key, row]) => {
+    const creationHour = creationHourOf(context, row.created_block);
+    return { key, row, protocol: row.kind === 'uniswap_v3_pool' ? 'uniswap_v3' : 'uniswap_v4', creationHour };
+  });
+  const placeholders = wanted.map(() => '(?,?,?,?,?)').join(',');
+  // The pre-existing first-observation index serves three bounded seeks per unique pool, in one statement.
+  // Do not read/rank every historical observation or fetch every pool's creation/coverage again for each token.
+  const first = db.prepare(`WITH wanted(protocol,pool,created_block,created_tx,creation_hour) AS (VALUES ${placeholders})
+    SELECT w.protocol,w.pool,
+    ${['swap', 'liquidity'].map(activity => `(SELECT json_object('hour_start',hour_start,'timestamp',timestamp,'block_number',block_number,
+      'log_index',log_index,'tx_hash',tx_hash) FROM compact_token_dex_observations WHERE protocol=w.protocol AND pool=w.pool
+      AND activity='${activity}' AND block_number<=? ORDER BY block_number,log_index LIMIT 1) AS ${activity}_json`).join(',')},
+    (SELECT timestamp FROM compact_token_dex_observations WHERE protocol=w.protocol AND pool=w.pool AND activity='creation'
+      AND block_number=w.created_block AND tx_hash=w.created_tx LIMIT 1) AS creation_timestamp,
+    (SELECT swap_count FROM compact_pool_hours WHERE hour_start=w.creation_hour AND protocol=w.protocol AND pool=w.pool) AS early_swaps
+    FROM wanted w`).all(...wanted.flatMap(({ row, protocol, creationHour }) => [protocol, row.address, BigInt(row.created_block), row.created_tx,
+      creationHour ? BigInt(creationHour.hour_start) : null]), BigInt(endBlock), BigInt(endBlock));
+  for (const row of first) context.observations.set(poolKey(row.protocol, row.pool), {
+    ...row, swap: row.swap_json ? JSON.parse(row.swap_json) : null, liquidity: row.liquidity_json ? JSON.parse(row.liquidity_json) : null });
+  const addresses = [...new Set(wanted.map(({ row }) => row.address))];
+  for (const row of db.prepare(`SELECT h.protocol,h.pool,SUM(h.swap_count) AS swaps FROM compact_pool_hours h
+    WHERE h.protocol IN ('uniswap_v3','uniswap_v4') AND h.pool IN (${addresses.map(() => '?').join(',')})
+    AND h.hour_start IN (SELECT hour_start FROM compact_hours WHERE last_block<=?) GROUP BY h.protocol,h.pool`)
+    .all(...addresses, BigInt(endBlock))) context.activity.set(poolKey(row.protocol, row.pool), row);
+  return context;
+}
+
+function creationHourOf(context, block) {
+  const index = lowerBound(context.hours, block, 'last_block');
+  const hour = context.hours[index];
+  return hour && hour.first_block <= block ? hour : null;
+}
+
+export function correlateDex(db, token, endBlock, { registry = INTELLIGENCE_REGISTRY } = {}) {
+  return createDexCorrelator(db, [token], endBlock, { registry })(token);
+}
+
+function correlatedDex(context, token, endBlock) {
+  const pools = context.poolsByToken.get(token) ?? [];
+  const registryComplete = context.registryComplete;
   if (!pools.length) return { ...unavailable(registryComplete ? 'no_verified_pool' : 'insufficient_coverage'), firstPool: null, observedPools: [] };
   const observedPools = pools.slice(0, 50).map((row) => {
-    const meta = JSON.parse(row.meta_json);
+    const meta = row.meta;
     const token0 = meta.token0 ?? meta.currency0; const token1 = meta.token1 ?? meta.currency1;
     const protocol = row.kind === 'uniswap_v3_pool' ? 'uniswap_v3' : 'uniswap_v4';
+    const evidence = context.observations.get(poolKey(protocol, row.address));
+    const creationHour = creationHourOf(context, row.created_block);
     const firstOf = (activity) => {
-      const observed = db.prepare(`SELECT * FROM compact_token_dex_observations WHERE protocol=? AND pool=? AND activity=? AND block_number<=?
-        ORDER BY block_number,log_index LIMIT 1`).get(protocol, row.address, activity, BigInt(endBlock));
+      const observed = evidence?.[activity];
       if (!observed) return unavailable('activity_not_stored');
-      const start = db.prepare('SELECT hour_start FROM compact_hours WHERE first_block<=? AND last_block>=?').get(BigInt(row.created_block), BigInt(row.created_block));
+      const start = creationHour;
       let complete = false;
       if (start) {
-        const count = db.prepare(`SELECT COUNT(*) AS n FROM compact_projection_hours WHERE hour_start BETWEEN ? AND ? AND projection=? AND status='available'`)
-          .get(BigInt(start.hour_start), BigInt(observed.hour_start), `${protocol}_pools`).n;
+        const rows = context.projectionHours.get(`${protocol}_pools`) ?? [];
+        const count = lowerBound(rows, observed.hour_start + HOUR) - lowerBound(rows, start.hour_start);
         // New observation coverage is required too: older pool projections alone did not retain their earliest events.
-        const covered = db.prepare(`SELECT COUNT(*) AS n FROM compact_intelligence_hours WHERE hour_start BETWEEN ? AND ? AND definition_version=?
-          AND registry_digest=? AND json_extract(payload_json,'$.firstDexComplete')=1`)
-          .get(BigInt(start.hour_start), BigInt(observed.hour_start), INTELLIGENCE_VERSION, registryDigest(registry)).n;
+        const covered = lowerBound(context.intelligenceHours, observed.hour_start + HOUR) - lowerBound(context.intelligenceHours, start.hour_start);
         complete = count === (observed.hour_start - start.hour_start) / HOUR + 1 && covered === count;
       }
       return { status: complete ? 'available' : 'insufficient_coverage', reason: complete ? null : 'first_activity_history_missing',
         firstProven: complete, firstObserved: { timestamp: iso(observed.timestamp), blockNumber: observed.block_number,
           logIndex: observed.log_index, txHash: observed.tx_hash } };
     };
-    const activity = db.prepare(`SELECT MIN(h.hour_start) AS start,SUM(h.swap_count) AS swaps FROM compact_pool_hours h WHERE h.protocol=? AND h.pool=?
-      AND h.hour_start IN (SELECT hour_start FROM compact_hours WHERE last_block<=?)`).get(protocol, row.address, BigInt(endBlock));
-    const creationHour = db.prepare('SELECT hour_start,last_block FROM compact_hours WHERE first_block<=? AND last_block>=?')
-      .get(BigInt(row.created_block), BigInt(row.created_block));
-    const early = creationHour && creationHour.last_block <= endBlock ? db.prepare(`SELECT p.status,h.swap_count FROM compact_projection_hours p
-      LEFT JOIN compact_pool_hours h ON h.hour_start=p.hour_start AND h.protocol=? AND h.pool=? WHERE p.hour_start=? AND p.projection=?`)
-      .get(protocol, row.address, BigInt(creationHour.hour_start), `${protocol}_pools`) : null;
+    const activity = context.activity.get(poolKey(protocol, row.address));
+    const early = creationHour && creationHour.last_block <= endBlock ? {
+      status: context.projections.get(`${protocol}_pools:${creationHour.hour_start}`), swap_count: evidence?.early_swaps } : null;
     return { protocol, pool: row.address, pairedToken: token0 === token ? token1 : token0, creationBlock: row.created_block,
       creationTxHash: row.created_tx, creationTimestamp: (() => {
-        const observed = db.prepare(`SELECT timestamp FROM compact_token_dex_observations WHERE protocol=? AND pool=? AND activity='creation'
-          AND block_number=? AND tx_hash=? LIMIT 1`).get(protocol, row.address, BigInt(row.created_block), row.created_tx);
-        return observed ? iso(observed.timestamp) : null;
+        return evidence?.creation_timestamp !== null && evidence?.creation_timestamp !== undefined ? iso(evidence.creation_timestamp) : null;
       })(), firstSwap: firstOf('swap'), firstLiquidity: firstOf('liquidity'),
       earlyActivity: { status: early?.status === 'available' ? 'available' : 'unavailable',
         reason: early?.status === 'available' ? null : 'creation_hour_projection_missing', basis: 'pool_creation_UTC_hour',
         hourStart: creationHour ? iso(creationHour.hour_start) : null, swapCount: early?.status === 'available' ? early.swap_count ?? 0 : null },
-      observedSwapCount: activity.swaps ?? null, countScope: 'stored_pool_hours_only_not_full_lifetime' };
+      observedSwapCount: activity?.swaps ?? null, countScope: 'stored_pool_hours_only_not_full_lifetime' };
   });
   const observed = observedPools.flatMap((pool) => ['firstSwap','firstLiquidity'].flatMap((key) => pool[key].firstObserved
     ? [{ ...pool[key].firstObserved, pool: pool.pool, protocol: pool.protocol, activity: key === 'firstSwap' ? 'swap' : 'liquidity', firstProven: pool[key].firstProven }] : []))

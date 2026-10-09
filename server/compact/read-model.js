@@ -1068,7 +1068,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   return Object.freeze({
     ecosystem(windowKey) {
       if (typeof windowKey !== 'string' || !Object.hasOwn(ECOSYSTEM_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
-      return snapshot(() => { anchor(); return readEcosystem(connection(), windowKey); });
+      return cached(`ecosystem:${windowKey}`, () => snapshot(() => { anchor(); return readEcosystem(connection(), windowKey); }));
     },
     // Process alive, file readable, schema and family versions valid. No checkpoint yet is still healthy (empty store).
     health() {

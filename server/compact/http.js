@@ -74,6 +74,14 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
     res.end(text);
   }
 
+  function readFailed(error, res) {
+    const code = error?.code;
+    if (code === 'incompatible') onFatal?.(error);
+    log(`HTTP_READ_FAILED code=${typeof code === 'string' ? code : 'unknown'}`);
+    try { return send(res, 503, { error: PUBLIC_READ_ERRORS.has(code) ? code : 'unavailable' }); }
+    catch { res.destroy(); }
+  }
+
   return function handle(req, res) {
     try {
       const raw = req.url;
@@ -98,36 +106,36 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
       else if (route.kind === 'pools') payload = readModel.pools(route.protocol, route.window);
       else if (route.kind === 'ecosystem') payload = readModel.ecosystem(route.window);
       else payload = readModel.activity(route.type);
-      const text = JSON.stringify(payload);
-      const bytes = Buffer.byteLength(text);
-      if (bytes > maxResponseBytes) {
-        log(`HTTP_RESPONSE_TOO_LARGE route=${route.kind} bytes=${bytes}`);
-        return send(res, 503, { error: 'response_too_large' });
-      }
-      if (route.kind === 'health') {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': bytes, 'Cache-Control': 'no-store',
-          'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+      const deliver = (payload) => {
+        const text = JSON.stringify(payload);
+        const bytes = Buffer.byteLength(text);
+        if (bytes > maxResponseBytes) {
+          log(`HTTP_RESPONSE_TOO_LARGE route=${route.kind} bytes=${bytes}`);
+          return send(res, 503, { error: 'response_too_large' });
+        }
+        if (route.kind === 'health') {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': bytes, 'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+          return res.end(text);
+        }
+        // The tag is the hash of the exact body, so it changes whenever any served byte (including freshness) changes.
+        const etag = `"${createHash('sha256').update(text).digest('hex').slice(0, 40)}"`;
+        const cacheHeaders = { ETag: etag, 'Cache-Control': 'no-cache' };
+        if (ifNoneMatchHits(req.headers['if-none-match'], etag)) {
+          res.writeHead(304, { ...cacheHeaders, 'X-Content-Type-Options': 'nosniff' });
+          return res.end();
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': bytes, 'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'no-referrer', ...cacheHeaders });
         return res.end(text);
-      }
-      // The tag is the hash of the exact body, so it changes whenever any served byte (including freshness) changes.
-      const etag = `"${createHash('sha256').update(text).digest('hex').slice(0, 40)}"`;
-      const cacheHeaders = { ETag: etag, 'Cache-Control': 'no-cache' };
-      if (ifNoneMatchHits(req.headers['if-none-match'], etag)) {
-        res.writeHead(304, { ...cacheHeaders, 'X-Content-Type-Options': 'nosniff' });
-        return res.end();
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': bytes, 'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer', ...cacheHeaders });
-      return res.end(text);
+      };
+      // Production Ecosystem uses a bounded read-only worker. Other routes remain synchronous and independent.
+      if (payload && typeof payload.then === 'function') return payload.then((value) => {
+        try { return deliver(value); } catch (error) { return readFailed(error, res); }
+      }, (error) => readFailed(error, res));
+      return deliver(payload);
     } catch (error) {
-      const code = error?.code;
-      if (code === 'incompatible') onFatal?.(error);
-      log(`HTTP_READ_FAILED code=${typeof code === 'string' ? code : 'unknown'}`);
-      try {
-        return send(res, 503, { error: PUBLIC_READ_ERRORS.has(code) ? code : 'unavailable' });
-      } catch {
-        res.destroy();
-      }
+      return readFailed(error, res);
     }
   };
 }
