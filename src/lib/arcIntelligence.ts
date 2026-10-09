@@ -559,7 +559,7 @@ export function formatUtcDay(iso: string): string {
   return Number.isNaN(date.getTime()) ? '' : `${date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} ${date.getUTCDate()}`
 }
 
-// The exact range of one chart period: "13:00-14:00 UTC" for an hour, "Oct 2, 14:00 to Oct 3, 14:00 UTC" for a 24-hour period.
+// The exact range of one chart period: "13:00-14:00 UTC" for an hour, "Oct 2, 00:00 to Oct 3, 00:00 UTC" for a complete UTC day.
 export function formatUtcPeriodRange(start: string, end: string, period: 'hour' | 'day'): string {
   if (period === 'hour') return formatUtcHourRange(start, end)
   return `${formatUtcDateTime(start).replace(/ UTC$/, '')} to ${formatUtcDateTime(end)}`

@@ -68,7 +68,7 @@ type Mode = 'loading' | 'ready' | 'history' | 'failed'
 type ViewContext = {
   mode: Mode
   windowLabel: string
-  // 24H charts are hourly; 7D and 30D charts are daily (24-hour periods ending at the latest verified hour).
+  // 24H charts are hourly; 7D and 30D charts show complete UTC days, from midnight to midnight.
   period: 'hour' | 'day'
   // hours the selected window covers once complete (24, 168 or 720)
   windowHours: number
@@ -398,7 +398,7 @@ function BarChart({ points, series, unit, period = 'hour', format = formatCount,
         ))}
       </div>
       <p className="mt-1 text-right text-[10px] text-slate-400">
-        {period === 'day' ? 'Days in UTC, each the 24 hours ending at the same hour as the latest verified hour' : 'Hours in UTC'}
+        {period === 'day' ? 'Days in UTC, each from midnight to midnight' : 'Hours in UTC'}
       </p>
     </div>
   )

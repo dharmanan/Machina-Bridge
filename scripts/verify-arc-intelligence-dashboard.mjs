@@ -14,7 +14,8 @@ import borrowHandler from '../api/borrow-markets.js';
 import { BORROW_CACHE_CONTROL, BORROW_COLLATERAL_ASSET, BORROW_LOAN_ASSET, BORROW_MARKETS_SCHEMA as PROXY_BORROW_SCHEMA,
   BORROW_MARKETS_UPSTREAM_URL, compatibleBorrowMarkets, handleBorrowMarketsProxy, normalizeBorrowMarketsPage } from '../api/_lib/borrow-markets-proxy.js';
 import { ARC_VERIFIED_ASSETS } from '../api/_lib/arc-intelligence/assets.js';
-import { ACTIVITY_SCHEMA, DATA_CACHE_CONTROL, NO_STORE, POOLS_SCHEMA, resolveIntelligenceRoute, SUMMARY_SCHEMA, TIMESERIES_SCHEMA } from '../api/_lib/intelligence-proxy.js';
+import { ACTIVITY_SCHEMA, DATA_CACHE_CONTROL, ECOSYSTEM_SCHEMA, NO_STORE, POOLS_SCHEMA, resolveIntelligenceRoute, SUMMARY_SCHEMA, TIMESERIES_SCHEMA } from '../api/_lib/intelligence-proxy.js';
+import { ECOSYSTEM_SCHEMA as BACKEND_ECOSYSTEM_SCHEMA } from '../server/compact/intelligence-registry.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { ACTIVITY_SCHEMA as BACKEND_ACTIVITY_SCHEMA, POOLS_SCHEMA as BACKEND_POOLS_SCHEMA, SUMMARY_SCHEMA as BACKEND_SUMMARY_SCHEMA,
   TIMESERIES_SCHEMA as BACKEND_TIMESERIES_SCHEMA } from '../server/compact/read-model.js';
@@ -49,6 +50,9 @@ const MAPPING = [
   [{ view: 'pools', protocol: 'v3', window: '30d' }, '/v1/intelligence/pools?protocol=v3&window=30d'],
   [{ view: 'pools', protocol: 'v4', window: '7d' }, '/v1/intelligence/pools?protocol=v4&window=7d'],
   [{ view: 'pools', protocol: 'v4', window: '30d' }, '/v1/intelligence/pools?protocol=v4&window=30d'],
+  [{ view: 'ecosystem', window: '24h' }, '/v1/intelligence/ecosystem?window=24h'],
+  [{ view: 'ecosystem', window: '7d' }, '/v1/intelligence/ecosystem?window=7d'],
+  [{ view: 'ecosystem', window: '30d' }, '/v1/intelligence/ecosystem?window=30d'],
 ];
 const ALLOWED_URLS = new Set(MAPPING.map(([, path]) => `${ORIGIN}${path}`));
 
@@ -93,9 +97,13 @@ const summaryBody = (window = '24h', extra = {}) => ({ schema: SUMMARY_SCHEMA, w
 const timeseriesBody = (window = '24h') => ({ schema: TIMESERIES_SCHEMA, window: { key: window }, buckets: [] });
 const poolsBody = (protocol = 'v3', window = '24h') => ({ schema: POOLS_SCHEMA, protocol, window: { key: window }, status: 'available', pools: [] });
 const activityBody = (type = 'all') => ({ schema: ACTIVITY_SCHEMA, type, status: 'available', limit: 25, rows: [] });
+const ecosystemBody = (window = '24h') => ({ schema: ECOSYSTEM_SCHEMA, chain: { id: 5042 }, window: { key: window },
+  coverage: { status: 'available' }, verifiedAssets: [], rwa: [], discoveredTokens: { rows: [] }, contractCandidates: { rows: [] },
+  launches: { rows: [] }, exchangeFlows: { status: 'unavailable' }, otherProtocols: { status: 'unavailable' } });
 const bodyFor = (query) => (query.view === 'health' ? { status: 'ok', checkpointHour: '2026-10-03T08:00:00.000Z' }
   : query.view === 'summary' ? summaryBody(query.window) : query.view === 'timeseries' ? timeseriesBody(query.window)
-    : query.view === 'pools' ? poolsBody(query.protocol, query.window) : activityBody(query.type));
+    : query.view === 'pools' ? poolsBody(query.protocol, query.window)
+      : query.view === 'ecosystem' ? ecosystemBody(query.window) : activityBody(query.type));
 
 async function withFetch(fetchDouble, work, env = {}) {
   const originalFetch = globalThis.fetch;
@@ -115,7 +123,7 @@ async function withFetch(fetchDouble, work, env = {}) {
 
 const noFetch = async () => { throw new Error('fetch must not run for a rejected request'); };
 
-await test('1-20 the twenty exact requests map to twenty fixed upstream URLs and return the upstream body unchanged', async () => {
+await test('the twenty-three exact requests map to twenty-three fixed upstream URLs and return the upstream body unchanged', async () => {
   await withFetch(async (url) => {
     const query = MAPPING.find(([, path]) => `${ORIGIN}${path}` === url)[0];
     return upstream({ body: bodyFor(query) });
@@ -128,7 +136,7 @@ await test('1-20 the twenty exact requests map to twenty fixed upstream URLs and
       assert.equal(seen.at(-1).url, `${ORIGIN}${path}`);
     }
     assert.ok(seen.every(({ options }) => options.method === 'GET' && options.headers.accept === 'application/json' && options.redirect === 'manual'));
-    assert.equal(seen.length, 20);
+    assert.equal(seen.length, 23);
   });
 });
 
@@ -164,6 +172,9 @@ await test('11-13 extra, missing, repeated or unknown parameters and windows are
       { view: 'activity', type: 'mints' }, { view: 'activity', type: 'swap' }, { view: 'activity', type: 'Swaps' }, { view: 'activity', type: 'ALL' },
       { view: 'activity', type: ['all', 'swaps'] }, { view: 'activity', type: 'all', limit: '100' }, { view: 'activity' }, { view: 'activity', type: '' },
       { view: 'activity', type: '%61ll' }, { view: 'activity', window: '24h' }, { view: 'activity', type: 'toString' }, { view: 'activity', type: 'all', window: '24h' },
+      { view: 'ecosystem' }, { view: 'ecosystem', window: '1h' }, { view: 'ecosystem', window: '6h' },
+      { view: 'ecosystem', window: '7D' }, { view: 'ecosystem', window: ['24h', '7d'] },
+      { view: 'ecosystem', window: '24h', url: 'https://evil.example' }, { view: 'ecosystem', window: '../../health' },
     ];
     for (const query of rejected) {
       const res = await call({ query });
@@ -333,6 +344,7 @@ await test('28 no user input can alter the upstream origin or path', async () =>
     { view: 'timeseries', window: '6h&view=health' }, { view: 'health?x=1' }, { view: 'summary', window: '%32%34h' },
     { view: 'pools', protocol: 'v3/../../health', window: '24h' }, { view: 'pools', protocol: 'v3', window: '24h@evil.example' },
     { view: 'activity', type: 'all&type=swaps' }, { view: 'activity', type: '//evil.example' },
+    { view: 'ecosystem', window: '24h?window=7d' }, { view: 'ecosystem', window: '24h', host: 'evil.example' },
   ];
   await withFetch(async (url) => upstream({ body: bodyFor(MAPPING.find(([, path]) => `${ORIGIN}${path}` === url)?.[0] ?? { view: 'health' }) }), async (seen) => {
     for (const query of hostile) assert.equal((await call({ query })).statusCode, 400, JSON.stringify(query));
@@ -351,12 +363,24 @@ await test('contract: proxy schemas and upstream paths are exactly the compact b
   assert.equal(TIMESERIES_SCHEMA, BACKEND_TIMESERIES_SCHEMA);
   assert.equal(POOLS_SCHEMA, BACKEND_POOLS_SCHEMA);
   assert.equal(ACTIVITY_SCHEMA, BACKEND_ACTIVITY_SCHEMA);
+  assert.equal(ECOSYSTEM_SCHEMA, BACKEND_ECOSYSTEM_SCHEMA);
   const backend = await readFile(new URL('../server/compact/http.js', import.meta.url), 'utf8');
   const backendRoutes = [...backend.matchAll(/^ {2}\['(\/[^']+)'/gm)].map((match) => match[1]).sort();
   assert.deepEqual(backendRoutes, MAPPING.map(([, path]) => path).sort());
   const proxy = await readFile(new URL('../api/_lib/intelligence-proxy.js', import.meta.url), 'utf8');
   assert.match(proxy, /url = `\$\{upstreamOrigin\(env\)\}\$\{route\.path\}`/);
-  assert.doesNotMatch(proxy, /\$\{(query|view|window|protocol|type)\b/, 'no user input is interpolated into a URL');
+  // The accepted ecosystem table expands three literal windows at module initialization, before any request exists.
+  // Exempt only this exact fixed construction; the general ban on request-input interpolation still covers all other code.
+  const fixedEcosystemPaths = "ecosystem: Object.freeze(Object.fromEntries(['24h', '7d', '30d'].map((window) => [window, Object.freeze({\n"
+    + '    path: `/v1/intelligence/ecosystem?window=${window}`,';
+  const assertProxySafety = (source) => {
+    assert.equal(source.split(fixedEcosystemPaths).length, 2, 'exactly one literal ecosystem window construction');
+    assert.doesNotMatch(source.replace(fixedEcosystemPaths, ''), /\$\{(query|view|window|protocol|type)\b/,
+      'no user input is interpolated into a URL');
+  };
+  assertProxySafety(proxy);
+  assert.throws(() => assertProxySafety(proxy.replace("['24h', '7d', '30d'].map", '[query.window].map')));
+  assert.throws(() => assertProxySafety(proxy.replace('${route.path}', '${query.window}')));
 });
 
 await test('end to end: the real compact HTTP server behind the proxy gives 200, then 304 for the same ETag', async () => {
@@ -366,6 +390,7 @@ await test('end to end: the real compact HTTP server behind the proxy gives 200,
     timeseries: (window) => timeseriesBody(window),
     pools: (protocol, window) => ({ ...poolsBody(protocol), window: { key: window } }),
     activity: (type) => activityBody(type),
+    ecosystem: (window) => ecosystemBody(window),
   };
   const server = createIntelligenceServer({ readModel });
   await new Promise((done) => server.listen(0, '127.0.0.1', done));
@@ -722,20 +747,24 @@ const longSummary = (window, hours) => summaryFixture({ window, hours, families:
     valuedSwaps: null, unvaluedSwaps: null, averageFeeUsdMicros: null },
   protocolUsd: Object.fromEntries(Object.keys(PROTOCOL_USD_READY).map((name) => [name, { status: 'unavailable', reason: 'insufficient_coverage', values: null }])) });
 function dailyTimeseries(window, days) {
+  const dayMs = 24 * HOUR_MS;
+  const end = Math.floor(END / dayMs) * dayMs;
   const buckets = Array.from({ length: days }, (_, index) => {
-    const range = { start: isoAt(END - (days - index) * 24 * HOUR_MS), end: isoAt(END - (days - 1 - index) * 24 * HOUR_MS) };
+    const start = end - (days - index) * dayMs;
+    const range = { start: isoAt(start), end: isoAt(start + dayMs) };
     const fromEnd = days - 1 - index;
-    if (fromEnd >= 3) return { ...range, status: 'not_stored', storedHours: 0, network: null, families: null, dexUsdVolume: null };
-    if (fromEnd === 2) return { ...range, status: 'incomplete', storedHours: STORED_HOURS - 48, network: null, families: null, dexUsdVolume: null };
+    const storedHours = Math.max(0, Math.min(24, (start + dayMs - Math.max(start, END - STORED_HOURS * HOUR_MS)) / HOUR_MS));
+    if (storedHours < 24) return { ...range, status: storedHours ? 'incomplete' : 'not_stored', storedHours,
+      network: null, families: null, dexUsdVolume: null };
     return { ...range, status: 'committed', storedHours: 24,
       network: { blocks: 86_400, transactions: 1_200_000 + index, transactionsPerSecond: 13.9, averageTransactionsPerBlock: 13.9, gasUsedRaw: '980000000000',
-        uniqueActiveAddresses: null, uniqueActiveAddressesStatus: { status: 'not_supported', reason: 'identity_retention_exceeded' } },
+        uniqueActiveAddresses: null, uniqueActiveAddressesStatus: { status: 'not_stored', reason: 'daily_identity_not_processed', value: null } },
       families: { uniswapV3: { status: 'available', swapCount: 4000 + index, poolCreatedCount: 1, mintCount: 9, burnCount: 4, foreignEventCount: 0 },
         uniswapV4: { status: 'available', swapCount: 1000, initializeCount: 0, modifyLiquidityCount: 3 } },
       dexUsdVolume: fromEnd === 1 ? { status: 'unavailable', reason: 'valuation_not_processed' }
         : { status: 'available', totalUsdMicros: '36000000000', uniswapV3UsdMicros: '24000000000', uniswapV4UsdMicros: '12000000000', valuedSwaps: 5000, unvaluedSwaps: 3 } };
   });
-  return { schema: TIMESERIES_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: window, hours: days * 24, start: isoAt(END - days * 24 * HOUR_MS), end: isoAt(END) },
+  return { schema: TIMESERIES_SCHEMA, chain: { id: 5042, name: 'Arc' }, window: { key: window, hours: days * 24, start: isoAt(end - days * dayMs), end: isoAt(end) },
     freshness, bucketHours: 24, buckets };
 }
 const longPools = (window, hours) => Object.fromEntries(['v3', 'v4'].map((protocol) => [protocol, { ...POOLS_COLLECTING[protocol],
@@ -1909,6 +1938,13 @@ await test('Completion 2 fully valued 7D and 30D render their own daily USD bars
     const data = { ...COMPLETE_DATA, window, summary, timeseries: series, pools };
     const { tree } = render({ selectedWindow: window, data, borrowMarket: BORROW_AVAILABLE });
     checkScope(tree, SCOPE);
+    assert.match(textOf(tree), /Days in UTC, each from midnight to midnight/);
+    assert.doesNotMatch(textOf(tree), /ending at the same hour as the latest verified hour/);
+    assert.equal(series.window.end, '2026-10-03T00:00:00.000Z');
+    for (const bucket of series.buckets) {
+      assert.equal(new Date(bucket.start).getUTCHours(), 0);
+      assert.equal(Date.parse(bucket.end) - Date.parse(bucket.start), 24 * HOUR_MS);
+    }
     assert.equal(item(tree, 'network.total-volume').attrs['data-intel-status'], 'available', window);
     assert.equal(item(tree, 'volume-chart.volume').attrs['data-intel-status'], 'available', window);
     assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable', 'long-window uniques are not guessed');

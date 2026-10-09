@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { normalizeLog } from '../api/_lib/arc-intelligence/normalize.js';
 import { decodeV3Swap, decodeV4Swap, UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intelligence/uniswap.js';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from '../server/compact/families.js';
+import { DAILY_ACTIVE_ADDRESSES_SQL } from '../server/compact/daily-active-addresses.js';
+import { INTELLIGENCE_SQL } from '../server/compact/intelligence-store.js';
 import { createProjectionSink, v4PoolIdOf, VALUATION_INPUT_PROJECTIONS } from '../server/compact/projections.js';
 import { ARC_CHAIN_ID, createProvider } from '../server/compact/provider.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
@@ -182,12 +184,14 @@ await test('every writer holds the lock: hourly runner, projection repair child,
 // Storage safety (static): compact hourly tables only, no raw archive, no dumps, no external services.
 
 const STORE_SOURCE = readFileSync(new URL('../server/compact/store.js', import.meta.url), 'utf8');
-const SCHEMA = STORE_SOURCE.match(/const SCHEMA = `([\s\S]*?)`;/)[1];
+const SCHEMA = STORE_SOURCE.match(/const SCHEMA = `([\s\S]*?)`;/)[1] + DAILY_ACTIVE_ADDRESSES_SQL + INTELLIGENCE_SQL;
 const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(/g)].map((match) => match[1]);
 export const ALLOWED_TABLES = Object.freeze(['compact_meta', 'compact_hours', 'compact_family_hours', 'compact_hour_addresses', 'compact_registry',
   'compact_registry_coverage', 'compact_checkpoint', 'compact_projection_hours', 'compact_pool_hours', 'compact_dex_activity', 'compact_pool_price_hours',
   'compact_valuation_hours', 'compact_token_price_hours', 'compact_dex_volume_hours', 'compact_pool_fee_hours', 'compact_dex_fee_hours',
-  'compact_token_metadata', 'compact_pool_tvl_hours']);
+  'compact_token_metadata', 'compact_pool_tvl_hours',
+  'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage',
+  'compact_intelligence_hours', 'compact_token_dex_observations', 'compact_token_discoveries']);
 const ARCHIVE_NAME = /raw|_logs?\b|_log_|receipt|transaction|_txs?\b|block_body|blocks\b|events?\b|archive|dump/i;
 
 await test('storage safety: the schema is exactly the compact tables; no raw log, transaction, receipt, block or per-swap archive table', async () => {
@@ -463,7 +467,7 @@ if (!sqlite) {
       assert.ok(changed.every((table) => VALUATION_BACKFILL_TABLES.includes(table)), `only valuation tables changed: ${changed}`);
       const inspector = new DatabaseSync(path, { readOnly: true });
       try {
-        assert.deepEqual(tablesOf(inspector).filter((table) => table.startsWith('compact_')).sort(), [...ALLOWED_TABLES].sort());
+        assert.deepEqual(tablesOf(inspector).sort(), [...ALLOWED_TABLES].sort());
       } finally { inspector.close(); }
       assert.equal(countsAfter.compact_pool_price_hours - countsBefore.compact_pool_price_hours, 24 * 4, 'one row per pool with swaps per hour');
       assert.equal(countsAfter.compact_pool_fee_hours - countsBefore.compact_pool_fee_hours, 24 * 2, 'one fee row per V4 pool with swaps per hour');

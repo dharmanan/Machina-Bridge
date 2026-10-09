@@ -190,8 +190,17 @@ try {
           assert.equal(series.buckets.reduce((sum, bucket) => sum + BigInt(bucket.dexUsdVolume.totalUsdMicros), 0n), BigInt(hours) * 6_000_000n);
           for (const protocol of ['v3', 'v4']) assert.equal(model.pools(protocol, key).pools[0].usdVolume.usdMicros, (BigInt(hours) * 3_000_000n).toString());
           if (hours > 24) {
-            assert.equal(summary.network.uniqueActiveAddresses.reason, 'identity_retention_exceeded');
-            assert.ok(series.buckets.every((bucket) => bucket.network.uniqueActiveAddresses === null));
+            assert.deepEqual(summary.network.uniqueActiveAddresses,
+              { status: 'not_supported', reason: 'identity_retention_exceeded', value: null });
+            assert.equal(series.window.start, iso(BASE + (720 - hours) * HOUR));
+            assert.equal(series.window.end, iso(BASE + 720 * HOUR));
+            for (const [index, bucket] of series.buckets.entries()) {
+              assert.equal(bucket.start, iso(BASE + (720 - hours + index * 24) * HOUR));
+              assert.equal(bucket.end, iso(BASE + (720 - hours + (index + 1) * 24) * HOUR));
+              assert.equal(bucket.storedHours, 24);
+              assert.equal(bucket.network.uniqueActiveAddresses, 1, 'daily distinct count, not the sum of hourly uniques');
+              assert.deepEqual(bucket.network.uniqueActiveAddressesStatus, { status: 'available', value: 1 });
+            }
           }
         }
       } finally { model.close(); }
@@ -268,6 +277,35 @@ try {
       } finally { model.close(); }
     });
   } finally { live.db.close(); }
+
+  await test('daily charts exclude the current partial UTC day and keep missing or unavailable DAU counts null', async () => {
+    const data = fixture('partial-utc-day', 173);
+    try {
+      data.db.prepare('DELETE FROM compact_daily_active_addresses WHERE day_start = ?').run(BigInt(BASE));
+      data.db.prepare("UPDATE compact_daily_active_addresses SET status='unavailable',reason='identity_not_captured',active_addresses=NULL WHERE day_start = ?")
+        .run(BigInt(BASE + 24 * HOUR));
+      const model = data.model();
+      try {
+        assert.equal(model.summary('7d').window.end, iso(BASE + 173 * HOUR), 'summary retains its rolling-hour window');
+        const series = model.timeseries('7d');
+        assert.equal(series.window.start, iso(BASE));
+        assert.equal(series.window.end, iso(BASE + 168 * HOUR));
+        assert.equal(series.buckets.length, 7);
+        for (const [index, bucket] of series.buckets.entries()) {
+          assert.equal(bucket.start, iso(BASE + index * 24 * HOUR));
+          assert.equal(bucket.end, iso(BASE + (index + 1) * 24 * HOUR));
+          assert.equal(bucket.status, 'committed');
+          assert.equal(bucket.storedHours, 24);
+          assert.equal(bucket.network.transactions, 240, 'missing daily identities do not remove additive evidence');
+          const expected = index === 0 ? { status: 'not_stored', reason: 'daily_identity_not_processed', value: null }
+            : index === 1 ? { status: 'unavailable', reason: 'identity_not_captured', value: null }
+              : { status: 'available', value: 1 };
+          assert.deepEqual(bucket.network.uniqueActiveAddressesStatus, expected);
+          assert.equal(bucket.network.uniqueActiveAddresses, expected.value);
+        }
+      } finally { model.close(); }
+    } finally { data.db.close(); }
+  });
 
   await test('missing long-window history is an explicit gap; the bounded valuation backfill never promises 168/720 hours', async () => {
     const short = fixture('short', 24);

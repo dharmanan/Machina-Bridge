@@ -13,6 +13,8 @@ import { UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../api/_lib/arc-intellig
 import { USDC_ERC20_ADDRESS } from '../api/_lib/arc-intelligence/usdc.js';
 import { createUniswapV3Accumulator, createUniswapV4Accumulator, FAMILY_FIELDS } from '../server/compact/families.js';
 import { processHour } from '../server/compact/hour.js';
+import { DISCOVERY_READS_PER_RUN } from '../server/compact/intelligence.js';
+import { selectorOf } from '../server/compact/abi.js';
 import { LogError } from '../server/compact/logs.js';
 import { createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_V4_HOOKS, syntheticV4PoolKey } from '../server/compact/offline.js';
 import {
@@ -347,6 +349,8 @@ async function liveHour(options = {}, extra = {}) {
 const live = await liveHour();
 const LIVE = live.result;
 const withoutProjections = ({ projections, ...rest }) => rest;
+const coreHour = ({ intelligence, ...rest }) => withoutProjections(rest);
+const sharedIntelligence = ({ discovery, firstDex, firstDexComplete, ...rest }) => rest;
 const corruptInitialize = (filter, logs) => logs.map((log) => (log.topics[0] === T.v4Initialize
   ? { ...log, topics: [log.topics[0], `0x${'ab'.repeat(32)}`, ...log.topics.slice(2)] } : log));
 
@@ -378,7 +382,15 @@ await test('no extra RPC: the live projections cost exactly zero requests', asyn
   const without = await liveHour({}, { projections: false });
   assert.deepEqual(live.chain.requests, without.chain.requests, 'identical request sequence');
   assert.deepEqual([live.provider.stats.requests, live.provider.stats.calls], [without.provider.stats.requests, without.provider.stats.calls]);
-  assert.deepEqual(withoutProjections(LIVE), without.result, 'identical hour, families, network and registry');
+  assert.deepEqual(coreHour(LIVE), coreHour(without.result), 'identical hour, families, network and registry');
+  assert.deepEqual(sharedIntelligence(LIVE.intelligence), sharedIntelligence(without.result.intelligence));
+  assert.deepEqual(LIVE.intelligence.discovery.candidates.filter((row) => row.kind !== 'pool'),
+    without.result.intelligence.discovery.candidates, 'top-level creation evidence is unchanged');
+  assert(LIVE.intelligence.discovery.candidates.some((row) => row.kind === 'pool'));
+  assert.equal(LIVE.intelligence.firstDexComplete, true);
+  assert(LIVE.intelligence.firstDex.length > 0, 'verified projections feed Intelligence DEX observations');
+  assert.deepEqual(without.result.intelligence.firstDex, []);
+  assert.equal(without.result.intelligence.firstDexComplete, false, 'no complete DEX claim without projections');
   assert(!('projections' in without.result));
 });
 
@@ -405,7 +417,11 @@ await test('projections are not a compact family: no family version, field, stre
 
 await test('projection failure does not corrupt family data: a forged Initialize poolId leaves families, network and registry identical', async () => {
   const forged = await liveHour({ faults: { logs: corruptInitialize } });
-  assert.deepEqual(withoutProjections(forged.result), withoutProjections(LIVE));
+  assert.deepEqual(coreHour(forged.result), coreHour(LIVE));
+  assert.deepEqual(sharedIntelligence(forged.result.intelligence), sharedIntelligence(LIVE.intelligence));
+  assert.deepEqual(forged.result.intelligence.firstDex, LIVE.intelligence.firstDex.filter((row) => row.protocol === 'uniswap_v3'));
+  assert.equal(forged.result.intelligence.firstDexComplete, false, 'failed V4 projection blocks complete Intelligence DEX coverage');
+  assert(!forged.result.intelligence.discovery.candidates.some((row) => row.poolEvidence?.protocol === 'uniswap_v4'));
   assert.deepEqual(forged.result.projections.uniswap_v4_pools, { status: 'unavailable', reason: 'v4_pool_id_mismatch' });
   assert.equal(forged.result.projections.uniswap_v3_pools.status, 'available');
   assert.deepEqual(forged.result.projections.dex_activity, { status: 'unavailable', reason: 'projection_inputs_unavailable' });
@@ -742,9 +758,11 @@ if (!sqlite) {
         dex_activity: { status: 'available', rows: activity },
       } };
   }
-  const TABLES = ['compact_checkpoint', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
-    'compact_hour_addresses', 'compact_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
-    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_metadata', 'compact_token_price_hours',
+  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage',
+    'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+    'compact_hour_addresses', 'compact_hours', 'compact_intelligence_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
+    'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage',
+    'compact_token_dex_observations', 'compact_token_discoveries', 'compact_token_metadata', 'compact_token_price_hours',
     'compact_valuation_hours'];
   try {
     await test('sqlite: additive projection tables, activity index and projection_version meta rows; a changed version is refused', async () => {
@@ -947,9 +965,47 @@ if (!sqlite) {
       assert.equal(summary.ok, true, 'a projection being unavailable is not a failed hour');
       assert.equal(summary.projections.uniswap_v4_pools, 'unavailable(v4_pool_id_mismatch)');
       assert(lines.some((line) => line.startsWith('PROJECTIONS ') && line.includes('uniswap_v3_pools=available')));
-      const again = await runCompactHour({ sqlitePath: join(directory, 'runner.sqlite'), hourStart: HOUR, provider: offlineProvider(chainOf().fetchImpl),
-        registryFromBlock: ORIGIN.originNumber, print: () => {} });
-      assert.deepEqual([again.hourMode, again.provider.requests], ['stored', 0], 'no repair is triggered by an unavailable projection');
+      const inspector = open('runner.sqlite');
+      try {
+        const before = hourState(inspector);
+        const calls = [];
+        const chain = chainOf();
+        const provider = offlineProvider((url, init) => {
+          calls.push(...[].concat(JSON.parse(init.body)));
+          return chain.fetchImpl(url, init);
+        });
+        const again = await runCompactHour({ sqlitePath: join(directory, 'runner.sqlite'), hourStart: HOUR, provider,
+          registryFromBlock: ORIGIN.originNumber, print: () => {} });
+        assert.equal(again.hourMode, 'stored', 'no repair is triggered by an unavailable projection');
+        assert.equal(again.discovery.status, 'available');
+        assert(again.discovery.candidates <= DISCOVERY_READS_PER_RUN, 'discovery remains capped');
+        const allowed = new Set(['eth_chainId', 'eth_getTransactionReceipt', 'eth_getCode', 'eth_call']);
+        assert(Object.keys(provider.stats.calls).every((method) => allowed.has(method)), 'targeted discovery RPC only');
+        const candidates = inspector.prepare('SELECT candidate_json, result_json FROM compact_token_discoveries').all()
+          .map((row) => ({ ...JSON.parse(row.candidate_json), address: JSON.parse(row.result_json ?? row.candidate_json).address }));
+        const receipts = new Set(candidates.filter((row) => row.kind === 'creation').map((row) => row.txHash));
+        const targets = new Set(candidates.filter((row) => row.address).map((row) => `${row.address}:0x${row.readBlock.toString(16)}`));
+        const views = new Set(['totalSupply()', 'symbol()', 'name()', 'decimals()', 'machinaIntelligenceUnknownSelector()']
+          .map(selectorOf).concat(`${selectorOf('balanceOf(address)')}${'0'.repeat(64)}`));
+        for (const { method, params } of calls) {
+          assert(allowed.has(method));
+          if (method === 'eth_chainId') assert.deepEqual(params, []);
+          else if (method === 'eth_getTransactionReceipt') assert(params.length === 1 && receipts.has(params[0]));
+          else {
+            const address = method === 'eth_call' ? params[0].to : params[0];
+            assert(params.length === 2 && targets.has(`${address}:${params[1]}`), 'only persisted candidates at their historical tags');
+            if (method === 'eth_call') {
+              assert.deepEqual(Object.keys(params[0]).sort(), ['data', 'to']);
+              assert(views.has(params[0].data), 'only ERC-20 verification views and the negative control');
+            }
+          }
+        }
+        assert.equal(provider.stats.calls.eth_getLogs ?? 0, 0, 'no family, projection or registry log re-read');
+        assert.equal(provider.stats.calls.eth_getBlockByNumber ?? 0, 0, 'no block range re-read');
+        assert(provider.stats.requests <= DISCOVERY_READS_PER_RUN * 2 + 1, 'bounded discovery RPC requests');
+        assert.deepEqual(again.projections, summary.projections, 'failed projection remains unavailable');
+        assert.deepEqual(hourState(inspector), before, 'hour, families, identities and checkpoint remain unchanged');
+      } finally { inspector.close(); }
     });
 
     // -----------------------------------------------------------------------------------------------------------------

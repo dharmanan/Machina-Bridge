@@ -26,7 +26,7 @@ export const POOLS_SCHEMA = 'machina.intelligence.pools.v1';
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1';
 // 7D and 30D follow exactly the same rule as 24H: available only when every hour of the window is stored and verified.
 // Unique active addresses over 7D/30D are not_supported (identities are kept for 24 hours only); everything additive is
-// summed from hourly rows. 7D/30D timeseries come as 24-hour buckets ending at the checkpoint.
+// summed from hourly rows. 7D/30D timeseries show complete UTC days ending at the latest verified midnight.
 export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const POOLS_WINDOWS = Object.freeze({ '24h': 24, '7d': 168, '30d': 720 });
