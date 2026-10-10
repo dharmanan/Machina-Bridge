@@ -19,6 +19,9 @@ export const DISCOVERY_PUBLIC_START = Date.parse('2026-09-16T11:00:00Z') / 1000;
 export const RECOVERY_HOURS = 720;
 export const MAX_RECOVERY_ATTEMPTS = 8;
 export const RECOVERY_TIMEOUT_MS = 600_000;
+// Recovery only: <=469 body requests for the maximum 15,000-block hour, leaving
+// room for canonical boundaries within 512 HTTP requests. Live spine defaults stay unchanged.
+export const RECOVERY_BLOCK_BATCH_SIZE = 32;
 export const RECOVERY_RETRY_MS = 3_600_000;
 export const V3_RETRY_POLICY = 'sqlite-pool-membership-v1';
 const HOUR = 3600;
@@ -280,18 +283,22 @@ async function boundaries(provider, h) {
   return { before, first, last, after };
 }
 // Existing Gateway/projection repair model: canonical pinned boundaries plus canonical log-bearing block/tx proofs.
-// Never rescans non-event transaction bodies for a source-only unit. Memory is one <=500-block log chunk.
+// Never rescans non-event transaction bodies for a source-only unit. Keep the
+// <=500-block log range, but retain at most 32 decoded block/transaction proofs.
 async function scan(provider, h, stream, onLogs) {
   for (let from = h.first_block; from <= h.last_block; from += 500) {
     // validateLogs duplicate keys are relative to this chunk, not the entire hour.
     const seen = new Set();
     const to = Math.min(h.last_block, from + 499);
     for await (const raw of streamLogs(provider, stream, from, to)) {
-      const numbers = [...new Set(raw.map(r => Number(BigInt(r.blockNumber))))];
+      const numbers = [...new Set(raw.map(r => Number(BigInt(r.blockNumber))))].sort((a, b) => a - b);
       if (numbers.some(n => !Number.isSafeInteger(n) || n < from || n > to)) fail('recovery_log_range_mismatch');
-      const window = new Map();
-      for (let offset = 0; offset < numbers.length; offset += 50) {
-        const chunk = numbers.slice(offset, offset + 50);
+      raw.sort((a, b) => Number(BigInt(a.blockNumber)) - Number(BigInt(b.blockNumber)));
+      let cursor = 0;
+      if (!numbers.length) await onLogs([], new Map());
+      for (let offset = 0; offset < numbers.length; offset += RECOVERY_BLOCK_BATCH_SIZE) {
+        const chunk = numbers.slice(offset, offset + RECOVERY_BLOCK_BATCH_SIZE);
+        const window = new Map();
         const blocks = await provider.batch(chunk.map(n => ['eth_getBlockByNumber', [`0x${n.toString(16)}`, true]]));
         blocks.forEach((b, i) => {
           const block = spineBlockOf(b, chunk[i]);
@@ -299,8 +306,10 @@ async function scan(provider, h, stream, onLogs) {
             || block.number === h.first_block && block.hash !== h.first_hash || block.number === h.last_block && block.hash !== h.last_hash) fail('recovery_event_block_mismatch');
           window.set(block.number, block);
         });
+        const start = cursor;
+        while (cursor < raw.length && Number(BigInt(raw[cursor].blockNumber)) <= chunk.at(-1)) cursor++;
+        await onLogs(validateLogs(raw.slice(start, cursor), stream, { fromBlock: from, toBlock: to, window, seen }), window);
       }
-      await onLogs(validateLogs(raw, stream, { fromBlock: from, toBlock: to, window, seen }), window);
     }
   }
 }
@@ -320,7 +329,8 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
   if (unit.kind === 'creations') {
     const network = createNetworkAccumulator(); let last;
     for await (const blocks of spineWindows(provider, { first: h.first_block, last: h.last_block, before: edges.before,
-      hourStart: h.hour_start, hourEnd: h.hour_start + HOUR })) { network.addBlocks(blocks); sink.blocks(blocks); last = blocks.at(-1); }
+      hourStart: h.hour_start, hourEnd: h.hour_start + HOUR,
+      batchSize: RECOVERY_BLOCK_BATCH_SIZE, windowBlocks: RECOVERY_BLOCK_BATCH_SIZE })) { network.addBlocks(blocks); sink.blocks(blocks); last = blocks.at(-1); }
     if (last.hash !== h.last_hash || canonical(network.finish({ durationSeconds: HOUR })) !== h.network_json) fail('recovery_network_conflict');
     const p = finishSink(sink, h, families, null);
     result = { evidence: { candidates: p.discovery.candidates, firstDex: [] }, status: p.discovery.reason === 'candidate_limit' ? 'insufficient_coverage' : 'available',

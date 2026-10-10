@@ -112,7 +112,7 @@ The final result includes completed/required unit counts and physical provider r
 | Execution / HTTP timeout | 10 minutes / 10 seconds |
 | Heap | CLI requires bounded heap; scheduler uses existing 64 MiB old-space and 2 MiB semi-space flags |
 | Planner | Read-only worker, 64 MiB old generation / 4 MiB young generation, 10-second deadline |
-| Log chunk / transaction batch | At most 500 blocks / 50 log-bearing blocks |
+| Log chunk / full-block batch and retained proof window | At most 500 blocks / 32 blocks (recovery only) |
 | Persisted evidence | At most 2 MiB per unit; append-only |
 | Candidate / first-DEX list | Existing 2,048 / 4,096 limits, with explicit incomplete coverage on caps |
 | Retry budget | Eight attempts per hour/component/evidence fingerprint; minimum one-hour cooldown |
@@ -302,3 +302,25 @@ An aggregate explicitly reporting creations:<failure> cannot prove a complete cr
 accepted-list checksum; recovery must retain the failure/cooldown rather than import that empty or partial list.
 One physical attempt per recovery request and stop-after-failure behavior are unchanged, as are all memory, disk,
 RPC, response and time limits. No production recovery or flag activation is performed by this change.
+
+## Bounded full-block recovery responses
+
+Creations uses 32-block HTTP batches and 32-block decoded spine windows. Source-only recovery, including V3/V4,
+keeps the existing 500-block log ranges and requests only log-bearing transaction bodies in groups of at most 32.
+Logs are grouped in canonical block order; each proof window is released before the next. Duplicate-log tracking
+remains shared across every proof group and split response within the original log chunk. Transaction identities,
+canonical boundary/hash checks, parent-chain continuity for creations, factory membership, foreign-emitter filters
+and exact stored network/family evidence comparisons are unchanged. Live indexing's spine batch defaults are unchanged.
+
+32 balances response headroom with the existing request/time ceilings: the observed 8,425,803-byte 50-block response
+would average approximately 5.4 MB for 32 similarly sized blocks, not a guarantee for variable block sizes. The
+maximum 15,000-block creations unit needs 469 body requests plus two boundary requests and one chain check (472 HTTP
+requests, 15,009 RPC items). At minimum one-second pacing, request starts consume 471 seconds, excluding processing
+and response latency. These counts are for creations alone; other sources share the remaining execution budget.
+
+No response, cumulative-byte, request, call, heap, disk or timeout budget is increased. A single oversized block,
+remaining dense batch, cumulative 64 MiB exhaustion or slow provider still fails closed with the original diagnostic
+and zero further RPC in that execution. There is no post-budget adaptive retry. Successfully committed units are
+retained and reused after cooldown; an unfinished unit is not claimed complete. This change reduces the demonstrated
+per-response failure; it does not prove that the production hour fits all cumulative budgets. No production reads,
+recovery execution, scheduler activation or environment changes are part of local verification.

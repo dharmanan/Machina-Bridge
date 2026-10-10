@@ -18,7 +18,7 @@ import { selectorOf } from '../server/compact/abi.js';
 import { headerOf } from '../server/compact/spine.js';
 import { LOG_STREAMS } from '../server/compact/sources.js';
 import { intelligenceRegistry, INTELLIGENCE_REGISTRY, registryDigest } from '../server/compact/intelligence-registry.js';
-import { planDiscoveryRecovery, recoverDiscoveryHour, recoveryHourPlan, MAX_RECOVERY_ATTEMPTS, RECOVERY_RETRY_MS, DISCOVERY_PUBLIC_START, V3_RETRY_POLICY } from '../server/compact/discovery-recovery.js';
+import { planDiscoveryRecovery, recoverDiscoveryHour, recoverEvidenceUnit, recoveryHourPlan, MAX_RECOVERY_ATTEMPTS, RECOVERY_RETRY_MS, DISCOVERY_PUBLIC_START, V3_RETRY_POLICY, RECOVERY_BLOCK_BATCH_SIZE } from '../server/compact/discovery-recovery.js';
 import { recoveryConfig, runDiscoveryRecovery, boundedRecoveryProvider, RECOVERY_BUDGET } from './recover-compact-discovery.mjs';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
@@ -43,11 +43,11 @@ async function test(name, fn) {
   await fn(); passed++; console.log(`PASS ${name}`);
 }
 async function fixture({ initialRegistry = noLaunch, missing = false, path = ':memory:', count = 1, blocksPerHour = 10,
-  poolCreatedAt = ORIGIN, txPerBlock = 2,
+  poolCreatedAt = ORIGIN, txPerBlock = 2, v3Every = 300,
   streams = LOG_STREAMS.filter(s => ['v3Factory', 'v3Pools', 'v4'].includes(s.key)) } = {}) {
   const db = new DatabaseSync(path), store = createCompactStore(db);
   const chain = createSyntheticChain({ originNumber: ORIGIN, originTimestamp: BASE, blockSpacing: 36_000_000 / blocksPerHour,
-    poolCreatedAt, factoryDeployedAt: Math.min(ORIGIN - 1, poolCreatedAt), protocols: false, txPerBlock, v4PerBlock: 1, usdcPerBlock: 1 });
+    poolCreatedAt, factoryDeployedAt: Math.min(ORIGIN - 1, poolCreatedAt), protocols: false, txPerBlock, v3Every, v4PerBlock: 1, usdcPerBlock: 1 });
   const provider = createProvider({ fetchImpl: chain.fetchImpl, sleep: async () => {}, minIntervalMs: 0, maxAttempts: 1 });
   // An empty verified factory registry covers all earlier blocks; the hour discovers its own PoolCreated.
   store.extendRegistry({ kind: 'uniswap_v3_pool', fromBlock: 0, through: ORIGIN - 1, throughHash: chain.blockHash(ORIGIN - 1), previousThrough: null,
@@ -89,6 +89,145 @@ const payload = (unit, status = 'available', reason = null) => ({ status, reason
   evidence: { candidates: [], firstDex: [], ...(unit.kind === 'launch' ? { entry: { kind: 'launch', id: unit.entry.id, version: unit.entry.version,
     source: unit.entry.source, verificationBasis: unit.entry.verificationBasis, address: unit.entry.address, status, reason, counts: {}, rawFlows: {} } } : {}) } });
 const fakeRecover = async ({ unit }) => payload(unit);
+
+// Stream one JSON-RPC envelope at a time, as a real HTTP body. Padding models
+// transaction input/other full-block fields without allocating the entire response.
+function bodyFixture(f, { paddingBytes = 0, mutate = () => {} } = {}) {
+  const batches = [], encoder = new TextEncoder(), padding = 'x'.repeat(paddingBytes);
+  let requests = 0, maxResponseBytes = 0;
+  return { batches, get requests() { return requests; }, get maxResponseBytes() { return maxResponseBytes; }, fetchImpl: async (url, options) => {
+    requests++;
+    const call = JSON.parse(options.body), items = Array.isArray(call) ? call : [call];
+    if (items.some(i => i.method === 'eth_getBlockByNumber' && i.params[1] === true)) batches.push(items.length);
+    const response = JSON.parse(await (await f.chain.fetchImpl(url, options)).text());
+    const replies = Array.isArray(response) ? response : [response];
+    replies.forEach((reply, i) => {
+      if (items[i].method === 'eth_getBlockByNumber' && items[i].params[1] === true) reply.result.fixturePadding = padding;
+      // Deliberately reverse log responses; proof grouping must preserve normalized order.
+      if (items[i].method === 'eth_getLogs') reply.result.reverse();
+      mutate(reply, items[i]);
+    });
+    let index = 0, responseBytes = 0;
+    return new Response(new ReadableStream({ pull(controller) {
+      if (index === replies.length) { controller.close(); return; }
+      const i = index++;
+      const bytes = encoder.encode((Array.isArray(response) && i === 0 ? '[' : '')
+        + JSON.stringify(replies[i]) + (Array.isArray(response) ? i === replies.length - 1 ? ']' : ',' : ''));
+      responseBytes += bytes.byteLength; maxResponseBytes = Math.max(maxResponseBytes, responseBytes);
+      controller.enqueue(bytes);
+    } }));
+  } };
+}
+
+await test('bounded block batches reproduce legacy 50-body HTTP 200 response-budget failure', async () => {
+  const f = await fixture({ blocksPerHour: 96, txPerBlock: 6 });
+  const http = bodyFixture(f, { paddingBytes: 170_000 });
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+  try {
+    await bounded.provider.batch([ORIGIN - 1, ORIGIN, ORIGIN + 95, ORIGIN + 96].map(n => ['eth_getBlockByNumber', [`0x${n.toString(16)}`, false]]));
+    await assert.rejects(bounded.provider.batch(Array.from({ length: 50 }, (_, i) => ['eth_getBlockByNumber', [`0x${(ORIGIN + i).toString(16)}`, true]])), e => {
+      const d = providerDiagnostics(e);
+      assert.equal(e.code, 'recovery_response_budget_exhausted'); assert.equal(d.category, 'response_budget');
+      assert.equal(d.httpStatus, 200); assert.equal(d.batchSize, 50);
+      return true;
+    });
+    assert.equal(bounded.stats.requests, 3); assert.equal(bounded.stats.calls, 55);
+    const count = http.requests;
+    await assert.rejects(bounded.provider.request('eth_getCode', []), e => e.code === 'recovery_response_budget_exhausted');
+    assert.equal(http.requests, count);
+  } finally { bounded.close(); f.db.close(); }
+});
+await test('bounded block batches recover dense creations V3 and V4 with identical evidence', async () => {
+  const options = { missing: true, blocksPerHour: 96, txPerBlock: 6, v3Every: 1 };
+  const baseline = await fixture({ ...options, missing: false }), f = await fixture(options);
+  const before = immutableDigest(f.db), http = bodyFixture(f, { paddingBytes: 170_000 });
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+  try {
+    assert.equal((await recoverDiscoveryHour({ db: baseline.db, hourStart: BASE, registry: noLaunch, provider: baseline.provider })).phase, 'recovered');
+    assert.equal((await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check })).phase, 'recovered');
+    const units = db => db.prepare("SELECT key,value FROM compact_meta WHERE key LIKE 'discovery_unit:%' ORDER BY key").all();
+    assert.deepEqual(units(f.db), units(baseline.db));
+    assert(http.batches.length >= 9); assert(http.batches.every(n => n <= RECOVERY_BLOCK_BATCH_SIZE));
+    assert(bounded.stats.bytes > 30 * 1024 * 1024 && bounded.stats.bytes < RECOVERY_BUDGET.bytes);
+    assert(http.maxResponseBytes < RECOVERY_BUDGET.responseBytes);
+    assert.equal(immutableDigest(f.db), before);
+    const count = http.requests;
+    assert.equal((await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider })).rpcNeeded, false);
+    assert.equal(http.requests, count);
+    assert(process.memoryUsage().heapUsed < 64 * 1024 * 1024);
+    console.log(`MEASURE dense-hour requests=${bounded.stats.requests} calls=${bounded.stats.calls} bytes=${bounded.stats.bytes} maxResponseBytes=${http.maxResponseBytes} heapUsed=${process.memoryUsage().heapUsed}`);
+  } finally { bounded.close(); baseline.db.close(); f.db.close(); }
+});
+await test('bounded block batches stop oversized single-block evidence and retain successful units', async () => {
+  const f = await fixture({ missing: true, blocksPerHour: 96, txPerBlock: 6, v3Every: 1 });
+  const before = immutableDigest(f.db);
+  let inV4 = false, oversized = false;
+  const http = bodyFixture(f, { mutate(reply, item) {
+    if (item.method === 'eth_getLogs' && item.params[0].address?.includes(LOG_STREAMS.find(s => s.key === 'v4').address[0])) inV4 = true;
+    if (inV4 && !oversized && item.method === 'eth_getBlockByNumber' && item.params[1] === true) {
+      oversized = true; reply.result.fixturePadding = 'x'.repeat(RECOVERY_BUDGET.responseBytes + 1);
+    }
+  } });
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+  try {
+    const result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check });
+    assert.equal(result.phase, 'incomplete'); assert.match(result.reason, /recovery_response_budget_exhausted/);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key LIKE 'discovery_unit:%'").get().n, 2);
+    assert.equal(immutableDigest(f.db), before);
+    const count = http.requests;
+    await assert.rejects(bounded.provider.request('eth_getCode', []), e => e.code === 'recovery_response_budget_exhausted');
+    assert.equal(http.requests, count);
+  } finally { bounded.close(); f.db.close(); }
+});
+await test('bounded block batches reject transaction mismatch beyond the first proof group atomically', async () => {
+  const f = await fixture({ missing: true, blocksPerHour: 96, txPerBlock: 6, v3Every: 1 });
+  const before = immutableDigest(f.db);
+  const http = bodyFixture(f, { mutate(reply, item) {
+    if (item.method === 'eth_getLogs') for (const log of reply.result) {
+      if (Number(BigInt(log.blockNumber)) >= ORIGIN + 64) log.transactionHash = '0x' + 'f'.repeat(64);
+    }
+  } });
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+  try {
+    const result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check });
+    assert.equal(result.phase, 'incomplete'); assert.match(result.reason, /log_transaction_mismatch/);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key LIKE 'discovery_unit:%'").get().n, 1);
+    assert.equal(immutableDigest(f.db), before);
+  } finally { bounded.close(); f.db.close(); }
+});
+await test('bounded block batches preserve creations parent continuity across spine windows', async () => {
+  const f = await fixture({ blocksPerHour: 96, txPerBlock: 6 });
+  const before = allState(f.db);
+  const http = bodyFixture(f, { mutate(reply, item) {
+    if (item.method === 'eth_getBlockByNumber' && item.params[1] === true && Number(BigInt(item.params[0])) === ORIGIN + 32) {
+      reply.result.parentHash = '0x' + 'f'.repeat(64);
+    }
+  } });
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+  try {
+    await assert.rejects(recoverEvidenceUnit({ db: f.db, provider: bounded.provider,
+      c: { h: f.db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(BASE) }, unit: { kind: 'creations' }, registry: noLaunch }),
+    e => e.code === 'parent_hash_mismatch');
+    assert.deepEqual(http.batches, [32, 32]); assert.equal(http.requests, 4);
+    assert.deepEqual(allState(f.db), before);
+  } finally { bounded.close(); f.db.close(); }
+});
+await test('bounded block batches fit maximum creations hour under unchanged request and time budgets', async () => {
+  const f = await fixture({ blocksPerHour: 15_000, txPerBlock: 1, streams: [] });
+  const before = immutableDigest(f.db), http = bodyFixture(f);
+  let clock = 0;
+  const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, now: () => clock, sleep: async ms => { clock += ms; } });
+  try {
+    const result = await recoverEvidenceUnit({ db: f.db, provider: bounded.provider,
+      c: { h: f.db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(BASE) }, unit: { kind: 'creations' }, registry: noLaunch });
+    assert.equal(result.status, 'available'); assert.equal(http.batches.length, 469);
+    assert.equal(bounded.stats.requests, 472); assert.equal(bounded.stats.calls, 15009);
+    assert(clock < RECOVERY_BUDGET.timeoutMs); bounded.check();
+    assert.equal(immutableDigest(f.db), before);
+    assert(process.memoryUsage().heapUsed < 64 * 1024 * 1024);
+    console.log(`MEASURE max-creations-hour requests=${bounded.stats.requests} calls=${bounded.stats.calls} bytes=${bounded.stats.bytes} pacedMs=${clock} heapUsed=${process.memoryUsage().heapUsed}`);
+  } finally { bounded.close(); f.db.close(); }
+});
 
 if (process.env.RECOVERY_CRASH_CHILD || process.env.RECOVERY_POLICY_CRASH_CHILD) {
   const path = process.env.RECOVERY_CRASH_CHILD ?? process.env.RECOVERY_POLICY_CRASH_CHILD;
