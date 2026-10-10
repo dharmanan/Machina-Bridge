@@ -14,6 +14,8 @@ import { streamLogs, validateLogs } from './logs.js';
 import { codeIsPresent } from './registry.js';
 import { UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { providerDiagnostics } from './provider.js';
+import { spineProgress, appendSpine, cachedSpineBlock, spineNetwork } from './discovery-spine-progress.js';
+import { archiveConfig } from './evidence-archive.js';
 
 export const DISCOVERY_PUBLIC_START = Date.parse('2026-09-16T11:00:00Z') / 1000;
 export const RECOVERY_HOURS = 720;
@@ -24,6 +26,7 @@ export const RECOVERY_TIMEOUT_MS = 600_000;
 export const RECOVERY_BLOCK_BATCH_SIZE = 32;
 export const RECOVERY_RETRY_MS = 3_600_000;
 export const V3_RETRY_POLICY = 'sqlite-pool-membership-v1';
+export const CREATIONS_RETRY_POLICY = 'durable-spine-v1';
 const HOUR = 3600;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const jsonHash = value => hash(intelligenceJson(value));
@@ -104,15 +107,29 @@ function readUnit(db, h, unit) {
     || !['available', 'insufficient_coverage'].includes(saved.status)) fail('recovery_unit_corrupt');
   return saved;
 }
-function validateRetry(attempt) {
+function validateRetry(attempt, allowProgress = false) {
   if (attempt && (!/^[0-9a-f]{64}$/.test(attempt.fingerprint) || !Number.isSafeInteger(attempt.attempts)
-    || attempt.attempts < 1 || attempt.attempts > MAX_RECOVERY_ATTEMPTS || !Number.isSafeInteger(attempt.notBefore)
+    || attempt.attempts < (allowProgress && attempt.retryPolicy === CREATIONS_RETRY_POLICY ? 0 : 1) || attempt.attempts > MAX_RECOVERY_ATTEMPTS || !Number.isSafeInteger(attempt.notBefore)
     || attempt.notBefore < 0 || !['retryable', 'blocked'].includes(attempt.phase)
-    || typeof attempt.reason !== 'string' || attempt.reason.length > 256)) fail('recovery_retry_corrupt');
+    || typeof attempt.reason !== 'string' || attempt.reason.length > 256
+    || attempt.lastRun != null && (!Number.isSafeInteger(attempt.lastRun) || attempt.lastRun < 0))) fail('recovery_retry_corrupt');
   return attempt;
 }
 function readRetry(db, hour, unit, fingerprint) {
   const legacy = validateRetry(meta(db, retryKey(hour, unit.id)));
+  if (unit.kind === 'creations') {
+    const budgetReason = /^recovery_(response|rpc|time)_budget_exhausted$/.test(legacy?.reason ?? '');
+    if (legacy?.fingerprint === fingerprint && (legacy.attempts >= MAX_RECOVERY_ATTEMPTS || legacy.phase === 'blocked' && !budgetReason)) return legacy;
+    const revised = validateRetry(meta(db, retryKey(hour, unit.id, CREATIONS_RETRY_POLICY)), true);
+    const supersedes = legacy ? jsonHash(legacy) : null;
+    if (revised?.fingerprint === fingerprint) {
+      if (revised.retryPolicy !== CREATIONS_RETRY_POLICY || revised.supersedes !== supersedes) fail('recovery_retry_policy_conflict');
+      return revised;
+    }
+    return { fingerprint, attempts: legacy?.fingerprint === fingerprint ? legacy.attempts : 0,
+      phase: 'retryable', reason: legacy?.fingerprint === fingerprint ? legacy.reason : 'recovery_incremental_ready',
+      notBefore: legacy?.fingerprint === fingerprint ? legacy.notBefore : 0, retryPolicy: CREATIONS_RETRY_POLICY, supersedes };
+  }
   // Only this obsolete implementation cap is superseded. Keep the original record and attempt count;
   // exhausted quotas, corrupt evidence and every other blocked reason remain blocked.
   if (unit.kind !== 'uniswap_v3' || legacy?.fingerprint !== fingerprint || legacy.phase !== 'blocked'
@@ -193,8 +210,11 @@ function hourPlan(db, hour, registry, now) {
   try { for (const row of c.rows) { const p = payload(row, c.h); if (row === current) currentPayload = p; } imports = storedImports(db, c, registry, units); }
   catch (error) { corrupt = error.code ?? 'recovery_stored_evidence_corrupt'; category = 'inconsistent'; }
   const unitPlans = units.map(unit => {
-    let saved, attempt;
-    try { saved = readUnit(db, c.h, unit); attempt = readRetry(db, hour, unit, c.fingerprint); }
+    let saved, attempt, progress;
+    try {
+      saved = readUnit(db, c.h, unit); attempt = readRetry(db, hour, unit, c.fingerprint);
+      if (unit.kind === 'creations' && !saved && !imports.has(unit.id)) progress = spineProgress(db, c.h, unit);
+    }
     catch (error) { corrupt ??= error.code; }
     let phase = saved?.status === 'available' || imports.has(unit.id) ? 'complete' : 'pending';
     let reason = saved?.reason ?? null;
@@ -216,6 +236,7 @@ function hourPlan(db, hour, registry, now) {
     return { ...unit, phase, reason, attempts: attempt?.fingerprint === c.fingerprint ? attempt.attempts : 0,
       retryPolicy: attempt?.fingerprint === c.fingerprint ? attempt.retryPolicy ?? null : null,
       supersedes: attempt?.supersedes ?? null,
+      lastRun: attempt?.lastRun ?? 0, progress,
       saved, imported: imports.get(unit.id) ?? null };
   });
   const aggregateLimited = unitPlans.every(u => u.phase === 'complete') && ['candidate_limit', 'first_dex_observation_limit'].includes(currentPayload?.discovery.reason);
@@ -229,7 +250,8 @@ export function recoveryHourPlan(db, hour, { registry = INTELLIGENCE_REGISTRY, n
   try { p = hourPlan(db, hour, registry, now); }
   catch (error) { return { hourStart: hour, digest: registryDigest(registry), category: 'inconsistent', phase: 'blocked', reason: error.code ?? 'recovery_evidence_corrupt', units: [] }; }
   return { hourStart: hour, digest: p.c.digest, category: p.category, phase: p.phase, reason: p.reason,
-    units: p.units.map(({ kind, id, entry, phase, reason, attempts, retryPolicy }) => ({ kind, id, source: entry?.id ?? null, phase, reason, attempts, retryPolicy })) };
+    units: p.units.map(({ kind, id, entry, phase, reason, attempts, retryPolicy, progress }) => ({ kind, id, source: entry?.id ?? null, phase, reason, attempts, retryPolicy,
+      ...(progress?.blocks ? { verifiedBlocks: progress.blocks, nextBlock: progress.nextBlock } : {}) })) };
 }
 export function planDiscoveryRecovery(db, { registry = INTELLIGENCE_REGISTRY, now = Date.now() } = {}) {
   assertRecoverySchema(db);
@@ -258,12 +280,12 @@ function saveUnit(db, c, unit, evidence, { status = 'available', reason = null, 
   });
 }
 
-function retry(db, c, unit, { now, reason, phase = 'retryable', lease = false, diagnostics = null }) {
+function retry(db, c, unit, { now, reason, phase = 'retryable', lease = false, diagnostics = null, progress = false }) {
   transaction(db, () => {
     unchanged(db, c);
     db.prepare('INSERT INTO compact_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-      .run(retryKey(c.h.hour_start, unit.id, unit.retryPolicy), intelligenceJson({ fingerprint: c.fingerprint, attempts: unit.attempts + 1,
-        reason, phase, notBefore: now + RECOVERY_RETRY_MS + (lease ? RECOVERY_TIMEOUT_MS : 0),
+      .run(retryKey(c.h.hour_start, unit.id, unit.retryPolicy), intelligenceJson({ fingerprint: c.fingerprint, attempts: unit.attempts + (progress ? 0 : 1),
+        reason, phase, lastRun: now, notBefore: now + (progress ? 60_000 : RECOVERY_RETRY_MS) + (lease ? RECOVERY_TIMEOUT_MS : 0),
         ...(unit.retryPolicy ? { retryPolicy: unit.retryPolicy, supersedes: unit.supersedes } : {}),
         ...(diagnostics ? { diagnostics } : {}) }));
   });
@@ -285,7 +307,7 @@ async function boundaries(provider, h) {
 // Existing Gateway/projection repair model: canonical pinned boundaries plus canonical log-bearing block/tx proofs.
 // Never rescans non-event transaction bodies for a source-only unit. Keep the
 // <=500-block log range, but retain at most 32 decoded block/transaction proofs.
-async function scan(provider, h, stream, onLogs) {
+async function scan(provider, h, stream, onLogs, cached = () => null) {
   for (let from = h.first_block; from <= h.last_block; from += 500) {
     // validateLogs duplicate keys are relative to this chunk, not the entire hour.
     const seen = new Set();
@@ -299,9 +321,11 @@ async function scan(provider, h, stream, onLogs) {
       for (let offset = 0; offset < numbers.length; offset += RECOVERY_BLOCK_BATCH_SIZE) {
         const chunk = numbers.slice(offset, offset + RECOVERY_BLOCK_BATCH_SIZE);
         const window = new Map();
-        const blocks = await provider.batch(chunk.map(n => ['eth_getBlockByNumber', [`0x${n.toString(16)}`, true]]));
+        for (const n of chunk) { const block = cached(n); if (block) window.set(n, block); }
+        const missing = chunk.filter(n => !window.has(n));
+        const blocks = missing.length ? await provider.batch(missing.map(n => ['eth_getBlockByNumber', [`0x${n.toString(16)}`, true]])) : [];
         blocks.forEach((b, i) => {
-          const block = spineBlockOf(b, chunk[i]);
+          const block = spineBlockOf(b, missing[i]);
           if (block.timestamp < h.hour_start || block.timestamp >= h.hour_start + HOUR
             || block.number === h.first_block && block.hash !== h.first_hash || block.number === h.last_block && block.hash !== h.last_hash) fail('recovery_event_block_mismatch');
           window.set(block.number, block);
@@ -320,13 +344,40 @@ function singleRegistry(registry, unit) {
 function finishSink(sink, h, families, projections, present = () => false) {
   return sink.finish({ range: rangeOf(h), families, projections, codePresent: present });
 }
-export async function recoverEvidenceUnit({ db, provider, c, unit, registry = INTELLIGENCE_REGISTRY }) {
+export async function recoverEvidenceUnit({ db, provider, c, unit, registry = INTELLIGENCE_REGISTRY, saveSpine = null, checkStorage = () => {} }) {
   const h = c.h;
-  const edges = await boundaries(provider, h);
   const reg = singleRegistry(registry, unit), sink = createIntelligenceSink({ registry: reg });
+  const spineUnit = definitions(h, registry).find(u => u.kind === 'creations');
+  const progress = spineProgress(db, h, spineUnit, { verify: true, onBlock: b => { if (unit.kind === 'creations' && saveSpine) sink.blocks([b]); } });
+  const cached = n => n < progress.nextBlock ? cachedSpineBlock(db, h, spineUnit, n) : null;
+  const edges = await boundaries(provider, h);
   let result;
   const families = { uniswapV3: { status: 'unavailable' }, uniswapV4: { status: 'unavailable' } };
   if (unit.kind === 'creations') {
+    if (JSON.parse(h.network_json).internal?.deploymentAttempts === 0) {
+      // The accepted canonical absence count is proof; activity samples/address sets are not.
+      await boundaries(provider, h);
+      return { evidence: { candidates: [], firstDex: [] }, status: 'available', reason: null };
+    }
+    if (saveSpine) {
+      let cursor = progress;
+      if (cursor.nextBlock <= h.last_block && provider.canContinue && !provider.canContinue(RECOVERY_BLOCK_BATCH_SIZE))
+        return { status: 'progress', reason: 'recovery_progress_pending' };
+      const before = cursor.blocks ? { number: cursor.nextBlock - 1, hash: cursor.lastHash, timestamp: cursor.lastTimestamp } : edges.before;
+      if (cursor.nextBlock <= h.last_block) for await (const blocks of spineWindows(provider, {
+        first: cursor.nextBlock, last: h.last_block, before, hourStart: h.hour_start, hourEnd: h.hour_start + HOUR,
+        batchSize: RECOVERY_BLOCK_BATCH_SIZE, windowBlocks: RECOVERY_BLOCK_BATCH_SIZE })) {
+        cursor = saveSpine(spineUnit, blocks); sink.blocks(blocks);
+        if (cursor.nextBlock <= h.last_block && provider.canContinue && !provider.canContinue(RECOVERY_BLOCK_BATCH_SIZE))
+          return { status: 'progress', reason: 'recovery_progress_pending', nextBlock: cursor.nextBlock };
+      }
+      checkStorage(Math.max(8 * 1024 * 1024, cursor.bytes)); // Reserve native SQL sorting space before finalization.
+      if (canonical(spineNetwork(db, h, spineUnit, cursor)) !== h.network_json) fail('recovery_network_conflict');
+      const p = finishSink(sink, h, families, null);
+      await boundaries(provider, h);
+      const limited = p.discovery.reason === 'candidate_limit';
+      return { evidence: { candidates: p.discovery.candidates, firstDex: [] }, status: limited ? 'insufficient_coverage' : 'available', reason: limited ? 'candidate_limit' : null };
+    }
     const network = createNetworkAccumulator(); let last;
     for await (const blocks of spineWindows(provider, { first: h.first_block, last: h.last_block, before: edges.before,
       hourStart: h.hour_start, hourEnd: h.hour_start + HOUR,
@@ -350,7 +401,7 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
       await scan(provider, h, stream, (logs, window) => {
         accumulator.add(stream.key, logs, window);
         if (stream.key === 'v3Factory') for (const record of accumulator.createdPools()) if (window.has(record.createdBlock)) sink.poolCreated(record, window);
-      });
+      }, cached);
     }
     const address = v3 ? UNISWAP_REGISTRY.v3Factory.address : UNISWAP_REGISTRY.v4PoolManager.address;
     const present = codeIsPresent(await provider.request('eth_getCode', [address, `0x${h.last_block.toString(16)}`]));
@@ -368,7 +419,7 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
   } else if (unit.kind === 'exchange') {
     const accumulators = { usdc: createUsdcAccumulator(), assets: createAssetsAccumulator() };
     for (const stream of LOG_STREAMS.filter(s => ['usdc', 'assets'].includes(s.key))) {
-      await scan(provider, h, stream, (logs, window) => { accumulators[stream.key].add(stream.key, logs, window); sink.transfers(logs); });
+      await scan(provider, h, stream, (logs, window) => { accumulators[stream.key].add(stream.key, logs, window); sink.transfers(logs); }, cached);
     }
     for (const [family, accumulator] of Object.entries(accumulators)) {
       const metrics = accumulator.finish();
@@ -396,7 +447,7 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
         }
       }
     }
-    await scan(provider, h, stream, (logs, window) => sink.extension(stream, logs, window));
+    await scan(provider, h, stream, (logs, window) => sink.extension(stream, logs, window), cached);
     const p = finishSink(sink, h, families, null, present);
     const entry = p[unit.kind === 'launch' ? 'launchSources' : 'protocols'][0];
     result = { evidence: { candidates: p.discovery.candidates, firstDex: [], entry }, status: entry.status === 'available' ? 'available' : 'insufficient_coverage', reason: entry.reason,
@@ -459,14 +510,32 @@ export function commitDiscoveryRecovery(db, c, units, { registry = INTELLIGENCE_
   });
 }
 export async function recoverDiscoveryHour({ db, hourStart, provider, registry = INTELLIGENCE_REGISTRY, now = Date.now(),
-  recoverUnit = recoverEvidenceUnit, beforeCommit = null, beforeUnitCommit = null, checkBudget = () => {}, checkStorage = () => {}, log = () => {} }) {
+  recoverUnit = recoverEvidenceUnit, beforeCommit = null, beforeUnitCommit = null, beforeSpineCommit = null,
+  oneUnit = false, storage = archiveConfig(), checkBudget = () => {}, checkStorage = () => {}, log = () => {} }) {
   assertRecoverySchema(db);
   const plan = hourPlan(db, hourStart, registry, now);
   if (plan.phase !== 'pending') return { hourStart, phase: plan.phase, reason: plan.reason, rpcNeeded: false };
   const { c, units } = plan;
   if (c.h.last_block - c.h.first_block + 1 > 15000) fail('recovery_block_limit');
   let calls = false;
-  for (const unit of units) {
+  for (const unit of units) if (unit.imported && !unit.saved) {
+    checkStorage(); unit.saved = saveUnit(db, c, unit, unit.imported, { beforeCommit: beforeUnitCommit });
+  }
+  const eligible = units.filter(u => u.phase === 'pending' && !u.saved);
+  const work = oneUnit ? eligible.sort((a,b) => a.lastRun-b.lastRun || Number(a.kind==='creations')-Number(b.kind==='creations')).slice(0,1) : units;
+  const saveSpine = (spineUnit, blocks) => {
+    checkBudget(); checkStorage();
+    return transaction(db, () => {
+      unchanged(db, c);
+      const archiveUsage = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='compact_evidence_archive_usage'").get()
+        ? db.prepare('SELECT * FROM compact_evidence_archive_usage WHERE id=1').get() : null;
+      return appendSpine(db, c.h, spineUnit, blocks, { maxTotalBytes: storage.maxArchiveBytes,
+        maxDailyBytes: storage.maxDailyBytes, archiveBytes: archiveUsage?.stored_bytes ?? 0,
+        archiveDayBytes: archiveUsage?.day_start === Math.floor(Date.now()/86400000)*86400 ? archiveUsage.day_bytes : 0,
+        beforeCommit: () => beforeSpineCommit?.() });
+    });
+  };
+  for (const unit of work) {
     checkStorage();
     checkBudget(); // Capacity guard before background writes or historical requests.
     if (unit.imported && !unit.saved) unit.saved = saveUnit(db, c, unit, unit.imported, { beforeCommit: beforeUnitCommit });
@@ -474,11 +543,18 @@ export async function recoverDiscoveryHour({ db, hourStart, provider, registry =
     retry(db, c, unit, { now, reason: 'recovery_interrupted_or_in_progress', lease: true });
     try {
       checkBudget(); calls = true;
-      const result = await recoverUnit({ db, provider, c, unit, registry });
+      const result = await recoverUnit({ db, provider, c, unit, registry, saveSpine, checkStorage });
       checkBudget();
       checkStorage();
       // Transient semantic unavailability remains retryable. Deterministic caps/validity failures retain their evidence permanently.
-      if (result.status === 'available' || result.reason === 'candidate_limit' || result.reason === 'registry_not_valid_for_entire_range' || result.permanent) {
+      if (result.status === 'progress') {
+        if (unit.kind !== 'creations' || unit.retryPolicy !== CREATIONS_RETRY_POLICY) fail('recovery_progress_policy_mismatch');
+        if (spineProgress(db, c.h, unit).blocks <= (unit.progress?.blocks ?? 0)) fail('recovery_progress_stalled');
+        unit.reason = result.reason;
+        retry(db, c, unit, { now, reason: result.reason, progress: true });
+        log(`DISCOVERY_UNIT_PROGRESS hour=${hourStart} kind=creations nextBlock=${spineProgress(db,c.h,unit).nextBlock}`);
+        break;
+      } else if (result.status === 'available' || result.reason === 'candidate_limit' || result.reason === 'registry_not_valid_for_entire_range' || result.permanent) {
         unit.saved = saveUnit(db, c, unit, result.evidence, { status: result.status, reason: result.reason, beforeCommit: beforeUnitCommit });
         log(`DISCOVERY_UNIT_COMMITTED hour=${hourStart} kind=${unit.kind} source=${unit.entry?.id ?? 'none'} status=${result.status}`);
       } else { unit.reason = result.reason; retry(db, c, unit, { now, reason: result.reason }); }
@@ -486,7 +562,7 @@ export async function recoverDiscoveryHour({ db, hourStart, provider, registry =
       unit.reason = error.code ?? 'recovery_failed';
       try {checkStorage();} catch (storageError) {log(`DISCOVERY_STORAGE_BLOCKED reason=${storageError.code??storageError.message}`);throw storageError;}
       const diagnostics = providerDiagnostics(error);
-      retry(db, c, unit, { now, reason: unit.reason, diagnostics, phase: /conflict|corrupt|mismatch|limit/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
+      retry(db, c, unit, { now, reason: unit.reason, diagnostics, phase: /conflict|corrupt|mismatch|limit|spine_storage_budget/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
       log(`DISCOVERY_UNIT_FAILED hour=${hourStart} kind=${unit.kind} source=${unit.entry?.id ?? 'none'} attempt=${unit.attempts + 1} reason=${unit.reason} diagnostics=${JSON.stringify(diagnostics)}`);
       // Subsequent requests after a provider/budget failure are forbidden. Already committed units survive.
       try { checkBudget(); } catch { break; }

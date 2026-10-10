@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { statfsSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { spineStorageUsage } from './discovery-spine-progress.js';
 
 const MiB = 1024 * 1024;
 const pendingArchives = new WeakMap(); // Shared by controllers on the same connection; never clear inside a transaction.
@@ -202,7 +203,9 @@ export function createEvidenceArchive(db, { config = archiveConfig(), capacity, 
       const storedBytes=payloads.reduce((n,p)=>n+p.length,0), rawBytes=parts.reduce((n,p)=>n+p.length,0), charge=storedBytes+Buffer.byteLength(JSON.stringify(manifest))+parts.length*256;
       const usage=db.prepare('SELECT * FROM compact_evidence_archive_usage WHERE id=1').get();
       const dayStart=Math.floor(now()/86400000)*86400, dayBytes=usage.day_start===dayStart?usage.day_bytes:0;
-      if(usage.stored_bytes+charge>config.maxArchiveBytes||dayBytes+charge>config.maxDailyBytes)throw error('archive_storage_budget');
+      const spine = spineStorageUsage(db);
+      if(usage.stored_bytes+spine.bytes+charge>config.maxArchiveBytes
+        ||dayBytes+(spine.dayStart===dayStart?spine.dayBytes:0)+charge>config.maxDailyBytes)throw error('archive_storage_budget');
       const preflight=storagePreflight(db,config,{plannedBytes:charge,capacity});if(!preflight.ok)throw error(preflight.reason);
       db.exec('SAVEPOINT evidence_archive');
       try{

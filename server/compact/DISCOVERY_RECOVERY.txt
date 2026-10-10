@@ -324,3 +324,62 @@ and zero further RPC in that execution. There is no post-budget adaptive retry. 
 retained and reused after cooldown; an unfinished unit is not claimed complete. This change reduces the demonstrated
 per-response failure; it does not prove that the production hour fits all cumulative budgets. No production reads,
 recovery execution, scheduler activation or environment changes are part of local verification.
+
+## Durable recovery passes (total-response budget)
+
+Batch size remains 32. The 64 MiB response-byte budget is PER EXECUTION, never silently enlarged for a dense hour.
+The runner performs at most ONE pending source unit per execution. Complete imports use zero RPC; independently
+eligible sources are selected before creations at equal last-run times. A creations provider failure cannot spend
+the next source's fresh execution budget. Existing live scheduler priority, writer lock and feature flags are unchanged.
+
+An accepted canonical network payload with internal.deploymentAttempts exactly zero proves an empty creations list;
+recovery verifies pinned boundaries but does not reread full transaction bodies for that unit. Missing internal counts,
+activity samples, address membership, registry entries and pool projections DO NOT prove creation-list completeness.
+Existing independently complete live/archive units and compatible old-registry evidence retain their existing reuse rules.
+
+Otherwise each validated 32-block spine window is committed atomically to indexed compact_meta keys. Per-block records
+keep the exact compact inputs used by the existing engine: canonical number/hash/parent/time/gas and ordered transaction
+hash/from/to arrays, including null recipients. They intentionally do NOT keep calldata, receipts, values or internal
+traces that the compact engine never persisted. Each immutable record binds the canonical network digest, hour bounds,
+definition, unit identity and previous record checksum. The same transaction updates a checksummed cursor and storage
+accounting. SQLite triggers prohibit UPDATE, DELETE and REPLACE of accepted spine inputs; the mutable cursor cannot
+claim completion on its own. No existing canonical row, checkpoint, archive or completed unit is changed or deleted.
+
+Before another body request, the bounded provider reserves two maximum responses (16 MiB), three HTTP requests,
+the next batch's calls plus eight boundary calls, and 30 seconds. If insufficient headroom remains, the pass commits
+explicit recovery_progress_pending state and yields. Every next pass rechecks canonical identity and verifies the
+entire persisted checksum/parent chain, then starts at the next missing block. An aborted HTTP response is never saved;
+only the unfinished batch may be requested again. A single oversized response still fails closed, without another RPC.
+
+Only full, gap-free coverage ending at the pinned last hash, exact network counters/gas and exact sender/recipient
+unions permits final creations-unit completion. Address unions use bounded, indexed SQLite reads instead of an
+hour-wide JS Set. The execute connection uses a 2 MiB SQLite page cache and disk-backed temporary sorting. Partial
+progress is never imported as a complete creation list or exposed as recovered discovery coverage. Compatible cached
+spine inputs may supply existing source log/transaction validation; emitter, ABI, factory, timestamp, transaction and
+stored-family checks still apply. Logs/code verification for a new source are not implied by a cached transaction body.
+
+The versioned durable-spine-v1 retry record preserves the legacy record, failure count and cooldown. Unknown/conflicting
+or corrupt evidence, other blocked causes and already-exhausted legacy quotas remain blocked. Only successful forward
+progress releases its lease without consuming another FAILURE attempt, with a one-minute continuation cooldown. Actual
+failures still use eight attempts and the one-hour cooldown; process death retains the original lease delay. A yield
+that advances no block counts as a failure rather than allowing infinite "successful" no-op retries.
+
+Storage is bounded: at most 15,000 progress rows/512 MiB disk payload per hour, 2 MiB per record and 8 MiB per write transaction.
+The hour-wide disk ledger may span many executions; the 64 MiB RPC/heap limits remain PER EXECUTION. The existing
+disk-capacity preflight guards every write. Final SQL union calculation also reserves four times the ledger size
+on the database and temporary filesystems, retaining all evidence if capacity is insufficient. Raw progress payloads and compressed archive storage share
+COMPACT_ARCHIVE_MAX_TOTAL_MIB and COMPACT_ARCHIVE_MAX_DAILY_MIB; neither writer may bypass the other's charge. Exhaustion
+retains all original evidence and reports the storage failure. Checkpoints do not expire or reset on deployment or a
+registry update. No recovery or archive activation is introduced, and the existing 720-hour eligibility scope is unchanged.
+Progress older than that scope remains stored but is not automatically replayed outside the approved window.
+
+Local disposable measurement: a generated 512-block hour with dense transaction bodies failed the legacy 64 MiB path.
+Two incremental passes used about 54/43 MB, stored about 2.2 MB of compact inputs, never reread an accepted body and
+produced byte-identical live evidence under 64 MiB V8 old-space. This fixture is not a production storage forecast.
+554 similarly sized fixture hours would require roughly 1.2 GB of raw input payload alone, so a 512 MiB shared quota
+cannot be assumed sufficient. Production block counts, unique senders and transaction payload sizes were not read.
+For planning only, the supplied partial 67,110,888-byte/384-body-call observation is about 175 KB per requested block.
+If that density applied to maximum 15,000-block hours, creations traffic alone could approach 2.6 GB/hour or 1.45 TB
+for 554 hours, before reuse. Successful chunks remove recurring prefix traffic, not the cost of genuinely absent input.
+HTTP time is at least one second per physical request, plus provider latency, disk/validation and scheduler waits;
+the ten-minute ceiling applies to every pass, not the whole backlog. Capacity must be assessed before any bulk activation.

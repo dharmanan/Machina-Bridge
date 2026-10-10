@@ -1,5 +1,6 @@
 // Default: read-only current-30D plan. --execute requires exactly ONE stored UTC hour; no bulk mode.
-import { existsSync } from 'node:fs';
+import { existsSync, statfsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -78,8 +79,16 @@ export function boundedRecoveryProvider({ fetchImpl = globalThis.fetch, now = Da
       throw err;
     }
   };
+  const canContinue = (calls = 32) => {
+    check();
+    // Reserve a maximum next body response PLUS a maximum boundary response.
+    // Yield before exhaustion; this does not relax any hard provider guard.
+    return stats.bytes + 2 * budget.responseBytes <= budget.bytes
+      && stats.requests + 3 <= budget.requests && stats.calls + calls + 8 <= budget.calls
+      && now() - started + 30_000 < budget.timeoutMs;
+  };
   return { stats, check, close: () => clearTimer(timer), provider: {
-    stats,
+    stats, canContinue,
     request: (...args) => guarded(() => provider.request(...args)),
     batch: (...args) => guarded(() => provider.batch(...args))
   } };
@@ -91,7 +100,7 @@ export async function runDiscoveryRecovery(config, { Database = DatabaseSync, pr
     if (!existsSync(config.sqlitePath)) throw new Error('existing_sqlite_path_required');
     if (config.execute) lock = acquireWriterLock(config.sqlitePath, { owner: 'discovery-recovery' });
     db = new Database(config.sqlitePath, { readOnly: !config.execute });
-    db.exec(`PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON; ${config.execute ? 'PRAGMA synchronous=FULL;' : 'PRAGMA query_only=ON;'}`);
+    db.exec(`PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON; ${config.execute ? 'PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE;' : 'PRAGMA query_only=ON;'}`);
     assertRecoverySchema(db);
     if (!config.execute) {
       db.exec('BEGIN');
@@ -106,13 +115,19 @@ export async function runDiscoveryRecovery(config, { Database = DatabaseSync, pr
       print(`DISCOVERY_RECOVERY_SKIP ${JSON.stringify(plan)}`);
       return plan;
     }
-    const checkStorage = () => {
-      const preflight=storagePreflight(db,storage,{plannedBytes:8*1024*1024,capacity});
+    const checkStorage = (plannedBytes = 8*1024*1024) => {
+      const preflight=storagePreflight(db,storage,{plannedBytes,capacity});
       if(!preflight.ok)throw Object.assign(new Error(preflight.reason),{code:preflight.reason});
+      if (plannedBytes > 8*1024*1024) {
+        let freeBytes;
+        try { const fs=statfsSync(process.env.SQLITE_TMPDIR || tmpdir(),{bigint:true});freeBytes=Number(fs.bavail*fs.bsize); } catch {}
+        if (!Number.isSafeInteger(freeBytes) || freeBytes-plannedBytes*4<storage.minFreeBytes)
+          throw Object.assign(new Error('recovery_temp_capacity_insufficient'),{code:'recovery_temp_capacity_insufficient'});
+      }
     };
     checkStorage(); // Before constructing a provider, leases, recovery evidence or any historical RPC.
     bounded = providerFactory({ minIntervalMs: config.minIntervalMs });
-    const result = await recoverDiscoveryHour({ db, hourStart: config.hourStart, provider: bounded.provider,
+    const result = await recoverDiscoveryHour({ db, hourStart: config.hourStart, provider: bounded.provider, oneUnit: true, storage,
       checkBudget:()=>{bounded.check();checkStorage();},checkStorage, log: print });
     print(`DISCOVERY_RECOVERY_RESULT ${JSON.stringify({ ...result, provider: bounded.stats })}`);
     return result;

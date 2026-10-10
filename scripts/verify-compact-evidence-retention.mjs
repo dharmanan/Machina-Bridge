@@ -21,6 +21,7 @@ import { intelligenceRegistry,registryDigest } from '../server/compact/intellige
 import { recoveryHourPlan,recoverDiscoveryHour } from '../server/compact/discovery-recovery.js';
 import { runDiscoveryRecovery } from './recover-compact-discovery.mjs';
 import { runDailyActiveReplay } from './replay-compact-dau-hour.mjs';
+import { SPINE_PROGRESS_VERSION } from '../server/compact/discovery-spine-progress.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 
 globalThis.fetch=async()=>{throw new Error('external_network_forbidden');};
@@ -77,6 +78,17 @@ await test('feature flags default OFF; read-only preflight fails closed and vali
   assert.equal(storagePreflight(f.db,config,{capacity:()=>({freeBytes:1,databaseBytes:0})}).reason,'storage_low_space');
   assert.equal(storagePreflight(f.db,config,{capacity:()=>({freeBytes:10*1024**3,databaseBytes:config.maxDatabaseBytes+1})}).reason,'storage_database_budget');
   assert.deepEqual(rows(f.db,'compact_evidence_archive'),before);f.db.close();
+});
+await test('recovery spine and archive share total and daily quotas without pruning originals',()=>{
+  for(const daily of [false,true]) {
+    const quota=1024*1024, cfg={...config,...(daily?{maxDailyBytes:quota}:{maxArchiveBytes:quota})};
+    const f=fixture({archive:{...options,config:cfg}}),before=rows(f.db,'compact_hour_addresses');
+    f.db.prepare('INSERT INTO compact_meta(key,value) VALUES(?,?)').run('discovery_spine_usage',JSON.stringify({
+      version:SPINE_PROGRESS_VERSION,bytes:quota,dayBytes:quota,dayStart:Math.floor(Date.now()/86400000)*86400}));
+    transaction(f,()=>f.store.archive.prune('compact_hour_addresses','hour_start=?',[BASE]));
+    assert.deepEqual(rows(f.db,'compact_hour_addresses'),before);assert.equal(count(f.db,'compact_evidence_archive'),0);
+    assert(f.store.archive.report().failures.includes('archive_storage_budget'));f.db.close();
+  }
 });
 await test('address deletion path: two separate commits, lossless 20-byte membership, restart and idempotency',()=>{
   const f=fixture(),before=rows(f.db,'compact_hour_addresses');

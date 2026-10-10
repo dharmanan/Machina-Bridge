@@ -26,6 +26,9 @@ import { createDiscoveryRecoveryPlanner } from '../server/compact/discovery-reco
 import { createScheduler, hourIso, createChildDiscoveryRecoveryRunner } from '../server/compact/scheduler.js';
 import { serviceConfig } from './serve-compact-intelligence.mjs';
 import { acquireWriterLock } from '../server/compact/writer-lock.js';
+import { spineProgress } from '../server/compact/discovery-spine-progress.js';
+import { discoveryUnitDefinitions } from '../server/compact/discovery-evidence.js';
+import { archiveConfig } from '../server/compact/evidence-archive.js';
 
 const realFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error('external_network_forbidden'); };
@@ -39,6 +42,7 @@ const launch = (id, n) => ({ id, chainId: 5042, address: addr(n), version: 'test
 const registry = intelligenceRegistry({ launches: [launch('one', 800)] });
 let passed = 0;
 async function test(name, fn) {
+  if (process.env.RECOVERY_CRASH_CHILD || process.env.RECOVERY_POLICY_CRASH_CHILD || process.env.RECOVERY_SPINE_CRASH_CHILD) return;
   if (process.env.RECOVERY_TEST_FILTER && !name.includes(process.env.RECOVERY_TEST_FILTER)) return;
   await fn(); passed++; console.log(`PASS ${name}`);
 }
@@ -67,7 +71,7 @@ function immutable(db) {
   const allowed = new Set(['compact_intelligence_hours', 'compact_token_discoveries', 'compact_token_dex_observations', 'compact_meta']);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'compact_%' ORDER BY name").all().map(r => r.name);
   return Object.fromEntries(tables.filter(t => !allowed.has(t)).map(t => [t, db.prepare(`SELECT * FROM ${t} ORDER BY 1,2`).all()])
-    .concat([['meta', db.prepare("SELECT * FROM compact_meta WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%' ORDER BY key").all()]]));
+    .concat([['meta', db.prepare("SELECT * FROM compact_meta WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%' AND key NOT GLOB 'discovery_spine_*' ORDER BY key").all()]]));
 }
 function immutableDigest(db) {
   // Stream large registry fixtures rather than allocating copies of 100,000 rows under the 64 MiB test heap.
@@ -76,7 +80,7 @@ function immutableDigest(db) {
   for (const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'compact_%' ORDER BY name").all()) {
     if (excluded.has(name)) continue;
     digest.update(name);
-    const where=name==='compact_meta'?" WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%'":'';
+    const where=name==='compact_meta'?" WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%' AND key NOT GLOB 'discovery_spine_*'":'';
     for (const row of db.prepare(`SELECT * FROM ${name}${where} ORDER BY 1,2`).iterate()) digest.update(intelligenceJson(row)+'\n');
   }
   return digest.digest('hex');
@@ -90,15 +94,252 @@ const payload = (unit, status = 'available', reason = null) => ({ status, reason
     source: unit.entry.source, verificationBasis: unit.entry.verificationBasis, address: unit.entry.address, status, reason, counts: {}, rawFlows: {} } } : {}) } });
 const fakeRecover = async ({ unit }) => payload(unit);
 
+const creationContext = (db, reg = noLaunch) => {
+  const h = db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(BASE);
+  return { h, unit: discoveryUnitDefinitions(h, reg).find(u => u.kind === 'creations') };
+};
+
+if (process.env.RECOVERY_SPINE_CRASH_CHILD) {
+  const path=process.env.RECOVERY_SPINE_CRASH_CHILD, db=new DatabaseSync(path);
+  db.exec('PRAGMA synchronous=FULL;'); acquireWriterLock(path,{owner:'disposable-spine-crash'});
+  const chain=createSyntheticChain({originNumber:ORIGIN,originTimestamp:BASE,blockSpacing:36_000_000/96,
+    poolCreatedAt:ORIGIN,factoryDeployedAt:ORIGIN-1,protocols:false,txPerBlock:100,v3Every:1,v4PerBlock:1,usdcPerBlock:1});
+  const http=bodyFixture({chain});
+  const bounded=boundedRecoveryProvider({sleep:async()=>{},fetchImpl:async(url,options)=>{
+    const items=[].concat(JSON.parse(options.body));
+    if(items.some(i=>i.method==='eth_getBlockByNumber'&&i.params[1]===true&&Number(BigInt(i.params[0]))>=ORIGIN+32)) {
+      process.send('spine-prefix-committed'); await new Promise(()=>{setInterval(()=>{},1000);});
+    }
+    return http.fetchImpl(url,options);
+  }});
+  await recoverDiscoveryHour({db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check});
+  process.exit(2);
+}
+
+await test('incremental recovery: dense hour exceeds legacy total bytes but resumes without repeated bodies', async () => {
+  const options = { blocksPerHour: 512, txPerBlock: 20, v3Every: 1 };
+  const baseline = await fixture(options), f = await fixture({ ...options, missing: true });
+  const before = immutableDigest(f.db), { h, unit } = creationContext(f.db);
+  assert(JSON.parse(h.network_json).internal.deploymentAttempts > 0);
+  const legacyHttp = bodyFixture(f, { paddingBytes: 170_000 });
+  const legacy = boundedRecoveryProvider({ fetchImpl: legacyHttp.fetchImpl, sleep: async () => {} });
+  try {
+    await assert.rejects(recoverEvidenceUnit({ db: f.db, provider: legacy.provider, c: { h }, unit, registry: noLaunch }),
+      e => e.code === 'recovery_response_budget_exhausted');
+    assert(legacy.stats.bytes > RECOVERY_BUDGET.bytes);
+  } finally { legacy.close(); }
+  const bodies = [], stats = []; let result, now = 1_000;
+  try {
+    for (let pass = 0; pass < 4; pass++, now += 60_001) {
+      const http = bodyFixture(f, { paddingBytes: 170_000 });
+      const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+      try {
+        result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check, now });
+        bodies.push(...http.bodyBlocks); stats.push({ ...bounded.stats });
+        assert(bounded.stats.bytes < RECOVERY_BUDGET.bytes); assert(bounded.stats.requests <= RECOVERY_BUDGET.requests);
+        if (result.phase === 'recovered') break;
+        assert.equal(result.phase, 'incomplete'); assert.match(result.reason, /creations:recovery_progress_pending/);
+        assert.equal(result.completedUnits, 0);
+        assert.equal(recoveryHourPlan(f.db, BASE, { registry: noLaunch, now }).units.find(u => u.kind === 'creations').phase, 'retryable');
+      } finally { bounded.close(); }
+    }
+    assert.equal(result.phase, 'recovered'); assert.equal(stats.length, 2);
+    assert.deepEqual(bodies, Array.from({ length: 512 }, (_, i) => ORIGIN + i));
+    assert.equal(spineProgress(f.db, h, unit, { verify: true }).blocks, 512);
+    assert.deepEqual(f.db.prepare("SELECT key,value FROM compact_meta WHERE key LIKE 'discovery_unit:%' ORDER BY key").all(),
+      baseline.db.prepare("SELECT key,value FROM compact_meta WHERE key LIKE 'discovery_unit:%' ORDER BY key").all());
+    assert.equal(immutableDigest(f.db), before);
+    console.log(`INCREMENTAL_MEASURE ${JSON.stringify({ passes: stats, compactBytes: spineProgress(f.db,h,unit).bytes, heapUsed: process.memoryUsage().heapUsed })}`);
+    const state = allState(f.db);
+    await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: { batch() { throw Error('unexpected_rpc'); } } });
+    assert.deepEqual(allState(f.db), state);
+  } finally { baseline.db.close(); f.db.close(); }
+});
+await test('incremental recovery: more than eight successful slices do not exhaust the failure quota', async () => {
+  const f = await fixture({ blocksPerHour: 320, txPerBlock: 20, missing: true, v3Every: 1 });
+  const before = immutableDigest(f.db); let result;
+  try {
+    for (let pass = 0; pass < 10; pass++) {
+      const http = bodyFixture(f), bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
+      const provider = { ...bounded.provider, canContinue: n => bounded.provider.canContinue(n) && http.batches.length < 1 };
+      try {
+        result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider, checkBudget: bounded.check, now: 1000 + pass * 60_001 });
+        if (pass < 9) {
+          assert.equal(result.phase, 'incomplete');
+          assert.equal(recoveryHourPlan(f.db, BASE, { registry: noLaunch, now: 1000 + (pass+1)*60_001 }).units.find(u => u.kind === 'creations').attempts, 0);
+        }
+      } finally { bounded.close(); }
+    }
+    assert.equal(result.phase, 'recovered'); assert.equal(immutableDigest(f.db), before);
+  } finally { f.db.close(); }
+});
+await test('incremental recovery: committed prefix survives transport failure and database reopen', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'compact-spine-restart-')), path = join(dir, 'test.sqlite');
+  let f = await fixture({ path, blocksPerHour: 96, txPerBlock: 100, missing: true, v3Every: 1 });
+  const before = immutableDigest(f.db), http = bodyFixture(f);
+  const bounded = boundedRecoveryProvider({ sleep: async () => {}, fetchImpl: async (url, options) => {
+    const items = [].concat(JSON.parse(options.body));
+    if (items.some(i => i.method === 'eth_getBlockByNumber' && i.params[1] === true && Number(BigInt(i.params[0])) >= ORIGIN+32)) throw TypeError('fixture transport');
+    return http.fetchImpl(url, options);
+  } });
+  try {
+    const result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check, now: 1000 });
+    assert.equal(result.phase, 'incomplete'); assert.match(result.reason, /transport/);
+    const { h, unit } = creationContext(f.db); assert.equal(spineProgress(f.db,h,unit,{verify:true}).blocks,32);
+    assert.equal(immutableDigest(f.db),before); f.db.close(); f.db = new DatabaseSync(path);
+    const resumed = bodyFixture(f), next = boundedRecoveryProvider({ fetchImpl: resumed.fetchImpl, sleep: async () => {} });
+    try {
+      assert.equal((await recoverDiscoveryHour({ db:f.db,hourStart:BASE,registry:noLaunch,provider:next.provider,checkBudget:next.check,now:1000+RECOVERY_RETRY_MS+1 })).phase,'recovered');
+      assert.deepEqual(resumed.bodyBlocks,Array.from({length:64},(_,i)=>ORIGIN+32+i));
+      assert.equal(immutableDigest(f.db),before);
+    } finally {next.close();}
+  } finally {bounded.close();f.db.close();rmSync(dir,{recursive:true,force:true});}
+});
+await test('incremental recovery: transactional checkpoint failure rolls back every block and cursor', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100});const before=immutableDigest(f.db);
+  const http=bodyFixture(f),bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check,now:1000,
+      beforeSpineCommit:()=>{throw Object.assign(Error('fixture crash before commit'),{code:'recovery_spine_conflict'});}});
+    assert.equal(result.phase,'incomplete');
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key GLOB 'discovery_spine_*'").get().n,0);
+    assert.equal(immutableDigest(f.db),before);
+  } finally {bounded.close();f.db.close();}
+});
+await test('incremental recovery: independent sources get their own bounded pass while creations is absent', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100}); const before=immutableDigest(f.db),calls=[];
+  const reg=intelligenceRegistry({...noLaunch,launches:Array.from({length:4},(_,i)=>launch(`source-${i}`,900+i))});
+  try {
+    for(let pass=0;pass<6;pass++) {
+      const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:reg,oneUnit:true,now:1000+pass,
+        recoverUnit:async args=>{calls.push(args.unit.kind);return fakeRecover(args);}});
+      assert.equal(result.phase,'incomplete');assert.match(result.reason,/creations:/);
+      assert.equal(result.completedUnits,pass+1);
+    }
+    assert.deepEqual(calls,['uniswap_v3','uniswap_v4','launch','launch','launch','launch']);
+    assert.equal(recoveryHourPlan(f.db,BASE,{registry:reg}).units.find(u=>u.kind==='creations').phase,'pending');
+    assert.equal(immutableDigest(f.db),before);
+  } finally {f.db.close();}
+});
+await test('incremental recovery: canonical zero-deployment proof avoids every full transaction body', async () => {
+  const f=await fixture({missing:true}); const {h,unit}=creationContext(f.db);const http=bodyFixture(f);
+  assert.equal(JSON.parse(h.network_json).internal.deploymentAttempts,0);
+  const bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    const result=await recoverEvidenceUnit({db:f.db,provider:bounded.provider,c:{h},unit,registry:noLaunch});
+    assert.equal(result.status,'available');assert.deepEqual(result.evidence.candidates,[]);assert.deepEqual(http.bodyBlocks,[]);
+  } finally {bounded.close();f.db.close();}
+});
+await test('incremental recovery: immutable progress rejects corruption before RPC and preserves canonical facts', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100});const before=immutableDigest(f.db),http=bodyFixture(f);
+  const bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:{...bounded.provider,canContinue:()=>http.batches.length<1},checkBudget:bounded.check,now:1000});
+    const {h,unit}=creationContext(f.db);
+    assert.throws(()=>f.db.exec("DELETE FROM compact_meta WHERE key GLOB 'discovery_spine_block:*'"),/immutable_recovery_spine/);
+    assert.throws(()=>f.db.exec("UPDATE compact_meta SET value='{}' WHERE key GLOB 'discovery_spine_block:*'"),/immutable_recovery_spine/);
+    f.db.exec('DROP TRIGGER compact_spine_no_update'); // disposable corruption simulation only
+    const row=f.db.prepare("SELECT key,value FROM compact_meta WHERE key GLOB 'discovery_spine_block:*' ORDER BY key LIMIT 1").get();
+    const value=JSON.parse(row.value);value.block.txFrom[0]=addr(999);
+    f.db.prepare('UPDATE compact_meta SET value=? WHERE key=?').run(JSON.stringify(value),row.key);
+    let requests=0;
+    await assert.rejects(recoverEvidenceUnit({db:f.db,c:{h},unit,registry:noLaunch,provider:{batch(){requests++;throw Error('unexpected_rpc');}}}),/recovery_spine_corrupt/);
+    assert.equal(requests,0);assert.equal(immutableDigest(f.db),before);
+  } finally {bounded.close();f.db.close();}
+});
+await test('incremental recovery: storage quota refuses progress without deleting accepted evidence', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100});const before=immutableDigest(f.db),http=bodyFixture(f);
+  const bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check,
+      storage:{...archiveConfig({}),maxArchiveBytes:1}});
+    assert.equal(result.phase,'incomplete');assert.match(result.reason,/recovery_spine_storage_budget/);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key GLOB 'discovery_spine_*'").get().n,0);
+    assert.equal(immutableDigest(f.db),before);
+  } finally {bounded.close();f.db.close();}
+});
+await test('incremental recovery: stalled budget yield consumes a failure attempt instead of retrying forever', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100});const http=bodyFixture(f),bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:{...bounded.provider,canContinue:()=>false},checkBudget:bounded.check,now:1000});
+    assert.equal(result.phase,'incomplete');assert.match(result.reason,/recovery_progress_stalled/);
+    const unit=recoveryHourPlan(f.db,BASE,{registry:noLaunch,now:1001}).units.find(u=>u.kind==='creations');
+    assert.equal(unit.attempts,1);assert.equal(unit.phase,'retryable');
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key GLOB 'discovery_spine_block:*'").get().n,0);
+  } finally {bounded.close();f.db.close();}
+});
+await test('incremental recovery: HTTP call and time headroom yield durable progress without raising limits', async () => {
+  for(const kind of ['requests','calls','time']) {
+    const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100}),before=immutableDigest(f.db);let clock=0;
+    const budget={...RECOVERY_BUDGET,...(kind==='requests'?{requests:5}:kind==='calls'?{calls:50}:{})};
+    const http=bodyFixture(f,{mutate(_reply,item){if(kind==='time'&&item.method==='eth_getBlockByNumber'&&item.params[1]===true)clock=570_001;}});
+    const bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{},now:()=>clock,budget});
+    try {
+      const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check,now:1000});
+      assert.equal(result.phase,'incomplete');assert.match(result.reason,/recovery_progress_pending/);
+      const {h,unit}=creationContext(f.db);assert.equal(spineProgress(f.db,h,unit,{verify:true}).blocks,32);
+      assert.deepEqual(http.bodyBlocks,Array.from({length:32},(_,i)=>ORIGIN+i));
+      assert(bounded.stats.requests<=budget.requests);assert(bounded.stats.calls<=budget.calls);assert(clock<budget.timeoutMs);
+      assert.equal(immutableDigest(f.db),before);
+    } finally {bounded.close();f.db.close();}
+  }
+});
+await test('incremental recovery: SIGKILL preserves committed block prefix and lease across process restart', async () => {
+  const dir=mkdtempSync(join(tmpdir(),'compact-spine-kill-')),path=join(dir,'test.sqlite');let child,db;
+  try {
+    const f=await fixture({path,missing:true,blocksPerHour:96,txPerBlock:100,v3Every:1}),before=immutableDigest(f.db);f.db.close();
+    child=fork(new URL(import.meta.url),[],{execArgv:['--max-old-space-size=64','--max-semi-space-size=2'],
+      env:{...process.env,RECOVERY_SPINE_CRASH_CHILD:path},stdio:['ignore','ignore','ignore','ipc']});
+    await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(Error('spine_crash_child_timeout')),5000);
+      child.once('message',m=>{clearTimeout(timer);assert.equal(m,'spine-prefix-committed');resolve();});
+      child.once('error',e=>{clearTimeout(timer);reject(e);});
+      child.once('exit',()=>{clearTimeout(timer);reject(Error('spine_child_exited_early'));});
+    });
+    const exited=once(child,'exit');child.kill('SIGKILL');const [,signal]=await exited;assert.equal(signal,'SIGKILL');
+    db=new DatabaseSync(path);const {h,unit}=creationContext(db);
+    assert.equal(spineProgress(db,h,unit,{verify:true}).blocks,32);
+    assert.equal(recoveryHourPlan(db,BASE,{registry:noLaunch}).units.find(u=>u.kind==='creations').phase,'retryable');
+    assert.equal(immutableDigest(db),before);
+    const lock=acquireWriterLock(path,{owner:'disposable-spine-restart'}),http=bodyFixture(f),bounded=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+    try {
+      const result=await recoverDiscoveryHour({db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check,
+        now:Date.now()+RECOVERY_RETRY_MS+RECOVERY_BUDGET.timeoutMs+1});
+      assert.equal(result.phase,'recovered');assert.deepEqual(http.bodyBlocks,Array.from({length:64},(_,i)=>ORIGIN+32+i));
+      assert.equal(immutableDigest(db),before);
+    } finally {bounded.close();lock.release();}
+  } finally {child?.kill('SIGKILL');db?.close();rmSync(dir,{recursive:true,force:true});}
+});
+await test('incremental recovery: registry expansion reuses partial spine and completed independent sources', async () => {
+  const f=await fixture({missing:true,blocksPerHour:96,txPerBlock:100,v3Every:1}),before=immutableDigest(f.db),http=bodyFixture(f);
+  const first=boundedRecoveryProvider({fetchImpl:http.fetchImpl,sleep:async()=>{}});
+  try {
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:{...first.provider,canContinue:()=>http.batches.length<1},checkBudget:first.check,now:1000});
+    const {h,unit}=creationContext(f.db),prior=f.db.prepare("SELECT key,value FROM compact_meta WHERE key GLOB 'discovery_spine_block:*' ORDER BY key").all();
+    assert.equal(spineProgress(f.db,h,unit,{verify:true}).blocks,32);
+    const nextHttp=bodyFixture(f),next=boundedRecoveryProvider({fetchImpl:nextHttp.fetchImpl,sleep:async()=>{}}),calls=[];
+    try {
+      const result=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry,provider:next.provider,checkBudget:next.check,now:61_001,
+        recoverUnit:args=>args.unit.kind==='launch'?(calls.push('launch'),fakeRecover(args)):recoverEvidenceUnit(args)});
+      assert.equal(result.phase,'recovered');assert.deepEqual(calls,['launch']);
+      assert.deepEqual(nextHttp.bodyBlocks,Array.from({length:64},(_,i)=>ORIGIN+32+i));
+      for(const row of prior)assert.equal(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(row.key).value,row.value);
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM compact_intelligence_hours').get().n,2);
+      assert.equal(immutableDigest(f.db),before);
+    } finally {next.close();}
+  } finally {first.close();f.db.close();}
+});
+
 // Stream one JSON-RPC envelope at a time, as a real HTTP body. Padding models
 // transaction input/other full-block fields without allocating the entire response.
 function bodyFixture(f, { paddingBytes = 0, mutate = () => {} } = {}) {
-  const batches = [], encoder = new TextEncoder(), padding = 'x'.repeat(paddingBytes);
+  const batches = [], bodyBlocks = [], encoder = new TextEncoder(), padding = 'x'.repeat(paddingBytes);
   let requests = 0, maxResponseBytes = 0;
-  return { batches, get requests() { return requests; }, get maxResponseBytes() { return maxResponseBytes; }, fetchImpl: async (url, options) => {
+  return { batches, bodyBlocks, get requests() { return requests; }, get maxResponseBytes() { return maxResponseBytes; }, fetchImpl: async (url, options) => {
     requests++;
     const call = JSON.parse(options.body), items = Array.isArray(call) ? call : [call];
     if (items.some(i => i.method === 'eth_getBlockByNumber' && i.params[1] === true)) batches.push(items.length);
+    for (const i of items) if (i.method === 'eth_getBlockByNumber' && i.params[1] === true) bodyBlocks.push(Number(BigInt(i.params[0])));
     const response = JSON.parse(await (await f.chain.fetchImpl(url, options)).text());
     const replies = Array.isArray(response) ? response : [response];
     replies.forEach((reply, i) => {
@@ -147,8 +388,8 @@ await test('bounded block batches recover dense creations V3 and V4 with identic
     assert.equal((await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check })).phase, 'recovered');
     const units = db => db.prepare("SELECT key,value FROM compact_meta WHERE key LIKE 'discovery_unit:%' ORDER BY key").all();
     assert.deepEqual(units(f.db), units(baseline.db));
-    assert(http.batches.length >= 9); assert(http.batches.every(n => n <= RECOVERY_BLOCK_BATCH_SIZE));
-    assert(bounded.stats.bytes > 30 * 1024 * 1024 && bounded.stats.bytes < RECOVERY_BUDGET.bytes);
+    assert.equal(http.batches.length, 6); assert(http.batches.every(n => n <= RECOVERY_BLOCK_BATCH_SIZE));
+    assert(bounded.stats.bytes > 15 * 1024 * 1024 && bounded.stats.bytes < RECOVERY_BUDGET.bytes);
     assert(http.maxResponseBytes < RECOVERY_BUDGET.responseBytes);
     assert.equal(immutableDigest(f.db), before);
     const count = http.requests;
@@ -170,7 +411,8 @@ await test('bounded block batches stop oversized single-block evidence and retai
   } });
   const bounded = boundedRecoveryProvider({ fetchImpl: http.fetchImpl, sleep: async () => {} });
   try {
-    const result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check });
+    const result = await recoverDiscoveryHour({ db: f.db, hourStart: BASE, registry: noLaunch, provider: bounded.provider, checkBudget: bounded.check,
+      recoverUnit: args => recoverEvidenceUnit({ ...args, saveSpine: null }) });
     assert.equal(result.phase, 'incomplete'); assert.match(result.reason, /recovery_response_budget_exhausted/);
     assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_meta WHERE key LIKE 'discovery_unit:%'").get().n, 2);
     assert.equal(immutableDigest(f.db), before);
@@ -196,7 +438,7 @@ await test('bounded block batches reject transaction mismatch beyond the first p
   } finally { bounded.close(); f.db.close(); }
 });
 await test('bounded block batches preserve creations parent continuity across spine windows', async () => {
-  const f = await fixture({ blocksPerHour: 96, txPerBlock: 6 });
+  const f = await fixture({ blocksPerHour: 96, txPerBlock: 100 });
   const before = allState(f.db);
   const http = bodyFixture(f, { mutate(reply, item) {
     if (item.method === 'eth_getBlockByNumber' && item.params[1] === true && Number(BigInt(item.params[0])) === ORIGIN + 32) {
