@@ -32,6 +32,7 @@ import {
 import { COMPACT_DEFINITION_VERSION, FAMILY_STREAMS, FAMILY_VERSIONS, LOG_STREAMS, V4_INITIALIZE_STREAM } from '../server/compact/sources.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createCompactStore } from '../server/compact/store.js';
+import { archiveConfig } from '../server/compact/evidence-archive.js';
 import { backfillConfig, runBackfillTool } from './backfill-compact-projections.mjs';
 import { repairConfig, repairProjectionHour } from './repair-compact-projection-hour.mjs';
 import { runCompactHour } from './run-compact-hour.mjs';
@@ -350,7 +351,7 @@ const live = await liveHour();
 const LIVE = live.result;
 const withoutProjections = ({ projections, ...rest }) => rest;
 const coreHour = ({ intelligence, ...rest }) => withoutProjections(rest);
-const sharedIntelligence = ({ discovery, firstDex, firstDexComplete, ...rest }) => rest;
+const sharedIntelligence = ({ discovery, firstDex, firstDexComplete, firstDexLimited, discoveryComponents, ...rest }) => rest;
 const corruptInitialize = (filter, logs) => logs.map((log) => (log.topics[0] === T.v4Initialize
   ? { ...log, topics: [log.topics[0], `0x${'ab'.repeat(32)}`, ...log.topics.slice(2)] } : log));
 
@@ -408,7 +409,7 @@ await test('projections are not a compact family: no family version, field, stre
   assert(!readModel.match(/availableFamilies: `([^`]*)`/)[1].includes('projection'), 'family repair candidates never look at projections');
   assert(!readModel.match(/const TABLES = Object\.freeze\(\[([^\]]*)\]/)[1].includes('projection'), 'projection tables are not in the family schema check');
   const scheduler = await readFile(new URL('../server/compact/scheduler.js', import.meta.url), 'utf8');
-  assert.match(scheduler, /runChild\(candidate, 'repair'\)/, 'family repair runs the hour runner');
+  assert.match(scheduler, /runChild\(candidate, kind, gatewayOnly \? runGatewayRepair : runHour\)/, 'family repair keeps the existing Gateway-only routing');
   assert.match(scheduler, /runChild\(projectionHour, 'projection_repair', runProjectionRepair\)/, 'projection repair runs only the projection-only child');
   const runner = await readFile(new URL('./run-compact-hour.mjs', import.meta.url), 'utf8');
   assert(/unavailableStored = \[\.\.\.stored\.filter/.test(runner) && /summary\.ok = unavailable\.length === 0/.test(runner),
@@ -722,7 +723,13 @@ if (!sqlite) {
     families: familyState(db), addresses: count(db, 'compact_hour_addresses'), checkpoint: db.prepare('SELECT * FROM compact_checkpoint').all().map((row) => ({ ...row })) });
   const statusOf = (store, hour) => Object.fromEntries(store.projectionStatus(hour).map((row) => [row.projection, row.status === 'available' ? 'available'
     : `unavailable(${row.reason})`]));
-  const clone = (value) => structuredClone(value);
+  const clone = (value) => {
+    // The registry's decoder functions are immutable internal inputs, never persisted evidence.
+    if (!value.intelligence?.registryDefinition) return structuredClone(value);
+    const copy=structuredClone({...value,intelligence:{...value.intelligence,registryDefinition:undefined}});
+    copy.intelligence.registryDefinition=value.intelligence.registryDefinition;
+    return copy;
+  };
   const unhashed = (result, mutate) => {
     const copy = clone(result);
     mutate(copy.projections);
@@ -758,8 +765,8 @@ if (!sqlite) {
         dex_activity: { status: 'available', rows: activity },
       } };
   }
-  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage',
-    'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage', 'compact_daily_address_status_history',
+    'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_evidence_archive', 'compact_evidence_archive_parts', 'compact_evidence_archive_usage', 'compact_family_hours',
     'compact_hour_addresses', 'compact_hours', 'compact_intelligence_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
     'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage',
     'compact_token_dex_observations', 'compact_token_discoveries', 'compact_token_metadata', 'compact_token_price_hours',
@@ -866,21 +873,24 @@ if (!sqlite) {
       db.close();
     });
 
-    await test('sqlite: 35-day pool-hour retention, pruned in the commit transaction; hours themselves are kept', async () => {
+    await test('sqlite: 35-day hot pool retention requires a prior archive commit; status evidence and hours are permanent', async () => {
       const db = open('retention.sqlite');
-      const store = createCompactStore(db);
+      const store = createCompactStore(db,{archive:{config:{...archiveConfig({COMPACT_EVIDENCE_ARCHIVE_ENABLED:'true'}),maxTransactionMs:2000},
+        capacity:()=>({freeBytes:10*1024**3,databaseBytes:0}),log:()=>{}}});
       const total = POOL_HOUR_RETENTION_HOURS + 2;
       for (let i = 0; i < total; i++) assert.deepEqual(store.commitHour(fakeHour(i)).projections.uniswap_v4_pools, 'inserted');
+      store.commitHour(fakeHour(total-1)); // Later transaction independently checks the committed archive before pruning.
       assert.equal(count(db, 'compact_hours'), total);
       assert.equal(db.prepare('SELECT COUNT(DISTINCT hour_start) AS count FROM compact_pool_hours').get().count, POOL_HOUR_RETENTION_HOURS);
       assert.equal(db.prepare('SELECT MIN(hour_start) AS hour FROM compact_pool_hours').get().hour, FAKE_BASE + 2 * 3600);
-      assert.equal(count(db, 'compact_projection_hours'), POOL_HOUR_RETENTION_HOURS * PROJECTIONS.length);
+      assert.equal(count(db, 'compact_projection_hours'), total * PROJECTIONS.length);
       db.close();
     });
 
     await test('sqlite: recent activity keeps the newest 500 rows per kind across hours', async () => {
       const db = open('activity.sqlite');
-      const store = createCompactStore(db);
+      const store = createCompactStore(db,{archive:{config:archiveConfig({COMPACT_EVIDENCE_ARCHIVE_ENABLED:'true'}),
+        capacity:()=>({freeBytes:10*1024**3,databaseBytes:0}),log:()=>{}}});
       const first = fakeHour(0, { swaps: 300 });
       const second = fakeHour(1, { swaps: 300 });
       store.commitHour(first);

@@ -1,0 +1,278 @@
+# Incremental Arc discovery recovery
+
+This subsystem is implemented locally and has not been activated in production. Deployment, a production write, or
+automatic recovery requires separate approval. The recovery feature flag is OFF when unset, empty, or `false`.
+
+## Preservation contract
+
+Recovery opens an existing schema-2 database. It does not initialize, migrate, replace, rebuild, truncate, or delete it.
+It never calls the compact hour, family, projection, valuation, activity, registry-extension, or checkpoint writers.
+Each transaction checks that the complete canonical hour and checkpoint still equal their captured values.
+
+Complete evidence is appended under `discovery_unit:<hour>:<component digest>` in the existing `compact_meta` table.
+The digest binds the canonical network identity and payload, intelligence definition, and the exact component
+definition. Stored units include their definition, canonical range, evidence checksum, status, and reason.
+Registry snapshots are append-only under `discovery_registry:<definition>:<registry digest>`. Neither namespace has
+an expiry or pruning routine. Older intelligence rows and verified candidate results remain intact.
+
+Components are top-level creations, each Uniswap pool protocol, and each registered launch source. Registered extra
+protocols and exchange evidence have separate components when configured. A changed launch definition gets a new
+component digest; adding/removing a launch source leaves the completed base and unchanged source units reusable.
+Changing an actual pool definition or verified-asset exclusion set invalidates only that component's compatibility.
+It does not erase the earlier evidence or authorize an entire historical-window replay.
+
+New live hour commits retain independently complete components and their registry snapshot in the same existing
+hour transaction. A supplemental component conflict or size limit preserves the earlier unit, writes an explicit
+diagnostic, and does not prevent independently verified live indexing. Recovery refuses that conflicted unit.
+Ordinary SQLite/disk failures still roll back the live hour, as before.
+
+Each successful recovery component is committed immediately, before another source is read. Aggregate publication
+is a separate atomic transaction through the existing intelligence repository. A crash rolls back only its open
+transaction; earlier completed components survive. Retries skip completed units and preserve existing candidate
+verification results. A successful repeated run performs no RPC calls and no writes.
+
+This preservation contract applies to discovery recovery and its permanent evidence records. Existing live engine
+rolling hot retention is now gated by the lossless archive described below. Recovery itself does not invoke
+pruning routines. Already deleted data and raw blockchain inputs that were never captured are not invented.
+
+## What is and is not already stored
+
+The supplied production inventory remains unmodified: 574 canonical hours, 19 current available, 199 older available,
+323 without intelligence rows, and 33 other states. The exact causes of the 33 states have not been established here.
+Generated inconsistent and older-insufficient fixtures test handling; they are not asserted to represent those rows.
+
+An older row is reusable only when its payload checksum, range, status, registry digest and definition agree, and its
+complete candidate/first-DEX count and evidence digest can be reproduced from persisted facts. For the confirmed
+old registry with no launch sources, compatible creation and pool evidence can be imported while new factory
+sources are scanned separately. Incomplete/capped lists are not treated as complete. Unknown old definitions are
+preserved and never relabelled as current. New permanent units make compatibility checks independent of later
+changes to the whole-registry digest.
+
+The compact database is not a raw block, receipt, or log archive. Canonical network totals, transaction counts,
+pool totals and registry rows do not prove complete creation or launch-source event coverage. When the relevant
+verified unit/legacy completeness proof is absent:
+
+- Creation discovery needs transaction bodies for that exact committed hour, with parent continuity and a
+  recomputed network result equal to the stored canonical result.
+- Launch discovery needs historical code/topic/required-view verification and exact-address, exact-topic logs
+  for that source and hour. Only log-bearing blocks need full transaction bodies. Empty valid log results can
+  prove absence after source verification; a failed RPC request cannot.
+- Pool discovery needs the existing verified V3 registry through the preceding block plus exact-hour factory/pool
+  streams, or the exact-hour V4 stream. The same family accumulators, projection decoders, official-pool validation
+  and candidate rules are reused in memory; their family/projection rows are not rewritten.
+
+Canonical boundary headers are verified before and after a scan, including the stored canonical network digest.
+Logs must match their emitter/topic, canonical block hash and timestamp, transaction hash/index, and strict ABI.
+Token identity remains pending/unverified until the existing token verifier succeeds. Recovery does not invent
+symbols, ERC20 proof, deployment transactions, first activity, prices, USD values, or internal creation coverage.
+The existing small enrichment drain remains separate from coverage recovery.
+
+## Planning and execution
+
+Use Node 24. These examples refer to a local existing database, not a production operation.
+
+```sh
+COMPACT_SQLITE_PATH=/path/to/existing.sqlite \
+node --max-old-space-size=64 --max-semi-space-size=2 scripts/recover-compact-discovery.mjs
+```
+
+No `--execute` means read-only planning: `DatabaseSync(..., {readOnly:true})`, `PRAGMA query_only=ON`, and a read
+snapshot. No provider is created and no lock file is written. Add one exact ISO UTC hour to inspect only that hour.
+There is no bulk execution mode.
+
+After separate approval, execution requires one hour and bounded V8 heap arguments. Example for a **disposable**
+database containing that hour:
+
+```sh
+COMPACT_SQLITE_PATH=/tmp/disposable-discovery.sqlite COMPACT_RPC_MIN_INTERVAL_MS=1000 \
+node --max-old-space-size=64 --max-semi-space-size=2 \
+scripts/recover-compact-discovery.mjs 2026-10-09T09:00:00Z --execute
+```
+
+Execution holds the existing exclusive writer lock for the entire run. A live writer is never displaced based on
+age; a dead process's lock is handled by the existing guarded lock acquisition. Only stored canonical hours in the
+checkpoint-anchored current 720-hour window are eligible, never before `2026-09-16T11:00:00Z`. The 146 hours before
+stored public-mainnet history are not fabricated recovery targets. No registry bootstrap is performed.
+
+Plans distinguish `current_available`, `current_insufficient`, `older_available`, `missing`, older insufficient/other
+definitions, and inconsistent evidence. Queue phases are `pending`, `recovered`, `retryable`, and `blocked`.
+`DISCOVERY_RECOVERY_PLAN` shows hours and thin component reasons without dumping evidence payloads. Scheduler logs
+report all four phase counts and the registry digest. Unit commit/failure logs identify the hour, kind and reason.
+The final result includes completed/required unit counts and physical provider requests, RPC items and decoded bytes.
+
+## Exact bounds
+
+| Control | Limit |
+| --- | --- |
+| Execution scope | One stored canonical UTC hour; at most 15,000 blocks |
+| Provider | Existing free primary Arc endpoint; chain check included; no failover |
+| Pacing | 1,000–10,000 ms between physical request starts |
+| HTTP / RPC budget per execution | 512 requests / 20,000 items, including failed attempts and chain checks |
+| Response budget | 8 MiB per response; 64 MiB decoded bytes per execution, streamed before parsing |
+| Execution / HTTP timeout | 10 minutes / 10 seconds |
+| Heap | CLI requires bounded heap; scheduler uses existing 64 MiB old-space and 2 MiB semi-space flags |
+| Planner | Read-only worker, 64 MiB old generation / 4 MiB young generation, 10-second deadline |
+| Log chunk / transaction batch | At most 500 blocks / 50 log-bearing blocks |
+| Persisted evidence | At most 2 MiB per unit; append-only |
+| Candidate / first-DEX list | Existing 2,048 / 4,096 limits, with explicit incomplete coverage on caps |
+| Retry budget | Eight attempts per hour/component/evidence fingerprint; minimum one-hour cooldown |
+
+A lease is persisted before RPC begins. An interrupted attempt waits its 10-minute lease plus the cooldown before
+retry; completed units do not wait or rerun. Provider failure prevents any further request in that execution. Range
+limits may use the existing bounded splitting logic, still consuming the same physical budgets. Deterministic
+absence/ABI/cap/validity failures remain explicitly incomplete or blocked. Exhaustion, conflicts, corrupt evidence,
+unknown definition compatibility and missing V3 registry coverage require evidence/operator review, not a reset.
+Retryable components wait for the cooldown. Exhausted or blocked retry state becomes eligible again only when its
+evidence/version readiness fingerprint changes; completed units remain reusable. Persisted deterministic incomplete
+units require a compatible new component definition or individual review. Aggregate caps retain full individual
+units and do not repeatedly reaggregate.
+
+## Automatic behavior after approved activation
+
+`COMPACT_DISCOVERY_RECOVERY_ENABLED=true` opts in. Invalid flag values or unsafe pacing refuse startup. The existing
+`COMPACT_SCHEDULER_ENABLED` gate still applies. The default scheduler behavior is unchanged when recovery is off.
+
+The eligible queue is reconstructed from indexed canonical/intelligence rows, permanent units, and durable retry
+state after each restart and registry change. It selects the oldest eligible gap first so newly indexed hours cannot
+continually displace historical progress. Automatic planning is isolated from public API CPU work in a separate
+read-only worker. Planning failure skips recovery without stopping live indexing or other maintenance.
+
+Live catch-up is always checked first and again after asynchronous planning. Once caught up, a round-robin pass
+serves history prepend, DAU replay, family repair, projection repair, discovery recovery, and enrichment. Only one
+writer child runs at a time. Recovery is not started within 90 seconds of the next live slot and is terminated by
+its own 10-minute deadline or the next live slot. Recovery cannot require other maintenance to drain completely
+before making progress, and its failures do not hold the other classes indefinitely.
+
+Progress is conditional on compatible evidence, available historical RPC, and spare live-indexing capacity. It is
+not a promise of 100% coverage: unsupported internal creations, capped facts, a source not valid for an entire hour,
+unverified factories, missing registry coverage, contradictory evidence, exhausted retry quotas and hours outside
+the current window remain explicit. No whole-window replay or destructive repair is provided as a fallback.
+
+## Review and future production prerequisites
+
+Local disposable-database verification must pass before any production execution is approved. Deploy all reader,
+runner and shared evidence modules together on Node 24, initially with recovery OFF. Confirm the existing schema-2
+tables, persistent disk, writer-lock ownership, backup/snapshot health, WAL-readable connections and free disk space.
+Permanent evidence is deliberately not pruned; monitor disk growth and memory/RPC counters. The new planner adds a
+bounded worker only after activation; active recovery adds one memory-isolated child alongside existing readers.
+
+Refresh the read-only inventory and inspect blocked reasons before proposing one approved production pilot hour.
+Compare canonical hours/checkpoint, all unrelated verified tables, old registry rows and verified discovery results
+before/after that pilot; verify new current-digest coverage through the existing Ecosystem API and a zero-RPC repeat.
+Only then consider separately approved automatic activation. No migration, credentials or paid service is required.
+
+Rollback means disable **only** `COMPACT_DISCOVERY_RECOVERY_ENABLED`, stop/await the recovery child, and if needed
+roll back application code while preserving the same database and all evidence namespaces. Do not restore an older
+database over newly collected canonical data, delete recovery rows, reset the checkpoint, or rebuild history.
+
+## Integrated lossless retention (local implementation; not activated)
+
+COMPACT_EVIDENCE_ARCHIVE_ENABLED is strictly true/false and defaults OFF. Discovery recovery remains independently
+OFF by default. No environment, deployment configuration or production database has been changed by this work.
+Bulk archive OFF means NO compressed archive payloads are written and NO eligible originals are pruned. Small
+projection/valuation status rows and DAU failure reasons are permanent normal live evidence. A completed DAU replay
+upgrades its unavailable status without deleting the earlier identity_not_captured reason.
+
+The additive schema keeps schema version 2, existing tables, rows, registry versions and checkpoints. It adds
+compact_evidence_archive (indexed manifests), compact_evidence_archive_parts (bounded compressed typed bytes),
+compact_evidence_archive_usage (durable quota counters), compact_daily_address_status_history, and two activity
+indexes. There is no database rebuild, table replacement or data migration. New indexes are built once on existing
+activity rows during authorized initialization; allow disk space for those indexes and the additive DDL.
+
+An archive stores exact SQLite integers, text, BLOBs and nulls, the canonical hour rows, source/definition version
+snapshot, proof scope, row count, full typed-row SHA256 and individual compressed/uncompressed chunk checksums.
+Chunks are at most 512 KiB uncompressed, with bounded inflation. Archive manifests and chunks reject UPDATE,
+DELETE and INSERT OR REPLACE. A content-addressed repeated snapshot is a no-op; changed immutable hot evidence
+with an already archived primary key is a conflict and prevents pruning. This is evidence integrity protection,
+not protection against an administrator dropping triggers or loss of the entire disk.
+
+Two-phase deletion is mandatory:
+1. In the existing writer-locked hour transaction, preserve selected hot evidence in immutable chunks; independently
+   decode/check it; COMMIT while retaining ALL original rows. Archive-enabled store connections use synchronous=FULL.
+2. In a LATER writer transaction, independently read/check that previously committed archive, compare exact original
+   row values and canonical identity, then prune only matching eligible hot copies. Newly inserted archives, including
+   archives inserted through a second controller in the same transaction, NEVER authorize deletion.
+Each transaction rolls back both pruning and any new archive/quota writes on failure. SIGKILL tests cover both sides
+of the first commit and restart. A corrupt/absent/incompatible archive keeps originals; it does not trigger a scan.
+
+Hourly address sets (including older replay/prepend identities) are preserved. Only the existing accepted activity
+subset is preserved: at most 500 records per kind in the ingestion projection, NOT complete blockchain activity.
+Pool rows, price paths, fee inputs, liquidity snapshots, token prices and USD valuations use archive-before-prune.
+Projection/valuation status rows stay permanently indexed instead of expiring after 35 days. DAU captured hours
+and exact staged membership may expire only after a complete daily result and a committed verified archive.
+Incomplete DAU staging is retained indefinitely until completed or capacity intervention is needed.
+
+The existing 24H/7D/30D API windows, verification rules, byte caps and ingestion limits remain unchanged. Activity
+and metadata selection now use bounded indexed latest-record queries even if archival is OFF or delayed. Original
+rolling address-window support is unchanged; recovery has a separate explicit persisted-membership accessor.
+DAU replay verifies complete hourly membership against the canonical count and uses retained/archived addresses
+before considering exact-hour RPC. Discovery reads archived complete units through indexed unit-key lookups,
+checks canonical identity and every checksum, then applies its existing unit-definition/completeness checks.
+It neither merges registry digests nor promotes an incomplete archive to complete coverage.
+
+## Capacity and workload controls
+
+Read-only preflight (no schema initialization, lock, RPC, recovery or writes):
+
+COMPACT_SQLITE_PATH=/path/to/existing.sqlite node scripts/inspect-compact-storage.mjs
+
+This command opens readOnly:true, sets query_only=ON, reports configured limits, filesystem available bytes,
+database plus WAL bytes, durable archive quota counters and the checkpoint. It fails rather than creating a missing
+database. Unknown free space fails closed. Actual production size/capacity/billing has NOT been measured here.
+
+Defaults, all configurable with validated integer environment values:
+
+COMPACT_STORAGE_MIN_FREE_MIB=256                 filesystem reserve
+COMPACT_STORAGE_MAX_DATABASE_MIB=16384           database + WAL ceiling
+COMPACT_ARCHIVE_MAX_TOTAL_MIB=4096               durable charged archive-byte quota
+COMPACT_ARCHIVE_MAX_DAILY_MIB=256                durable UTC-day charged-byte quota
+COMPACT_ARCHIVE_MAX_TRANSACTION_MIB=8            encoded/write and verification-read workload budget
+COMPACT_ARCHIVE_MAX_TRANSACTION_ROWS=32768       accepted rows per archival transaction
+COMPACT_ARCHIVE_MAX_TRANSACTION_SETS=32          new immutable snapshots per transaction
+COMPACT_ARCHIVE_MAX_TRANSACTION_MS=200           cooperative work deadline
+COMPACT_ARCHIVE_PRUNE_HOURS=4                    oldest eligible scopes per dataset per transaction
+
+Capacity checks reserve 4x planned encoded storage for pages/indexes/WAL. They are conservative estimates, not a
+reservation against unrelated filesystem writers. Pruning is incremental under the SAME writer lock/transaction
+as existing indexing; there is no independent archival scan/scheduler or unlimited archive writer. Deflate/inflate
+are bounded synchronous operations in the isolated writer child, never the public HTTP process. An individual
+snapshot read is capped at 8 MiB, chunks at 1 MiB inflation, and revisions per indexed scope/key at 32. Exceeded
+budgets retain original rows and report EVIDENCE_RETENTION_BLOCKED. They never delete a completed archive.
+
+Persistent store initialization and EVERY store writer transaction preflight capacity. Live runner reports
+STORAGE_PREFLIGHT and per-transaction EVIDENCE_ARCHIVE diagnostics. Discovery runner checks space before creating
+a provider and before unit/retry/aggregate writes, with an 8 MiB planned-write reserve. Capacity failure stops
+background recovery with no new historical RPC. At physical/database limits the live writer also refuses new work
+before its transaction; checkpoint and existing evidence remain intact. A disk cannot guarantee infinite retention
+and uninterrupted indexing at the same time. Raising limits requires verified capacity, not deleting evidence.
+
+Archive OFF, quotas exhausted, archive corruption and deadline failures all retain originals. Hot storage can
+therefore grow beyond 24H/35D/500 cached rows, but public response scopes remain bounded. Operators must monitor
+filesystem/database/WAL usage, quota diagnostics and live indexing delay. A valid backup and sufficient disk are
+deployment prerequisites, not properties that code can invent. Backups on the same volume do not protect against
+loss of that volume. No new paid service is required, but more Railway volume usage may cost more.
+
+## Local verification and activation gates
+
+scripts/verify-compact-evidence-retention.mjs exercises all 14 audited deletion paths, lossless chunk round trips,
+committed-vs-uncommitted archives, idempotency/restart, SIGKILL before/after COMMIT, conflicts/corruption, rollback,
+writer-lock contention, capacity/quotas/workload failures, accepted-subset activity and unchanged API windows.
+Its disposable end-to-end fixture indexes an hour, expires its hot address copies, removes hot unit copies ONLY
+as a disposable fault, changes the registry, then recovers using three archived compatible units and one new source.
+No unrelated history is rebuilt, no canonical/checkpoint/family value changes, and no external RPC is used.
+Storage measurements are synthetic and include SQLite page overhead; do not extrapolate their compression ratio
+as a production promise. High-entropy generated activity is measured separately from repetitive fixtures.
+
+Before any production activation: review the consolidated patch; verify backups and read-only capacity inventory;
+size quotas for actual accepted row/candidate rates; obtain separate explicit approval for deployment, additive
+schema writes and an archival pilot. Keep discovery recovery OFF while independently validating the archival pilot.
+Then request separate approval for any one-hour recovery/pilot or automatic recovery activation. Neither feature
+is automatically enabled by deployment or by the storage-inspection command.
+
+Guarantee scope: existing still-present accepted evidence and future accepted evidence are preserved losslessly
+when hot copies expire, subject to disk integrity/capacity and backups. Already-pruned or never-stored raw blocks,
+transactions, receipts, complete event streams, historical code/views or new ABI requirements are NOT made locally
+available by this archive. Those gaps still need exact-hour/source RPC, or remain explicitly unverified if the
+provider cannot supply them. No compressed archive claims completeness beyond its independently verified scope.
+Contradictory evidence requires an individually reviewed correction outside this runner; no destructive shortcut is
+implemented.

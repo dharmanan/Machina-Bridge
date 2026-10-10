@@ -75,6 +75,10 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     const { DatabaseSync } = await import('node:sqlite');
     db = new DatabaseSync(sqlitePath);
     const store = createCompactStore(db);
+    const capacity=store.archive.preflight();
+    print(`STORAGE_PREFLIGHT ${JSON.stringify(capacity)}`);
+    // Physical exhaustion is a live-indexing blocker too. Refuse new RPC/work; existing evidence stays intact.
+    if (!capacity.ok) throw new RunnerError(capacity.reason);
     const before = store.v3Registry();
     summary.registryBefore = span(before);
     const stored = store.familyRows(hourStart);
@@ -121,6 +125,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     // Candidates survive a crash between hour COMMIT and this bounded historical-tag enrichment step.
     // Runs on stored hours too: old unresolved candidates remain reachable without an independent indexer.
     summary.discovery = await refreshDiscoverySafely({ store, provider });
+    print(`EVIDENCE_ARCHIVE ${JSON.stringify(store.archive.report())}`);
     // Valuations of stored hours that have none yet (hours stored before valuations existed). No RPC; never fails the run.
     try {
       summary.valuationPass = { derived: store.derivePendingValuations({ limit: VALUATION_HOURS_PER_RUN }).hours.length, error: null };

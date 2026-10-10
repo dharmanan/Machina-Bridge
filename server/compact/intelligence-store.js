@@ -4,6 +4,7 @@ import { INTELLIGENCE_VERSION, ECOSYSTEM_SCHEMA, ECOSYSTEM_WINDOWS, INTELLIGENCE
   existingProtocolDefinitions, addressOf } from './intelligence-registry.js';
 import { DISCOVERY_LIMIT_PER_HOUR, intelligenceJson, valueExchangeFlow } from './intelligence.js';
 import { storedWindow } from './windows.js';
+import { retainLiveDiscoveryEvidence } from './discovery-evidence.js';
 
 export const INTELLIGENCE_SQL = `
 CREATE TABLE IF NOT EXISTS compact_intelligence_hours (
@@ -49,8 +50,9 @@ export function discoveryWorkDue(db, now) {
     AND (status='pending' OR ${RETRY_DISCOVERY}) LIMIT 1`).get(BigInt(now)));
 }
 
-export function createIntelligenceRepository(db) {
+export function createIntelligenceRepository(db, { archive } = {}) {
   const run = (fn) => {
+    archive?.begin();
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
@@ -64,11 +66,13 @@ export function createIntelligenceRepository(db) {
       if (!hour || hour.hour_start !== payload.range.hourStart || hour.first_block !== payload.range.firstBlock || hour.last_block !== payload.range.lastBlock
         || hour.last_hash !== payload.range.lastHash || hour.parent_hash !== payload.range.parentHash) throw new Error('intelligence_range_mismatch');
       if (!Array.isArray(payload.discovery?.candidates) || payload.discovery.candidates.length > DISCOVERY_LIMIT_PER_HOUR) throw new Error('intelligence_candidate_limit');
+      const definition = payload.registryDefinition;
+      const components = payload.discoveryComponents;
       const candidateFacts = payload.discovery.candidates;
       const dexFacts = payload.firstDex;
       if (!Array.isArray(dexFacts) || dexFacts.length > DISCOVERY_LIMIT_PER_HOUR * 2 || !/^[0-9a-f]{64}$/.test(payload.registryDigest)) throw new Error('intelligence_payload_invalid');
       // Store identity facts once in their bounded tables. The hourly row holds only coverage/counts/digests.
-      payload = { ...payload, discovery: { ...payload.discovery, candidates: undefined, candidateCount: candidateFacts.length,
+      payload = { ...payload, registryDefinition: undefined, discoveryComponents: undefined, firstDexLimited: undefined, discovery: { ...payload.discovery, candidates: undefined, candidateCount: candidateFacts.length,
         candidateEvidenceDigest: digest(candidateFacts) }, firstDex: undefined, firstDexCount: dexFacts.length, firstDexEvidenceDigest: digest(dexFacts) };
       const old = db.prepare(`SELECT * FROM compact_intelligence_hours WHERE hour_start = ? AND definition_version = ? AND registry_digest = ?`)
         .get(BigInt(hour.hour_start), INTELLIGENCE_VERSION, payload.registryDigest);
@@ -118,6 +122,8 @@ export function createIntelligenceRepository(db) {
         db.prepare('INSERT OR IGNORE INTO compact_token_dex_observations VALUES (?,?,?,?,?,?,?,?)').run(BigInt(hour.hour_start), row.protocol,
           row.pool, row.activity, BigInt(row.blockNumber), BigInt(row.logIndex), BigInt(row.timestamp), row.txHash);
       }
+      // Versioned complete components survive future registry changes, in the same atomic hour commit.
+      retainLiveDiscoveryEvidence(db, hour, payload, candidateFacts, dexFacts, definition, components, archive);
     },
     pending({ now, limit }) {
       if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 1 || limit > 16) throw new Error('invalid_discovery_limit');

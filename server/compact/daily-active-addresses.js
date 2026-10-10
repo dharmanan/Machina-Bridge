@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS compact_daily_active_addresses (
     (status = 'unavailable' AND reason IS NOT NULL AND active_addresses IS NULL)
   )
 ) STRICT;
+CREATE TABLE IF NOT EXISTS compact_daily_address_status_history (
+  day_start INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+  definition_version TEXT NOT NULL, PRIMARY KEY(day_start,status,reason,definition_version)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS compact_daily_status_history_no_update BEFORE UPDATE ON compact_daily_address_status_history BEGIN SELECT RAISE(ABORT,'immutable_daily_status_history'); END;
+CREATE TRIGGER IF NOT EXISTS compact_daily_status_history_no_delete BEFORE DELETE ON compact_daily_address_status_history BEGIN SELECT RAISE(ABORT,'immutable_daily_status_history'); END;
 `;
 
 export function dayStartOf(hourStart) {
@@ -34,7 +40,7 @@ export function dayStartOf(hourStart) {
   return Math.floor(hourStart / DAY) * DAY;
 }
 
-export function createDailyActiveAddressesStore(db) {
+export function createDailyActiveAddressesStore(db, { archive } = {}) {
   const insertHour = db.prepare(
     'INSERT OR IGNORE INTO compact_daily_address_hours (day_start, hour_start) VALUES (?, ?)'
   );
@@ -54,15 +60,12 @@ export function createDailyActiveAddressesStore(db) {
     'SELECT status, reason, active_addresses FROM compact_daily_active_addresses WHERE day_start = ?'
   );
   const finalize = db.prepare(
-    "INSERT INTO compact_daily_active_addresses (day_start, status, reason, active_addresses) VALUES (?, 'available', NULL, ?)"
+    `INSERT INTO compact_daily_active_addresses (day_start,status,reason,active_addresses) VALUES (?,'available',NULL,?)
+     ON CONFLICT(day_start) DO UPDATE SET status='available',reason=NULL,active_addresses=excluded.active_addresses
+     WHERE compact_daily_active_addresses.status='unavailable' AND compact_daily_active_addresses.reason='identity_not_captured'`
   );
   const finalizeUnavailable = db.prepare(
     "INSERT INTO compact_daily_active_addresses (day_start, status, reason, active_addresses) VALUES (?, 'unavailable', 'identity_not_captured', NULL)"
-  );
-  const clearHours = db.prepare('DELETE FROM compact_daily_address_hours WHERE day_start = ?');
-  const clearStage = db.prepare('DELETE FROM compact_daily_address_stage WHERE day_start = ?');
-  const clearUnavailable = db.prepare(
-    "DELETE FROM compact_daily_active_addresses WHERE day_start = ? AND status = 'unavailable' AND reason = 'identity_not_captured'"
   );
 
   function observeHour(hourStart, addresses, { replay = false } = {}) {
@@ -72,6 +75,19 @@ export function createDailyActiveAddressesStore(db) {
     }
 
     const stored = daily.get(dayStart);
+    // Small failure/status facts are permanent even while bulk archival is OFF. No deletion on replay.
+    if (stored?.status === 'unavailable') db.prepare('INSERT OR IGNORE INTO compact_daily_address_status_history VALUES(?,?,?,?)')
+      .run(dayStart,stored.status,stored.reason,'arc-dau-v1');
+    if (archive?.config.enabled) {
+      const finalized = db.prepare(`SELECT day_start FROM compact_daily_active_addresses WHERE status='available'
+        AND day_start<=? AND (EXISTS(SELECT 1 FROM compact_daily_address_stage s WHERE s.day_start=compact_daily_active_addresses.day_start)
+        OR EXISTS(SELECT 1 FROM compact_daily_address_hours h WHERE h.day_start=compact_daily_active_addresses.day_start)) ORDER BY day_start LIMIT ?`)
+        .all(dayStart,archive.config.maxPruneHours);
+      for (const row of finalized) {
+        archive.prune('compact_daily_address_hours','day_start=?',[row.day_start],'day_start');
+        archive.prune('compact_daily_address_stage','day_start=?',[row.day_start],'day_start');
+      }
+    }
     if (stored?.status === 'available') {
       return {
         dayStart,
@@ -92,7 +108,9 @@ export function createDailyActiveAddressesStore(db) {
           finalized: true,
         };
       }
-      clearUnavailable.run(dayStart);
+      // Keep the unavailable row until a complete replay can atomically upgrade it; history retains its reason.
+      archive?.preserve('compact_daily_active_addresses',dayStart,
+        archive.readRows('compact_daily_active_addresses','day_start=?',[dayStart]),{scope:'prior_daily_status'});
     }
 
     const inserted = insertHour.run(dayStart, hourStart);
@@ -108,8 +126,8 @@ export function createDailyActiveAddressesStore(db) {
     if (hours === 24) {
       const count = Number(activeCount.get(dayStart).count);
       finalize.run(dayStart, count);
-      clearHours.run(dayStart);
-      clearStage.run(dayStart);
+      archive?.prune('compact_daily_address_hours','day_start=?',[dayStart],'day_start');
+      archive?.prune('compact_daily_address_stage','day_start=?',[dayStart],'day_start');
 
       return {
         dayStart,
@@ -121,9 +139,8 @@ export function createDailyActiveAddressesStore(db) {
     }
 
     if (!replay && storedHourCount === 24) {
-      finalizeUnavailable.run(dayStart);
-      clearHours.run(dayStart);
-      clearStage.run(dayStart);
+      if (!stored) finalizeUnavailable.run(dayStart);
+      // Incomplete membership is recovery evidence, never disposable staging.
 
       return {
         dayStart,

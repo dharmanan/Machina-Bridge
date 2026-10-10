@@ -484,7 +484,7 @@ await test('child runner: terminate() sends SIGTERM, and SIGKILL after the grace
 
 await test('service: configuration is validated before anything starts', () => {
   assert.deepEqual(serviceConfig({ env: { COMPACT_SQLITE_PATH: '/data/arc-compact.sqlite' } }),
-    { sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000, port: 8080, host: '0.0.0.0', schedulerEnabled: true });
+    { discoveryRecoveryEnabled: false, sqlitePath: '/data/arc-compact.sqlite', minIntervalMs: 1000, port: 8080, host: '0.0.0.0', schedulerEnabled: true });
   assert.equal(serviceConfig({ env: { COMPACT_SQLITE_PATH: '/data/x.sqlite', PORT: '3000', COMPACT_RPC_MIN_INTERVAL_MS: '1500' } }).port, 3000);
   for (const [env, code] of [[{}, 'sqlite_path_required'], [{ COMPACT_SQLITE_PATH: ':memory:' }, 'sqlite_path_required'],
     [{ COMPACT_SQLITE_PATH: 'file:x.sqlite' }, 'sqlite_path_required'], [{ COMPACT_SQLITE_PATH: '/d.sqlite', COMPACT_RPC_MIN_INTERVAL_MS: '250' }, 'unsafe_rpc_pacing'],
@@ -550,7 +550,7 @@ await test('service: the scheduler gets the strict single-hour projection repair
   assert.match(source, /createChildHourRunner\(\{ scriptPath: PROJECTION_REPAIR_SCRIPT, env: childEnv \}\)/);
   assert.match(source, /createChildHistoryRunner\(\{ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv \}\)/);
   assert.match(source, /createChildDiscoveryRunner\(\{ scriptPath: DISCOVERY_DRAIN_SCRIPT, env: childEnv \}\)/);
-  assert.match(source, /createScheduler\(\{\s*readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain,/);
+  assert.match(source, /createScheduler\(\{\s*readModel: recoveryPlanner[^\n]+\n\s*runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain,/);
   assert.doesNotMatch(source, /backfill-compact-projections|--execute|COMPACT_PROJECTION_EXECUTE/);
 });
 

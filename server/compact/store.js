@@ -36,6 +36,7 @@ import { sumWindow } from './windows.js';
 
 import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
 import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
+import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storagePreflight } from './evidence-archive.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -367,7 +368,14 @@ function normalizeProjections(projections, range, families) {
 const VALUATION_PROTOCOLS = Object.freeze(['uniswap_v3', 'uniswap_v4']);
 const unavailableValuation = (reason) => ({ status: 'unavailable', reason: VALUATION_REASONS.includes(reason) ? reason : 'valuation_error' });
 
-export function createCompactStore(db) {
+export function createCompactStore(db, { archive: archiveOptions } = {}) {
+  const archival={...archiveOptions,config:archiveOptions?.config??archiveConfig()};
+  const persistent=Boolean(db.prepare('PRAGMA database_list').all().find(r=>r.name==='main')?.file);
+  const checkCapacity=()=>{
+    if(!persistent)return; // In-memory stores are disposable/local; production runners reject them.
+    const check=storagePreflight(db,archival.config,{plannedBytes:64*1024,capacity:archival.capacity});
+    if(!check.ok)throw new StoreError(check.reason);
+  };
   // An existing compact database must already be this schema version. Anything else (a Stage 1 file, compact tables
   // without a version row) is refused by reads alone, before any pragma, table or row touches the file.
   const versionOf = () => db.prepare('SELECT value FROM compact_meta WHERE key = ?').get('schema_version')?.value;
@@ -375,13 +383,16 @@ export function createCompactStore(db) {
   if (existing.length && (!existing.includes('compact_meta') || versionOf() !== COMPACT_SCHEMA_VERSION)) {
     throw new StoreError('schema_version_mismatch');
   }
+  checkCapacity();
   db.exec(PRAGMAS);
+  if(archival.config.enabled)db.exec('PRAGMA synchronous=FULL;'); // Archive commits must survive before hot-copy deletion.
   // A new database gets every table and its version row in one transaction, so it is never left half created.
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(SCHEMA);
     db.exec(INTELLIGENCE_SQL);
     db.exec(DAILY_ACTIVE_ADDRESSES_SQL);
+    db.exec(ARCHIVE_SQL);
     const setMeta = db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)');
     setMeta.run('schema_version', COMPACT_SCHEMA_VERSION);
     for (const [name, version] of Object.entries(FAMILY_VERSIONS)) {
@@ -419,8 +430,9 @@ export function createCompactStore(db) {
   }
   if (versionOf() !== COMPACT_SCHEMA_VERSION) throw new StoreError('schema_version_mismatch');
   const int = (value) => BigInt(value); // bind as SQLite INTEGER, never REAL
-  const intelligence = createIntelligenceRepository(db);
-  const dailyActiveAddresses = createDailyActiveAddressesStore(db);
+  const archive = createEvidenceArchive(db, archival);
+  const intelligence = createIntelligenceRepository(db, { archive });
+  const dailyActiveAddresses = createDailyActiveAddressesStore(db, { archive });
   const sql = {
     hour: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash, network_sha256 FROM compact_hours WHERE hour_start = ?'),
     insertHour: db.prepare(`INSERT INTO compact_hours (hour_start, definition_version, first_block, last_block, parent_hash, first_hash,
@@ -434,7 +446,6 @@ export function createCompactStore(db) {
     newestHour: db.prepare('SELECT MAX(hour_start) AS hour_start FROM compact_hours'),
     oldestHour: db.prepare('SELECT hour_start, first_block, parent_hash FROM compact_hours ORDER BY hour_start ASC LIMIT 1'),
     insertAddress: db.prepare('INSERT INTO compact_hour_addresses (hour_start, address) VALUES (?, ?)'),
-    pruneAddresses: db.prepare('DELETE FROM compact_hour_addresses WHERE hour_start <= ?'),
     windowHours: db.prepare(`SELECT h.unique_active_addresses AS expected,
       (SELECT COUNT(*) FROM compact_hour_addresses a WHERE a.hour_start = h.hour_start) AS stored
       FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ?`),
@@ -486,12 +497,9 @@ export function createCompactStore(db) {
     insertActivity: db.prepare(`INSERT OR IGNORE INTO compact_dex_activity (block_number, log_index, hour_start, block_timestamp, tx_hash,
       tx_from, protocol, kind, pool, amount0_raw, amount1_raw, amount_basis, counterparty, counterparty_kind)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-    pruneActivity: db.prepare(`DELETE FROM compact_dex_activity WHERE kind = ? AND (block_number, log_index) NOT IN
-      (SELECT block_number, log_index FROM compact_dex_activity WHERE kind = ? ORDER BY block_number DESC, log_index DESC LIMIT ?)`),
-    activity: db.prepare(`SELECT * FROM compact_dex_activity WHERE (?1 IS NULL OR kind = ?1)
+    activity: db.prepare(`SELECT * FROM compact_dex_activity WHERE kind = ?1
       ORDER BY block_number DESC, log_index DESC LIMIT ?2`),
-    prunePoolHours: db.prepare('DELETE FROM compact_pool_hours WHERE hour_start <= ?'),
-    pruneProjectionHours: db.prepare('DELETE FROM compact_projection_hours WHERE hour_start <= ?'),
+    activityAll: db.prepare('SELECT * FROM compact_dex_activity ORDER BY block_number DESC,log_index DESC LIMIT ?'),
     registryCount: db.prepare('SELECT COUNT(*) AS count FROM compact_registry WHERE kind = ?'),
     checkpoint: db.prepare('SELECT hour_start, last_block, last_hash FROM compact_checkpoint WHERE id = 1'),
     setCheckpoint: db.prepare(`INSERT INTO compact_checkpoint (id, hour_start, last_block, last_hash) VALUES (1, ?, ?, ?)
@@ -501,7 +509,6 @@ export function createCompactStore(db) {
       priced_blocks, close_sqrt_price_x96, close_liquidity, sqrt_price_block_sum, reserve0_block_sum, reserve1_block_sum)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     pricePaths: db.prepare('SELECT * FROM compact_pool_price_hours WHERE hour_start = ? AND protocol = ? ORDER BY pool'),
-    prunePricePaths: db.prepare('DELETE FROM compact_pool_price_hours WHERE hour_start <= ?'),
     valuations: db.prepare(`SELECT valuation, status, reason, row_count, rows_sha256 FROM compact_valuation_hours WHERE hour_start = ?
       ORDER BY valuation`),
     // An available valuation is never replaced; an unavailable one is updated (another reason) or upgraded.
@@ -517,22 +524,16 @@ export function createCompactStore(db) {
     insertSwapFee: db.prepare(`INSERT INTO compact_pool_fee_hours (hour_start, pool, swap_count, fee_in0_e6, fee_in1_e6, fee_out0_e12, fee_out1_e12)
       VALUES (?, ?, ?, ?, ?, ?, ?)`),
     swapFees: db.prepare('SELECT * FROM compact_pool_fee_hours WHERE hour_start = ? ORDER BY pool'),
-    pruneSwapFees: db.prepare('DELETE FROM compact_pool_fee_hours WHERE hour_start <= ?'),
     insertDexFee: db.prepare(`INSERT INTO compact_dex_fee_hours (hour_start, protocol, fee_usd_micros, valued_swaps, unvalued_swaps)
       VALUES (?, ?, ?, ?, ?)`),
     dexFees: db.prepare('SELECT * FROM compact_dex_fee_hours WHERE hour_start = ? ORDER BY protocol'),
-    pruneDexFees: db.prepare('DELETE FROM compact_dex_fee_hours WHERE hour_start <= ?'),
     // Pool liquidity snapshots (tvl.js): one row per top pool and hour, written once.
     insertPoolTvl: db.prepare(`INSERT OR IGNORE INTO compact_pool_tvl_hours (hour_start, protocol, pool, status, reason, amount0_raw, amount1_raw,
       block_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
     poolTvl: db.prepare('SELECT * FROM compact_pool_tvl_hours WHERE hour_start = ? AND protocol = ? ORDER BY pool'),
-    prunePoolTvl: db.prepare('DELETE FROM compact_pool_tvl_hours WHERE hour_start <= ?'),
     // The read model's 24H top pools (by summed swap count, ties by pool), for the liquidity snapshot of the same pools.
     topPools: db.prepare(`SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3
       GROUP BY pool HAVING total > 0 ORDER BY total DESC, pool ASC LIMIT ?4`),
-    pruneValuationHours: db.prepare('DELETE FROM compact_valuation_hours WHERE hour_start <= ?'),
-    pruneTokenPrices: db.prepare('DELETE FROM compact_token_price_hours WHERE hour_start <= ?'),
-    pruneDexVolume: db.prepare('DELETE FROM compact_dex_volume_hours WHERE hour_start <= ?'),
     // Stored hours inside retention without a status row for every valuation, newest first.
     pendingValuationHours: db.prepare(`SELECT h.hour_start FROM compact_hours h WHERE h.hour_start > ?1
       AND (SELECT COUNT(*) FROM compact_valuation_hours v WHERE v.hour_start = h.hour_start) < ?2 ORDER BY h.hour_start DESC LIMIT ?3`),
@@ -540,7 +541,11 @@ export function createCompactStore(db) {
     tokenMetadata: db.prepare('SELECT * FROM compact_token_metadata WHERE token = ?'),
     insertTokenMetadata: db.prepare(`INSERT OR IGNORE INTO compact_token_metadata (token, verified, symbol, name, decimals, reason, read_block)
       VALUES (?, ?, ?, ?, ?, ?, ?)`),
-    recentActivityPools: db.prepare(`SELECT protocol, pool, MAX(block_number) AS latest FROM compact_dex_activity GROUP BY protocol, pool
+    recentActivityPools: db.prepare(`WITH bounded AS (
+      SELECT protocol,pool,block_number FROM (SELECT protocol,pool,block_number FROM compact_dex_activity WHERE kind='swap' ORDER BY block_number DESC,log_index DESC LIMIT 500)
+      UNION ALL SELECT protocol,pool,block_number FROM (SELECT protocol,pool,block_number FROM compact_dex_activity WHERE kind='add' ORDER BY block_number DESC,log_index DESC LIMIT 500)
+      UNION ALL SELECT protocol,pool,block_number FROM (SELECT protocol,pool,block_number FROM compact_dex_activity WHERE kind='remove' ORDER BY block_number DESC,log_index DESC LIMIT 500))
+      SELECT protocol, pool, MAX(block_number) AS latest FROM bounded GROUP BY protocol, pool
       ORDER BY latest DESC, protocol ASC, pool ASC LIMIT ?`),
     busiestPools: db.prepare(`SELECT protocol, pool, SUM(swap_count) AS swaps FROM compact_pool_hours WHERE hour_start > ? GROUP BY protocol, pool
       ORDER BY swaps DESC, protocol ASC, pool ASC LIMIT ?`),
@@ -557,6 +562,8 @@ export function createCompactStore(db) {
   const coverage = () => coverageOf(V3_POOL_KIND);
 
   function transaction(work, beforeCommit = null) {
+    checkCapacity(); // Applies to every historical/live store writer before its transaction.
+    archive.begin();
     db.exec('BEGIN IMMEDIATE');
     try {
       const value = work();
@@ -583,8 +590,9 @@ export function createCompactStore(db) {
   // Identities only for the latest 24 hours (by the newest stored hour): no supported window needs anything older.
   function storeAddresses(hourStart, addresses) {
     const horizon = sql.newestHour.get().hour_start - ADDRESS_WINDOW_HOURS * HOUR;
-    if (hourStart > horizon) for (const address of addresses) sql.insertAddress.run(int(hourStart), Buffer.from(address.slice(2), 'hex'));
-    sql.pruneAddresses.run(int(horizon));
+    // Keep older replay identities too. OFF/failed archival must never silently discard accepted evidence.
+    for (const address of addresses) sql.insertAddress.run(int(hourStart), Buffer.from(address.slice(2), 'hex'));
+    archive.prune('compact_hour_addresses', 'hour_start <= ?', [int(horizon)]);
   }
 
   // Registry row identity and metadata per kind. V3: the official pool address. V4: the PoolManager poolId, with its full
@@ -679,6 +687,9 @@ export function createCompactStore(db) {
           sql.insertActivity.run(int(row.blockNumber), int(row.logIndex), hour, int(row.blockTimestamp), row.txHash, row.txFrom, row.protocol,
             row.kind, row.pool, row.amount0Raw, row.amount1Raw, row.amountBasis, row.counterparty, row.counterpartyKind);
         }
+        if (archive.config.enabled) archive.preserve('compact_dex_activity',range.hourStart,archive.readRows('compact_dex_activity','hour_start=?',[hour]),
+          {scope:'accepted_bounded_hourly_projection',projection:name,rowsSha256:entry.sha,limitPerKind:ACTIVITY_ROWS_PER_KIND,
+            completeBlockchainActivity:false});
       } else if (name === 'uniswap_v4_swap_fees') {
         for (const row of entry.rows) {
           sql.insertSwapFee.run(hour, row.pool, int(row.swapCount), row.feeIn0E6, row.feeIn1E6, row.feeOut0E12, row.feeOut1E12);
@@ -706,15 +717,18 @@ export function createCompactStore(db) {
     }
     // The hour's valuations follow from what is stored now (never from what was only offered).
     deriveValuations(range.hourStart);
-    for (const kind of ACTIVITY_KINDS) sql.pruneActivity.run(kind, kind, int(ACTIVITY_ROWS_PER_KIND));
+    for (const kind of ACTIVITY_KINDS) archive.prune('compact_dex_activity', `kind = ? AND (block_number,log_index) NOT IN
+      (SELECT block_number,log_index FROM compact_dex_activity WHERE kind=? ORDER BY block_number DESC,log_index DESC LIMIT ?)`,
+    [kind,kind,int(ACTIVITY_ROWS_PER_KIND)]);
     pruneHours(poolHourCutoff(sql.newestHour.get().hour_start));
     return report;
   }
 
   // Pool-hours, price paths, projection status rows and valuations share one retention (projections.js).
   function pruneHours(cutoff) {
-    for (const statement of [sql.prunePoolHours, sql.prunePricePaths, sql.pruneProjectionHours, sql.pruneValuationHours, sql.pruneTokenPrices,
-      sql.pruneDexVolume, sql.pruneSwapFees, sql.pruneDexFees, sql.prunePoolTvl]) statement.run(int(cutoff));
+    // Small coverage/status rows remain indexed permanently; missing hot payload is not missing verified coverage.
+    for (const table of ['compact_pool_hours','compact_pool_price_hours','compact_token_price_hours','compact_dex_volume_hours',
+      'compact_pool_fee_hours','compact_dex_fee_hours','compact_pool_tvl_hours']) archive.prune(table, 'hour_start <= ?', [int(cutoff)]);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -1062,6 +1076,8 @@ export function createCompactStore(db) {
     const rows = sql.windowHours.all(int(start), int(endHourStart));
     if (rows.length !== hours) return null;
     if (hours === 1) return rows[0].expected;
+    // Retained/archive evidence does not silently expand this existing rolling-window contract.
+    if(start<=sql.newestHour.get().hour_start-ADDRESS_WINDOW_HOURS*HOUR)return null;
     if (rows.some((row) => row.stored !== row.expected)) return null;
     return sql.windowUnique.get(int(start), int(endHourStart)).count;
   }
@@ -1083,6 +1099,16 @@ export function createCompactStore(db) {
   }
 
   return Object.freeze({
+    archive,
+    persistedActiveAddresses(hourStart) {
+      const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
+      if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
+      const hot=db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
+      const evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
+      if(evidence.some(r=>Number(r.hour_start)!==hourStart||!ArrayBuffer.isView(r.address)||r.address.byteLength!==20))throw new StoreError('archived_address_evidence_invalid');
+      const addresses=[...new Set(evidence.map(r=>`0x${Buffer.from(r.address).toString('hex')}`))].sort();
+      return addresses.length===hour.unique_active_addresses?addresses:null;
+    },
     intelligence,
     commitHour,
     gatewayRepairInput(hourStart) {
@@ -1173,7 +1199,7 @@ export function createCompactStore(db) {
       token0InRaw: row.token0_in_raw, token0OutRaw: row.token0_out_raw, token1InRaw: row.token1_in_raw, token1OutRaw: row.token1_out_raw,
       addCount: row.add_count, removeCount: row.remove_count, pokeCount: row.poke_count, addAmount0Raw: row.add_amount0_raw,
       addAmount1Raw: row.add_amount1_raw, removeAmount0Raw: row.remove_amount0_raw, removeAmount1Raw: row.remove_amount1_raw })),
-    recentActivity: (kind = null, limit = ACTIVITY_ROWS_PER_KIND * ACTIVITY_KINDS.length) => sql.activity.all(kind, int(limit)).map((row) => ({
+    recentActivity: (kind = null, limit = ACTIVITY_ROWS_PER_KIND * ACTIVITY_KINDS.length) => (kind===null?sql.activityAll.all(int(limit)):sql.activity.all(kind, int(limit))).map((row) => ({
       blockNumber: row.block_number, logIndex: row.log_index, hourStart: row.hour_start, blockTimestamp: row.block_timestamp, txHash: row.tx_hash,
       txFrom: row.tx_from, protocol: row.protocol, kind: row.kind, pool: row.pool, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw,
       amountBasis: row.amount_basis, counterparty: row.counterparty, counterpartyKind: row.counterparty_kind })),

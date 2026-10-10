@@ -57,12 +57,12 @@ export function backoffMs(failures, baseMs = DEFAULT_BASE_BACKOFF_MS, maxMs = MA
 // One child per call; the promise never rejects. terminate(): SIGTERM, then SIGKILL after the grace period. A killed
 // child never commits its hour: the runner writes an hour in one SQLite transaction, which a dead process cannot finish.
 export function createChildHourRunner({ scriptPath, execPath = process.execPath, env = process.env, spawnImpl = spawn,
-  killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now() }) {
+  killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now(), extraArgs = [] }) {
   if (typeof scriptPath !== 'string' || !scriptPath) throw new Error('script_path_required');
   return function runHour(hour) {
     const argument = assertHourIso(hour);
     const startedAt = now();
-    const child = spawnImpl(execPath, [...CHILD_NODE_ARGS, scriptPath, argument], { stdio: ['ignore', 'inherit', 'inherit'], env,
+    const child = spawnImpl(execPath, [...CHILD_NODE_ARGS, scriptPath, argument, ...extraArgs], { stdio: ['ignore', 'inherit', 'inherit'], env,
       shell: false });
     let exited = false;
     const done = new Promise((resolve) => {
@@ -112,6 +112,10 @@ export function createChildHistoryRunner(options) {
   return createChildTaskRunner({ ...options, args: { beforeScript: [], afterScript: ['--execute', '--max-hours=1'] } });
 }
 
+export function createChildDiscoveryRecoveryRunner(options) {
+  return createChildHourRunner({ ...options, extraArgs: ['--execute'] });
+}
+
 export function createChildDiscoveryRunner(options) {
   return createChildTaskRunner({ ...options, args: { beforeScript: CHILD_NODE_ARGS, afterScript: [] } });
 }
@@ -122,7 +126,7 @@ export function createChildDiscoveryRunner(options) {
 // runHistoryBackfill(): one historical hour child. runDiscoveryDrain(): one capped enrichment pass, lowest priority.
 // Live checkpoint catch-up always has priority.
 export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, runDiscoveryDrain = null,
-  runDailyActiveReplay = null, runGatewayRepair = null, historyStartHour = null,
+  runDailyActiveReplay = null, runGatewayRepair = null, runDiscoveryRecovery = null, historyStartHour = null,
   now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
   safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
   maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS,
@@ -138,6 +142,9 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
   let blockedSummary = '';
   let familyBlockedSummary = '';
   let backgroundTurn = 'dau';
+  let maintenanceTurn = 0;
+  let recoverySummary = '';
+  const maintenanceKinds = ['history_backfill', 'daily_active_replay', 'repair', 'projection_repair', 'discovery_recovery', 'discovery_drain'];
   const status = { lastRun: null, consecutiveFailures: 0, retryAt: null, projectionRepairBlocked: null, familyRepairBlocked: [] };
 
   async function runChild(hourStart, kind, runner = runHour) {
@@ -187,6 +194,8 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
         + `retry_at=${new Date(retryAt).toISOString()}`);
       return { again: false, wakeAt: retryAt };
     }
+
+    if (runDiscoveryRecovery) return fairMaintenance(checkpoint, target);
 
     // Live is caught up. Alternate one historical hour with one DAU replay hour so neither
     // background backfill can starve the other. Every child remains service-owned and non-overlapping.
@@ -317,6 +326,73 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
       return { again: false, wakeAt: Math.min(nextHourDue, now() + tickMs) };
     }
 
+    return { again: false, wakeAt: nextHourDue };
+  }
+
+  // Opt-in recovery uses bounded round-robin maintenance; flag OFF retains the existing order exactly.
+  async function fairMaintenance(checkpointBefore, target) {
+    const nowMs = now();
+    const nextHourDue = (target + 2 * HOUR_SECONDS) * 1000 + safetyDelayMs;
+    let recovery;
+    try { recovery = await readModel.discoveryRecoveryPlan({ nowMs }); }
+    catch (error) { log(`SCHEDULER_DISCOVERY_PLAN_FAILED reason=${error.code ?? 'planning_failed'}`); recovery = { counts: {}, candidate: null }; }
+    if (stopped) return { again: false };
+    // Planning is asynchronous: a live hour or an external committed checkpoint may arrive while it runs.
+    const currentCheckpoint = readModel.checkpoint();
+    if (latestSafeHourStart(now(), safetyDelayMs) > target || !currentCheckpoint
+      || currentCheckpoint.hourStart !== checkpointBefore.hourStart || currentCheckpoint.lastBlock !== checkpointBefore.lastBlock
+      || currentCheckpoint.lastHash !== checkpointBefore.lastHash) return { again: true };
+    const summary = JSON.stringify({ digest: recovery.digest, counts: recovery.counts });
+    if (summary !== recoverySummary) { log(`SCHEDULER_DISCOVERY_RECOVERY_QUEUE ${summary}`); recoverySummary = summary; }
+    const jobs = new Map();
+    const bounds = runHistoryBackfill && readModel.historyBounds?.();
+    if (bounds?.first > historyStartHour && Number.isSafeInteger(historyStartHour))
+      jobs.set('history_backfill', () => runHistoryBackfill());
+    const dau = runDailyActiveReplay && readModel.dailyActiveReplayCandidate?.();
+    if (Number.isSafeInteger(dau)) jobs.set('daily_active_replay', () => runDailyActiveReplay(hourIso(dau)));
+    const fromHour = checkpointBefore.hourStart - (repairWindowHours - 1) * HOUR_SECONDS;
+    for (const hour of repairAttempts.keys()) if (hour < fromHour) repairAttempts.delete(hour);
+    const projectionFrom = checkpointBefore.hourStart - (projectionRepairWindowHours - 1) * HOUR_SECONDS;
+    for (const hour of projectionAttempts.keys()) if (hour < projectionFrom) projectionAttempts.delete(hour);
+    const repair = typeof readModel.familyRepairPlans === 'function' ? readModel.familyRepairPlans({ fromHour, toHour: checkpointBefore.hourStart })
+      : { plans: readModel.repairCandidates({ fromHour, toHour: checkpointBefore.hourStart }).map(hourStart => ({ hourStart, families: [], cooldownMs: repairCooldownMs })), blocked: [] };
+    status.familyRepairBlocked = repair.blocked;
+    const family = repair.plans.find(p => nowMs - (repairAttempts.get(p.hourStart) ?? -Infinity) >= Math.max(repairCooldownMs, p.cooldownMs));
+    if (family) jobs.set('repair', () => {
+      repairAttempts.set(family.hourStart, nowMs);
+      const gateway = runGatewayRepair && family.families.length === 1 && family.families[0] === 'gateway';
+      return (gateway ? runGatewayRepair : runHour)(hourIso(family.hourStart));
+    });
+    if (runProjectionRepair) {
+      const projections = readModel.projectionRepairCandidates({ fromHour: checkpointBefore.hourStart - (projectionRepairWindowHours - 1) * HOUR_SECONDS,
+        toHour: checkpointBefore.hourStart });
+      noteBlocked(projections.blocked);
+      const hour = projections.hours.find(h => nowMs - (projectionAttempts.get(h) ?? -Infinity) >= projectionRepairCooldownMs);
+      if (hour !== undefined) jobs.set('projection_repair', () => { projectionAttempts.set(hour, nowMs); return runProjectionRepair(hourIso(hour)); });
+    }
+    // Don't begin a costly hour when live is nearly due. A deadline terminates recovery before the next live slot.
+    if (Number.isSafeInteger(recovery.candidate) && nextHourDue - nowMs >= 90_000)
+      jobs.set('discovery_recovery', () => runDiscoveryRecovery(hourIso(recovery.candidate)));
+    if (runDiscoveryDrain && readModel.discoveryPending?.({ nowMs })) jobs.set('discovery_drain', () => runDiscoveryDrain());
+    for (let n = 0; n < maintenanceKinds.length; n++) {
+      const index = (maintenanceTurn + n) % maintenanceKinds.length;
+      const kind = maintenanceKinds[index];
+      if (!jobs.has(kind)) continue;
+      maintenanceTurn = (index + 1) % maintenanceKinds.length;
+      const handle = jobs.get(kind)();
+      child = { kind, terminate: () => handle.terminate() };
+      log(`SCHEDULER_CHILD_START kind=${kind}${kind === 'discovery_recovery' ? ` hour=${hourIso(recovery.candidate)}` : ''}`);
+      const deadline = kind === 'discovery_recovery' ? setTimer(() => { void handle.terminate(); }, Math.min(600_000, nextHourDue - now())) : null;
+      let outcome;
+      try { outcome = await handle.done; } finally { if (deadline) clearTimer(deadline); child = null; }
+      if (stopped) return { again: false };
+      const after = readModel.checkpoint();
+      if (!after || after.hourStart !== checkpointBefore.hourStart || after.lastBlock !== checkpointBefore.lastBlock
+        || after.lastHash !== checkpointBefore.lastHash) throw new Error('maintenance_checkpoint_changed');
+      status.lastRun = { kind, ...outcome };
+      log(`SCHEDULER_MAINTENANCE_DONE kind=${kind} exit=${outcome.exitCode}`);
+      return { again: false, wakeAt: Math.min(nextHourDue, now() + tickMs) };
+    }
     return { again: false, wakeAt: nextHourDue };
   }
 

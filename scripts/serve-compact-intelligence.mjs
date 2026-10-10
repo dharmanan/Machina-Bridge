@@ -14,9 +14,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createEcosystemReader } from '../server/compact/ecosystem-reader.js';
-import { createChildHistoryRunner, createChildHourRunner, createChildDiscoveryRunner, createScheduler } from '../server/compact/scheduler.js';
+import { createDiscoveryRecoveryPlanner } from '../server/compact/discovery-recovery-planner.js';
+import { createChildHistoryRunner, createChildHourRunner, createChildDiscoveryRunner, createChildDiscoveryRecoveryRunner, createScheduler } from '../server/compact/scheduler.js';
 import { ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR } from './backfill-compact-history.mjs';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
+import { archiveConfig } from '../server/compact/evidence-archive.js';
 
 export const RUNNER_SCRIPT = fileURLToPath(new URL('./run-compact-hour.mjs', import.meta.url));
 export const PROJECTION_REPAIR_SCRIPT = fileURLToPath(new URL('./repair-compact-projection-hour.mjs', import.meta.url));
@@ -32,6 +34,7 @@ export class ServiceConfigError extends Error {
 
 // Environment checked before anything is opened or started. The child runner re-validates the same variables.
 export function serviceConfig({ env = process.env } = {}) {
+  archiveConfig(env); // Validate child storage/archival limits without activating or writing anything.
   const sqlitePath = env.COMPACT_SQLITE_PATH?.trim();
   if (!sqlitePath || sqlitePath === ':memory:' || sqlitePath.startsWith('file:')) throw new ServiceConfigError('sqlite_path_required');
   const pacing = env.COMPACT_RPC_MIN_INTERVAL_MS ?? String(DEFAULT_RPC_INTERVAL_MS);
@@ -43,7 +46,10 @@ export function serviceConfig({ env = process.env } = {}) {
   // Exactly "true" or "false"; a malformed value fails closed instead of silently pausing (or running) the indexer.
   const enabled = env.COMPACT_SCHEDULER_ENABLED ?? '';
   if (enabled !== '' && enabled !== 'true' && enabled !== 'false') throw new ServiceConfigError('invalid_scheduler_enabled');
-  return { sqlitePath: resolve(sqlitePath), minIntervalMs, port, host: '0.0.0.0', schedulerEnabled: enabled !== 'false' };
+  const recovery = env.COMPACT_DISCOVERY_RECOVERY_ENABLED ?? '';
+  if (recovery !== '' && recovery !== 'true' && recovery !== 'false') throw new ServiceConfigError('invalid_discovery_recovery_enabled');
+  if (recovery === 'true' && (minIntervalMs < 1000 || minIntervalMs > 10000)) throw new ServiceConfigError('unsafe_recovery_rpc_pacing');
+  return { discoveryRecoveryEnabled: recovery === 'true', sqlitePath: resolve(sqlitePath), minIntervalMs, port, host: '0.0.0.0', schedulerEnabled: enabled !== 'false' };
 }
 
 // Wires the three parts; returns shutdown(code, reason) so signals, fatal read-model errors and tests share one path.
@@ -119,13 +125,20 @@ async function main() {
   const runHistoryBackfill = createChildHistoryRunner({ scriptPath: HISTORY_BACKFILL_SCRIPT, env: childEnv });
   const runDiscoveryDrain = createChildDiscoveryRunner({ scriptPath: DISCOVERY_DRAIN_SCRIPT, env: childEnv });
   const runDailyActiveReplay = createChildHourRunner({ scriptPath: DAILY_ACTIVE_REPLAY_SCRIPT, env: childEnv });
+  const runDiscoveryRecovery = config.discoveryRecoveryEnabled ? createChildDiscoveryRecoveryRunner({
+    scriptPath: fileURLToPath(new URL('./recover-compact-discovery.mjs', import.meta.url)), env: childEnv,
+  }) : null;
+  log(`DISCOVERY_RECOVERY_ENABLED ${config.discoveryRecoveryEnabled}`);
+  log(`EVIDENCE_ARCHIVE_ENABLED ${archiveConfig(childEnv).enabled}`);
+  const recoveryPlanner = config.discoveryRecoveryEnabled ? createDiscoveryRecoveryPlanner({ path: config.sqlitePath }) : null;
   const scheduler = createScheduler({
-    readModel, runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair,
+    readModel: recoveryPlanner ? { ...readModel, discoveryRecoveryPlan: ({ nowMs }) => recoveryPlanner.read(nowMs) } : readModel,
+    runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair, runDiscoveryRecovery,
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
   });
   const ecosystemReader = createEcosystemReader({ path: config.sqlitePath });
   const httpReadModel = { ...readModel, ecosystem: (window) => ecosystemReader.read(window),
-    async close() { await ecosystemReader.close(); readModel.close(); } };
+    async close() { await recoveryPlanner?.close(); await ecosystemReader.close(); readModel.close(); } };
   const server = createIntelligenceServer({ readModel: httpReadModel, log, onFatal: fatal });
   service = startIntelligenceService({ config, readModel: httpReadModel, scheduler, server, log });
   process.once('SIGTERM', () => { void service.shutdown(0, 'SIGTERM'); });

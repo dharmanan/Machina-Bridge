@@ -295,8 +295,10 @@ const SQL = Object.freeze({
     FROM compact_token_price_hours WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, token`,
   tokenMetadata: 'SELECT symbol, name, decimals FROM compact_token_metadata WHERE token = ? AND verified = 1',
   activityRows: `SELECT block_number, log_index, block_timestamp, tx_hash, tx_from, protocol, kind, pool, amount0_raw, amount1_raw,
-    amount_basis, counterparty, counterparty_kind FROM compact_dex_activity WHERE (?1 IS NULL OR kind = ?1)
+    amount_basis, counterparty, counterparty_kind FROM compact_dex_activity WHERE kind = ?1
     ORDER BY block_number DESC, log_index DESC LIMIT ?2`,
+  activityRowsAll: `SELECT block_number,log_index,block_timestamp,tx_hash,tx_from,protocol,kind,pool,amount0_raw,amount1_raw,
+    amount_basis,counterparty,counterparty_kind FROM compact_dex_activity ORDER BY block_number DESC,log_index DESC LIMIT ?`,
   // Projection repair state per stored hour: primary-key lookups only (compact_hours by hour, family and projection rows by
   // their (hour_start, name) keys), so a 35-day scan stays a bounded index read.
   projectionTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_projection_hours'",
@@ -1036,7 +1038,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     if (latest?.status !== 'available') return unavailable(latest ? latest.reason : 'projection_not_processed');
     const tables = optionalTables();
     return { anchor: state, status: 'available', reason: null,
-      rows: statement('activityRows').all(ACTIVITY_TYPES[typeKey], int(ACTIVITY_LIMIT)).map((row) => activityRow(row, tables)) };
+      rows: (ACTIVITY_TYPES[typeKey]===null?statement('activityRowsAll').all(int(ACTIVITY_LIMIT))
+        :statement('activityRows').all(ACTIVITY_TYPES[typeKey], int(ACTIVITY_LIMIT))).map((row) => activityRow(row, tables)) };
   }
 
   // Projection state of every stored hour in [fromHour, toHour], oldest first (see projections.js projectionRepairState).

@@ -50,7 +50,10 @@ export async function runDailyActiveReplay({ sqlitePath, hourStart, provider, pr
       if (hour === null) throw new Error('dau_replay_hour_missing');
 
       const checkpointBefore = store.checkpoint();
-      const addresses = await replayHourActiveAddresses({ provider, hour });
+      const persisted=store.persistedActiveAddresses(hourStart);
+      const capacity=store.archive.preflight(8*1024*1024);
+      if(!capacity.ok)throw Object.assign(new Error(capacity.reason),{code:capacity.reason});
+      const addresses = persisted ?? await replayHourActiveAddresses({ provider, hour });
       const result = store.replayDailyActiveAddresses(hourStart, addresses);
       const checkpointAfter = store.checkpoint();
 
@@ -62,6 +65,7 @@ export async function runDailyActiveReplay({ sqlitePath, hourStart, provider, pr
       if (checkpointUnchanged === false) throw new Error('dau_replay_checkpoint_changed');
 
       print(`DAU_REPLAY_HOUR ${iso(hourStart)} addresses=${addresses.length}`);
+      print(`DAU_REPLAY_EVIDENCE ${persisted?'verified_persisted_membership':'exact_hour_rpc'}`);
       print(`DAU_REPLAY_DAY ${iso(result.dayStart)} status=${result.status} finalized=${result.finalized}`);
       print('RESULT PASS');
       return { ok: true, hourStart, addresses: addresses.length, result };

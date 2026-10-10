@@ -613,7 +613,7 @@ if (!sqlite) {
   const rows = (db) => db.prepare('SELECT hour_start, network_sha256 FROM compact_hours ORDER BY hour_start').all()
     .map((row) => `${row.hour_start}:${row.network_sha256}`);
   const tables = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name").all().map((row) => row.name);
-  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_family_hours',
+  const TABLES = ['compact_checkpoint', 'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage', 'compact_daily_address_status_history', 'compact_dex_activity', 'compact_dex_fee_hours', 'compact_dex_volume_hours', 'compact_evidence_archive', 'compact_evidence_archive_parts', 'compact_evidence_archive_usage', 'compact_family_hours',
     'compact_hour_addresses', 'compact_hours', 'compact_intelligence_hours', 'compact_meta', 'compact_pool_fee_hours', 'compact_pool_hours', 'compact_pool_price_hours',
     'compact_pool_tvl_hours', 'compact_projection_hours', 'compact_registry', 'compact_registry_coverage', 'compact_token_dex_observations',
     'compact_token_discoveries', 'compact_token_metadata', 'compact_token_price_hours', 'compact_valuation_hours'];
@@ -670,7 +670,8 @@ if (!sqlite) {
       assert.throws(() => store.commitHour({ ...hours[0], definitionVersion: 'arc-compact-hour-v1' }), (error) => error.code === 'definition_version_mismatch');
       assert.throws(() => store.commitHour({ ...hours[0], chainId: 1 }), (error) => error.code === 'chain_id_mismatch');
       const dataTables = TABLES.filter((table) => table !== 'compact_meta');
-      assert.deepEqual(dataTables.map((table) => db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count), dataTables.map(() => 0));
+      assert.deepEqual(dataTables.map((table) => db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count),
+        dataTables.map(table=>table==='compact_evidence_archive_usage'?1:0), 'only the initialized quota counter exists');
       assert.equal(store.commitHour(hours[0]).outcome, 'inserted', 'the same hour with the expected identity is accepted');
       db.close();
     });
@@ -846,7 +847,7 @@ if (!sqlite) {
       db.close();
     });
 
-    await test('sqlite: rolling address identity retention stays at 24H with exact 1H, 6H and 24H unions', async () => {
+    await test('sqlite: archival OFF preserves identities with exact 1H, 6H and 24H unions', async () => {
       // One block per minute keeps 25 consecutive hours small.
       const slowOrigin = { originNumber: ORIGIN.originNumber, originTimestamp: HOUR - 120, blockSpacing: 600_000 };
       const slow = createSyntheticChain({ ...slowOrigin, senderPool: 900, recipientPool: 600 });
@@ -877,7 +878,7 @@ if (!sqlite) {
       assert.equal(store.uniqueActiveAddresses(HOUR, 1), identities[0].size, '1H stays exact from the hour row');
       for (const span of [2, 168, 720]) assert.throws(() => store.uniqueActiveAddresses(last, span), (error) => error.code === 'unsupported_window');
       const kept = db.prepare('SELECT COUNT(DISTINCT hour_start) AS hours, MIN(hour_start) AS first FROM compact_hour_addresses').get();
-      assert.deepEqual([kept.hours, kept.first], [ADDRESS_WINDOW_HOURS, last - 23 * 3600]);
+      assert.deepEqual([kept.hours, kept.first], [25, HOUR], 'OFF retains originals instead of unarchived pruning');
       assert.deepEqual(tables(db), TABLES, 'exact schema includes the separate accepted DAU tables');
       db.close();
     });
@@ -908,9 +909,11 @@ if (!sqlite) {
       const additiveSchemaAllowanceBytes = 64 * 1024;
       // Same 6,500-address fixture, accepted baseline DDL: isolated Python SQLite DAU allocation adds
       // 233,472 bytes (57 x 4 KiB pages). Reserve 64 pages for that bounded union and its two small tables.
-      // Keep the existing core/projection/Intelligence budget; this is not a per-row or unlimited allowance.
+      // OFF now keeps every accepted hourly activity subset instead of deleting older unarchived rows.
+      // Bound this fixture allowance by the existing 500-per-kind cap and additional accepted hours.
       const dailyAddressAllowanceBytes = 256 * 1024;
-      const storageBudgetBytes = 2 * 1024 * 1024 + additiveSchemaAllowanceBytes + dailyAddressAllowanceBytes;
+      const retainedActivityAllowanceBytes=(hours.length-1)*500*3*512;
+      const storageBudgetBytes = 2 * 1024 * 1024 + additiveSchemaAllowanceBytes + dailyAddressAllowanceBytes + retainedActivityAllowanceBytes;
       assert(size < storageBudgetBytes, `database is ${size} bytes for ${hours.length} hours; budget ${storageBudgetBytes}`);
     });
 

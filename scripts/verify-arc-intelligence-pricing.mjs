@@ -156,7 +156,8 @@ await test('bounded RPC: metadata of at most 32 tokens per run, three eth_call e
   const failing = [];
   const partial = await refreshTokenMetadata({ store: { ...store, recordTokenMetadata: (rows) => failing.push(...rows) },
     provider: metadataProvider(new Map(), { failAt: 2 }), blockNumber: 1_000_000 });
-  assert.deepEqual([partial.requests, partial.rejected, failing.length, partial.error], [1, 16, 16, 'rate_limited']);
+  assert.deepEqual([partial.requests, partial.rejected, failing.length, partial.error], [2, 16, 16, 'rate_limited'],
+    'both attempted batches count, including the failed request; the completed batch remains cached');
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -457,7 +458,7 @@ if (!sqlite) {
       if (spec.counts?.includes(field)) return [field, k + 1];
       if (spec.amounts?.includes(field)) return [field, String(1000 + k)];
       if (spec.constants?.includes(field)) return [field, CONSTANTS[field]];
-      if (spec.tallies?.[field]) return [field, { k: entry(spec.tallies[field], k, 0) }];
+      if (spec.tallies?.[field]) return [field, { [name==='across'&&['depositByToken','fillByToken'].includes(field)?USDC:'k']: entry(spec.tallies[field], k, 0) }];
       if (spec.lists?.[field]) return [field, [entry(spec.lists[field], k, 0)]];
       return [field, 50 + k];
     }));

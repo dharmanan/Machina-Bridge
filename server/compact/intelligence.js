@@ -59,12 +59,18 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
   const launchProofs = new Map();
   let capped = false;
   let dexCapped = false;
+  const candidateCaps = new Set(), dexCaps = new Set();
   let transferError = false;
   const addCandidate = (candidate) => {
     const key = candidate.kind === 'creation' ? candidate.txHash : `${candidate.kind}:${candidate.address}:${candidate.txHash}`
       + (candidate.kind === 'source' ? `:${candidate.launchEvidence.version}` : '');
     if (candidates.has(key)) return;
-    if (candidates.size === limit) { capped = true; return; }
+    if (candidates.size === limit) {
+      capped = true;
+      candidateCaps.add(candidate.kind === 'pool' ? candidate.poolEvidence.protocol : candidate.kind === 'source'
+        ? `${candidate.launchEvidence.emitter}:${candidate.launchEvidence.version}` : 'creations');
+      return;
+    }
     candidates.set(key, { key, ...candidate });
   };
   const mark = (kind, entry) => {
@@ -93,7 +99,7 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
     const row = { protocol, pool, activity, blockNumber: log.blockNumber, logIndex: log.logIndex,
       timestamp: block.timestamp, txHash: log.transactionHash };
     const previous = first.get(key);
-    if (!previous && first.size >= DISCOVERY_LIMIT_PER_HOUR * 2) { dexCapped = true; return; }
+    if (!previous && first.size >= DISCOVERY_LIMIT_PER_HOUR * 2) { dexCapped = true; dexCaps.add(protocol); return; }
     if (!previous || row.blockNumber < previous.blockNumber || row.blockNumber === previous.blockNumber && row.logIndex < previous.logIndex) first.set(key, row);
   };
   return Object.freeze({
@@ -204,7 +210,14 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
       const validCandidates = [...candidates.values()].filter((row) => row.kind !== 'pool'
         || projections?.[`${row.poolEvidence.protocol}_pools`]?.status === 'available')
         .sort((a, b) => a.blockNumber - b.blockNumber || a.transactionIndex - b.transactionIndex || a.key.localeCompare(b.key));
-      return { version: INTELLIGENCE_VERSION, registryDigest: registryDigest(registry), range,
+      return { version: INTELLIGENCE_VERSION, registryDigest: registryDigest(registry), registryDefinition: registry, range,
+        // Internal per-component completeness survives an unrelated source/family failure or a shared list cap.
+        discoveryComponents: { creations: !candidateCaps.has('creations'),
+          ...Object.fromEntries(['uniswap_v3', 'uniswap_v4'].map(protocol => [protocol,
+            families[protocol === 'uniswap_v3' ? 'uniswapV3' : 'uniswapV4']?.status === 'available'
+            && projections?.[`${protocol}_pools`]?.status === 'available' && !candidateCaps.has(protocol) && !dexCaps.has(protocol)])),
+          launches: Object.fromEntries(registry.launches.map(entry => [entry.id, extensions.get(`launch:${entry.id}`)?.status === 'available'
+            && !entry.addresses.some(a => candidateCaps.has(`${a}:${entry.version}`))])) },
         discovery: { scope: 'top_level_creations_and_registered_sources',
           status: capped || !launchComplete || !poolDiscoveryComplete ? 'insufficient_coverage' : 'available',
           reason: capped ? 'candidate_limit' : !launchComplete ? 'registered_launch_scan_unavailable'
@@ -215,6 +228,7 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
           && projections?.[`${row.protocol}_pools`]?.status === 'available')
           .sort((a, b) => a.protocol.localeCompare(b.protocol) || a.pool.localeCompare(b.pool) || a.activity.localeCompare(b.activity)),
         firstDexComplete: !dexCapped && poolDiscoveryComplete,
+        firstDexLimited: dexCapped, // Internal completeness flag for a recovery unit scoped to one pool protocol.
         exchange: { status: !registry.exchanges.length ? 'unavailable' : transferComplete ? 'available' : 'insufficient_coverage',
           reason: !registry.exchanges.length ? 'verified_exchange_registry_empty' : !registryInRange ? 'registry_not_valid_for_entire_range'
             : transferComplete ? null : 'transfer_family_unavailable',
