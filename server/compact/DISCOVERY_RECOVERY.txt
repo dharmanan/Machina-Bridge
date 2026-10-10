@@ -276,3 +276,29 @@ available by this archive. Those gaps still need exact-hour/source RPC, or remai
 provider cannot supply them. No compressed archive claims completeness beyond its independently verified scope.
 Contradictory evidence requires an individually reviewed correction outside this runner; no destructive shortcut is
 implemented.
+
+## Recovery V3 membership and failure diagnostics
+
+Historical V3 recovery looks up each log emitter with the existing (kind,address) primary key and requires
+created_block < hour.first_block. It never loads the entire registry or caps valid registry membership at 10,000.
+The independently verified factory coverage, same-hour PoolCreated overlay, foreign-emitter accounting, canonical
+boundaries and stored-family comparisons are unchanged. No family/source version, schema or RPC filter changes.
+
+Retry policy sqlite-pool-membership-v1 supersedes ONLY a matching V3 retry record blocked by
+recovery_pool_registry_limit. The original record remains unchanged; the new record has a separate versioned key
+and hashes the superseded record. Attempts carry forward toward the existing maximum of eight, not a new quota.
+Already exhausted attempts and all other blocked/evidence reasons remain blocked. Once started, the new record's
+lease, cooldown, failures and quota govern restart; it cannot repeatedly reset from the legacy cap. Planning is
+read-only, and no retry occurs while automatic discovery recovery is disabled unless a one-hour execution is
+explicitly invoked. This policy does not invalidate or change any completed evidence unit or registry identity.
+
+Recovery failures log and retain allowlisted structured diagnostics: category, phase, endpoint NAME, HTTP/RPC codes,
+known OS transport cause codes, RPC methods, numeric block range, batch size, duration, request timeout/ordinal and
+request/call/byte usage. Categories distinguish HTTP, network transport, per-request timeout, body-read failure and
+response/time/RPC budgets. Raw error messages, URLs, headers, response bodies and address/transaction parameters
+are excluded. Transport remains the backward-compatible error code for HTTP/network/read/timeouts; use category
+to distinguish them. recovery_response_budget_exhausted retains its exact code, including when cancellation fails.
+An aggregate explicitly reporting creations:<failure> cannot prove a complete creation list merely through the
+accepted-list checksum; recovery must retain the failure/cooldown rather than import that empty or partial list.
+One physical attempt per recovery request and stop-after-failure behavior are unchanged, as are all memory, disk,
+RPC, response and time limits. No production recovery or flag activation is performed by this change.

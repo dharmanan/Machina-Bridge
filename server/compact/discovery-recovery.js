@@ -13,12 +13,14 @@ import { headerOf, spineBlockOf, spineWindows } from './spine.js';
 import { streamLogs, validateLogs } from './logs.js';
 import { codeIsPresent } from './registry.js';
 import { UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
+import { providerDiagnostics } from './provider.js';
 
 export const DISCOVERY_PUBLIC_START = Date.parse('2026-09-16T11:00:00Z') / 1000;
 export const RECOVERY_HOURS = 720;
 export const MAX_RECOVERY_ATTEMPTS = 8;
 export const RECOVERY_TIMEOUT_MS = 600_000;
 export const RECOVERY_RETRY_MS = 3_600_000;
+export const V3_RETRY_POLICY = 'sqlite-pool-membership-v1';
 const HOUR = 3600;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const jsonHash = value => hash(intelligenceJson(value));
@@ -30,7 +32,7 @@ const checkpoint = db => db.prepare('SELECT * FROM compact_checkpoint WHERE id=1
 const sameCheckpoint = (a, b) => a && b && a.hour_start === b.hour_start && a.last_block === b.last_block && a.last_hash === b.last_hash;
 const rangeOf = h => ({ hourStart: h.hour_start, firstBlock: h.first_block, lastBlock: h.last_block, parentHash: h.parent_hash, lastHash: h.last_hash });
 const unitKey = (hour, id) => `discovery_unit:${hour}:${id}`;
-const retryKey = (hour, id) => `discovery_retry:${hour}:${id}`;
+const retryKey = (hour, id, policy = null) => `discovery_retry:${hour}:${id}${policy ? `:${policy}` : ''}`;
 const transaction = (db, fn) => {
   db.exec('BEGIN IMMEDIATE');
   try { const value = fn(); db.exec('COMMIT'); return value; } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -99,13 +101,24 @@ function readUnit(db, h, unit) {
     || !['available', 'insufficient_coverage'].includes(saved.status)) fail('recovery_unit_corrupt');
   return saved;
 }
-function readRetry(db, hour, unit) {
-  const attempt = meta(db, retryKey(hour, unit.id));
+function validateRetry(attempt) {
   if (attempt && (!/^[0-9a-f]{64}$/.test(attempt.fingerprint) || !Number.isSafeInteger(attempt.attempts)
     || attempt.attempts < 1 || attempt.attempts > MAX_RECOVERY_ATTEMPTS || !Number.isSafeInteger(attempt.notBefore)
     || attempt.notBefore < 0 || !['retryable', 'blocked'].includes(attempt.phase)
     || typeof attempt.reason !== 'string' || attempt.reason.length > 256)) fail('recovery_retry_corrupt');
   return attempt;
+}
+function readRetry(db, hour, unit, fingerprint) {
+  const legacy = validateRetry(meta(db, retryKey(hour, unit.id)));
+  // Only this obsolete implementation cap is superseded. Keep the original record and attempt count;
+  // exhausted quotas, corrupt evidence and every other blocked reason remain blocked.
+  if (unit.kind !== 'uniswap_v3' || legacy?.fingerprint !== fingerprint || legacy.phase !== 'blocked'
+    || legacy.reason !== 'recovery_pool_registry_limit' || legacy.attempts >= MAX_RECOVERY_ATTEMPTS) return legacy;
+  const revised = validateRetry(meta(db, retryKey(hour, unit.id, V3_RETRY_POLICY)));
+  const supersedes = jsonHash(legacy);
+  if (revised && (revised.retryPolicy !== V3_RETRY_POLICY || revised.supersedes !== supersedes
+    || revised.fingerprint !== fingerprint || revised.attempts < legacy.attempts)) fail('recovery_retry_policy_conflict');
+  return revised ?? { ...legacy, phase: 'retryable', notBefore: 0, retryPolicy: V3_RETRY_POLICY, supersedes };
 }
 // Import only definitions and COMPLETE observation lists whose original count/digest is reproduced exactly.
 // New source facts cannot contaminate an old digest: candidates are selected by the source definitions in that row.
@@ -127,7 +140,11 @@ function storedImports(db, c, registry, units) {
       && entry.version === f.launchEvidence?.version && entry.events.some(e => e.event.signature === f.launchEvidence?.eventSignature)))
       .sort((a, b) => a.blockNumber - b.blockNumber || a.transactionIndex - b.transactionIndex || a.key.localeCompare(b.key));
     if (candidates.length !== p.discovery.candidateCount || jsonHash(candidates) !== p.discovery.candidateEvidenceDigest) continue;
-    imports.set(units.find(u => u.kind === 'creations').id, { candidates: candidates.filter(f => f.kind === 'creation'), firstDex: [] });
+    // A checksum proves the accepted list's integrity, not its completeness. A recovery aggregate that
+    // explicitly reports missing creations must never turn an empty/partial list into a successful unit.
+    if (!p.discovery.reason?.startsWith('creations:')) {
+      imports.set(units.find(u => u.kind === 'creations').id, { candidates: candidates.filter(f => f.kind === 'creation'), firstDex: [] });
+    }
     if (p.firstDexComplete) {
       dex ??= db.prepare('SELECT * FROM compact_token_dex_observations WHERE hour_start=? ORDER BY protocol,pool,activity LIMIT 4097').all(c.h.hour_start)
         .map(r => ({ protocol: r.protocol, pool: r.pool, activity: r.activity, blockNumber: r.block_number, logIndex: r.log_index, timestamp: r.timestamp, txHash: r.tx_hash }));
@@ -174,7 +191,7 @@ function hourPlan(db, hour, registry, now) {
   catch (error) { corrupt = error.code ?? 'recovery_stored_evidence_corrupt'; category = 'inconsistent'; }
   const unitPlans = units.map(unit => {
     let saved, attempt;
-    try { saved = readUnit(db, c.h, unit); attempt = readRetry(db, hour, unit); }
+    try { saved = readUnit(db, c.h, unit); attempt = readRetry(db, hour, unit, c.fingerprint); }
     catch (error) { corrupt ??= error.code; }
     let phase = saved?.status === 'available' || imports.has(unit.id) ? 'complete' : 'pending';
     let reason = saved?.reason ?? null;
@@ -194,6 +211,8 @@ function hourPlan(db, hour, registry, now) {
       else if (attempt.notBefore > now) phase = 'retryable';
     }
     return { ...unit, phase, reason, attempts: attempt?.fingerprint === c.fingerprint ? attempt.attempts : 0,
+      retryPolicy: attempt?.fingerprint === c.fingerprint ? attempt.retryPolicy ?? null : null,
+      supersedes: attempt?.supersedes ?? null,
       saved, imported: imports.get(unit.id) ?? null };
   });
   const aggregateLimited = unitPlans.every(u => u.phase === 'complete') && ['candidate_limit', 'first_dex_observation_limit'].includes(currentPayload?.discovery.reason);
@@ -207,7 +226,7 @@ export function recoveryHourPlan(db, hour, { registry = INTELLIGENCE_REGISTRY, n
   try { p = hourPlan(db, hour, registry, now); }
   catch (error) { return { hourStart: hour, digest: registryDigest(registry), category: 'inconsistent', phase: 'blocked', reason: error.code ?? 'recovery_evidence_corrupt', units: [] }; }
   return { hourStart: hour, digest: p.c.digest, category: p.category, phase: p.phase, reason: p.reason,
-    units: p.units.map(({ kind, id, entry, phase, reason, attempts }) => ({ kind, id, source: entry?.id ?? null, phase, reason, attempts })) };
+    units: p.units.map(({ kind, id, entry, phase, reason, attempts, retryPolicy }) => ({ kind, id, source: entry?.id ?? null, phase, reason, attempts, retryPolicy })) };
 }
 export function planDiscoveryRecovery(db, { registry = INTELLIGENCE_REGISTRY, now = Date.now() } = {}) {
   assertRecoverySchema(db);
@@ -236,12 +255,14 @@ function saveUnit(db, c, unit, evidence, { status = 'available', reason = null, 
   });
 }
 
-function retry(db, c, unit, { now, reason, phase = 'retryable', lease = false }) {
+function retry(db, c, unit, { now, reason, phase = 'retryable', lease = false, diagnostics = null }) {
   transaction(db, () => {
     unchanged(db, c);
     db.prepare('INSERT INTO compact_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-      .run(retryKey(c.h.hour_start, unit.id), intelligenceJson({ fingerprint: c.fingerprint, attempts: unit.attempts + 1,
-        reason, phase, notBefore: now + RECOVERY_RETRY_MS + (lease ? RECOVERY_TIMEOUT_MS : 0) }));
+      .run(retryKey(c.h.hour_start, unit.id, unit.retryPolicy), intelligenceJson({ fingerprint: c.fingerprint, attempts: unit.attempts + 1,
+        reason, phase, notBefore: now + RECOVERY_RETRY_MS + (lease ? RECOVERY_TIMEOUT_MS : 0),
+        ...(unit.retryPolicy ? { retryPolicy: unit.retryPolicy, supersedes: unit.supersedes } : {}),
+        ...(diagnostics ? { diagnostics } : {}) }));
   });
 }
 async function boundaries(provider, h) {
@@ -309,11 +330,12 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
     if (c.versions.get(`family_version:${family}`) !== FAMILY_VERSIONS[family]
       || c.versions.get(`projection_version:${unit.kind}_pools`) !== PROJECTION_VERSIONS[`${unit.kind}_pools`]) fail('recovery_pool_definition_mismatch');
     const projection = createProjectionSink({ onVerifiedDex: sink.dex });
-    const poolRows = v3 ? db.prepare("SELECT address FROM compact_registry WHERE kind='uniswap_v3_pool' AND created_block<? LIMIT 10001").all(h.first_block) : [];
-    if (poolRows.length > 10000) fail('recovery_pool_registry_limit');
     if (v3 && (!c.v3 || c.v3.through_block < h.first_block - 1)) fail('recovery_pool_registry_unavailable');
+    // The existing (kind,address) primary key bounds each lookup to one row. No registry-sized Set,
+    // cache or address-filter RPC is required; same-hour factory discoveries still use the accumulator overlay.
+    const membership = v3 ? db.prepare("SELECT 1 FROM compact_registry WHERE kind='uniswap_v3_pool' AND address=? AND created_block<?") : null;
     const accumulator = v3 ? createUniswapV3Accumulator({ registry: { through: h.first_block - 1, throughHash: h.parent_hash,
-      pools: new Set(poolRows.map(r => r.address)) }, projection }) : createUniswapV4Accumulator({ projection });
+      pools: { has: address => Boolean(membership.get(address, h.first_block)) } }, projection }) : createUniswapV4Accumulator({ projection });
     for (const stream of LOG_STREAMS.filter(s => (v3 ? ['v3Factory', 'v3Pools'] : ['v4']).includes(s.key))) {
       await scan(provider, h, stream, (logs, window) => {
         accumulator.add(stream.key, logs, window);
@@ -453,8 +475,9 @@ export async function recoverDiscoveryHour({ db, hourStart, provider, registry =
     } catch (error) {
       unit.reason = error.code ?? 'recovery_failed';
       try {checkStorage();} catch (storageError) {log(`DISCOVERY_STORAGE_BLOCKED reason=${storageError.code??storageError.message}`);throw storageError;}
-      retry(db, c, unit, { now, reason: unit.reason, phase: /conflict|corrupt|mismatch|limit/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
-      log(`DISCOVERY_UNIT_FAILED hour=${hourStart} kind=${unit.kind} reason=${unit.reason}`);
+      const diagnostics = providerDiagnostics(error);
+      retry(db, c, unit, { now, reason: unit.reason, diagnostics, phase: /conflict|corrupt|mismatch|limit/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
+      log(`DISCOVERY_UNIT_FAILED hour=${hourStart} kind=${unit.kind} source=${unit.entry?.id ?? 'none'} attempt=${unit.attempts + 1} reason=${unit.reason} diagnostics=${JSON.stringify(diagnostics)}`);
       // Subsequent requests after a provider/budget failure are forbidden. Already committed units survive.
       try { checkBudget(); } catch { break; }
     }

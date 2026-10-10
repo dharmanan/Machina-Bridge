@@ -10,17 +10,65 @@ export const ARC_SECONDARY_ENDPOINT = Object.freeze({ name: 'drpc', url: 'https:
 
 const DETAIL_LIMIT = 160;
 const detailOf = (value) => (typeof value === 'string' && value.trim() ? value.replace(/\s+/g, ' ').trim().slice(0, DETAIL_LIMIT) : null);
+const categoryOf = code => code === 'recovery_response_budget_exhausted' ? 'response_budget'
+  : code === 'recovery_time_budget_exhausted' ? 'time_budget'
+    : code === 'recovery_rpc_budget_exhausted' ? 'rpc_budget'
+      : ['rate_limited', 'invalid_response', 'transport'].includes(code) ? code : 'rpc_error';
+const CATEGORIES = new Set(['transport', 'http', 'timeout', 'body_read', 'response_budget', 'time_budget', 'rpc_budget',
+  'rate_limited', 'invalid_response', 'rpc_error']);
+const PHASES = new Set(['fetch', 'body_read', 'http', 'decode', 'rpc', 'budget']);
+const CAUSES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET']);
+
+// Recovery logs and durable retry metadata use ONLY these allowlisted fields. Never include raw detail,
+// error messages, URLs, headers, RPC parameters or response bodies (even if the provider echoes credentials).
+export function providerDiagnostics(error) {
+  if (!(error instanceof ProviderError)) return null;
+  const integer = n => Number.isSafeInteger(n) && n >= 0 ? n : null;
+  const range = error.blockRange;
+  return { category: CATEGORIES.has(error.category) ? error.category : categoryOf(error.code),
+    phase: PHASES.has(error.phase) ? error.phase : null,
+    endpoint: /^[a-z][a-z0-9_-]{0,31}$/.test(error.endpoint ?? '') ? error.endpoint : null,
+    httpStatus: Number.isInteger(error.httpStatus) && error.httpStatus >= 100 && error.httpStatus <= 599 ? error.httpStatus : null,
+    rpcCode: Number.isSafeInteger(error.rpcCode) ? error.rpcCode : null,
+    causeCode: CAUSES.has(error.causeCode) ? error.causeCode : null,
+    methods: Array.isArray(error.methods) ? [...new Set(error.methods.filter(m => /^eth_[A-Za-z0-9]{1,40}$/.test(m)))].slice(0, 50) : [],
+    batchSize: integer(error.batchSize), requestNumber: integer(error.requestNumber), durationMs: integer(error.durationMs),
+    timeoutMs: integer(error.timeoutMs),
+    blockRange: range && integer(range.first) !== null && integer(range.last) !== null && range.first <= range.last
+      ? { first: range.first, last: range.last } : null,
+    recoveryUsage: error.recoveryUsage ? { requests: integer(error.recoveryUsage.requests),
+      calls: integer(error.recoveryUsage.calls), bytes: integer(error.recoveryUsage.bytes) } : null };
+}
+
+function requestContext(payload) {
+  const items = [].concat(payload), blocks = [];
+  const add = tag => { if (typeof tag === 'string' && /^0x[0-9a-f]+$/i.test(tag)) {
+    const n = Number(BigInt(tag)); if (Number.isSafeInteger(n) && n >= 0) blocks.push(n);
+  } };
+  for (const item of items) {
+    if (item.method === 'eth_getLogs') { add(item.params?.[0]?.fromBlock); add(item.params?.[0]?.toBlock); }
+    else if (item.method === 'eth_getBlockByNumber') add(item.params?.[0]);
+    else if (['eth_getCode', 'eth_call', 'eth_getBalance'].includes(item.method)) add(item.params?.[1]);
+  }
+  return { methods: [...new Set(items.map(i => i.method))], batchSize: items.length,
+    blockRange: blocks.length ? { first: Math.min(...blocks), last: Math.max(...blocks) } : null };
+}
 
 // code: rate_limited | range_too_large | too_many_results | rpc_error | invalid_response | transport | chain_mismatch
 // httpStatus and detail (a short response excerpt, RPC message or transport cause) are diagnostics only.
 export class ProviderError extends Error {
-  constructor(code, { rpcCode = null, endpoint = null, httpStatus = null, detail = null } = {}) {
+  constructor(code, { rpcCode = null, endpoint = null, httpStatus = null, detail = null, category = categoryOf(code),
+    phase = null, causeCode = null } = {}) {
     super(code);
     this.code = code;
     this.rpcCode = rpcCode;
     this.endpoint = endpoint;
     this.httpStatus = httpStatus;
     this.detail = detailOf(detail);
+    this.category = category;
+    this.phase = phase;
+    this.causeCode = causeCode;
   }
 }
 const RETRYABLE = new Set(['rate_limited', 'transport', 'invalid_response']);
@@ -61,29 +109,46 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
     for (const { method } of [].concat(payload)) stats.calls[method] = (stats.calls[method] ?? 0) + 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response, text;
+    const started = now(), context = { ...requestContext(payload), requestNumber: stats.requests, timeoutMs };
+    const decorate = error => Object.assign(error, context, { durationMs: Math.max(0, Math.floor(now() - started)) });
+    let response, text, phase = 'fetch';
     try {
       response = await fetchImpl(endpoint.url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(payload), signal: controller.signal });
-      text = await response.text();
+      phase = 'body_read'; text = await response.text();
     } catch (error) {
-      throw fail('transport', { httpStatus: response?.status ?? null, detail: controller.signal.aborted ? `timeout after ${timeoutMs} ms`
-        : [error?.name, error?.message, error?.cause?.code ?? error?.cause?.message].filter(Boolean).join(': ') });
+      // In particular, the bounded recovery reader can throw a response-budget ProviderError.
+      // Preserve its original code instead of relabelling it as an RPC/network transport failure.
+      if (error instanceof ProviderError) { error.endpoint ??= name; error.httpStatus ??= response?.status ?? null; throw decorate(error); }
+      throw decorate(fail('transport', { httpStatus: response?.status ?? null,
+        category: controller.signal.aborted ? 'timeout' : phase === 'body_read' ? 'body_read' : 'transport', phase,
+        causeCode: error?.cause?.code ?? error?.code ?? null,
+        detail: controller.signal.aborted ? `timeout after ${timeoutMs} ms`
+          : [error?.name, error?.message, error?.cause?.code ?? error?.cause?.message].filter(Boolean).join(': ') }));
     } finally { clearTimeout(timer); }
     stats.responseBytes += text.length;
     if (response.status === 429) {
       nextStart = Math.max(nextStart, now() + cooldownMs);
-      throw fail('rate_limited', { httpStatus: 429, detail: text });
+      throw decorate(fail('rate_limited', { httpStatus: 429, detail: text, phase: 'http' }));
     }
-    if (!response.ok) throw fail('transport', { httpStatus: response.status ?? null, detail: text });
-    try { return JSON.parse(text); } catch { throw fail('invalid_response', { httpStatus: response.status ?? null, detail: text }); }
+    if (!response.ok) throw decorate(fail('transport', { httpStatus: response.status ?? null, detail: text, category: 'http', phase: 'http' }));
+    try { return JSON.parse(text); } catch { throw decorate(fail('invalid_response', { httpStatus: response.status ?? null, detail: text, phase: 'decode' })); }
   }
 
   const rpcFailure = (error) => {
     const code = classifyRpcError(error);
     if (code === 'rate_limited') nextStart = Math.max(nextStart, now() + cooldownMs);
-    return fail(code, { rpcCode: error.code ?? null, detail: String(error.message ?? '') });
+    return fail(code, { rpcCode: error.code ?? null, detail: String(error.message ?? ''), phase: 'rpc' });
   };
+  async function answer(payload, parse) {
+    const started = now();
+    try { return parse(await post(payload)); }
+    catch (error) {
+      if (error instanceof ProviderError && !error.methods) Object.assign(error, requestContext(payload),
+        { requestNumber: stats.requests, durationMs: Math.max(0, Math.floor(now() - started)), timeoutMs });
+      throw error;
+    }
+  }
 
   function single(body) {
     if (!validEnvelope(body) || body.id !== 1) throw fail('invalid_response');
@@ -109,7 +174,7 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
 
   async function ensureChain() {
     if (chainVerified) return;
-    const result = single(await post({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }));
+    const result = await answer({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }, single);
     if (typeof result !== 'string' || Number.parseInt(result, 16) !== chainId) throw fail('chain_mismatch', { detail: String(result) });
     chainVerified = true;
   }
@@ -133,12 +198,13 @@ export function createProvider({ endpoint = ARC_PRIMARY_ENDPOINT, fetchImpl = gl
     endpoint: Object.freeze({ name, url: endpoint.url }),
     stats,
     request(method, params = []) {
-      return run(async () => single(await post({ jsonrpc: '2.0', id: 1, method, params })));
+      const payload = { jsonrpc: '2.0', id: 1, method, params };
+      return run(() => answer(payload, single));
     },
     batch(calls, { allowItemErrors = false, retryRateLimited = true } = {}) {
       if (!Array.isArray(calls) || !calls.length || calls.length > 50) throw new Error('invalid_batch');
       const payload = calls.map(([method, params], index) => ({ jsonrpc: '2.0', id: index + 1, method, params }));
-      return run(async () => batch(await post(payload), calls.length, allowItemErrors), { retryRateLimited });
+      return run(() => answer(payload, body => batch(body, calls.length, allowItemErrors)), { retryRateLimited });
     },
   });
 }

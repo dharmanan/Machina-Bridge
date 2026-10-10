@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { assertHourIso } from '../server/compact/scheduler.js';
 import { acquireWriterLock } from '../server/compact/writer-lock.js';
-import { createProvider, ProviderError } from '../server/compact/provider.js';
+import { createProvider, ProviderError, providerDiagnostics } from '../server/compact/provider.js';
 import { planDiscoveryRecovery, recoveryHourPlan, recoverDiscoveryHour, assertRecoverySchema, RECOVERY_TIMEOUT_MS } from '../server/compact/discovery-recovery.js';
 import { archiveConfig, storagePreflight } from '../server/compact/evidence-archive.js';
 
@@ -28,7 +28,7 @@ export function boundedRecoveryProvider({ fetchImpl = globalThis.fetch, now = Da
   const started = now(), controller = new AbortController();
   const stats = { requests: 0, calls: 0, bytes: 0 };
   let failure = null;
-  const error = code => new ProviderError(code);
+  const error = code => new ProviderError(code, { phase: 'budget' });
   const exhausted = code => { failure ??= error(code); throw failure; };
   const check = () => {
     if (failure) throw failure;
@@ -42,7 +42,9 @@ export function boundedRecoveryProvider({ fetchImpl = globalThis.fetch, now = Da
       const count = [].concat(JSON.parse(options.body)).length;
       if (stats.requests >= budget.requests || stats.calls + count > budget.calls) exhausted('recovery_rpc_budget_exhausted');
       stats.requests++; stats.calls += count;
-      const response = await fetchImpl(url, { ...options, signal: AbortSignal.any([options.signal, controller.signal]) });
+      let response;
+      try { response = await fetchImpl(url, { ...options, signal: AbortSignal.any([options.signal, controller.signal]) }); }
+      catch (err) { if (controller.signal.aborted) exhausted('recovery_time_budget_exhausted'); throw err; }
       return { ok: response.ok, status: response.status, async text() {
         const chunks = []; let size = 0;
         const reader = response.body.getReader();
@@ -52,11 +54,16 @@ export function boundedRecoveryProvider({ fetchImpl = globalThis.fetch, now = Da
             if (done) break;
             size += value.byteLength; stats.bytes += value.byteLength;
             if (size > budget.responseBytes || stats.bytes > budget.bytes) {
-              await reader.cancel(); exhausted('recovery_response_budget_exhausted');
+              // Latch the budget failure BEFORE cancellation; even a failing cancel must not hide it.
+              failure ??= error('recovery_response_budget_exhausted');
+              controller.abort();
+              try { void reader.cancel().catch(() => {}); } catch {} // Cleanup must not stall the failure/deadline.
+              throw failure;
             }
             chunks.push(Buffer.from(value));
           }
-        } finally { reader.releaseLock(); }
+        } catch (err) { if (controller.signal.aborted) exhausted('recovery_time_budget_exhausted'); throw err; }
+        finally { reader.releaseLock(); }
         check();
         return Buffer.concat(chunks).toString('utf8');
       } };
@@ -65,11 +72,14 @@ export function boundedRecoveryProvider({ fetchImpl = globalThis.fetch, now = Da
     check();
     try { return await fn(); } catch (err) {
       // Existing bounded log splitting needs another narrower request; every physical attempt still consumes budget.
-      if (!['range_too_large', 'too_many_results'].includes(err.code)) failure ??= err;
+      if (!['range_too_large', 'too_many_results'].includes(err.code)) {
+        failure ??= err; failure.recoveryUsage = { ...stats }; throw failure;
+      }
       throw err;
     }
   };
   return { stats, check, close: () => clearTimer(timer), provider: {
+    stats,
     request: (...args) => guarded(() => provider.request(...args)),
     batch: (...args) => guarded(() => provider.batch(...args))
   } };
@@ -107,7 +117,8 @@ export async function runDiscoveryRecovery(config, { Database = DatabaseSync, pr
     print(`DISCOVERY_RECOVERY_RESULT ${JSON.stringify({ ...result, provider: bounded.stats })}`);
     return result;
   } catch (error) {
-    const result = { phase: 'retryable', reason: error.code ?? error.message ?? 'recovery_failed' };
+    const result = { phase: 'retryable', reason: error.code ?? 'recovery_failed', diagnostics: providerDiagnostics(error),
+      ...(bounded ? { provider: bounded.stats } : {}) };
     print(`DISCOVERY_RECOVERY_RESULT ${JSON.stringify(result)}`);
     return result;
   } finally { bounded?.close(); db?.close(); lock?.release(); }

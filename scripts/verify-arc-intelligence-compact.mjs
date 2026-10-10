@@ -16,7 +16,7 @@ import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { HourIncompleteError, processBlockRange as processBlockRangeEngine, processHour as processHourEngine } from '../server/compact/hour.js';
 import { createRecordedFetch, createSyntheticChain, SYNTHETIC_CONTRACTS, SYNTHETIC_PROTOCOL } from '../server/compact/offline.js';
 import { PROTOCOL_FAMILIES } from '../server/compact/protocols/index.js';
-import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError } from '../server/compact/provider.js';
+import { ARC_PRIMARY_ENDPOINT, createProvider, ProviderError, providerDiagnostics } from '../server/compact/provider.js';
 import { DISCOVERY_READS_PER_RUN } from '../server/compact/intelligence.js';
 import { intelligenceRegistry } from '../server/compact/intelligence-registry.js';
 import { bootstrapV3Registry, catchUpV3Registry, registrySnapshot } from '../server/compact/registry.js';
@@ -1180,6 +1180,38 @@ await test('provider: wrong chain fails closed; a dead primary yields no result 
   assert.equal((await offlineProvider(chain.fetchImpl).request('eth_chainId')), hex(5042));
 });
 
+await test('provider: safe diagnostics distinguish HTTP, transport, body-read, timeout and RPC errors', async () => {
+  const response = result => ({status:200,ok:true,text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,result})});
+  const cases = [
+    ['http', async()=>({status:503,ok:false,text:async()=>'<html>SECRET token=credential</html>'})],
+    ['transport', async()=>{throw new TypeError('SECRET https://user:password@host',{cause:{code:'ECONNRESET'}});}],
+    ['body_read', async()=>({status:200,ok:true,text:async()=>{throw new Error('SECRET body');}})],
+    ['timeout', async(_url,{signal})=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('SECRET aborted')),{once:true}))],
+    ['rpc_error', async()=>({status:200,ok:true,text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'SECRET provider echo'}})})],
+    ['invalid_response', async()=>({status:200,ok:true,text:async()=>'SECRET invalid JSON'})],
+  ];
+  for(const [category,fault] of cases){
+    const provider=offlineProvider(async(url,options)=>JSON.parse(options.body).method==='eth_chainId'?response('0x13b2'):fault(url,options),{maxAttempts:1,timeoutMs:5});
+    let failure;try{await provider.request('eth_getCode',['SECRET address','0x2a']);}catch(e){failure=e;}
+    assert(failure instanceof ProviderError);const diagnostic=providerDiagnostics(failure);
+    assert.equal(diagnostic.category,category);assert.deepEqual(diagnostic.methods,['eth_getCode']);
+    assert.deepEqual(diagnostic.blockRange,{first:42,last:42});assert.equal(diagnostic.requestNumber,2);
+    assert.equal(diagnostic.timeoutMs,5);assert(Number.isSafeInteger(diagnostic.durationMs));
+    assert(!JSON.stringify(diagnostic).includes('SECRET'));assert(!JSON.stringify(diagnostic).includes('password'));
+    if(category==='http')assert.equal(diagnostic.httpStatus,503);
+    if(category==='rpc_error')assert.equal(diagnostic.rpcCode,-32000);
+    if(category==='transport')assert.equal(diagnostic.causeCode,'ECONNRESET');
+  }
+});
+await test('provider: typed recovery budget errors keep their original identity and are never retried', async () => {
+  for(const phase of ['fetch','body_read']){
+    const original=new ProviderError('recovery_response_budget_exhausted',{phase:'budget'});let calls=0;
+    const provider=offlineProvider(async()=>{calls++;if(phase==='fetch')throw original;return{status:200,ok:true,text:async()=>{throw original;}};});
+    await assert.rejects(provider.request('eth_getCode',[]),e=>e===original);
+    assert.equal(calls,1);assert.equal(provider.stats.retries,0);
+    assert.equal(providerDiagnostics(original).category,'response_budget');assert.equal(providerDiagnostics(original).phase,'budget');
+  }
+});
 console.log('COMPACT_REAL_MICRO_WINDOW', JSON.stringify({ range: microResult.range, network: microResult.network, families: microResult.families,
   requests: microProvider.stats.requests, responseBytes: microProvider.stats.responseBytes, sha256: digest(microResult) }));
 console.log('COMPACT_SYNTHETIC_HOUR', JSON.stringify({ range: cleanResult.range, network: cleanResult.network, usdc: cleanResult.families.usdc,

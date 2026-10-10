@@ -7,8 +7,10 @@ import { join } from 'node:path';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
 import { createCompactStore } from '../server/compact/store.js';
-import { createProvider, ProviderError } from '../server/compact/provider.js';
-import { createSyntheticChain } from '../server/compact/offline.js';
+import { createProvider, ProviderError, providerDiagnostics } from '../server/compact/provider.js';
+import { createSyntheticChain, SYNTHETIC_CONTRACTS } from '../server/compact/offline.js';
+import { normalizeLog } from '../api/_lib/arc-intelligence/normalize.js';
+import { poolRecordOf } from '../server/compact/registry.js';
 import { processBlockRange } from '../server/compact/hour.js';
 import { verifyTokenCandidate, intelligenceJson } from '../server/compact/intelligence.js';
 import { createHash } from 'node:crypto';
@@ -16,7 +18,7 @@ import { selectorOf } from '../server/compact/abi.js';
 import { headerOf } from '../server/compact/spine.js';
 import { LOG_STREAMS } from '../server/compact/sources.js';
 import { intelligenceRegistry, INTELLIGENCE_REGISTRY, registryDigest } from '../server/compact/intelligence-registry.js';
-import { planDiscoveryRecovery, recoverDiscoveryHour, recoveryHourPlan, MAX_RECOVERY_ATTEMPTS, RECOVERY_RETRY_MS, DISCOVERY_PUBLIC_START } from '../server/compact/discovery-recovery.js';
+import { planDiscoveryRecovery, recoverDiscoveryHour, recoveryHourPlan, MAX_RECOVERY_ATTEMPTS, RECOVERY_RETRY_MS, DISCOVERY_PUBLIC_START, V3_RETRY_POLICY } from '../server/compact/discovery-recovery.js';
 import { recoveryConfig, runDiscoveryRecovery, boundedRecoveryProvider, RECOVERY_BUDGET } from './recover-compact-discovery.mjs';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
@@ -41,13 +43,15 @@ async function test(name, fn) {
   await fn(); passed++; console.log(`PASS ${name}`);
 }
 async function fixture({ initialRegistry = noLaunch, missing = false, path = ':memory:', count = 1, blocksPerHour = 10,
+  poolCreatedAt = ORIGIN, txPerBlock = 2,
   streams = LOG_STREAMS.filter(s => ['v3Factory', 'v3Pools', 'v4'].includes(s.key)) } = {}) {
   const db = new DatabaseSync(path), store = createCompactStore(db);
   const chain = createSyntheticChain({ originNumber: ORIGIN, originTimestamp: BASE, blockSpacing: 36_000_000 / blocksPerHour,
-    poolCreatedAt: ORIGIN, factoryDeployedAt: ORIGIN - 1, protocols: false, txPerBlock: 2, v4PerBlock: 1, usdcPerBlock: 1 });
+    poolCreatedAt, factoryDeployedAt: Math.min(ORIGIN - 1, poolCreatedAt), protocols: false, txPerBlock, v4PerBlock: 1, usdcPerBlock: 1 });
   const provider = createProvider({ fetchImpl: chain.fetchImpl, sleep: async () => {}, minIntervalMs: 0, maxAttempts: 1 });
   // An empty verified factory registry covers all earlier blocks; the hour discovers its own PoolCreated.
-  store.extendRegistry({ kind: 'uniswap_v3_pool', fromBlock: 0, through: ORIGIN - 1, throughHash: chain.blockHash(ORIGIN - 1), previousThrough: null, created: [] });
+  store.extendRegistry({ kind: 'uniswap_v3_pool', fromBlock: 0, through: ORIGIN - 1, throughHash: chain.blockHash(ORIGIN - 1), previousThrough: null,
+    created: poolCreatedAt < ORIGIN ? chain.logsOf(poolCreatedAt).map(normalizeLog).map(poolRecordOf).filter(Boolean) : [] });
   const results = [];
   for (let i = 0; i < count; i++) {
     const first = ORIGIN + i * blocksPerHour, last = first + blocksPerHour - 1;
@@ -65,6 +69,18 @@ function immutable(db) {
   return Object.fromEntries(tables.filter(t => !allowed.has(t)).map(t => [t, db.prepare(`SELECT * FROM ${t} ORDER BY 1,2`).all()])
     .concat([['meta', db.prepare("SELECT * FROM compact_meta WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%' ORDER BY key").all()]]));
 }
+function immutableDigest(db) {
+  // Stream large registry fixtures rather than allocating copies of 100,000 rows under the 64 MiB test heap.
+  const excluded = new Set(['compact_intelligence_hours','compact_token_discoveries','compact_token_dex_observations']);
+  const digest = createHash('sha256');
+  for (const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'compact_%' ORDER BY name").all()) {
+    if (excluded.has(name)) continue;
+    digest.update(name);
+    const where=name==='compact_meta'?" WHERE key NOT LIKE 'discovery_unit:%' AND key NOT LIKE 'discovery_retry:%' AND key NOT LIKE 'discovery_registry:%' AND key NOT LIKE 'discovery_unit_warning:%'":'';
+    for (const row of db.prepare(`SELECT * FROM ${name}${where} ORDER BY 1,2`).iterate()) digest.update(intelligenceJson(row)+'\n');
+  }
+  return digest.digest('hex');
+}
 function allState(db) {
   return Object.fromEntries(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'compact_%'").all()
     .map(r => [r.name, db.prepare(`SELECT * FROM ${r.name} ORDER BY 1,2`).all()]));
@@ -74,9 +90,10 @@ const payload = (unit, status = 'available', reason = null) => ({ status, reason
     source: unit.entry.source, verificationBasis: unit.entry.verificationBasis, address: unit.entry.address, status, reason, counts: {}, rawFlows: {} } } : {}) } });
 const fakeRecover = async ({ unit }) => payload(unit);
 
-if (process.env.RECOVERY_CRASH_CHILD) {
-  const db = new DatabaseSync(process.env.RECOVERY_CRASH_CHILD);
-  acquireWriterLock(process.env.RECOVERY_CRASH_CHILD, { owner: 'disposable-crash-test' });
+if (process.env.RECOVERY_CRASH_CHILD || process.env.RECOVERY_POLICY_CRASH_CHILD) {
+  const path = process.env.RECOVERY_CRASH_CHILD ?? process.env.RECOVERY_POLICY_CRASH_CHILD;
+  const db = new DatabaseSync(path);
+  acquireWriterLock(path, { owner: 'disposable-crash-test' });
   await recoverDiscoveryHour({ db, hourStart: BASE, registry: noLaunch, recoverUnit: async args => {
     if (args.unit.kind === 'uniswap_v3') { process.send('unit-one-durable-unit-two-leased'); await new Promise(() => {}); }
     return fakeRecover(args);
@@ -628,5 +645,180 @@ await test('independently complete V4 live evidence is retained when V3 fails; r
   assert.deepEqual(immutable(f.db), before);
   assert(requests.filter(([m]) => m === 'eth_getLogs').every(([, p]) => !p[0].topics[0].includes(LOG_STREAMS.find(s => s.key === 'v4').topics[0])));
   assert.equal(f.db.prepare("SELECT status FROM compact_family_hours WHERE family='uniswapV3'").get().status, 'unavailable'); f.db.close();
+});
+for (const count of [10000, 10001, 100000]) await test(`SQLite membership recovers with ${count} pools and immutable canonical/archive evidence`, async () => {
+  const f = await fixture({ missing: true, poolCreatedAt: ORIGIN - 2, blocksPerHour: 350, txPerBlock:6 });
+  // Generate one row at a time: the test itself must not allocate a registry-sized JS array/Set.
+  const insert = f.db.prepare('INSERT INTO compact_registry VALUES(?,?,?,?,?,?)');
+  f.db.exec('BEGIN');
+  for (let n = 1; n < count; n++) insert.run('uniswap_v3_pool', addr(n + 1000), ORIGIN - 1, n,
+    f.chain.blockHash(ORIGIN - 1), '{}');
+  // A V3-signature foreign emitter appearing only in a future registry row must remain foreign.
+  insert.run('uniswap_v3_pool', SYNTHETIC_CONTRACTS.foreignV3Emitter, ORIGIN + 1000, 0, f.chain.blockHash(ORIGIN + 1000), '{}');
+  f.db.exec('COMMIT');
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM compact_registry WHERE kind='uniswap_v3_pool' AND created_block<?").get(ORIGIN).n, count);
+  const query = "SELECT 1 FROM compact_registry WHERE kind='uniswap_v3_pool' AND address=? AND created_block<?";
+  assert(f.db.prepare('EXPLAIN QUERY PLAN '+query).all(SYNTHETIC_CONTRACTS.validV3Pool, ORIGIN).some(r => /SEARCH.*PRIMARY KEY/.test(r.detail)));
+  // Verify against actual production SQL through a delegating DB: no full registry read is permitted.
+  let lookups = 0;
+  const delegated = { get isTransaction() { return f.db.isTransaction; }, exec: sql => f.db.exec(sql), prepare(sql) {
+    if (/SELECT address FROM compact_registry/.test(sql)) throw new Error('registry_bulk_read_forbidden');
+    const statement = f.db.prepare(sql);
+    return sql === query ? { get(...args) { lookups++; return statement.get(...args); } } : statement;
+  } };
+  const before = immutableDigest(f.db), start = performance.now();
+  const result = await recoverDiscoveryHour({ db: delegated, hourStart: BASE, registry: noLaunch, provider: f.provider });
+  assert.equal(result.phase, 'recovered'); assert(lookups > 0);
+  assert.equal(immutableDigest(f.db), before); // Includes every archive table, canonical row, family and checkpoint.
+  assert(f.results[0].families.uniswapV3.swapCount > 0); assert(f.results[0].families.uniswapV3.foreignEventCount > 0);
+  console.log(`MEMBERSHIP_MEASUREMENT pools=${count} lookups=${lookups} recoveryMs=${(performance.now()-start).toFixed(1)} heapUsedMiB=${(process.memoryUsage().heapUsed/1024**2).toFixed(1)}`);
+  f.db.close();
+});
+await test('same-hour V3 factory overlay still verifies pools absent from pre-hour registry', async () => {
+  const f = await fixture({ missing: true }); const before = immutable(f.db);
+  assert.equal(f.db.prepare("SELECT 1 FROM compact_registry WHERE address=? AND created_block<?").get(SYNTHETIC_CONTRACTS.validV3Pool, ORIGIN), undefined);
+  assert.equal((await recoverDiscoveryHour({ db:f.db, hourStart:BASE, registry:noLaunch, provider:f.provider })).phase, 'recovered');
+  assert.deepEqual(immutable(f.db), before); assert.equal(f.results[0].families.uniswapV3.poolCreatedCount, 1); f.db.close();
+});
+await test('versioned retry supersedes only obsolete V3 pool cap and preserves legacy records and successful units', async () => {
+  const f = await fixture({ missing:true });
+  await recoverDiscoveryHour({ db:f.db, hourStart:BASE, registry:noLaunch, now:1000, recoverUnit:async args => {
+    if(args.unit.kind==='uniswap_v3') throw Object.assign(new Error('fixture cap'),{code:'recovery_pool_registry_limit'}); return fakeRecover(args);
+  } });
+  const p = recoveryHourPlan(f.db,BASE,{registry:noLaunch,now:1001}), v3=p.units.find(u=>u.kind==='uniswap_v3');
+  assert.equal(v3.phase,'pending'); assert.equal(v3.retryPolicy,V3_RETRY_POLICY); assert.equal(v3.attempts,1);
+  const key=`discovery_retry:${BASE}:${v3.id}`, legacy=f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value;
+  const before=immutable(f.db), calls=[];
+  await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:1001,recoverUnit:async args=>{calls.push(args.unit.kind);return fakeRecover(args);}});
+  assert.deepEqual(calls,['uniswap_v3']); assert.deepEqual(immutable(f.db),before);
+  assert.equal(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value,legacy);
+  const revised=JSON.parse(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(`${key}:${V3_RETRY_POLICY}`).value);
+  assert.equal(revised.retryPolicy,V3_RETRY_POLICY); assert.equal(revised.attempts,2);
+  assert.equal((await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,recoverUnit:()=>{throw new Error('repeat');}})).rpcNeeded,false); f.db.close();
+});
+await test('retry policy leaves other blocked reasons, exhausted quotas and non-V3 caps untouched', async () => {
+  for(const [kind,reason,exhausted] of [['uniswap_v3','recovery_pool_definition_mismatch',false],['creations','recovery_pool_registry_limit',false],['uniswap_v4','recovery_pool_registry_limit',false],['uniswap_v3','recovery_pool_registry_limit',true]]) {
+    const f=await fixture({missing:true});
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:1000,recoverUnit:async args=>{
+      if(args.unit.kind===kind)throw Object.assign(new Error('fixture'),{code:reason});return fakeRecover(args);
+    }});
+    if(exhausted){const u=recoveryHourPlan(f.db,BASE,{registry:noLaunch}).units.find(u=>u.kind===kind),key=`discovery_retry:${BASE}:${u.id}`;
+      const record=JSON.parse(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value);record.attempts=MAX_RECOVERY_ATTEMPTS;
+      f.db.prepare('UPDATE compact_meta SET value=? WHERE key=?').run(JSON.stringify(record),key);}
+    const before=allState(f.db),plan=recoveryHourPlan(f.db,BASE,{registry:noLaunch,now:100*RECOVERY_RETRY_MS});
+    assert.equal(plan.units.find(u=>u.kind===kind).phase,'blocked');
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:100*RECOVERY_RETRY_MS,recoverUnit:()=>{throw new Error('unexpected RPC');}});
+    assert.deepEqual(allState(f.db),before);f.db.close();
+  }
+});
+await test('retry policy survives interruption, honors cooldown and never resets attempts after revised failures', async () => {
+  const f=await fixture({missing:true});
+  await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:1000,recoverUnit:async args=>{
+    if(args.unit.kind==='uniswap_v3')throw Object.assign(new Error('cap'),{code:'recovery_pool_registry_limit'});return fakeRecover(args);
+  }});
+  const v3=recoveryHourPlan(f.db,BASE,{registry:noLaunch}).units.find(u=>u.kind==='uniswap_v3'), key=`discovery_retry:${BASE}:${v3.id}`;
+  const legacy=f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value;
+  for(let attempt=2;attempt<=MAX_RECOVERY_ATTEMPTS;attempt++){
+    const now=1001+(attempt-2)*(RECOVERY_RETRY_MS+1);
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now,recoverUnit:()=>{throw new ProviderError('transport');}});
+    const plan=recoveryHourPlan(f.db,BASE,{registry:noLaunch,now:now+1});
+    assert.equal(plan.units.find(u=>u.kind==='uniswap_v3').attempts,attempt);
+    assert.equal(plan.units.find(u=>u.kind==='uniswap_v3').phase,attempt===MAX_RECOVERY_ATTEMPTS?'blocked':'retryable');
+  }
+  assert.equal(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value,legacy);
+  const before=allState(f.db);await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:100*RECOVERY_RETRY_MS,recoverUnit:()=>{throw new Error('quota reset');}});
+  assert.deepEqual(allState(f.db),before);f.db.close();
+});
+await test('versioned V3 lease survives process death and restart without erasing old failure or successful units', async () => {
+  const dir=mkdtempSync(join(tmpdir(),'discovery-policy-crash-')),path=join(dir,'db.sqlite');let child;
+  try {
+    const f=await fixture({missing:true,path});
+    await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,recoverUnit:async args=>{
+      if(args.unit.kind==='uniswap_v3')throw Object.assign(new Error('cap'),{code:'recovery_pool_registry_limit'});return fakeRecover(args);
+    }});
+    const unit=recoveryHourPlan(f.db,BASE,{registry:noLaunch}).units.find(u=>u.kind==='uniswap_v3'),key=`discovery_retry:${BASE}:${unit.id}`;
+    const legacy=f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value,before=immutableDigest(f.db);f.db.close();
+    child=fork(new URL(import.meta.url),[],{env:{...process.env,RECOVERY_POLICY_CRASH_CHILD:path},execArgv:['--max-old-space-size=64','--max-semi-space-size=2'],stdio:['ignore','ignore','ignore','ipc']});
+    await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(new Error('policy_crash_test_timeout')),5000);
+      child.once('message',()=>{clearTimeout(timer);resolve();});child.once('exit',()=>{clearTimeout(timer);reject(new Error('policy_child_early_exit'));});
+    });
+    const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+    const db=new DatabaseSync(path),lock=acquireWriterLock(path,{owner:'disposable-policy-restart'});
+    try {
+      assert.equal(immutableDigest(db),before);assert.equal(db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value,legacy);
+      const revised=JSON.parse(db.prepare('SELECT value FROM compact_meta WHERE key=?').get(`${key}:${V3_RETRY_POLICY}`).value);
+      assert.equal(revised.reason,'recovery_interrupted_or_in_progress');assert.equal(revised.attempts,2);
+      assert.equal(recoveryHourPlan(db,BASE,{registry:noLaunch}).units.find(u=>u.kind==='uniswap_v3').phase,'retryable');
+      const calls=[];
+      await recoverDiscoveryHour({db,hourStart:BASE,registry:noLaunch,now:revised.notBefore+1,recoverUnit:async args=>{calls.push(args.unit.kind);return fakeRecover(args);}});
+      assert.deepEqual(calls,['uniswap_v3']);assert.equal(immutableDigest(db),before);
+      assert.equal(db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value,legacy);
+    } finally {lock.release();db.close();}
+  } finally {child?.kill('SIGKILL');rmSync(dir,{recursive:true,force:true});}
+});
+await test('response budget remains original error even if body cancellation fails; zero RPC after failure', async () => {
+  for (const cancellation of ['fails','stalls']) {
+  const bounded=boundedRecoveryProvider({sleep:async()=>{},budget:{...RECOVERY_BUDGET,responseBytes:5},fetchImpl:async()=>new Response(new ReadableStream({
+    start(c){c.enqueue(new Uint8Array(6));},cancel(){if(cancellation==='fails')throw new Error('SECRET cancellation');return new Promise(()=>{});}
+  }))});
+  await assert.rejects(bounded.provider.request('eth_getCode',[]),e=>e.code==='recovery_response_budget_exhausted'&&providerDiagnostics(e).category==='response_budget');
+  const requests=bounded.stats.requests;
+  await assert.rejects(bounded.provider.request('eth_getCode',[]),e=>e.code==='recovery_response_budget_exhausted');
+  assert.equal(bounded.stats.requests,requests);bounded.close();
+  }
+});
+await test('bounded provider isolates HTTP, body-read and cumulative response budget failures with no extra requests', async () => {
+  for(const kind of ['http','body_read','response_budget']){
+    let requests=0;
+    const bounded=boundedRecoveryProvider({sleep:async()=>{},budget:{...RECOVERY_BUDGET,...(kind==='response_budget'?{bytes:80}:{})},fetchImpl:async(_url,options)=>{
+      requests++;const item=JSON.parse(options.body);
+      if(item.method==='eth_chainId')return new Response(JSON.stringify({jsonrpc:'2.0',id:item.id,result:'0x13b2'}));
+      if(kind==='http')return new Response('SECRET upstream',{status:503});
+      if(kind==='body_read')return new Response(new ReadableStream({start(c){c.error(new Error('SECRET reader'));}}));
+      return new Response('SECRET'+'x'.repeat(50));
+    }});
+    await assert.rejects(bounded.provider.request('eth_getLogs',[{fromBlock:'0x10',toBlock:'0x20',address:'SECRET'}]),e=>{
+      const d=providerDiagnostics(e);assert.equal(d.category,kind);assert.deepEqual(d.blockRange,{first:16,last:32});
+      assert.equal(d.recoveryUsage.requests,2);assert(!JSON.stringify(d).includes('SECRET'));
+      return e.code===(kind==='response_budget'?'recovery_response_budget_exhausted':'transport');
+    });
+    await assert.rejects(bounded.provider.batch([['eth_getCode',[]]]));assert.equal(requests,2);bounded.close();
+  }
+});
+await test('recovery deadline abort keeps time-budget identity and creates no subsequent request', async () => {
+  let requests=0;
+  const bounded=boundedRecoveryProvider({sleep:async()=>{},budget:{...RECOVERY_BUDGET,timeoutMs:10},fetchImpl:async(_url,{signal})=>{
+    requests++;return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('SECRET aborted')),{once:true}));
+  }});
+  await assert.rejects(bounded.provider.request('eth_getCode',[]),e=>e.code==='recovery_time_budget_exhausted'&&providerDiagnostics(e).category==='time_budget');
+  await assert.rejects(bounded.provider.request('eth_getCode',[]));assert.equal(requests,1);bounded.close();
+});
+await test('revised blocked failure cannot restart the V3 retry transition and corrupt supersession fails closed', async () => {
+  const f=await fixture({missing:true});
+  const cap=async args=>{if(args.unit.kind==='uniswap_v3')throw Object.assign(new Error('cap'),{code:'recovery_pool_registry_limit'});return fakeRecover(args);};
+  await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:1000,recoverUnit:cap});
+  await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:1001,recoverUnit:async()=>{throw Object.assign(new Error('bad evidence'),{code:'recovery_family_evidence_conflict'});}});
+  const p=recoveryHourPlan(f.db,BASE,{registry:noLaunch,now:100*RECOVERY_RETRY_MS}),unit=p.units.find(u=>u.kind==='uniswap_v3');
+  assert.equal(unit.phase,'blocked');assert.equal(unit.reason,'recovery_family_evidence_conflict');assert.equal(unit.attempts,2);
+  const before=allState(f.db);await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,now:100*RECOVERY_RETRY_MS,recoverUnit:()=>{throw new Error('reset');}});
+  assert.deepEqual(allState(f.db),before);
+  const key=`discovery_retry:${BASE}:${unit.id}:${V3_RETRY_POLICY}`,revised=JSON.parse(f.db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value);
+  revised.supersedes='0'.repeat(64);f.db.prepare('UPDATE compact_meta SET value=? WHERE key=?').run(JSON.stringify(revised),key);
+  assert.equal(recoveryHourPlan(f.db,BASE,{registry:noLaunch}).reason,'recovery_retry_policy_conflict');f.db.close();
+});
+await test('transport diagnostics survive durable retries without secrets or additional failed-run RPC', async () => {
+  const f=await fixture({missing:true}), before=immutable(f.db),logs=[];let requests=0;
+  const bounded=boundedRecoveryProvider({sleep:async()=>{},fetchImpl:async()=>{requests++;throw new TypeError('SECRET https://user:password@host',{cause:{code:'ECONNRESET'}});}});
+  const outcome=await recoverDiscoveryHour({db:f.db,hourStart:BASE,registry:noLaunch,provider:bounded.provider,checkBudget:bounded.check,log:s=>logs.push(s)});
+  assert.equal(outcome.phase,'incomplete');assert.equal(requests,1);assert.deepEqual(immutable(f.db),before);
+  const retries=f.db.prepare("SELECT value FROM compact_meta WHERE key LIKE 'discovery_retry:%'").all();
+  assert.equal(retries.length,1);const record=JSON.parse(retries[0].value);
+  assert.equal(record.reason,'transport');assert.equal(record.diagnostics.category,'transport');assert.equal(record.diagnostics.causeCode,'ECONNRESET');
+  assert.equal(recoveryHourPlan(f.db,BASE,{registry:noLaunch}).units.find(u=>u.kind==='creations').phase,'retryable',
+    'An empty accepted-list checksum cannot certify creations after an explicitly failed scan');
+  assert.deepEqual(record.diagnostics.methods,['eth_chainId']);assert.equal(record.diagnostics.recoveryUsage.requests,1);
+  assert(!JSON.stringify([record,logs]).includes('SECRET'));assert(!JSON.stringify([record,logs]).includes('password'));
+  bounded.close();f.db.close();
 });
 console.log(`Discovery recovery checks: ${passed} passed (disposable SQLite, no external network)`);
