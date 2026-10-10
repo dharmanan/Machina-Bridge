@@ -164,6 +164,17 @@ const REASON_TEXT: Record<string, string> = {
   balance_unreadable: 'A token balance of this pool could not be read.',
   pool_not_initialized: 'This pool has no price yet.',
   identity_retention_exceeded: 'Unique addresses are counted within 24H only. Longer windows would count the same address more than once.',
+  verified_protocol_registry_empty: 'No additional protocol sources have been verified for this dashboard.',
+  verified_exchange_registry_empty: 'No exchange addresses have verified labels for this dashboard.',
+  discovery_hour_missing_or_capped: 'Discovery checks cover only part of the stored history; additional records may exist.',
+  bounded_response_limit: 'The returned list is capped to keep responses small.',
+  first_activity_history_missing: 'Earlier DEX history is incomplete, so lifetime first activity is unproven.',
+  activity_not_stored: 'No activity observation has been stored.',
+  pool_registry_history_incomplete_or_limit: 'Earlier pool history is incomplete or the pool list is capped.',
+  no_verified_pool: 'No pool with verified provenance is stored.',
+  deployment_not_proven: 'The token deployment has not been proven.',
+  registry_definition_not_current: 'The launch source has not been verified against the current registry.',
+  creation_hour_projection_missing: 'Activity for the pool creation hour is unavailable.',
 }
 const reasonText = (reason: string | null | undefined, fallback = 'Not verified for this window.') => (reason && REASON_TEXT[reason]) || fallback
 
@@ -274,7 +285,7 @@ function GroupHeader({ title, icon: Icon }: { title: string; icon?: typeof Activ
 function CardTitle({ title, subtitle, right }: { title: string; subtitle?: string; right?: ReactNode }) {
   return (
     <div>
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <h4 className="min-w-0 text-base font-semibold text-slate-950">{title}</h4>
         {right && <div className="shrink-0">{right}</div>}
       </div>
@@ -283,7 +294,7 @@ function CardTitle({ title, subtitle, right }: { title: string; subtitle?: strin
   )
 }
 
-const CARD = 'rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5'
+const CARD = 'min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5 [overflow-wrap:anywhere]'
 
 function Banner({ tone, children }: { tone: 'info' | 'warn'; children: ReactNode }) {
   const style = tone === 'warn' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-[#d5e9c7] bg-[#eef7e8] text-[#25580A]'
@@ -530,7 +541,7 @@ function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
     <div {...markerProps(item, cell.status, cell.raw)} className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
       <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</p>
       {cell.status === 'available'
-        ? <p className="mt-2 truncate text-2xl font-bold tracking-tight text-slate-950 tabular-nums sm:text-3xl" title={cell.title}>{cell.text}</p>
+        ? <p className="mt-2 break-words text-2xl font-bold tracking-tight text-slate-950 tabular-nums sm:text-3xl [overflow-wrap:anywhere]" title={cell.title}>{cell.text}</p>
         : <div className="mt-3"><StatusPill status={cell.status} /></div>}
       <p className="mt-2 text-xs leading-5 text-slate-500">{cell.status === 'available' ? caption : cell.note}</p>
       {cell.status === 'available' && delta !== null && delta !== undefined && (
@@ -899,8 +910,8 @@ function EmptyRows({ title, detail, status }: { title: string; detail: string; s
 
 function CardHeader({ title, subtitle, icon: Icon, right }: { title: string; subtitle?: string; icon?: typeof Coins; right?: ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-3">
-      <div className="flex min-w-0 items-start gap-2.5">
+    <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+      <div className="flex min-w-0 flex-1 basis-40 items-start gap-2.5">
         {Icon && (
           <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#eef7e8] text-[#2F6E0C]">
             <Icon className="h-3.5 w-3.5" />
@@ -1359,8 +1370,8 @@ function FamilyCoverage({ family }: { family: FamilyWindow | null }) {
   if (!coverage) return null
   return <div className="mt-2 text-[11px] leading-4 text-slate-500">
     <p>Partial history: {coverage.availableHours} / {coverage.expectedHours} verified hours. Values exclude {coverage.missingHours} missing hours.</p>
-    <details><summary className="cursor-pointer">Missing hours and reasons</summary>
-      <p>{family?.reasons?.join(', ')}</p><p>{family?.unavailableHours?.map(formatUtcDateTime).join('; ')}</p>
+    <details data-api-reasons={family?.reasons?.join(',')}><summary className="cursor-pointer">Missing hours and reasons</summary>
+      <p>{family?.reasons?.map(reason => reasonText(reason)).join(' ')}</p><p>{family?.unavailableHours?.map(formatUtcDateTime).join('; ')}</p>
     </details>
   </div>
 }
@@ -1377,11 +1388,11 @@ const tokenDexStatus = (row: DiscoveredToken) => row.dex.firstDexActivity?.first
 
 function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind: 'launches' | 'discoveredTokens' }) {
   const list = ecosystem[kind]
-  return <div className="mt-3 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
+  return <div data-api-reason={ecosystem.coverage.reason} className="mt-3 min-w-0 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
     <p className="font-semibold text-slate-800">Discovery coverage: {ecosystem.coverage.availableHours} / {ecosystem.coverage.requiredHours} hours.</p>
     <p>{list.rows.length} {kind === 'launches' ? 'launch' : 'discovered token'} records returned{list.truncated ? ' (list capped)' : ''}.
       {' '}{list.truncated ? 'Capped results are not the total number of launches or tokens.' : 'Incomplete discovery does not establish a chain-wide total.'}</p>
-    {ecosystem.coverage.status !== 'available' && <p>Incomplete discovery does not hide proven launches. {ecosystem.coverage.reason}</p>}
+    {ecosystem.coverage.status !== 'available' && <p>{reasonText(ecosystem.coverage.reason, 'Discovery checks are incomplete; additional records may exist.')}</p>}
   </div>
 }
 
@@ -1405,20 +1416,20 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
         {row.deployment.deployer && <p className="break-all">Deployer {row.deployment.deployer}</p>}
         <p>{launchType(row)}{row.launch.source && ` · ${row.launch.source}`}</p>
         {row.launch.observedAt && <p>Launch observed {formatUtcDateTime(row.launch.observedAt)}</p>}
-        {row.launch.reason && <p>{row.launch.reason}</p>}</div>
+        {row.launch.reason && <p data-api-reason={row.launch.reason}>{reasonText(row.launch.reason)}</p>}</div>
       <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')}>
         <p className="font-semibold text-slate-800">{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p>
         <p>{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p>
         {pool ? <><p className="break-all">{pool.protocol} · {pool.pool}</p><p>Block {formatCount(pool.creationBlock)}</p>
           <p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
-          : <p>{row.dex.reason ?? 'No verified pool record'}</p>}</div>
+          : <p data-api-reason={row.dex.reason}>{reasonText(row.dex.reason, 'No verified pool record is stored.')}</p>}</div>
       <div {...launchFieldProps('launches.dex-activity', activity ? 'available' : 'unavailable')}>
         <p className="font-semibold text-slate-800">{tokenDexStatus(row)}</p>
         {activity && <><p>{formatUtcDateTime(activity.timestamp)} · block {formatCount(activity.blockNumber)}</p>
           <p>{transaction(activity.txHash, 'Activity transaction unavailable')}</p></>}
-        {row.dex.firstDexActivity?.status !== 'available' && <p>Lifetime first unproven: {row.dex.firstDexActivity?.reason ?? row.dex.reason ?? 'Activity not observed'}</p>}
+        {row.dex.firstDexActivity?.status !== 'available' && <p data-api-reason={row.dex.firstDexActivity?.reason ?? row.dex.reason}>Lifetime first unproven: {reasonText(row.dex.firstDexActivity?.reason ?? row.dex.reason, 'No activity observation has been stored.')}</p>}
         {pool?.earlyActivity.status === 'available' && <p>{pool.earlyActivity.swapCount} swaps in pool creation UTC hour</p>}
-        <p>{row.dex.reason}</p></div>
+        {row.dex.reason && <p data-api-reason={row.dex.reason}>{reasonText(row.dex.reason)}</p>}</div>
     </div>
     {(row.dex.observedPools ?? []).map((observedPool) => <details key={observedPool.pool} className="rounded-lg border border-slate-200 px-3 py-2">
       <summary className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#2F6E0C]">{observedPool.protocol} pool evidence · {shortenHash(observedPool.pool)}</summary>
@@ -1430,9 +1441,9 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
           return <div key={key}><p className="font-medium">{key === 'firstSwap' ? 'Swap' : 'Liquidity'}: {evidence.firstObserved ? evidence.firstProven ? 'Proven first activity' : 'First observed activity' : 'Activity not observed'}</p>
             {evidence.firstObserved && <><p>{formatUtcDateTime(evidence.firstObserved.timestamp)} · block {formatCount(evidence.firstObserved.blockNumber)} · log {evidence.firstObserved.logIndex}</p>
               <p>{transaction(evidence.firstObserved.txHash, 'Unavailable')}</p></>}
-            {evidence.reason && <p>{evidence.reason}</p>}</div>
+            {evidence.reason && <p data-api-reason={evidence.reason}>{reasonText(evidence.reason)}</p>}</div>
         })}
-        <p>{observedPool.earlyActivity.status === 'available' ? `${observedPool.earlyActivity.swapCount} swaps in pool creation UTC hour` : observedPool.earlyActivity.reason}</p>
+        <p data-api-reason={observedPool.earlyActivity.reason ?? undefined}>{observedPool.earlyActivity.status === 'available' ? `${observedPool.earlyActivity.swapCount} swaps in pool creation UTC hour` : reasonText(observedPool.earlyActivity.reason)}</p>
         {observedPool.earlyActivity.hourStart && <p>Creation UTC hour: {formatUtcDateTime(observedPool.earlyActivity.hourStart)}</p>}
       </div>
     </details>)}
@@ -1458,7 +1469,7 @@ export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'lau
     {ctx.ecosystem && <TokenListCoverage ecosystem={ctx.ecosystem} kind={kind} />}
     <p className="mt-2 text-[11px] text-slate-500" {...marker('launches.status')}>
       {launches ? 'Verified launch evidence; token asset identities remain unverified.' : ctx.ecosystem
-        ? `${rows.length} verified ERC-20-like records; asset identities remain unverified` : 'Discovery evidence unavailable; asset identities remain unverified.'}
+        ? 'ERC-20-like contracts; asset identities remain unverified.' : 'Discovery evidence unavailable; asset identities remain unverified.'}
     </p>
     {launches && <span className="sr-only" {...marker('launches.transaction')}>Deployment transaction in expandable evidence</span>}
     <table id={tableId} aria-label={title} className="mt-3 block w-full text-left text-xs md:table md:table-fixed">
@@ -1517,7 +1528,7 @@ function LaunchesSection({ ctx }: { ctx: ViewContext }) {
   const rows = ctx.ecosystem?.launches.rows ?? []
   const status: DisplayStatus = rows.length ? 'available' : ctx.ecosystem ? 'unavailable' : 'source_pending'
   return <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
-    <CardHeader title="New Token Launches" subtitle={`Verified launch records within ${ctx.windowLabel}`} right={<StatusPill status={status} />} />
+    <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-slate-600">Verified launch records within {ctx.windowLabel}</p><StatusPill status={status} /></div>
     <EcosystemTokenList key={ctx.windowHours} ctx={ctx} kind="launches" />
   </section>
 }
@@ -1760,7 +1771,7 @@ function EventCell({ entry, value }: { entry: EventField; value: number | null }
   return (
     <div className="min-w-0 rounded-lg bg-[#f8faf7] px-2.5 py-1.5">
       <p className="flex items-center gap-1.5 truncate text-[11px] text-slate-500"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${entry.dot}`} />{entry.label}</p>
-      {value !== null ? <p className="text-base font-semibold tabular-nums text-slate-950">{formatCount(value)}</p> : <p className="pt-1"><ValueGap /></p>}
+      {value !== null ? <p className="text-base font-semibold tabular-nums text-slate-950 [overflow-wrap:anywhere]">{formatCount(value)}</p> : <p className="pt-1"><ValueGap /></p>}
     </div>
   )
 }
@@ -1792,7 +1803,7 @@ function TokenFlows({ flows, labels, title = 'Amounts by token' }: { flows: Toke
       {!flows.length ? <p className="mt-1 text-[11px] text-slate-400">No token amounts in this window</p> : (
         <ul className="mt-1 space-y-1">
           {shown.map((flow) => (
-            <li key={flow.token} title={flow.token} className="flex items-center justify-between gap-2 rounded-lg border border-slate-100 px-2 py-1.5">
+            <li key={flow.token} title={flow.token} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-100 px-2 py-1.5">
               <span className="flex shrink-0 items-center gap-1.5">
                 <TokenAvatar symbol={flow.label} size="sm" />
                 <span className="text-xs font-semibold text-slate-800">{flow.label}</span>
@@ -1847,14 +1858,14 @@ function UsdValues({ ctx, item, name }: { ctx: ViewContext; item: string; name: 
   const partial = rows.some((row) => row.action && row.action.status !== 'complete')
   const note = status === 'collecting' ? collectingText(ctx) : status === 'source_pending' ? 'Verified data does not include protocol USD valuations yet.'
     : ctx.mode === 'ready' ? reasonText(entry?.reason) : noteFor(ctx, status)
-  return <div {...markerProps(item, shown)} className="mt-3 rounded-lg border border-slate-100 px-2.5 py-2">
-    <div className="flex items-center justify-between gap-2"><p className={LABEL}>USD value, last {ctx.windowLabel}</p>
+  return <div {...markerProps(item, shown)} className="mt-3 min-w-0 rounded-lg border border-slate-100 px-2.5 py-2">
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2"><p className={LABEL}>USD value, last {ctx.windowLabel}</p>
       {partial ? <Chip>Verified subset</Chip> : shown !== 'available' && <InlineStatus status={shown} />}
     </div>
-    {hasValues ? <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1">
-      {rows.map(({ label, field, micros, action }) => <div key={field} className="text-[11px]">
-        <div className="flex items-baseline justify-between gap-2"><dt className="text-slate-500">{label}</dt>
-          <dd data-usd-action={field} data-usd-micros={numeric(micros) ? micros : undefined} className="font-semibold tabular-nums text-slate-900">
+    {hasValues ? <dl className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-x-4 gap-y-2">
+      {rows.map(({ label, field, micros, action }) => <div key={field} data-usd-row={field} className="min-w-0 text-[11px]">
+        <div className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,9rem),1fr))] items-baseline gap-x-3 gap-y-0.5"><dt className="min-w-0 whitespace-normal text-slate-500">{label}</dt>
+          <dd data-usd-action={field} data-usd-micros={numeric(micros) ? micros : undefined} className="min-w-0 text-right font-semibold tabular-nums text-slate-900 [overflow-wrap:anywhere]">
             {numeric(micros) ? formatUsdMicros(micros) : 'Unavailable'}</dd></div>
         {action && action.status !== 'complete' && <p className="text-[10px] text-slate-500">Verified priced subset · {action.coverage.fullyValuedHours} / {action.coverage.expectedHours} fully valued hours</p>}
       </div>)}
@@ -1991,7 +2002,7 @@ function DirectionRow({ direction, label, detail, leg, max }: { direction: 'out'
   const available = leg.cell.status === 'available'
   return (
     <div className="py-2">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         <p className="flex min-w-0 items-center gap-2">
           <DirectionIcon direction={direction} />
           <span className="min-w-0">
@@ -2017,7 +2028,7 @@ function LegCell({ label, direction, leg }: { label: string; direction?: 'out' |
       {available ? (
         <>
           <p className="mt-0.5 text-base font-semibold tabular-nums text-slate-950">{leg.cell.text}<span className="ml-1 text-[11px] font-normal text-slate-500">transfers</span></p>
-          <p className="truncate text-[11px] tabular-nums text-slate-500">{leg.amount ?? 'Amount not verified'}</p>
+          <p className="text-[11px] tabular-nums text-slate-500 [overflow-wrap:anywhere]">{leg.amount ?? 'Amount not verified'}</p>
         </>
       ) : <p className="pt-1.5"><ValueGap /></p>}
     </div>
@@ -2120,12 +2131,12 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
           {shown !== 'available' ? (
             <p className="mt-2 text-xs text-slate-500">{noteFor(ctx, shown)}</p>
           ) : usyc ? (
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,7rem),1fr))] gap-2">
               {([['Transfers', formatCount(usyc.transferCount)], ['Mints', formatCount(usyc.mintCount)], ['Burns', formatCount(usyc.burnCount)],
                 ['Amount moved', `${formatAmount(usyc.amountRaw, usyc.decimals)} USYC`]] as const).map(([label, value]) => (
                 <div key={label} className="min-w-0 rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-slate-100">
                   <p className="text-[11px] text-slate-500">{label}</p>
-                  <p className="truncate text-sm font-semibold tabular-nums text-slate-950">{value}</p>
+                  <p className="text-sm font-semibold tabular-nums text-slate-950 [overflow-wrap:anywhere]">{value}</p>
                 </div>
               ))}
             </div>
@@ -2136,18 +2147,18 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
         </div>
       </div>
       <div className={`${CARD} min-w-0`}>
-        <CardHeader title="Other Verified Protocols" subtitle="Verified source dependencies" right={<StatusPill status={ctx.ecosystem ? 'unavailable' : 'source_pending'} />} />
-        <div className="mt-3 grid gap-2 sm:grid-cols-3">
-          {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => (
-            <div key={item} {...markerProps(item, 'source_pending')} className="min-w-0 rounded-lg border border-dashed border-slate-200 px-3 py-2.5">
-              <Icon className="h-4 w-4 text-slate-400" />
-              <p className="mt-1.5 text-xs font-semibold text-slate-700">{title}</p>
-              <p className="text-[11px] leading-4 text-slate-500">{ctx.ecosystem
-                ? item.includes('exchange') ? `${ctx.ecosystem.exchangeFlows.reason ?? 'verified_exchange_registry_empty'}: verified exchange labels are required; P9 remains deferred.`
-                  : `${ctx.ecosystem.otherProtocols.reason ?? 'verified_protocol_registry_empty'}: an explicit contract, ABI, deployment and asset definition is required.`
-                : detail}</p>
+        <CardHeader title="Other Verified Protocols" subtitle="Additional protocol coverage" right={<StatusPill status={ctx.ecosystem ? 'unavailable' : 'source_pending'} />} />
+        <div className="mt-3 grid grid-cols-1 gap-2">
+          {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => {
+            const entry = item.includes('exchange') ? ctx.ecosystem?.exchangeFlows : ctx.ecosystem?.otherProtocols
+            return <div key={item} {...markerProps(item, entry?.status === 'unavailable' ? 'unavailable' : 'source_pending')}
+              className="flex min-w-0 items-start gap-2.5 rounded-lg border border-dashed border-slate-200 px-3 py-2.5">
+              <Icon className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+              <div className="min-w-0"><p className="text-xs font-semibold text-slate-700">{title}</p>
+                <p data-api-reason={entry?.reason ?? undefined} className="text-[11px] leading-4 text-slate-500 [overflow-wrap:anywhere]">{entry
+                  ? reasonText(entry.reason, 'Additional activity has not been verified for this window.') : detail}</p></div>
             </div>
-          ))}
+          })}
         </div>
       </div>
     </section>

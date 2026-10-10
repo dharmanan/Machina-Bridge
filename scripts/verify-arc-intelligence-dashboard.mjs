@@ -4,7 +4,7 @@
 // React server rendering across every data state. Upstream calls go to fetch doubles, except one end-to-end check against
 // the real compact HTTP server on 127.0.0.1. No external network.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import Module, { createRequire } from 'node:module';
 import path from 'node:path';
@@ -2118,7 +2118,8 @@ await test('Completion verified launches and discovery render despite incomplete
   assert.match(launches, /First observed activity/);
   assert.equal(byAttr(tree, 'data-token-evidence').length, 0, 'technical evidence starts collapsed');
   assert.equal(item(tree, 'assets.new-tokens').attrs['data-intel-status'], 'available');
-  assert.match(textOf(sectionNode(tree, 'rwa-other')), /verified_exchange_registry_empty/);
+  assert.match(textOf(sectionNode(tree, 'rwa-other')), /No exchange addresses have verified labels/);
+  assert.ok(byAttr(tree, 'data-api-reason', 'verified_exchange_registry_empty').length);
   const corrupt = structuredClone(ecosystem); corrupt.launches.rows[0].dex.observedPools[0].creationTxHash = 'guessed';
   assert.equal(lib.parseArcEcosystem(corrupt, '24h'), null);
 });
@@ -2177,12 +2178,13 @@ for (const window of ['24h', '7d', '30d']) await test(`Ecosystem schema ${window
   assert.equal(lib.parseArcEcosystem(body, window === '24h' ? '7d' : '24h'), null);
   const summary = structuredClone(READY_DATA.summary); summary.window = body.window;
   const tree = render({ selectedWindow: window, data: { ...READY_DATA, window, summary, ecosystem: parsed } }).tree;
-  assert.match(textOf(sectionNode(tree, 'assets')), /19 verified ERC-20-like records; asset identities remain unverified/);
+  assert.match(textOf(sectionNode(tree, 'assets')), /19 discovered token records returned/);
+  assert.match(textOf(sectionNode(tree, 'assets')), /asset identities remain unverified/);
   assert.equal(byAttr(tree, 'data-launch-token').length, 10);
   const launches = textOf(sectionNode(tree, 'launches'));
   assert.match(launches, /50 launch records returned \(list capped\)/);
   assert.match(launches, new RegExp(`Discovery coverage: 6 / ${body.coverage.requiredHours} hours`));
-  assert.match(launches, /Incomplete discovery does not hide proven launches/);
+  assert.match(launches, /Discovery checks cover only part of the stored history/);
   assert.match(launches, /First observed activity/);
   assert.equal(byAttr(tree, 'data-token-evidence').length, 0);
 });
@@ -2327,7 +2329,8 @@ await test('Token list UX expansion reveals real evidence, remains single-row an
   assert.match(textOf(output.tree), /Deployment block 100/);
   assert.match(textOf(output.tree), new RegExp(rows[0].dex.firstPool.pool));
   assert.match(textOf(output.tree), /First observed activity/); assert.match(textOf(output.tree), /Lifetime first unproven/);
-  assert.match(textOf(output.tree), /activity_not_stored/);
+  assert.match(textOf(output.tree), /No activity observation has been stored/);
+  assert.ok(byAttr(output.tree, 'data-api-reason', 'activity_not_stored').length);
   const toggle = output.controls.find(node => node.props['aria-expanded'] === true);
   assert.ok(byAttr(output.tree, 'id', toggle.props['aria-controls']).length);
   assert.equal(toggle.props.type, 'button'); assert.match(toggle.props['aria-label'], /Hide evidence for/);
@@ -2540,6 +2543,74 @@ await test('Refresh 9 cancellation stops queued section requests without issuing
     calls++; return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
   } });
   assert.equal(calls, 2); controller.abort(); await result; assert.equal(calls, 2);
+});
+
+await test('Responsive fixture preserves exact valuations and exports representative dashboard states', async () => {
+  const fixtures = [];
+  const fields = {
+    aaveV4: ['suppliedUsdMicros', 'withdrawnUsdMicros', 'borrowedUsdMicros', 'repaidUsdMicros', 'liquidatedDebtUsdMicros', 'liquidatedCollateralUsdMicros'],
+    morphoBlue: ['suppliedUsdMicros', 'withdrawnUsdMicros', 'borrowedUsdMicros', 'repaidUsdMicros', 'collateralSuppliedUsdMicros', 'collateralWithdrawnUsdMicros', 'liquidationRepaidUsdMicros', 'liquidationSeizedUsdMicros', 'badDebtUsdMicros'],
+    morphoVaultsV2: ['depositedUsdMicros', 'withdrawnUsdMicros'], cctp: ['outboundUsdMicros', 'inboundUsdMicros'],
+    gateway: ['depositUsdMicros', 'outboundBurnUsdMicros', 'inboundMintUsdMicros', 'withdrawalUsdMicros'], across: ['depositUsdMicros', 'fillUsdMicros'],
+  };
+  for (const window of ['24h', '7d', '30d']) {
+    const data = structuredClone(COMPLETE_DATA), ecosystem = missingActivityEcosystem(window);
+    if (window === '30d') {
+      ecosystem.coverage.requiredHours = 561;
+      Object.assign(ecosystem.window.coverage, { availableHours: 561, missingHours: 159, start: isoAt(END - 561 * HOUR_MS) });
+    }
+    data.window = window; data.summary.window = ecosystem.window; data.ecosystem = ecosystem;
+    for (const pool of Object.values(data.pools)) pool.window = ecosystem.window;
+    if (window !== '24h') data.timeseries = dailyTimeseries(window, window === '7d' ? 7 : 30);
+    for (const [name, actions] of Object.entries(fields)) {
+      data.summary.protocolUsd[name] = { status: 'available', reason: null, values: Object.fromEntries(actions.map((field, i) =>
+        [field, i % 2 ? '12345' : '1234567890123456789012345678'])) };
+    }
+    const aave = data.summary.protocolUsd.aaveV4;
+    aave.status = 'unavailable'; aave.reason = 'unverified_token';
+    aave.actions = Object.fromEntries(Object.entries(aave.values).map(([field, amount]) => [field, {
+      status: 'partial', scope: 'verified_priced_subset', usdMicros: amount,
+      coverage: { expectedHours: ecosystem.window.hours, storedHours: Math.min(561, ecosystem.window.hours), fullyValuedHours: 0 },
+      assets: [{ token: USDC, symbol: 'USDC', verified: true, decimals: 6, amountRaw: amount,
+        valuedAmountRaw: amount, unvaluedAmountRaw: '0', usdMicros: amount, blockers: [] }],
+    }]));
+    aave.values = null;
+    assert.ok(lib.protocolActions(aave));
+    ecosystem.launches.rows[0].name = 'A'.repeat(128);
+    const { html, tree } = render({ selectedWindow: window, data, borrowMarket: BORROW_AVAILABLE, explorerUrl: 'https://arcscan.app' });
+    const usd = byAttr(tree, 'data-usd-action');
+    assert.equal(usd.length, 25);
+    for (const amount of usd) assert.equal(textOf(amount), lib.formatUsdMicros(amount.attrs['data-usd-micros']));
+    assert.match(textOf(tree), /Verified subset/);
+    assert.match(textOf(tree), new RegExp(`0 / ${ecosystem.window.hours} fully valued hours`));
+    assert.match(textOf(tree), /Each action is valued on its own/);
+    assert.match(textOf(tree), /Collateral removed/);
+    for (const id of ['rwa-other.other-protocols', 'rwa-other.exchange-flows', 'rwa-other.more-protocols'])
+      assert.equal(item(tree, id).attrs['data-intel-status'], 'unavailable');
+    assert.match(textOf(sectionNode(tree, 'rwa-other')), /No additional protocol sources have been verified/);
+    assert.match(textOf(sectionNode(tree, 'rwa-other')), /No exchange addresses have verified labels/);
+    assert.doesNotMatch(textOf(tree), /verified_protocol_registry_empty|verified_exchange_registry_empty|discovery_hour_missing_or_capped/);
+    assert.ok(byAttr(tree, 'data-api-reason', 'verified_exchange_registry_empty').length);
+    assert.equal([...walk(tree)].filter(node => ['h3','h4'].includes(node.tag) && textOf(node) === 'New Token Launches').length, 1);
+    assert.equal(byAttr(tree, 'data-launch-token').length, 10);
+    assert.equal(byAttr(tree, 'data-discovered-token').length, 10);
+    fixtures.push({ name: window, html, usd: usd.map(node => ({ field: node.attrs['data-usd-action'], micros: node.attrs['data-usd-micros'], text: textOf(node) })) });
+    if (window === '30d') {
+      const harness = tokenListHarness('launches', ecosystem), collapsed = harness.draw().html;
+      assert.ok(html.includes(collapsed), 'expanded evidence uses the same list and context as the full dashboard');
+      harness.expand(ecosystem.launches.rows[0].address);
+      fixtures.push({ name: '30d-expanded', html: html.replace(collapsed, harness.draw().html), usd: fixtures.at(-1).usd });
+      harness.expand(ecosystem.launches.rows[2].address);
+      assert.match(textOf(harness.draw().tree), /No pool with verified provenance is stored/);
+      assert.doesNotMatch(textOf(harness.draw().tree), /no_verified_pool/);
+      const unknown = structuredClone(data); unknown.ecosystem.otherProtocols.reason = 'unknown_reason_'.repeat(100);
+      const output = render({ selectedWindow: window, data: unknown, borrowMarket: BORROW_AVAILABLE }).tree;
+      assert.match(textOf(sectionNode(output, 'rwa-other')), /Additional activity has not been verified for this window/);
+      assert.ok(byAttr(output, 'data-api-reason', unknown.ecosystem.otherProtocols.reason).length);
+      assert.equal(item(output, 'rwa-other.other-protocols').attrs['data-intel-status'], 'unavailable');
+    }
+  }
+  if (process.env.ARC_DASHBOARD_RESPONSIVE_FIXTURE) writeFileSync(process.env.ARC_DASHBOARD_RESPONSIVE_FIXTURE, JSON.stringify(fixtures));
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);
