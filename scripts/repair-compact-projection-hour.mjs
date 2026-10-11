@@ -25,6 +25,8 @@ import { assertHourIso } from '../server/compact/scheduler.js';
 import { COMPACT_SCHEMA_VERSION, createCompactStore } from '../server/compact/store.js';
 import { acquireWriterLock, WriterLockError } from '../server/compact/writer-lock.js';
 import { DEFAULT_RPC_INTERVAL_MS, MIN_RPC_INTERVAL_MS } from './run-compact-hour.mjs';
+import { recoverProjectionInputs, projectionRecoveryConfig } from '../server/compact/projection-recovery.js';
+import { boundedRecoveryProvider } from './recover-compact-discovery.mjs';
 
 export class RepairConfigError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -45,8 +47,10 @@ export function repairConfig({ argv = process.argv.slice(2), env = process.env }
 const statusOf = (row) => (row.status === 'available' ? 'available' : `unavailable(${row.reason})`);
 const listOf = (object) => Object.entries(object).map(([name, value]) => (value === true ? name : `${name}=${value}`)).join(',') || 'none';
 
-// providerFactory is called only when there is something to fetch.
-export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync, providerFactory, print = console.log }) {
+// The legacy path is unchanged by default. Opt-in continuation uses the same child,
+// with COMPACT_DEX_INPUT_RECOVERY_ENABLED=true and a <=64 MiB V8 heap (48 + 2 MiB flags).
+export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync, providerFactory, print = console.log,
+  continuationConfig = projectionRecoveryConfig(), capacity }) {
   const summary = { hour: new Date(hourStart * 1000).toISOString(), needs: null, blocked: null, outcomes: null, projections: null, requests: 0,
     ok: false, reason: null, diagnostics: null };
   print(`PROJECTION_REPAIR_HOUR ${summary.hour}`);
@@ -61,23 +65,32 @@ export async function repairProjectionHour({ sqlitePath, hourStart, DatabaseSync
     db = new DatabaseSync(sqlitePath);
     const store = createCompactStore(db);
     const input = readProjectionRepairInput(db, hourStart, { schemaVersion: COMPACT_SCHEMA_VERSION });
-    const plan = planProjectionRepair(input);
-    summary.needs = Object.keys(plan.needs);
-    summary.blocked = plan.blocked;
-    if (plan.reason) throw new RepairConfigError(plan.reason);
-    if (summary.needs.length) {
+    if (continuationConfig.enabled) {
       provider = providerFactory();
-      if ((await verifyStoredBoundaries(provider, [input.hour])).size) throw new RepairConfigError('boundary_hash_mismatch');
-      // The V3 registry is loaded only when V3 is rebuilt; V4 pool identities come from the hour's own Initialize logs.
-      const v3Pools = plan.needs.uniswap_v3_pools ? store.v3Registry()?.pools ?? new Set() : new Set();
-      const projections = await backfillProjectionHour({ provider, hour: { ...input.hour, needs: plan.needs }, v3Pools });
-      summary.outcomes = store.commitProjectionHour(hourStart, projections,
-        { only: [...summary.needs, ...summary.needs.flatMap((name) => VALUATION_INPUTS_OF_POOLS[name])] });
+      const result = await recoverProjectionInputs({ db, store, provider, hourStart, config: continuationConfig, capacity });
+      summary.needs = Object.keys(result.outcomes); summary.blocked = result.blocked;
+      summary.outcomes = result.outcomes; summary.continuation = result;
+      summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map(row => [row.projection, statusOf(row)]));
+      summary.ok = result.phase === 'complete'; summary.reason = summary.ok ? null : `continuation_${result.phase}`;
+    } else {
+      const plan = planProjectionRepair(input);
+      summary.needs = Object.keys(plan.needs);
+      summary.blocked = plan.blocked;
+      if (plan.reason) throw new RepairConfigError(plan.reason);
+      if (summary.needs.length) {
+        provider = providerFactory();
+        if ((await verifyStoredBoundaries(provider, [input.hour])).size) throw new RepairConfigError('boundary_hash_mismatch');
+        // The V3 registry is loaded only when V3 is rebuilt; V4 pool identities come from the hour's own Initialize logs.
+        const v3Pools = plan.needs.uniswap_v3_pools ? store.v3Registry()?.pools ?? new Set() : new Set();
+        const projections = await backfillProjectionHour({ provider, hour: { ...input.hour, needs: plan.needs }, v3Pools });
+        summary.outcomes = store.commitProjectionHour(hourStart, projections,
+          { only: [...summary.needs, ...summary.needs.flatMap((name) => VALUATION_INPUTS_OF_POOLS[name])] });
+      }
+      summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
+      const notRepaired = summary.needs.filter((name) => summary.projections[name] !== 'available');
+      summary.ok = notRepaired.length === 0 && Object.keys(plan.blocked).length === 0;
+      if (!summary.ok) summary.reason = notRepaired.length ? `not_repaired:${notRepaired.join(',')}` : `blocked:${listOf(plan.blocked)}`;
     }
-    summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
-    const notRepaired = summary.needs.filter((name) => summary.projections[name] !== 'available');
-    summary.ok = notRepaired.length === 0 && Object.keys(plan.blocked).length === 0;
-    if (!summary.ok) summary.reason = notRepaired.length ? `not_repaired:${notRepaired.join(',')}` : `blocked:${listOf(plan.blocked)}`;
   } catch (error) {
     summary.reason = error?.code ?? `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}`;
     if (error instanceof ProviderError) summary.diagnostics = { httpStatus: error.httpStatus, rpcCode: error.rpcCode };
@@ -112,8 +125,13 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  const continuationConfig = projectionRecoveryConfig();
+  let bounded;
   const summary = await repairProjectionHour({ sqlitePath: config.sqlitePath, hourStart: config.hourStart, DatabaseSync: sqlite.DatabaseSync,
-    providerFactory: () => createProvider({ minIntervalMs: config.minIntervalMs }) });
+    continuationConfig, providerFactory: () => continuationConfig.enabled
+      ? (bounded = boundedRecoveryProvider({ minIntervalMs: config.minIntervalMs })).provider
+      : createProvider({ minIntervalMs: config.minIntervalMs }) });
+  bounded?.close();
   process.exitCode = summary.ok ? 0 : 1;
 }
 

@@ -274,7 +274,7 @@ function pricePathRow(pool, path, firstBlock, lastBlock) {
     reserve1BlockSum: sums[2].toString(10) };
 }
 
-export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND, onVerifiedDex = null } = {}) {
+export function createProjectionSink({ activity = true, activityLimit = ACTIVITY_ROWS_PER_KIND, onVerifiedDex = null, checkpoint = null } = {}) {
   const pools = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const paths = { uniswap_v3: new Map(), uniswap_v4: new Map() };
   const fees = new Map();
@@ -289,6 +289,54 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
     if (!entry) pools[protocol].set(key, (entry = newPool()));
     return entry;
   };
+
+  // Recovery checkpoints keep integer reducer state, not logs. In particular a price path's final
+  // block remains open until the NEXT swap: closing each slice separately would double-count gaps.
+  if (checkpoint !== null) {
+    if (activity || checkpoint.version !== 'compact-projection-reducer-v1') throw new ProjectionError('projection_checkpoint_invalid');
+    try {
+      const counter = value => {
+        if (!Number.isSafeInteger(value) || value < 0) throw new Error();
+        return value;
+      };
+      const integer = value => {
+        if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value) || value.length > 256) throw new Error();
+        return BigInt(value);
+      };
+      for (const protocol of Object.keys(pools)) {
+        const pattern = protocol === 'uniswap_v3' ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/;
+        for (const [key, saved] of checkpoint.pools[protocol]) {
+          if (!pattern.test(key) || pools[protocol].has(key)) throw new Error();
+          const entry = newPool();
+          for (const field of Object.keys(entry)) entry[field] = typeof entry[field] === 'bigint' ? integer(saved[field]) : counter(saved[field]);
+          if (Object.keys(saved).length !== Object.keys(entry).length) throw new Error();
+          pools[protocol].set(key, entry);
+        }
+        for (const [key, saved] of checkpoint.paths[protocol]) {
+          if (!pattern.test(key) || paths[protocol].has(key) || !pools[protocol].has(key)) throw new Error();
+          const state = blockState(integer(saved.close[0]), integer(saved.close[1]));
+          if (saved.close.length !== 2 || saved.sums.length !== 3 || saved.swapCount !== pools[protocol].get(key).swapCount
+            || counter(saved.swapCount) < 1 || counter(saved.block) < counter(saved.firstBlock)) throw new Error();
+          paths[protocol].set(key, { swapCount: saved.swapCount, firstBlock: saved.firstBlock, block: saved.block,
+            logIndex: counter(saved.logIndex), state, close: [...saved.close], sums: saved.sums.map(integer) });
+        }
+      }
+      for (const [key, saved] of checkpoint.fees) {
+        if (!/^0x[0-9a-f]{64}$/.test(key) || fees.has(key)) throw new Error();
+        fees.set(key, { swapCount: counter(saved.swapCount), in0: integer(saved.in0), in1: integer(saved.in1),
+          out0: integer(saved.out0), out1: integer(saved.out1) });
+      }
+      for (const record of checkpoint.created) {
+        if (!validV4Record(record) || createdIds.has(record.poolId)) throw new Error();
+        createdIds.add(record.poolId); created.push(record);
+      }
+      if (Object.keys(checkpoint.failures).length !== Object.keys(failures).length) throw new Error();
+      for (const key of Object.keys(failures)) {
+        if (checkpoint.failures[key] !== null && typeof checkpoint.failures[key] !== 'string') throw new Error();
+        failures[key] = checkpoint.failures[key];
+      }
+    } catch { throw new ProjectionError('projection_checkpoint_invalid'); }
+  }
 
   // One V4 Swap event's fee: amounts are the caller-side delta (negative = paid into the pool), fee in pips.
   function swapFee(poolId, event) {
@@ -354,6 +402,17 @@ export function createProjectionSink({ activity = true, activityLimit = ACTIVITY
   }
 
   return Object.freeze({
+    checkpoint() {
+      if (activity) throw new ProjectionError('projection_checkpoint_activity_unsupported');
+      const entries = map => [...map].sort(([a], [b]) => a.localeCompare(b));
+      const strings = entry => Object.fromEntries(Object.entries(entry).map(([key, value]) => [key, typeof value === 'bigint' ? value.toString() : value]));
+      return { version: 'compact-projection-reducer-v1',
+        pools: Object.fromEntries(Object.entries(pools).map(([protocol, map]) => [protocol, entries(map).map(([key, value]) => [key, strings(value)])])),
+        paths: Object.fromEntries(Object.entries(paths).map(([protocol, map]) => [protocol, entries(map).map(([key, value]) => [key,
+          { swapCount: value.swapCount, firstBlock: value.firstBlock, block: value.block, logIndex: value.logIndex,
+            close: [...value.close], sums: value.sums.map(String) }])])),
+        fees: entries(fees).map(([key, value]) => [key, strings(value)]), created: [...created], failures: { ...failures } };
+    },
     // kind: swap | mint | burn; event: the decodeV3* result the family accumulator just produced for this official log.
     v3(kind, log, event, window) {
       onVerifiedDex?.('uniswap_v3', kind, log, event, window);

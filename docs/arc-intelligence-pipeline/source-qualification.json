@@ -1,0 +1,70 @@
+{
+  "scopeVersion": "arc-ui-product-scope-84-v1",
+  "all84FieldsRemainRequired": true,
+  "productionAcceptancePassed": false,
+  "paidServiceActivated": false,
+  "sources": [
+    {
+      "protocol": "Topaz",
+      "officialAddressSource": "https://www.topazdex.com/docs/contracts",
+      "deploymentManifest": "https://raw.githubusercontent.com/topazdex/agent-skill/main/references/deployments.json",
+      "manifestSha256": "66f958c22ee447490ffa2667f484a953eec8d916c41db5d2f3b702e80807f76a",
+      "clFactory": "0xaa5865dc3a60b25d305226d66fd573021f0d8ffb",
+      "stableVolatileFactory": "0x1e3ac31cf96b20619c913384c9bf6010a824fb95",
+      "issuerToken": "0x1aa89c4ab9884cb65b759a3cc3a1690744d687a6",
+      "verifiedLocally": ["Published ABI hashes use compact JSON, not whitespace-sensitive file hashes", "Direct deployment receipts and canonical blocks", "Code absent before deployment, present at deployment and dense-hour boundary", "xTOPAZ symbol and 18 decimals at historical block", "One dense-hour CL pool creation with same-block getPool membership", "Zero stable/volatile creations and zero xTOPAZ transfers in the measured hour"],
+      "remaining": ["CLPool and Pool implementation transaction receipts returned null; their published deployment associations remain unverified", "Historical pool enumeration and complete swap/valuation adapter", "Dynamic fee semantics must not be replaced by fixed Uniswap fees", "No historical xTOPAZ USD price proven", "Runtime/source equivalence and upgrade history not audited"],
+      "productionRegistryActivated": false
+    },
+    {
+      "protocol": "AchSwap",
+      "source": "https://docs.achswap.app/technical/contract-addresses/",
+      "status": "official_address_candidate",
+      "remaining": "Qualify exact deployed ABI, historical deployment intervals and factory membership. Do not assume all Uniswap callback or fee semantics."
+    },
+    {
+      "protocol": "Arco",
+      "source": "https://www.arcodex.io/contracts",
+      "status": "unqualified",
+      "remaining": "Published addresses coexist with a not-deployed statement; deployment and ABI require independent resolution."
+    },
+    {
+      "protocol": "Mercuri",
+      "source": "https://github.com/mercuri-finance/mercuri-launch-contracts/blob/main/deployments/5042.json",
+      "manifestSha256": "725c47ce062903c4220e3c6ab5caecc032ad56d35ec78070eb7f97e7f119643a",
+      "declaredDeploymentBlock": 22060881,
+      "status": "official_deployment_candidate",
+      "remaining": "Deployment begins after the dense target hour. Verify on-chain receipt, implementation/version and TokenCreated evidence; do not apply it to earlier history."
+    },
+    {
+      "protocol": "ArcStockPad",
+      "source": "https://github.com/ArcStockPad/arcstockpad/blob/main/addresses.json",
+      "manifestSha256": "7afba39a1816740eaf43488a3428210d57dde7fec5fee25d180411a763cf41a5",
+      "status": "official_versioned_deployment_candidate",
+      "remaining": "Qualify curve versions 2.2/2.3/2.4 separately. Launchpad evidence does not prove RWA issuer identity or price."
+    },
+    {
+      "protocol": "Circle StableFX and USYC",
+      "source": "https://docs.arc.io/arc/references/contract-addresses",
+      "status": "official_address_candidates",
+      "remaining": "Exact mainnet escrow/teller ABI, deployment validity and accepted action semantics. Do not invent volume or treat transfers as settlement events."
+    },
+    {
+      "protocol": "Exchange flows",
+      "sources": ["https://www.binance.com/en/support/announcement/detail/60d9115a95ed4855ad70af192e996aef", "https://www.binance.com/en/proof-of-reserves"],
+      "status": "ownership_registry_not_qualified",
+      "confirmed": "Official Arc deposit support and a public proof-of-reserves ownership framework exist.",
+      "remaining": "No Arc-specific owned-address set with validity periods was extracted and verified. Support announcements, generic EVM wallets and transaction behavior do not prove Arc exchange ownership."
+    }
+  ],
+  "pendingFields": {
+    "volume-chart.other": "Topaz source/creation adapter added; complete priced swap history and chart integration remain.",
+    "top-protocols.volume-ranking": "Exact micro-USD DEX ranking implemented. Lending/cross-chain stay in separate action rankings; API/UI integration and real full-window valuations remain.",
+    "top-protocols.other": "Additional source candidates recorded; no guessed protocol availability.",
+    "assets.other-verified": "Publisher-sourced xTOPAZ transfer adapter added and measured; historical price and UI integration remain.",
+    "borrow.action": "Actual Circle market/quote access and wallet capability validation remain; write gate stays OFF.",
+    "rwa-other.other-protocols": "StableFX/USYC official addresses found; action/ABI/history qualification remains.",
+    "rwa-other.exchange-flows": "Arc-specific exchange ownership and validity evidence remain unqualified.",
+    "rwa-other.more-protocols": "Remains required; qualification and coverage must succeed before availability is asserted."
+  }
+}

@@ -1,0 +1,60 @@
+// Offline replay of independently verified real Arc proof. Never opens production or makes RPC calls.
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
+import assert from 'node:assert/strict';
+import { openPipeline, hash, json, assertHeapBudget } from '../server/intelligence-pipeline/storage.js';
+import { createNetworkReducer, unpackAddresses } from '../server/intelligence-pipeline/network-reducer.js';
+import { createNetworkHourStore, verifyNetworkSeal } from '../server/intelligence-pipeline/network-hour-store.js';
+import { evidenceJson } from '../server/compact/discovery-evidence.js';
+import { sha256Of } from '../server/compact/projections.js';
+import { INTELLIGENCE_REGISTRY, registryDigest } from '../server/compact/intelligence-registry.js';
+const inputPath=process.argv[2],outputPath=process.argv[3];
+const heapBudget=assertHeapBudget();
+if(!inputPath?.startsWith('/tmp/')||!outputPath?.startsWith('/tmp/'))throw Error('isolated_tmp_input_and_report_required');
+const input=new DatabaseSync(inputPath,{readOnly:true});input.exec('PRAGMA query_only=ON; PRAGMA cache_size=-2048');
+const h=input.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(Date.parse('2026-09-16T12:00:00Z')/1000);
+if(!h)throw Error('canonical_network_missing');
+const first=input.prepare("SELECT key,value FROM compact_meta WHERE key GLOB 'discovery_spine_block:*' ORDER BY key LIMIT 1").get();
+if(!first)throw Error('real_rpc_spine_not_available');
+const prefix=first.key.slice(0,first.key.lastIndexOf(':')+1),source={id:'network',definition:'arc-canonical-reduction-v2',chainId:5042,originalDefinition:h.definition_version};
+const tail=JSON.parse(input.prepare('SELECT value FROM compact_meta WHERE key=?').get(prefix+String(h.last_block).padStart(16,'0')).value);
+const range={kind:'hour',hourStart:h.hour_start,hourEnd:h.hour_start+3600,startUtc:new Date(h.hour_start*1000).toISOString(),endUtc:new Date((h.hour_start+3600)*1000).toISOString(),firstBlock:h.first_block,lastBlock:h.last_block,parentHash:h.parent_hash,firstHash:h.first_hash,lastHash:h.last_hash,firstTimestamp:JSON.parse(first.value).block.timestamp,lastTimestamp:tail.block.timestamp};
+if(sha256Of({definitionVersion:h.definition_version,range,network:JSON.parse(h.network_json)})!==h.network_sha256)throw Error('canonical_network_not_verified');
+let peakHeap=0,peakDisk=0;const sample=()=>{peakHeap=Math.max(peakHeap,process.memoryUsage().heapUsed);};
+const directory=mkdtempSync(join(tmpdir(),'arc-reduced-real-hour-')),p=openPipeline({path:join(directory,'reduced.sqlite'),create:true,verifySeal:(db,seal,u)=>verifyNetworkSeal(db,seal,u,{onProgress:sample}),knownOtherBytes:1978695680,volumeLimitBytes:4838498304});
+const networkStore=createNetworkHourStore(p,{onProgress:sample});
+const spec={source,first:h.first_block,last:h.last_block,hourStart:h.hour_start,anchorHash:h.last_hash,registryDigest:registryDigest(INTELLIGENCE_REGISTRY)};
+const unit=p.defineUnit(spec),start=performance.now(),sourceRead=[];
+let previous={number:h.first_block-1,hash:h.parent_hash,timestamp:h.hour_start},previousDigest=null,counts={blocks:0,transactions:0,gas:0n,deployments:0};
+const senders=new Set(),recipients=new Set();
+for(let job;job=p.claim();){
+ const reducer=createNetworkReducer({first:job.first_block,last:job.last_block,before:previous,hourStart:h.hour_start,hourEnd:h.hour_start+3600,source,anchorHash:h.last_hash});
+ const rows=input.prepare('SELECT key,value FROM compact_meta WHERE key>=? AND key<=? ORDER BY key').iterate(prefix+String(job.first_block).padStart(16,'0'),prefix+String(job.last_block).padStart(16,'0'));
+ let expected=job.first_block;
+ for(const row of rows){const saved=JSON.parse(row.value),{checksum,...body}=saved,b=body.block;
+   if(checksum!==hash(evidenceJson(body))||body.previousDigest!==previousDigest||b.number!==expected++||body.identity.canonical!==h.network_sha256||hash(body.identity)!==hash(JSON.parse(first.value).identity))throw Error('exported_rpc_evidence_not_verified');
+   reducer.addVerifiedSpine({...b,gasUsed:BigInt(b.gasUsed)});previous=b;previousDigest=checksum;
+ }
+ if(expected!==job.last_block+1)throw Error('real_evidence_gap');
+ const summary=reducer.finish();p.accept(job,summary);sourceRead.push([job.first_block,job.last_block]);
+ counts.blocks+=summary.counts.blockCount;counts.transactions+=summary.counts.transactionCount;counts.gas+=BigInt(summary.counts.gasUsedRaw);counts.deployments+=summary.counts.deploymentAttempts;
+ for(const a of unpackAddresses(summary.rows[0].senderMembership))senders.add(a);for(const a of unpackAddresses(summary.rows[0].recipientMembership))recipients.add(a);
+ peakHeap=Math.max(peakHeap,process.memoryUsage().heapUsed);peakDisk=Math.max(peakDisk,p.metrics().directoryBytes);
+}
+const canonical=JSON.parse(h.network_json),active=new Set([...senders,...recipients]);
+assert.equal(counts.blocks,h.block_count);assert.equal(counts.transactions,h.transaction_count);assert.equal(counts.gas.toString(),canonical.gasUsedRaw);assert.equal(counts.deployments,canonical.internal.deploymentAttempts);assert.equal(senders.size,canonical.uniqueSenders);assert.equal(recipients.size,canonical.uniqueRecipients);assert.equal(active.size,h.unique_active_addresses);assert.equal(previous.hash,h.last_hash);assert.equal(p.coverage(unit).status,'complete');
+const accepted=p.db.prepare('SELECT COUNT(*) n,SUM(length(payload_gzip)) compressed,SUM(plain_bytes) plain FROM arc_pipeline_results').get();
+const metricsBefore=p.metrics();p.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');const compactMetrics=p.metrics();
+// Alternative consolidated membership sizing only: not an implemented archival lifecycle or full-product guarantee.
+const pack=set=>Buffer.concat([...set].sort().map(a=>Buffer.from(a.slice(2),'hex')));
+const finalMembership=gzipSync(Buffer.concat([pack(senders),pack(recipients)]),{level:3});
+const published=networkStore.publish(unit,h,{afterCommit:()=>{sample();peakDisk=Math.max(peakDisk,p.metrics().directoryBytes);}});const compacted=networkStore.compact(unit);assert.equal(p.coverage(unit).status,'complete');p.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');const afterSeal=p.metrics();
+const sealRow=p.db.prepare('SELECT length(payload_gzip) bytes FROM arc_pipeline_seals WHERE unit_id=?').get(unit);
+const dictionary=p.db.prepare('SELECT COUNT(*) entries FROM arc_pipeline_addresses').get();
+const audit=p.audit();assert.equal(audit.repairQueued,0);assert.equal(p.claim(),null);
+const usedPages=afterSeal.pageCount-afterSeal.freelistCount;
+const report={usedPagesAfterCompaction:usedPages,liveEvidencePagesBytes:usedPages*afterSeal.pageSize,piecePagesReusableBytes:afterSeal.freelistCount*afterSeal.pageSize,input:'previously verified real Arc RPC evidence, replayed offline',hour:'2026-09-16T12:00:00.000Z',scope:'network only; not all 84 fields or live RPC end-to-end acceptance',heapBudget,node:process.version,directory,blocks:counts.blocks,transactions:counts.transactions,activeAddresses:active.size,deploymentAttempts:counts.deployments,canonicalAllNetworkFieldsMatch:true,acceptedChunks:accepted.n,compressedSummaryBytes:accepted.compressed,plainSummaryBytes:accepted.plain,peakManagedDirectoryBytes:peakDisk,beforeCheckpoint:metricsBefore,afterCheckpoint:compactMetrics,afterSealing:afterSeal,dictionaryEntries:dictionary.entries,sealedHourGzipBytes:sealRow.bytes,compacted,consolidatedAddressMembershipGzipBytes:finalMembership.length,durationMs:Math.round(performance.now()-start),peakSampledHeapBytes:peakHeap,maxRSSBytes:process.resourceUsage().maxRSS*1024,restartCompletedWorkIsSkipped:p.claim()===null,offlineRpcRequests:0,rejectedUncompactedStaging720HoursEstimateBytes:compactMetrics.directoryBytes*720,sealed720HoursExcludingDictionaryAndIndexesEstimateBytes:sealRow.bytes*720,estimateExcludes:'Remaining product sections, existing production files, pool/price/candidate evidence, indexes of future readers, backups, peak future WAL and safety reserve. These estimates are not a measured 720-hour volume; shared dictionary novelty and full-product growth remain unknown.'};
+writeFileSync(outputPath,JSON.stringify(report,null,2));console.log(JSON.stringify(report));p.close();input.close();

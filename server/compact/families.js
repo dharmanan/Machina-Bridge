@@ -16,13 +16,37 @@ import { poolRecordOf } from './registry.js';
 
 export { FamilyError };
 
-export function createNetworkAccumulator() {
+// Recovery-only snapshots contain exact counters and distinct membership, never raw transactions/logs.
+const recoveryCount = n => { if (!Number.isSafeInteger(n) || n < 0) throw new FamilyError('recovery_state_corrupt'); return n; };
+const restoreMembers = (values, bytes = 20) => {
+  if (typeof values !== 'string') throw new FamilyError('recovery_state_corrupt');
+  const raw = Buffer.from(values, 'base64');
+  if (raw.toString('base64') !== values || raw.length % bytes || raw.length > 8 * 1024 * 1024) throw new FamilyError('recovery_state_corrupt');
+  const set = new Set(); let previous = '';
+  for (let i = 0; i < raw.length; i += bytes) { const v = '0x' + raw.subarray(i, i + bytes).toString('hex');
+    if (v <= previous) throw new FamilyError('recovery_state_corrupt'); previous = v; set.add(v); }
+  return set;
+};
+const packMembers = values => {
+  const sorted=[...values].sort(), width=sorted.length?(sorted[0].length-2)/2:20;
+  const raw=Buffer.alloc(sorted.length*width);
+  sorted.forEach((value,i)=>raw.write(value.slice(2),i*width,width,'hex'));
+  return raw.toString('base64');
+};
+
+export function createNetworkAccumulator({ recoveryState = null } = {}) {
   let blockCount = 0;
   let transactionCount = 0;
   let gasUsed = 0n;
   let deploymentAttempts = 0;
-  const senders = new Set();
-  const recipients = new Set();
+  const senders = recoveryState ? restoreMembers(recoveryState.senders) : new Set();
+  const recipients = recoveryState ? restoreMembers(recoveryState.recipients) : new Set();
+  if (recoveryState) {
+    if (recoveryState.version !== 'network-recovery-state-v1' || !/^\d+$/.test(recoveryState.gasUsed)) throw new FamilyError('recovery_state_corrupt');
+    blockCount = recoveryCount(recoveryState.blockCount); transactionCount = recoveryCount(recoveryState.transactionCount);
+    deploymentAttempts = recoveryCount(recoveryState.deploymentAttempts); gasUsed = BigInt(recoveryState.gasUsed);
+    if (deploymentAttempts > transactionCount || senders.size > transactionCount || recipients.size > transactionCount) throw new FamilyError('recovery_state_corrupt');
+  }
   return {
     addBlocks(blocks) {
       for (const block of blocks) {
@@ -43,6 +67,8 @@ export function createNetworkAccumulator() {
       for (const recipient of recipients) if (!senders.has(recipient)) active.push(recipient);
       return active.sort();
     },
+    recoveryState: () => ({ version: 'network-recovery-state-v1', blockCount, transactionCount, deploymentAttempts,
+      gasUsed: gasUsed.toString(), senders: packMembers(senders), recipients: packMembers(recipients) }),
     finish({ durationSeconds = null } = {}) {
       let active = senders.size;
       for (const recipient of recipients) if (!senders.has(recipient)) active += 1;
@@ -112,12 +138,22 @@ export function createAssetsAccumulator() {
 // before that window's pool stream, so a pool created and used in the same block is counted.
 // projection (optional, projections.js sink): receives each official event already decoded here, before the logs are
 // released. It never throws and never changes anything this accumulator counts; foreign emitters never reach it.
-export function createUniswapV3Accumulator({ registry, projection = null }) {
+export function createUniswapV3Accumulator({ registry, projection = null, recoveryState = null }) {
   let poolCreatedCount = 0, swapCount = 0, mintCount = 0, burnCount = 0, foreignEventCount = 0;
   const created = new Map();
-  const traders = new Set();
-  const swapPools = new Set();
-  const foreign = new Set();
+  const traders = recoveryState ? restoreMembers(recoveryState.traders) : new Set();
+  const swapPools = recoveryState ? restoreMembers(recoveryState.swapPools) : new Set();
+  const foreign = recoveryState ? restoreMembers(recoveryState.foreign) : new Set();
+  if (recoveryState) {
+    if (recoveryState.version !== 'v3-recovery-state-v1' || !Array.isArray(recoveryState.created) || recoveryState.created.length > 15000) throw new FamilyError('recovery_state_corrupt');
+    ({ poolCreatedCount, swapCount, mintCount, burnCount, foreignEventCount } = recoveryState);
+    [poolCreatedCount, swapCount, mintCount, burnCount, foreignEventCount].forEach(recoveryCount);
+    for (const pool of recoveryState.created) {
+      if (!/^0x[0-9a-f]{40}$/.test(pool.address) || created.has(pool.address)) throw new FamilyError('recovery_state_corrupt');
+      created.set(pool.address, pool);
+    }
+    if (created.size !== poolCreatedCount || traders.size > swapCount || swapPools.size > swapCount || foreign.size > foreignEventCount) throw new FamilyError('recovery_state_corrupt');
+  }
   const decoders = { [UNISWAP_EVENT_TOPICS.v3Swap]: ['swap', decodeV3Swap], [UNISWAP_EVENT_TOPICS.v3Mint]: ['mint', decodeV3Mint],
     [UNISWAP_EVENT_TOPICS.v3Burn]: ['burn', decodeV3Burn] };
   return {
@@ -152,6 +188,8 @@ export function createUniswapV3Accumulator({ registry, projection = null }) {
     },
     // Official pools created inside the range, in chain order: the registry rows this range adds.
     createdPools: () => [...created.values()],
+    recoveryState: () => ({ version: 'v3-recovery-state-v1', poolCreatedCount, swapCount, mintCount, burnCount, foreignEventCount,
+      created: [...created.values()], traders: packMembers(traders), swapPools: packMembers(swapPools), foreign: packMembers(foreign) }),
     async finish({ factoryCodePresent }) {
       if (!factoryCodePresent) throw new FamilyError('v3_factory_code_unverified');
       return { poolCreatedCount, swapCount, mintCount, burnCount, uniqueTraders: traders.size, poolsWithSwaps: swapPools.size,
@@ -161,10 +199,16 @@ export function createUniswapV3Accumulator({ registry, projection = null }) {
 }
 
 // projection (optional, projections.js sink): as for V3, every decoded PoolManager event, never affecting these counts.
-export function createUniswapV4Accumulator({ projection = null } = {}) {
+export function createUniswapV4Accumulator({ projection = null, recoveryState = null } = {}) {
   let initializeCount = 0, swapCount = 0, modifyLiquidityCount = 0;
-  const traders = new Set();
-  const swapPools = new Set();
+  const traders = recoveryState ? restoreMembers(recoveryState.traders) : new Set();
+  const swapPools = recoveryState ? restoreMembers(recoveryState.swapPools, 32) : new Set();
+  if (recoveryState) {
+    if (recoveryState.version !== 'v4-recovery-state-v1') throw new FamilyError('recovery_state_corrupt');
+    ({ initializeCount, swapCount, modifyLiquidityCount } = recoveryState);
+    [initializeCount, swapCount, modifyLiquidityCount].forEach(recoveryCount);
+    if (traders.size > swapCount || swapPools.size > swapCount) throw new FamilyError('recovery_state_corrupt');
+  }
   return {
     add(_stream, logs, window) {
       for (const log of logs) {
@@ -189,6 +233,8 @@ export function createUniswapV4Accumulator({ projection = null } = {}) {
         }
       }
     },
+    recoveryState: () => ({ version: 'v4-recovery-state-v1', initializeCount, swapCount, modifyLiquidityCount,
+      traders: packMembers(traders), swapPools: packMembers(swapPools) }),
     async finish({ poolManagerCodePresent }) {
       if (!poolManagerCodePresent) throw new FamilyError('v4_pool_manager_code_unverified');
       return { initializeCount, swapCount, modifyLiquidityCount, uniqueTraders: traders.size, poolsWithSwaps: swapPools.size };

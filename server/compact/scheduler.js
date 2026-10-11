@@ -28,6 +28,8 @@ export const PROJECTION_REPAIR_COOLDOWN_MS = HOUR_MS;
 export const DEFAULT_CHILD_KILL_GRACE_MS = 15_000;
 // Equivalent to the proven production command: node --max-old-space-size=64 --max-semi-space-size=2 run-compact-hour.mjs
 export const CHILD_NODE_ARGS = Object.freeze(['--max-old-space-size=64', '--max-semi-space-size=2']);
+// Recovery must fit the TOTAL 64 MiB V8 heap, including the young generation.
+export const RECOVERY_CHILD_NODE_ARGS = Object.freeze(['--max-old-space-size=48', '--max-semi-space-size=2']);
 const HOUR_SECONDS = 3600;
 const HOUR_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:00:00\.000Z$/;
 
@@ -57,12 +59,12 @@ export function backoffMs(failures, baseMs = DEFAULT_BASE_BACKOFF_MS, maxMs = MA
 // One child per call; the promise never rejects. terminate(): SIGTERM, then SIGKILL after the grace period. A killed
 // child never commits its hour: the runner writes an hour in one SQLite transaction, which a dead process cannot finish.
 export function createChildHourRunner({ scriptPath, execPath = process.execPath, env = process.env, spawnImpl = spawn,
-  killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now(), extraArgs = [] }) {
+  killGraceMs = DEFAULT_CHILD_KILL_GRACE_MS, now = () => Date.now(), extraArgs = [], nodeArgs = CHILD_NODE_ARGS }) {
   if (typeof scriptPath !== 'string' || !scriptPath) throw new Error('script_path_required');
   return function runHour(hour) {
     const argument = assertHourIso(hour);
     const startedAt = now();
-    const child = spawnImpl(execPath, [...CHILD_NODE_ARGS, scriptPath, argument, ...extraArgs], { stdio: ['ignore', 'inherit', 'inherit'], env,
+    const child = spawnImpl(execPath, [...nodeArgs, scriptPath, argument, ...extraArgs], { stdio: ['ignore', 'inherit', 'inherit'], env,
       shell: false });
     let exited = false;
     const done = new Promise((resolve) => {
@@ -113,7 +115,7 @@ export function createChildHistoryRunner(options) {
 }
 
 export function createChildDiscoveryRecoveryRunner(options) {
-  return createChildHourRunner({ ...options, extraArgs: ['--execute'] });
+  return createChildHourRunner({ ...options, extraArgs: ['--execute'], nodeArgs: RECOVERY_CHILD_NODE_ARGS });
 }
 
 export function createChildDiscoveryRunner(options) {

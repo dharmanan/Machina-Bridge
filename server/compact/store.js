@@ -27,7 +27,7 @@ import {
   validV4Record,
 } from './projections.js';
 import { ARC_CHAIN_ID } from './provider.js';
-import { V3_POOL_KIND } from './registry.js';
+import { V3_POOL_KIND, validateScopedPoolWitness } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { metadataExempt, TOKEN_METADATA_VERSION } from './token-metadata.js';
 import { TVL_POOLS_PER_PROTOCOL, TVL_REASONS, TVL_VERSION } from './tvl.js';
@@ -609,7 +609,8 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
       const [key, meta] = REGISTRY_ROW[kind](pool);
       const stored = sql.pool.get(kind, key);
       if (stored) {
-        if (stored.created_block !== pool.createdBlock || stored.created_log_index !== pool.createdLogIndex || stored.created_tx !== pool.createdTx) {
+        if (stored.created_block !== pool.createdBlock || stored.created_log_index !== pool.createdLogIndex || stored.created_tx !== pool.createdTx
+          || canonical(JSON.parse(sql.registryMeta.get(kind, key).meta_json)) !== meta) {
           throw new StoreError('registry_conflict');
         }
         continue;
@@ -895,8 +896,9 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
       .map((pool) => ({ ...pool, tickSpacing: JSON.parse(sql.registryMeta.get(protocol === 'uniswap_v4' ? V4_POOL_KIND : V3_POOL_KIND, pool.pool).meta_json).tickSpacing }));
   }
 
-  // Writes one hour's snapshot rows once; an existing row of the hour is never replaced.
-  function recordPoolTvl(hourStart, protocol, rows, { blockNumber }) {
+  // Live snapshots are written once. Explicit historical repair can upgrade an unavailable
+  // snapshot at the SAME canonical block; verified balances remain immutable.
+  function recordPoolTvl(hourStart, protocol, rows, { blockNumber, upgradeUnavailable = false, beforeCommit = null }) {
     if (!Number.isSafeInteger(blockNumber) || !['uniswap_v3', 'uniswap_v4'].includes(protocol)
       || !Array.isArray(rows) || rows.length > TVL_POOLS_PER_PROTOCOL || new Set(rows.map((row) => row.pool)).size !== rows.length) {
       throw new StoreError('invalid_tvl_snapshot');
@@ -910,10 +912,20 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
         const available = row.status === 'available';
         if (available ? typeof row.amount0 !== 'bigint' || typeof row.amount1 !== 'bigint' || row.amount0 < 0n || row.amount1 < 0n
           : !TVL_REASONS.includes(row.reason)) throw new StoreError('invalid_tvl_snapshot');
+        if (upgradeUnavailable && available) {
+          const previous = db.prepare('SELECT * FROM compact_pool_tvl_hours WHERE hour_start=? AND protocol=? AND pool=?')
+            .get(int(hourStart), protocol, row.pool);
+          if (previous && previous.block_number !== blockNumber) throw new StoreError('pool_tvl_conflict');
+          if (previous?.status === 'available' && (previous.amount0_raw !== row.amount0.toString() || previous.amount1_raw !== row.amount1.toString()
+            || previous.block_number !== blockNumber)) throw new StoreError('pool_tvl_conflict');
+          if (previous?.status === 'unavailable') db.prepare(`UPDATE compact_pool_tvl_hours SET status='available',reason=NULL,
+            amount0_raw=?,amount1_raw=? WHERE hour_start=? AND protocol=? AND pool=? AND status='unavailable' AND block_number=?`)
+            .run(row.amount0.toString(), row.amount1.toString(), int(hourStart), protocol, row.pool, int(blockNumber));
+        }
         sql.insertPoolTvl.run(int(hourStart), protocol, row.pool, row.status, available ? null : row.reason, available ? row.amount0.toString(10) : null,
           available ? row.amount1.toString(10) : null, int(blockNumber));
       }
-    });
+    }, beforeCommit);
   }
 
   // Each row is written once (INSERT OR IGNORE): cached metadata is never replaced.
@@ -1182,6 +1194,11 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
     },
     // Projections (never families).
     commitProjectionHour,
+    // Adds a single independently verified identity, NEVER a global coverage assertion.
+    recordPoolWitness(protocol, pool, atBlock, proof, { beforeCommit = null } = {}) {
+      const record = validateScopedPoolWitness(proof, protocol, pool, atBlock);
+      return transaction(() => insertRegistryRows(protocol === 'uniswap_v3' ? V3_POOL_KIND : V4_POOL_KIND, [record]), beforeCommit);
+    },
     extendV4Registry: (registryScan) => extendRegistryOf(V4_POOL_KIND, registryScan),
     // Coverage and size only: V4 pool identities are resolved when read, never loaded whole into the hour processor.
     v4Registry: () => {

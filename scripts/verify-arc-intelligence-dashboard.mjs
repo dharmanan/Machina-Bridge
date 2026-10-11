@@ -919,8 +919,9 @@ await test('UI 6 without the API\'s USD valuation no USD value exists; the proto
     'top-pools-v4.liquidity', 'lending.aave-usd', 'lending.morpho-blue-usd', 'lending.morpho-vaults-usd', 'cross-chain.cctp-usd', 'cross-chain.gateway-usd',
     'cross-chain.across-usd'];
   for (const [name, { tree, html }] of Object.entries(rendered)) {
-    assert.equal(item(tree, 'top-protocols.volume-ranking').attrs['data-intel-status'], 'source_pending', `${name} ranking`);
     if (USD_STATES.includes(name)) continue;
+    assert.notEqual(item(tree, 'top-protocols.volume-ranking').attrs['data-intel-status'], 'available', `${name}: absent USD cannot produce ranking`);
+    assert.equal(tree.querySelectorAll?.('[data-financial-rank]').length ?? 0, 0, `${name}: no fabricated DEX USD rows`);
     for (const id of VOLUME) assert.notEqual(item(tree, id).attrs['data-intel-status'], 'available', `${name} ${id}`);
     assert.equal(item(tree, 'network.total-volume').attrs['data-intel-value'], undefined, `${name}: no financial value`);
     assert.doesNotMatch(html, /\$\s?\d|\d\s?USD\b|US\$/, `${name}: no USD amount`);
@@ -1816,7 +1817,8 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
       assert.match(text, /Liquidity (Not available yet|Available|Collecting|Unavailable|Loading)/, `${name} ${id}: liquidity keeps its place, stated once`);
     }
     const protocols = textOf(sectionNode(tree, 'top-protocols'));
-    assert.match(protocols, /Ranked by USD volume Not available: lending and bridge USD values are kept per action \(supplied, borrowed, sent\), so protocols share no comparable USD volume\. Listed in a fixed order\./, name);
+    assert.match(protocols, /DEX USD volume ranking/, name);
+    assert.match(protocols, /DEX volume is compared separately\. Lending and cross-chain values are ranked per action and never added together\./, name);
     assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
   }
   // The ready fixtures carry no valuation: their Volume (USD) line says so once, beside Liquidity.
@@ -1841,6 +1843,39 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
 
 // ---------------------------------------------------------------------------------------------------------------------
 // USD volume (server/compact/valuation.js through summary.v1, timeseries.v1 and pools.v1).
+
+await test('Financial ranking exact DEX integers determine order; counts and lending never enter volume', async () => {
+  const summary=summaryFixture({usdVolume:{...usdWindow('18014398509481987'),byProtocol:{uniswapV3:'9007199254740993',uniswapV4:'9007199254740994'}}});
+  const ranked=lib.rankArcFinancialActions(summary);assert.deepEqual(ranked.dex.map(r=>r.protocol),['uniswapV4','uniswapV3']);
+  assert.equal(ranked.combinedFinancialTotal,null);assert.equal(ranked.dexStatus,'available');
+  const tree=render({...STATES.ready,data:{...READY_DATA,summary}}).tree;
+  const section=sectionNode(tree,'top-protocols');assert.equal(item(tree,'top-protocols.volume-ranking').attrs['data-intel-status'],'available');
+  assert.deepEqual(byAttr(section,'data-financial-rank').map(n=>n.attrs['data-financial-rank']),['uniswapV4','uniswapV3']);
+  assert.deepEqual(byAttr(section,'data-financial-rank-usd').map(n=>n.attrs['data-financial-rank-usd']),['9007199254740994','9007199254740993']);
+  assert.match(textOf(section),/\$9,007,199,254\.74/);
+});
+await test('Financial ranking separates lending and bridge actions and retains subset coverage',async()=>{
+  const action=(value,status='complete')=>({status,scope:status==='complete'?'all_verified_window_amounts':'verified_priced_subset',usdMicros:value,
+    coverage:{expectedHours:24,storedHours:24,fullyValuedHours:status==='complete'?24:6},assets:[{token:ZERO_ADDRESS,symbol:'USDC',verified:true,decimals:18,
+      amountRaw:String(BigInt(value)*10n**12n),valuedAmountRaw:String(BigInt(value)*10n**12n),unvaluedAmountRaw:'0',usdMicros:value,blockers:[]}]});
+  const summary=summaryFixture({protocolUsd:{aaveV4:{status:'available',reason:null,values:null,actions:{borrowedUsdMicros:action('2000000'),suppliedUsdMicros:action('5000000')}},
+    morphoBlue:{status:'available',reason:null,values:null,actions:{borrowedUsdMicros:action('3000000','partial')}},
+    gateway:{status:'available',reason:null,values:null,actions:{depositUsdMicros:action('9000000')}}}});
+  const ranked=lib.rankArcFinancialActions(summary);assert.deepEqual(ranked.lending.borrowedUsdMicros.map(r=>r.protocol),['morphoBlue','aaveV4']);
+  assert.deepEqual(Object.keys(ranked.crossChain),['depositUsdMicros']);assert.equal(ranked.lending.borrowedUsdMicros[0].fullyValuedHours,6);
+  assert.equal(ranked.dex.length,0);assert.equal(ranked.combinedFinancialTotal,null);
+  const tree=render({...STATES.ready,data:{...READY_DATA,summary}}).tree;const text=textOf(sectionNode(tree,'top-protocols'));
+  assert.match(text,/Lending actions · separate USD rankings/);assert.match(text,/Cross-chain actions · separate USD rankings/);
+  assert.match(text,/Verified priced subset · 6 \/ 24 fully valued hours/);
+});
+await test('Financial ranking keeps absent prices, malformed values and unavailable actions out',async()=>{
+  for(const volume of [undefined,usdUnavailable(['prices_unavailable']),{...usdWindow('10'),byProtocol:{uniswapV3:'-1',uniswapV4:'11'}}]){
+    const summary=summaryFixture({usdVolume:volume});const ranked=lib.rankArcFinancialActions(summary);
+    assert.notEqual(ranked.dexStatus,'available');
+    const tree=render({...STATES.ready,data:{...READY_DATA,summary}}).tree;assert.equal(byAttr(sectionNode(tree,'top-protocols'),'data-financial-rank').length,0);
+  }
+  assert.deepEqual(lib.rankArcFinancialActions(null).dex,[]);
+});
 
 await test('Volume 1 DEX Volume is the exact window value from the API, with its unit, period, change and unvalued swaps stated', async () => {
   const kpi = item(rendered['ready-usd'].tree, 'network.total-volume');

@@ -1,0 +1,63 @@
+{
+  "scopeVersion": "arc-ui-product-scope-84-v1",
+  "scopeSha256": "644a73006433b128e79697d7346e43e2f9cc138147c5a52c740891e9caab9170",
+  "all84FieldsRemainRequired": true,
+  "productionAcceptancePassed": false,
+  "pendingFields": [
+    {
+      "id": "volume-chart.other",
+      "source": "Additional DEX: authoritative factory/manager deployment and ABI; Arco official contracts page is an unverified candidate, not a verified registry entry.",
+      "work": "Versioned source registry; historical validity and code checks; per-pool events and USD valuation; independent coverage.",
+      "dependency": "No additional DEX has been qualified in this isolated pipeline yet. No paid RPC requirement demonstrated."
+    },
+    {
+      "id": "top-protocols.volume-ranking",
+      "source": "Existing verified Uniswap V3/V4 swap USD valuations; existing lending/cross-chain per-action valuations.",
+      "work": "DEX-only USD ordering; separate lending and bridge action rankings, with per-action coverage. Never one combined volume.",
+      "dependency": "User comparison semantics resolved. Full-window valuation/read-model integration remains to implement and verify."
+    },
+    {
+      "id": "top-protocols.other",
+      "source": "Authoritative additional Arc protocol address/ABI/version registry. Current ADDITIONAL_VERIFIED_PROTOCOLS is empty.",
+      "work": "Explicit protocol source adapters, historical code/validity checks, per-action metrics and independent coverage.",
+      "dependency": "Qualified additional protocol definitions absent; generic ecosystem names are not contract evidence."
+    },
+    {
+      "id": "assets.other-verified",
+      "source": "Authoritative issuer/Arc mainnet asset registries beyond the existing five verified assets.",
+      "work": "Versioned issuer identity, native/contract decimal semantics, transfer stream, historical metadata and price validation.",
+      "dependency": "Additional issuer-qualified asset entries and acceptable historical price evidence have not been established."
+    },
+    {
+      "id": "borrow.action",
+      "source": "Installed Circle Borrow Kit, existing guarded write planner and per-market quote/capability checks.",
+      "work": "Explicit market selection, wallet capability, exact allowance and atomic transaction preview; retain write gate OFF.",
+      "dependency": "Cloud api.circle.com access is not currently allowed; actual market/quote data not validated here. No wallet transaction or write activation authorized. No paid plan requirement established."
+    },
+    {
+      "id": "rwa-other.other-protocols",
+      "source": "Additional issuer/protocol-owned Arc mainnet deployments and event specifications.",
+      "work": "Source-valid per-action raw flows; historical valuation only with independently verified prices.",
+      "dependency": "Additional verified protocol registry empty; token identity cannot establish protocol provenance."
+    },
+    {
+      "id": "rwa-other.exchange-flows",
+      "source": "Authoritative exchange-owned address attribution with source/version and validity block; existing canonical asset transfer streams.",
+      "work": "Exact attributed inbound/outbound flows per asset, independent coverage and USD valuation when verified.",
+      "dependency": "VERIFIED_EXCHANGE_ADDRESSES empty. No exchange labels will be inferred from transaction behavior."
+    },
+    {
+      "id": "rwa-other.more-protocols",
+      "source": "Same qualified additional protocol registry, preserved as a distinct required UI field.",
+      "work": "Complete coverage and readable protocol cards; no silent omission or duplicated availability claim.",
+      "dependency": "Additional protocol definitions have not been qualified."
+    }
+  ],
+  "paidServiceActivated": false,
+  "independentBackupTargetApproved": false,
+  "rules": [
+    "An implementation or synthetic test is not a real-mainnet acceptance result.",
+    "External unknowns do not block engineering of independently verified sources.",
+    "No source is classified verified merely because a public website names a protocol."
+  ]
+}

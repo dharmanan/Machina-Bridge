@@ -1,0 +1,25 @@
+{
+  "source": "user-provided read-only Railway inventory; not measured by this agent",
+  "reportedOn": "2026-10-10",
+  "volumeLimitBytes": 4838498304,
+  "contractMaximumBytes": 5000000000,
+  "usedBytes": 1978695680,
+  "freeBytes": 2859802624,
+  "sqliteBytes": 817713152,
+  "walBytes": 109369552,
+  "shmBytes": 32768,
+  "unattributedUsedBytes": 1051580208,
+  "pageSize": 4096,
+  "pageCount": 199655,
+  "freelistCount": 0,
+  "logicalDatabaseBytesFromPages": 817786880,
+  "pageVsMainDifferenceBytes": 73728,
+  "safetyReserveBytes": 536870912,
+  "remainingForAllNewDataAndWorkBytes": 2322931712,
+  "rules": [
+    "All existing used bytes remain reserved; no deletion or reuse of unattributed space assumed.",
+    "WAL, temporary space, indexes, live growth and all 84 fields must share the remaining budget.",
+    "Snapshot is not a current future capacity guarantee; activation requires a fresh bounded read-only preflight.",
+    "No production access, subscriptions or remote backup activation."
+  ]
+}

@@ -35,6 +35,7 @@ import {
   metricSum,
   familyMetrics,
   protocolActions,
+  rankArcFinancialActions,
   verifiedFamilyCoverage,
   percentChange,
   shortenAddress,
@@ -940,6 +941,10 @@ const PROTOCOL_ROWS: { item: string; name: string; category: string; family: (su
 ]
 
 function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
+  const financial = rankArcFinancialActions(ctx.mode === 'ready' ? ctx.summary : null)
+  const names: Record<string, string> = { uniswapV3: 'Uniswap V3', uniswapV4: 'Uniswap V4', aaveV4: 'Aave',
+    morphoBlue: 'Morpho Blue', morphoVaultsV2: 'Morpho Vaults', cctp: 'CCTP', gateway: 'Gateway', across: 'Across' }
+  const rankingStatus = ctx.mode === 'ready' ? financial.dexStatus : ctx.mode === 'loading' ? 'loading' : 'unavailable'
   const rows = PROTOCOL_ROWS.map((row) => {
     const family = ctx.summary ? row.family(ctx.summary) : null
     return { ...row, cell: numberCell(ctx, family, metricSum(family, row.fields), formatCount) }
@@ -949,16 +954,39 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
   return (
     <section data-intel-section="top-protocols" aria-label="Top Protocols" className={`${CARD} min-w-0`}>
       <CardHeader title="Top Protocols" subtitle={`Verified Arc protocols, last ${ctx.windowLabel}`} />
-      <div {...markerProps('top-protocols.volume-ranking', 'source_pending')}
-        className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-dashed border-slate-200 px-3 py-2">
-        <div className="min-w-0">
-          <p className="text-xs font-semibold text-slate-700">Ranked by USD volume</p>
-          <p className="text-[11px] leading-4 text-slate-500">
-            Not available: lending and bridge USD values are kept per action (supplied, borrowed, sent), so protocols share no comparable USD volume. Listed in a fixed order.
-          </p>
+      <div {...markerProps('top-protocols.volume-ranking', rankingStatus)}
+        className="mt-3 min-w-0 rounded-lg border border-slate-200 px-3 py-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs font-semibold text-slate-700">DEX USD volume ranking</p>
+          {rankingStatus !== 'available' && <StatusPill status={rankingStatus} />}
         </div>
-        <StatusPill status="source_pending" />
+        <p className="mt-1 text-[11px] leading-4 text-slate-500">DEX volume is compared separately. Lending and cross-chain values are ranked per action and never added together.</p>
+        {rankingStatus === 'available' ? <ol className="mt-2 space-y-1.5" aria-label="DEX protocols ranked by verified USD volume">
+          {financial.dex.map(row => <li key={row.protocol} data-financial-rank={row.protocol}
+            className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-x-3 gap-y-0.5 text-xs">
+            <span className="min-w-0 font-medium text-slate-700">{names[row.protocol]}</span>
+            <span data-financial-rank-usd={row.usdMicros} className="min-w-0 text-right font-semibold tabular-nums text-slate-900 [overflow-wrap:anywhere]">{formatUsdMicros(row.usdMicros)}</span>
+          </li>)}
+        </ol> : <p className="mt-1 text-[11px] text-slate-500">{rankingStatus === 'collecting' ? collectingText(ctx) : ctx.mode === 'ready' ? reasonText(ctx.summary?.dex.usdVolume?.reason) : noteFor(ctx, rankingStatus)}</p>}
+        {rankingStatus === 'available' && financial.unvaluedSwaps !== null && financial.unvaluedSwaps > 0 &&
+          <p className="mt-1 text-[10px] text-slate-500">Verified priced swaps only; {formatCount(financial.unvaluedSwaps)} unpriced swaps are excluded.</p>}
       </div>
+      {([['Lending actions', financial.lending], ['Cross-chain actions', financial.crossChain]] as const).map(([title, actions]) =>
+        Object.keys(actions).length > 0 && <details key={title} className="mt-2 min-w-0 rounded-lg border border-slate-100 px-3 py-2 text-[11px]">
+          <summary className="cursor-pointer font-semibold text-slate-700">{title} · separate USD rankings</summary>
+          {Object.entries(actions).map(([action, entries]) => <div key={action} className="mt-2 min-w-0">
+            <p className={LABEL}>{Object.values(PROTOCOL_USD_FIELDS).flat().find(([, key]) => key === action)?.[0] ?? action}</p>
+            <ol aria-label={`${title}: ${action}`} className="mt-1 space-y-1">
+              {entries.map(row => <li key={row.protocol} className="min-w-0">
+                <div className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-x-3 gap-y-0.5">
+                  <span className="min-w-0 text-slate-600">{names[row.protocol]}</span>
+                  <span className="min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]">{formatUsdMicros(row.usdMicros)}</span>
+                </div>
+                {row.status === 'partial' && <p className="text-[10px] text-slate-500">Verified priced subset · {row.fullyValuedHours} / {row.expectedHours} fully valued hours</p>}
+              </li>)}
+            </ol>
+          </div>)}
+        </details>)}
       <div className="mt-3 flex items-center justify-between gap-2">
         <p className={LABEL}>Activity, last {ctx.windowLabel}</p>
         {shared && <InlineStatus status={shared} />}

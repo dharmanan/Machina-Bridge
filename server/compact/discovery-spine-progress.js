@@ -1,6 +1,7 @@
 // Incremental recovery inputs, not canonical hours or a completed discovery unit.
 // Full RPC calldata is discarded; the exact validated compact spine survives restart.
 import { createHash } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { spineBlockOf } from './spine.js';
 import { evidenceJson } from './discovery-evidence.js';
 
@@ -162,4 +163,97 @@ export function spineNetwork(db, h, unit, cursor) {
     uniqueSenders: count('txFrom'), uniqueRecipients: count('txTo'), uniqueActiveAddresses: active,
     gasUsedRaw: cursor.gasUsed, averageTransactionsPerBlock: cursor.transactions / cursor.blocks,
     transactionsPerSecond: cursor.transactions / 3600, internal: { deploymentAttempts: cursor.deployments } };
+}
+
+// Reduced, versioned progress in the SAME compact database. Old full-spine rows remain immutable/readable.
+// One current exact reducer state, plus small immutable range commitments: no raw bodies or raw logs.
+export const SLICE_PROGRESS_VERSION = 'compact-discovery-slices-v1';
+// Base64 + envelope must still fit the existing 2 MiB compact_meta read bound.
+const MAX_SLICE_PACKED_BYTES = 3 * MiB / 2 - 4096;
+const slicePrefix = (h, unit) => `discovery_slice_piece:${h.hour_start}:${unit.id}:`;
+const sliceCursorKey = (h, unit) => `discovery_slice_cursor:${h.hour_start}:${unit.id}`;
+const sliceIdentity = (h, unit) => ({ ...identity(h, unit), version: SLICE_PROGRESS_VERSION });
+const sliceRows = (db, h, unit) => db.prepare('SELECT key,CASE WHEN length(CAST(value AS BLOB))<=65536 THEN value END AS value FROM compact_meta WHERE key>=? AND key<? ORDER BY key LIMIT 15001')
+  .iterate(slicePrefix(h, unit), slicePrefix(h, unit) + '~');
+const packSlice = value => {
+  const raw = Buffer.from(evidenceJson(value)); if (raw.length > 8 * MiB) fail('recovery_slice_size_limit');
+  const packed = gzipSync(raw, { level: 6 });
+  if (packed.length > MAX_SLICE_PACKED_BYTES) fail('recovery_slice_size_limit');
+  return evidenceJson({ version: SLICE_PROGRESS_VERSION, bytes: raw.length, sha: digest(value), packed: packed.toString('base64') });
+};
+const unpackSlice = text => {
+  let wire, raw, value;
+  try { wire = JSON.parse(text); if (wire.version !== SLICE_PROGRESS_VERSION || !Number.isInteger(wire.bytes) || wire.bytes < 1 || wire.bytes > 8 * MiB
+    || typeof wire.packed !== 'string' || wire.packed.length > 2 * MiB) fail('recovery_slice_corrupt');
+    const packed = Buffer.from(wire.packed, 'base64'); if (packed.length > MAX_SLICE_PACKED_BYTES || packed.toString('base64') !== wire.packed) fail('recovery_slice_corrupt');
+    raw = gunzipSync(packed, { maxOutputLength: 8 * MiB }); value = JSON.parse(raw);
+  } catch { fail('recovery_slice_corrupt'); }
+  if (raw.length !== wire.bytes || digest(value) !== wire.sha) fail('recovery_slice_corrupt'); return value;
+};
+export function recoverySliceProgress(db, h, unit) {
+  const binding = sliceIdentity(h, unit), cursor = read(db, sliceCursorKey(h, unit));
+  if (!cursor) {
+    if (sliceRows(db, h, unit).next().value) fail('recovery_slice_cursor_missing');
+    return { nextBlock: h.first_block, blocks: 0, lastHash: h.parent_hash, lastTimestamp: h.hour_start, lastDigest: null, state: null };
+  }
+  const value = unpackSlice(evidenceJson(cursor));
+  if (digest(value.identity) !== digest(binding)) fail('recovery_slice_binding_conflict');
+  let next = h.first_block, previous = null, lastHash = h.parent_hash, lastTimestamp = h.hour_start;
+  for (const row of sliceRows(db, h, unit)) {
+    if (row.value === null) fail('recovery_slice_size_limit');
+    let piece;
+    try { piece=checked(JSON.parse(row.value),binding); } catch { fail('recovery_slice_corrupt'); }
+    if (piece.first !== next || !Number.isSafeInteger(piece.last) || piece.last < next || piece.last > h.last_block
+      || piece.last - piece.first + 1 > 32 || piece.previousDigest !== previous
+      || !/^0x[0-9a-f]{64}$/.test(piece.lastHash) || !/^[0-9a-f]{64}$/.test(piece.inputSha256)
+      || !/^[0-9a-f]{64}$/.test(piece.stateSha) || !Number.isSafeInteger(piece.lastTimestamp)
+      || piece.lastTimestamp < lastTimestamp || piece.lastTimestamp >= h.hour_start + 3600
+      || row.key !== slicePrefix(h, unit) + String(next).padStart(16, '0')) fail('recovery_slice_corrupt');
+    next = piece.last + 1; previous = digest(piece); lastHash = piece.lastHash; lastTimestamp = piece.lastTimestamp;
+    if (next === value.nextBlock && piece.stateSha !== digest(value.state)) fail('recovery_slice_corrupt');
+  }
+  if (value.nextBlock !== next || value.blocks !== next - h.first_block || value.blocks < 1 || value.lastDigest !== previous
+    || value.lastHash !== lastHash || value.lastTimestamp !== lastTimestamp || next === h.last_block + 1 && lastHash !== h.last_hash) fail('recovery_slice_corrupt');
+  return value;
+}
+export function recoverySliceUsage(db) {
+  const usage = read(db, 'discovery_slice_usage');
+  if (!usage) {
+    if (db.prepare("SELECT 1 FROM compact_meta WHERE key>='discovery_slice_cursor:' AND key<'discovery_slice_cursor;' LIMIT 1").get()) fail('recovery_slice_usage_corrupt');
+    return { bytes: 0, dayStart: 0, dayBytes: 0 };
+  }
+  if (usage.version !== SLICE_PROGRESS_VERSION || ![usage.bytes, usage.dayStart, usage.dayBytes].every(n => Number.isSafeInteger(n) && n >= 0)
+    || usage.dayBytes > usage.bytes) fail('recovery_slice_usage_corrupt'); return usage;
+}
+// Caller owns the canonical guard and BEGIN IMMEDIATE. Cursor, checksum chain and accounting commit together.
+export function appendRecoverySlice(db, h, unit, { first, last, lastHash, lastTimestamp, inputSha256, state },
+  { maxTotalBytes, maxDailyBytes, archiveBytes = 0, archiveDayBytes = 0, beforeCommit = () => {} }) {
+  const old = recoverySliceProgress(db, h, unit), binding = sliceIdentity(h, unit);
+  if (first !== old.nextBlock || !Number.isSafeInteger(last) || last < first || last > h.last_block || last - first + 1 > 32
+    || !/^0x[0-9a-f]{64}$/.test(lastHash) || !/^[0-9a-f]{64}$/.test(inputSha256)
+    || !Number.isSafeInteger(lastTimestamp) || lastTimestamp < old.lastTimestamp || lastTimestamp >= h.hour_start + 3600
+    || last === h.last_block && lastHash !== h.last_hash) fail('recovery_slice_conflict');
+  const piece = { identity: binding, first, last, lastHash, lastTimestamp, inputSha256, previousDigest: old.lastDigest, stateSha: digest(state) };
+  const checksum = digest(piece), pieceText = evidenceJson({ ...piece, checksum });
+  const cursor = { identity: binding, nextBlock: last + 1, blocks: last - h.first_block + 1, lastHash, lastTimestamp, lastDigest: checksum, state };
+  const cursorText = packSlice(cursor), prior = db.prepare('SELECT length(CAST(value AS BLOB)) bytes FROM compact_meta WHERE key=?').get(sliceCursorKey(h, unit))?.bytes ?? 0;
+  const addedBytes = Buffer.byteLength(cursorText) - prior + Buffer.byteLength(pieceText), usage = recoverySliceUsage(db);
+  const bytes = usage.bytes + addedBytes, dayStart = Math.floor(Date.now() / 86400000) * 86400;
+  // Shared daily quota counts net retained bytes, matching the existing archive/spine accounting.
+  const dayBytes = (usage.dayStart === dayStart ? usage.dayBytes : 0) + Math.max(0, addedBytes);
+  const legacy = spineStorageUsage(db);
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || !Number.isSafeInteger(maxTotalBytes) || bytes + legacy.bytes + archiveBytes > maxTotalBytes
+    || !Number.isSafeInteger(maxDailyBytes) || dayBytes + (legacy.dayStart === dayStart ? legacy.dayBytes : 0) + archiveDayBytes > maxDailyBytes) fail('recovery_slice_storage_budget');
+  db.exec(`CREATE TRIGGER IF NOT EXISTS compact_slice_no_update BEFORE UPDATE ON compact_meta
+    WHEN OLD.key GLOB 'discovery_slice_piece:*' BEGIN SELECT RAISE(ABORT,'immutable_recovery_slice'); END;
+    CREATE TRIGGER IF NOT EXISTS compact_slice_no_delete BEFORE DELETE ON compact_meta
+    WHEN OLD.key GLOB 'discovery_slice_piece:*' BEGIN SELECT RAISE(ABORT,'immutable_recovery_slice'); END;
+    CREATE TRIGGER IF NOT EXISTS compact_slice_no_replace BEFORE INSERT ON compact_meta
+    WHEN NEW.key GLOB 'discovery_slice_piece:*' AND EXISTS(SELECT 1 FROM compact_meta WHERE key=NEW.key)
+    BEGIN SELECT RAISE(ABORT,'immutable_recovery_slice'); END;`);
+  db.prepare('INSERT INTO compact_meta VALUES(?,?)').run(slicePrefix(h, unit) + String(first).padStart(16, '0'), pieceText);
+  const upsert = db.prepare('INSERT INTO compact_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+  upsert.run(sliceCursorKey(h, unit), cursorText);
+  upsert.run('discovery_slice_usage', evidenceJson({ version: SLICE_PROGRESS_VERSION, bytes, dayStart, dayBytes }));
+  recoverySliceProgress(db, h, unit); beforeCommit(); return cursor;
 }

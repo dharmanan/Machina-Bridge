@@ -1,0 +1,848 @@
+{
+  "version": "arc-ui-product-scope-84-v1",
+  "scopeSha256": "644a73006433b128e79697d7346e43e2f9cc138147c5a52c740891e9caab9170",
+  "fields": [
+    {
+      "id": "window.24h",
+      "section": "network",
+      "label": "24H window",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "24 canonical saat ve her family/projection için ayrı doğrulama; pencere seçimi.",
+      "history": "24 saat + önceki dönem karşılaştırması için önceki24 (toplam48).",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "window.7d",
+      "section": "network",
+      "label": "7D window: daily buckets, totals once all 168 hours are stored",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Tam168 canonical saat ve eksiksiz günlük buckets; mevcut7D davranışı tam kapsam gerektirir.",
+      "history": "168 saat; önceki dönem göstergeleri için336.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "window.30d",
+      "section": "network",
+      "label": "30D window: available verified history and complete UTC-day buckets, with actual coverage",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Seçili720 saat; mevcut ürün partial verified history’yi açık kapsamla gösterir; full total ancak720/720.",
+      "history": "720 saat; önceki dönem göstergeleri için1440. Chain genesis yeni RPC’de May12, zincir yaşı yeterli; bunun bütün state/log erişimi henüz kanıtlanmadı.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.active-addresses",
+      "section": "network",
+      "label": "Active Addresses: unique within 24H; not counted over 7D or 30D (identities are kept for one day)",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Distinct(tx.from ∪ non-null tx.to), tekrar eden adres saatler arasında tek sayılır.",
+      "history": "Pencerenin bütün saatleri için durably verified üyelik gerekir.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.transactions",
+      "section": "network",
+      "label": "Transactions",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Her doğrulanmış blok transaction listesi uzunluklarının toplamı; outcome dahil değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.total-volume",
+      "section": "network",
+      "label": "DEX Volume: USD-valued Uniswap V3 and V4 swaps on Arc, each swap counted once",
+      "originalBackend": "live",
+      "source": "V3/V4 raw swap projections + valuation.js verified USDC-anchored hourly prices",
+      "calculation": "Her swap için tek taraf USD; USDC anchor veya verified price; unvalued swaps ayrı; global transfer hacmi değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.average-fee",
+      "section": "network",
+      "label": "Avg DEX Pool Fee: estimated Uniswap pool fees / fee-valued swaps; not Arc gas or network fee; excludes per step rounding and hook fees",
+      "originalBackend": "live",
+      "source": "V3 fee tier, V4 her Swap applied fee, input amounts ve hourly verified prices",
+      "calculation": "Estimated pool fee USD / fee-valued swaps; rounding/hook fees hariç; gas fee değildir.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.blocks",
+      "section": "network",
+      "label": "Blocks",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Kesintisiz canonical blok sayısı: last-first+1.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.tps",
+      "section": "network",
+      "label": "Transactions per second",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Doğrulanmış transaction count / kapsanan seconds; missing saat denominator’a tam veri gibi katılmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "network.gas-used",
+      "section": "network",
+      "label": "Gas used",
+      "originalBackend": "live",
+      "source": "Canonical tam bloklar ve top-level işlemler (spine.js, families.js)",
+      "calculation": "Blok gasUsed BigInt toplamı; gas fiyatı veya USD gas fee değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Kesintisiz blok numarası/parentHash, UTC saat sınırları, işlem listesi bütünlüğü, network SHA256."
+    },
+    {
+      "id": "volume-chart.volume",
+      "section": "volume-chart",
+      "label": "Volume tab: USD volume per hour (24H) or per day (7D, 30D) across all verified pairs, each swap counted once",
+      "originalBackend": "live",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Saatlik swap sayısı veya her swapı bir kez değerleyen USD; günlük eksiksiz saatlerin toplamı; eksik aralık null.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "volume-chart.swaps",
+      "section": "volume-chart",
+      "label": "Swaps tab: swap events per hour (24H) or per day (7D, 30D) across all verified pairs",
+      "originalBackend": "live",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Saatlik swap sayısı veya her swapı bir kez değerleyen USD; günlük eksiksiz saatlerin toplamı; eksik aralık null.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "volume-chart.uniswap-v3",
+      "section": "volume-chart",
+      "label": "Uniswap V3",
+      "originalBackend": "live",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Saatlik swap sayısı veya her swapı bir kez değerleyen USD; günlük eksiksiz saatlerin toplamı; eksik aralık null.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "volume-chart.uniswap-v4",
+      "section": "volume-chart",
+      "label": "Uniswap V4",
+      "originalBackend": "live",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Saatlik swap sayısı veya her swapı bir kez değerleyen USD; günlük eksiksiz saatlerin toplamı; eksik aralık null.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "volume-chart.other",
+      "section": "volume-chart",
+      "label": "Other verified DEX protocols",
+      "originalBackend": "pending",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Saatlik swap sayısı veya her swapı bir kez değerleyen USD; günlük eksiksiz saatlerin toplamı; eksik aralık null.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "volume-chart.latest",
+      "section": "volume-chart",
+      "label": "Latest complete period and peak period",
+      "originalBackend": "live",
+      "source": "Resmî V3 factory/pool ve V4 PoolManager logları + fiyat/fee projectionları",
+      "calculation": "Son tamamlanmış bucket ve available bucketlar arasından max; missing bucket sıfır değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. V3 factory üyeliği, V4 PoolKey keccak, fiyat politikası."
+    },
+    {
+      "id": "active-addresses-chart.series",
+      "section": "active-addresses-chart",
+      "label": "Active addresses per hour (24H) or persisted exact distinct counts per completed UTC day (7D, 30D)",
+      "originalBackend": "live",
+      "source": "Canonical tx.from ∪ boş olmayan tx.to; kalıcı günlük distinct replay",
+      "calculation": "Her saatin veya tamamlanmış UTC gününün adres birleşiminin cardinality değeri; saatlik sayılar toplanmaz.",
+      "history": "24H: saatlik üyelik. 7D/30D: bütün 24 saatlik üyeliklerin doğrulanmış günlük birleşimleri; tarihsel üyelik veya tam tx spine gerekir.",
+      "verification": "Üyelik sayısı canonical saat sayısıyla eşit; replay sürümü+checksum; 24/24 saat olmadan gün tamamlanmaz."
+    },
+    {
+      "id": "active-addresses-chart.latest",
+      "section": "active-addresses-chart",
+      "label": "Latest complete period and peak period",
+      "originalBackend": "live",
+      "source": "Canonical tx.from ∪ boş olmayan tx.to; kalıcı günlük distinct replay",
+      "calculation": "Son tamamlanmış distinct bucket ve max; günlük sonuç sadece24/24 doğrulanmış üyelikle.",
+      "history": "24H: saatlik üyelik. 7D/30D: bütün 24 saatlik üyeliklerin doğrulanmış günlük birleşimleri; tarihsel üyelik veya tam tx spine gerekir.",
+      "verification": "Üyelik sayısı canonical saat sayısıyla eşit; replay sürümü+checksum; 24/24 saat olmadan gün tamamlanmaz."
+    },
+    {
+      "id": "top-protocols.volume-ranking",
+      "section": "top-protocols",
+      "label": "Ranking by verified volume: blocked, lending and bridge USD values are per action and never one comparable volume",
+      "originalBackend": "pending",
+      "source": "Henüz ortak karşılaştırılabilir finansal metrik tanımı yok.",
+      "calculation": "Yok; supply/repay/bridge/deposit/swap USD tutarlarını bir toplamda toplamak yanıltır.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.uniswap-v3",
+      "section": "top-protocols",
+      "label": "Uniswap V3",
+      "originalBackend": "live",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.uniswap-v4",
+      "section": "top-protocols",
+      "label": "Uniswap V4",
+      "originalBackend": "live",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.aave",
+      "section": "top-protocols",
+      "label": "Aave",
+      "originalBackend": "live",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.morpho-blue",
+      "section": "top-protocols",
+      "label": "Morpho Blue",
+      "originalBackend": "live",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.morpho-vaults",
+      "section": "top-protocols",
+      "label": "Morpho Vaults",
+      "originalBackend": "live",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-protocols.other",
+      "section": "top-protocols",
+      "label": "Other verified Arc protocols",
+      "originalBackend": "pending",
+      "source": "V3/V4 swaps; Aave V4 Spoke, Morpho Blue, VaultV2 doğrulanmış olayları",
+      "calculation": "Mevcut tabloda protokole göre swap/pozisyon/vault olay sayısı; sabit gösterim sırası, ortak USD hacim sıralaması değil.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Doğru protocol sürümü ve historical code/state."
+    },
+    {
+      "id": "top-pools-v3.all-pairs",
+      "section": "top-pools-v3",
+      "label": "All verified V3 pairs, not only USDC pairs",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Pencere swap sayısıyla sıralama (tie pool ID), USD hacim tek swap tarafı; TVL iki token bakiyesinin fiyatlı toplamı; new pools=PoolCreated.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v3.volume",
+      "section": "top-pools-v3",
+      "label": "Pool volume in USD over the window, shown beside the swap count",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Pencere swap sayısıyla sıralama (tie pool ID), USD hacim tek swap tarafı; TVL iki token bakiyesinin fiyatlı toplamı; new pools=PoolCreated.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v3.swaps",
+      "section": "top-pools-v3",
+      "label": "Pool swap count, labelled as a count: the ranking of the table",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Pencere swap sayısıyla sıralama (tie pool ID), USD hacim tek swap tarafı; TVL iki token bakiyesinin fiyatlı toplamı; new pools=PoolCreated.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v3.liquidity",
+      "section": "top-pools-v3",
+      "label": "Pool liquidity: value held in the pool (TVL style), read from pool state for the top pools",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Pencere swap sayısıyla sıralama (tie pool ID), USD hacim tek swap tarafı; TVL iki token bakiyesinin fiyatlı toplamı; new pools=PoolCreated.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v3.new-pools",
+      "section": "top-pools-v3",
+      "label": "New V3 pools in the window",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Penceredeki resmî PoolCreated olay sayısı, factory creation evidence.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v3.pool-count",
+      "section": "top-pools-v3",
+      "label": "Verified V3 pools tracked",
+      "originalBackend": "live",
+      "source": "Resmî V3 PoolCreated registry + Swap/Mint/Burn; token.balanceOf(pool) tarihsel state",
+      "calculation": "Resmî factory registry’de coverage sınırına kadar canonical PoolCreated unique address count.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Registry başlangıcından snapshot son bloğuna kadar factory kapsamı; dated TVL snapshot.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory created_block, pool token/fee kimliği, fiyatlı tutarlar, snapshot block."
+    },
+    {
+      "id": "top-pools-v4.all-pairs",
+      "section": "top-pools-v4",
+      "label": "All verified V4 pairs, not only USDC pairs",
+      "originalBackend": "live",
+      "source": "Resmî PoolManager Initialize/Swap/ModifyLiquidity + historical extsload state",
+      "calculation": "Swap sayısı sıralaması; tek taraf USD; tam tick sweep ile estimated principal reserves, uncollected fees/per-position rounding hariç.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. PoolKey registry başlangıç kapsamı; snapshot son bloğundaki tüm initialized ticks.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. PoolId=keccak(PoolKey), tick-net sweep mevcut liquidity ile eşit, doğru historical block."
+    },
+    {
+      "id": "top-pools-v4.volume",
+      "section": "top-pools-v4",
+      "label": "Pool volume in USD over the window, shown beside the swap count",
+      "originalBackend": "live",
+      "source": "Resmî PoolManager Initialize/Swap/ModifyLiquidity + historical extsload state",
+      "calculation": "Swap sayısı sıralaması; tek taraf USD; tam tick sweep ile estimated principal reserves, uncollected fees/per-position rounding hariç.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. PoolKey registry başlangıç kapsamı; snapshot son bloğundaki tüm initialized ticks.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. PoolId=keccak(PoolKey), tick-net sweep mevcut liquidity ile eşit, doğru historical block."
+    },
+    {
+      "id": "top-pools-v4.swaps",
+      "section": "top-pools-v4",
+      "label": "Pool swap count, labelled as a count: the ranking of the table",
+      "originalBackend": "live",
+      "source": "Resmî PoolManager Initialize/Swap/ModifyLiquidity + historical extsload state",
+      "calculation": "Swap sayısı sıralaması; tek taraf USD; tam tick sweep ile estimated principal reserves, uncollected fees/per-position rounding hariç.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. PoolKey registry başlangıç kapsamı; snapshot son bloğundaki tüm initialized ticks.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. PoolId=keccak(PoolKey), tick-net sweep mevcut liquidity ile eşit, doğru historical block."
+    },
+    {
+      "id": "top-pools-v4.liquidity",
+      "section": "top-pools-v4",
+      "label": "Estimated principal reserves from pool state for the top pools; excludes uncollected fees and position rounding",
+      "originalBackend": "live",
+      "source": "Resmî PoolManager Initialize/Swap/ModifyLiquidity + historical extsload state",
+      "calculation": "Swap sayısı sıralaması; tek taraf USD; tam tick sweep ile estimated principal reserves, uncollected fees/per-position rounding hariç.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. PoolKey registry başlangıç kapsamı; snapshot son bloğundaki tüm initialized ticks.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. PoolId=keccak(PoolKey), tick-net sweep mevcut liquidity ile eşit, doğru historical block."
+    },
+    {
+      "id": "top-pools-v4.new-pools",
+      "section": "top-pools-v4",
+      "label": "New V4 pools in the window",
+      "originalBackend": "live",
+      "source": "Resmî PoolManager Initialize/Swap/ModifyLiquidity + historical extsload state",
+      "calculation": "Penceredeki valid Initialize count, V4 PoolKey keccak eşitliği.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. PoolKey registry başlangıç kapsamı; snapshot son bloğundaki tüm initialized ticks.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. PoolId=keccak(PoolKey), tick-net sweep mevcut liquidity ile eşit, doğru historical block."
+    },
+    {
+      "id": "recent-activity.all",
+      "section": "recent-activity",
+      "label": "All",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.swaps",
+      "section": "recent-activity",
+      "label": "Swaps",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.adds",
+      "section": "recent-activity",
+      "label": "Adds",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.removes",
+      "section": "recent-activity",
+      "label": "Removes",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.time",
+      "section": "recent-activity",
+      "label": "Time",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.type",
+      "section": "recent-activity",
+      "label": "Activity type",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.protocol",
+      "section": "recent-activity",
+      "label": "Protocol",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Verified emitter üyeliği; router/aggregator adı değil.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.pair",
+      "section": "recent-activity",
+      "label": "Pair, all verified pairs",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Block/log sırasına göre son olaylar, token atomları decimal ile gösterilir; from=tx.from; to=olayın recipient/owner alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.amounts",
+      "section": "recent-activity",
+      "label": "Token amounts",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "ABI signed Swap/Mint/Burn raw amounts + verified token decimals; fiyat yoksa token miktarı USD’ye çevrilmez.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.from",
+      "section": "recent-activity",
+      "label": "From: transaction sender",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Log transactionIndex’inin aynı block spine tx.from adresi, event sender değil.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.to",
+      "section": "recent-activity",
+      "label": "To: recipient or owner recorded by the event; V4 swaps state why none exists",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "V3 recipient veya liquidity owner gibi açık decoded event alanı.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "recent-activity.transaction-links",
+      "section": "recent-activity",
+      "label": "Transaction links",
+      "originalBackend": "live",
+      "source": "Doğrulanmış V3/V4 olaylar ve aynı canonical işlem spine",
+      "calculation": "Canonical transactionHash için explorer linki; receipt başarı kanıtı değil.",
+      "history": "API seçilen pencereyi almaz; güncel son 25 kayıt. Ingestion en çok 500/kind kabul eder, tüm faaliyet arşivi değildir.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Sender canonical tx listesine bağlı; counterpart semantiği olay bazlı."
+    },
+    {
+      "id": "assets.usdc",
+      "section": "assets",
+      "label": "USDC",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.eurc",
+      "section": "assets",
+      "label": "EURC",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.cirbtc",
+      "section": "assets",
+      "label": "cirBTC",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.weth",
+      "section": "assets",
+      "label": "WETH",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.usyc",
+      "section": "assets",
+      "label": "USYC",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.other-verified",
+      "section": "assets",
+      "label": "Other verified Arc assets",
+      "originalBackend": "pending",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "assets.new-tokens",
+      "section": "assets",
+      "label": "Newly discovered tokens",
+      "originalBackend": "live",
+      "source": "Resmî Arc asset registry, canonical USDC system Transfer, verified ERC20 Transfer; discovery için receipts/code/views/factory olayları",
+      "calculation": "Adres bazlı transfer/mint/burn sayısı ve exact token ham tutarı; discovery evidence ve token kimliği ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Canonical registry başlangıcı; token metadata tarihsel readBlock; ilk gözlem kanıt kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. USDC system 18 decimals vs ERC20 6 decimals ayrımı; symbol kimlik kanıtı değildir; negative-control token views."
+    },
+    {
+      "id": "launches.token",
+      "section": "launches",
+      "label": "Token",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.symbol-address",
+      "section": "launches",
+      "label": "Symbol and address",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Gerçek adres; symbol/name yalnız tarihsel ERC20 view display metadata, doğrulanmış token brand kimliği değil.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.source",
+      "section": "launches",
+      "label": "Launch source",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.time",
+      "section": "launches",
+      "label": "Launch time",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.transaction",
+      "section": "launches",
+      "label": "Launch transaction",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.initial-pool",
+      "section": "launches",
+      "label": "Initial pair or pool",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.dex-activity",
+      "section": "launches",
+      "label": "DEX activity",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "İlk gözlenen Swap/Liquidity ve pool creation’dan itibaren eksiksiz interval varsa proven first; diğer durumda observed.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "launches.status",
+      "section": "launches",
+      "label": "Status",
+      "originalBackend": "live",
+      "source": "Resmî Argus/Tolly/Archemist V2/Openlaunch event+factory ABI/bytecode/view kanıtı veya doğrulanmış creation receipt",
+      "calculation": "Token address, unverified symbol, source/type, event timestamp/tx/block, doğrulanmış initial pool ve observed/proven DEX evidence.",
+      "history": "24/168/720 saatin kaynak coverage kayıtları; factory validity interval. First-ever DEX kanıtı için pool creation’dan ilk etkinliğe kadar eksiksiz geçmiş.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Factory code/event/view ayrı proof; creation receipt status/address; token views+negative control; firstObserved != firstProven."
+    },
+    {
+      "id": "borrow.route",
+      "section": "borrow",
+      "label": "cirBTC collateral to USDC borrow, on Morpho on Arc, through Circle Borrow Kit",
+      "originalBackend": "live",
+      "source": "Circle Borrow Kit: https://api.circle.com/v1/borrowKit/markets?chain=ARC&pageSize=20",
+      "calculation": "SDK wire-format ham miktar+decimals dönüşümü; APY/LLTV/utilization/liquidity upstream; canonical cirBTC/USDC market ID listesi.",
+      "history": "Mevcut kart anlık market terms; 24H/7D/30D lending ile aynı tarihsel seri değil.",
+      "verification": "Arc chain, Morpho protocol, bytes32 marketId, resmî token adres/decimals/symbol eşitliği; nulls korunur."
+    },
+    {
+      "id": "borrow.market-list",
+      "section": "borrow",
+      "label": "Every validated Arc cirBTC/USDC Morpho market, listed by market ID for display only (not a ranking)",
+      "originalBackend": "live",
+      "source": "Circle Borrow Kit: https://api.circle.com/v1/borrowKit/markets?chain=ARC&pageSize=20",
+      "calculation": "SDK wire-format ham miktar+decimals dönüşümü; APY/LLTV/utilization/liquidity upstream; canonical cirBTC/USDC market ID listesi.",
+      "history": "Mevcut kart anlık market terms; 24H/7D/30D lending ile aynı tarihsel seri değil.",
+      "verification": "Arc chain, Morpho protocol, bytes32 marketId, resmî token adres/decimals/symbol eşitliği; nulls korunur."
+    },
+    {
+      "id": "borrow.market-id",
+      "section": "borrow",
+      "label": "Shortened market ID of each listed market",
+      "originalBackend": "live",
+      "source": "Circle Borrow Kit: https://api.circle.com/v1/borrowKit/markets?chain=ARC&pageSize=20",
+      "calculation": "SDK wire-format ham miktar+decimals dönüşümü; APY/LLTV/utilization/liquidity upstream; canonical cirBTC/USDC market ID listesi.",
+      "history": "Mevcut kart anlık market terms; 24H/7D/30D lending ile aynı tarihsel seri değil.",
+      "verification": "Arc chain, Morpho protocol, bytes32 marketId, resmî token adres/decimals/symbol eşitliği; nulls korunur."
+    },
+    {
+      "id": "borrow.market-terms",
+      "section": "borrow",
+      "label": "Borrow APY, liquidation LTV, utilization and available liquidity of each market, read only from Circle Borrow Kit",
+      "originalBackend": "live",
+      "source": "Circle Borrow Kit: https://api.circle.com/v1/borrowKit/markets?chain=ARC&pageSize=20",
+      "calculation": "SDK wire-format ham miktar+decimals dönüşümü; APY/LLTV/utilization/liquidity upstream; canonical cirBTC/USDC market ID listesi.",
+      "history": "Mevcut kart anlık market terms; 24H/7D/30D lending ile aynı tarihsel seri değil.",
+      "verification": "Arc chain, Morpho protocol, bytes32 marketId, resmî token adres/decimals/symbol eşitliği; nulls korunur."
+    },
+    {
+      "id": "borrow.action",
+      "section": "borrow",
+      "label": "Borrow action with explicit market selection, rendered only when Machina borrowing writes are enabled",
+      "originalBackend": "pending",
+      "source": "Kullanıcının seçtiği market için ayrıca yetkilendirilmiş Borrow Kit transaction akışı.",
+      "calculation": "Analitik veri üretimi değil; mevcut write enable kapalı.",
+      "history": "Mevcut kart anlık market terms; 24H/7D/30D lending ile aynı tarihsel seri değil.",
+      "verification": "Arc chain, Morpho protocol, bytes32 marketId, resmî token adres/decimals/symbol eşitliği; nulls korunur."
+    },
+    {
+      "id": "lending.aave",
+      "section": "lending",
+      "label": "Aave",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "lending.morpho-blue",
+      "section": "lending",
+      "label": "Morpho Blue",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "lending.morpho-vaults",
+      "section": "lending",
+      "label": "Morpho Vaults",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "lending.aave-usd",
+      "section": "lending",
+      "label": "Aave USD value per action (supplied, withdrawn, borrowed, repaid), never added across actions",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "lending.morpho-blue-usd",
+      "section": "lending",
+      "label": "Morpho Blue USD value per action, never added across actions",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "lending.morpho-vaults-usd",
+      "section": "lending",
+      "label": "Morpho Vaults USD value of deposits and withdrawals, kept separate",
+      "originalBackend": "live",
+      "source": "Aave V4 CoreHub/Main+ForexSpoke; Morpho Blue singleton; resmî VaultV2Factory ile kabul edilen ERC4626 emitters; pinned-block views",
+      "calculation": "Eylem event sayıları; reserve/market/vault bazında exact raw flows; her eylem ayrı historical fiyatla USD. Vault/Blue aynı sermaye olabilir, toplanmaz.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Reserve/market/asset/factory views saat son bloğunda; per-action price coverage.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Aave getReserve Hub/underlying/decimals; Blue idToMarketParams; Vault isVaultV2+asset; doğru blok fiyatı."
+    },
+    {
+      "id": "cross-chain.cctp",
+      "section": "cross-chain",
+      "label": "CCTP",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "cross-chain.gateway",
+      "section": "cross-chain",
+      "label": "Gateway",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "cross-chain.across",
+      "section": "cross-chain",
+      "label": "Across",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "cross-chain.cctp-usd",
+      "section": "cross-chain",
+      "label": "CCTP USD value per direction, never added across directions",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "cross-chain.gateway-usd",
+      "section": "cross-chain",
+      "label": "Gateway USD value per action, never added across actions",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "cross-chain.across-usd",
+      "section": "cross-chain",
+      "label": "Across USD value of deposits and fills, kept separate",
+      "originalBackend": "live",
+      "source": "Circle CCTP TokenMessengerV2/MessageTransmitterV2; Gateway Wallet/Minter; Across Arc SpokePool",
+      "calculation": "Arc outbound/inbound/action counts ve raw token amounts; CCTP/Gateway USDC6 decimals; Across deposit input/fill output ayrı; USD her eylem ayrı.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Deployed address/ABI geçerlilik aralıkları ve per-hour fiyatlar.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. CCTP/Gateway token USDC olmalı; Across EVM bytes32/token semantics; yalnız Arc leg kanıtlanır."
+    },
+    {
+      "id": "rwa-other.rwa",
+      "section": "rwa-other",
+      "label": "RWA",
+      "originalBackend": "live",
+      "source": "USYC resmî ERC20 Transfer; additional protocols/exchanges registry (şu anda boş)",
+      "calculation": "USYC transfer/mint/burn ve ham miktar; exchange flow sadece adres sahibi ve başlangıç tarihi doğrulanırsa.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Exchange ownership validity, protocol ABI/address intervals ve fiyat kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Resmî kaynak/kimlik sahipliği; exchange adı loglardan çıkarılmaz."
+    },
+    {
+      "id": "rwa-other.other-protocols",
+      "section": "rwa-other",
+      "label": "Verified Arc protocol activity",
+      "originalBackend": "pending",
+      "source": "USYC resmî ERC20 Transfer; additional protocols/exchanges registry (şu anda boş)",
+      "calculation": "USYC transfer/mint/burn ve ham miktar; exchange flow sadece adres sahibi ve başlangıç tarihi doğrulanırsa.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Exchange ownership validity, protocol ABI/address intervals ve fiyat kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Resmî kaynak/kimlik sahipliği; exchange adı loglardan çıkarılmaz."
+    },
+    {
+      "id": "rwa-other.exchange-flows",
+      "section": "rwa-other",
+      "label": "Verified exchange flows",
+      "originalBackend": "pending",
+      "source": "USYC resmî ERC20 Transfer; additional protocols/exchanges registry (şu anda boş)",
+      "calculation": "USYC transfer/mint/burn ve ham miktar; exchange flow sadece adres sahibi ve başlangıç tarihi doğrulanırsa.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Exchange ownership validity, protocol ABI/address intervals ve fiyat kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Resmî kaynak/kimlik sahipliği; exchange adı loglardan çıkarılmaz."
+    },
+    {
+      "id": "rwa-other.more-protocols",
+      "section": "rwa-other",
+      "label": "Other verified Arc protocols",
+      "originalBackend": "pending",
+      "source": "USYC resmî ERC20 Transfer; additional protocols/exchanges registry (şu anda boş)",
+      "calculation": "USYC transfer/mint/burn ve ham miktar; exchange flow sadece adres sahibi ve başlangıç tarihi doğrulanırsa.",
+      "history": "Seçilen 24 / 168 / 720 canonical saat; saat ve aile kapsamı ayrı. Günlük grafik için 24 eksiksiz UTC saati. Exchange ownership validity, protocol ABI/address intervals ve fiyat kapsamı.",
+      "verification": "Aralık/emitter/topic/ABI; canonical blockHash; txIndex→txHash; zaman ve tekil logIndex; sürüm+checksum; eksik saat sıfır değildir. Resmî kaynak/kimlik sahipliği; exchange adı loglardan çıkarılmaz."
+    }
+  ],
+  "rankingDecision": "DEX USD volume; lending and cross-chain each action separately; never add financial actions",
+  "volumeLimitBytes": 5000000000
+}

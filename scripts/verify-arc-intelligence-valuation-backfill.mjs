@@ -190,9 +190,11 @@ export const ALLOWED_TABLES = Object.freeze(['compact_meta', 'compact_hours', 'c
   'compact_registry_coverage', 'compact_checkpoint', 'compact_projection_hours', 'compact_pool_hours', 'compact_dex_activity', 'compact_pool_price_hours',
   'compact_valuation_hours', 'compact_token_price_hours', 'compact_dex_volume_hours', 'compact_pool_fee_hours', 'compact_dex_fee_hours',
   'compact_token_metadata', 'compact_pool_tvl_hours',
-  'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage',
+  'compact_daily_active_addresses', 'compact_daily_address_hours', 'compact_daily_address_stage', 'compact_daily_address_status_history',
   'compact_intelligence_hours', 'compact_token_dex_observations', 'compact_token_discoveries']);
 const ARCHIVE_NAME = /raw|_logs?\b|_log_|receipt|transaction|_txs?\b|block_body|blocks\b|events?\b|archive|dump/i;
+// Already part of the approved lossless-retention schema; not new backfill outputs.
+const EVIDENCE_ARCHIVE_TABLES = ['compact_evidence_archive', 'compact_evidence_archive_parts', 'compact_evidence_archive_usage'];
 
 await test('storage safety: the schema is exactly the compact tables; no raw log, transaction, receipt, block or per-swap archive table', async () => {
   assert.deepEqual([...SCHEMA_TABLES].sort(), [...ALLOWED_TABLES].sort(), 'a new table must be reviewed and allow-listed here');
@@ -328,7 +330,8 @@ if (!sqlite) {
       if (spec.counts?.includes(field)) return [field, k + 1];
       if (spec.amounts?.includes(field)) return [field, String(1000 + k)];
       if (spec.constants?.includes(field)) return [field, CONSTANTS[field]];
-      if (spec.tallies?.[field]) return [field, { k: entry(spec.tallies[field], k) }];
+      // Across token tallies are keyed by an address, as required by the existing strict USD read model.
+      if (spec.tallies?.[field]) return [field, { [name === 'across' && field.endsWith('ByToken') ? USDC : 'k']: entry(spec.tallies[field], k) }];
       if (spec.lists?.[field]) return [field, [entry(spec.lists[field], k)]];
       return [field, 50 + k];
     }));
@@ -467,7 +470,7 @@ if (!sqlite) {
       assert.ok(changed.every((table) => VALUATION_BACKFILL_TABLES.includes(table)), `only valuation tables changed: ${changed}`);
       const inspector = new DatabaseSync(path, { readOnly: true });
       try {
-        assert.deepEqual(tablesOf(inspector).sort(), [...ALLOWED_TABLES].sort());
+        assert.deepEqual(tablesOf(inspector).sort(), [...ALLOWED_TABLES, ...EVIDENCE_ARCHIVE_TABLES].sort());
       } finally { inspector.close(); }
       assert.equal(countsAfter.compact_pool_price_hours - countsBefore.compact_pool_price_hours, 24 * 4, 'one row per pool with swaps per hour');
       assert.equal(countsAfter.compact_pool_fee_hours - countsBefore.compact_pool_fee_hours, 24 * 2, 'one fee row per V4 pool with swaps per hour');

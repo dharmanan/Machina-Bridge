@@ -1,0 +1,415 @@
+{
+  "checkedAt": "2026-10-11T00:05:42.673Z",
+  "endpoint": "https://api.circle.com/v1/borrowKit/markets?chain=ARC&pageSize=20",
+  "requests": 1,
+  "httpStatus": 200,
+  "responseBytes": 7491,
+  "responseSha256": "70ae7375da0dd94260ffbd176befc51de9494a8ff9f32a72f04c40096d8a310a",
+  "pageOnly": true,
+  "completeBorrowVerification": false,
+  "filesWritten": false,
+  "databaseAccess": false,
+  "outcome": "public_market_page_received",
+  "marketCount": 14,
+  "response": {
+    "data": {
+      "markets": [
+        {
+          "marketId": "0x82854ef95669aadb0fb07a93055b7f8133375021e6ff56cf5fdef37edb7c8b5f",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "E20M/E20M",
+          "loanAsset": {
+            "symbol": "E20M",
+            "address": "0xef33282ea70215bf8200a2364c5deb716126fe91",
+            "decimals": 18
+          },
+          "collateralAsset": {
+            "symbol": "E20M",
+            "address": "0x5ae7eae1d894cc2b0b37742928ec3de3a2742590",
+            "decimals": 18
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "0",
+            "decimals": 18
+          },
+          "liquidity": {
+            "raw": "10000000001000000000",
+            "decimals": 18
+          },
+          "borrowApy": 0.001136,
+          "utilization": 0,
+          "refreshedAt": "2026-10-11T00:04:52.354726Z"
+        },
+        {
+          "marketId": "0xc2db905f174e5defcce01d321b09f15f78856a36a21b90cc7e1abbc29225815d",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "cirBTC/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "cirBTC",
+            "address": "0x171a4217b86a807a64eb94757db6849fb4bdbaa0",
+            "decimals": 8
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "193993947167902",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "977415429911",
+            "decimals": 6
+          },
+          "borrowApy": 0.024118,
+          "utilization": 0.994987,
+          "refreshedAt": "2026-10-11T00:04:52.371938Z"
+        },
+        {
+          "marketId": "0x6ea1ea96a1cc671615f3a3bdf51481c5b79e362a8b634396e680d1070137daf4",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "cirBTC/EURC",
+          "loanAsset": {
+            "symbol": "EURC",
+            "address": "0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "cirBTC",
+            "address": "0x171a4217b86a807a64eb94757db6849fb4bdbaa0",
+            "decimals": 8
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "1069397812854",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "92587967081",
+            "decimals": 6
+          },
+          "borrowApy": 0.020347,
+          "utilization": 0.920319,
+          "refreshedAt": "2026-10-11T00:04:52.350341Z"
+        },
+        {
+          "marketId": "0x126759c350bb65bf782cf9fbfe09fb9cbd32c5a39d26c2194994049ddb3b7e5c",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "sUSDai/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "sUSDai",
+            "address": "0x0b2b2b2076d95dda7817e785989fe353fe955ef9",
+            "decimals": 18
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "131436509567",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "14574582847",
+            "decimals": 6
+          },
+          "borrowApy": 0.054833,
+          "utilization": 0.900182,
+          "refreshedAt": "2026-10-11T00:04:52.319992Z"
+        },
+        {
+          "marketId": "0x9bd953647610205cd0869118035ca1b021ed5d7654b8a9a013032b549d0abe12",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "PST/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "PST",
+            "address": "0xa6db07ebf438d91aa653746fc05523e435645525",
+            "decimals": 6
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "41052540708",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "1838988969",
+            "decimals": 6
+          },
+          "borrowApy": 0.173512,
+          "utilization": 0.957125,
+          "refreshedAt": "2026-10-11T00:04:52.359161Z"
+        },
+        {
+          "marketId": "0x55098be724d711573c4c8053ae87ad02c107ac18e94c8d0640ccb4ab07fa2cbc",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "NVDA.sol/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "NVDA.sol",
+            "address": "0x2312290792cf429605d09a42fa43dab810486c18",
+            "decimals": 18
+          },
+          "lltv": 0.625,
+          "borrowAssets": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "300000751",
+            "decimals": 6
+          },
+          "borrowApy": 0.007425,
+          "utilization": 0,
+          "refreshedAt": "2026-10-11T00:04:52.341842Z"
+        },
+        {
+          "marketId": "0x2f192dcd77943c7771aea0aedacb957844cf53a4a5218da4b04037bd2c759b75",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "WETH/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "WETH",
+            "address": "0x128cc466b61f542da60c70e3aa11c10e19b84edb",
+            "decimals": 18
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "205621353",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "2076894",
+            "decimals": 6
+          },
+          "borrowApy": 0.040374,
+          "utilization": 0.99,
+          "refreshedAt": "2026-10-11T00:04:52.333161Z"
+        },
+        {
+          "marketId": "0x9c3c36180cb6d1e95305edc11de986717732009a39f349db19cde95eaf693239",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "nOPAL/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "nOPAL",
+            "address": "0x119dd7daff816f29d7ee47596ae5e4bdc4299165",
+            "decimals": 6
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "900985",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "199998",
+            "decimals": 6
+          },
+          "borrowApy": 0.032475,
+          "utilization": 0.818346,
+          "refreshedAt": "2026-10-11T00:04:52.363367Z"
+        },
+        {
+          "marketId": "0xd1c277b24f103a508543b06f87acc76d1350b83dfd43d35f6d65098c178705f1",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "WETH/EURC",
+          "loanAsset": {
+            "symbol": "EURC",
+            "address": "0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "WETH",
+            "address": "0x128cc466b61f542da60c70e3aa11c10e19b84edb",
+            "decimals": 18
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "900683",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "100000",
+            "decimals": 6
+          },
+          "borrowApy": 0.00293,
+          "utilization": 0.900068,
+          "refreshedAt": "2026-10-11T00:04:52.376106Z"
+        },
+        {
+          "marketId": "0x28b684e2283b59170abacad24b15484c2606339183fe37d8fd7cf96478c9b684",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "syrupUSDC/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "syrupUSDC",
+            "address": "0x0dc6b79f3c3854e4d74514fd4d29be6c96beee39",
+            "decimals": 6
+          },
+          "lltv": 0.915,
+          "borrowAssets": {
+            "raw": "902836",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "86494",
+            "decimals": 6
+          },
+          "borrowApy": 0.024633,
+          "utilization": 0.912573,
+          "refreshedAt": "2026-10-11T00:04:52.328668Z"
+        },
+        {
+          "marketId": "0xabd1763943714b96b6590238d484a240019b4b842eb67fbcff7d96c081b7b566",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "cirBTC/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "cirBTC",
+            "address": "0x171a4217b86a807a64eb94757db6849fb4bdbaa0",
+            "decimals": 8
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "15037812135",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "10000",
+            "decimals": 6
+          },
+          "borrowApy": 0.018983,
+          "utilization": 0.999999,
+          "refreshedAt": "2026-10-11T00:04:52.367921Z"
+        },
+        {
+          "marketId": "0x20f431a88b5e1d9e3cd83c50ff26612d100359a41f32787f6c6bf7a1ad5ed9ab",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "PST/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "PST",
+            "address": "0xa6db07ebf438d91aa653746fc05523e435645525",
+            "decimals": 6
+          },
+          "lltv": 0.86,
+          "borrowAssets": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "borrowApy": 0.000466,
+          "utilization": 0,
+          "refreshedAt": "2026-10-11T00:04:52.324443Z"
+        },
+        {
+          "marketId": "0x43b04ce1e2fb3120a792515af1c1271175343512deeb4232c5347f1db6378e8a",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "PST/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "PST",
+            "address": "0xa6db07ebf438d91aa653746fc05523e435645525",
+            "decimals": 6
+          },
+          "lltv": 0.915,
+          "borrowAssets": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "borrowApy": 0.003193,
+          "utilization": 0,
+          "refreshedAt": "2026-10-11T00:04:52.337208Z"
+        },
+        {
+          "marketId": "0x6cbae29b4f0905c393c01cc91f5d439b64928cc7664eb906f1e67e8d6c4cb993",
+          "protocol": "morpho",
+          "chain": "ARC",
+          "marketName": "XAUM/USDC",
+          "loanAsset": {
+            "symbol": "USDC",
+            "address": "0x3600000000000000000000000000000000000000",
+            "decimals": 6
+          },
+          "collateralAsset": {
+            "symbol": "XAUM",
+            "address": "0x178b01f61cbea1d2a5581fe1621be607835ec349",
+            "decimals": 18
+          },
+          "lltv": 0.77,
+          "borrowAssets": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "liquidity": {
+            "raw": "0",
+            "decimals": 6
+          },
+          "borrowApy": 0.004098,
+          "utilization": 0,
+          "refreshedAt": "2026-10-11T00:04:52.346059Z"
+        }
+      ],
+      "pagination": {}
+    }
+  },
+  "durationMs": 564,
+  "heapLimitBytes": 56623104
+}

@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync,rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { openPipeline,hash,assertHeapBudget } from '../server/intelligence-pipeline/storage.js';
+import { createV3FactoryProcessor } from '../server/intelligence-pipeline/v3-factory.js';
+import { reduceDexLogs } from '../server/intelligence-pipeline/dex-log-reducer.js';
+import { deriveDexFamily } from '../server/intelligence-pipeline/dex-family.js';
+import { LOG_STREAMS } from '../server/compact/sources.js';
+import { UNISWAP_EVENT_TOPICS as T } from '../api/_lib/arc-intelligence/uniswap.js';
+const root=mkdtempSync(join(tmpdir(),'arc-dex-family-')),p=openPipeline({path:join(root,'lab.sqlite'),create:true}),H='0x'+'1'.repeat(64),A='0x'+'2'.repeat(40),B='0x'+'3'.repeat(40),D='0x'+'4'.repeat(40),digest='a'.repeat(64);
+const topic=a=>'0x'+a.slice(2).padStart(64,'0'),word=n=>(BigInt(n)<0n?(1n<<256n)+BigInt(n):BigInt(n)).toString(16).padStart(64,'0');
+const factory=LOG_STREAMS.find(s=>s.key==='v3Factory'),stream=LOG_STREAMS.find(s=>s.key==='v3Pools'),window=new Map([[10,{hash:H,timestamp:1,txHashes:[H],txFrom:[A]}]]);
+const envelope={blockNumber:'0xa',blockHash:H,transactionHash:H,transactionIndex:'0x0',removed:false};
+const created={...envelope,address:factory.address[0],logIndex:'0x0',topics:[T.v3PoolCreated,topic(A),topic(B),'0x'+word(3000)],data:'0x'+word(60)+D.slice(2).padStart(64,'0')};
+const swap=(address,index)=>({...envelope,address,logIndex:'0x'+index.toString(16),topics:[T.v3Swap,topic(A),topic(B)],data:'0x'+[100,-50,1n<<96n,1000,0].map(word).join('')});
+const define=source=>p.defineUnit({source,first:10,last:10,hourStart:0,anchorHash:H,registryDigest:digest});
+let checks=0;const test=async(name,fn)=>{await fn();checks++;console.log('PASS '+name);};
+try{
+ const factorySource={id:'uniswap_v3_factory',definition:'official-factory-sparse-evidence-v1'},factoryUnit=define(factorySource),processor=createV3FactoryProcessor({loadVerifiedWindow:()=>window});
+ const factoryJob=p.claim({unitId:factoryUnit}),accepted=await processor(factoryJob,{request:async()=>[created]});p.accept(factoryJob,accepted.summary,{facts:accepted.facts});
+ const baseSource={id:'uniswap_v3_events',definition:'bounded-dex-raw-statistics-v1'},base=define(baseSource),b=p.claim({unitId:base});p.accept(b,reduceDexLogs([swap(D,1),swap(B,2)],{stream,first:10,last:10,window,isOfficialV3:l=>l.address===B,source:baseSource,anchorHash:H}));
+ const extraSource={id:'uniswap_v3_hour_created_events',definition:'v2',stream:{...stream,address:[D]}},extra=define(extraSource),e=p.claim({unitId:extra});p.accept(e,reduceDexLogs([swap(D,1)],{stream:{...stream,address:[D]},first:10,last:10,window,isOfficialV3:()=>true,source:extraSource,anchorHash:H}));
+ let derived;
+ await test('same-hour factory evidence plus disjoint supplemental logs corrects only missing pool activity',()=>{derived=deriveDexFamily(p,{baseUnit:base,supplementUnit:extra,factoryUnit,protocol:'uniswap_v3'});assert.deepEqual(derived.metrics,{poolCreatedCount:1,swapCount:2,mintCount:0,burnCount:0,uniqueTraders:1,poolsWithSwaps:2,foreignEmitterCount:0,foreignEventCount:0});assert.equal(p.coverage(base).status,'complete');assert.equal(p.coverage(extra).status,'complete');});
+ await test('idempotent family result reuses durable child proofs without RPC',()=>{const again=deriveDexFamily(p,{baseUnit:base,supplementUnit:extra,factoryUnit,protocol:'uniswap_v3'});assert.equal(again.unitId,derived.unitId);assert.equal(p.claim({unitId:derived.unitId}),null);});
+ await test('deleted derived result repairs from exact child checksums without blockchain reads',()=>{const row=p.db.prepare('SELECT result_sha FROM arc_pipeline_jobs WHERE unit_id=?').get(derived.unitId);p.db.prepare('DELETE FROM arc_pipeline_results WHERE result_sha=?').run(row.result_sha);assert.equal(p.audit().repairQueued,1);const repaired=deriveDexFamily(p,{baseUnit:base,supplementUnit:extra,factoryUnit,protocol:'uniswap_v3'});assert.equal(repaired.unitId,derived.unitId);assert.equal(p.coverage(derived.unitId).status,'complete');});
+ await test('missing factory, duplicate sources and different canonical ranges fail closed',()=>{assert.throws(()=>deriveDexFamily(p,{baseUnit:base,supplementUnit:extra,protocol:'uniswap_v3'}));assert.throws(()=>deriveDexFamily(p,{baseUnit:base,supplementUnits:[extra,extra],factoryUnit,protocol:'uniswap_v3'}));const incomplete=define({id:'other_source',definition:'v1'});assert.throws(()=>deriveDexFamily(p,{baseUnit:base,supplementUnit:incomplete,factoryUnit,protocol:'uniswap_v3'}));});
+ await test('foreign factory emitter cannot supply a verified pool record',async()=>{const u=define({id:'factory_test_other',definition:'v1'}),j=p.claim({unitId:u});await assert.rejects(processor(j,{request:async()=>[{...created,address:A}]}));assert.equal(p.coverage(u).status,'partial');});
+ console.log(JSON.stringify({checks,heapBudget:assertHeapBudget(),scope:'synthetic incremental DEX family and repair tests',productionAccess:false}));
+}finally{p.close();rmSync(root,{recursive:true,force:true});}

@@ -50,7 +50,7 @@ export function classifyLaunch(candidate, registry = INTELLIGENCE_REGISTRY) {
   return { status: 'unknown_source', source: null, provenance: null };
 }
 
-export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit = DISCOVERY_LIMIT_PER_HOUR } = {}) {
+export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit = DISCOVERY_LIMIT_PER_HOUR, recoveryState = null } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > DISCOVERY_LIMIT_PER_HOUR) throw new Error('invalid_discovery_limit');
   const candidates = new Map();
   const first = new Map();
@@ -88,6 +88,26 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
         poolEvidence: { protocol, pool, basis: 'existing_official_pool_creation_decoder' } });
     }
   };
+  if (recoveryState) {
+    if (registry.launches.length || registry.protocols.length || registry.exchanges.length
+      || recoveryState.version !== 'discovery-sink-recovery-v1' || recoveryState.registryDigest !== registryDigest(registry)
+      || !Array.isArray(recoveryState.candidates) || recoveryState.candidates.length > limit
+      || !Array.isArray(recoveryState.first) || recoveryState.first.length > DISCOVERY_LIMIT_PER_HOUR * 2
+      || typeof recoveryState.capped !== 'boolean' || typeof recoveryState.dexCapped !== 'boolean'
+      || !Array.isArray(recoveryState.candidateCaps) || !Array.isArray(recoveryState.dexCaps)) throw Object.assign(new Error('recovery_sink_state_corrupt'), { code: 'recovery_sink_state_corrupt' });
+    for (const row of recoveryState.candidates) {
+      if (!['creation','pool'].includes(row.kind)) throw Object.assign(new Error('recovery_sink_state_corrupt'), { code: 'recovery_sink_state_corrupt' });
+      addCandidate(row);
+    }
+    if (candidates.size !== recoveryState.candidates.length) throw Object.assign(new Error('recovery_sink_state_corrupt'), { code: 'recovery_sink_state_corrupt' });
+    for (const row of recoveryState.first) {
+      const key = `${row.protocol}:${row.pool}:${row.activity}`;
+      if (first.has(key)) throw Object.assign(new Error('recovery_sink_state_corrupt'), { code: 'recovery_sink_state_corrupt' }); first.set(key, row);
+    }
+    capped = recoveryState.capped; dexCapped = recoveryState.dexCapped;
+    for (const value of recoveryState.candidateCaps) candidateCaps.add(value);
+    for (const value of recoveryState.dexCaps) dexCaps.add(value);
+  }
   const dex = (protocol, kind, log, event, window) => {
     if (!['swap', 'mint', 'modify', 'initialize', 'creation'].includes(kind) || kind === 'modify' && event.classification !== 'increase') return;
     const activity = ['initialize', 'creation'].includes(kind) ? 'creation' : kind === 'swap' ? 'swap' : 'liquidity';
@@ -103,6 +123,9 @@ export function createIntelligenceSink({ registry = INTELLIGENCE_REGISTRY, limit
     if (!previous || row.blockNumber < previous.blockNumber || row.blockNumber === previous.blockNumber && row.logIndex < previous.logIndex) first.set(key, row);
   };
   return Object.freeze({
+    recoveryState: () => ({ version: 'discovery-sink-recovery-v1', registryDigest: registryDigest(registry),
+      candidates: [...candidates.values()], first: [...first.values()], capped, dexCapped,
+      candidateCaps: [...candidateCaps], dexCaps: [...dexCaps] }),
     async verifyLaunchSources(provider, { firstBlock, lastBlock }) {
       for (const entry of registry.launches.filter(entry => entry.factoryVerification)) {
         const end = factoryEvidence(await verifyCompactLaunchSource(provider, entry, lastBlock), lastBlock);

@@ -648,6 +648,31 @@ export function usdVolumeStatus(entry: { status: string; reason?: string | null;
   return reasons.length > 0 && reasons.every((reason) => reason === 'valuation_not_processed') ? 'collecting' : 'unavailable'
 }
 
+// Compare exact integer micro-USD values. DEX volume, lending and bridge actions are separate ledgers.
+export function rankArcFinancialActions(summary: ArcSummary | null) {
+  const compare = (a: { protocol: string; usdMicros: string }, b: { protocol: string; usdMicros: string }) =>
+    BigInt(a.usdMicros) > BigInt(b.usdMicros) ? -1 : BigInt(a.usdMicros) < BigInt(b.usdMicros) ? 1 : a.protocol.localeCompare(b.protocol)
+  const valid = (value: unknown): value is string => typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+  const volume = summary?.dex.usdVolume
+  const dex = volume?.status === 'available' && volume.byProtocol
+    ? Object.entries(volume.byProtocol).filter(([, value]) => valid(value)).map(([protocol, usdMicros]) => ({ protocol, usdMicros })).sort(compare) : []
+  const dexStatus = usdVolumeStatus(volume) === 'available' && dex.length !== 2 ? 'unavailable' : usdVolumeStatus(volume)
+  type ActionRow = { protocol: string; usdMicros: string; status: 'complete' | 'partial';
+    fullyValuedHours: number; expectedHours: number }
+  const lending: Record<string, ActionRow[]> = {}, crossChain: Record<string, ActionRow[]> = {}
+  for (const [protocol, entry] of Object.entries(summary?.protocolUsd ?? {})) {
+    const target = ['aaveV4', 'morphoBlue', 'morphoVaultsV2'].includes(protocol) ? lending : crossChain
+    if (!['aaveV4', 'morphoBlue', 'morphoVaultsV2', 'cctp', 'gateway', 'across'].includes(protocol)) continue
+    for (const [action, value] of Object.entries(protocolActions(entry) ?? {})) {
+      if (!['complete', 'partial'].includes(value.status) || !valid(value.usdMicros)) continue
+      ;(target[action] ??= []).push({ protocol, usdMicros: value.usdMicros, status: value.status as 'complete' | 'partial',
+        fullyValuedHours: value.coverage.fullyValuedHours, expectedHours: value.coverage.expectedHours })
+    }
+  }
+  for (const target of [lending, crossChain]) for (const rows of Object.values(target)) rows.sort(compare)
+  return { dex, dexStatus, lending, crossChain, unvaluedSwaps: volume?.unvaluedSwaps ?? null, combinedFinancialTotal: null }
+}
+
 // A micro-USD amount as a number of dollars (for charts and comparisons only; displays use the exact string).
 export function usdMicrosToNumber(micros: string | null | undefined): number | null {
   if (typeof micros !== 'string' || !USD_MICROS.test(micros)) return null

@@ -142,7 +142,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   try {
     if (Number(process.versions.node.split('.')[0]) !== 24) throw new Error('node24_required');
     const config = recoveryConfig();
-    if (config.execute && (await import('node:v8')).getHeapStatistics().heap_size_limit > 96 * 1024 * 1024) throw new Error('recovery_heap_limit_required');
+    if (config.execute && (await import('node:v8')).getHeapStatistics().heap_size_limit > 64 * 1024 * 1024) throw new Error('recovery_heap_limit_required');
     const result = await runDiscoveryRecovery(config);
     process.exitCode = ['planned', 'recovered'].includes(result.phase) ? 0 : 1;
   } catch (error) { console.log(`DISCOVERY_RECOVERY_FAIL ${error.message}`); process.exitCode = 1; }

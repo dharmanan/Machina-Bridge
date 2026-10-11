@@ -237,19 +237,22 @@ export function poolTvlUsd({ token0, token1, amount0, amount1 }, prices) {
 // The hourly step (scripts/run-compact-hour.mjs, after the hour commits): snapshot the 24H top pools of each protocol at
 // the hour's last block, once per hour. Bounded: TVL_POOLS_PER_PROTOCOL pools per protocol, one batched round for V3 and at
 // most three for V4. Never throws: a failure is reported and the hour simply has no snapshot (the dashboard then says so).
-export async function collectPoolTvl({ store, provider, hourStart, blockNumber, poolManager, limit = TVL_POOLS_PER_PROTOCOL }) {
+export async function collectPoolTvl({ store, provider, hourStart, blockNumber, poolManager, limit = TVL_POOLS_PER_PROTOCOL, repairUnavailable = false }) {
   const report = { v3: 0, v4: 0, error: null };
   try {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > TVL_POOLS_PER_PROTOCOL) throw new TvlError('tvl_scan_unbounded');
     const blockTag = `0x${blockNumber.toString(16)}`;
     for (const protocol of ['uniswap_v3', 'uniswap_v4']) {
-      if (store.poolTvl(hourStart, protocol).length) continue; // an hour's snapshot is written once
-      const pools = store.topPoolsOf(protocol, hourStart, limit);
+      const stored = store.poolTvl(hourStart, protocol);
+      if (!repairUnavailable && stored.length) continue; // Live behavior remains once per hour.
+      const preserved = new Set(stored.filter(row => row.status === 'available').map(row => row.pool));
+      // Opt-in historical repair reads only missing/unreadable snapshots, never verified balances.
+      const pools = store.topPoolsOf(protocol, hourStart, limit).filter(pool => !repairUnavailable || !preserved.has(pool.pool));
       if (!pools.length) continue;
       const results = protocol === 'uniswap_v3' ? await readV3Balances(provider, pools, { blockTag })
         : await readV4Reserves(provider, pools, { poolManager, blockTag });
       const rows = pools.map((pool) => ({ pool: pool.pool, ...results.get(pool.pool) }));
-      store.recordPoolTvl(hourStart, protocol, rows, { blockNumber });
+      store.recordPoolTvl(hourStart, protocol, rows, { blockNumber, upgradeUnavailable: repairUnavailable });
       report[protocol === 'uniswap_v3' ? 'v3' : 'v4'] = rows.length;
     }
   } catch (error) {

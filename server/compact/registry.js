@@ -8,7 +8,10 @@
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
 import { decodeV3PoolCreated, UNISWAP_EVENT_TOPICS, UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { LOG_MAX_RANGE_BLOCKS, LogError, streamLogs } from './logs.js';
-import { v4PoolRecordOf, V4_POOL_KIND } from './projections.js';
+import { canonicalJson, sha256Of, v4PoolRecordOf, validV4Record, V4_POOL_KIND } from './projections.js';
+import { selectorOf } from './abi.js';
+import { v4StateSlot } from './tvl.js';
+import { validateLogs } from './logs.js';
 import { LOG_STREAMS, V4_INITIALIZE_STREAM } from './sources.js';
 import { headerOf } from './spine.js';
 
@@ -29,6 +32,112 @@ export function poolRecordOf(log) {
   const event = decodeV3PoolCreated(log);
   return event && { address: event.pool, createdBlock: log.blockNumber, createdLogIndex: log.logIndex, createdTx: log.transactionHash,
     token0: event.token0, token1: event.token1, fee: event.fee, tickSpacing: event.tickSpacing };
+}
+
+export const POOL_WITNESS_VERSION = 'compact-official-pool-witness-v1';
+const word = value => BigInt(value).toString(16).padStart(64, '0');
+const addressWord = value => word(BigInt(value));
+const scopedStream = protocol => protocol === 'uniswap_v3' ? FACTORY_STREAM : V4_INITIALIZE_STREAM;
+
+// A pool-specific witness never advances global registry coverage and never establishes a token price.
+export function validateScopedPoolWitness(proof, protocol, pool, atBlock) {
+  try {
+    const { checksum, ...body } = proof;
+    const stream = scopedStream(protocol), log = normalizeLog(body.event);
+    const record = protocol === 'uniswap_v3' ? poolRecordOf(log) : v4PoolRecordOf(log);
+    if (!['uniswap_v3', 'uniswap_v4'].includes(protocol) || checksum !== sha256Of(body)
+      || body.version !== POOL_WITNESS_VERSION || body.protocol !== protocol || body.transactionMembershipVerified !== true
+      || log.address !== stream.address[0] || log.topics[0] !== stream.topics[0] || body.event.removed !== false
+      || !record || canonicalJson(record) !== canonicalJson(body.record)
+      || record[protocol === 'uniswap_v3' ? 'address' : 'poolId'] !== pool || record.createdBlock > atBlock
+      || body.blockHash !== log.blockHash || !/^0x[0-9a-f]{64}$/.test(body.blockHash)
+      || !Number.isSafeInteger(record.createdBlock) || record.createdBlock < 0 || !Number.isSafeInteger(record.createdLogIndex)
+      || record.createdLogIndex < 0 || !/^0x[0-9a-f]{64}$/.test(record.createdTx)
+      || protocol === 'uniswap_v4' && !validV4Record(record)) throw new Error();
+    return record;
+  } catch { throw new RegistryError('pool_witness_invalid'); }
+}
+
+// Cached probes only narrow the search. Acceptance still requires the exact official birth event,
+// its block hash and transaction membership. No full body, receipt, global registry scan or code archive.
+// cached(key, producer) persists bounded accepted facts and is supplied by the existing repair worker.
+export async function readScopedPoolWitness(provider, { protocol, pool, atBlock, cached }) {
+  const stream = scopedStream(protocol), v3 = protocol === 'uniswap_v3';
+  if (!['uniswap_v3', 'uniswap_v4'].includes(protocol) || !(v3 ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/).test(pool)
+    || !Number.isSafeInteger(atBlock) || atBlock < 0) throw new RegistryError('pool_witness_inputs_invalid');
+  const call = async (to, data, block) => cached(['call', to, data, block], () => provider.request('eth_call', [{ to, data }, hex(block)]));
+  const decodeWord = value => {
+    if (typeof value !== 'string' || !/^0x[0-9a-f]{64}$/i.test(value)) throw new RegistryError('pool_witness_call_invalid');
+    return BigInt(value);
+  };
+  let token0, token1, fee;
+  if (v3) {
+    const probe = await cached(['factory-probe', pool, atBlock], async () => {
+      const [answer] = await provider.batch([['eth_call', [{ to: pool, data: selectorOf('factory()') }, hex(atBlock)]]], { allowItemErrors: true });
+      if (answer.error) {
+        // A proved EVM revert is a foreign-emitter outcome, not a transport failure.
+        // Messages are used transiently and never persisted or logged.
+        if ([3, -32000].includes(answer.error.code) && /execution reverted/i.test(answer.error.message)) return { foreign: true };
+        throw new RegistryError('pool_factory_probe_unavailable');
+      }
+      decodeWord(answer.result);
+      return { result: answer.result };
+    });
+    if (probe.foreign === true) return null;
+    const factory = decodeWord(probe.result);
+    if (factory !== BigInt(FACTORY)) return null; // V3-signature foreign emitter: never accepted.
+    token0 = `0x${decodeWord(await call(pool, selectorOf('token0()'), atBlock)).toString(16).padStart(40, '0')}`;
+    token1 = `0x${decodeWord(await call(pool, selectorOf('token1()'), atBlock)).toString(16).padStart(40, '0')}`;
+    fee = Number(decodeWord(await call(pool, selectorOf('fee()'), atBlock)));
+    if (![token0, token1].every(v => /^0x[0-9a-f]{40}$/.test(v)) || !Number.isSafeInteger(fee) || fee > 1000000) {
+      throw new RegistryError('pool_witness_call_invalid');
+    }
+    const mapped = decodeWord(await call(FACTORY, selectorOf('getPool(address,address,uint24)') + addressWord(token0) + addressWord(token1) + word(fee), atBlock));
+    if (mapped !== BigInt(pool)) throw new RegistryError('pool_factory_mapping_mismatch');
+  }
+  const codePresent = async (address, block) => {
+    const value = await cached(['code-present', address, block], async () => {
+      const code = await provider.request('eth_getCode', [address, hex(block)]);
+      if (typeof code !== 'string' || !/^0x(?:[0-9a-f]{2})*$/i.test(code)) throw new RegistryError('pool_code_invalid');
+      return { present: codeIsPresent(code), codeSha: sha256Of(code) };
+    });
+    if (typeof value.present !== 'boolean' || !/^[0-9a-f]{64}$/.test(value.codeSha)) throw new RegistryError('pool_code_invalid');
+    return value.present;
+  };
+  const exists = async block => {
+    if (v3) return codePresent(pool, block);
+    const raw = await call(POOL_MANAGER, '0xdbd035ff' + word(32) + word(1) + word(v4StateSlot(pool)), block);
+    // An empty response before the source was deployed is usable ONLY with independent no-code proof.
+    if (raw === '0x' && !await codePresent(POOL_MANAGER, block)) return false;
+    if (typeof raw !== 'string' || !/^0x[0-9a-f]{192}$/i.test(raw) || raw.slice(2, 66) !== word(32) || raw.slice(66, 130) !== word(1)) {
+      throw new RegistryError('pool_state_lookup_unverified');
+    }
+    return (BigInt('0x' + raw.slice(130)) & ((1n << 160n) - 1n)) !== 0n;
+  };
+  if (!await exists(atBlock)) throw new RegistryError('pool_not_initialized_at_event');
+  let low = 0, high = atBlock;
+  if (await exists(0)) high = 0;
+  else while (high - low > 1) { const middle = low + Math.floor((high - low) / 2); if (await exists(middle)) high = middle; else low = middle; }
+  const filter = { address: stream.address[0], topics: v3
+    ? [stream.topics[0], '0x' + addressWord(token0), '0x' + addressWord(token1), '0x' + word(fee)] : [stream.topics[0], pool],
+  fromBlock: hex(high), toBlock: hex(high) };
+  const raw = await cached(['birth-log', protocol, pool, high], async () => {
+    const logs = await provider.request('eth_getLogs', [filter]);
+    if (!Array.isArray(logs) || logs.length !== 1) throw new RegistryError('pool_birth_evidence_missing');
+    return logs[0];
+  });
+  const block = await provider.request('eth_getBlockByNumber', [hex(high), false]), header = headerOf(block, high);
+  if (!Array.isArray(block.transactions) || !block.transactions.every(value => /^0x[0-9a-f]{64}$/i.test(value))) {
+    throw new RegistryError('pool_birth_block_invalid');
+  }
+  const log = validateLogs([raw], stream, { fromBlock: high, toBlock: high,
+    window: new Map([[high, { ...header, txHashes: block.transactions.map(v => v.toLowerCase()) }]]), seen: new Set() })[0];
+  const record = v3 ? poolRecordOf(log) : v4PoolRecordOf(log);
+  const body = { version: POOL_WITNESS_VERSION, protocol, record, blockHash: header.hash,
+    transactionMembershipVerified: true, event: { ...raw, removed: false } };
+  const proof = { ...body, checksum: sha256Of(body) };
+  validateScopedPoolWitness(proof, protocol, pool, atBlock);
+  return proof;
 }
 
 const header = async (provider, number) => headerOf(await provider.request('eth_getBlockByNumber', [hex(number), false]), number);

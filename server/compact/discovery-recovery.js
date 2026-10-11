@@ -14,7 +14,7 @@ import { streamLogs, validateLogs } from './logs.js';
 import { codeIsPresent } from './registry.js';
 import { UNISWAP_REGISTRY } from '../../api/_lib/arc-intelligence/uniswap.js';
 import { providerDiagnostics } from './provider.js';
-import { spineProgress, appendSpine, cachedSpineBlock, spineNetwork } from './discovery-spine-progress.js';
+import { spineProgress, appendSpine, cachedSpineBlock, spineNetwork, recoverySliceProgress, appendRecoverySlice, recoverySliceUsage } from './discovery-spine-progress.js';
 import { archiveConfig } from './evidence-archive.js';
 
 export const DISCOVERY_PUBLIC_START = Date.parse('2026-09-16T11:00:00Z') / 1000;
@@ -27,6 +27,8 @@ export const RECOVERY_BLOCK_BATCH_SIZE = 32;
 export const RECOVERY_RETRY_MS = 3_600_000;
 export const V3_RETRY_POLICY = 'sqlite-pool-membership-v1';
 export const CREATIONS_RETRY_POLICY = 'durable-spine-v1';
+export const SLICE_RETRY_POLICY = 'reduced-discovery-slices-v1';
+export const RECOVERY_LOG_SLICE_BLOCKS = 16;
 const HOUR = 3600;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const jsonHash = value => hash(intelligenceJson(value));
@@ -109,13 +111,26 @@ function readUnit(db, h, unit) {
 }
 function validateRetry(attempt, allowProgress = false) {
   if (attempt && (!/^[0-9a-f]{64}$/.test(attempt.fingerprint) || !Number.isSafeInteger(attempt.attempts)
-    || attempt.attempts < (allowProgress && attempt.retryPolicy === CREATIONS_RETRY_POLICY ? 0 : 1) || attempt.attempts > MAX_RECOVERY_ATTEMPTS || !Number.isSafeInteger(attempt.notBefore)
+    || attempt.attempts < (allowProgress && [CREATIONS_RETRY_POLICY,SLICE_RETRY_POLICY].includes(attempt.retryPolicy) ? 0 : 1) || attempt.attempts > MAX_RECOVERY_ATTEMPTS || !Number.isSafeInteger(attempt.notBefore)
     || attempt.notBefore < 0 || !['retryable', 'blocked'].includes(attempt.phase)
     || typeof attempt.reason !== 'string' || attempt.reason.length > 256
+    || attempt.sliceBlocks != null && (!Number.isSafeInteger(attempt.sliceBlocks) || attempt.sliceBlocks < 1 || attempt.sliceBlocks > 32)
     || attempt.lastRun != null && (!Number.isSafeInteger(attempt.lastRun) || attempt.lastRun < 0))) fail('recovery_retry_corrupt');
   return attempt;
 }
 function readRetry(db, hour, unit, fingerprint) {
+  if (unit.kind.startsWith('uniswap_')) {
+    const sliced = validateRetry(meta(db, retryKey(hour, unit.id, SLICE_RETRY_POLICY)), true);
+    if (sliced?.fingerprint === fingerprint) {
+      if (sliced.retryPolicy !== SLICE_RETRY_POLICY) fail('recovery_retry_policy_conflict');
+      const old=validateRetry(meta(db,retryKey(hour,unit.id)));
+      if(old?.fingerprint===fingerprint&&(old.attempts>=MAX_RECOVERY_ATTEMPTS
+        ||old.phase==='blocked'&&!(unit.kind==='uniswap_v3'&&old.reason==='recovery_pool_registry_limit')))return old;
+      if(sliced.supersedes !== (old ? jsonHash(old) : null)
+        || old?.fingerprint===fingerprint && sliced.attempts<old.attempts)fail('recovery_retry_policy_conflict');
+      return sliced;
+    }
+  }
   const legacy = validateRetry(meta(db, retryKey(hour, unit.id)));
   if (unit.kind === 'creations') {
     const budgetReason = /^recovery_(response|rpc|time)_budget_exhausted$/.test(legacy?.reason ?? '');
@@ -213,7 +228,11 @@ function hourPlan(db, hour, registry, now) {
     let saved, attempt, progress;
     try {
       saved = readUnit(db, c.h, unit); attempt = readRetry(db, hour, unit, c.fingerprint);
-      if (unit.kind === 'creations' && !saved && !imports.has(unit.id)) progress = spineProgress(db, c.h, unit);
+      if(unit.kind.startsWith('uniswap_')&&attempt?.sliceBlocks>RECOVERY_LOG_SLICE_BLOCKS)fail('recovery_retry_corrupt');
+      if (['creations','uniswap_v3','uniswap_v4'].includes(unit.kind) && !saved && !imports.has(unit.id)) {
+        const slices=recoverySliceProgress(db,c.h,unit);
+        progress=slices.blocks ? {...slices,reduced:true} : unit.kind==='creations' ? spineProgress(db,c.h,unit) : slices;
+      }
     }
     catch (error) { corrupt ??= error.code; }
     let phase = saved?.status === 'available' || imports.has(unit.id) ? 'complete' : 'pending';
@@ -237,6 +256,7 @@ function hourPlan(db, hour, registry, now) {
       retryPolicy: attempt?.fingerprint === c.fingerprint ? attempt.retryPolicy ?? null : null,
       supersedes: attempt?.supersedes ?? null,
       lastRun: attempt?.lastRun ?? 0, progress,
+      sliceBlocks: attempt?.sliceBlocks ?? (unit.kind==='creations'?RECOVERY_BLOCK_BATCH_SIZE:RECOVERY_LOG_SLICE_BLOCKS),
       saved, imported: imports.get(unit.id) ?? null };
   });
   const aggregateLimited = unitPlans.every(u => u.phase === 'complete') && ['candidate_limit', 'first_dex_observation_limit'].includes(currentPayload?.discovery.reason);
@@ -286,6 +306,7 @@ function retry(db, c, unit, { now, reason, phase = 'retryable', lease = false, d
     db.prepare('INSERT INTO compact_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
       .run(retryKey(c.h.hour_start, unit.id, unit.retryPolicy), intelligenceJson({ fingerprint: c.fingerprint, attempts: unit.attempts + (progress ? 0 : 1),
         reason, phase, lastRun: now, notBefore: now + (progress ? 60_000 : RECOVERY_RETRY_MS) + (lease ? RECOVERY_TIMEOUT_MS : 0),
+        ...(['creations','uniswap_v3','uniswap_v4'].includes(unit.kind)?{sliceBlocks:unit.sliceBlocks}:{}),
         ...(unit.retryPolicy ? { retryPolicy: unit.retryPolicy, supersedes: unit.supersedes } : {}),
         ...(diagnostics ? { diagnostics } : {}) }));
   });
@@ -307,17 +328,20 @@ async function boundaries(provider, h) {
 // Existing Gateway/projection repair model: canonical pinned boundaries plus canonical log-bearing block/tx proofs.
 // Never rescans non-event transaction bodies for a source-only unit. Keep the
 // <=500-block log range, but retain at most 32 decoded block/transaction proofs.
-async function scan(provider, h, stream, onLogs, cached = () => null) {
-  for (let from = h.first_block; from <= h.last_block; from += 500) {
+async function scan(provider, h, stream, onLogs, cached = () => null, {first=h.first_block,last=h.last_block,input=null,remember=null}={}) {
+  for (let from = first; from <= last; from += 500) {
     // validateLogs duplicate keys are relative to this chunk, not the entire hour.
     const seen = new Set();
-    const to = Math.min(h.last_block, from + 499);
+    const to = Math.min(last, from + 499);
     for await (const raw of streamLogs(provider, stream, from, to)) {
       const numbers = [...new Set(raw.map(r => Number(BigInt(r.blockNumber))))].sort((a, b) => a - b);
       if (numbers.some(n => !Number.isSafeInteger(n) || n < from || n > to)) fail('recovery_log_range_mismatch');
       raw.sort((a, b) => Number(BigInt(a.blockNumber)) - Number(BigInt(b.blockNumber)));
       let cursor = 0;
-      if (!numbers.length) await onLogs([], new Map());
+      if (!numbers.length) {
+        input?.update(intelligenceJson({stream:stream.key,from,to,logs:[]})+'\n');
+        await onLogs([], new Map());
+      }
       for (let offset = 0; offset < numbers.length; offset += RECOVERY_BLOCK_BATCH_SIZE) {
         const chunk = numbers.slice(offset, offset + RECOVERY_BLOCK_BATCH_SIZE);
         const window = new Map();
@@ -329,10 +353,14 @@ async function scan(provider, h, stream, onLogs, cached = () => null) {
           if (block.timestamp < h.hour_start || block.timestamp >= h.hour_start + HOUR
             || block.number === h.first_block && block.hash !== h.first_hash || block.number === h.last_block && block.hash !== h.last_hash) fail('recovery_event_block_mismatch');
           window.set(block.number, block);
+          remember?.(block);
         });
+        if(input) for(const block of window.values())input.update(intelligenceJson(block)+'\n');
         const start = cursor;
         while (cursor < raw.length && Number(BigInt(raw[cursor].blockNumber)) <= chunk.at(-1)) cursor++;
-        await onLogs(validateLogs(raw.slice(start, cursor), stream, { fromBlock: from, toBlock: to, window, seen }), window);
+        const logs=validateLogs(raw.slice(start, cursor), stream, { fromBlock: from, toBlock: to, window, seen });
+        input?.update(intelligenceJson({stream:stream.key,from,to,logs})+'\n');
+        await onLogs(logs, window);
       }
     }
   }
@@ -344,7 +372,75 @@ function singleRegistry(registry, unit) {
 function finishSink(sink, h, families, projections, present = () => false) {
   return sink.finish({ range: rangeOf(h), families, projections, codePresent: present });
 }
-export async function recoverEvidenceUnit({ db, provider, c, unit, registry = INTELLIGENCE_REGISTRY, saveSpine = null, checkStorage = () => {} }) {
+
+async function recoverReducedSlices({db,provider,c,unit,registry,saveSlice,checkStorage,edges,cached}) {
+  const h=c.h,creation=unit.kind==='creations',v3=unit.kind==='uniswap_v3',family=v3?'uniswapV3':'uniswapV4';
+  const span=unit.sliceBlocks??(creation?RECOVERY_BLOCK_BATCH_SIZE:RECOVERY_LOG_SLICE_BLOCKS);
+  if(!Number.isSafeInteger(span)||span<1||span>(creation?RECOVERY_BLOCK_BATCH_SIZE:RECOVERY_LOG_SLICE_BLOCKS))fail('recovery_slice_size_limit');
+  let cursor=recoverySliceProgress(db,h,unit);
+  if(cursor.state && cursor.state.kind!==unit.kind)fail('recovery_slice_binding_conflict');
+  const reg=singleRegistry(registry,unit);
+  const sink=createIntelligenceSink({registry:reg,recoveryState:cursor.state?.sink??null});
+  const families={uniswapV3:{status:'unavailable'},uniswapV4:{status:'unavailable'}};
+  if(creation){
+    if(JSON.parse(h.network_json).internal?.deploymentAttempts===0)return{status:'available',reason:null,evidence:{candidates:[],firstDex:[]}};
+    const network=createNetworkAccumulator({recoveryState:cursor.state?.family??null});
+    if(network.finish().blockCount!==cursor.blocks)fail('recovery_slice_network_conflict');
+    const before={number:cursor.nextBlock-1,hash:cursor.lastHash,timestamp:cursor.lastTimestamp};
+    if(cursor.nextBlock<=h.last_block && provider.canContinue&&!provider.canContinue(span))return{status:'progress',reason:'recovery_progress_pending'};
+    if(cursor.nextBlock<=h.last_block)for await(const blocks of spineWindows(provider,{first:cursor.nextBlock,last:h.last_block,before,
+      hourStart:h.hour_start,hourEnd:h.hour_start+HOUR,batchSize:span,windowBlocks:span})){
+      network.addBlocks(blocks);sink.blocks(blocks);const tail=blocks.at(-1);
+      cursor=saveSlice(unit,{first:blocks[0].number,last:tail.number,lastHash:tail.hash,lastTimestamp:tail.timestamp,
+        inputSha256:jsonHash(blocks),state:{kind:unit.kind,family:network.recoveryState(),sink:sink.recoveryState()}});
+      if(cursor.nextBlock<=h.last_block&&provider.canContinue&&!provider.canContinue(span))return{status:'progress',reason:'recovery_progress_pending'};
+    }
+    if(canonical(network.finish({durationSeconds:HOUR}))!==h.network_json)fail('recovery_network_conflict');
+    await boundaries(provider,h);
+    const p=finishSink(sink,h,families,null),limited=p.discovery.reason==='candidate_limit';
+    return{status:limited?'insufficient_coverage':'available',reason:limited?'candidate_limit':null,evidence:{candidates:p.discovery.candidates,firstDex:[]}};
+  }
+  if(c.versions.get(`family_version:${family}`)!==FAMILY_VERSIONS[family]
+    ||c.versions.get(`projection_version:${unit.kind}_pools`)!==PROJECTION_VERSIONS[`${unit.kind}_pools`])fail('recovery_pool_definition_mismatch');
+  if(v3&&(!c.v3||c.v3.through_block<h.first_block-1))fail('recovery_pool_registry_unavailable');
+  const membership=v3?db.prepare("SELECT 1 FROM compact_registry WHERE kind='uniswap_v3_pool' AND address=? AND created_block<?"):null;
+  let projection;
+  const bridge={v3:(...args)=>projection.v3(...args),v4:(...args)=>projection.v4(...args)};
+  const accumulator=v3?createUniswapV3Accumulator({registry:{through:h.first_block-1,throughHash:h.parent_hash,
+    pools:{has:address=>Boolean(membership.get(address,h.first_block))}},projection:bridge,recoveryState:cursor.state?.family??null})
+    :createUniswapV4Accumulator({projection:bridge,recoveryState:cursor.state?.family??null});
+  const address=v3?UNISWAP_REGISTRY.v3Factory.address:UNISWAP_REGISTRY.v4PoolManager.address;
+  const present=codeIsPresent(await provider.request('eth_getCode',[address,`0x${h.last_block.toString(16)}`]));
+  if(!present)fail(v3?'v3_factory_code_unverified':'v4_pool_manager_code_unverified');
+  const finish=()=>accumulator.finish({factoryCodePresent:present,poolManagerCodePresent:present});
+  let metrics=await finish();
+  while(cursor.nextBlock<=h.last_block){
+    if(provider.canContinue&&!provider.canContinue(span))return{status:'progress',reason:'recovery_progress_pending'};
+    checkStorage();const first=cursor.nextBlock,last=Math.min(h.last_block,first+span-1),input=createHash('sha256');
+    const blocks=new Map(),pieceCache=n=>blocks.get(n)??cached(n);
+    projection=createProjectionSink({activity:false,onVerifiedDex:sink.dex});
+    const old=metrics;
+    for(const stream of LOG_STREAMS.filter(s=>(v3?['v3Factory','v3Pools']:['v4']).includes(s.key)))
+      await scan(provider,h,stream,(logs,window)=>{
+        accumulator.add(stream.key,logs,window);
+        if(stream.key==='v3Factory')for(const record of accumulator.createdPools())if(window.has(record.createdBlock))sink.poolCreated(record,window);
+      },pieceCache,{first,last,input,remember:block=>blocks.set(block.number,block)});
+    metrics=await finish();const delta=Object.fromEntries(FAMILY_FIELDS[family].map(k=>[k,metrics[k]-old[k]]));
+    const projected=projection.finish({families:{...families,[family]:{status:'available',...delta}},hourStart:h.hour_start,firstBlock:first,lastBlock:last});
+    if(projected[`${unit.kind}_pools`]?.status!=='available')fail('recovery_pool_discovery_unavailable');
+    const tail=last===h.last_block?edges.last:headerOf(await provider.request('eth_getBlockByNumber',[`0x${last.toString(16)}`,false]),last);
+    input.update(intelligenceJson(tail));
+    cursor=saveSlice(unit,{first,last,lastHash:tail.hash,lastTimestamp:tail.timestamp,inputSha256:input.digest('hex'),
+      state:{kind:unit.kind,family:accumulator.recoveryState(),sink:sink.recoveryState()}});
+  }
+  const stored=db.prepare('SELECT * FROM compact_family_hours WHERE hour_start=? AND family=?').get(h.hour_start,family);
+  if(stored?.status==='available'&&canonical(Object.fromEntries(FAMILY_FIELDS[family].map(k=>[k,metrics[k]])))!==stored.metrics_json)fail('recovery_family_evidence_conflict');
+  await boundaries(provider,h);
+  const p=finishSink(sink,h,{...families,[family]:{status:'available',...metrics}},{[`${unit.kind}_pools`]:{status:'available'}});
+  const reason=p.discovery.reason==='candidate_limit'?'candidate_limit':p.firstDexLimited?'first_dex_observation_limit':null;
+  return{status:reason?'insufficient_coverage':'available',reason,permanent:Boolean(reason),evidence:{candidates:p.discovery.candidates,firstDex:p.firstDex}};
+}
+export async function recoverEvidenceUnit({ db, provider, c, unit, registry = INTELLIGENCE_REGISTRY, saveSpine = null, saveSlice = null, checkStorage = () => {} }) {
   const h = c.h;
   const reg = singleRegistry(registry, unit), sink = createIntelligenceSink({ registry: reg });
   const spineUnit = definitions(h, registry).find(u => u.kind === 'creations');
@@ -353,6 +449,10 @@ export async function recoverEvidenceUnit({ db, provider, c, unit, registry = IN
   const edges = await boundaries(provider, h);
   let result;
   const families = { uniswapV3: { status: 'unavailable' }, uniswapV4: { status: 'unavailable' } };
+  // Existing full-spine prefixes stay on their original verified path. New work uses reduced state only.
+  if (saveSlice && ['creations','uniswap_v3','uniswap_v4'].includes(unit.kind) && !(unit.kind==='creations'&&progress.blocks)) {
+    return recoverReducedSlices({db,provider,c,unit,registry,saveSlice,checkStorage,edges,cached});
+  }
   if (unit.kind === 'creations') {
     if (JSON.parse(h.network_json).internal?.deploymentAttempts === 0) {
       // The accepted canonical absence count is proof; activity samples/address sets are not.
@@ -510,7 +610,7 @@ export function commitDiscoveryRecovery(db, c, units, { registry = INTELLIGENCE_
   });
 }
 export async function recoverDiscoveryHour({ db, hourStart, provider, registry = INTELLIGENCE_REGISTRY, now = Date.now(),
-  recoverUnit = recoverEvidenceUnit, beforeCommit = null, beforeUnitCommit = null, beforeSpineCommit = null,
+  recoverUnit = recoverEvidenceUnit, beforeCommit = null, beforeUnitCommit = null, beforeSpineCommit = null, afterSliceCommit = null,
   oneUnit = false, storage = archiveConfig(), checkBudget = () => {}, checkStorage = () => {}, log = () => {} }) {
   assertRecoverySchema(db);
   const plan = hourPlan(db, hourStart, registry, now);
@@ -529,30 +629,45 @@ export async function recoverDiscoveryHour({ db, hourStart, provider, registry =
       unchanged(db, c);
       const archiveUsage = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='compact_evidence_archive_usage'").get()
         ? db.prepare('SELECT * FROM compact_evidence_archive_usage WHERE id=1').get() : null;
-      return appendSpine(db, c.h, spineUnit, blocks, { maxTotalBytes: storage.maxArchiveBytes,
-        maxDailyBytes: storage.maxDailyBytes, archiveBytes: archiveUsage?.stored_bytes ?? 0,
+      return appendSpine(db, c.h, spineUnit, blocks, { maxTotalBytes: storage.maxArchiveBytes-recoverySliceUsage(db).bytes,
+        maxDailyBytes: storage.maxDailyBytes-(recoverySliceUsage(db).dayStart===Math.floor(Date.now()/86400000)*86400?recoverySliceUsage(db).dayBytes:0), archiveBytes: archiveUsage?.stored_bytes ?? 0,
         archiveDayBytes: archiveUsage?.day_start === Math.floor(Date.now()/86400000)*86400 ? archiveUsage.day_bytes : 0,
         beforeCommit: () => beforeSpineCommit?.() });
     });
+  };
+  const saveSlice=(sliceUnit,piece)=>{
+    checkBudget();checkStorage();const result=transaction(db,()=>{
+      unchanged(db,c);
+      const usage=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='compact_evidence_archive_usage'").get()
+        ?db.prepare('SELECT * FROM compact_evidence_archive_usage WHERE id=1').get():null;
+      return appendRecoverySlice(db,c.h,sliceUnit,piece,{maxTotalBytes:storage.maxArchiveBytes,maxDailyBytes:storage.maxDailyBytes,
+        archiveBytes:usage?.stored_bytes??0,archiveDayBytes:usage?.day_start===Math.floor(Date.now()/86400000)*86400?usage.day_bytes:0,
+        beforeCommit:()=>beforeSpineCommit?.()});
+    });afterSliceCommit?.(sliceUnit,result);return result;
   };
   for (const unit of work) {
     checkStorage();
     checkBudget(); // Capacity guard before background writes or historical requests.
     if (unit.imported && !unit.saved) unit.saved = saveUnit(db, c, unit, unit.imported, { beforeCommit: beforeUnitCommit });
     if (unit.phase !== 'pending' || unit.saved) continue;
+    if(unit.kind.startsWith('uniswap_')&&!unit.retryPolicy){
+      unit.retryPolicy=SLICE_RETRY_POLICY;
+      const old=meta(db,retryKey(hourStart,unit.id));unit.supersedes=old?jsonHash(old):null;
+    }
     retry(db, c, unit, { now, reason: 'recovery_interrupted_or_in_progress', lease: true });
     try {
       checkBudget(); calls = true;
-      const result = await recoverUnit({ db, provider, c, unit, registry, saveSpine, checkStorage });
+      const result = await recoverUnit({ db, provider, c, unit, registry, saveSpine, saveSlice, checkStorage });
       checkBudget();
       checkStorage();
       // Transient semantic unavailability remains retryable. Deterministic caps/validity failures retain their evidence permanently.
       if (result.status === 'progress') {
-        if (unit.kind !== 'creations' || unit.retryPolicy !== CREATIONS_RETRY_POLICY) fail('recovery_progress_policy_mismatch');
-        if (spineProgress(db, c.h, unit).blocks <= (unit.progress?.blocks ?? 0)) fail('recovery_progress_stalled');
+        if (!['creations','uniswap_v3','uniswap_v4'].includes(unit.kind)) fail('recovery_progress_policy_mismatch');
+        const blocks=Math.max(recoverySliceProgress(db,c.h,unit).blocks,unit.kind==='creations'?spineProgress(db,c.h,unit).blocks:0);
+        if (blocks <= (unit.progress?.blocks ?? 0)) fail('recovery_progress_stalled');
         unit.reason = result.reason;
         retry(db, c, unit, { now, reason: result.reason, progress: true });
-        log(`DISCOVERY_UNIT_PROGRESS hour=${hourStart} kind=creations nextBlock=${spineProgress(db,c.h,unit).nextBlock}`);
+        log(`DISCOVERY_UNIT_PROGRESS hour=${hourStart} kind=${unit.kind} nextBlock=${c.h.first_block+blocks}`);
         break;
       } else if (result.status === 'available' || result.reason === 'candidate_limit' || result.reason === 'registry_not_valid_for_entire_range' || result.permanent) {
         unit.saved = saveUnit(db, c, unit, result.evidence, { status: result.status, reason: result.reason, beforeCommit: beforeUnitCommit });
@@ -560,9 +675,14 @@ export async function recoverDiscoveryHour({ db, hourStart, provider, registry =
       } else { unit.reason = result.reason; retry(db, c, unit, { now, reason: result.reason }); }
     } catch (error) {
       unit.reason = error.code ?? 'recovery_failed';
+      // As in the laboratory worker, shrink ONLY unfinished work in the next bounded invocation.
+      // The provider failure latch still forbids another request in this failed invocation.
+      if(unit.reason==='recovery_response_budget_exhausted' && ['creations','uniswap_v3','uniswap_v4'].includes(unit.kind)
+        && unit.sliceBlocks>1 && !(unit.kind==='creations'&&unit.progress?.blocks&&!unit.progress.reduced))
+        unit.sliceBlocks=Math.max(1,Math.floor(unit.sliceBlocks/2));
       try {checkStorage();} catch (storageError) {log(`DISCOVERY_STORAGE_BLOCKED reason=${storageError.code??storageError.message}`);throw storageError;}
       const diagnostics = providerDiagnostics(error);
-      retry(db, c, unit, { now, reason: unit.reason, diagnostics, phase: /conflict|corrupt|mismatch|limit|spine_storage_budget/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
+      retry(db, c, unit, { now, reason: unit.reason, diagnostics, phase: /conflict|corrupt|mismatch|limit|(?:spine|slice)_storage_budget/.test(unit.reason) && !/rate_limit/.test(unit.reason) ? 'blocked' : 'retryable' });
       log(`DISCOVERY_UNIT_FAILED hour=${hourStart} kind=${unit.kind} source=${unit.entry?.id ?? 'none'} attempt=${unit.attempts + 1} reason=${unit.reason} diagnostics=${JSON.stringify(diagnostics)}`);
       // Subsequent requests after a provider/budget failure are forbidden. Already committed units survive.
       try { checkBudget(); } catch { break; }
