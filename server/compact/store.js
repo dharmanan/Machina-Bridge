@@ -19,6 +19,9 @@
 // rows. They are derived in the transaction that writes their inputs, and for stored hours without them by a bounded pass
 // without any RPC (derivePendingValuations). An available valuation is immutable; a failure never blocks its hour.
 // Token metadata (token-metadata.js) is a read-once cache of ERC-20 symbol, name and decimals, never used for a value.
+// Packed shards (packed-shards.js, OFF unless COMPACT_PACKED_SHARDS_ENABLED=true) are verified lossless copies of an hour's
+// final pool, price path, swap fee and identity rows (and of a completed day's identities), written in the same transaction
+// as those rows inside a savepoint: a packing failure is reported and never blocks or changes the hour. Hot rows stay.
 import { createHash } from 'node:crypto';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import {
@@ -37,6 +40,7 @@ import { sumWindow } from './windows.js';
 import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
 import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
 import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storagePreflight } from './evidence-archive.js';
+import { PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -368,8 +372,9 @@ function normalizeProjections(projections, range, families) {
 const VALUATION_PROTOCOLS = Object.freeze(['uniswap_v3', 'uniswap_v4']);
 const unavailableValuation = (reason) => ({ status: 'unavailable', reason: VALUATION_REASONS.includes(reason) ? reason : 'valuation_error' });
 
-export function createCompactStore(db, { archive: archiveOptions } = {}) {
+export function createCompactStore(db, { archive: archiveOptions, packedShards: packedOptions } = {}) {
   const archival={...archiveOptions,config:archiveOptions?.config??archiveConfig()};
+  const packing = { config: packedOptions?.config ?? packedShardsConfig(), log: packedOptions?.log ?? console.warn, beforePack: packedOptions?.beforePack ?? null };
   const persistent=Boolean(db.prepare('PRAGMA database_list').all().find(r=>r.name==='main')?.file);
   const checkCapacity=()=>{
     if(!persistent)return; // In-memory stores are disposable/local; production runners reject them.
@@ -393,6 +398,8 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
     db.exec(INTELLIGENCE_SQL);
     db.exec(DAILY_ACTIVE_ADDRESSES_SQL);
     db.exec(ARCHIVE_SQL);
+    // OFF: no packed table is created, so the file stays exactly as before.
+    if (packing.config.enabled) db.exec(PACKED_SHARDS_SQL);
     const setMeta = db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)');
     setMeta.run('schema_version', COMPACT_SCHEMA_VERSION);
     for (const [name, version] of Object.entries(FAMILY_VERSIONS)) {
@@ -431,6 +438,9 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
   if (versionOf() !== COMPACT_SCHEMA_VERSION) throw new StoreError('schema_version_mismatch');
   const int = (value) => BigInt(value); // bind as SQLite INTEGER, never REAL
   const archive = createEvidenceArchive(db, archival);
+  // Same storage rule as every store writer: in-memory stores without an injected capacity are disposable and unchecked.
+  const packed = createPackedShards(db, { config: packing.config, log: packing.log, beforePack: packing.beforePack,
+    preflight: (plannedBytes) => (persistent || archival.capacity ? archive.preflight(plannedBytes) : { ok: true }) });
   const intelligence = createIntelligenceRepository(db, { archive });
   const dailyActiveAddresses = createDailyActiveAddressesStore(db, { archive });
   const sql = {
@@ -987,6 +997,7 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
       // Same transaction as the hour: a crash leaves neither the hour nor its projections.
       const projections = rows.projections ? writeProjections(range, rows.projections) : null;
       intelligence.recordHour(result);
+      packed.packHour(range.hourStart);
       return { outcome, checkpoint: checkpoint(), projections };
     }, beforeCommit);
   }
@@ -1025,6 +1036,7 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
       if (rows.v3) advanceRegistry(range, rows.v3);
       const projections = rows.projections ? writeProjections(range, rows.projections) : null;
       intelligence.recordHour(result);
+      packed.packHour(range.hourStart);
 
       if (requireValuations) {
         const valuations = new Map(sql.valuations.all(int(range.hourStart)).map((row) => [row.valuation, row.status]));
@@ -1055,7 +1067,9 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
       const families = Object.fromEntries(sql.uniswapFamilies.all(int(hourStart)).map((row) => [row.family,
         row.status === 'available' ? { status: 'available', ...JSON.parse(row.metrics_json) } : { status: row.status }]));
       const range = { hourStart, firstBlock: hour.first_block, lastBlock: hour.last_block, parentHash: hour.parent_hash, lastHash: hour.last_hash };
-      return writeProjections(range, normalizeProjections(projections, range, families), only);
+      const report = writeProjections(range, normalizeProjections(projections, range, families), only);
+      packed.packHour(hourStart);
+      return report;
     }, beforeCommit);
   }
 
@@ -1112,11 +1126,25 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
 
   return Object.freeze({
     archive,
+    // Packed shards: streamed, verified read-back (forEachRow, status) and an explicit pack of one stored hour in a writer
+    // transaction (null when OFF). Nothing here deletes or changes a hot row.
+    packedShards: Object.freeze({
+      enabled: packed.config.enabled,
+      forEachRow: packed.forEachRow,
+      status: packed.status,
+      packHour: (hourStart) => (packed.config.enabled ? transaction(() => packed.packHour(hourStart)) : null),
+    }),
     persistedActiveAddresses(hourStart) {
       const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
       if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
       const hot=db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
-      const evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
+      let evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
+      // Packed identities (streamed and verified on read) only while packing is ON; OFF keeps the previous hot/archive
+      // behaviour. Like the hot read above, this holds one hour's identities, which this accessor returns.
+      if(packed.config.enabled&&evidence.length!==hour.unique_active_addresses){
+        const packedRows=[];
+        if(packed.forEachRow('compact_hour_addresses',hourStart,(row)=>packedRows.push(row)))evidence=packedRows;
+      }
       if(evidence.some(r=>Number(r.hour_start)!==hourStart||!ArrayBuffer.isView(r.address)||r.address.byteLength!==20))throw new StoreError('archived_address_evidence_invalid');
       const addresses=[...new Set(evidence.map(r=>`0x${Buffer.from(r.address).toString('hex')}`))].sort();
       return addresses.length===hour.unique_active_addresses?addresses:null;
@@ -1179,7 +1207,9 @@ export function createCompactStore(db, { archive: archiveOptions } = {}) {
     replayDailyActiveAddresses(hourStart, addresses) {
       return transaction(() => {
         if (!sql.hourRange.get(int(hourStart))) throw new StoreError('hour_missing');
-        return dailyActiveAddresses.observeHour(hourStart, addresses, { replay: true });
+        const observed = dailyActiveAddresses.observeHour(hourStart, addresses, { replay: true });
+        if (observed.finalized && observed.status === 'available') packed.packDay(observed.dayStart);
+        return observed;
       });
     },
     extendRegistry,
