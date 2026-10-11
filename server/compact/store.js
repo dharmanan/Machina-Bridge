@@ -574,6 +574,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   function transaction(work, beforeCommit = null) {
     checkCapacity(); // Applies to every historical/live store writer before its transaction.
     archive.begin();
+    packed.begin();
     db.exec('BEGIN IMMEDIATE');
     try {
       const value = work();
@@ -759,11 +760,21 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     return { token0, token1, hooks, fee: meta.fee };
   }
 
-  const pricePathRowsOf = (hour, protocol) => sql.pricePaths.all(hour, protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+  // One hour of a packed dataset: its hot rows, or, only for a scope retention removed (marked pruned), its verified
+  // packed rows in the same primary-key order. keep() filters packed rows the way the hot statement filters (protocol).
+  function retainedRows(dataset, hour, hot, keep = () => true) {
+    if (!packed.isPruned(dataset, hour)) return hot();
+    const rows = [];
+    packed.forEachRow(dataset, Number(hour), (row) => { if (keep(row)) rows.push(row); });
+    return rows;
+  }
+  const pricePathRowsOf = (hour, protocol) => retainedRows('compact_pool_price_hours', hour, () => sql.pricePaths.all(hour, protocol),
+    (row) => row.protocol === protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
     firstSwapBlock: row.first_swap_block, lastSwapBlock: row.last_swap_block, pricedBlocks: row.priced_blocks, closeSqrtPriceX96: row.close_sqrt_price_x96,
     closeLiquidity: row.close_liquidity, sqrtPriceBlockSum: row.sqrt_price_block_sum, reserve0BlockSum: row.reserve0_block_sum,
     reserve1BlockSum: row.reserve1_block_sum }));
-  const poolRowsOf = (hour, protocol) => sql.poolHours.all(hour, protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+  const poolRowsOf = (hour, protocol) => retainedRows('compact_pool_hours', hour, () => sql.poolHours.all(hour, protocol),
+    (row) => row.protocol === protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
     token0InRaw: row.token0_in_raw, token0OutRaw: row.token0_out_raw, token1InRaw: row.token1_in_raw, token1OutRaw: row.token1_out_raw }));
   const storedPrices = (hour) => new Map(sql.tokenPrices.all(hour).map((row) => [row.token, { priceUsdE18: BigInt(row.price_usd_e18),
     protocol: row.source_protocol, pool: row.source_pool, depthUsdMicros: BigInt(row.depth_usd_micros), sources: row.source_count }]));
@@ -789,7 +800,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     }
   }
 
-  const swapFeeRowsOf = (hour) => sql.swapFees.all(hour).map((row) => ({ pool: row.pool, swapCount: row.swap_count, feeIn0E6: row.fee_in0_e6,
+  const swapFeeRowsOf = (hour) => retainedRows('compact_pool_fee_hours', hour, () => sql.swapFees.all(hour)).map((row) => ({ pool: row.pool,
+    swapCount: row.swap_count, feeIn0E6: row.fee_in0_e6,
     feeIn1E6: row.fee_in1_e6, feeOut0E12: row.fee_out0_e12, feeOut1E12: row.fee_out1_e12 }));
 
   // Token prices, then DEX USD volume, then swap fees; each valuation is independent and an available one is never redone.
@@ -901,9 +913,24 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   // identity the snapshot needs. A pool without a well-formed registry row is left out (it is never shown either).
   function topPoolsOf(protocol, hourStart, limit) {
     const from = hourStart - (ADDRESS_WINDOW_HOURS - 1) * HOUR;
-    return sql.topPools.all(protocol, int(from), int(hourStart), int(limit)).map((row) => ({ pool: row.pool, ...registryPool(protocol, row.pool) }))
+    return poolRanking(protocol, from, hourStart, limit).map((row) => ({ pool: row.pool, ...registryPool(protocol, row.pool) }))
       .filter((pool) => pool.token0)
       .map((pool) => ({ ...pool, tickSpacing: JSON.parse(sql.registryMeta.get(protocol === 'uniswap_v4' ? V4_POOL_KIND : V3_POOL_KIND, pool.pool).meta_json).tickSpacing }));
+  }
+
+  // sql.topPools, also for a window (a historical TVL or projection repair) holding hours whose pool rows retention moved
+  // into packed sets: those hours' verified packed rows (streamed) join the other hours' totals, with the same ranking.
+  function poolRanking(protocol, from, to, limit) {
+    const pruned = packed.prunedScopes('compact_pool_hours', from, to);
+    if (!pruned.length) return sql.topPools.all(protocol, int(from), int(to), int(limit));
+    const totals = new Map(db.prepare(`SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3
+      AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
+      GROUP BY pool`).all(protocol, int(from), int(to)).map((row) => [row.pool, row.total]));
+    for (const hour of pruned) {
+      packed.forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) totals.set(row.pool, (totals.get(row.pool) ?? 0) + row.swap_count); });
+    }
+    return [...totals].filter(([, total]) => total > 0).sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, limit)
+      .map(([pool, total]) => ({ pool, total }));
   }
 
   // Live snapshots are written once. Explicit historical repair can upgrade an unavailable
@@ -998,6 +1025,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       const projections = rows.projections ? writeProjections(range, rows.projections) : null;
       intelligence.recordHour(result);
       packed.packHour(range.hourStart);
+      // Retention (OFF by default): one bounded pass per live hour, every scope in its own savepoint, never blocking.
+      packed.maintain(sql.newestHour.get().hour_start);
       return { outcome, checkpoint: checkpoint(), projections };
     }, beforeCommit);
   }
@@ -1126,18 +1155,25 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
 
   return Object.freeze({
     archive,
-    // Packed shards: streamed, verified read-back (forEachRow, status) and an explicit pack of one stored hour in a writer
-    // transaction (null when OFF). Nothing here deletes or changes a hot row.
+    // Packed shards: streamed, verified read-back (forEachRow, status, pruned) and, in a writer transaction, an explicit pack
+    // of one stored hour (null when packing is OFF) and one bounded retention pass (null when retention is OFF).
     packedShards: Object.freeze({
       enabled: packed.config.enabled,
+      retention: packed.config.retention === true,
       forEachRow: packed.forEachRow,
       status: packed.status,
+      pruned: packed.isPruned,
       packHour: (hourStart) => (packed.config.enabled ? transaction(() => packed.packHour(hourStart)) : null),
+      maintain: (options) => {
+        const newest = sql.newestHour.get().hour_start;
+        return packed.config.retention === true && newest !== null ? transaction(() => packed.maintain(newest, options)) : null;
+      },
     }),
     persistedActiveAddresses(hourStart) {
       const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
       if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
-      const hot=db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
+      const hot=packed.isPruned('compact_hour_addresses',hourStart)?retainedRows('compact_hour_addresses',hourStart,()=>[])
+        :db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
       let evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
       // Packed identities (streamed and verified on read) only while packing is ON; OFF keeps the previous hot/archive
       // behaviour. Like the hot read above, this holds one hour's identities, which this accessor returns.
@@ -1242,7 +1278,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     },
     projectionStatus: (hourStart) => sql.projections.all(int(hourStart)).map((row) => ({ projection: row.projection, status: row.status,
       reason: row.reason, rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
-    poolHours: (hourStart, protocol) => sql.poolHours.all(int(hourStart), protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
+    poolHours: (hourStart, protocol) => retainedRows('compact_pool_hours', int(hourStart), () => sql.poolHours.all(int(hourStart), protocol),
+      (row) => row.protocol === protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
       token0InRaw: row.token0_in_raw, token0OutRaw: row.token0_out_raw, token1InRaw: row.token1_in_raw, token1OutRaw: row.token1_out_raw,
       addCount: row.add_count, removeCount: row.remove_count, pokeCount: row.poke_count, addAmount0Raw: row.add_amount0_raw,
       addAmount1Raw: row.add_amount1_raw, removeAmount0Raw: row.remove_amount0_raw, removeAmount1Raw: row.remove_amount1_raw })),

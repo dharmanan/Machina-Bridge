@@ -5,6 +5,7 @@ import { INTELLIGENCE_VERSION, ECOSYSTEM_SCHEMA, ECOSYSTEM_WINDOWS, INTELLIGENCE
 import { DISCOVERY_LIMIT_PER_HOUR, intelligenceJson, valueExchangeFlow } from './intelligence.js';
 import { storedWindow } from './windows.js';
 import { retainLiveDiscoveryEvidence } from './discovery-evidence.js';
+import { createPackedShards } from './packed-shards.js';
 
 export const INTELLIGENCE_SQL = `
 CREATE TABLE IF NOT EXISTS compact_intelligence_hours (
@@ -429,11 +430,71 @@ function dexReadContext(db, tokens, endBlock, registry) {
   for (const row of first) context.observations.set(poolKey(row.protocol, row.pool), {
     ...row, swap: row.swap_json ? JSON.parse(row.swap_json) : null, liquidity: row.liquidity_json ? JSON.parse(row.liquidity_json) : null });
   const addresses = [...new Set(wanted.map(({ row }) => row.address))];
-  for (const row of db.prepare(`SELECT h.protocol,h.pool,SUM(h.swap_count) AS swaps FROM compact_pool_hours h
+  // Hours whose pool rows retention moved into packed sets (marked pruned) still count as stored hours: their rows are
+  // read from the verified packed sets (streamed), never assumed absent. Without such hours this is the original query.
+  const pruned = prunedPoolHours(db);
+  const skipPruned = pruned.length ? " AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset='compact_pool_hours')" : '';
+  for (const row of db.prepare(`SELECT h.protocol,h.pool,SUM(h.swap_count) AS swaps,COUNT(*) AS rows FROM compact_pool_hours h
     WHERE h.protocol IN ('uniswap_v3','uniswap_v4') AND h.pool IN (${addresses.map(() => '?').join(',')})
-    AND h.hour_start IN (SELECT hour_start FROM compact_hours WHERE last_block<=?) GROUP BY h.protocol,h.pool`)
+    AND h.hour_start IN (SELECT hour_start FROM compact_hours WHERE last_block<=?)${skipPruned} GROUP BY h.protocol,h.pool`)
     .all(...addresses, BigInt(endBlock))) context.activity.set(poolKey(row.protocol, row.pool), row);
+  if (pruned.length) addPrunedPoolHours(db, context, wanted, pruned, endBlock);
   return context;
+}
+
+function prunedPoolHours(db) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_packed_pruned'").get()) return [];
+  return db.prepare(`SELECT m.scope_start AS hour_start,h.last_block FROM compact_packed_pruned m JOIN compact_hours h ON h.hour_start=m.scope_start
+    WHERE m.dataset='compact_pool_hours' ORDER BY m.scope_start`).all();
+}
+
+// Early swaps of pools created in a pruned hour and the pruned hours' share of each pool's stored swaps. The share is the
+// exact all-pruned total (compact_packed_pool_swaps) minus the pruned hours after endBlock, or the pruned hours up to
+// endBlock streamed directly, whichever needs fewer hours decoded. Any packed read that does not verify throws.
+function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
+  const packed = createPackedShards(db, { config: { enabled: false } });
+  const wantedKeys = new Set(wanted.map(({ key }) => key));
+  const forPools = (hour, onRow) => packed.forEachRow('compact_pool_hours', hour, (row) => {
+    if (wantedKeys.has(poolKey(row.protocol, row.pool))) onRow(row);
+  });
+  const prunedSet = new Set(pruned.map((row) => row.hour_start));
+  const early = new Map();
+  for (const { key, creationHour } of wanted) {
+    if (creationHour && prunedSet.has(creationHour.hour_start)) early.set(key, creationHour.hour_start);
+  }
+  for (const hour of new Set(early.values())) {
+    forPools(hour, (row) => {
+      const key = poolKey(row.protocol, row.pool);
+      const observation = context.observations.get(key);
+      if (early.get(key) === hour && observation) observation.early_swaps = row.swap_count;
+    });
+  }
+  const totals = new Map();
+  const add = (protocol, pool, swaps, rows) => {
+    const key = poolKey(protocol, pool);
+    const entry = totals.get(key) ?? { protocol, pool, swaps: 0, rows: 0 };
+    entry.swaps += swaps;
+    entry.rows += rows;
+    totals.set(key, entry);
+  };
+  const late = pruned.filter((row) => row.last_block > endBlock);
+  const upTo = pruned.filter((row) => row.last_block <= endBlock);
+  if (late.length <= upTo.length) {
+    const pools = [...new Set(wanted.map(({ row }) => row.address))];
+    for (const row of db.prepare(`SELECT protocol,pool,swap_count,row_count FROM compact_packed_pool_swaps
+      WHERE pool IN (${pools.map(() => '?').join(',')})`).all(...pools)) {
+      if (wantedKeys.has(poolKey(row.protocol, row.pool))) add(row.protocol, row.pool, row.swap_count, row.row_count);
+    }
+    for (const { hour_start: hour } of late) forPools(hour, (row) => add(row.protocol, row.pool, -row.swap_count, -1));
+  } else {
+    for (const { hour_start: hour } of upTo) forPools(hour, (row) => add(row.protocol, row.pool, row.swap_count, 1));
+  }
+  for (const [key, share] of totals) {
+    if (share.rows < 0 || share.swaps < 0) throw new Error('packed_pool_swaps_inconsistent');
+    if (!share.rows) continue;
+    const hot = context.activity.get(key);
+    context.activity.set(key, { protocol: share.protocol, pool: share.pool, swaps: (hot?.swaps ?? 0) + share.swaps, rows: (hot?.rows ?? 0) + share.rows });
+  }
 }
 
 function creationHourOf(context, block) {

@@ -7,6 +7,7 @@
 // stated interval; 30D exposes a shorter stored interval with explicit coverage, never missing hours turned into zero.
 import { existsSync } from 'node:fs';
 import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
+import { createPackedShards } from './packed-shards.js';
 import { ECOSYSTEM_WINDOWS } from './intelligence-registry.js';
 import { ARC_ASSETS_BY_ADDRESS } from '../../api/_lib/arc-intelligence/assets.js';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
@@ -275,6 +276,11 @@ const SQL = Object.freeze({
       p.remove_count, p.poke_count, p.add_amount0_raw, p.add_amount1_raw, p.remove_amount0_raw, p.remove_amount1_raw
     FROM compact_pool_hours p JOIN top ON top.pool = p.pool
     WHERE p.protocol = ?1 AND p.hour_start BETWEEN ?2 AND ?3 ORDER BY top.total DESC, p.pool ASC, p.hour_start ASC`,
+  // Windows that include hours whose pool rows retention moved into packed sets (packed-shards.js): every pool's total over
+  // the window's other hours. A marked hour is read only from its packed set, so its hot rows (there are none) never count.
+  hotPoolTotals: `SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3
+    AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
+    GROUP BY pool`,
   // Valuations and token metadata (store.js). Optional tables: a database written before them still serves everything
   // else, and these reads report valuation_not_ready (or no contract metadata).
   optionalTables: `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('compact_valuation_hours', 'compact_dex_volume_hours',
@@ -325,7 +331,10 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) throw new ReadModelError('invalid_busy_timeout');
   let db = null;
   let statements = new Map();
+  let packedReader = null;
   const cache = new Map();
+  // Read-only access to packed sets (SELECT only, on this query_only connection); packing itself stays a writer concern.
+  const packedSets = () => (packedReader ??= createPackedShards(connection(), { config: { enabled: false } }));
 
   function connection() {
     if (db) return db;
@@ -341,6 +350,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     }
     db = opened;
     statements = new Map();
+    packedReader = null;
     return db;
   }
   const statement = (name) => {
@@ -883,6 +893,41 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       tickSpacing: meta.tickSpacing, hooks: v4 ? meta.hooks : null };
   }
 
+  // The top pools' hourly rows of [from, to] with their window totals, in the order of the topPoolRows statement (total
+  // desc, pool asc, hour asc). Hours whose pool rows retention moved into packed sets (marked pruned) are read from those
+  // verified sets, streamed; a window without such an hour runs the original statement unchanged. Memory holds one total
+  // per pool of the window (as the SQL grouping does) and the chosen pools' rows, never a pruned hour's whole set.
+  function topPoolRowsOf(protocol, from, to) {
+    const pruned = packedSets().prunedScopes('compact_pool_hours', from, to);
+    if (!pruned.length) return statement('topPoolRows').all(protocol, int(from), int(to), int(POOL_LIMIT));
+    const forPrunedRows = (onRow) => {
+      for (const hour of pruned) packedSets().forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) onRow(row); });
+    };
+    // Pass 1: the window totals and the same ranking as the statement (total desc, then pool id; zero totals left out).
+    const totals = new Map(statement('hotPoolTotals').all(protocol, int(from), int(to)).map((row) => [row.pool, row.total]));
+    forPrunedRows((row) => totals.set(row.pool, (totals.get(row.pool) ?? 0) + row.swap_count));
+    const top = [...totals].filter(([, total]) => total > 0).sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, POOL_LIMIT);
+    totals.clear();
+    if (!top.length) return [];
+    // Pass 2: only the chosen pools' hourly rows, hot and packed, with the statement's columns.
+    const rank = new Map(top.map(([pool, total], index) => [pool, { index, total }]));
+    const rows = [];
+    const keep = (row) => {
+      const entry = rank.get(row.pool);
+      if (!entry) return;
+      rows.push({ pool: row.pool, total: entry.total, hour_start: row.hour_start, swap_count: row.swap_count, token0_in_raw: row.token0_in_raw,
+        token0_out_raw: row.token0_out_raw, token1_in_raw: row.token1_in_raw, token1_out_raw: row.token1_out_raw, add_count: row.add_count,
+        remove_count: row.remove_count, poke_count: row.poke_count, add_amount0_raw: row.add_amount0_raw, add_amount1_raw: row.add_amount1_raw,
+        remove_amount0_raw: row.remove_amount0_raw, remove_amount1_raw: row.remove_amount1_raw });
+    };
+    const pools = top.map(([pool]) => pool);
+    for (const row of connection().prepare(`SELECT * FROM compact_pool_hours WHERE protocol = ? AND hour_start BETWEEN ? AND ?
+      AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ? AND ?)
+      AND pool IN (${pools.map(() => '?').join(', ')})`).iterate(protocol, int(from), int(to), int(from), int(to), ...pools)) keep(row);
+    forPrunedRows(keep);
+    return rows.sort((a, b) => rank.get(a.pool).index - rank.get(b.pool).index || a.hour_start - b.hour_start);
+  }
+
   // Top pools of one protocol over the window, ranked by swap count (the only verified ranking: USD volume and liquidity
   // are source_pending). Available only when every hour of the window holds that protocol's pool projection and the
   // registry covers the checkpoint; flows and V3 liquidity amounts are exact raw integer strings.
@@ -924,7 +969,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       return details.get(pool);
     };
     const totals = new Map();
-    for (const row of statement('topPoolRows').all(spec.protocol, int(from), int(to), int(POOL_LIMIT))) {
+    for (const row of topPoolRowsOf(spec.protocol, from, to)) {
       const flows = [row.token0_in_raw, row.token0_out_raw, row.token1_in_raw, row.token1_out_raw];
       const liquidity = [row.add_amount0_raw, row.add_amount1_raw, row.remove_amount0_raw, row.remove_amount1_raw];
       if (!flows.every(isDigits) || !(v3 ? liquidity.every(isDigits) : liquidity.every((value) => value === null))
@@ -1190,6 +1235,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     close() {
       cache.clear();
       statements = new Map();
+      packedReader = null;
       db?.close();
       db = null;
     },

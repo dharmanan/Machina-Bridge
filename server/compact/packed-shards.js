@@ -10,16 +10,29 @@
 // Writing and reading both stream: source rows are iterated, never loaded as one array, and decoded rows are handed on
 // piece by piece, so memory is bounded by one piece (at most 256 KiB raw) however large an hour or a completed day is.
 // Reading verifies payload and raw checksums, piece order and sizes, the row digest, the table schema and the binding to
-// the canonical compact_hours rows; any mismatch fails closed. Deleting hot rows is NOT part of this module: a later,
-// separately approved retention step must re-verify a set in a transaction after the one that wrote it. Until then,
-// turning this ON adds the packed bytes on top of the hot rows it copies; it saves no disk by itself.
+// the canonical compact_hours rows; any mismatch fails closed. Packing alone adds the packed bytes on top of the hot
+// rows it copies; disk is only saved by retention.
+// Retention (OFF unless COMPACT_PACKED_RETENTION_ENABLED=true, which requires packing) removes the hot rows of a packed
+// scope only when every condition holds: the scope is older than the hot window (COMPACT_PACKED_HOT_HOURS, at least 48,
+// so every 24H read, the 24H identity union, TVL top pools and pending valuations stay on hot rows); the set was committed
+// by an EARLIER transaction; for pool data all of the hour's valuations are final (their inputs are no longer needed);
+// the set verifies completely in this transaction; and the hot rows have exactly the packed row count and typed digest.
+// Removal writes an immutable compact_packed_pruned marker in the same savepoint, and only a marked scope is ever read
+// from its packed set (store accessors, read model pools, ecosystem pool activity, persisted identities). Pruned pool
+// hours also add their swap counts to compact_packed_pool_swaps, so all-history pool activity stays an exact sum
+// without decoding every pruned hour. Packed sets are never deleted: every identity set stays available for 30-day
+// unions and recovery. Any missing, corrupt or mismatching packed data keeps the hot rows.
 import { createHash } from 'node:crypto';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
+import { VALUATIONS } from './valuation.js';
 
 export const PACKED_SHARDS_VERSION = 'arc-packed-shards-v1';
 export const PACKED_COLUMN_ROWS = 256;
 export const PACKED_ADDRESS_ROWS = 4096;
 export const PACKED_MAX_RAW_PIECE_BYTES = 256 * 1024;
+// The 24H window plus a full day of margin: nothing a 24H read, the TVL top-pool choice or a pending valuation touches
+// is ever removed from the hot tables.
+export const PACKED_MIN_HOT_HOURS = 48;
 const ADDRESS_BYTES = 20;
 const HOUR = 3600;
 const DAY = 24 * HOUR;
@@ -64,6 +77,22 @@ CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_update BEFORE UPDATE ON com
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_delete BEFORE DELETE ON compact_packed_pieces BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_replace BEFORE INSERT ON compact_packed_pieces
 WHEN EXISTS (SELECT 1 FROM compact_packed_pieces WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start AND part = NEW.part)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TABLE IF NOT EXISTS compact_packed_pruned (
+  dataset TEXT NOT NULL, scope_start INTEGER NOT NULL, row_count INTEGER NOT NULL CHECK (row_count >= 0), rows_sha256 TEXT NOT NULL,
+  PRIMARY KEY (dataset, scope_start)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_packed_pool_swaps (
+  protocol TEXT NOT NULL, pool TEXT NOT NULL, swap_count INTEGER NOT NULL CHECK (swap_count >= 0), row_count INTEGER NOT NULL CHECK (row_count > 0),
+  PRIMARY KEY (protocol, pool)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_update BEFORE UPDATE ON compact_packed_pruned BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_delete BEFORE DELETE ON compact_packed_pruned BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_replace BEFORE INSERT ON compact_packed_pruned
+WHEN EXISTS (SELECT 1 FROM compact_packed_pruned WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_no_delete BEFORE DELETE ON compact_packed_pool_swaps BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_only_grow BEFORE UPDATE ON compact_packed_pool_swaps
+WHEN NEW.protocol <> OLD.protocol OR NEW.pool <> OLD.pool OR NEW.swap_count < OLD.swap_count OR NEW.row_count <= OLD.row_count
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;`;
 
 export class PackedShardsError extends Error {
@@ -92,9 +121,22 @@ function typed(value) {
 const rowText = (row) => JSON.stringify(Object.keys(row).sort().map((key) => [key, typed(row[key])]));
 
 export function packedShardsConfig(env = process.env) {
-  const flag = env.COMPACT_PACKED_SHARDS_ENABLED ?? '';
-  if (!['', 'true', 'false'].includes(flag)) fail('invalid_packed_shards_enabled');
-  return Object.freeze({ enabled: flag === 'true' });
+  const flag = (key) => {
+    const value = env[key] ?? '';
+    if (!['', 'true', 'false'].includes(value)) fail(`invalid_${key.slice('COMPACT_'.length).toLowerCase()}`);
+    return value === 'true';
+  };
+  const number = (key, fallback, min, max) => {
+    const text = env[key] ?? String(fallback);
+    const value = /^\d+$/.test(text) ? Number(text) : NaN;
+    if (!Number.isSafeInteger(value) || value < min || value > max) fail(`invalid_${key.slice('COMPACT_'.length).toLowerCase()}`);
+    return value;
+  };
+  const enabled = flag('COMPACT_PACKED_SHARDS_ENABLED');
+  const retention = flag('COMPACT_PACKED_RETENTION_ENABLED');
+  if (retention && !enabled) fail('packed_retention_requires_packing');
+  return Object.freeze({ enabled, retention, hotHours: number('COMPACT_PACKED_HOT_HOURS', PACKED_MIN_HOT_HOURS, PACKED_MIN_HOT_HOURS, 400 * 24),
+    maintenanceScopes: number('COMPACT_PACKED_MAINTENANCE_SCOPES', 16, 1, 256) });
 }
 
 // A JSON column value: NULL, TEXT or a safe INTEGER, which JSON returns with the same type. A BLOB is never JSON-packed.
@@ -139,7 +181,20 @@ function decodePiece(codec, columns, scopeColumn, scope, raw, rowCount) {
 // preflight(plannedBytes): the store's storage check ({ ok, reason }). beforePack(dataset, scope): test hook.
 export function createPackedShards(db, { config = packedShardsConfig(), preflight = () => ({ ok: true }), log = console.warn, beforePack = null } = {}) {
   const tablesExist = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_sets'").get());
+  const prunedTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_pruned'").get());
   const int = (value) => BigInt(value);
+  const retention = config.retention === true;
+  const hotHours = Number.isSafeInteger(config.hotHours) ? Math.max(config.hotHours, PACKED_MIN_HOT_HOURS) : PACKED_MIN_HOT_HOURS;
+  const maintenanceScopes = Number.isSafeInteger(config.maintenanceScopes) ? config.maintenanceScopes : 16;
+  // Sets written by the current writer transaction (reset by begin()): such a set never authorizes removing hot rows.
+  const created = new Set();
+  const keyOf = (dataset, scope) => `${dataset}:${scope}`;
+  // True when retention removed this scope's hot rows; readers then read the packed set, and only then.
+  const isPruned = (dataset, scope) => prunedTableExists()
+    && Boolean(db.prepare('SELECT 1 FROM compact_packed_pruned WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope)));
+  const prunedScopes = (dataset, from, to) => (prunedTableExists()
+    ? db.prepare('SELECT scope_start FROM compact_packed_pruned WHERE dataset = ? AND scope_start BETWEEN ? AND ? ORDER BY scope_start')
+      .all(dataset, int(from), int(to)).map((row) => row.scope_start) : []);
   const schemaOf = (dataset) => db.prepare(`PRAGMA table_info(${dataset})`).all();
   const definitionOf = (dataset) => {
     const spec = PACKED_DATASETS[dataset];
@@ -234,6 +289,8 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     if (db.isTransaction !== true) fail('packed_transaction_required');
     const definition = definitionOf(dataset);
     if (!Number.isSafeInteger(scope) || scope % (definition.scope === 'day_start' ? DAY : HOUR) !== 0) fail('packed_scope_invalid');
+    // A pruned scope's packed set is its only copy (immutable, verified on every read): a replayed hour leaves it as it is.
+    if (isPruned(dataset, scope)) return { outcome: 'unchanged' };
     const hours = canonicalHours(definition, scope);
     // Counts first: a set that is not final is never read row by row (a day's stage can hold a whole day of identities).
     const rowCount = db.prepare(`SELECT COUNT(*) AS count FROM ${dataset} WHERE ${definition.scope} = ?`).get(int(scope)).count;
@@ -255,6 +312,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     db.prepare(`INSERT INTO compact_packed_sets (dataset, scope_start, version, codec, columns_json, row_count, rows_sha256, pieces, binding_sha256,
       raw_bytes, stored_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(dataset, int(scope), PACKED_SHARDS_VERSION, definition.codec,
       JSON.stringify(definition.columns), int(written.count), written.sha256, int(written.pieces), binding, int(written.rawBytes), int(written.storedBytes));
+    created.add(keyOf(dataset, scope));
     // Read every piece back and require the exact typed row digest (checked against the digest just stored) before the
     // caller can commit. Streaming too: no decoded row is kept.
     const verified = streamSet(dataset, scope);
@@ -328,9 +386,159 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     }
   }
 
+  // Last hour a scope covers, and the newest last hour retention may remove for the newest stored hour.
+  const lastHourOf = (definition, scope) => (definition.scope === 'day_start' ? scope + DAY - HOUR : scope);
+  const retentionCutoff = (newest) => newest - hotHours * HOUR;
+  const valuationsFinal = (hour) => db.prepare(`SELECT COUNT(*) AS count FROM compact_valuation_hours WHERE hour_start = ? AND status = 'available'
+    AND valuation IN (${VALUATIONS.map(() => '?').join(', ')})`).get(int(hour), ...VALUATIONS).count === VALUATIONS.length;
+
+  // Removes one scope's hot rows inside the caller's transaction, or keeps them and says why. Throws (caught by
+  // pruneSafely, which rolls the savepoint back) when the packed set does not verify or differs from the hot rows.
+  function pruneScope(dataset, scope, newest) {
+    if (!retention) fail('packed_retention_disabled');
+    if (db.isTransaction !== true) fail('packed_transaction_required');
+    const definition = definitionOf(dataset);
+    if (lastHourOf(definition, scope) > retentionCutoff(newest)) return { outcome: 'kept:hot_window' };
+    if (created.has(keyOf(dataset, scope))) return { outcome: 'kept:packed_in_this_transaction' };
+    if (isPruned(dataset, scope)) return { outcome: 'unchanged' };
+    const set = db.prepare('SELECT row_count, rows_sha256 FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
+    if (!set) return { outcome: 'kept:not_packed' };
+    if (definition.projections && !valuationsFinal(scope)) return { outcome: 'kept:valuations_not_final' };
+    // 1. The packed set verifies completely now, in a transaction after the one that wrote it (streamed, bounded).
+    streamSet(dataset, scope);
+    // 2. The hot rows are exactly the packed rows: same count and the same typed digest, streamed in primary-key order.
+    //    Pool hours add their swaps to the pruned totals in the same pass (rolled back with everything else on failure).
+    const addSwaps = dataset === 'compact_pool_hours' ? db.prepare(`INSERT INTO compact_packed_pool_swaps (protocol, pool, swap_count, row_count)
+      VALUES (?, ?, ?, 1) ON CONFLICT (protocol, pool) DO UPDATE SET swap_count = swap_count + excluded.swap_count, row_count = row_count + 1`) : null;
+    const hash = createHash('sha256');
+    let count = 0;
+    for (const row of db.prepare(`SELECT * FROM ${dataset} WHERE ${definition.scope} = ? ORDER BY ${definition.order}`).iterate(int(scope))) {
+      hash.update(`${rowText(row)}\n`);
+      count++;
+      addSwaps?.run(row.protocol, row.pool, int(row.swap_count));
+    }
+    if (count !== set.row_count || hash.digest('hex') !== set.rows_sha256) fail('packed_hot_rows_differ');
+    // 3. Mark the scope and remove exactly its hot rows.
+    db.prepare('INSERT INTO compact_packed_pruned (dataset, scope_start, row_count, rows_sha256) VALUES (?, ?, ?, ?)')
+      .run(dataset, int(scope), int(count), set.rows_sha256);
+    const deleted = Number(db.prepare(`DELETE FROM ${dataset} WHERE ${definition.scope} = ?`).run(int(scope)).changes);
+    if (deleted !== count || db.prepare(`SELECT COUNT(*) AS count FROM ${dataset} WHERE ${definition.scope} = ?`).get(int(scope)).count !== 0) {
+      fail('packed_prune_mismatch');
+    }
+    return { outcome: 'pruned', rows: count };
+  }
+
+  function pruneSafely(dataset, scope, newest) {
+    db.exec('SAVEPOINT compact_packed_retention');
+    try {
+      const report = pruneScope(dataset, scope, newest);
+      db.exec('RELEASE compact_packed_retention');
+      return report;
+    } catch (error) {
+      db.exec('ROLLBACK TO compact_packed_retention');
+      db.exec('RELEASE compact_packed_retention');
+      const reason = error?.code ?? 'packed_retention_failed';
+      log(`PACKED_RETENTION_BLOCKED dataset=${dataset} scope=${scope} reason=${reason}`);
+      return { outcome: `failed:${reason}` };
+    }
+  }
+
+  // Oldest packed scopes outside the hot window whose hot rows are all present and, for pool data, whose valuations
+  // are final. Scopes that cannot qualify are filtered here, so they never consume the maintenance budget.
+  function pruneCandidates(dataset, newest, limit) {
+    const definition = definitionOf(dataset);
+    const cutoff = retentionCutoff(newest) - (definition.scope === 'day_start' ? DAY - HOUR : 0);
+    const valuations = definition.projections ? `AND (SELECT COUNT(*) FROM compact_valuation_hours v WHERE v.hour_start = s.scope_start
+      AND v.status = 'available' AND v.valuation IN (${VALUATIONS.map(() => '?').join(', ')})) = ${VALUATIONS.length}` : '';
+    return db.prepare(`SELECT s.scope_start FROM compact_packed_sets s WHERE s.dataset = ? AND s.scope_start <= ?
+      AND NOT EXISTS (SELECT 1 FROM compact_packed_pruned m WHERE m.dataset = s.dataset AND m.scope_start = s.scope_start)
+      AND (SELECT COUNT(*) FROM ${dataset} t WHERE t.${definition.scope} = s.scope_start) = s.row_count ${valuations}
+      ORDER BY s.scope_start LIMIT ?`).all(dataset, int(cutoff), ...(definition.projections ? VALUATIONS : []), int(limit))
+      .map((row) => row.scope_start).filter((scope) => !created.has(keyOf(dataset, scope)));
+  }
+
+  // Oldest final scopes that are not packed yet (hours stored before packing was turned on, or whose projections
+  // became available later). The same readiness rules as packScope, as SQL, so a scope that is not final is skipped.
+  function packCandidates(dataset, newest, limit) {
+    const definition = definitionOf(dataset);
+    const unpacked = (scope) => `NOT EXISTS (SELECT 1 FROM compact_packed_sets s WHERE s.dataset = '${dataset}' AND s.scope_start = ${scope})`;
+    if (definition.scope === 'day_start') {
+      return db.prepare(`SELECT d.day_start AS scope FROM compact_daily_active_addresses d WHERE d.status = 'available' AND d.day_start <= ?
+        AND ${unpacked('d.day_start')}
+        AND (SELECT COUNT(*) FROM compact_hours h WHERE h.hour_start >= d.day_start AND h.hour_start < d.day_start + ${DAY}) = 24
+        AND (SELECT COUNT(*) FROM compact_daily_address_hours c WHERE c.day_start = d.day_start) = 24
+        AND (SELECT COUNT(*) FROM compact_daily_address_stage a WHERE a.day_start = d.day_start) = d.active_addresses
+        ORDER BY d.day_start LIMIT ?`).all(int(newest), int(limit)).map((row) => row.scope);
+    }
+    if (definition.codec === 'address-b20') {
+      return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start <= ? AND ${unpacked('h.hour_start')}
+        AND (SELECT COUNT(*) FROM ${dataset} a WHERE a.hour_start = h.hour_start) = h.unique_active_addresses
+        ORDER BY h.hour_start LIMIT ?`).all(int(newest), int(limit)).map((row) => row.scope);
+    }
+    const names = definition.projections.map(() => '?').join(', ');
+    return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start <= ? AND ${unpacked('h.hour_start')}
+      AND (SELECT COUNT(*) FROM compact_projection_hours p WHERE p.hour_start = h.hour_start AND p.projection IN (${names})
+        AND p.status = 'available') = ${definition.projections.length}
+      AND (SELECT COUNT(*) FROM ${dataset} t WHERE t.hour_start = h.hour_start) = (SELECT SUM(p.row_count) FROM compact_projection_hours p
+        WHERE p.hour_start = h.hour_start AND p.projection IN (${names}))
+      ORDER BY h.hour_start LIMIT ?`).all(int(newest), ...definition.projections, ...definition.projections, int(limit)).map((row) => row.scope);
+  }
+
+  // One bounded retention pass inside the caller's writer transaction: first remove the hot rows of up to `limit`
+  // qualifying scopes packed by earlier transactions, then pack up to `limit` final scopes that are not packed yet
+  // (those can only be removed by a later pass). Datasets take turns, oldest scope first. Null when retention is OFF.
+  function maintain(newest, { limit = maintenanceScopes } = {}) {
+    if (!retention) return null;
+    if (db.isTransaction !== true) fail('packed_transaction_required');
+    if (!Number.isSafeInteger(limit) || limit < 1) fail('packed_maintenance_limit_invalid');
+    const report = { pruned: 0, packed: 0, kept: 0, failed: [] };
+    // Candidate selection is read-only; a failure there is reported like a failed scope and never fails the caller.
+    const candidates = (select) => Object.keys(PACKED_DATASETS).map((dataset) => {
+      try {
+        return [dataset, select(dataset, newest, limit)];
+      } catch (error) {
+        const reason = error?.code ?? 'packed_retention_failed';
+        log(`PACKED_RETENTION_BLOCKED dataset=${dataset} scope=candidates reason=${reason}`);
+        report.failed.push({ dataset, scope: null, reason });
+        return [dataset, []];
+      }
+    });
+    const roundRobin = (lists, budget, run) => {
+      for (let round = 0, done = 0; done < budget; round++) {
+        const turn = lists.filter(([, scopes]) => round < scopes.length);
+        if (!turn.length) break;
+        for (const [dataset, scopes] of turn) {
+          if (done >= budget) break;
+          run(dataset, scopes[round]);
+          done++;
+        }
+      }
+    };
+    roundRobin(candidates(pruneCandidates), limit, (dataset, scope) => {
+      const { outcome } = pruneSafely(dataset, scope, newest);
+      if (outcome === 'pruned') report.pruned++;
+      else if (outcome.startsWith('failed:')) report.failed.push({ dataset, scope, reason: outcome.slice(7) });
+      else report.kept++;
+    });
+    roundRobin(candidates(packCandidates), limit, (dataset, scope) => {
+      const { outcome } = packSafely(dataset, scope);
+      if (outcome === 'inserted') report.packed++;
+      else if (outcome.startsWith('failed:') || outcome.startsWith('storage_blocked:')) report.failed.push({ dataset, scope, reason: outcome });
+    });
+    return report;
+  }
+
   return Object.freeze({
     config,
     tablesExist,
+    // Called before each writer transaction opens; inside one it would forget the sets that transaction already wrote.
+    begin() {
+      if (db.isTransaction === true) fail('packed_begin_requires_closed_transaction');
+      created.clear();
+    },
+    isPruned,
+    prunedScopes,
+    maintain,
     // Writer side (inside the caller's transaction): the hour's datasets, and the hour's UTC day once it is final.
     packHour(hourStart) {
       if (!config.enabled) return null;
