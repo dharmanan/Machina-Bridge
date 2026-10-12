@@ -162,7 +162,9 @@ if (process.env.RETENTION_LOW_HEAP_CHILD) {
   const blocked = [];
   const store = createCompactStore(db, { packedShards: { config: RETAIN, log: (line) => blocked.push(line) } });
   const started = performance.now();
-  const report = store.packedShards.maintain({ limit: 64 });
+  // Passes until nothing is left to prune: each pass stays within its write-ahead-log budget (64 MiB by default).
+  const report = { pruned: 0, passes: 0 };
+  for (let pass; (pass = store.packedShards.maintain({ limit: 64 })).pruned; report.passes++) report.pruned += pass.pruned;
   const pruneMs = Math.round(performance.now() - started);
   let peakHeap = process.memoryUsage().heapUsed;
   let rows = 0;
@@ -210,8 +212,8 @@ for (let report; (report = storeB.packedShards.maintain({ limit: 256 })).pruned 
 measurements.build = { hours: HOURS, ms: Math.round(performance.now() - buildStarted), markersAfterLiveHours: liveMarkers, drainPasses: drains.length };
 
 await test('configuration: strict, retention OFF by default, requires packing, a hot window of at least 48 hours', async () => {
-  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, hotHours: 48, maintenanceScopes: 16 });
-  assert.deepEqual(RETAIN, { enabled: true, retention: true, hotHours: 48, maintenanceScopes: 32 });
+  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, expiry: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 });
+  assert.deepEqual(RETAIN, { enabled: true, retention: true, expiry: false, hotHours: 48, maintenanceScopes: 32, maintenanceMiB: 64 });
   assert.equal(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'true', COMPACT_PACKED_RETENTION_ENABLED: 'true', COMPACT_PACKED_HOT_HOURS: '72' }).hotHours, 72);
   const refused = (env, code) => assert.throws(() => packedShardsConfig(env), (error) => error.code === code, code);
   refused({ COMPACT_PACKED_RETENTION_ENABLED: 'true' }, 'packed_retention_requires_packing');
@@ -434,7 +436,7 @@ await test('safety: corrupt payload, missing piece or changed hot row keep the h
   const logs = [];
   const store = createCompactStore(db, { packedShards: { config: RETAIN, log: (line) => logs.push(line) } }); // re-creates the triggers
   const before = Object.fromEntries(HOT_TABLES.map((t) => [t, count(db, t)]));
-  db.exec('DROP TRIGGER compact_packed_payload_no_update; DROP TRIGGER compact_packed_piece_no_delete');
+  db.exec('DROP TRIGGER compact_packed_payload_no_update; DROP TRIGGER compact_packed_piece_delete_guard');
   db.prepare(`UPDATE compact_packed_payloads SET payload = zeroblob(length(payload)) WHERE payload_sha256 =
     (SELECT payload_sha256 FROM compact_packed_pieces WHERE dataset = 'compact_pool_hours' AND scope_start = ? AND part = 0)`).run(hours[10]);
   db.prepare("DELETE FROM compact_packed_pieces WHERE dataset = 'compact_hour_addresses' AND scope_start = ? AND part = 0").run(hours[11]);
@@ -621,7 +623,7 @@ await test('low heap: pruning a 1,200,000-identity completed day (and its hours)
   assert.equal(out.pruned, true);
   assert.deepEqual([out.hotStage, out.hotHour, out.marker.row_count, out.rows, out.verified.rowCount], [0, 0, 1_200_000, 1_200_000, 1_200_000]);
   assert(out.heapLimit <= 64 * 1024 * 1024 && out.peakHeapUsed < out.heapLimit);
-  measurements.lowHeap = { day: '24 x 50,000 distinct identities', pruned: out.report.pruned, pruneMs: out.pruneMs, heapLimitBytes: out.heapLimit,
+  measurements.lowHeap = { day: '24 x 50,000 distinct identities', pruned: out.report.pruned, passes: out.report.passes, pruneMs: out.pruneMs, heapLimitBytes: out.heapLimit,
     peakSampledHeapUsedBytes: out.peakHeapUsed, maxRssBytes: out.maxRssBytes };
 });
 

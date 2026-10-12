@@ -40,7 +40,7 @@ import { sumWindow } from './windows.js';
 import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
 import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
 import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storagePreflight } from './evidence-archive.js';
-import { PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
+import { PACKED_JOURNAL_LIMIT_BYTES, PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -390,6 +390,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   }
   checkCapacity();
   db.exec(PRAGMAS);
+  // Retention deletes in large passes: after a checkpoint the write-ahead log shrinks back to this size, not to its peak.
+  if (packing.config.retention === true) db.exec(`PRAGMA journal_size_limit = ${PACKED_JOURNAL_LIMIT_BYTES}`);
   if(archival.config.enabled)db.exec('PRAGMA synchronous=FULL;'); // Archive commits must survive before hot-copy deletion.
   // A new database gets every table and its version row in one transaction, so it is never left half created.
   db.exec('BEGIN IMMEDIATE');
@@ -762,10 +764,13 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
 
   // One hour of a packed dataset: its hot rows, or, only for a scope retention removed (marked pruned), its verified
   // packed rows in the same primary-key order. keep() filters packed rows the way the hot statement filters (protocol).
+  // A scope whose packed set expiry deleted has no rows anywhere: that is an error, never an empty hour.
   function retainedRows(dataset, hour, hot, keep = () => true) {
     if (!packed.isPruned(dataset, hour)) return hot();
     const rows = [];
-    packed.forEachRow(dataset, Number(hour), (row) => { if (keep(row)) rows.push(row); });
+    if (!packed.forEachRow(dataset, Number(hour), (row) => { if (keep(row)) rows.push(row); })) {
+      throw new StoreError(packed.isExpired(dataset, hour) ? 'packed_scope_expired' : 'packed_set_missing');
+    }
     return rows;
   }
   const pricePathRowsOf = (hour, protocol) => retainedRows('compact_pool_price_hours', hour, () => sql.pricePaths.all(hour, protocol),
@@ -927,7 +932,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
       GROUP BY pool`).all(protocol, int(from), int(to)).map((row) => [row.pool, row.total]));
     for (const hour of pruned) {
-      packed.forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) totals.set(row.pool, (totals.get(row.pool) ?? 0) + row.swap_count); });
+      const read = packed.forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) totals.set(row.pool, (totals.get(row.pool) ?? 0) + row.swap_count); });
+      if (!read) throw new StoreError(packed.isExpired('compact_pool_hours', hour) ? 'packed_scope_expired' : 'packed_set_missing');
     }
     return [...totals].filter(([, total]) => total > 0).sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, limit)
       .map(([pool, total]) => ({ pool, total }));
@@ -1160,9 +1166,11 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     packedShards: Object.freeze({
       enabled: packed.config.enabled,
       retention: packed.config.retention === true,
+      expiry: packed.config.retention === true && packed.config.expiry === true,
       forEachRow: packed.forEachRow,
       status: packed.status,
       pruned: packed.isPruned,
+      expired: packed.isExpired,
       packHour: (hourStart) => (packed.config.enabled ? transaction(() => packed.packHour(hourStart)) : null),
       maintain: (options) => {
         const newest = sql.newestHour.get().hour_start;
@@ -1172,6 +1180,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     persistedActiveAddresses(hourStart) {
       const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
       if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
+      // Expired identities exist nowhere any more: unknown (null), so a replay re-reads the hour instead.
+      if(packed.isExpired('compact_hour_addresses',hourStart))return null;
       const hot=packed.isPruned('compact_hour_addresses',hourStart)?retainedRows('compact_hour_addresses',hourStart,()=>[])
         :db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
       let evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);

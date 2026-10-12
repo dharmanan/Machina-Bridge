@@ -172,7 +172,7 @@ const onStore = liveStore(onDb, ON);
 const onCommit = onStore.commitHour(LIVE);
 
 await test('configuration is strict and OFF by default', async () => {
-  const defaults = { retention: false, hotHours: 48, maintenanceScopes: 16 };
+  const defaults = { retention: false, expiry: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 };
   assert.deepEqual(packedShardsConfig({}), { enabled: false, ...defaults });
   assert.deepEqual(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'false' }), { enabled: false, ...defaults });
   assert.deepEqual(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'true' }), { enabled: true, ...defaults });
@@ -189,7 +189,7 @@ await test('OFF: no packed table is created, nothing is packed and the hour comm
 });
 
 await test('ON: every final dataset of the live hour is packed and reads back as the exact typed hot rows', async () => {
-  assert.equal(hasPackedTables(onDb), 5, 'sets, pieces, payloads and the (still empty) retention marker and pool swap tables');
+  assert.equal(hasPackedTables(onDb), 7, 'sets, pieces, payloads and the (still empty) retention and expiry tables');
   for (const dataset of PACKED_HOUR_DATASETS) {
     const status = onStore.packedShards.status(dataset, HOUR);
     const rows = hot(onDb, dataset, HOUR);
@@ -264,7 +264,7 @@ await test('copy: corrupt payload bytes, a missing piece and a changed canonical
 
   const missing = copyOf('missing.sqlite');
   const missingStore = createCompactStore(missing, ON);
-  missing.exec('DROP TRIGGER compact_packed_piece_no_delete');
+  missing.exec('DROP TRIGGER compact_packed_piece_delete_guard');
   missing.prepare("DELETE FROM compact_packed_pieces WHERE dataset = 'compact_hour_addresses' AND part = 0").run();
   assert.throws(() => packedRows(missingStore, 'compact_hour_addresses', HOUR), (e) => e.code === 'packed_pieces_corrupt');
   missing.close();

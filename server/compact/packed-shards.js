@@ -20,10 +20,21 @@
 // Removal writes an immutable compact_packed_pruned marker in the same savepoint, and only a marked scope is ever read
 // from its packed set (store accessors, read model pools, ecosystem pool activity, persisted identities). Pruned pool
 // hours also add their swap counts to compact_packed_pool_swaps, so all-history pool activity stays an exact sum
-// without decoding every pruned hour. Packed sets are never deleted: every identity set stays available for 30-day
-// unions and recovery. Any missing, corrupt or mismatching packed data keeps the hot rows.
+// without decoding every pruned hour. Any missing, corrupt or mismatching packed data keeps the hot rows.
+// Expiry (OFF unless COMPACT_PACKED_EXPIRY_ENABLED=true, which requires retention) bounds the packed data: it deletes the
+// packed set of a pruned scope only once nothing the system serves or repairs can reach it any more (PACKED_KEEP_HOURS:
+// identities 61 days, for the 30D unique union and the previous 30D it is compared with; pool data 36 days, the 35-day
+// pool-hour retention of projection/valuation backfill, TVL repair and 30D pools), only when its hot rows are already gone
+// and the set still matches its prune marker, and only after the storage check accepts the write-ahead log the deletion
+// needs. An expired pool hour first keeps the creation-hour swap count of every registered pool created in it
+// (compact_packed_pool_creation_swaps, for the ecosystem's early activity); all-history swap totals stay in
+// compact_packed_pool_swaps. Deletion writes an immutable compact_packed_expired marker first: delete triggers allow
+// removing a set or piece only for a marked scope, a payload only when no piece references it, and no set can be packed
+// again for a marked scope. Readers never turn an expired scope into empty data: they fail closed or report it.
+// Canonical hours, status rows, the registry and every non-packed table are never touched here, so they keep growing.
 import { createHash } from 'node:crypto';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
+import { POOL_HOUR_RETENTION_HOURS } from './projections.js';
 import { VALUATIONS } from './valuation.js';
 
 export const PACKED_SHARDS_VERSION = 'arc-packed-shards-v1';
@@ -33,9 +44,17 @@ export const PACKED_MAX_RAW_PIECE_BYTES = 256 * 1024;
 // The 24H window plus a full day of margin: nothing a 24H read, the TVL top-pool choice or a pending valuation touches
 // is ever removed from the hot tables.
 export const PACKED_MIN_HOT_HOURS = 48;
+// Expiry keeps every packed scope whose last hour is inside these spans before the newest stored hour (each with one day
+// of margin): identity sets cover the 30D window and the previous 30D its unique count is compared with (address-union.js);
+// pool, price-path and fee sets cover the pool-hour retention (projections.js), the widest reach of 30D pools, TVL and
+// projection repair, and projection/valuation backfill.
+export const PACKED_KEEP_HOURS = Object.freeze({ identity: 2 * 30 * 24 + 24, pool: POOL_HOUR_RETENTION_HOURS + 24 });
+// The write-ahead log of a retention pass is truncated back to this size after it is checkpointed (store.js).
+export const PACKED_JOURNAL_LIMIT_BYTES = 64 * 1024 * 1024;
 const ADDRESS_BYTES = 20;
 const HOUR = 3600;
 const DAY = 24 * HOUR;
+const MiB = 1024 * 1024;
 
 // Hourly datasets are final when every listed projection of the hour is available and the stored rows match their
 // row counts; identity datasets when the hour's (or completed day's) identity count matches the canonical count.
@@ -65,18 +84,37 @@ CREATE TABLE IF NOT EXISTS compact_packed_pieces (
   payload_sha256 TEXT NOT NULL REFERENCES compact_packed_payloads (payload_sha256),
   PRIMARY KEY (dataset, scope_start, part)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_packed_expired (
+  dataset TEXT NOT NULL, scope_start INTEGER NOT NULL, row_count INTEGER NOT NULL CHECK (row_count >= 0), rows_sha256 TEXT NOT NULL,
+  PRIMARY KEY (dataset, scope_start)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_packed_pool_creation_swaps (
+  protocol TEXT NOT NULL, pool TEXT NOT NULL, hour_start INTEGER NOT NULL, swap_count INTEGER CHECK (swap_count IS NULL OR swap_count >= 0),
+  PRIMARY KEY (protocol, pool)
+) STRICT, WITHOUT ROWID;
+DROP TRIGGER IF EXISTS compact_packed_payload_no_delete;
+DROP TRIGGER IF EXISTS compact_packed_set_no_delete;
+DROP TRIGGER IF EXISTS compact_packed_piece_no_delete;
 CREATE TRIGGER IF NOT EXISTS compact_packed_payload_no_update BEFORE UPDATE ON compact_packed_payloads BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_payload_no_delete BEFORE DELETE ON compact_packed_payloads BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_payload_delete_guard BEFORE DELETE ON compact_packed_payloads
+WHEN EXISTS (SELECT 1 FROM compact_packed_pieces WHERE payload_sha256 = OLD.payload_sha256) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_payload_no_replace BEFORE INSERT ON compact_packed_payloads
 WHEN EXISTS (SELECT 1 FROM compact_packed_payloads WHERE payload_sha256 = NEW.payload_sha256) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_set_no_update BEFORE UPDATE ON compact_packed_sets BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_set_no_delete BEFORE DELETE ON compact_packed_sets BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_set_delete_guard BEFORE DELETE ON compact_packed_sets
+WHEN NOT EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_set_no_replace BEFORE INSERT ON compact_packed_sets
-WHEN EXISTS (SELECT 1 FROM compact_packed_sets WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+WHEN EXISTS (SELECT 1 FROM compact_packed_sets WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_update BEFORE UPDATE ON compact_packed_pieces BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_delete BEFORE DELETE ON compact_packed_pieces BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_piece_delete_guard BEFORE DELETE ON compact_packed_pieces
+WHEN NOT EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_replace BEFORE INSERT ON compact_packed_pieces
 WHEN EXISTS (SELECT 1 FROM compact_packed_pieces WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start AND part = NEW.part)
+  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TABLE IF NOT EXISTS compact_packed_pruned (
   dataset TEXT NOT NULL, scope_start INTEGER NOT NULL, row_count INTEGER NOT NULL CHECK (row_count >= 0), rows_sha256 TEXT NOT NULL,
@@ -93,6 +131,17 @@ WHEN EXISTS (SELECT 1 FROM compact_packed_pruned WHERE dataset = NEW.dataset AND
 CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_no_delete BEFORE DELETE ON compact_packed_pool_swaps BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_only_grow BEFORE UPDATE ON compact_packed_pool_swaps
 WHEN NEW.protocol <> OLD.protocol OR NEW.pool <> OLD.pool OR NEW.swap_count < OLD.swap_count OR NEW.row_count <= OLD.row_count
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_update BEFORE UPDATE ON compact_packed_expired BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_delete BEFORE DELETE ON compact_packed_expired BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_replace BEFORE INSERT ON compact_packed_expired
+WHEN EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+  OR NOT EXISTS (SELECT 1 FROM compact_packed_pruned WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_creation_no_update BEFORE UPDATE ON compact_packed_pool_creation_swaps BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_creation_no_delete BEFORE DELETE ON compact_packed_pool_creation_swaps BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_creation_no_replace BEFORE INSERT ON compact_packed_pool_creation_swaps
+WHEN EXISTS (SELECT 1 FROM compact_packed_pool_creation_swaps WHERE protocol = NEW.protocol AND pool = NEW.pool)
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;`;
 
 export class PackedShardsError extends Error {
@@ -134,9 +183,13 @@ export function packedShardsConfig(env = process.env) {
   };
   const enabled = flag('COMPACT_PACKED_SHARDS_ENABLED');
   const retention = flag('COMPACT_PACKED_RETENTION_ENABLED');
+  const expiry = flag('COMPACT_PACKED_EXPIRY_ENABLED');
   if (retention && !enabled) fail('packed_retention_requires_packing');
-  return Object.freeze({ enabled, retention, hotHours: number('COMPACT_PACKED_HOT_HOURS', PACKED_MIN_HOT_HOURS, PACKED_MIN_HOT_HOURS, 400 * 24),
-    maintenanceScopes: number('COMPACT_PACKED_MAINTENANCE_SCOPES', 16, 1, 256) });
+  if (expiry && !retention) fail('packed_expiry_requires_retention');
+  return Object.freeze({ enabled, retention, expiry, hotHours: number('COMPACT_PACKED_HOT_HOURS', PACKED_MIN_HOT_HOURS, PACKED_MIN_HOT_HOURS, 400 * 24),
+    maintenanceScopes: number('COMPACT_PACKED_MAINTENANCE_SCOPES', 16, 1, 256),
+    // Write-ahead log a pass may plan for its deletions; the first deletion of a pass is never refused by this alone.
+    maintenanceMiB: number('COMPACT_PACKED_MAINTENANCE_MAX_MIB', 64, 1, 1024) });
 }
 
 // A JSON column value: NULL, TEXT or a safe INTEGER, which JSON returns with the same type. A BLOB is never JSON-packed.
@@ -182,16 +235,22 @@ function* decodePiece(codec, columns, scopeColumn, scope, raw, rowCount) {
 export function createPackedShards(db, { config = packedShardsConfig(), preflight = () => ({ ok: true }), log = console.warn, beforePack = null } = {}) {
   const tablesExist = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_sets'").get());
   const prunedTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_pruned'").get());
+  const expiredTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_expired'").get());
   const int = (value) => BigInt(value);
   const retention = config.retention === true;
   const hotHours = Number.isSafeInteger(config.hotHours) ? Math.max(config.hotHours, PACKED_MIN_HOT_HOURS) : PACKED_MIN_HOT_HOURS;
   const maintenanceScopes = Number.isSafeInteger(config.maintenanceScopes) ? config.maintenanceScopes : 16;
+  const expiry = retention && config.expiry === true;
+  const maintenanceBytes = (Number.isSafeInteger(config.maintenanceMiB) ? config.maintenanceMiB : 64) * MiB;
   // Sets written by the current writer transaction (reset by begin()): such a set never authorizes removing hot rows.
   const created = new Set();
   const keyOf = (dataset, scope) => `${dataset}:${scope}`;
   // True when retention removed this scope's hot rows; readers then read the packed set, and only then.
   const isPruned = (dataset, scope) => prunedTableExists()
     && Boolean(db.prepare('SELECT 1 FROM compact_packed_pruned WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope)));
+  // True when expiry deleted this pruned scope's packed set: its rows exist nowhere any more, and readers must say so.
+  const isExpired = (dataset, scope) => expiredTableExists()
+    && Boolean(db.prepare('SELECT 1 FROM compact_packed_expired WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope)));
   const prunedScopes = (dataset, from, to) => (prunedTableExists()
     ? db.prepare('SELECT scope_start FROM compact_packed_pruned WHERE dataset = ? AND scope_start BETWEEN ? AND ? ORDER BY scope_start')
       .all(dataset, int(from), int(to)).map((row) => row.scope_start) : []);
@@ -406,18 +465,31 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   const valuationsFinal = (hour) => db.prepare(`SELECT COUNT(*) AS count FROM compact_valuation_hours WHERE hour_start = ? AND status = 'available'
     AND valuation IN (${VALUATIONS.map(() => '?').join(', ')})`).get(int(hour), ...VALUATIONS).count === VALUATIONS.length;
 
+  // A deletion writes the pages it touches to the write-ahead log before any space is freed. It is admitted only when the
+  // store's storage check (free space after a reserve, database and WAL budget) accepts the pass's planned bytes; after the
+  // pass's first deletion also only within the pass budget. Admitted bytes count against the pass even if rolled back.
+  function admit(pass, planned) {
+    if (pass.bytes > 0 && pass.bytes + planned > maintenanceBytes) return false;
+    const check = preflight(pass.bytes + planned);
+    if (!check?.ok) throw new PackedShardsError('packed_storage_blocked', check?.reason ?? 'storage_capacity_unknown');
+    pass.bytes += planned;
+    return true;
+  }
+
   // Removes one scope's hot rows inside the caller's transaction, or keeps them and says why. Throws (caught by
   // pruneSafely, which rolls the savepoint back) when the packed set does not verify or differs from the hot rows.
-  function pruneScope(dataset, scope, newest) {
+  function pruneScope(dataset, scope, newest, pass) {
     if (!retention) fail('packed_retention_disabled');
     if (db.isTransaction !== true) fail('packed_transaction_required');
     const definition = definitionOf(dataset);
     if (lastHourOf(definition, scope) > retentionCutoff(newest)) return { outcome: 'kept:hot_window' };
     if (created.has(keyOf(dataset, scope))) return { outcome: 'kept:packed_in_this_transaction' };
     if (isPruned(dataset, scope)) return { outcome: 'unchanged' };
-    const set = db.prepare('SELECT row_count, rows_sha256 FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
+    const set = db.prepare('SELECT row_count, rows_sha256, raw_bytes FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
     if (!set) return { outcome: 'kept:not_packed' };
     if (definition.projections && !valuationsFinal(scope)) return { outcome: 'kept:valuations_not_final' };
+    // The hot rows' pages (about twice their raw bytes) and their index pages.
+    if (!admit(pass, 2 * set.raw_bytes + 64 * 1024)) return { outcome: 'kept:pass_budget' };
     // 1. The packed set verifies completely now, in a transaction after the one that wrote it (streamed, bounded).
     streamSet(dataset, scope);
     // 2. The hot rows are exactly the packed rows: same count and the same typed digest, streamed in primary-key order.
@@ -442,19 +514,92 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     return { outcome: 'pruned', rows: count };
   }
 
-  function pruneSafely(dataset, scope, newest) {
-    db.exec('SAVEPOINT compact_packed_retention');
+  // Runs one deletion inside its own savepoint; a failure rolls back only that scope and is reported, never thrown.
+  function deleteSafely(savepoint, tag, work, dataset, scope) {
+    db.exec(`SAVEPOINT ${savepoint}`);
     try {
-      const report = pruneScope(dataset, scope, newest);
-      db.exec('RELEASE compact_packed_retention');
+      const report = work();
+      db.exec(`RELEASE ${savepoint}`);
       return report;
     } catch (error) {
-      db.exec('ROLLBACK TO compact_packed_retention');
-      db.exec('RELEASE compact_packed_retention');
-      const reason = error?.code ?? 'packed_retention_failed';
-      log(`PACKED_RETENTION_BLOCKED dataset=${dataset} scope=${scope} reason=${reason}`);
-      return { outcome: `failed:${reason}` };
+      db.exec(`ROLLBACK TO ${savepoint}`);
+      db.exec(`RELEASE ${savepoint}`);
+      const storage = error?.code === 'packed_storage_blocked';
+      const reason = storage ? `storage:${error.reason}` : error?.code ?? `${savepoint}_failed`;
+      log(`${tag} dataset=${dataset} scope=${scope} reason=${reason}`);
+      return { outcome: storage ? `storage_blocked:${error.reason}` : `failed:${reason}` };
     }
+  }
+  const pruneSafely = (dataset, scope, newest, pass) => deleteSafely('compact_packed_retention', 'PACKED_RETENTION_BLOCKED',
+    () => pruneScope(dataset, scope, newest, pass), dataset, scope);
+
+  // Deletes one pruned scope's packed set once nothing can reach it (PACKED_KEEP_HOURS), or keeps it and says why.
+  // Throws (caught by expireSafely) when the set no longer matches its prune marker, hot rows came back, an expiring pool
+  // hour's set cannot be read for its creation-hour swaps, or the storage check refuses the deletion.
+  const keepHoursOf = (definition) => (definition.codec === 'address-b20' ? PACKED_KEEP_HOURS.identity : PACKED_KEEP_HOURS.pool);
+  const expiryCutoff = (definition, newest) => newest - (keepHoursOf(definition) - 1) * HOUR; // the oldest last hour kept
+  function expireScope(dataset, scope, newest, pass) {
+    if (!expiry) fail('packed_expiry_disabled');
+    if (db.isTransaction !== true) fail('packed_transaction_required');
+    const definition = definitionOf(dataset);
+    if (lastHourOf(definition, scope) >= expiryCutoff(definition, newest)) return { outcome: 'kept:needed' };
+    if (isExpired(dataset, scope)) return { outcome: 'unchanged' };
+    const marker = db.prepare('SELECT row_count, rows_sha256 FROM compact_packed_pruned WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
+    if (!marker) return { outcome: 'kept:not_pruned' };
+    const set = db.prepare('SELECT row_count, rows_sha256, pieces, stored_bytes FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?')
+      .get(dataset, int(scope));
+    if (!set || set.row_count !== marker.row_count || set.rows_sha256 !== marker.rows_sha256) fail('packed_expiry_set_mismatch');
+    if (db.prepare(`SELECT COUNT(*) AS count FROM ${dataset} WHERE ${definition.scope} = ?`).get(int(scope)).count !== 0) {
+      fail('packed_expiry_hot_rows_present');
+    }
+    // The set's payload pages and its index pages.
+    if (!admit(pass, set.stored_bytes + 64 * 1024)) return { outcome: 'kept:pass_budget' };
+    if (dataset === 'compact_pool_hours') keepCreationSwaps(scope);
+    db.prepare('INSERT INTO compact_packed_expired (dataset, scope_start, row_count, rows_sha256) VALUES (?, ?, ?, ?)')
+      .run(dataset, int(scope), int(set.row_count), set.rows_sha256);
+    const payloads = db.prepare('SELECT DISTINCT payload_sha256 FROM compact_packed_pieces WHERE dataset = ? AND scope_start = ?')
+      .all(dataset, int(scope)).map((row) => row.payload_sha256);
+    const pieces = Number(db.prepare('DELETE FROM compact_packed_pieces WHERE dataset = ? AND scope_start = ?').run(dataset, int(scope)).changes);
+    const sets = Number(db.prepare('DELETE FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').run(dataset, int(scope)).changes);
+    if (pieces !== set.pieces || sets !== 1) fail('packed_expiry_mismatch');
+    // A payload another set still references (an equal piece) stays.
+    const unreferenced = db.prepare(`DELETE FROM compact_packed_payloads WHERE payload_sha256 = ?
+      AND NOT EXISTS (SELECT 1 FROM compact_packed_pieces WHERE payload_sha256 = ?)`);
+    for (const payload of payloads) unreferenced.run(payload, payload);
+    return { outcome: 'expired', rows: set.row_count };
+  }
+  const expireSafely = (dataset, scope, newest, pass) => deleteSafely('compact_packed_expiry', 'PACKED_EXPIRY_BLOCKED',
+    () => expireScope(dataset, scope, newest, pass), dataset, scope);
+
+  // Before an hour's pool rows are gone for good: the creation-hour swap count of every registered pool created in that
+  // hour (NULL when the pool had no row in it), exactly what the ecosystem reads as early activity (intelligence-store.js).
+  // Reading the set verifies it; a pool registered only after this hour expired is never given a count.
+  function keepCreationSwaps(hour) {
+    const range = db.prepare('SELECT first_block, last_block FROM compact_hours WHERE hour_start = ?').get(int(hour));
+    if (!range) fail('packed_expiry_hour_missing');
+    const created = new Map(db.prepare(`SELECT kind, address FROM compact_registry WHERE kind IN ('uniswap_v3_pool', 'uniswap_v4_pool')
+      AND created_block BETWEEN ? AND ?`).all(int(range.first_block), int(range.last_block))
+      .map((row) => [`${row.kind === 'uniswap_v3_pool' ? 'uniswap_v3' : 'uniswap_v4'}:${row.address}`, null]));
+    if (!created.size) return;
+    const verified = streamSet('compact_pool_hours', hour, (row) => {
+      const key = `${row.protocol}:${row.pool}`;
+      if (created.has(key)) created.set(key, row.swap_count);
+    });
+    if (!verified) fail('packed_expiry_set_mismatch');
+    const insert = db.prepare('INSERT INTO compact_packed_pool_creation_swaps (protocol, pool, hour_start, swap_count) VALUES (?, ?, ?, ?)');
+    for (const [key, swaps] of created) {
+      const [protocol, pool] = key.split(':');
+      insert.run(protocol, pool, int(hour), swaps === null ? null : int(swaps));
+    }
+  }
+
+  // Oldest pruned scopes whose packed set nothing can reach any more and that are not expired yet.
+  function expiryCandidates(dataset, newest, limit) {
+    const definition = definitionOf(dataset);
+    const newestScope = expiryCutoff(definition, newest) - HOUR - (definition.scope === 'day_start' ? DAY - HOUR : 0);
+    return db.prepare(`SELECT m.scope_start FROM compact_packed_pruned m WHERE m.dataset = ? AND m.scope_start <= ?
+      AND NOT EXISTS (SELECT 1 FROM compact_packed_expired e WHERE e.dataset = m.dataset AND e.scope_start = m.scope_start)
+      ORDER BY m.scope_start LIMIT ?`).all(dataset, int(newestScope), int(limit)).map((row) => row.scope_start);
   }
 
   // Oldest packed scopes outside the hot window whose hot rows are all present and, for pool data, whose valuations
@@ -475,7 +620,9 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   // became available later). The same readiness rules as packScope, as SQL, so a scope that is not final is skipped.
   function packCandidates(dataset, newest, limit) {
     const definition = definitionOf(dataset);
-    const unpacked = (scope) => `NOT EXISTS (SELECT 1 FROM compact_packed_sets s WHERE s.dataset = '${dataset}' AND s.scope_start = ${scope})`;
+    // Not packed and never pruned: an expired scope has neither hot rows nor a set and must not come back as a candidate.
+    const unpacked = (scope) => `NOT EXISTS (SELECT 1 FROM compact_packed_sets s WHERE s.dataset = '${dataset}' AND s.scope_start = ${scope})
+      AND NOT EXISTS (SELECT 1 FROM compact_packed_pruned m WHERE m.dataset = '${dataset}' AND m.scope_start = ${scope})`;
     if (definition.scope === 'day_start') {
       return db.prepare(`SELECT d.day_start AS scope FROM compact_daily_active_addresses d WHERE d.status = 'available' AND d.day_start <= ?
         AND ${unpacked('d.day_start')}
@@ -498,14 +645,17 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
       ORDER BY h.hour_start LIMIT ?`).all(int(newest), ...definition.projections, ...definition.projections, int(limit)).map((row) => row.scope);
   }
 
-  // One bounded retention pass inside the caller's writer transaction: first remove the hot rows of up to `limit`
-  // qualifying scopes packed by earlier transactions, then pack up to `limit` final scopes that are not packed yet
-  // (those can only be removed by a later pass). Datasets take turns, oldest scope first. Null when retention is OFF.
+  // One bounded retention pass inside the caller's writer transaction: with expiry ON, first delete the packed sets of
+  // up to `limit` pruned scopes nothing can reach any more; then remove the hot rows of up to `limit` qualifying scopes
+  // packed by earlier transactions; then pack up to `limit` final scopes that are not packed yet (those can only be
+  // removed by a later pass). Datasets take turns, oldest scope first. Deletions share one write-ahead-log budget and stop
+  // for the rest of the pass at the first storage refusal (the next pass checks again). Null when retention is OFF.
   function maintain(newest, { limit = maintenanceScopes } = {}) {
     if (!retention) return null;
     if (db.isTransaction !== true) fail('packed_transaction_required');
     if (!Number.isSafeInteger(limit) || limit < 1) fail('packed_maintenance_limit_invalid');
-    const report = { pruned: 0, packed: 0, kept: 0, failed: [] };
+    const report = { expired: 0, pruned: 0, packed: 0, kept: 0, failed: [] };
+    const pass = { bytes: 0, blocked: false };
     // Candidate selection is read-only; a failure there is reported like a failed scope and never fails the caller.
     const candidates = (select) => Object.keys(PACKED_DATASETS).map((dataset) => {
       try {
@@ -528,12 +678,18 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
         }
       }
     };
-    roundRobin(candidates(pruneCandidates), limit, (dataset, scope) => {
-      const { outcome } = pruneSafely(dataset, scope, newest);
-      if (outcome === 'pruned') report.pruned++;
+    const deletion = (deleteSafe, done) => (dataset, scope) => {
+      if (pass.blocked) return;
+      const { outcome } = deleteSafe(dataset, scope, newest, pass);
+      if (outcome === done) report[done]++;
       else if (outcome.startsWith('failed:')) report.failed.push({ dataset, scope, reason: outcome.slice(7) });
-      else report.kept++;
-    });
+      else if (outcome.startsWith('storage_blocked:')) {
+        pass.blocked = true;
+        report.failed.push({ dataset, scope, reason: outcome });
+      } else report.kept++;
+    };
+    if (expiry) roundRobin(candidates(expiryCandidates), limit, deletion(expireSafely, 'expired'));
+    roundRobin(candidates(pruneCandidates), limit, deletion(pruneSafely, 'pruned'));
     roundRobin(candidates(packCandidates), limit, (dataset, scope) => {
       const { outcome } = packSafely(dataset, scope);
       if (outcome === 'inserted') report.packed++;
@@ -551,6 +707,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
       created.clear();
     },
     isPruned,
+    isExpired,
     prunedScopes,
     maintain,
     // Writer side (inside the caller's transaction): the hour's datasets, and the hour's UTC day once it is final.

@@ -450,7 +450,10 @@ function prunedPoolHours(db) {
 
 // Early swaps of pools created in a pruned hour and the pruned hours' share of each pool's stored swaps. The share is the
 // exact all-pruned total (compact_packed_pool_swaps) minus the pruned hours after endBlock, or the pruned hours up to
-// endBlock streamed directly, whichever needs fewer hours decoded. Any packed read that does not verify throws.
+// endBlock streamed directly, whichever needs fewer hours decoded. Any packed read that does not verify throws. A creation
+// hour whose set expiry deleted gives the count kept for the pool when it expired (compact_packed_pool_creation_swaps),
+// or, for a pool registered later, no count (early activity unavailable); an expired hour the share would have to
+// stream leaves those pools without a stored swap count instead of a smaller one.
 function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
   const packed = createPackedShards(db, { config: { enabled: false } });
   const wantedKeys = new Set(wanted.map(({ key }) => key));
@@ -462,12 +465,22 @@ function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
   for (const { key, creationHour } of wanted) {
     if (creationHour && prunedSet.has(creationHour.hour_start)) early.set(key, creationHour.hour_start);
   }
+  const kept = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_packed_pool_creation_swaps'").get()
+    ? db.prepare('SELECT swap_count FROM compact_packed_pool_creation_swaps WHERE protocol=? AND pool=? AND hour_start=?') : null;
   for (const hour of new Set(early.values())) {
-    forPools(hour, (row) => {
+    const read = forPools(hour, (row) => {
       const key = poolKey(row.protocol, row.pool);
       const observation = context.observations.get(key);
       if (early.get(key) === hour && observation) observation.early_swaps = row.swap_count;
     });
+    if (read) continue;
+    for (const { key, row, protocol } of wanted) {
+      const observation = context.observations.get(key);
+      if (early.get(key) !== hour || !observation) continue;
+      const stored = kept?.get(protocol, row.address, BigInt(hour));
+      if (stored) observation.early_swaps = stored.swap_count;
+      else observation.early_expired = true;
+    }
   }
   const totals = new Map();
   const add = (protocol, pool, swaps, rows) => {
@@ -477,6 +490,7 @@ function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
     entry.rows += rows;
     totals.set(key, entry);
   };
+  let complete = true;
   const late = pruned.filter((row) => row.last_block > endBlock);
   const upTo = pruned.filter((row) => row.last_block <= endBlock);
   if (late.length <= upTo.length) {
@@ -485,9 +499,13 @@ function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
       WHERE pool IN (${pools.map(() => '?').join(',')})`).all(...pools)) {
       if (wantedKeys.has(poolKey(row.protocol, row.pool))) add(row.protocol, row.pool, row.swap_count, row.row_count);
     }
-    for (const { hour_start: hour } of late) forPools(hour, (row) => add(row.protocol, row.pool, -row.swap_count, -1));
+    for (const { hour_start: hour } of late) complete &&= Boolean(forPools(hour, (row) => add(row.protocol, row.pool, -row.swap_count, -1)));
   } else {
-    for (const { hour_start: hour } of upTo) forPools(hour, (row) => add(row.protocol, row.pool, row.swap_count, 1));
+    for (const { hour_start: hour } of upTo) complete &&= Boolean(forPools(hour, (row) => add(row.protocol, row.pool, row.swap_count, 1)));
+  }
+  if (!complete) {
+    for (const key of wantedKeys) context.activity.delete(key);
+    return;
   }
   for (const [key, share] of totals) {
     if (share.rows < 0 || share.swaps < 0) throw new Error('packed_pool_swaps_inconsistent');
@@ -535,7 +553,8 @@ function correlatedDex(context, token, endBlock) {
     };
     const activity = context.activity.get(poolKey(protocol, row.address));
     const early = creationHour && creationHour.last_block <= endBlock ? {
-      status: context.projections.get(`${protocol}_pools:${creationHour.hour_start}`), swap_count: evidence?.early_swaps } : null;
+      status: evidence?.early_expired ? 'expired' : context.projections.get(`${protocol}_pools:${creationHour.hour_start}`),
+      swap_count: evidence?.early_swaps } : null;
     return { protocol, pool: row.address, pairedToken: token0 === token ? token1 : token0, creationBlock: row.created_block,
       creationTxHash: row.created_tx, creationTimestamp: (() => {
         return evidence?.creation_timestamp !== null && evidence?.creation_timestamp !== undefined ? iso(evidence.creation_timestamp) : null;

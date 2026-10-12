@@ -906,7 +906,12 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     const pruned = packedSets().prunedScopes('compact_pool_hours', from, to);
     if (!pruned.length) return statement('topPoolRows').all(protocol, int(from), int(to), int(POOL_LIMIT));
     const forPrunedRows = (onRow) => {
-      for (const hour of pruned) packedSets().forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) onRow(row); });
+      for (const hour of pruned) {
+        // An expired set (never inside a served window) or a missing one fails the answer closed, never as an empty hour.
+        if (!packedSets().forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) onRow(row); })) {
+          throw new ReadModelError('inconsistent_state', 'packed_set_missing');
+        }
+      }
     };
     // Pass 1: the window totals and the same ranking as the statement (total desc, then pool id; zero totals left out).
     const totals = new Map(statement('hotPoolTotals').all(protocol, int(from), int(to)).map((row) => [row.pool, row.total]));
