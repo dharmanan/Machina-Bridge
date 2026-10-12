@@ -128,10 +128,11 @@ export function createIntelligenceRepository(db, { archive } = {}) {
     },
     pending({ now, limit }) {
       if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 1 || limit > 16) throw new Error('invalid_discovery_limit');
-      // Separate bounded queues: due retries keep up to half the places; the fresh places are split between the newest
-      // pending candidates (so the latest committed hours start verifying in the next pass, ahead of any historical
-      // backlog) and the oldest (so that backlog keeps draining in block order and is never starved). Unused places are
-      // borrowed, by the other fresh end first and then by retries; a candidate is taken at most once per pass.
+      // Separate bounded queues with reserved places. At the limit of sixteen: twelve for the newest pending candidates,
+      // so the latest committed hours are verified ahead of any historical backlog at about the observed arrival rate
+      // (about 116 per hour at about 11 passes per hour needs eleven); two for due retries and two for the oldest pending,
+      // so both progress every pass and due retries can never take the newest candidates' places. Unused places are
+      // borrowed (oldest, then retries, then newest); a candidate is taken at most once per pass.
       // Earliest retry eligibility rotates old attempts fairly. Terminal negatives never enter any queue.
       // Pending rows are inserted with not_before 0 and leave 'pending' on their first verification, so ordering by
       // (not_before, block_number) is block order and follows the retry index: each read stops at the limit.
@@ -147,9 +148,11 @@ export function createIntelligenceRepository(db, { archive } = {}) {
           if (!selected.has(row.candidate_key)) { selected.set(row.candidate_key, row); places--; }
         }
       };
-      take(retries, Math.ceil(limit / 2));
-      take(newest, Math.ceil((limit - selected.size) / 2));
-      for (const rows of [oldest, newest, retries]) take(rows, limit - selected.size);
+      const newestPlaces = Math.ceil(limit * 3 / 4), retryPlaces = Math.ceil((limit - newestPlaces) / 2);
+      take(newest, newestPlaces);
+      take(retries, retryPlaces);
+      take(oldest, limit - newestPlaces - retryPlaces);
+      for (const rows of [oldest, retries, newest]) take(rows, limit - selected.size);
       return [...selected.values()].map((row) => JSON.parse(row.candidate_json));
     },
     recordVerification(result, { now }) {
