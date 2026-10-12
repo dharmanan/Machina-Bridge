@@ -18,6 +18,8 @@ import { COMPACT_DEFINITION_VERSION, COMPACT_SOURCE_VERSIONS, DENSE_LOG_RANGE_BL
 import { headerOf, SpineError, spineWindows } from './spine.js';
 import { createIntelligenceSink } from './intelligence.js';
 import { INTELLIGENCE_REGISTRY, extensionStreams } from './intelligence-registry.js';
+import { ARCHERY_CL } from '../../api/_lib/arc-intelligence/archery.js';
+import { createArcheryClAccumulator } from './archery-cl.js';
 
 export const HOUR_SECONDS = 3600;
 // One spine window per dense log request: a window never holds more blocks than one dense eth_getLogs covers.
@@ -50,10 +52,13 @@ function registryGap(registry, first, before) {
 // onLogs (optional, for validation tooling) sees each validated log response per stream; it must not keep them all.
 // projections: the Uniswap pool/activity projections (projections.js) are fed from the same validated, decoded events the
 // V3/V4 families count, before the logs are released: no extra request. false only to prove that in tests.
+// protocolActivity: additional protocol counts (Archery CL) from the same v3Pools logs, reported under `protocols`, never
+// among `families`. Only the live runner asks for it; off, the result is exactly what it was before.
 export async function processBlockRange({ provider, first, last, before, after = null, hourStart = null, hourEnd = null,
   windowBlocks = DEFAULT_WINDOW_BLOCKS, streams = LOG_STREAMS, onLogs = null, v3Registry = null, projections = true,
-  intelligenceRegistry = INTELLIGENCE_REGISTRY }) {
+  intelligenceRegistry = INTELLIGENCE_REGISTRY, protocolActivity = false, archeryRegistry = ARCHERY_CL }) {
   const network = createNetworkAccumulator();
+  const archery = protocolActivity ? createArcheryClAccumulator({ registry: archeryRegistry, uniswapPools: v3Registry?.pools ?? null }) : null;
   const intelligence = createIntelligenceSink({ registry: intelligenceRegistry });
   const additionalStreams = extensionStreams(intelligenceRegistry);
   const projection = projections ? createProjectionSink({ onVerifiedDex: intelligence.dex }) : null;
@@ -89,6 +94,7 @@ export async function processBlockRange({ provider, first, last, before, after =
           for await (const response of streamLogs(provider, stream, fromBlock, toBlock)) {
             const logs = validateLogs(response, stream, { fromBlock, toBlock, window, seen });
             family.accumulator.add(stream.key, logs, window);
+            if (stream.key === 'v3Pools') archery?.add(logs);
             if (stream.key === 'v3Factory') for (const record of family.accumulator.createdPools()) {
               if (record.createdBlock >= fromBlock && record.createdBlock <= toBlock) intelligence.poolCreated(record, window);
             }
@@ -115,6 +121,8 @@ export async function processBlockRange({ provider, first, last, before, after =
     throw error;
   }
   if (!lastBlock || lastBlock.number !== last) throw new HourIncompleteError('spine_incomplete');
+  // Archery reads the v3Pools logs of every window only when the uniswapV3 family streamed the whole range without error.
+  const v3PoolsDelivered = !families.uniswapV3.error;
   if (after && (after.number !== last + 1 || after.parentHash !== lastBlock.hash || (hourEnd !== null && after.timestamp < hourEnd))) {
     throw new HourIncompleteError('right_boundary_mismatch', last + 1);
   }
@@ -151,6 +159,7 @@ export async function processBlockRange({ provider, first, last, before, after =
     results[name] = { status: 'unavailable', reason: family.error, ...Object.fromEntries(FAMILY_FIELDS[name].map((field) => [field, null])) };
   }
 
+  const protocols = archery ? { archeryCl: await archery.finish({ provider, blockTag, delivered: v3PoolsDelivered }) } : null;
   await intelligence.verifyLaunchSources(provider, { firstBlock: first, lastBlock: last });
   const projectionResults = projection ? projection.finish({ families: results, hourStart, firstBlock: first, lastBlock: last }) : null;
   return {
@@ -183,6 +192,7 @@ export async function processBlockRange({ provider, first, last, before, after =
     },
     // Not families: separate status, storage and versions (store.js). Present only when computed.
     ...(projectionResults ? { projections: projectionResults } : {}),
+    ...(protocols ? { protocols } : {}),
     intelligence: intelligence.finish({ range: { hourStart, firstBlock: first, lastBlock: last, parentHash: before.hash, lastHash: lastBlock.hash },
       families: results, codePresent: context.codePresent, projections: projectionResults }),
   };
@@ -221,12 +231,12 @@ export async function locateHour({ provider, hourStart, safeHead }) {
 // any registry that covers the blocks before the hour classifies V3 emitters the same way. `bounds` (from locateHour)
 // skips the boundary search; it is checked again here and the spine re-validates every block against it.
 export async function processHour({ provider, hourStart, safeHead, windowBlocks = DEFAULT_WINDOW_BLOCKS, onLogs = null, v3Registry = null,
-  bounds = null, projections = true, intelligenceRegistry = INTELLIGENCE_REGISTRY }) {
+  bounds = null, projections = true, intelligenceRegistry = INTELLIGENCE_REGISTRY, protocolActivity = false, archeryRegistry = ARCHERY_CL }) {
   if (!Number.isSafeInteger(hourStart) || hourStart % HOUR_SECONDS !== 0) throw new HourIncompleteError('invalid_hour_request');
   const hourEnd = hourStart + HOUR_SECONDS;
   const { before, first, last, after } = bounds ? checkedBounds(bounds, hourStart) : await locateHour({ provider, hourStart, safeHead });
   const result = await processBlockRange({ provider, first: first.number, last: last.number, before, after, hourStart, hourEnd,
-    windowBlocks, onLogs, v3Registry, projections, intelligenceRegistry });
+    windowBlocks, onLogs, v3Registry, projections, intelligenceRegistry, protocolActivity, archeryRegistry });
   if (result.range.firstHash !== first.hash || result.range.lastHash !== last.hash) throw new HourIncompleteError('boundary_hash_mismatch');
   return result;
 }

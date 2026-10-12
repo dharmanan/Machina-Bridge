@@ -1094,7 +1094,7 @@ await test('UI 16 mutation: a component that drops a section, or hides one when 
     [componentSource.replace('<LaunchesSection ctx={ctx} />', ''), 'ready', /section launches not rendered/],
     [componentSource.replace('<BorrowSection borrowMarket={borrowMarket} />', ''), 'collecting', /section borrow not rendered/],
     [componentSource.replace('function AssetsSection({ ctx }: { ctx: ViewContext }) {', "function AssetsSection({ ctx }: { ctx: ViewContext }) {\n  if (ctx.mode !== 'ready') return null"), 'failed', /section assets not rendered/],
-    [componentSource.replace("  { item: 'rwa-other.exchange-flows', icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },\n", ''),
+    [componentSource.replace("  { item: 'rwa-other.exchange-flows', also: null, icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },\n", ''),
       'collecting', /item rwa-other\.exchange-flows not rendered/],
   ];
   for (const [source, state, expected] of mutations) {
@@ -2646,6 +2646,26 @@ await test('Refresh 9 cancellation stops queued section requests without issuing
   assert.equal(calls, 2); controller.abort(); await result; assert.equal(calls, 2);
 });
 
+// Archery CL (summary.dex.archeryCl, server/compact/read-model.js archeryWindow): counts of the official factory's pools in
+// the Top Protocols "other" place, with the coverage of the period; never USD, never part of Uniswap.
+const ARCHERY_WETH = '0x128cc466b61f542da60c70e3aa11c10e19b84edb';
+const ARCHERY_POOLS = [
+  { pool: '0x072ca55acb3cc90f96b7f7807cf8de2250af4dc7', token0: ARCHERY_WETH, token1: USDC, tickSpacing: 50, market: 'WETH / USDC', swaps: 60, mints: 2, burns: 1 },
+  { pool: '0xb88c08e31c1bc7d41f2cfc4fbafad5b3b0a5eae9', token0: USDC, token1: EURC, tickSpacing: 1, market: 'USDC / EURC', swaps: 47, mints: 0, burns: 0 },
+];
+function archeryFixture({ hours = 24, available = hours, unavailable = 0, pools = ARCHERY_POOLS, trackedFrom = isoAt(END - available * HOUR_MS) } = {}) {
+  const notTracked = hours - available - unavailable;
+  const status = available === hours ? 'available' : available > 0 ? 'partial' : notTracked === hours && trackedFrom === null ? 'source_pending' : 'unavailable';
+  const sum = (field) => pools.reduce((total, pool) => total + pool[field], 0);
+  return { protocol: 'archery_cl', name: 'Archery CL', source: 'https://archery.wtf/docs/security', factory: '0xc481038c013fe96f38ce7a2dc417b2b1b78b16a4',
+    definitionVersion: 'archery-cl-hour-v1', unit: 'events', start: isoAt(END - hours * HOUR_MS), end: isoAt(END), status,
+    reason: status === 'available' ? null : status === 'source_pending' ? 'not_tracked_yet' : 'hour_unavailable',
+    reasons: [...(notTracked ? [trackedFrom === null ? 'not_tracked_yet' : 'not_tracked_before_start'] : []), ...(unavailable ? ['factory_rpc_unavailable'] : [])],
+    trackedFrom, coverage: { expectedHours: hours, availableHours: available, unavailableHours: unavailable, notTrackedHours: notTracked },
+    unavailableHours: Array.from({ length: unavailable }, (_, index) => isoAt(END - (index + 1) * HOUR_MS)),
+    metrics: available ? { swapCount: sum('swaps'), mintCount: sum('mints'), burnCount: sum('burns'), activePoolCount: pools.length, registeredPoolCount: 4,
+      pools } : null };
+}
 await test('Responsive fixture preserves exact valuations and exports representative dashboard states', async () => {
   const fixtures = [];
   const fields = {
@@ -2678,7 +2698,11 @@ await test('Responsive fixture preserves exact valuations and exports representa
     aave.values = null;
     assert.ok(lib.protocolActions(aave));
     ecosystem.launches.rows[0].name = 'A'.repeat(128);
+    data.summary.dex.archeryCl = window === '24h' ? archeryFixture()
+      : archeryFixture({ hours: ecosystem.window.hours, available: 30, unavailable: window === '30d' ? 1 : 0 });
     const { html, tree } = render({ selectedWindow: window, data, borrowMarket: BORROW_AVAILABLE, explorerUrl: 'https://arcscan.app' });
+    assert.equal(item(tree, 'top-protocols.other').attrs['data-intel-value'], '107', `${window}: Archery CL row in the layout`);
+    assert.equal(byAttr(tree, 'data-archery-coverage', 'partial').length, window === '24h' ? 0 : 1, window);
     const usd = byAttr(tree, 'data-usd-action');
     assert.equal(usd.length, 25);
     for (const amount of usd) assert.equal(textOf(amount), lib.formatUsdMicros(amount.attrs['data-usd-micros']));
@@ -2843,6 +2867,120 @@ await test('UX 4 an asset price shows price and hour in the row; its source pool
     assert.match(textOf(details), /pool 0x[0-9a-f]{4}\.\.\.[0-9a-f]{4}, \$[\d,.]+ depth/, symbol);
     assert.match(textOf(nodes[symbol]).slice(0, -textOf(details).length).trim(), /^\$[\d,.]+ at 13:00 UTC$/, symbol);
   }
+});
+
+function archeryView(archeryCl, { window = '24h', hours = 24 } = {}) {
+  const summary = summaryFixture({ window, hours });
+  if (archeryCl !== undefined) summary.dex.archeryCl = archeryCl;
+  const props = { selectedWindow: window, initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE,
+    data: { ...READY_DATA, window, summary, ecosystem: completionEcosystem() } };
+  const { tree } = render(props);
+  checkScope(tree, SCOPE);
+  return { tree, row: item(tree, 'top-protocols.other'), slot: item(tree, 'rwa-other.other-protocols') };
+}
+
+await test('Archery 1 an API without Archery keeps the previous Other Arc protocols row; nothing about Archery is claimed', async () => {
+  const { tree, row, slot } = archeryView(undefined);
+  assert.equal(row.attrs['data-intel-status'], 'source_pending');
+  assert.equal(row.attrs['data-intel-value'], undefined);
+  assert.match(textOf(row), /^Other Arc protocols Not tracked yet$/);
+  assert.doesNotMatch(textOf(tree), /Archery/);
+  assert.doesNotMatch(textOf(slot), /Top Protocols/);
+});
+
+await test('Archery 2 a fully counted 24H shows Archery CL on its own row: swaps, adds, removes and pools, counts only, outside Uniswap', async () => {
+  const { tree, row, slot } = archeryView(archeryFixture());
+  assert.equal(row.attrs['data-intel-status'], 'available');
+  assert.equal(row.attrs['data-intel-value'], '107');
+  const text = textOf(row);
+  assert.match(text, /^Archery CL DEX 107 swaps /);
+  assert.match(text, /2 adds · 1 removes · 2 of 4 pools active\. Counts only, not USD\./);
+  assert.doesNotMatch(text, /\$|USD volume|TVL|APY|liquidity|Partial/i);
+  const details = [...walk(row)].find((node) => node.tag === 'details');
+  assert.ok(details && details.attrs.open === undefined, 'the pool list is one tap away');
+  assert.match(textOf(details), /^Pools WETH \/ USDC 60 swaps USDC \/ EURC 47 swaps$/);
+  assert.equal(byAttr(row, 'data-archery-coverage').length, 0);
+  // One bar scale: the largest row is full width, Archery is drawn against it.
+  const bars = Object.fromEntries(['top-protocols.uniswap-v3', 'top-protocols.other'].map((id) => [id, widthOf(byAttr(item(tree, id), 'data-activity-bar')[0])]));
+  assert.equal(bars['top-protocols.uniswap-v3'], 100);
+  assert.ok(Math.abs(bars['top-protocols.other'] - (107 / FAMILY_METRICS.uniswapV3.swapCount) * 100) < 1e-9, `${bars['top-protocols.other']}`);
+  // Uniswap stays exactly its own family; Archery is never added to it.
+  assert.equal(item(tree, 'top-protocols.uniswap-v3').attrs['data-intel-value'], String(FAMILY_METRICS.uniswapV3.swapCount));
+  assert.equal(item(tree, 'top-protocols.uniswap-v4').attrs['data-intel-value'], String(FAMILY_METRICS.uniswapV4.swapCount));
+  assert.match(textOf(slot), /Archery CL activity is shown under Top Protocols\.$/);
+});
+
+await test('Archery 3 7D and 30D started mid-window say partial: hours counted, when tracking began, earlier hours not counted', async () => {
+  for (const [window, hours, available, unavailable, expected] of [
+    ['7d', 168, 30, 0, /Partial: 30 of 168 hours counted, tracking began Oct 2, 08:00 UTC\. Earlier hours are not counted\./],
+    ['30d', 720, 30, 1, /Partial: 30 of 720 hours counted, tracking began Oct 2, 08:00 UTC\. 1 tracked hour could not be verified\. Earlier hours are not counted\./],
+  ]) {
+    const { row } = archeryView(archeryFixture({ hours, available, unavailable }), { window, hours });
+    assert.equal(row.attrs['data-intel-status'], 'available', window);
+    assert.equal(row.attrs['data-intel-value'], '107', `${window}: only the counted hours`);
+    const coverage = byAttr(row, 'data-archery-coverage', 'partial');
+    assert.equal(coverage.length, 1, window);
+    assert.match(textOf(coverage[0]), expected, window);
+    assert.equal([...walk(row)].filter((node) => /width:/.test(node.attrs.style ?? '')).length, 0, `${window}: no bar for a partial count`);
+  }
+  // 24H partial reads the same way; a period tracked throughout with a failed hour states only that hour.
+  const { row } = archeryView(archeryFixture({ available: 5 }));
+  assert.match(textOf(byAttr(row, 'data-archery-coverage', 'partial')[0]), /^Partial: 5 of 24 hours counted, tracking began Oct 3, 09:00 UTC\. Earlier hours are not counted\.$/);
+  const gap = archeryView(archeryFixture({ available: 23, unavailable: 1, trackedFrom: isoAt(END - 40 * HOUR_MS) })).row;
+  assert.match(textOf(byAttr(gap, 'data-archery-coverage', 'partial')[0]), /^Partial: 23 of 24 hours counted\. 1 tracked hour could not be verified\.$/);
+});
+
+await test('Archery 4 before the first live hour, or when every tracked hour failed, no count is shown and nothing reads as zero', async () => {
+  const pending = archeryView(archeryFixture({ available: 0, trackedFrom: null })).row;
+  assert.equal(pending.attrs['data-intel-status'], 'source_pending');
+  assert.equal(pending.attrs['data-intel-value'], undefined);
+  assert.match(textOf(pending), /^Archery CL DEX Not tracked yet Counting starts with the first live hour after tracking begins\. Official Archery CL factory pools only\.$/);
+  const failed = archeryView(archeryFixture({ available: 0, unavailable: 3, trackedFrom: isoAt(END - 3 * HOUR_MS) })).row;
+  assert.equal(failed.attrs['data-intel-status'], 'unavailable');
+  assert.equal(failed.attrs['data-intel-value'], undefined);
+  assert.match(textOf(failed), /3 of 3 hours since tracking began could not be verified\. Earlier hours are not counted\.$/);
+  const whole = archeryView(archeryFixture({ available: 0, unavailable: 24, trackedFrom: isoAt(END - 30 * HOUR_MS) })).row;
+  assert.match(textOf(whole), /24 of 24 hours in this period could not be verified\.$/);
+  for (const row of [pending, failed, whole]) {
+    assert.doesNotMatch(withoutAllowedDigits(textOf(row)), /\d/, 'no number other than the hours');
+    assert.doesNotMatch(textOf(row), /\b0 swaps\b/);
+  }
+});
+
+await test('Archery 5 an inconsistent Archery answer is ignored as a whole: no count, the previous row, every other section intact', async () => {
+  const good = archeryFixture();
+  const broken = [
+    { ...good, metrics: { ...good.metrics, swapCount: good.metrics.swapCount + 1 } },
+    { ...good, coverage: { ...good.coverage, notTrackedHours: 1 } },
+    { ...good, status: 'partial' },
+    { ...archeryFixture({ available: 5 }), metrics: null },
+    { ...good, metrics: { ...good.metrics, pools: [{ ...ARCHERY_POOLS[0], pool: 'WETH' }, ARCHERY_POOLS[1]] } },
+    { ...good, trackedFrom: null },
+    { ...good, factory: 'archery' },
+    { ...good, metrics: { ...good.metrics, swapCount: -1 } },
+    'available',
+  ];
+  for (const value of broken) {
+    assert.equal(lib.archeryActivity({ dex: { archeryCl: value } }), null, JSON.stringify(value).slice(0, 80));
+    const { tree, row } = archeryView(value);
+    assert.match(textOf(row), /^Other Arc protocols Not tracked yet$/);
+    assert.equal(item(tree, 'top-protocols.uniswap-v3').attrs['data-intel-value'], String(FAMILY_METRICS.uniswapV3.swapCount));
+  }
+});
+
+await test('Archery 6 the ecosystem card has one row for further protocols and an honest exchange flows row without invented data', async () => {
+  const { tree } = archeryView(archeryFixture());
+  const card = sectionNode(tree, 'rwa-other');
+  const rows = [...walk(card)].filter((node) => node.attrs['data-intel-item'] === 'rwa-other.other-protocols' || node.attrs['data-intel-item'] === 'rwa-other.exchange-flows');
+  assert.equal(rows.length, 2, 'two rows: further protocols and exchange flows');
+  const other = item(tree, 'rwa-other.other-protocols');
+  assert.equal(byAttr(other, 'data-intel-item', 'rwa-other.more-protocols').length, 1, 'both scope items are carried by the one row');
+  assert.doesNotMatch(textOf(card), /Verified Arc protocol activity/);
+  const flows = item(tree, 'rwa-other.exchange-flows');
+  assert.equal(flows.attrs['data-intel-value'], undefined);
+  assert.equal(byAttr(flows, 'data-api-reason', 'verified_exchange_registry_empty').length, 1);
+  assert.doesNotMatch(withoutAllowedDigits(textOf(flows)), /\d|\$/, 'no flow amount without a verified exchange address');
+  assert.match(textOf(flows), /^Exchange flows Not tracked yet/);
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

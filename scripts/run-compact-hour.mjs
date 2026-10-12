@@ -65,7 +65,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   const started = performance.now();
   const summary = { targetHour: iso(hourStart), sqlitePath, hourMode: null, repairFamilies: null, registryMode: null, registryBefore: null,
     registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, valuations: null, valuationPass: null,
-    metadata: null, tvl: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
+    metadata: null, tvl: null, protocols: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
   print(`TARGET_HOUR ${summary.targetHour}`);
   print(`SQLITE_PATH ${sqlitePath}`);
   let db = null;
@@ -112,8 +112,11 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
         summary.registryMode = 'catchup';
         store.extendRegistry(await catchUpV3Registry(provider, before, target));
       } else summary.registryMode = 'reused';
-      const result = await processHour({ provider, hourStart, safeHead, v3Registry: store.v3Registry(), bounds });
+      // Additional protocol activity (Archery CL) only for a new live hour: a repaired hour never gets it.
+      const result = await processHour({ provider, hourStart, safeHead, v3Registry: store.v3Registry(), bounds, protocolActivity: !repair });
       summary.hourOutcome = store.commitHour(result).outcome;
+      if (result.protocols) summary.protocols = Object.fromEntries(Object.entries(result.protocols)
+        .map(([name, entry]) => [name, entry.status === 'available' ? 'available' : `unavailable(${entry.reason})`]));
       // Display metadata of newly met pool tokens, read at the safe head. Never fails the run.
       summary.metadata = await refreshTokenMetadata({ store, provider, blockNumber: safeHead, limit: METADATA_TOKENS_PER_RUN });
       // Liquidity of the 24H top pools at the new hour's last block (a repaired older hour keeps what it has). Never fails the run.
@@ -173,6 +176,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   print(`TOKEN_METADATA ${summary.metadata ? `candidates=${summary.metadata.candidates} verified=${summary.metadata.verified} `
     + `rejected=${summary.metadata.rejected} skipped=${summary.metadata.skipped} requests=${summary.metadata.requests}`
     + `${summary.metadata.error ? ` error=${summary.metadata.error}` : ''}` : 'not_run'}`);
+  print(`PROTOCOLS ${summary.protocols ? Object.entries(summary.protocols).map(([name, status]) => `${name}=${status}`).join(' ') : 'not_run'}`);
   print(`POOL_TVL ${summary.tvl ? `v3=${summary.tvl.v3} v4=${summary.tvl.v4}${summary.tvl.error ? ` error=${summary.tvl.error}` : ''}` : 'not_run'}`);
   print(`CHECKPOINT ${summary.checkpoint ? `${summary.checkpoint.hour} last_block=${summary.checkpoint.lastBlock}` : 'none'}`);
   print(`PROVIDER requests=${summary.provider.requests} retries=${summary.provider.retries} response_mb=${summary.provider.responseMbDecoded} `

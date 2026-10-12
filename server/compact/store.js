@@ -45,6 +45,7 @@ import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './d
 import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storagePreflight } from './evidence-archive.js';
 import { PACKED_DATASETS, PACKED_JOURNAL_LIMIT_BYTES, PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
 import { createHistoryExpiry, historyFloorOf } from './history-expiry.js';
+import { ARCHERY_CL_KEEP_HOURS, ARCHERY_CL_META_PREFIX, archeryHourRecord, archeryMetaKey } from './archery-cl.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -466,6 +467,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     insertHour: db.prepare(`INSERT INTO compact_hours (hour_start, definition_version, first_block, last_block, parent_hash, first_hash,
       last_hash, block_count, transaction_count, unique_active_addresses, network_json, network_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     family: db.prepare('SELECT status, metrics_sha256 FROM compact_family_hours WHERE hour_start = ? AND family = ?'),
+    insertMeta: db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)'),
+    deleteMetaRange: db.prepare('DELETE FROM compact_meta WHERE key >= ? AND key < ?'),
     families: db.prepare('SELECT family, status, reason, metrics_json FROM compact_family_hours WHERE hour_start = ? ORDER BY family'),
     insertFamily: db.prepare(`INSERT INTO compact_family_hours (hour_start, family, status, reason, metrics_json, metrics_sha256)
       VALUES (?, ?, ?, ?, ?, ?)`),
@@ -1042,6 +1045,12 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
         storeAddresses(range.hourStart, result.activeAddresses);
         dailyActiveAddresses.observeHour(range.hourStart, result.activeAddresses);
         advanceCheckpoint(range.hourStart);
+        // Additional protocol activity (archery-cl.js), in this same transaction and only for a newly committed hour that
+        // computed it: a repaired, replayed or prepended hour never gets a record, so no older hour is ever filled in.
+        if (result.protocols?.archeryCl !== undefined) {
+          sql.insertMeta.run(archeryMetaKey(range.hourStart), canonical(archeryHourRecord(result.protocols.archeryCl, range)));
+          sql.deleteMetaRange.run(ARCHERY_CL_META_PREFIX, archeryMetaKey(range.hourStart - (ARCHERY_CL_KEEP_HOURS - 1) * 3600));
+        }
       } else {
         for (const family of rows.families) {
           const stored = sql.family.get(int(range.hourStart), family.name);

@@ -20,6 +20,8 @@ import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
 import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
 import { poolTvlUsd, TVL_VERSION } from './tvl.js';
 import { familyRetryPolicy } from './repair-policy.js';
+import { ARCHERY_CL, ARCHERY_CL_DEFINITION_VERSION } from '../../api/_lib/arc-intelligence/archery.js';
+import { ARCHERY_CL_META_PREFIX, archeryHourRecord, archeryMetaKey } from './archery-cl.js';
 import { anchorDecimals, poolVolumeUsd, PRICE_POLICY, priceableDecimals, PRICEABLE_TOKENS, usdMicrosOf, VALUATION_VERSIONS } from './valuation.js';
 import { storedWindow, sumWindow, WindowError } from './windows.js';
 
@@ -215,6 +217,9 @@ function definitionState(db) {
 }
 
 const SQL = Object.freeze({
+  // Archery CL hour records (archery-cl.js): one compact_meta key per committed live hour, read by key range only.
+  archeryFirst: 'SELECT key FROM compact_meta WHERE key >= ? AND key < ? ORDER BY key LIMIT 1',
+  archeryRows: 'SELECT key, value FROM compact_meta WHERE key >= ? AND key <= ? ORDER BY key LIMIT 721',
   checkpoint: 'SELECT hour_start, last_block, last_hash FROM compact_checkpoint WHERE id = 1',
   bounds: 'SELECT MIN(hour_start) AS first, MAX(hour_start) AS last, COUNT(*) AS count FROM compact_hours',
   networkRows: `SELECT hour_start, block_count, transaction_count, unique_active_addresses, network_json FROM compact_hours
@@ -322,8 +327,10 @@ const SQL = Object.freeze({
     LEFT JOIN compact_projection_hours v4p ON v4p.hour_start = h.hour_start AND v4p.projection = 'uniswap_v4_pools'
     LEFT JOIN compact_projection_hours ap ON ap.hour_start = h.hour_start AND ap.projection = 'dex_activity'
     WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start`,
+  // Only the core families count: a row of any other name can never make a missing core family look present.
   availableFamilies: `SELECT h.hour_start,
-    (SELECT COUNT(*) FROM compact_family_hours f WHERE f.hour_start = h.hour_start AND f.status = 'available') AS available
+    (SELECT COUNT(*) FROM compact_family_hours f WHERE f.hour_start = h.hour_start AND f.status = 'available'
+      AND f.family IN (${FAMILIES.map((name) => `'${name}'`).join(', ')})) AS available
     FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ? ORDER BY h.hour_start DESC`,
 });
 
@@ -507,6 +514,62 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         : { status: 'not_supported', reason: 'per_hour_unique', values: null };
     }
     return window;
+  }
+
+  // Archery CL counts of [from, to]: only hours with an available record are summed. Hours before tracking began are
+  // reported as not tracked, and a tracked hour without an available record as unavailable: neither is ever a zero.
+  function archeryWindow(from, to, hours) {
+    const base = { protocol: ARCHERY_CL.id, name: ARCHERY_CL.name, source: ARCHERY_CL.source, factory: ARCHERY_CL.factory,
+      definitionVersion: ARCHERY_CL_DEFINITION_VERSION, unit: 'events', start: iso(from), end: iso(to + HOUR) };
+    const first = statement('archeryFirst').get(ARCHERY_CL_META_PREFIX, `${ARCHERY_CL_META_PREFIX.slice(0, -1)};`);
+    if (!first) {
+      return { ...base, status: 'source_pending', reason: 'not_tracked_yet', reasons: ['not_tracked_yet'], trackedFrom: null,
+        coverage: { expectedHours: hours, availableHours: 0, unavailableHours: 0, notTrackedHours: hours }, unavailableHours: [], metrics: null };
+    }
+    const trackedFrom = Number(first.key.slice(ARCHERY_CL_META_PREFIX.length));
+    const records = new Map(statement('archeryRows').all(archeryMetaKey(from), archeryMetaKey(to))
+      .map((row) => [Number(row.key.slice(ARCHERY_CL_META_PREFIX.length)), row.value]));
+    const reasons = new Set();
+    const gaps = [];
+    const pools = new Map();
+    let notTracked = 0, available = 0, latest = null;
+    const metrics = { swapCount: 0, mintCount: 0, burnCount: 0 };
+    for (let hour = from; hour <= to; hour += HOUR) {
+      if (hour < trackedFrom) { notTracked += 1; continue; }
+      let record = null;
+      if (records.has(hour)) {
+        // The stored form is re-validated exactly as it was written (archeryHourRecord); anything else is a stated gap.
+        try { record = JSON.parse(records.get(hour)); } catch { record = null; }
+        if (record === null || typeof record !== 'object') record = { status: 'unavailable', reason: 'record_malformed' };
+        else if (record.definitionVersion !== ARCHERY_CL_DEFINITION_VERSION) record = { status: 'unavailable', reason: 'definition_unsupported' };
+        else {
+          const checked = archeryHourRecord(record, record);
+          record = checked.reason === 'result_invalid' && record.reason !== 'result_invalid' ? { status: 'unavailable', reason: 'record_malformed' } : checked;
+        }
+      }
+      if (record?.status !== 'available') {
+        reasons.add(record ? record.reason : 'not_recorded');
+        gaps.push(iso(hour));
+        continue;
+      }
+      available += 1;
+      latest = record;
+      for (const field of ['swapCount', 'mintCount', 'burnCount']) metrics[field] += record.metrics[field];
+      for (const pool of record.metrics.pools) {
+        const entry = pools.get(pool.pool) ?? { pool: pool.pool, token0: pool.token0, token1: pool.token1, tickSpacing: pool.tickSpacing,
+          market: ARCHERY_CL.pools.find((known) => known.address === pool.pool)?.market ?? null, swaps: 0, mints: 0, burns: 0 };
+        entry.swaps += pool.swaps; entry.mints += pool.mints; entry.burns += pool.burns;
+        pools.set(pool.pool, entry);
+      }
+    }
+    if (notTracked) reasons.add('not_tracked_before_start');
+    const status = available === hours ? 'available' : available > 0 ? 'partial' : 'unavailable';
+    return { ...base, status, reason: status === 'available' ? null : notTracked === hours ? 'not_tracked_before_start' : 'hour_unavailable',
+      reasons: [...reasons].sort(), trackedFrom: iso(trackedFrom),
+      coverage: { expectedHours: hours, availableHours: available, unavailableHours: gaps.length, notTrackedHours: notTracked },
+      unavailableHours: gaps,
+      metrics: available ? { ...metrics, activePoolCount: pools.size, registeredPoolCount: latest.metrics.registeredPoolCount,
+        pools: [...pools.values()].sort((a, b) => b.swaps - a.swaps || (a.pool < b.pool ? -1 : 1)) } : null };
   }
 
   const optionalTables = () => new Set(statement('optionalTables').all().map((row) => row.name));
@@ -737,7 +800,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       network,
       assets: { usdc: families.usdc, verifiedAssets: families.assets },
       dex: { uniswapV3: families.uniswapV3, uniswapV4: families.uniswapV4, officialV3Pools, usdVolume, swapFees,
-        usdPrices: hourPrices(state.hour, tables) },
+        usdPrices: hourPrices(state.hour, tables), archeryCl: archeryWindow(from, to, hours) },
       lending: { aaveV4: families.aaveV4, morphoBlue: families.morphoBlue, morphoVaultsV2: families.morphoVaultsV2 },
       protocolUsd,
       crossChain: { cctp: families.cctp, gateway: families.gateway, across: families.across },

@@ -115,7 +115,7 @@ export type ArcSummary = {
   network: NetworkWindow
   assets: { usdc: FamilyWindow; verifiedAssets: FamilyWindow }
   dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null }; usdVolume?: UsdVolumeWindow;
-    swapFees?: SwapFeesWindow; usdPrices?: UsdPricesHour }
+    swapFees?: SwapFeesWindow; usdPrices?: UsdPricesHour; archeryCl?: unknown }
   lending: { aaveV4: FamilyWindow; morphoBlue: FamilyWindow; morphoVaultsV2: FamilyWindow }
   protocolUsd?: Partial<Record<'cctp' | 'gateway' | 'across' | 'aaveV4' | 'morphoBlue' | 'morphoVaultsV2', ProtocolUsd>>
   crossChain: { cctp: FamilyWindow; gateway: FamilyWindow; across: FamilyWindow }
@@ -723,6 +723,47 @@ const VALUATION_ANCHOR = '0x3600000000000000000000000000000000000000'
 
 export type VerifiedAssetPrice = { address: string; symbol: string; priceUsdE18: string; sourceProtocol: 'uniswap_v3' | 'uniswap_v4';
   sourcePool: string; depthUsdMicros: string; sourceCount: number }
+
+// Archery CL counts of the selected window (server/compact/archery-cl.js): swaps, mints and burns of the official
+// factory's pools only, never USD. Only hours with an available record are counted; the coverage says how many.
+export type ArcheryPool = { pool: string; token0: string; token1: string; tickSpacing: number; market: string | null;
+  swaps: number; mints: number; burns: number }
+export type ArcheryWindow = { protocol: 'archery_cl'; name: string; source: string; factory: string;
+  status: 'available' | 'partial' | 'unavailable' | 'source_pending'; reason: string | null; reasons: string[]; trackedFrom: string | null;
+  coverage: { expectedHours: number; availableHours: number; unavailableHours: number; notTrackedHours: number };
+  unavailableHours: string[]
+  metrics: { swapCount: number; mintCount: number; burnCount: number; activePoolCount: number; registeredPoolCount: number; pools: ArcheryPool[] } | null }
+
+// The window as served, or null when absent (an API without Archery) or not exactly consistent: a count never stands
+// without its coverage, and hours before tracking began are never counted as zero.
+export function archeryActivity(summary: ArcSummary | null): ArcheryWindow | null {
+  const value = summary?.dex?.archeryCl
+  if (!isRecord(value)) return null
+  const count = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0
+  const address = (a: unknown): a is string => typeof a === 'string' && /^0x[0-9a-f]{40}$/.test(a)
+  const c = value.coverage, m = value.metrics
+  if (value.protocol !== 'archery_cl' || typeof value.name !== 'string' || typeof value.source !== 'string' || !address(value.factory)
+    || !['available', 'partial', 'unavailable', 'source_pending'].includes(value.status as string)
+    || !(value.reason === null || typeof value.reason === 'string') || !Array.isArray(value.reasons) || !value.reasons.every((r) => typeof r === 'string')
+    || !(value.trackedFrom === null ? value.status === 'source_pending' : typeof value.trackedFrom === 'string' && Number.isFinite(Date.parse(value.trackedFrom)))
+    || !isRecord(c) || !count(c.expectedHours) || !count(c.availableHours) || !count(c.unavailableHours) || !count(c.notTrackedHours)
+    || c.expectedHours < 1 || c.expectedHours > 720 || c.availableHours + c.unavailableHours + c.notTrackedHours !== c.expectedHours
+    || !Array.isArray(value.unavailableHours) || value.unavailableHours.length !== c.unavailableHours) return null
+  const expected = { available: c.availableHours === c.expectedHours, partial: c.availableHours > 0 && c.availableHours < c.expectedHours,
+    unavailable: c.availableHours === 0, source_pending: c.availableHours === 0 && c.notTrackedHours === c.expectedHours }[value.status as string]
+  if (!expected || (c.availableHours > 0) !== isRecord(m)) return null
+  if (isRecord(m)) {
+    const pools = m.pools
+    if (!count(m.swapCount) || !count(m.mintCount) || !count(m.burnCount) || !count(m.activePoolCount) || !count(m.registeredPoolCount)
+      || !Array.isArray(pools) || pools.length !== m.activePoolCount || pools.length > m.registeredPoolCount || pools.length > 64
+      || !pools.every((p) => isRecord(p) && address(p.pool) && address(p.token0) && address(p.token1) && Number.isSafeInteger(p.tickSpacing)
+        && (p.market === null || typeof p.market === 'string') && count(p.swaps) && count(p.mints) && count(p.burns))
+      || new Set(pools.map((p) => (p as ArcheryPool).pool)).size !== pools.length
+      || (['swaps', 'mints', 'burns'] as const).some((field, i) => (pools as ArcheryPool[]).reduce((sum, p) => sum + p[field], 0)
+        !== [m.swapCount, m.mintCount, m.burnCount][i])) return null
+  }
+  return value as unknown as ArcheryWindow
+}
 
 // Verified USD prices of the latest stored hour by asset symbol (summary.dex.usdPrices). Only a verified Arc asset with its
 // exact registry identity, a positive exact price, its source pool, depth and source count is kept; an entry that does not

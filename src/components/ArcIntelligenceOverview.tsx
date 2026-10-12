@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Activity, AlertCircle, ArrowDown, ArrowDownLeft, ArrowLeftRight, ArrowRight, ArrowUpRight, Banknote, Building2, Clock, Coins,
-  Droplets, Landmark, Layers, Radar, RefreshCw, Rocket, Store,
+  Droplets, Landmark, Radar, RefreshCw, Rocket, Store,
 } from 'lucide-react'
 import {
   ARC_INTELLIGENCE_BACKEND_WINDOWS,
@@ -11,6 +11,7 @@ import {
 import { MAINNET_BORROW_WRITES_ENABLED } from '../config/mainnetBorrow'
 import {
   ARC_KNOWN_TOKENS,
+  archeryActivity,
   formatCompact,
   formatCompactRaw,
   formatCount,
@@ -952,6 +953,46 @@ const PROTOCOL_ROWS: { item: string; name: string; category: string; family: (su
   { item: 'top-protocols.morpho-vaults', name: 'Morpho Vaults', category: 'Vaults', family: (summary) => summary.lending.morphoVaultsV2, fields: MORPHO_VAULT_ACTIONS, unit: 'vault actions' },
 ]
 
+// Archery CL (official factory, counts only: server/compact/archery-cl.js) in the "Other verified Arc protocols" place.
+// A partial period shows how many hours it counts and when tracking began; hours before that are never counted as zero.
+function ArcheryProtocolRow({ ctx, max }: { ctx: ViewContext; max: number }) {
+  const archery = ctx.mode === 'ready' ? archeryActivity(ctx.summary) : null
+  const metrics = archery?.metrics ?? null
+  const status: DisplayStatus = ctx.mode !== 'ready' ? liveStatus(ctx, null) : !archery || archery.status === 'source_pending' ? 'source_pending'
+    : metrics ? 'available' : archery.coverage.notTrackedHours === archery.coverage.expectedHours ? 'source_pending' : 'unavailable'
+  const c = archery?.coverage
+  const pair = (pool: { market: string | null; token0: string; token1: string }) => pool.market ?? `${tokenName(pool.token0)} / ${tokenName(pool.token1)}`
+  return (
+    <li {...markerProps('top-protocols.other', status, metrics ? metrics.swapCount : null)} className="border-t border-dashed border-slate-200 pt-2">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="flex min-w-0 items-center gap-1.5">
+          <span className={`truncate text-sm ${archery ? 'font-semibold text-slate-900' : 'font-medium text-slate-400'}`}>{archery ? archery.name : 'Other Arc protocols'}</span>
+          {archery && <Chip>DEX</Chip>}
+        </p>
+        {metrics
+          ? <p className="shrink-0 text-sm font-semibold tabular-nums text-slate-950">{formatCount(metrics.swapCount)} <span className="text-[11px] font-normal text-slate-500">swaps</span></p>
+          : <InlineStatus status={status} />}
+      </div>
+      {metrics && archery?.status === 'available' && <div className="mt-1"><ActivityBar value={metrics.swapCount} max={max} /></div>}
+      {archery && c && <div className="mt-1 space-y-0.5 text-[11px] leading-4 text-slate-500">
+        {metrics && <p>{formatCount(metrics.mintCount)} adds · {formatCount(metrics.burnCount)} removes · {metrics.activePoolCount} of {metrics.registeredPoolCount} pools active. Counts only, not USD.</p>}
+        {archery.status === 'partial' && <p data-archery-coverage="partial">Partial: {c.availableHours} of {c.expectedHours} hours counted{c.notTrackedHours > 0
+          && archery.trackedFrom ? `, tracking began ${formatUtcDateTime(archery.trackedFrom)}` : ''}.{c.unavailableHours > 0
+          ? ` ${c.unavailableHours} tracked ${c.unavailableHours === 1 ? 'hour' : 'hours'} could not be verified.` : ''}{c.notTrackedHours > 0 ? ' Earlier hours are not counted.' : ''}</p>}
+        {!metrics && status === 'unavailable' && <p>{c.unavailableHours} of {c.expectedHours - c.notTrackedHours} hours {c.notTrackedHours
+          ? 'since tracking began' : 'in this period'} could not be verified.{c.notTrackedHours ? ' Earlier hours are not counted.' : ''}</p>}
+        {status === 'source_pending' && <p>Counting starts with the first live hour after tracking begins. Official Archery CL factory pools only.</p>}
+        {metrics && metrics.pools.length > 0 && <details>
+          <summary className="cursor-pointer">Pools</summary>
+          <ul className="mt-1 space-y-0.5">{metrics.pools.map((pool) => <li key={pool.pool} className="flex min-w-0 justify-between gap-3">
+            <span className="min-w-0 truncate" title={pool.pool}>{pair(pool)}</span>
+            <span className="shrink-0 tabular-nums">{formatCount(pool.swaps)} swaps</span></li>)}</ul>
+        </details>}
+      </div>}
+    </li>
+  )
+}
+
 function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
   const financial = rankArcFinancialActions(ctx.mode === 'ready' ? ctx.summary : null)
   const names: Record<string, string> = { uniswapV3: 'Uniswap V3', uniswapV4: 'Uniswap V4', aaveV4: 'Aave',
@@ -962,7 +1003,10 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
     return { ...row, cell: numberCell(ctx, family, metricSum(family, row.fields), formatCount) }
   })
   const shared = sharedStatus(rows.map((row) => row.cell.status))
-  const max = Math.max(0, ...rows.map((row) => (row.cell.status === 'available' ? Number(row.cell.raw) : 0)))
+  // One bar scale for every row, Archery CL included once its whole period is counted.
+  const archery = ctx.mode === 'ready' ? archeryActivity(ctx.summary) : null
+  const max = Math.max(0, ...rows.map((row) => (row.cell.status === 'available' ? Number(row.cell.raw) : 0)),
+    archery?.status === 'available' && archery.metrics ? archery.metrics.swapCount : 0)
   return (
     <section data-intel-section="top-protocols" aria-label="Top Protocols" className={`${CARD} min-w-0`}>
       <CardHeader title="Top Protocols" subtitle={`Verified Arc protocols, last ${ctx.windowLabel}`} />
@@ -1018,10 +1062,7 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
             <div className="mt-1"><ActivityBar value={row.cell.status === 'available' ? Number(row.cell.raw) : null} max={max} /></div>
           </li>
         ))}
-        <li {...markerProps('top-protocols.other', 'source_pending')} className="flex items-center justify-between gap-3 border-t border-dashed border-slate-200 pt-2">
-          <p className="min-w-0 truncate text-sm font-medium text-slate-400">Other Arc protocols</p>
-          <InlineStatus status="source_pending" />
-        </li>
+        <ArcheryProtocolRow ctx={ctx} max={max} />
       </ul>
     </section>
   )
@@ -2199,10 +2240,11 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
 // Ecosystem reasons that mean a source is not tracked at all (no verified addresses), not that tracked data failed.
 const ECOSYSTEM_UNTRACKED = new Set(['verified_protocol_registry_empty', 'verified_exchange_registry_empty'])
 
+// Further protocols (both scope items read the same registry, so they share one row) and exchange flows.
 const ECOSYSTEM_SLOTS = [
-  { item: 'rwa-other.other-protocols', icon: Radar, title: 'Verified Arc protocol activity', detail: 'Activity of further verified Arc protocols' },
-  { item: 'rwa-other.exchange-flows', icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },
-  { item: 'rwa-other.more-protocols', icon: Layers, title: 'Other verified Arc protocols', detail: 'New sources as they are verified' },
+  { item: 'rwa-other.other-protocols', also: 'rwa-other.more-protocols', icon: Radar, title: 'Other verified Arc protocols',
+    detail: 'Activity of further protocols appears here once their contracts are verified' },
+  { item: 'rwa-other.exchange-flows', also: null, icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },
 ]
 
 function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
@@ -2248,14 +2290,17 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
           right={<StatusPill status={!ctx.ecosystem || ECOSYSTEM_UNTRACKED.has(ctx.ecosystem.otherProtocols.reason ?? '')
             && ECOSYSTEM_UNTRACKED.has(ctx.ecosystem.exchangeFlows.reason ?? '') ? 'source_pending' : 'unavailable'} />} />
         <div className="mt-3 grid grid-cols-1 gap-2">
-          {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => {
+          {ECOSYSTEM_SLOTS.map(({ item, also, icon: Icon, title, detail }) => {
             const entry = item.includes('exchange') ? ctx.ecosystem?.exchangeFlows : ctx.ecosystem?.otherProtocols
-            return <div key={item} {...markerProps(item, entry?.status === 'unavailable' ? 'unavailable' : 'source_pending')}
+            const status = entry?.status === 'unavailable' ? 'unavailable' : 'source_pending'
+            const archery = also && ctx.mode === 'ready' ? archeryActivity(ctx.summary) : null
+            return <div key={item} {...markerProps(item, status)}
               className="flex min-w-0 items-start gap-2.5 rounded-lg border border-dashed border-slate-200 px-3 py-2.5">
               <Icon className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
-              <div className="min-w-0"><p className="text-xs font-semibold text-slate-700">{title}</p>
+              <div className="min-w-0"><p className="text-xs font-semibold text-slate-700" {...(also ? markerProps(also, status) : {})}>{title}</p>
                 <p data-api-reason={entry?.reason ?? undefined} className="text-[11px] leading-4 text-slate-500 [overflow-wrap:anywhere]">{entry
-                  ? reasonText(entry.reason, 'Additional activity has not been verified for this window.') : detail}</p></div>
+                  ? reasonText(entry.reason, 'Additional activity has not been verified for this window.') : detail}
+                  {archery && archery.status !== 'source_pending' && ' Archery CL activity is shown under Top Protocols.'}</p></div>
             </div>
           })}
         </div>
