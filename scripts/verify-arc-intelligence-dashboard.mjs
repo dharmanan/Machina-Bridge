@@ -2399,6 +2399,64 @@ await test('Token list UX unavailable and unsupported data stay explicit without
   assert.match(componentSource, /<EcosystemTokenList key=\{ctx.windowHours\} ctx=\{ctx\} kind="launches"/);
   assert.match(componentSource, /<EcosystemTokenList key=\{ctx.windowHours\} ctx=\{ctx\} kind="discoveredTokens"/);
 });
+// An empty 24H token list says which API state it is (server/compact/intelligence-store.js readEcosystem): every hour
+// scanned and every candidate checked, candidates still waiting, or hours missing. The row count alone never decides it.
+const discoveryState = (state) => {
+  const data = completionEcosystem(); data.launches.rows = []; data.discoveredTokens.rows = [];
+  const full = { status: 'available', reason: null, requiredHours: 24, availableHours: 24 };
+  data.coverage = state === 'complete' ? { ...full, unresolvedCandidateCount: 0, candidateVerificationComplete: true }
+    : state === 'verifying' ? { ...full, unresolvedCandidateCount: 3, candidateVerificationComplete: false }
+      : { status: 'insufficient_coverage', reason: 'discovery_hour_missing_or_capped', requiredHours: 24, availableHours: 6,
+        unresolvedCandidateCount: 0, candidateVerificationComplete: false };
+  for (const name of ['launches', 'discoveredTokens']) data[name].status = state === 'complete' ? 'available' : 'insufficient_coverage';
+  return data;
+};
+const discoveryView = (ecosystem) => {
+  const tree = render({ ...STATES.ready, data: { ...READY_DATA, ecosystem } }).tree;
+  checkScope(tree, SCOPE);
+  return { tree, launches: textOf(sectionNode(tree, 'launches')), tokens: textOf(item(tree, 'assets.new-tokens')),
+    pill: byAttr(sectionNode(tree, 'launches'), 'data-status-pill').map(textOf)[0] };
+};
+await test('Discovery 1 an empty 24H list separates checked and empty, candidates still waiting and missing hours', async () => {
+  for (const state of ['complete', 'verifying', 'partial']) {
+    const ecosystem = discoveryState(state);
+    assert.ok(lib.parseArcEcosystem(ecosystem, '24h'), state);
+    for (const kind of ['launches', 'discoveredTokens']) assert.equal(lib.tokenListState(ecosystem, kind), state, `${state} ${kind}`);
+    const view = discoveryView(ecosystem), both = `${view.launches} ${view.tokens}`;
+    assert.doesNotMatch(both, /\b[a-z0-9]+_[a-z0-9_]+\b/, `${state}: no raw code`);
+    const expected = { complete: ['Available', 'available'], verifying: ['Collecting', 'collecting'], partial: ['Not verified', 'unavailable'] }[state];
+    assert.equal(view.pill, expected[0], state);
+    for (const id of ['launches.status', 'assets.new-tokens']) assert.equal(item(view.tree, id).attrs['data-intel-status'], expected[1], `${state} ${id}`);
+    if (state === 'complete') {
+      assert.match(view.launches, /Token discovery covers 24 of 24 hours\. Every candidate found in these hours has been checked\./);
+      assert.match(view.launches, /No new launches in this period No verified launchpad launch or direct token deployment was found\. Only these sources are tracked, so this does not mean no token was created on Arc\./);
+      assert.match(view.tokens, /No new tokens in this period No new token was found in direct deployments, verified launchpads or new Uniswap pools\./);
+    } else {
+      assert.doesNotMatch(both, /Every candidate found|No new (launches|tokens) in this period/, `${state}: never reads as checked and empty`);
+    }
+    if (state === 'verifying') {
+      assert.match(view.launches, /Token discovery covers 24 of 24 hours\. 3 candidates are still waiting for verification, so this list may be incomplete\./);
+      assert.match(view.launches, /No launches verified yet Candidates found in this period are still being checked\./);
+      assert.match(view.tokens, /No tokens verified yet/);
+    }
+    if (state === 'partial') {
+      assert.match(view.launches, /Token discovery covers 6 of 24 hours\./);
+      assert.match(view.launches, /No launches listed yet Some hours of this period are not fully scanned, so records from those hours may be missing\./);
+    }
+  }
+  // An API answer without the verification fields is never read as checked and empty.
+  const older = discoveryState('complete'); delete older.coverage.unresolvedCandidateCount; delete older.coverage.candidateVerificationComplete;
+  assert.equal(lib.tokenListState(older, 'launches'), 'verifying');
+  const view = discoveryView(older);
+  assert.equal(view.pill, 'Collecting');
+  assert.match(view.launches, /Candidate checks are not finished, so this list may be incomplete\./);
+  // Listed records stay available in every state; the note still says when the list may be incomplete.
+  const listed = discoveryState('verifying'); listed.launches.rows = completionEcosystem().launches.rows;
+  const shown = discoveryView(listed);
+  assert.equal(shown.pill, 'Available');
+  assert.match(shown.launches, /3 candidates are still waiting for verification/);
+});
+
 await test('Completion both 7D and 30D daily-active charts preserve persisted completed-day values', async () => {
   for (const [window, days] of [['7d', 7], ['30d', 30]]) {
     const data = longData(window, days);

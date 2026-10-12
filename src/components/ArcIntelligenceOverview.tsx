@@ -42,6 +42,7 @@ import {
   shortenAddress,
   shortenHash,
   shortenMarketId,
+  tokenListState,
   usdMicrosToNumber,
   usdVolumeStatus,
   V4_SWAP_TO_BLOCKER,
@@ -1425,10 +1426,21 @@ const tokenDexStatus = (row: DiscoveredToken) => row.dex.firstDexActivity?.first
   ? row.dex.firstDexActivity.status === 'available' ? 'Proven first activity' : 'First observed activity'
   : 'Activity not observed'
 
+// Status of a token list: an empty list is available only when the API reports every hour scanned and every candidate
+// checked; candidates still waiting read as collecting, missing hours as not verified. Rows shown are always available.
+const tokenListStatus = (ctx: ViewContext, kind: 'launches' | 'discoveredTokens'): DisplayStatus => !ctx.ecosystem ? 'source_pending'
+  : ctx.ecosystem[kind].rows.length ? 'available'
+    : ({ complete: 'available', verifying: 'collecting', partial: 'unavailable' } as const)[tokenListState(ctx.ecosystem, kind)]
+
 function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind: 'launches' | 'discoveredTokens' }) {
-  const list = ecosystem[kind]
-  return <div data-api-reason={ecosystem.coverage.reason} className="mt-3 min-w-0 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
+  const list = ecosystem[kind], state = tokenListState(ecosystem, kind)
+  const unresolved = ecosystem.coverage.unresolvedCandidateCount
+  return <div data-api-reason={ecosystem.coverage.reason} data-token-list-state={state} className="mt-3 min-w-0 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
     <p className="font-semibold text-slate-800">Token discovery covers {ecosystem.coverage.availableHours} of {ecosystem.coverage.requiredHours} hours.</p>
+    {state === 'complete' && <p>Every candidate found in these hours has been checked.</p>}
+    {Number.isSafeInteger(unresolved) && (unresolved as number) > 0
+      ? <p>{formatCount(unresolved as number)} {unresolved === 1 ? 'candidate is' : 'candidates are'} still waiting for verification, so this list may be incomplete.</p>
+      : state === 'verifying' && <p>Candidate checks are not finished, so this list may be incomplete.</p>}
     <p>Showing {list.rows.length} {kind === 'launches' ? list.rows.length === 1 ? 'launch' : 'launches' : list.rows.length === 1 ? 'token' : 'tokens'}{list.truncated ? ' (list is capped)' : ''}.
       {' '}{list.truncated ? 'This is not the total number of launches or tokens.' : 'This is not a chain-wide total.'}</p>
     {ecosystem.coverage.status !== 'available' && <p>{reasonText(ecosystem.coverage.reason, 'Discovery is incomplete, so more tokens may exist.')}</p>}
@@ -1492,6 +1504,21 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
   </div>
 }
 
+// An empty list says which of the API's states it is: checked and empty, candidates still waiting, or hours missing.
+// Checked and empty covers only the tracked sources, never every token on Arc.
+function emptyTokenList(ctx: ViewContext, kind: 'launches' | 'discoveredTokens') {
+  const noun = kind === 'launches' ? 'launches' : 'tokens'
+  if (!ctx.ecosystem) return { title: kind === 'launches' ? 'No launches listed yet' : 'No discovered tokens listed yet',
+    detail: 'Records appear once token discovery is verified. No sample tokens are shown.' }
+  return {
+    complete: { title: `No new ${noun} in this period`, detail: `${kind === 'launches' ? 'No verified launchpad launch or direct token deployment was found'
+      : 'No new token was found in direct deployments, verified launchpads or new Uniswap pools'}. Only these sources are tracked, so this does not mean no token was created on Arc.` },
+    verifying: { title: `No ${noun} verified yet`, detail: 'Candidates found in this period are still being checked. Verified records appear here once checks finish.' },
+    partial: { title: kind === 'launches' ? 'No launches listed yet' : 'No discovered tokens listed yet',
+      detail: 'Some hours of this period are not fully scanned, so records from those hours may be missing.' },
+  }[tokenListState(ctx.ecosystem, kind)]
+}
+
 // Each list owns its page and one expanded record. Window-keyed callers reset navigation on a window switch.
 export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'launches' | 'discoveredTokens' }) {
   const rows = ctx.ecosystem?.[kind].rows ?? []
@@ -1500,7 +1527,7 @@ export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'lau
   const page = Math.min(selection.page, pages - 1), start = page * TOKEN_PAGE_SIZE
   const visible = rows.slice(start, start + TOKEN_PAGE_SIZE)
   const launches = kind === 'launches'
-  const status: DisplayStatus = rows.length ? 'available' : ctx.ecosystem ? 'unavailable' : 'source_pending'
+  const status = tokenListStatus(ctx, kind)
   const title = launches ? 'New Token Launches' : 'Newly Discovered Tokens'
   const tableId = `${kind}-${ctx.windowHours}`
   const marker = (item: string) => launches ? markerProps(item, status) : {}
@@ -1527,8 +1554,7 @@ export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'lau
           launches={launches} onToggle={() => setSelection({ page, expanded: expanded ? null : row.address })} />
       })}</tbody>
     </table>
-    {!rows.length && <EmptyRows title={launches ? 'No launches listed yet' : 'No discovered tokens listed yet'}
-      detail={ctx.ecosystem?.coverage.reason ?? 'Records appear once token discovery is verified. No sample tokens are shown.'} />}
+    {!rows.length && <EmptyRows {...emptyTokenList(ctx, kind)} />}
     {!!rows.length && <nav aria-label={`${title} pagination`} className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
       <span role="status" aria-live="polite" aria-atomic="true" className="text-xs tabular-nums text-slate-500">{start + 1} to {start + visible.length} of {rows.length} shown · Page {page + 1} of {pages}</span>
       <div className="flex gap-2"><button type="button" className={TOKEN_CONTROL} disabled={page === 0} aria-controls={tableId}
@@ -1564,8 +1590,7 @@ function TokenListRow({ row, expanded, evidenceId, timestamp, ctx, launches, onT
 }
 
 function LaunchesSection({ ctx }: { ctx: ViewContext }) {
-  const rows = ctx.ecosystem?.launches.rows ?? []
-  const status: DisplayStatus = rows.length ? 'available' : ctx.ecosystem ? 'unavailable' : 'source_pending'
+  const status = tokenListStatus(ctx, 'launches')
   return <section data-intel-section="launches" aria-label="New Token Launches" className={CARD}>
     <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-slate-600">Verified launch records within {ctx.windowLabel}</p><StatusPill status={status} /></div>
     <EcosystemTokenList key={ctx.windowHours} ctx={ctx} kind="launches" />
@@ -1697,7 +1722,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
           </li>
         ))}
       </ul>
-      <div {...markerProps('assets.new-tokens', ctx.ecosystem ? ctx.ecosystem.discoveredTokens.rows.length ? 'available' : 'unavailable' : 'source_pending')}
+      <div {...markerProps('assets.new-tokens', tokenListStatus(ctx, 'discoveredTokens'))}
         className="mt-4 border-t border-slate-100 pt-3">
         <h4 className="text-sm font-semibold text-slate-900">Newly Discovered Tokens</h4>
         <EcosystemTokenList key={ctx.windowHours} ctx={ctx} kind="discoveredTokens" />

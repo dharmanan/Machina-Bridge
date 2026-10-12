@@ -334,10 +334,22 @@ export type DiscoveredToken = { address: string; status: 'verified_erc20_like'; 
   dex: { status: string; reason?: string; firstPool?: DiscoveryPool | null; observedPools?: DiscoveryPool[];
     firstDexActivity?: { status: string; reason: string | null; firstObserved: { timestamp: string; blockNumber: number; txHash: string; firstProven: boolean } | null } } }
 export type ArcEcosystem = { schema: typeof ECOSYSTEM_SCHEMA; window: IntelligenceWindow;
-  coverage: { status: string; reason?: string; requiredHours: number; availableHours: number; unresolvedCandidateCount?: number };
+  coverage: { status: string; reason?: string; requiredHours: number; availableHours: number; unresolvedCandidateCount?: number;
+    candidateVerificationComplete?: boolean };
   discoveredTokens: { status: string; truncated?: boolean; rows: DiscoveredToken[] };
   launches: { status: string; truncated?: boolean; rows: DiscoveredToken[] };
   otherProtocols: { status: string; reason?: string | null }; exchangeFlows: { status: string; reason?: string | null } }
+
+// What a token list of this window means, from the API's own coverage and list status, never from its row count.
+// 'complete': every hour scanned and every candidate checked; 'verifying': every hour scanned, candidates still waiting;
+// 'partial': hours missing or capped. A response without the verification fields is never complete.
+export type TokenListState = 'complete' | 'verifying' | 'partial'
+export function tokenListState(ecosystem: ArcEcosystem, kind: 'launches' | 'discoveredTokens'): TokenListState {
+  const { coverage } = ecosystem
+  if (coverage.status !== 'available' || coverage.availableHours !== coverage.requiredHours) return 'partial'
+  return ecosystem[kind].status === 'available' && coverage.candidateVerificationComplete === true
+    && coverage.unresolvedCandidateCount === 0 ? 'complete' : 'verifying'
+}
 
 export function parseArcEcosystem(value: Record<string, unknown> | null, selected: string): ArcEcosystem | null {
   if (!value || value.schema !== ECOSYSTEM_SCHEMA || !validWindowCoverage(value.window)) return null
