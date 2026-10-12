@@ -57,10 +57,10 @@
   },
   "overrides": {
     "@coinbase/cdp-sdk": {
-      "axios": "1.18.1"
+      "axios": "1.20.0"
     },
-    "axios": "1.18.1",
-    "hono": "4.13.5",
+    "axios": "1.20.0",
+    "hono": "4.13.7",
     "valibot": "1.4.2",
     "minimatch@^9.0.0": {
       "brace-expansion": "2.1.2"
