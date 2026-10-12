@@ -79,6 +79,8 @@ type Mode = 'loading' | 'ready' | 'history' | 'failed'
 type ViewContext = {
   mode: Mode
   windowLabel: string
+  // What a change is compared with: "24H", "7D", "30D", or "period" while 30D history is partial
+  previousLabel: string
   // 24H charts are hourly; 7D and 30D charts show complete UTC days, from midnight to midnight.
   period: 'hour' | 'day'
   // hours the selected window covers once complete (24, 168 or 720)
@@ -100,8 +102,8 @@ type Cell = { status: DisplayStatus; raw?: string | number; text?: string; note?
 const STATUS_TEXT: Record<DisplayStatus, string> = {
   available: 'Available',
   collecting: 'Collecting',
-  unavailable: 'Unavailable',
-  source_pending: 'Not available yet',
+  unavailable: 'Not verified',
+  source_pending: 'Not tracked yet',
   loading: 'Loading',
 }
 
@@ -137,7 +139,7 @@ function liveStatus(ctx: ViewContext, entry: { status: string; reason?: string }
   return windowStatus(entry)
 }
 
-function noteFor(ctx: ViewContext, status: DisplayStatus, pendingNote = 'Not available yet'): string | undefined {
+function noteFor(ctx: ViewContext, status: DisplayStatus, pendingNote = 'Not tracked yet'): string | undefined {
   if (status === 'loading') return 'Loading verified data'
   if (status === 'collecting') return ctx.collectingNote
   if (status === 'unavailable') return ctx.mode === 'failed' ? 'Could not be loaded right now' : 'Not verified for this window'
@@ -148,7 +150,7 @@ function noteFor(ctx: ViewContext, status: DisplayStatus, pendingNote = 'Not ava
 // Plain words for every reason a value is not shown. A reason never becomes a number, and an unknown one reads as not verified.
 const REASON_TEXT: Record<string, string> = {
   insufficient_coverage: 'History is still being collected.',
-  valuation_not_ready: 'USD valuation rows are missing from this snapshot.',
+  valuation_not_ready: 'USD values are not ready for this period yet.',
   valuation_not_processed: 'Some hours of this window are not valued yet.',
   valuation_hour_unavailable: 'Some hours of this window have no verified USD value.',
   prices_unavailable: 'No verified price for a token in some hour of this window.',
@@ -166,11 +168,11 @@ const REASON_TEXT: Record<string, string> = {
   tick_out_of_range: 'Pool holdings could not be read consistently.',
   balance_unreadable: 'A token balance of this pool could not be read.',
   pool_not_initialized: 'This pool has no price yet.',
-  identity_retention_exceeded: 'The address sets of this period are not stored, so its unique addresses cannot be counted without counting an address twice.',
-  identity_incomplete: 'An hour of this window does not have its complete stored address set, so unique addresses are not counted.',
-  identity_unverified: 'A stored address set of this window did not pass verification, so unique addresses are not counted.',
-  verified_protocol_registry_empty: 'No additional protocol sources have been verified for this dashboard.',
-  verified_exchange_registry_empty: 'No exchange addresses have verified labels for this dashboard.',
+  identity_retention_exceeded: 'Address lists for this period are not kept, so unique addresses cannot be counted without counting some twice.',
+  identity_incomplete: 'Some hours of this period are missing part of their address list, so unique addresses are not counted.',
+  identity_unverified: 'An address list of this period could not be verified, so unique addresses are not counted.',
+  verified_protocol_registry_empty: 'Not tracked yet: no further protocol has verified contracts for this dashboard.',
+  verified_exchange_registry_empty: 'Not tracked yet: exchange flows need verified exchange addresses.',
   discovery_hour_missing_or_capped: 'Discovery checks cover only part of the stored history; additional records may exist.',
   bounded_response_limit: 'The returned list is capped to keep responses small.',
   first_activity_history_missing: 'Earlier DEX history is incomplete, so lifetime first activity is unproven.',
@@ -558,7 +560,7 @@ function KpiCard({ item, label, caption, cell, delta, windowLabel }: {
   )
 }
 
-const DEX_VOLUME_SCOPE = 'USD-valued Uniswap V3 and V4 swaps on Arc.'
+const DEX_VOLUME_SCOPE = 'USD value of Uniswap V3 and V4 swaps on Arc.'
 
 // Note of a USD entry that is not shown: the window still filling, hours not valued yet, or the exact reason.
 function usdNote(ctx: ViewContext, status: DisplayStatus, entry: { reason?: string | null; reasons?: string[]; unavailableHours?: string[] } | null | undefined, pending: string): string | undefined {
@@ -568,9 +570,9 @@ function usdNote(ctx: ViewContext, status: DisplayStatus, entry: { reason?: stri
     const missing = entry?.unavailableHours?.length ?? 0
     const backfillCutoff = Date.parse(ctx.summary?.window.end ?? '') - 72 * 3_600_000
     const olderMissing = entry?.unavailableHours?.some((hour) => Date.parse(hour) < backfillCutoff) ?? false
-    const backfillLimit = ctx.windowHours > 72 && olderMissing
-      ? ' The historical valuation backfill covers the latest 72 hours at most; older missing hours require additional verified history.' : ''
-    return `${reason}${missing > 0 ? ' Some hourly valuations are missing in this window.' : ''}${backfillLimit}`
+    const olderLimit = ctx.windowHours > 72 && olderMissing
+      ? ' USD values are added afterwards only for the latest 72 hours, so older missing hours stay missing.' : ''
+    return `${reason}${missing > 0 ? ' Some hours of this period have no USD value.' : ''}${olderLimit}`
   }
   return noteFor(ctx, status)
 }
@@ -588,7 +590,7 @@ function usdVolumeCell(ctx: ViewContext, entry: UsdVolumeWindow | null | undefin
     return { status, raw: entry.totalUsdMicros, text: usdText(value), title: formatUsdMicros(entry.totalUsdMicros) }
   }
   const shown: DisplayStatus = status === 'available' ? 'unavailable' : status
-  return { status: shown, note: `${DEX_VOLUME_SCOPE} ${usdNote(ctx, shown, entry, 'Verified data does not include DEX USD valuations yet.')}` }
+  return { status: shown, note: `${DEX_VOLUME_SCOPE} ${usdNote(ctx, shown, entry, 'USD values are not tracked yet.')}` }
 }
 
 // Average DEX pool fee: estimated Uniswap pool fees / fee-valued swaps. This is not Arc gas. Same states as the
@@ -604,7 +606,7 @@ function averageFeeCell(ctx: ViewContext, entry: SwapFeesWindow | null | undefin
     if (value !== null) return { status, raw: entry.averageFeeUsdMicros, text: usdText(value), title: formatUsdMicros(entry.averageFeeUsdMicros) }
   }
   if (status === 'available') return { status: 'unavailable', note: 'No valued swaps in this window, so there is no average fee.' }
-  return { status, note: usdNote(ctx, status, entry, 'Verified data does not include estimated swap fees yet.') }
+  return { status, note: usdNote(ctx, status, entry, 'Pool fees are not tracked yet.') }
 }
 
 // Unique active addresses: the backend's exact distinct count for every window (24H, 7D, 30D), from the stored identity
@@ -638,28 +640,28 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
   const volumeDelta = volume.status === 'available' ? percentChange(usdMicrosToNumber(String(volume.raw)), previousVolume) : null
   const unvalued = usdVolume?.status === 'available' && isFiniteNumber(usdVolume.unvaluedSwaps) ? usdVolume.unvaluedSwaps : 0
   const volumeCaption = `${DEX_VOLUME_SCOPE} Total, last ${ctx.windowLabel}.${unvalued > 0
-    ? ` ${formatCount(unvalued)} swaps without a verified price excluded.` : ''}`
+    ? ` Excludes ${formatCount(unvalued)} swaps without a verified price.` : ''}`
   const swapFees = ctx.summary?.dex.swapFees
   const fee = averageFeeCell(ctx, swapFees)
   const previousFee = swapFees?.previous?.status === 'available' ? usdMicrosToNumber(swapFees.previous.averageFeeUsdMicros) : null
   const feeDelta = fee.status === 'available' ? percentChange(usdMicrosToNumber(String(fee.raw)), previousFee) : null
   const feeTotal = fee.status === 'available' ? usdMicrosToNumber(swapFees?.totalFeeUsdMicros) : null
   const unvaluedFees = fee.status === 'available' && isFiniteNumber(swapFees?.unvaluedSwaps) ? swapFees.unvaluedSwaps : 0
-  const feeCaption = `Estimated Uniswap V3 and V4 pool fee per fee-valued swap, last ${ctx.windowLabel}. This is not Arc gas or a network transaction fee. Does not include per step rounding or hook fees.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
-    ? ` ${usdText(feeTotal)} estimated pool fees across ${formatCount(swapFees.valuedSwaps)} fee-valued swaps.` : ''}${unvaluedFees > 0
-    ? ` ${formatCount(unvaluedFees)} swaps without a valued fee excluded from this fee estimate.` : ''}`
+  const feeCaption = `Estimated Uniswap pool fee per swap, last ${ctx.windowLabel}. Not Arc gas. Excludes hook fees and rounding.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
+    ? ` ${usdText(feeTotal)} in fees across ${formatCount(swapFees.valuedSwaps)} swaps.` : ''}${unvaluedFees > 0
+    ? ` Excludes ${formatCount(unvaluedFees)} swaps without a fee value.` : ''}`
 
   return (
     <section data-intel-section="network" aria-label="Network Activity" className="space-y-4">
       {header}
       <GroupHeader title="Network Activity" />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <KpiCard item="network.active-addresses" label="Active Addresses" cell={active} delta={activeDelta} windowLabel={ctx.windowLabel}
+        <KpiCard item="network.active-addresses" label="Active Addresses" cell={active} delta={activeDelta} windowLabel={ctx.previousLabel}
           caption={`Unique addresses, last ${ctx.windowLabel}`} />
-        <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.windowLabel}
+        <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.previousLabel}
           caption={`Total transactions, last ${ctx.windowLabel}`} />
-        <KpiCard item="network.total-volume" label="DEX Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.windowLabel} caption={volumeCaption} />
-        <KpiCard item="network.average-fee" label="Avg DEX Pool Fee" cell={fee} delta={feeDelta} windowLabel={ctx.windowLabel} caption={feeCaption} />
+        <KpiCard item="network.total-volume" label="DEX Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.previousLabel} caption={volumeCaption} />
+        <KpiCard item="network.average-fee" label="Avg DEX Pool Fee" cell={fee} delta={feeDelta} windowLabel={ctx.previousLabel} caption={feeCaption} />
       </div>
       <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
         {([
@@ -697,8 +699,8 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
       <CardTitle
         title={tab === 'volume' ? 'DEX Volume' : 'DEX Swaps'}
         subtitle={tab === 'volume'
-          ? `${DEX_VOLUME_SCOPE} USD value per ${ctx.period === 'day' ? 'day' : 'UTC hour'} across all verified pairs, last ${ctx.windowLabel}. Each swap is counted once.`
-          : `Swap events per ${ctx.period === 'day' ? 'day' : 'UTC hour'} across all verified Uniswap V3 and V4 pairs, last ${ctx.windowLabel}. Counts, not amounts.`}
+          ? `USD value of swaps per ${ctx.period === 'day' ? 'day' : 'UTC hour'}, last ${ctx.windowLabel}. All verified Uniswap V3 and V4 pairs, each swap counted once.`
+          : `Swaps per ${ctx.period === 'day' ? 'day' : 'UTC hour'}, last ${ctx.windowLabel}. All verified Uniswap V3 and V4 pairs. Counts, not amounts.`}
         right={(
           <div role="tablist" aria-label="DEX chart" className="flex gap-1.5">
             <TabButton selected={tab === 'volume'} onClick={() => setTab('volume')} marker={markerProps('volume-chart.volume', usdStatus)}>Volume</TabButton>
@@ -712,8 +714,8 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
             <HourReadout item="volume-chart.latest" status={usdStatus} points={usd} unit="" period={ctx.period} format={usdText} />
             <BarChart points={usd} series={series} unit="" period={ctx.period} format={usdText} axisFormat={usdText} />
             <p className="mt-1 text-[11px] leading-4 text-slate-400">
-              Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools.
-              {unvalued > 0 && ` ${formatCount(unvalued)} swaps between tokens without a verified price are not included.`}
+              Swaps are valued by their USDC side or a verified hourly Arc price.
+              {unvalued > 0 && ` ${formatCount(unvalued)} swaps without a verified price are not included.`}
             </p>
           </>
         ) : (
@@ -721,10 +723,10 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
             <HourReadout item="volume-chart.latest" status={usdStatus} points={[]} unit="" period={ctx.period}
               note={usdStatus === 'collecting' ? 'Not valued yet' : undefined} />
             <EmptyState status={usdStatus} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
-              title={usdStatus === 'source_pending' ? 'DEX volume is not available yet'
+              title={usdStatus === 'source_pending' ? 'DEX volume is not tracked yet'
                 : ctx.mode === 'history' ? 'History is still being collected'
                   : usdStatus === 'collecting' ? 'DEX volume is still being collected' : `DEX volume per ${ctx.period} is not available right now`}
-              detail={usdStatus === 'source_pending' ? 'Verified data does not include hourly DEX USD valuations yet. Swap counts are available in the Swaps tab.'
+              detail={usdStatus === 'source_pending' ? 'Hourly USD values are not tracked yet. Swap counts are in the Swaps tab.'
                 : ctx.mode === 'history' ? ctx.historyNote
                   : usdStatus === 'collecting' ? `${ctx.period === 'day' ? 'Days' : 'Hours'} appear here once their swaps are valued.`
                     : ctx.mode === 'ready' ? usdGapReason(ctx.timeseries) : noteFor(ctx, usdStatus)} />
@@ -747,7 +749,7 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
         <span {...markerProps('volume-chart.uniswap-v3', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V3_BAR}`} />Uniswap V3</span>
         <span {...markerProps('volume-chart.uniswap-v4', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V4_BAR}`} />Uniswap V4</span>
-        <span {...markerProps('volume-chart.other', 'source_pending')} className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2.5 w-2.5 rounded-sm border border-dashed border-slate-300" />Other DEX protocols: not available yet</span>
+        <span {...markerProps('volume-chart.other', 'source_pending')} className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2.5 w-2.5 rounded-sm border border-dashed border-slate-300" />Other DEX protocols: not tracked yet</span>
       </div>
     </section>
   )
@@ -765,7 +767,7 @@ function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
     <section data-intel-section="active-addresses-chart" aria-label="Active Addresses" className={`${CARD} min-w-0 lg:col-span-2`}>
       <CardTitle title="Active Addresses"
         subtitle={daily
-          ? storedDaily ? 'Verified distinct addresses per completed UTC day. Daily counts are never added together.'
+          ? storedDaily ? 'Unique addresses per completed UTC day. Days are never added together.'
             : 'Unique addresses are counted per UTC hour, within the 24H view.'
           : 'Unique addresses active in each UTC hour. Hourly values are not added together.'} />
       <div {...markerProps('active-addresses-chart.series', status)}>
@@ -779,7 +781,7 @@ function ActiveAddressesChartSection({ ctx }: { ctx: ViewContext }) {
             <HourReadout item="active-addresses-chart.latest" status={status} points={[]} unit="addresses" period="day" note="Not counted per day" />
             <EmptyState status={status} className="mt-4 flex min-h-[11rem] flex-col items-center justify-center"
               title="Daily active addresses are not available" detail={storedDaily
-                ? 'No stored verified daily distinct counts are available. Hourly unique counts are never added together.'
+                ? 'Daily unique counts are not stored for this period yet. Hourly counts are not added up, so no daily number is shown.'
                 : `${reasonText('identity_retention_exceeded')} Switch to 24H for hourly counts.`} />
           </>
         ) : (
@@ -833,6 +835,10 @@ function ActivityBar({ value, max, barClass = 'bg-[#2F6E0C]' }: { value: number 
     </span>
   )
 }
+
+// Display names of the DEX protocols a row can name (never the identifier).
+const PRICE_SOURCE_NAME = { uniswap_v3: 'Uniswap V3', uniswap_v4: 'Uniswap V4' } as const
+const protocolName = (protocol: string) => PRICE_SOURCE_NAME[protocol as keyof typeof PRICE_SOURCE_NAME] ?? protocol
 
 const ASSET_CATEGORY: Record<string, string> = {
   USDC: 'Stablecoin',
@@ -974,7 +980,7 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
           </li>)}
         </ol> : <p className="mt-1 text-[11px] text-slate-500">{rankingStatus === 'collecting' ? collectingText(ctx) : ctx.mode === 'ready' ? reasonText(ctx.summary?.dex.usdVolume?.reason) : noteFor(ctx, rankingStatus)}</p>}
         {rankingStatus === 'available' && financial.unvaluedSwaps !== null && financial.unvaluedSwaps > 0 &&
-          <p className="mt-1 text-[10px] text-slate-500">Verified priced swaps only; {formatCount(financial.unvaluedSwaps)} unpriced swaps are excluded.</p>}
+          <p className="mt-1 text-[10px] text-slate-500">Excludes {formatCount(financial.unvaluedSwaps)} swaps without a verified price.</p>}
       </div>
       {([['Lending actions', financial.lending], ['Cross-chain actions', financial.crossChain]] as const).map(([title, actions]) =>
         Object.keys(actions).length > 0 && <details key={title} className="mt-2 min-w-0 rounded-lg border border-slate-100 px-3 py-2 text-[11px]">
@@ -987,7 +993,7 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
                   <span className="min-w-0 text-slate-600">{names[row.protocol]}</span>
                   <span className="min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]">{formatUsdMicros(row.usdMicros)}</span>
                 </div>
-                {row.status === 'partial' && <p className="text-[10px] text-slate-500">Verified priced subset · {row.fullyValuedHours} / {row.expectedHours} fully valued hours</p>}
+                {row.status === 'partial' && <p className="text-[10px] text-slate-500">Partial: {row.fullyValuedHours} of {row.expectedHours} hours fully priced</p>}
               </li>)}
             </ol>
           </div>)}
@@ -1012,7 +1018,7 @@ function TopProtocolsSection({ ctx }: { ctx: ViewContext }) {
           </li>
         ))}
         <li {...markerProps('top-protocols.other', 'source_pending')} className="flex items-center justify-between gap-3 border-t border-dashed border-slate-200 pt-2">
-          <p className="min-w-0 truncate text-sm font-medium text-slate-500">Other Arc protocols</p>
+          <p className="min-w-0 truncate text-sm font-medium text-slate-400">Other Arc protocols</p>
           <InlineStatus status="source_pending" />
         </li>
       </ul>
@@ -1152,7 +1158,7 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
   const volumeStatus: DisplayStatus = status !== 'available' ? status
     : ranking?.status === 'source_pending' ? 'source_pending' : usdVolumeStatus(ranking ?? null)
   const volumeReason = volumeStatus === 'collecting' && ranking?.reason === 'insufficient_coverage' ? collectingText(ctx)
-    : volumeStatus === 'source_pending' ? 'Verified data does not include pool USD valuations yet.' : reasonText(firstReason(ranking))
+    : volumeStatus === 'source_pending' ? 'Pool USD values are not tracked yet.' : reasonText(firstReason(ranking))
   const holdings = data?.ranking.liquidityUsd
   const holdingsStatus = liquidityStatus(status, holdings)
   const asOf = holdings?.asOfHour && !Number.isNaN(Date.parse(holdings.asOfHour)) ? new Date(Date.parse(holdings.asOfHour) + 3_600_000).toISOString() : null
@@ -1160,7 +1166,7 @@ function TopPoolsSection({ ctx, version }: { ctx: ViewContext; version: 'v3' | '
     ? holdings?.snapshotScope === 'per_pool_latest_stored_snapshot' && !asOf
       ? 'Latest stored snapshot of each pool, dated individually and valued only with its own hour’s verified prices. These are not simultaneous current holdings.'
       : `${version === 'v4' ? 'Estimated principal reserves, excluding uncollected fees and position rounding' : 'Token balances held by each pool'} at ${asOf ? formatUtcDateTime(asOf) : 'the end of the latest verified hour'}, valued with that hour's verified prices.`
-    : holdingsStatus === 'source_pending' ? 'Verified data does not include pool balance or reserve snapshots yet.' : reasonText(holdings?.reason)
+    : holdingsStatus === 'source_pending' ? 'Pool holdings are not tracked yet.' : reasonText(holdings?.reason)
   const [emptyTitle, emptyDetail] = poolsEmpty(ctx, status)
   return (
     <section data-intel-section={id} aria-label={`Top Pools (Uniswap ${label})`} className={`${CARD} min-w-0`}>
@@ -1318,7 +1324,7 @@ function ActivityRowView({ row, explorerUrl, sharedTx }: { row: ArcActivityRow; 
       <ActivityCell label="From"><span className={ADDRESS_TEXT} title={row.from}>{shortenAddress(row.from)}</span></ActivityCell>
       <ActivityCell label="To">
         {row.to ? <span className={ADDRESS_TEXT} title={row.to}>{shortenAddress(row.to)}</span> : (
-          <span title={row.toReason === V4_SWAP_TO_BLOCKER ? V4_SWAP_TO_TEXT : undefined}><InlineStatus status="unavailable" /></span>
+          <span title={row.toReason === V4_SWAP_TO_BLOCKER ? V4_SWAP_TO_TEXT : undefined} className="whitespace-nowrap text-[11px] font-medium text-slate-400">Not recorded</span>
         )}
       </ActivityCell>
       <ActivityCell label="Tx">
@@ -1387,7 +1393,7 @@ function RecentActivitySection({ ctx, initialType }: { ctx: ViewContext; initial
         )}
       </ShellTable>
       <p className="mt-1 text-[11px] leading-4 text-slate-400">
-        From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.
+        From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads not recorded.
         {' '}Uniswap V4 swaps: {V4_SWAP_TO_TEXT}
       </p>
     </section>
@@ -1402,8 +1408,8 @@ function FamilyCoverage({ family }: { family: FamilyWindow | null }) {
   const coverage = verifiedFamilyCoverage(family)
   if (!coverage) return null
   return <div className="mt-2 text-[11px] leading-4 text-slate-500">
-    <p>Partial history: {coverage.availableHours} / {coverage.expectedHours} verified hours. Values exclude {coverage.missingHours} missing hours.</p>
-    <details data-api-reasons={family?.reasons?.join(',')}><summary className="cursor-pointer">Missing hours and reasons</summary>
+    <p>Partial: {coverage.availableHours} of {coverage.expectedHours} hours. {coverage.missingHours} missing {coverage.missingHours === 1 ? 'hour is' : 'hours are'} not counted.</p>
+    <details data-api-reasons={family?.reasons?.join(',')}><summary className="cursor-pointer">Which hours are missing</summary>
       <p>{family?.reasons?.map(reason => reasonText(reason)).join(' ')}</p><p>{family?.unavailableHours?.map(formatUtcDateTime).join('; ')}</p>
     </details>
   </div>
@@ -1422,10 +1428,10 @@ const tokenDexStatus = (row: DiscoveredToken) => row.dex.firstDexActivity?.first
 function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind: 'launches' | 'discoveredTokens' }) {
   const list = ecosystem[kind]
   return <div data-api-reason={ecosystem.coverage.reason} className="mt-3 min-w-0 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
-    <p className="font-semibold text-slate-800">Discovery coverage: {ecosystem.coverage.availableHours} / {ecosystem.coverage.requiredHours} hours.</p>
-    <p>{list.rows.length} {kind === 'launches' ? 'launch' : 'discovered token'} records returned{list.truncated ? ' (list capped)' : ''}.
-      {' '}{list.truncated ? 'Capped results are not the total number of launches or tokens.' : 'Incomplete discovery does not establish a chain-wide total.'}</p>
-    {ecosystem.coverage.status !== 'available' && <p>{reasonText(ecosystem.coverage.reason, 'Discovery checks are incomplete; additional records may exist.')}</p>}
+    <p className="font-semibold text-slate-800">Token discovery covers {ecosystem.coverage.availableHours} of {ecosystem.coverage.requiredHours} hours.</p>
+    <p>Showing {list.rows.length} {kind === 'launches' ? list.rows.length === 1 ? 'launch' : 'launches' : list.rows.length === 1 ? 'token' : 'tokens'}{list.truncated ? ' (list is capped)' : ''}.
+      {' '}{list.truncated ? 'This is not the total number of launches or tokens.' : 'This is not a chain-wide total.'}</p>
+    {ecosystem.coverage.status !== 'available' && <p>{reasonText(ecosystem.coverage.reason, 'Discovery is incomplete, so more tokens may exist.')}</p>}
   </div>
 }
 
@@ -1439,7 +1445,7 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
       <div><p className="font-semibold text-slate-800">Contract and identity</p><p className="break-all">{row.address}</p>
         <p>Verified ERC-20-like contract; unverified asset identity.</p>
         <p>{row.name ?? 'Contract name unavailable'} · {row.symbol ?? 'Contract symbol unavailable'}</p>
-        <p>Decimals: {row.decimals ?? 'Unavailable'}</p>
+        <p>Decimals: {row.decimals ?? 'Not recorded'}</p>
         <p>Discovered {formatUtcDateTime(row.discoveredAt)} · observed block {formatCount(row.observedBlock)}</p></div>
       <div {...launchFieldProps('launches.transaction', row.deployment.transactionHash ? 'available' : 'unavailable')}>
         <p className="font-semibold text-slate-800">Deployment evidence</p>
@@ -1453,7 +1459,7 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
       <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')}>
         <p className="font-semibold text-slate-800">{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p>
         <p>{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p>
-        {pool ? <><p className="break-all">{pool.protocol} · {pool.pool}</p><p>Block {formatCount(pool.creationBlock)}</p>
+        {pool ? <><p className="break-all">{protocolName(pool.protocol)} · {pool.pool}</p><p>Block {formatCount(pool.creationBlock)}</p>
           <p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
           : <p data-api-reason={row.dex.reason}>{reasonText(row.dex.reason, 'No verified pool record is stored.')}</p>}</div>
       <div {...launchFieldProps('launches.dex-activity', activity ? 'available' : 'unavailable')}>
@@ -1465,15 +1471,15 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
         {row.dex.reason && <p data-api-reason={row.dex.reason}>{reasonText(row.dex.reason)}</p>}</div>
     </div>
     {(row.dex.observedPools ?? []).map((observedPool) => <details key={observedPool.pool} className="rounded-lg border border-slate-200 px-3 py-2">
-      <summary className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#2F6E0C]">{observedPool.protocol} pool evidence · {shortenHash(observedPool.pool)}</summary>
+      <summary className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#2F6E0C]">{protocolName(observedPool.protocol)} pool evidence · {shortenHash(observedPool.pool)}</summary>
       <div className="mt-2 space-y-1 break-all"><p>{observedPool.pool}</p><p>Paired token {observedPool.pairedToken}</p>
         <p>Creation block {formatCount(observedPool.creationBlock)} · {observedPool.creationTimestamp ? formatUtcDateTime(observedPool.creationTimestamp) : 'Creation timestamp unavailable'}</p>
-        <p>Creation transaction: {transaction(observedPool.creationTxHash, 'Unavailable')}</p>
+        <p>Creation transaction: {transaction(observedPool.creationTxHash, 'Not recorded')}</p>
         {(['firstSwap', 'firstLiquidity'] as const).map((key) => {
           const evidence = observedPool[key]
           return <div key={key}><p className="font-medium">{key === 'firstSwap' ? 'Swap' : 'Liquidity'}: {evidence.firstObserved ? evidence.firstProven ? 'Proven first activity' : 'First observed activity' : 'Activity not observed'}</p>
             {evidence.firstObserved && <><p>{formatUtcDateTime(evidence.firstObserved.timestamp)} · block {formatCount(evidence.firstObserved.blockNumber)} · log {evidence.firstObserved.logIndex}</p>
-              <p>{transaction(evidence.firstObserved.txHash, 'Unavailable')}</p></>}
+              <p>{transaction(evidence.firstObserved.txHash, 'Not recorded')}</p></>}
             {evidence.reason && <p data-api-reason={evidence.reason}>{reasonText(evidence.reason)}</p>}</div>
         })}
         <p data-api-reason={observedPool.earlyActivity.reason ?? undefined}>{observedPool.earlyActivity.status === 'available' ? `${observedPool.earlyActivity.swapCount} swaps in pool creation UTC hour` : reasonText(observedPool.earlyActivity.reason)}</p>
@@ -1524,7 +1530,7 @@ export function EcosystemTokenList({ ctx, kind }: { ctx: ViewContext; kind: 'lau
     {!rows.length && <EmptyRows title={launches ? 'No launches listed yet' : 'No discovered tokens listed yet'}
       detail={ctx.ecosystem?.coverage.reason ?? 'Records appear once token discovery is verified. No sample tokens are shown.'} />}
     {!!rows.length && <nav aria-label={`${title} pagination`} className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
-      <span role="status" aria-live="polite" aria-atomic="true" className="text-xs tabular-nums text-slate-500">{start + 1}–{start + visible.length} of {rows.length} returned · Page {page + 1} of {pages}</span>
+      <span role="status" aria-live="polite" aria-atomic="true" className="text-xs tabular-nums text-slate-500">{start + 1} to {start + visible.length} of {rows.length} shown · Page {page + 1} of {pages}</span>
       <div className="flex gap-2"><button type="button" className={TOKEN_CONTROL} disabled={page === 0} aria-controls={tableId}
         onClick={() => setSelection({ page: Math.max(0, page - 1), expanded: null })}>Previous</button>
         <button type="button" className={TOKEN_CONTROL} disabled={page === pages - 1} aria-controls={tableId}
@@ -1569,28 +1575,30 @@ function LaunchesSection({ ctx }: { ctx: ViewContext }) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Assets
 
-const PRICE_SOURCE_NAME = { uniswap_v3: 'Uniswap V3', uniswap_v4: 'Uniswap V4' } as const
 
 // The verified USD price of one asset in the latest stored hour (summary.dex.usdPrices), shown beside its transfer activity:
 // never a value of its transfers, never an external, last-trade or older price. USDC is the valuation anchor, not a quote.
 function AssetPrice({ symbol, anchor, prices }: { symbol: string; anchor: boolean; prices: ReturnType<typeof verifiedAssetPrices> | null }) {
   if (!prices || prices.status === 'source_pending') return null
   if (anchor) {
-    return <p data-asset-price={symbol} data-asset-price-basis="valuation_anchor" className="mt-1 text-[11px] text-slate-500">1 {symbol} = 1 USD · valuation anchor</p>
+    return <p data-asset-price={symbol} data-asset-price-basis="valuation_anchor" className="mt-1 text-[11px] text-slate-500">Counted as $1 (USD reference)</p>
   }
   const price = prices.bySymbol[symbol]
   if (prices.status !== 'available' || !prices.hour || !price) {
     return <p data-asset-price={symbol} data-asset-price-status="unavailable" data-api-reason={prices.reason ?? undefined}
-      className="mt-1 text-[11px] text-slate-400">No verified USD price for the latest hour</p>
+      className="mt-1 text-[11px] text-slate-400">No verified price this hour</p>
   }
   const pool = price.sourceProtocol === 'uniswap_v3' ? shortenAddress(price.sourcePool) : shortenHash(price.sourcePool)
   return (
     <div data-asset-price={symbol} data-asset-price-usd-e18={price.priceUsdE18} className="mt-1 min-w-0">
       <p className="text-xs font-semibold tabular-nums text-slate-800 [overflow-wrap:anywhere]">{formatUsdPriceE18(price.priceUsdE18)}{' '}
-        <span className="font-normal text-slate-500">per {symbol}</span></p>
-      <p className="text-[10px] leading-4 text-slate-400 [overflow-wrap:anywhere]" title={price.sourcePool}>
-        Verified price of the hour from {formatUtcDateTime(prices.hour)} · {PRICE_SOURCE_NAME[price.sourceProtocol]} pool {pool} · depth{' '}
-        {formatUsdMicros(price.depthUsdMicros)} · {price.sourceCount} {price.sourceCount === 1 ? 'source' : 'sources'}</p>
+        <span className="font-normal text-slate-500">at {formatUtcHour(prices.hour)} UTC</span></p>
+      <details className="text-[10px] leading-4 text-slate-400">
+        <summary className="cursor-pointer">Price source</summary>
+        <p className="[overflow-wrap:anywhere]" title={price.sourcePool}>Verified on Arc from the {PRICE_SOURCE_NAME[price.sourceProtocol]} {symbol}/USDC
+          {' '}pool {pool}, {formatUsdMicros(price.depthUsdMicros)} depth{price.sourceCount > 1 ? `, ${price.sourceCount} qualifying pools in agreement` : ''}.
+          {' '}Hour from {formatUtcDateTime(prices.hour)}.</p>
+      </details>
     </div>
   )
 }
@@ -1626,13 +1634,13 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
   const shared = sharedStatus(rows.map((row) => row.cell.status))
   const maxTransfers = Math.max(0, ...rows.map((row) => row.transfers ?? 0))
   const pendingRows = [
-    { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: ctx.ecosystem ? 'Additional verified asset contracts, identities and units are required in the registry.' : 'More assets as they are verified' },
+    { item: 'assets.other-verified', label: 'Other verified Arc assets', detail: 'More assets appear here once their contracts are verified.' },
   ]
   const grid = 'md:grid-cols-[1.5fr_1.6fr_0.6fr_0.6fr_1.4fr]'
   return (
     <section data-intel-section="assets" aria-label="Assets" className={CARD}>
       <CardHeader title="Verified asset transfers"
-        subtitle={`Transfer, mint and burn events of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD; prices are verified Arc prices of the latest stored hour.`}
+        subtitle={`Transfers, mints and burns of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD. Prices are for the latest hour.`}
         right={shared ? <StatusPill status={shared} /> : undefined} />
       <div className={`mt-3 hidden gap-4 border-b border-slate-100 pb-1.5 md:grid ${grid}`}>
         <span className={LABEL}>Asset</span><span className={LABEL}>Transfer activity</span><span className={`${LABEL} text-right`}>Mints</span>
@@ -1917,32 +1925,32 @@ function UsdValues({ ctx, item, name }: { ctx: ViewContext; item: string; name: 
   const hasValues = rows.some((row) => numeric(row.micros))
   const shown = hasValues ? 'available' : status
   const partial = rows.some((row) => row.action && row.action.status !== 'complete')
-  const note = status === 'collecting' ? collectingText(ctx) : status === 'source_pending' ? 'Verified data does not include protocol USD valuations yet.'
+  const note = status === 'collecting' ? collectingText(ctx) : status === 'source_pending' ? 'USD values are not tracked yet.'
     : ctx.mode === 'ready' ? reasonText(entry?.reason) : noteFor(ctx, status)
   return <div {...markerProps(item, shown)} className="mt-3 min-w-0 rounded-lg border border-slate-100 px-2.5 py-2">
     <div className="flex min-w-0 flex-wrap items-center justify-between gap-2"><p className={LABEL}>USD value, last {ctx.windowLabel}</p>
-      {partial ? <Chip>Verified subset</Chip> : shown !== 'available' && <InlineStatus status={shown} />}
+      {partial ? <Chip>Partial value</Chip> : shown !== 'available' && <InlineStatus status={shown} />}
     </div>
     {hasValues ? <dl className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-x-4 gap-y-2">
       {rows.map(({ label, field, micros, action }) => <div key={field} data-usd-row={field} className="min-w-0 text-[11px]">
         <div className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,9rem),1fr))] items-baseline gap-x-3 gap-y-0.5"><dt className="min-w-0 whitespace-normal text-slate-500">{label}</dt>
           <dd data-usd-action={field} data-usd-micros={numeric(micros) ? micros : undefined} className="min-w-0 text-right font-semibold tabular-nums text-slate-900 [overflow-wrap:anywhere]">
-            {numeric(micros) ? formatUsdMicros(micros) : 'Unavailable'}</dd></div>
-        {action && action.status !== 'complete' && <p className="text-[10px] text-slate-500">Verified priced subset · {action.coverage.fullyValuedHours} / {action.coverage.expectedHours} fully valued hours</p>}
+            {numeric(micros) ? formatUsdMicros(micros) : 'Not verified'}</dd></div>
+        {action && action.status !== 'complete' && <p className="text-[10px] text-slate-500">Partial: {action.coverage.fullyValuedHours} of {action.coverage.expectedHours} hours fully priced</p>}
       </div>)}
     </dl> : <p className="mt-1 text-[11px] text-slate-500">{note}</p>}
-    {scoped && <details className="mt-2 text-[10px] text-slate-500"><summary className="cursor-pointer">Asset amounts, coverage and missing dependencies</summary>
+    {scoped && <details className="mt-2 text-[10px] text-slate-500"><summary className="cursor-pointer">Amounts by asset and what is missing</summary>
       {rows.map(({ label, field, action }) => action && <div key={field} className="mt-2"><p className="font-semibold">{label}</p>
         {action.assets.map((asset) => <div key={asset.token} className="mt-1 break-all">
           <p>{asset.verified ? asset.symbol : 'Unverified token'} · {asset.token}</p>
           <p>{asset.decimals === null ? `${asset.amountRaw} raw units (decimals unverified)` : `${formatTokenAmount(asset.amountRaw, asset.decimals)} ${asset.symbol}`}.
-            Verified priced value: {numeric(asset.usdMicros) ? formatUsdMicros(asset.usdMicros) : 'Unavailable'}.</p>
+            Verified priced value: {numeric(asset.usdMicros) ? formatUsdMicros(asset.usdMicros) : 'not verified'}.</p>
           {asset.blockers.map((blocker) => <p key={blocker.reason}>Excluded {blocker.amountRaw ?? asset.unvaluedAmountRaw} raw units: {blocker.reason.replace(/_/g, ' ')};
-            {blocker.hours} affected hours, {formatUtcDateTime(blocker.firstHour)} – {formatUtcDateTime(blocker.lastHour)}.</p>)}
+            {blocker.hours} affected hours, {formatUtcDateTime(blocker.firstHour)} to {formatUtcDateTime(blocker.lastHour)}.</p>)}
         </div>)}
       </div>)}
     </details>}
-    {hasValues && <p className="mt-1 text-[10px] leading-4 text-slate-400">{partial ? 'Only verified priced amounts are included. Unvalued amounts are excluded; this is not a full protocol total. ' : ''}Each action is valued on its own with that hour's verified prices and never added together.</p>}
+    {hasValues && <p className="mt-1 text-[10px] leading-4 text-slate-400">{partial ? 'Only amounts with a verified price are included, so this is not a full total. ' : ''}Each action is valued on its own and never added together.</p>}
   </div>
 }
 
@@ -2163,6 +2171,9 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Ecosystem
 
+// Ecosystem reasons that mean a source is not tracked at all (no verified addresses), not that tracked data failed.
+const ECOSYSTEM_UNTRACKED = new Set(['verified_protocol_registry_empty', 'verified_exchange_registry_empty'])
+
 const ECOSYSTEM_SLOTS = [
   { item: 'rwa-other.other-protocols', icon: Radar, title: 'Verified Arc protocol activity', detail: 'Activity of further verified Arc protocols' },
   { item: 'rwa-other.exchange-flows', icon: Store, title: 'Exchange flows', detail: 'Flows to and from verified exchange addresses' },
@@ -2208,7 +2219,9 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
         </div>
       </div>
       <div className={`${CARD} min-w-0`}>
-        <CardHeader title="Other Verified Protocols" subtitle="Additional protocol coverage" right={<StatusPill status={ctx.ecosystem ? 'unavailable' : 'source_pending'} />} />
+        <CardHeader title="Other Verified Protocols" subtitle="Protocols and exchanges appear here once their addresses are verified"
+          right={<StatusPill status={!ctx.ecosystem || ECOSYSTEM_UNTRACKED.has(ctx.ecosystem.otherProtocols.reason ?? '')
+            && ECOSYSTEM_UNTRACKED.has(ctx.ecosystem.exchangeFlows.reason ?? '') ? 'source_pending' : 'unavailable'} />} />
         <div className="mt-3 grid grid-cols-1 gap-2">
           {ECOSYSTEM_SLOTS.map(({ item, icon: Icon, title, detail }) => {
             const entry = item.includes('exchange') ? ctx.ecosystem?.exchangeFlows : ctx.ecosystem?.otherProtocols
@@ -2246,35 +2259,35 @@ export type ArcIntelligenceDashboardProps = {
 }
 
 const READ_SECTION_LABELS: Record<ArcReadSection, string> = {
-  summary: 'Summary', timeseries: 'Timeseries', poolsV3: 'V3 Pools', poolsV4: 'V4 Pools', ecosystem: 'Ecosystem',
-  'activity:all': 'Activity (all)', 'activity:swaps': 'Activity (swaps)', 'activity:adds': 'Activity (adds)', 'activity:removes': 'Activity (removes)',
+  summary: 'Overview', timeseries: 'Charts', poolsV3: 'Uniswap V3 pools', poolsV4: 'Uniswap V4 pools', ecosystem: 'Tokens and ecosystem',
+  'activity:all': 'Recent activity (all)', 'activity:swaps': 'Recent activity (swaps)', 'activity:adds': 'Recent activity (adds)',
+  'activity:removes': 'Recent activity (removes)',
 }
 
+// A failed refresh in one plain sentence (which parts show earlier data, which could not load); the per-section state,
+// the time of the last good update and response checks stay in collapsed technical details.
 function RefreshStatus({ data }: { data: ArcIntelligenceLoad | null }) {
   const entries = Object.entries(data?.refresh ?? {}) as [ArcReadSection, NonNullable<ArcIntelligenceLoad['refresh']>[ArcReadSection]][]
   if (!entries.length) return null
   const failures = entries.filter(([, state]) => state?.error)
+  const names = (retained: boolean) => failures.filter(([, state]) => Boolean(state?.retained) === retained).map(([section]) => READ_SECTION_LABELS[section])
+  const earlier = names(true), missing = names(false)
   return <>
     {failures.length > 0 && <Banner tone="warn">
-      Refresh failed for {failures.map(([section]) => READ_SECTION_LABELS[section]).join(', ')}.
-      {failures.some(([, state]) => state?.retained) && ' Previously verified responses are retained and marked stale; they may not reflect the latest window.'}
-      {failures.some(([, state]) => !state?.retained) && ' Sections without a previous successful response remain unavailable.'}
-      {failures.map(([section, state]) => state && <span key={section} className="block text-xs">
-        {READ_SECTION_LABELS[section]} — {state.retained ? 'stale retained response' : 'unavailable'}.
-        {' '}Last successfully validated response: {state.lastSuccessAt ? formatUtcDateTime(state.lastSuccessAt) : 'none'}.
-        {state.verifiedThrough && <> Verified through {formatUtcDateTime(state.verifiedThrough)}.</>}
-        {state.error === 'invalid_response' && ' Latest response failed schema validation.'}
-      </span>)}
+      Some parts could not be refreshed.
+      {earlier.length > 0 && ` Showing earlier data, which may be out of date: ${earlier.join(', ')}.`}
+      {missing.length > 0 && ` Not loaded: ${missing.join(', ')}.`}
+      {' '}Try Refresh in a moment.
     </Banner>}
-    <details className="text-xs text-slate-600">
-      <summary className="cursor-pointer">Response status and last successful validation times</summary>
+    <details className="text-xs text-slate-500">
+      <summary className="cursor-pointer">Technical details</summary>
       <ul className="mt-1 space-y-1">
         {entries.map(([section, state]) => state && <li key={section} data-refresh-section={section}
           data-refresh-status={state.error ? state.retained ? 'stale' : 'unavailable' : 'refreshed'}>
-          <strong>{READ_SECTION_LABELS[section]}</strong>: {state.error ? state.retained ? 'Stale retained response' : 'Response unavailable' : 'Last request succeeded'}.
-          {' '}Last successfully validated response: {state.lastSuccessAt ? formatUtcDateTime(state.lastSuccessAt) : 'none'}.
-          {state.verifiedThrough && <> Verified through {formatUtcDateTime(state.verifiedThrough)}.</>}
-          {state.error === 'invalid_response' && ' Latest response failed schema validation.'}
+          <strong>{READ_SECTION_LABELS[section]}</strong>: {state.error ? state.retained ? 'showing earlier data' : 'not loaded' : 'up to date'}.
+          {' '}Last good update: {state.lastSuccessAt ? formatUtcDateTime(state.lastSuccessAt) : 'none'}.
+          {state.verifiedThrough && <> Data through {formatUtcDateTime(state.verifiedThrough)}.</>}
+          {state.error === 'invalid_response' && ' The latest response did not pass its checks.'}
         </li>)}
       </ul>
     </details>
@@ -2296,7 +2309,8 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   const progress = mode === 'ready' && storedHours > 0 && storedHours < windowHours ? ` (${storedHours} of ${windowHours} hours so far)` : ''
   const days = selectedWindow === '30d' ? 30 : 7
   const historyNote = `The ${windowLabel} view fills in once ${days} full days of verified history are stored.`
-  const ctx: ViewContext = { mode, windowLabel: partialHistory ? `${coverage.availableHours} verified hours within 30D` : windowLabel,
+  const ctx: ViewContext = { mode, windowLabel: partialHistory ? `partial 30D (${coverage.availableHours} of ${coverage.expectedHours} hours)` : windowLabel,
+    previousLabel: partialHistory ? 'period' : windowLabel,
     period: selectedWindow === '24h' ? 'hour' : 'day', windowHours: selectedWindow === '30d' ? 720 : selectedWindow === '7d' ? 168 : 24,
     historyNote, summary, timeseries,
     collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
@@ -2342,11 +2356,11 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
       <RefreshStatus data={loaded} />
       {coverage && (
         <Banner tone="info"><span data-history-coverage={coverage.status}>
-          <strong>{partialHistory ? 'Partial history' : 'Full 30D history'}</strong>: {coverage.availableHours} / {coverage.expectedHours} verified hours.
-          {' '}{formatUtcDateTime(coverage.start)} – {formatUtcDateTime(coverage.end)}.
-          {' '}{coverage.completedUtcDays} completed UTC days.
-          {partialHistory && ' Values show available verified history within the selected 30D window.'}
-          {' '}Incomplete day intervals remain gaps; missing hours are never counted as zero.
+          {partialHistory
+            ? <><strong>Partial 30D history</strong>: {coverage.availableHours} of {coverage.expectedHours} hours are available
+              {' '}({coverage.completedUtcDays} complete days), so 30D totals cover only these hours. Missing hours are never counted as zero.</>
+            : <><strong>Full 30D history</strong>: all {coverage.expectedHours} hours.</>}
+          {' '}Period: {formatUtcDateTime(coverage.start)} to {formatUtcDateTime(coverage.end)}.
         </span></Banner>
       )}
       {networkCollecting && (

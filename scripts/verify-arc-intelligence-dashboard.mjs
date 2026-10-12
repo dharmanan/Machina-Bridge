@@ -929,8 +929,8 @@ await test('UI 6 without the API\'s USD valuation no USD value exists; the proto
   // An API without valuation (the ready fixtures carry none) reads as not available yet, never as zero or unavailable.
   for (const id of VOLUME) assert.equal(statusIn('ready', id), 'source_pending', id);
   assert.equal(statusIn('ready-default-view', 'volume-chart.volume'), 'source_pending');
-  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Avg DEX Pool Fee Not available yet Verified data does not include estimated swap fees yet\./);
-  assert.match(textOf(item(rendered.ready.tree, 'network.total-volume')), /DEX Volume Not available yet USD-valued Uniswap V3 and V4 swaps on Arc\. Verified data does not include DEX USD valuations yet\./);
+  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Avg DEX Pool Fee Not tracked yet Pool fees are not tracked yet\./);
+  assert.match(textOf(item(rendered.ready.tree, 'network.total-volume')), /DEX Volume Not tracked yet USD value of Uniswap V3 and V4 swaps on Arc\. USD values are not tracked yet\./);
 });
 
 const UI_SOURCES = [COMPONENT_PATH, LIB_PATH, SCOPE_PATH].map((file) => [file, readFileSync(file, 'utf8')]);
@@ -1219,7 +1219,7 @@ await test('UI 20 Volume is the primary DEX view, Swaps the secondary verified v
   const section = sectionNode(tree, 'volume-chart');
   const tabs = [...walk(section)].filter((node) => node.tag === 'button' && node.attrs.role === 'tab');
   assert.deepEqual(tabs.map((node) => [textOf(node), node.attrs['aria-selected']]), [['Volume', 'true'], ['Swaps', 'false']]);
-  assert.match(textOf(section), /DEX volume is not available yet/);
+  assert.match(textOf(section), /DEX volume is not tracked yet/);
   assert.equal(item(tree, 'volume-chart.volume').attrs['data-intel-status'], 'source_pending');
   assert.equal(item(tree, 'volume-chart.swaps').attrs['data-intel-status'], 'available');
   assert.equal(item(tree, 'volume-chart.latest').attrs['data-intel-status'], 'source_pending');
@@ -1265,7 +1265,7 @@ await test('Activity 1 Recent Activity rows: type, protocol, pair, exact token a
   assert.equal(cells(rows[0]), 'Time (UTC) Oct 3, 13:01 Type Swap Protocol Uniswap V3 Pair USDC / EURC Amount 1.5 USDC to pool 1.4 EURC from pool '
     + 'From 0x5e5e...5e5e To 0x7e7e...7e7e Tx 0x0000...ab01');
   assert.equal(cells(rows[1]), 'Time (UTC) Oct 3, 13:02 Type Swap Protocol Uniswap V4 Pair USDC / EURC Amount 2 USDC to pool 1.9 EURC from pool '
-    + 'From 0x5e5e...5e5e To Unavailable Tx 0x0000...ab02', 'a V4 swap records no recipient: To reads unavailable');
+    + 'From 0x5e5e...5e5e To Not recorded Tx 0x0000...ab02', 'a V4 swap records no recipient: To reads not recorded');
   assert.equal(cells(rows[2]), 'Time (UTC) Oct 3, 13:03 Type Add Protocol Uniswap V3 Pair USDC / 0xabcd...1234 Amount 2.5 USDC Raw amount 0xabcd...1234 123 '
     + 'From 0x5e5e...5e5e To 0x0e0e...0e0e Tx 0x0000...ab03', 'an unverified token keeps its exact raw amount, behind a short label');
   assert.equal(cells(rows[3]), 'Time (UTC) Oct 3, 13:04 Type Remove Protocol Uniswap V4 Pair USDC / EURC Amount Token amounts not recorded '
@@ -1683,7 +1683,7 @@ const scopeItem = (id) => SCOPE.flatMap((section) => section.items).find((entry)
 const RECENT_COLUMNS = [['recent-activity.time', 'Time (UTC)'], ['recent-activity.type', 'Type'], ['recent-activity.protocol', 'Protocol'],
   ['recent-activity.pair', 'Pair'], ['recent-activity.amounts', 'Amount'], ['recent-activity.from', 'From'], ['recent-activity.to', 'To'],
   ['recent-activity.transaction-links', 'Tx']];
-const TO_NOTE = 'From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads unavailable.';
+const TO_NOTE = 'From is the wallet that sent the transaction. To is shown only when the event itself records the recipient or owner; otherwise it reads not recorded.';
 const ROUTER_AS_RECIPIENT = /router|tx\.to|called contract|transaction recipient/i;
 const UI_CODE = [['component', componentSource], ['lib', libSource]];
 
@@ -1814,7 +1814,7 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
           assert.doesNotMatch(textOf(row).replace(/Holds \S+/, ''), /volume|USD\b|\$/i, `${name} ${id}: no volume without the valuation`);
         }
       }
-      assert.match(text, /Liquidity (Not available yet|Available|Collecting|Unavailable|Loading)/, `${name} ${id}: liquidity keeps its place, stated once`);
+      assert.match(text, /Liquidity (Not tracked yet|Available|Collecting|Not verified|Loading)/, `${name} ${id}: liquidity keeps its place, stated once`);
     }
     const protocols = textOf(sectionNode(tree, 'top-protocols'));
     assert.match(protocols, /DEX USD volume ranking/, name);
@@ -1822,7 +1822,7 @@ await test('Contract 4 Volume comes only from the USD valuation, never from coun
     assert.match(protocols, /Activity, last (24H|7D|30D)/, `${name}: counts carry an explicit Activity label`);
   }
   // The ready fixtures carry no valuation: their Volume (USD) line says so once, beside Liquidity.
-  assert.match(textOf(sectionNode(rendered.ready.tree, 'top-pools-v3')), /Volume \(USD\) Not available yet Verified data does not include pool USD valuations yet\. Liquidity Not available yet/);
+  assert.match(textOf(sectionNode(rendered.ready.tree, 'top-pools-v3')), /Volume \(USD\) Not tracked yet Pool USD values are not tracked yet\. Liquidity Not tracked yet/);
   const unitOf = (node) => textOf(node).match(/(swaps|lending actions|market actions|vault actions)$/)?.[1];
   for (const node of byAttr(sectionNode(rendered.ready.tree, 'top-protocols'), 'data-intel-value')) {
     assert.ok(unitOf(node), `${node.attrs['data-intel-item']}: a count is always shown with its unit`);
@@ -1866,7 +1866,7 @@ await test('Financial ranking separates lending and bridge actions and retains s
   assert.equal(ranked.dex.length,0);assert.equal(ranked.combinedFinancialTotal,null);
   const tree=render({...STATES.ready,data:{...READY_DATA,summary}}).tree;const text=textOf(sectionNode(tree,'top-protocols'));
   assert.match(text,/Lending actions · separate USD rankings/);assert.match(text,/Cross-chain actions · separate USD rankings/);
-  assert.match(text,/Verified priced subset · 6 \/ 24 fully valued hours/);
+  assert.match(text,/Partial: 6 of 24 hours fully priced/);
 });
 await test('Financial ranking keeps absent prices, malformed values and unavailable actions out',async()=>{
   for(const volume of [undefined,usdUnavailable(['prices_unavailable']),{...usdWindow('10'),byProtocol:{uniswapV3:'-1',uniswapV4:'11'}}]){
@@ -1881,16 +1881,16 @@ await test('Volume 1 DEX Volume is the exact window value from the API, with its
   const kpi = item(rendered['ready-usd'].tree, 'network.total-volume');
   assert.equal(kpi.attrs['data-intel-status'], 'available');
   assert.equal(kpi.attrs['data-intel-value'], '1234567890123', 'the exact micro-USD amount the API served');
-  assert.equal(textOf(kpi), 'DEX Volume $1.2M USD-valued Uniswap V3 and V4 swaps on Arc. Total, last 24H. 7 swaps without a verified price excluded. +23.5% vs previous 24H');
+  assert.equal(textOf(kpi), 'DEX Volume $1.2M USD value of Uniswap V3 and V4 swaps on Arc. Total, last 24H. Excludes 7 swaps without a verified price. +23.5% vs previous 24H');
   assert.equal([...walk(kpi)].find((node) => node.attrs.title)?.attrs.title, '$1,234,567.89', 'the exact amount stays on hover');
   const noPrevious = render({ ...STATES['ready-usd'], data: { ...USD_DATA, summary: summaryFixture({ usdVolume: usdWindow('5000000', { previous: null }) }) } }).tree;
-  assert.equal(textOf(item(noPrevious, 'network.total-volume')), 'DEX Volume $5 USD-valued Uniswap V3 and V4 swaps on Arc. Total, last 24H.',
+  assert.equal(textOf(item(noPrevious, 'network.total-volume')), 'DEX Volume $5 USD value of Uniswap V3 and V4 swaps on Arc. Total, last 24H.',
     'no change without an exactly comparable previous window, no unvalued note without unvalued swaps');
   assert.equal(statusIn('usd-collecting', 'network.total-volume'), 'collecting');
   assert.match(textOf(item(rendered['usd-collecting'].tree, 'network.total-volume')),
-    /DEX Volume Collecting USD-valued Uniswap V3 and V4 swaps on Arc\. Some hours of this window are not valued yet\./);
+    /DEX Volume Collecting USD value of Uniswap V3 and V4 swaps on Arc\. Some hours of this window are not valued yet\./);
   assert.match(textOf(item(rendered['usd-unavailable'].tree, 'network.total-volume')),
-    /DEX Volume Unavailable USD-valued Uniswap V3 and V4 swaps on Arc\. No verified price for a token in some hour of this window\./, 'the exact reason, never a vague gap');
+    /DEX Volume Not verified USD value of Uniswap V3 and V4 swaps on Arc\. No verified price for a token in some hour of this window\./, 'the exact reason, never a vague gap');
   assert.equal(statusIn('usd-unavailable', 'network.total-volume'), 'unavailable');
   for (const name of ['usd-collecting', 'usd-unavailable']) assert.doesNotMatch(rendered[name].html, /\$\s?\d/, `${name}: no USD amount without a valued window`);
 });
@@ -1909,8 +1909,8 @@ await test('Volume 2 the DEX Volume chart draws only valued hours, keeps the unv
   assert.equal(labels[23], '13:00-14:00 UTC: $1.5K', 'each bar is the hour\'s V3 plus V4 value');
   assert.equal(valueIn('ready-usd', 'volume-chart.latest'), '1523', 'latest complete hour, in dollars');
   assert.match(textOf(item(tree, 'volume-chart.latest')), /Latest complete hour \$1\.5K 13:00-14:00 UTC Peak hour in window \$1\.5K 13:00-14:00 UTC/);
-  assert.match(textOf(section), /USD-valued Uniswap V3 and V4 swaps on Arc\. USD value per UTC hour across all verified pairs, last 24H\. Each swap is counted once\./);
-  assert.match(textOf(section), /Each swap counts once, valued by its USDC side or by a verified hourly price from Arc USDC pools\. 7 swaps between tokens without a verified price are not included\./);
+  assert.match(textOf(section), /USD value of swaps per UTC hour, last 24H\. All verified Uniswap V3 and V4 pairs, each swap counted once\./);
+  assert.match(textOf(section), /Swaps are valued by their USDC side or a verified hourly Arc price\. 7 swaps without a verified price are not included\./);
   assert.match(textOf(sectionNode(rendered['usd-swaps-tab'].tree, 'volume-chart')), /Counts, not amounts/, 'the Swaps view stays counts');
   assert.equal(statusIn('usd-collecting', 'volume-chart.volume'), 'collecting');
   assert.match(textOf(sectionNode(rendered['usd-collecting'].tree, 'volume-chart')), /DEX volume is still being collected Hours appear here once their swaps are valued\./);
@@ -1932,7 +1932,7 @@ await test('Volume 3 pool volume is each listed pool\'s exact USD value; a pool 
     assert.equal(statusIn('usd-collecting', `${id}.volume`), 'collecting');
     assert.equal(statusIn('usd-unavailable', `${id}.volume`), 'unavailable');
     assert.match(textOf(sectionNode(rendered['usd-unavailable'].tree, id)),
-      /Volume \(USD\) Unavailable No verified price for a token in some hour of this window\. Liquidity Not available yet/);
+      /Volume \(USD\) Not verified No verified price for a token in some hour of this window\. Liquidity Not tracked yet/);
     for (const row of byAttr(sectionNode(rendered['usd-collecting'].tree, id), 'data-pool-row')) {
       assert.doesNotMatch(textOf(row), /\$|volume/i);
       assert.match(textOf(row), /Not valued yet/, 'a row says why its value is missing, never an endless placeholder');
@@ -1945,7 +1945,7 @@ await test('Completion 1 fee estimate, state-based liquidity and protocol USD re
   assert.equal(statusIn('ready-complete', 'network.average-fee'), 'available');
   assert.equal(valueIn('ready-complete', 'network.average-fee'), '300000');
   assert.match(textOf(item(tree, 'network.average-fee')), /Avg DEX Pool Fee \$0\.3/);
-  assert.match(textOf(item(tree, 'network.average-fee')), /Does not include per step rounding or hook fees/);
+  assert.match(textOf(item(tree, 'network.average-fee')), /Not Arc gas\. Excludes hook fees and rounding\./);
   assert.match(textOf(sectionNode(tree, 'top-pools-v3')), /Holds \$3\.5M/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /Estimated reserves \$820/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /excluding uncollected fees and position rounding/);
@@ -1989,11 +1989,11 @@ await test('Partial 30D displays 549 verified hours, all supported numeric secti
   const { tree } = render({ selectedWindow: '30d', data, borrowMarket: BORROW_AVAILABLE });
   checkScope(tree, SCOPE);
   const text = textOf(tree);
-  assert.match(text, /Partial history : 549 \/ 720 verified hours/);
-  assert.match(text, /22 completed UTC days/);
+  assert.match(text, /Partial 30D history : 549 of 720 hours are available \(22 complete days\), so 30D totals cover only these hours\. Missing hours are never counted as zero\./);
+  assert.match(text, /Total transactions, last partial 30D \(549 of 720 hours\)/);
   assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.start)));
   assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.end)));
-  assert.match(text, /Values show available verified history within the selected 30D window/);
+  assert.match(text, /Period: /);
   assert.doesNotMatch(text, /30D totals appear once every hour|Total transactions, last 30D|vs previous 30D/);
   for (const id of ['network.transactions', 'network.blocks', 'network.tps', 'network.gas-used', 'network.total-volume', 'network.average-fee',
     'top-protocols.uniswap-v3', 'top-protocols.uniswap-v4', 'top-pools-v3.volume', 'top-pools-v4.volume', 'assets.usdc',
@@ -2067,8 +2067,8 @@ await test('Completion 3 older missing valuations explain the bounded backfill l
   const { tree } = render({ selectedWindow: '7d', data: { ...SEVEN_DAY_DATA, summary }, borrowMarket: BORROW_UNAVAILABLE });
   const kpi = item(tree, 'network.total-volume');
   assert.equal(kpi.attrs['data-intel-value'], undefined);
-  assert.match(textOf(kpi), /Some hourly valuations are missing in this window/);
-  assert.match(textOf(kpi), /backfill covers the latest 72 hours at most/);
+  assert.match(textOf(kpi), /Some hours of this period have no USD value/);
+  assert.match(textOf(kpi), /USD values are added afterwards only for the latest 72 hours, so older missing hours stay missing/);
 });
 
 await test('Tokens 1 a token\'s own contract metadata reads as an unverified label, never as a verified identity', async () => {
@@ -2122,7 +2122,7 @@ await test('Completion partial family metrics reconcile actual hour evidence and
   assert.equal(lib.windowStatus(family), 'available');
   const data = structuredClone(READY_DATA); data.summary.assets.usdc = family;
   const tree = render({ ...STATES.ready, data }).tree;
-  assert.match(textOf(sectionNode(tree, 'assets')), /Partial history: 23 \/ 24 verified hours/);
+  assert.match(textOf(sectionNode(tree, 'assets')), /Partial: 23 of 24 hours\. 1 missing hour is not counted\./);
   for (const mutate of [row => row.verifiedSubset.coverage.verifiedHours[0] = row.unavailableHours[0],
     row => row.verifiedSubset.coverage.availableHours = 24]) {
     const bad = structuredClone(family); mutate(bad);
@@ -2142,8 +2142,8 @@ await test('Completion USD action/asset subtotals display real values and exact 
   const tree = render({ ...STATES['ready-complete'], data }).tree;
   const node = item(tree, 'lending.aave-usd');
   assert.equal(node.attrs['data-intel-status'], 'available');
-  assert.match(textOf(node), /\$12.00/); assert.match(textOf(node), /Verified subset/);
-  assert.match(textOf(node), /0 \/ 24 fully valued hours/);
+  assert.match(textOf(node), /\$12.00/); assert.match(textOf(node), /Partial value/);
+  assert.match(textOf(node), /Partial: 0 of 24 hours fully priced/);
   assert.match(textOf(node), /Excluded 999 raw units: unverified token/);
   assert.match(textOf(node), new RegExp(unknown));
 });
@@ -2155,13 +2155,13 @@ await test('Completion verified launches and discovery render despite incomplete
   const tree = render({ ...STATES.ready, data }).tree;
   checkScope(tree, SCOPE);
   const launches = textOf(sectionNode(tree, 'launches'));
-  assert.match(launches, /FOUND/); assert.match(launches, /1 launch records returned/);
-  assert.match(launches, /Discovery coverage: 1 \/ 24 hours/);
+  assert.match(launches, /FOUND/); assert.match(launches, /Showing 1 launch \(list is capped\)/);
+  assert.match(launches, /Token discovery covers 1 of 24 hours/);
   assert.match(launches, /Direct deployment/); assert.match(launches, /Observed pool/);
   assert.match(launches, /First observed activity/);
   assert.equal(byAttr(tree, 'data-token-evidence').length, 0, 'technical evidence starts collapsed');
   assert.equal(item(tree, 'assets.new-tokens').attrs['data-intel-status'], 'available');
-  assert.match(textOf(sectionNode(tree, 'rwa-other')), /No exchange addresses have verified labels/);
+  assert.match(textOf(sectionNode(tree, 'rwa-other')), /Not tracked yet: exchange flows need verified exchange addresses/);
   assert.ok(byAttr(tree, 'data-api-reason', 'verified_exchange_registry_empty').length);
   const corrupt = structuredClone(ecosystem); corrupt.launches.rows[0].dex.observedPools[0].creationTxHash = 'guessed';
   assert.equal(lib.parseArcEcosystem(corrupt, '24h'), null);
@@ -2221,12 +2221,12 @@ for (const window of ['24h', '7d', '30d']) await test(`Ecosystem schema ${window
   assert.equal(lib.parseArcEcosystem(body, window === '24h' ? '7d' : '24h'), null);
   const summary = structuredClone(READY_DATA.summary); summary.window = body.window;
   const tree = render({ selectedWindow: window, data: { ...READY_DATA, window, summary, ecosystem: parsed } }).tree;
-  assert.match(textOf(sectionNode(tree, 'assets')), /19 discovered token records returned/);
+  assert.match(textOf(sectionNode(tree, 'assets')), /Showing 19 tokens/);
   assert.match(textOf(sectionNode(tree, 'assets')), /asset identities remain unverified/);
   assert.equal(byAttr(tree, 'data-launch-token').length, 10);
   const launches = textOf(sectionNode(tree, 'launches'));
-  assert.match(launches, /50 launch records returned \(list capped\)/);
-  assert.match(launches, new RegExp(`Discovery coverage: 6 / ${body.coverage.requiredHours} hours`));
+  assert.match(launches, /Showing 50 launches \(list is capped\)/);
+  assert.match(launches, new RegExp(`Token discovery covers 6 of ${body.coverage.requiredHours} hours`));
   assert.match(launches, /Discovery checks cover only part of the stored history/);
   assert.match(launches, /First observed activity/);
   assert.equal(byAttr(tree, 'data-token-evidence').length, 0);
@@ -2326,10 +2326,10 @@ await test('Token list UX compact defaults, coverage and capped counts keep both
   assert.equal(byAttr(tree, 'data-token-evidence').length, 0);
   for (const kind of ['launches', 'discoveredTokens']) {
     const list = byAttr(tree, 'data-token-list', kind)[0], text = textOf(list);
-    assert.match(text, /Discovery coverage: 6 \/ 561 hours/);
-    assert.match(text, /Capped results are not the total number of launches or tokens/);
+    assert.match(text, /Token discovery covers 6 of 561 hours/);
+    assert.match(text, /\(list is capped\)\. This is not the total number of launches or tokens/);
     assert.match(text, /asset identities remain unverified/);
-    assert.match(text, kind === 'launches' ? /50 launch records returned/ : /19 discovered token records returned/);
+    assert.match(text, kind === 'launches' ? /Showing 50 launches/ : /Showing 19 tokens/);
     const table = [...walk(list)].find(node => node.tag === 'table');
     assert.ok(table); assert.match(table.attrs.class, /md:table/);
     assert.equal([...walk(table)].filter(node => node.tag === 'th' && node.attrs.scope === 'col').length, 5);
@@ -2355,9 +2355,9 @@ await test('Token list UX Previous and Next visit every returned record once and
   assert.match(textOf(discoveries.draw().tree), /Page 1 of 2/);
   discoveries.click('Next');
   assert.equal(byAttr(discoveries.draw().tree, 'data-discovered-token').length, 9);
-  assert.match(textOf(discoveries.draw().tree), /11–19 of 19 returned/);
+  assert.match(textOf(discoveries.draw().tree), /11 to 19 of 19 shown/);
   const smaller = structuredClone(ecosystem); smaller.launches.rows = smaller.launches.rows.slice(0, 3);
-  launches.replace(smaller); assert.match(textOf(launches.draw().tree), /1–3 of 3 returned · Page 1 of 1/);
+  launches.replace(smaller); assert.match(textOf(launches.draw().tree), /1 to 3 of 3 shown · Page 1 of 1/);
   launches.click('Previous'); assert.equal(byAttr(launches.draw().tree, 'data-launch-token').length, 3);
 });
 await test('Token list UX expansion reveals real evidence, remains single-row and closes on pagination', async () => {
@@ -2406,7 +2406,7 @@ await test('Completion both 7D and 30D daily-active charts preserve persisted co
       network: { ...bucket.network, uniqueActiveAddresses: 321, uniqueActiveAddressesStatus: { status: 'available', value: 321 } } } : bucket);
     const tree = render({ selectedWindow: window, data }).tree;
     const chart = textOf(sectionNode(tree, 'active-addresses-chart'));
-    assert.match(chart, /Verified distinct addresses per completed UTC day/);
+    assert.match(chart, /Unique addresses per completed UTC day/);
     assert.doesNotMatch(chart, /Daily active addresses are not available/);
     assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'collecting', 'the window\'s own state, not a fixed long-window refusal');
   }
@@ -2472,11 +2472,11 @@ await test('Refresh 2 a failed 30D reload preserves every verified section and s
   const tree = render({ selectedWindow: '30d', data: kept }).tree;
   assert.equal(item(tree, 'network.transactions').attrs['data-intel-status'], 'available');
   assert.equal(byAttr(tree, 'data-refresh-section', 'summary')[0].attrs['data-refresh-status'], 'stale');
-  assert.match(textOf(tree), /560 \/ 720 verified hours/);
-  assert.match(textOf(tree), /Refresh failed for Summary, Timeseries/);
-  assert.match(textOf(tree), /Previously verified responses are retained and marked stale/);
-  assert.match(textOf(tree), /Last successfully validated response: Oct 9, 17:00 UTC/);
-  assert.doesNotMatch(textOf(tree), /Last successfully validated response: Oct 9, 17:02 UTC/);
+  assert.match(textOf(tree), /560 of 720 hours are available/);
+  assert.match(textOf(tree), /Some parts could not be refreshed\. Showing earlier data, which may be out of date: Overview, Charts, /);
+  assert.match(textOf(tree), /Technical details Overview : showing earlier data/);
+  assert.match(textOf(tree), /Last good update: Oct 9, 17:00 UTC/);
+  assert.doesNotMatch(textOf(tree), /Last good update: Oct 9, 17:02 UTC/);
 });
 
 await test('Refresh 3 each partial API failure retains only that section while successful peers advance', async () => {
@@ -2507,7 +2507,7 @@ await test('Refresh 4 a first-load Summary failure does not hide successful Time
   for (const id of ['top-pools-v3.swaps', 'top-pools-v4.swaps', 'assets.new-tokens', 'recent-activity.all', 'volume-chart.swaps']) {
     assert.equal(item(tree, id).attrs['data-intel-status'], 'available', id);
   }
-  assert.match(textOf(tree), /Sections without a previous successful response remain unavailable/);
+  assert.match(textOf(tree), /Some parts could not be refreshed\. Not loaded: Overview\. Try Refresh in a moment\./);
 });
 
 await test('Refresh 5 recovery replaces retained responses and clears errors with new success timestamps', async () => {
@@ -2522,7 +2522,7 @@ await test('Refresh 5 recovery replaces retained responses and clears errors wit
     assert.equal(data.refresh[section].lastSuccessAt, recoveryTime);
   }
   const tree = render({ selectedWindow: '24h', data }).tree;
-  assert.doesNotMatch(textOf(tree), /Refresh failed|Stale retained response/);
+  assert.doesNotMatch(textOf(tree), /could not be refreshed|showing earlier data|not loaded/);
   assert.equal(byAttr(tree, 'data-refresh-section', 'summary')[0].attrs['data-refresh-status'], 'refreshed');
 });
 
@@ -2624,14 +2624,14 @@ await test('Responsive fixture preserves exact valuations and exports representa
     const usd = byAttr(tree, 'data-usd-action');
     assert.equal(usd.length, 25);
     for (const amount of usd) assert.equal(textOf(amount), lib.formatUsdMicros(amount.attrs['data-usd-micros']));
-    assert.match(textOf(tree), /Verified subset/);
-    assert.match(textOf(tree), new RegExp(`0 / ${ecosystem.window.hours} fully valued hours`));
+    assert.match(textOf(tree), /Partial value/);
+    assert.match(textOf(tree), new RegExp(`Partial: 0 of ${ecosystem.window.hours} hours fully priced`));
     assert.match(textOf(tree), /Each action is valued on its own/);
     assert.match(textOf(tree), /Collateral removed/);
     for (const id of ['rwa-other.other-protocols', 'rwa-other.exchange-flows', 'rwa-other.more-protocols'])
       assert.equal(item(tree, id).attrs['data-intel-status'], 'unavailable');
-    assert.match(textOf(sectionNode(tree, 'rwa-other')), /No additional protocol sources have been verified/);
-    assert.match(textOf(sectionNode(tree, 'rwa-other')), /No exchange addresses have verified labels/);
+    assert.match(textOf(sectionNode(tree, 'rwa-other')), /Not tracked yet: no further protocol has verified contracts/);
+    assert.match(textOf(sectionNode(tree, 'rwa-other')), /Not tracked yet: exchange flows need verified exchange addresses/);
     assert.doesNotMatch(textOf(tree), /verified_protocol_registry_empty|verified_exchange_registry_empty|discovery_hour_missing_or_capped/);
     assert.ok(byAttr(tree, 'data-api-reason', 'verified_exchange_registry_empty').length);
     assert.equal([...walk(tree)].filter(node => ['h3','h4'].includes(node.tag) && textOf(node) === 'New Token Launches').length, 1);
@@ -2683,18 +2683,18 @@ await test('Asset prices: verified prices of the latest stored hour with their s
   assert.equal(nodes.USDC.attrs['data-asset-price-basis'], 'valuation_anchor');
   assert.equal(nodes.USDC.attrs['data-asset-price-usd-e18'], undefined, 'USDC is the anchor, never a quoted price');
   assert.equal(nodes.EURC.attrs['data-asset-price-usd-e18'], '1084271234567890123');
-  assert.match(textOf(nodes.EURC), /^\$1\.0842 per EURC Verified price of the hour from Oct 3, 13:00 UTC · Uniswap V3 pool 0xabab\.\.\.abab · depth \$52,000\.00 · 2 sources$/);
-  assert.match(textOf(nodes.cirBTC), /^\$104,123\.45 per cirBTC /);
-  assert.match(textOf(nodes.WETH), /\$3,456\.78 per WETH .*Uniswap V4 pool 0xcdcd.*depth \$1,250,000\.00 · 1 source$/);
+  assert.match(textOf(nodes.EURC), /^\$1\.0842 at 13:00 UTC Price source Verified on Arc from the Uniswap V3 EURC\/USDC pool 0xabab\.\.\.abab, \$52,000\.00 depth, 2 qualifying pools in agreement\. Hour from Oct 3, 13:00 UTC\.$/);
+  assert.match(textOf(nodes.cirBTC), /^\$104,123\.45 at 13:00 UTC Price source /);
+  assert.match(textOf(nodes.WETH), /^\$3,456\.78 at 13:00 UTC .*Uniswap V4 WETH\/USDC pool 0xcdcd.*, \$1,250,000\.00 depth\. Hour from/);
   assert.equal(nodes.USYC.attrs['data-asset-price-status'], 'unavailable');
-  assert.equal(textOf(nodes.USYC), 'No verified USD price for the latest hour', 'an asset without a qualified source this hour has no price');
+  assert.equal(textOf(nodes.USYC), 'No verified price this hour', 'an asset without a qualified source this hour has no price');
   for (const symbol of ['USDC', 'EURC', 'cirBTC', 'WETH', 'USYC']) {
     let parent = nodes[symbol].parent;
     while (parent && parent.attrs['data-intel-item'] === undefined) parent = parent.parent;
     assert.equal(parent?.attrs['data-intel-item'], `assets.${symbol.toLowerCase()}`, `${symbol} price sits in its own asset row`);
   }
   assert.equal(item(tree, 'assets.eurc').attrs['data-intel-value'], valueIn('ready', 'assets.eurc'), 'the row value stays the transfer count');
-  assert.match(textOf(section), /Amounts are in token units, not USD; prices are verified Arc prices of the latest stored hour\./);
+  assert.match(textOf(section), /Amounts are in token units, not USD\. Prices are for the latest hour\./);
   checkScope(tree, SCOPE);
 });
 
@@ -2721,13 +2721,70 @@ await test('Asset prices fail closed: an entry outside the registry, a USDC quot
   const hourGone = assetPrices(withPrices({ hour: freshness.checkpointHour, status: 'unavailable', reason: 'valuation_hour_unavailable',
     reasons: ['price_paths_unavailable'], tokens: [] }));
   assert.equal(hourGone.nodes.WETH.attrs['data-api-reason'], 'valuation_hour_unavailable');
-  assert.equal(textOf(hourGone.nodes.WETH), 'No verified USD price for the latest hour');
+  assert.equal(textOf(hourGone.nodes.WETH), 'No verified price this hour');
   // An API without prices: nothing is shown in their place, the rows stay as before.
   const older = assetPrices(withPrices(undefined));
   assert.deepEqual(Object.keys(older.nodes), []);
   assert.equal(lib.verifiedAssetPrices(withPrices(undefined)).status, 'source_pending');
   // The loading and failed states render no price either.
   for (const state of ['loading', 'failed']) assert.equal(byAttr(sectionNode(rendered[state].tree, 'assets'), 'data-asset-price').length, 0, state);
+});
+
+// Plain wording: visible text and hover titles never show status or reason codes, the old machine labels or a placeholder
+// that reads as working; data-intel-status markers keep their exact codes.
+const collapsedInDetails = (node) => { let parent = node.parent; while (parent && parent.tag !== 'details') parent = parent.parent; return parent?.attrs.open === undefined ? parent : null; };
+await test('UX 1 statuses and reasons read in plain words in every state; scope markers keep their codes', async () => {
+  for (const [name, { tree }] of Object.entries(rendered)) {
+    const titles = [...walk(tree)].map((node) => node.attrs.title).filter(Boolean).join(' ');
+    for (const text of [textOf(tree), titles]) {
+      assert.doesNotMatch(text, /\b[a-z0-9]+_[a-z0-9_]+\b/, `${name}: no raw code`);
+      assert.doesNotMatch(text, /\bUnavailable\b|Not available yet|Verified hours|uniswap_v[34]/, `${name}: no machine label`);
+    }
+    const pills = byAttr(tree, 'data-status-pill').map(textOf);
+    assert.ok(pills.every((pill) => ['Available', 'Collecting', 'Not verified', 'Not tracked yet', 'Loading'].includes(pill)), `${name}: ${pills}`);
+    for (const node of byAttr(tree, 'data-intel-status')) assert.ok([...STATUSES, 'loading'].includes(node.attrs['data-intel-status']), name);
+  }
+  assert.match(textOf(rendered.ready.tree), /Not tracked yet/);
+  assert.match(textOf(rendered.mixed.tree), /Not verified/);
+});
+
+await test('UX 2 a failed refresh is one plain sentence; per-part times and response checks stay in collapsed technical details', async () => {
+  const previous = lib.retainArcIntelligenceLoad(undefined, refreshFixture('30d'), refreshTime);
+  const failure = await lib.loadArcIntelligence('30d', { fetchImpl: async () => { throw new TypeError('offline'); } });
+  const tree = render({ selectedWindow: '30d', data: lib.retainArcIntelligenceLoad(previous, failure, recoveryTime) }).tree;
+  const banner = [...walk(tree)].filter((node) => node.tag !== '#text' && /^Some parts could not be refreshed\./.test(textOf(node))).at(-1);
+  assert.ok(banner && !collapsedInDetails(banner), 'the notice itself is visible');
+  assert.doesNotMatch(textOf(banner), /status|validat|response|timestamp|success|Last good update|UTC/i);
+  const lines = byAttr(tree, 'data-refresh-section');
+  assert.equal(lines.length, lib.ARC_READ_SECTIONS.length);
+  for (const line of lines) {
+    const details = collapsedInDetails(line);
+    assert.ok(details, `${line.attrs['data-refresh-section']} sits in collapsed details`);
+    assert.equal(textOf(details.children.find((child) => child.tag === 'summary')), 'Technical details');
+  }
+});
+
+await test('UX 3 untracked protocols and exchanges read Not tracked yet, never as working; their item markers stay unchanged', async () => {
+  const tree = render({ ...STATES.ready, data: { ...READY_DATA, ecosystem: completionEcosystem() } }).tree;
+  const card = sectionNode(tree, 'rwa-other');
+  const header = byAttr(card, 'data-status-pill').map(textOf);
+  assert.ok(header.includes('Not tracked yet') && !header.includes('Available'), `${header}`);
+  for (const id of ['rwa-other.other-protocols', 'rwa-other.exchange-flows']) assert.equal(item(tree, id).attrs['data-intel-status'], 'unavailable', id);
+  const unknown = completionEcosystem(); unknown.otherProtocols.reason = 'family_hour_unavailable';
+  const pills = byAttr(sectionNode(render({ ...STATES.ready, data: { ...READY_DATA, ecosystem: unknown } }).tree, 'rwa-other'), 'data-status-pill').map(textOf);
+  assert.ok(pills.includes('Not verified'), 'a failed verified source is not shown as merely untracked');
+  checkScope(tree, SCOPE);
+});
+
+await test('UX 4 an asset price shows price and hour in the row; its source pool and depth stay one tap away', async () => {
+  const { nodes } = assetPrices(withPrices(PRICES));
+  for (const symbol of ['EURC', 'cirBTC', 'WETH']) {
+    const details = [...walk(nodes[symbol])].find((node) => node.tag === 'details');
+    assert.ok(details && details.attrs.open === undefined, symbol);
+    assert.equal(textOf(details.children.find((child) => child.tag === 'summary')), 'Price source');
+    assert.match(textOf(details), /pool 0x[0-9a-f]{4}\.\.\.[0-9a-f]{4}, \$[\d,.]+ depth/, symbol);
+    assert.match(textOf(nodes[symbol]).slice(0, -textOf(details).length).trim(), /^\$[\d,.]+ at 13:00 UTC$/, symbol);
+  }
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);
