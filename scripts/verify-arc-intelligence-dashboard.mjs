@@ -2656,4 +2656,78 @@ await test('Responsive fixture preserves exact valuations and exports representa
   if (process.env.ARC_DASHBOARD_RESPONSIVE_FIXTURE) writeFileSync(process.env.ARC_DASHBOARD_RESPONSIVE_FIXTURE, JSON.stringify(fixtures));
 });
 
+// Verified asset prices (summary.dex.usdPrices, server/compact/read-model.js hourPrices): the latest stored hour's verified
+// prices beside each asset's transfer activity, exact strings, never for USDC and never from an entry outside the registry.
+const PRICE_ASSET = Object.fromEntries(ARC_VERIFIED_ASSETS.map((asset) => [asset.symbol, asset.address.toLowerCase()]));
+const priceToken = (symbol, priceUsdE18, { protocol = 'uniswap_v3', pool = `0x${'ab'.repeat(20)}`, depth = '52000000000', sources = 2, ...extra } = {}) => ({
+  address: PRICE_ASSET[symbol], symbol, decimals: ARC_VERIFIED_ASSETS.find((asset) => asset.symbol === symbol).decimals, verified: true, native: false,
+  contractMetadata: null, priceUsdE18, sourceProtocol: protocol, sourcePool: pool, depthUsdMicros: depth, sourceCount: sources, ...extra });
+const withPrices = (usdPrices) => { const summary = summaryFixture(); return usdPrices === undefined ? summary : { ...summary, dex: { ...summary.dex, usdPrices } }; };
+const PRICES = { hour: freshness.checkpointHour, status: 'available', reason: null, reasons: [], tokens: [
+  priceToken('cirBTC', '104123456789000000000000'), priceToken('EURC', '1084271234567890123'),
+  priceToken('WETH', '3456780000000000000000', { protocol: 'uniswap_v4', pool: `0x${'cd'.repeat(32)}`, depth: '1250000000000', sources: 1 })] };
+const assetPrices = (summary) => {
+  const tree = render({ ...STATES.ready, data: { ...READY_DATA, summary } }).tree;
+  const section = sectionNode(tree, 'assets');
+  return { tree, section, nodes: Object.fromEntries(byAttr(section, 'data-asset-price').map((node) => [node.attrs['data-asset-price'], node])) };
+};
+
+await test('Asset prices: verified prices of the latest stored hour with their source pool, anchor USDC, no price for an unpriced asset', async () => {
+  assert.equal(lib.formatUsdPriceE18('1084271234567890123'), '$1.0842');
+  assert.equal(lib.formatUsdPriceE18('104123456789000000000000'), '$104,123.45');
+  assert.equal(lib.formatUsdPriceE18('1000000000000000000000'), '$1,000.00');
+  assert.equal(lib.formatUsdPriceE18('12345678901234567'), '$0.012345');
+  assert.equal(lib.formatUsdPriceE18('1'), '<$0.000001');
+  const { tree, section, nodes } = assetPrices(withPrices(PRICES));
+  assert.deepEqual(Object.keys(nodes).sort(), ['EURC', 'USDC', 'USYC', 'WETH', 'cirBTC']);
+  assert.equal(nodes.USDC.attrs['data-asset-price-basis'], 'valuation_anchor');
+  assert.equal(nodes.USDC.attrs['data-asset-price-usd-e18'], undefined, 'USDC is the anchor, never a quoted price');
+  assert.equal(nodes.EURC.attrs['data-asset-price-usd-e18'], '1084271234567890123');
+  assert.match(textOf(nodes.EURC), /^\$1\.0842 per EURC Verified price of the hour from Oct 3, 13:00 UTC · Uniswap V3 pool 0xabab\.\.\.abab · depth \$52,000\.00 · 2 sources$/);
+  assert.match(textOf(nodes.cirBTC), /^\$104,123\.45 per cirBTC /);
+  assert.match(textOf(nodes.WETH), /\$3,456\.78 per WETH .*Uniswap V4 pool 0xcdcd.*depth \$1,250,000\.00 · 1 source$/);
+  assert.equal(nodes.USYC.attrs['data-asset-price-status'], 'unavailable');
+  assert.equal(textOf(nodes.USYC), 'No verified USD price for the latest hour', 'an asset without a qualified source this hour has no price');
+  for (const symbol of ['USDC', 'EURC', 'cirBTC', 'WETH', 'USYC']) {
+    let parent = nodes[symbol].parent;
+    while (parent && parent.attrs['data-intel-item'] === undefined) parent = parent.parent;
+    assert.equal(parent?.attrs['data-intel-item'], `assets.${symbol.toLowerCase()}`, `${symbol} price sits in its own asset row`);
+  }
+  assert.equal(item(tree, 'assets.eurc').attrs['data-intel-value'], valueIn('ready', 'assets.eurc'), 'the row value stays the transfer count');
+  assert.match(textOf(section), /Amounts are in token units, not USD; prices are verified Arc prices of the latest stored hour\./);
+  checkScope(tree, SCOPE);
+});
+
+await test('Asset prices fail closed: an entry outside the registry, a USDC quote or another hour shows no price at all', async () => {
+  const invalid = [
+    ['unknown token', { ...PRICES, tokens: [...PRICES.tokens, { ...priceToken('EURC', '1'), address: `0x${'12'.repeat(20)}` }] }],
+    ['unverified identity', { ...PRICES, tokens: [{ ...priceToken('EURC', '1084271234567890123'), verified: false }] }],
+    ['wrong decimals', { ...PRICES, tokens: [{ ...priceToken('cirBTC', '1'), decimals: 18 }] }],
+    ['USDC quote', { ...PRICES, tokens: [{ ...priceToken('EURC', '1'), address: PRICE_ASSET.USDC, symbol: 'USDC', decimals: 6 }] }],
+    ['duplicate asset', { ...PRICES, tokens: [priceToken('EURC', '1'), priceToken('EURC', '2')] }],
+    ['zero price', { ...PRICES, tokens: [priceToken('EURC', '0')] }],
+    ['non-integer price', { ...PRICES, tokens: [priceToken('EURC', '1.08')] }],
+    ['pool id of the other protocol', { ...PRICES, tokens: [priceToken('EURC', '1', { protocol: 'uniswap_v4' })] }],
+    ['no source', { ...PRICES, tokens: [priceToken('EURC', '1', { sources: 0 })] }],
+    ['older hour', { ...PRICES, hour: isoAt(END - 2 * HOUR_MS) }],
+  ];
+  for (const [name, usdPrices] of invalid) {
+    const summary = withPrices(usdPrices);
+    assert.deepEqual(lib.verifiedAssetPrices(summary), { status: 'unavailable', reason: 'price_response_invalid', hour: null, bySymbol: {} }, name);
+    const { nodes } = assetPrices(summary);
+    assert.equal(Object.values(nodes).filter((node) => node.attrs['data-asset-price-usd-e18'] !== undefined).length, 0, name);
+    assert.equal(nodes.EURC.attrs['data-asset-price-status'], 'unavailable', name);
+  }
+  const hourGone = assetPrices(withPrices({ hour: freshness.checkpointHour, status: 'unavailable', reason: 'valuation_hour_unavailable',
+    reasons: ['price_paths_unavailable'], tokens: [] }));
+  assert.equal(hourGone.nodes.WETH.attrs['data-api-reason'], 'valuation_hour_unavailable');
+  assert.equal(textOf(hourGone.nodes.WETH), 'No verified USD price for the latest hour');
+  // An API without prices: nothing is shown in their place, the rows stay as before.
+  const older = assetPrices(withPrices(undefined));
+  assert.deepEqual(Object.keys(older.nodes), []);
+  assert.equal(lib.verifiedAssetPrices(withPrices(undefined)).status, 'source_pending');
+  // The loading and failed states render no price either.
+  for (const state of ['loading', 'failed']) assert.equal(byAttr(sectionNode(rendered[state].tree, 'assets'), 'data-asset-price').length, 0, state);
+});
+
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

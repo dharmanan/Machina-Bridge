@@ -102,6 +102,12 @@ export type ProtocolUsd = { status: 'available' | 'unavailable'; reason: string 
       valuedAmountRaw: string; unvaluedAmountRaw: string; usdMicros: string | null;
       blockers: { reason: string; firstHour: string; lastHour: string; hours: number; amountRaw?: string }[] }[] }> }
 
+// Verified token prices of the latest stored hour (server/compact/read-model.js hourPrices; server/compact/valuation.js
+// tokenPricesOf): only verified Arc assets, priced from qualified Arc pools against USDC, with the source pool.
+export type UsdPricesHour = { hour: string; status: 'available' | 'unavailable'; reason: string | null; reasons?: string[];
+  tokens: (PoolToken & { priceUsdE18: string; sourceProtocol: 'uniswap_v3' | 'uniswap_v4'; sourcePool: string; depthUsdMicros: string;
+    sourceCount: number })[] }
+
 export type ArcSummary = {
   schema: typeof SUMMARY_SCHEMA
   window: IntelligenceWindow
@@ -109,7 +115,7 @@ export type ArcSummary = {
   network: NetworkWindow
   assets: { usdc: FamilyWindow; verifiedAssets: FamilyWindow }
   dex: { uniswapV3: FamilyWindow; uniswapV4: FamilyWindow; officialV3Pools: { status: BackendStatus; count: number | null }; usdVolume?: UsdVolumeWindow;
-    swapFees?: SwapFeesWindow }
+    swapFees?: SwapFeesWindow; usdPrices?: UsdPricesHour }
   lending: { aaveV4: FamilyWindow; morphoBlue: FamilyWindow; morphoVaultsV2: FamilyWindow }
   protocolUsd?: Partial<Record<'cctp' | 'gateway' | 'across' | 'aaveV4' | 'morphoBlue' | 'morphoVaultsV2', ProtocolUsd>>
   crossChain: { cctp: FamilyWindow; gateway: FamilyWindow; across: FamilyWindow }
@@ -687,6 +693,49 @@ export function formatUsdMicros(micros: string): string {
   const cents = (value % 1_000_000n) / 10_000n
   if (value > 0n && whole === 0n && cents === 0n) return '<$0.01'
   return `$${whole.toLocaleString('en-US')}.${cents.toString().padStart(2, '0')}`
+}
+
+// A USD price per whole token from its exact 1e18-scaled integer, truncated (never rounded up): cents from $1,000, four
+// decimals from $1, six below.
+export function formatUsdPriceE18(priceUsdE18: string): string {
+  const value = BigInt(priceUsdE18)
+  const whole = value / 10n ** 18n
+  const digits = whole >= 1000n ? 2 : whole >= 1n ? 4 : 6
+  const fraction = (value % 10n ** 18n) / 10n ** BigInt(18 - digits)
+  if (value > 0n && whole === 0n && fraction === 0n) return `<$0.${'0'.repeat(digits - 1)}1`
+  return `$${whole.toLocaleString('en-US')}.${fraction.toString().padStart(digits, '0')}`
+}
+
+// The valuation anchor (server/compact/valuation.js): 1 USDC = 1 USD by definition, so it never carries a quoted price.
+const VALUATION_ANCHOR = '0x3600000000000000000000000000000000000000'
+
+export type VerifiedAssetPrice = { address: string; symbol: string; priceUsdE18: string; sourceProtocol: 'uniswap_v3' | 'uniswap_v4';
+  sourcePool: string; depthUsdMicros: string; sourceCount: number }
+
+// Verified USD prices of the latest stored hour by asset symbol (summary.dex.usdPrices). Only a verified Arc asset with its
+// exact registry identity, a positive exact price, its source pool, depth and source count is kept; an entry that does not
+// match its contract, or belongs to another hour than the summary's checkpoint, makes every price unavailable rather than
+// partly shown. USDC is the valuation anchor (1 USDC = 1 USD) and is never priced here. An API without prices: source_pending.
+export function verifiedAssetPrices(summary: ArcSummary | null): { status: IntelligenceDataStatus; reason: string | null; hour: string | null;
+  bySymbol: Record<string, VerifiedAssetPrice> } {
+  const result = (status: IntelligenceDataStatus, reason: string | null = null) => ({ status, reason, hour: null, bySymbol: {} })
+  const entry: unknown = summary?.dex.usdPrices
+  if (!summary || entry === undefined) return result('source_pending')
+  if (!isRecord(entry) || entry.hour !== summary.coverage?.checkpointHour || !Array.isArray(entry.tokens)) return result('unavailable', 'price_response_invalid')
+  if (entry.status !== 'available') return result('unavailable', typeof entry.reason === 'string' ? entry.reason : null)
+  const bySymbol: Record<string, VerifiedAssetPrice> = {}
+  for (const token of entry.tokens as unknown[]) {
+    const identity = isRecord(token) && typeof token.address === 'string' ? ARC_KNOWN_TOKENS[token.address] : undefined
+    if (!isRecord(token) || !identity || token.address === VALUATION_ANCHOR || bySymbol[identity.symbol] || token.verified !== true || token.native !== false
+      || token.symbol !== identity.symbol || token.decimals !== identity.decimals || typeof token.priceUsdE18 !== 'string' || !/^[1-9]\d*$/.test(token.priceUsdE18)
+      || (token.sourceProtocol !== 'uniswap_v3' && token.sourceProtocol !== 'uniswap_v4') || typeof token.sourcePool !== 'string'
+      || !(token.sourceProtocol === 'uniswap_v3' ? HEX_ADDRESS_LOWER : HEX_POOL_ID).test(token.sourcePool)
+      || typeof token.depthUsdMicros !== 'string' || !USD_MICROS.test(token.depthUsdMicros)
+      || !Number.isSafeInteger(token.sourceCount) || (token.sourceCount as number) < 1) return result('unavailable', 'price_response_invalid')
+    bySymbol[identity.symbol] = { address: token.address as string, symbol: identity.symbol, priceUsdE18: token.priceUsdE18,
+      sourceProtocol: token.sourceProtocol, sourcePool: token.sourcePool, depthUsdMicros: token.depthUsdMicros, sourceCount: token.sourceCount as number }
+  }
+  return { status: 'available', reason: null, hour: entry.hour as string, bySymbol }
 }
 
 // "$1.2M" style for tiles and axes.

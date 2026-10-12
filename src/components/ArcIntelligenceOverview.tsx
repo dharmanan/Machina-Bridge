@@ -21,6 +21,7 @@ import {
   formatTokenAmount,
   formatUsdCompact,
   formatUsdMicros,
+  formatUsdPriceE18,
   formatUtcDateTime,
   formatUtcDay,
   formatUtcHour,
@@ -46,6 +47,7 @@ import {
   V4_SWAP_TO_BLOCKER,
   V4_SWAP_TO_TEXT,
   verifiedAssetItems,
+  verifiedAssetPrices,
   windowStatus,
   type ArcActivity,
   type ArcEcosystem,
@@ -1567,6 +1569,32 @@ function LaunchesSection({ ctx }: { ctx: ViewContext }) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Assets
 
+const PRICE_SOURCE_NAME = { uniswap_v3: 'Uniswap V3', uniswap_v4: 'Uniswap V4' } as const
+
+// The verified USD price of one asset in the latest stored hour (summary.dex.usdPrices), shown beside its transfer activity:
+// never a value of its transfers, never an external, last-trade or older price. USDC is the valuation anchor, not a quote.
+function AssetPrice({ symbol, anchor, prices }: { symbol: string; anchor: boolean; prices: ReturnType<typeof verifiedAssetPrices> | null }) {
+  if (!prices || prices.status === 'source_pending') return null
+  if (anchor) {
+    return <p data-asset-price={symbol} data-asset-price-basis="valuation_anchor" className="mt-1 text-[11px] text-slate-500">1 {symbol} = 1 USD · valuation anchor</p>
+  }
+  const price = prices.bySymbol[symbol]
+  if (prices.status !== 'available' || !prices.hour || !price) {
+    return <p data-asset-price={symbol} data-asset-price-status="unavailable" data-api-reason={prices.reason ?? undefined}
+      className="mt-1 text-[11px] text-slate-400">No verified USD price for the latest hour</p>
+  }
+  const pool = price.sourceProtocol === 'uniswap_v3' ? shortenAddress(price.sourcePool) : shortenHash(price.sourcePool)
+  return (
+    <div data-asset-price={symbol} data-asset-price-usd-e18={price.priceUsdE18} className="mt-1 min-w-0">
+      <p className="text-xs font-semibold tabular-nums text-slate-800 [overflow-wrap:anywhere]">{formatUsdPriceE18(price.priceUsdE18)}{' '}
+        <span className="font-normal text-slate-500">per {symbol}</span></p>
+      <p className="text-[10px] leading-4 text-slate-400 [overflow-wrap:anywhere]" title={price.sourcePool}>
+        Verified price of the hour from {formatUtcDateTime(prices.hour)} · {PRICE_SOURCE_NAME[price.sourceProtocol]} pool {pool} · depth{' '}
+        {formatUsdMicros(price.depthUsdMicros)} · {price.sourceCount} {price.sourceCount === 1 ? 'source' : 'sources'}</p>
+    </div>
+  )
+}
+
 function AssetsSection({ ctx }: { ctx: ViewContext }) {
   const usdc = ctx.summary?.assets.usdc ?? null
   const verified = ctx.summary?.assets.verifiedAssets ?? null
@@ -1582,6 +1610,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
       amount: usdcAmount !== null && usdcDecimals !== null ? `${formatTokenAmount(usdcAmount, usdcDecimals)} USDC` : null }
     : { item: 'assets.usdc', symbol: 'USDC', cell: { status: usdcStatus === 'available' ? 'unavailable' : usdcStatus } }]
   const assetStatus = liveStatus(ctx, verified)
+  const prices = ctx.summary ? verifiedAssetPrices(ctx.summary) : null
   for (const [item, symbol] of [['assets.eurc', 'EURC'], ['assets.cirbtc', 'cirBTC'], ['assets.weth', 'WETH'], ['assets.usyc', 'USYC']] as const) {
     if (assetStatus !== 'available' || !items) {
       rows.push({ item, symbol, cell: { status: assetStatus === 'available' ? 'unavailable' : assetStatus } })
@@ -1603,7 +1632,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
   return (
     <section data-intel-section="assets" aria-label="Assets" className={CARD}>
       <CardHeader title="Verified asset transfers"
-        subtitle={`Transfer, mint and burn events of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD.`}
+        subtitle={`Transfer, mint and burn events of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD; prices are verified Arc prices of the latest stored hour.`}
         right={shared ? <StatusPill status={shared} /> : undefined} />
       <div className={`mt-3 hidden gap-4 border-b border-slate-100 pb-1.5 md:grid ${grid}`}>
         <span className={LABEL}>Asset</span><span className={LABEL}>Transfer activity</span><span className={`${LABEL} text-right`}>Mints</span>
@@ -1619,6 +1648,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
                 <p className="text-sm font-semibold text-slate-900">{row.symbol}</p>
                 <Chip tone={toneFor(row.symbol)}>{ASSET_CATEGORY[row.symbol]}</Chip>
                 {row.item === 'assets.usdc' && <FamilyCoverage family={usdc} />}
+                <AssetPrice symbol={row.symbol} anchor={row.item === 'assets.usdc'} prices={prices} />
               </div>
             </div>
             {row.cell.status !== 'available' ? (

@@ -621,6 +621,14 @@ if (!sqlite) {
         ['available', (24n * (HOUR_V3 + HOUR_V4)).toString(), { uniswapV3: (24n * HOUR_V3).toString(), uniswapV4: (24n * HOUR_V4).toString() }, 24 * 22, 24 * 2]);
       assert.deepEqual([volume.previous.status, volume.previous.reason], ['unavailable', 'insufficient_coverage'], 'only two earlier hours exist');
       assert.deepEqual(summary.dex.usdPrices.tokens.map((token) => [token.address, token.symbol, token.priceUsdE18]), [[WETH, 'WETH', WETH_PRICE.toString()]]);
+      // The dashboard shows these prices only in exactly this shape (src/lib/arcIntelligence.ts verifiedAssetPrices).
+      assert.equal(summary.dex.usdPrices.hour, summary.coverage.checkpointHour);
+      const [priced] = summary.dex.usdPrices.tokens;
+      assert.deepEqual(Object.keys(priced).sort(), ['address', 'contractMetadata', 'decimals', 'depthUsdMicros', 'native', 'priceUsdE18', 'sourceCount',
+        'sourcePool', 'sourceProtocol', 'symbol', 'verified']);
+      assert.deepEqual([priced.verified, priced.native, priced.decimals, typeof priced.depthUsdMicros, Number.isSafeInteger(priced.sourceCount)],
+        [true, false, 18, 'string', true]);
+      assert.match(priced.sourcePool, priced.sourceProtocol === 'uniswap_v3' ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/);
       assert.equal(summary.definitions.valuation.pricePolicy.minDepthUsdMicros, PRICE_POLICY.minDepthUsdMicros.toString());
       const series = model.timeseries('24h');
       assert.deepEqual(series.buckets.at(-1).dexUsdVolume, { status: 'available', totalUsdMicros: (HOUR_V3 + HOUR_V4).toString(),
