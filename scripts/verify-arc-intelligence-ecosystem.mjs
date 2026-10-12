@@ -326,6 +326,95 @@ await test('continuous fresh backlog cannot starve due retries; cooldown orderin
   const third = store.intelligence.pending({ now: 7200100, limit: 16 });
   assert.deepEqual(third.slice(0, 8).map(item => item.key), items.slice(0, 8).map(item => item.key)); db.close();
 });
+// Production on 2026-10-12: 139,741 pending candidates, the last 24 hours' 2,794 all pending, behind oldest-first selection.
+// One committed hour whose top-level creations are spread over its blocks (one hour holds at most 2,048 candidates).
+function creationHour(index, count) {
+  const row = hour(index, { observation: false }); const sink = createIntelligenceSink();
+  const blocks = Array.from({ length: 8 }, (_, b) => ({ number: row.range.firstBlock + 1 + b, hash: hash(row.range.firstBlock + 1 + b),
+    timestamp: row.range.hourStart + 10 + b, txHashes: [], txFrom: [], txTo: [] }));
+  for (let k = 0; k < count; k++) { const b = blocks[k % 8]; b.txHashes.push(hash(10_000_000 + index * 4096 + k)); b.txFrom.push(DEPLOYER); b.txTo.push(null); }
+  sink.blocks(blocks); row.intelligence = finish(sink, { range: row.range }); row.network.transactionCount = count;
+  return row;
+}
+// Twelve old hours of 2,000 pending candidates each (24,000), then the newest hour's 40 candidates.
+function backlogFixture() {
+  const out = fixture();
+  for (let i = 0; i <= 12; i++) out.store.commitHour(creationHour(i, i < 12 ? 2000 : 40));
+  const rows = out.db.prepare('SELECT candidate_key,hour_start,block_number FROM compact_token_discoveries').all();
+  const hourOf = new Map(rows.map(row => [row.candidate_key, (row.hour_start - BASE) / 3600]));
+  // Block order (the previous oldest-first selection), and the newest end: latest block first, key order within a block.
+  const sorted = (index, direction) => rows.filter(row => hourOf.get(row.candidate_key) === index)
+    .sort((a, b) => direction * (a.block_number - b.block_number) || (a.candidate_key < b.candidate_key ? -1 : 1)).map(row => row.candidate_key);
+  const order = (index) => sorted(index, 1), newestOrder = (index) => sorted(index, -1);
+  return { ...out, hourOf, order, newestOrder, item: (key) => JSON.parse(out.db.prepare('SELECT candidate_json FROM compact_token_discoveries WHERE candidate_key=?').get(key).candidate_json) };
+}
+const terminal = (store, item, now) => store.intelligence.recordVerification({ ...item, status: 'rejected_not_erc20_like', reason: 'deployment_failed' }, { now });
+await test('large backlog: newest candidates start in the next pass, oldest keep their share, due retries keep eight places', () => {
+  const { db, store, hourOf, order, newestOrder, item } = backlogFixture();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM compact_token_discoveries WHERE status='pending'").get().n, 24040);
+  const old = order(3);
+  for (const key of old.slice(0, 10)) retry(store, item(key), 100); // due at 3,600,100
+  retry(store, item(order(4)[0]), 3000000); // still cooling down at 3,600,100
+  terminal(store, item(order(5)[0]), 100);
+  const pass = store.intelligence.pending({ now: 3600100, limit: 16 });
+  const keys = pass.map(row => row.key);
+  assert.equal(keys.length, 16); assert.equal(new Set(keys).size, 16, 'a candidate is selected once per pass');
+  assert.deepEqual(keys.slice(0, 8), old.slice(0, 8), 'due retries keep their eight places in eligibility order');
+  assert.deepEqual(keys.slice(8, 12), newestOrder(12).slice(0, 4), 'four places go to the newest committed hour, latest block first');
+  assert.deepEqual(keys.slice(12), order(0).slice(0, 4), 'four places go to the oldest candidates, in block order');
+  assert.ok(!keys.includes(order(4)[0]) && !keys.includes(order(5)[0]), 'cooldown and terminal candidates are not selected');
+  // Without due retries the sixteen places split eight newest and eight oldest.
+  const fresh = store.intelligence.pending({ now: 200, limit: 16 }).map(row => row.key);
+  assert.deepEqual(fresh.slice(0, 8), newestOrder(12).slice(0, 8));
+  assert.deepEqual(fresh.slice(8), order(0).slice(0, 8));
+  db.close();
+});
+await test('large backlog drain: the newest hour is fully selected in five passes while the oldest lane advances every pass', () => {
+  const { db, store, hourOf, order } = backlogFixture();
+  const newest = new Set(order(12)), oldestOrder = order(0);
+  let passes = 0, oldestDone = 0;
+  while ([...newest].some(key => db.prepare("SELECT status FROM compact_token_discoveries WHERE candidate_key=?").get(key).status === 'pending')) {
+    const pass = store.intelligence.pending({ now: 200 + passes, limit: 16 });
+    assert.equal(pass.length, 16); assert.equal(new Set(pass.map(row => row.key)).size, 16);
+    const oldest = pass.filter(row => hourOf.get(row.key) === 0).map(row => row.key);
+    assert.deepEqual(oldest, oldestOrder.slice(oldestDone, oldestDone + 8), 'the oldest lane keeps eight places, in block order');
+    oldestDone += oldest.length;
+    for (const row of pass) terminal(store, row, 200 + passes);
+    passes++;
+  }
+  assert.equal(passes, 5, '40 newest candidates at eight per pass');
+  // The previous oldest-first order would have reached the newest hour only after 24,000 older candidates (1,500 passes).
+  // Once the newest hour is done, its places move to the next newest pending hour: the backlog drains from both ends.
+  const next = store.intelligence.pending({ now: 300, limit: 16 }).map(row => row.key);
+  assert.ok(next.slice(0, 8).every(key => hourOf.get(key) === 11)); assert.ok(next.slice(8).every(key => hourOf.get(key) === 0));
+  db.close();
+});
+await test('selection reads stay index-bounded; small queues are not duplicated; retries borrow unused fresh places', () => {
+  const { db, store } = backlogFixture();
+  const statements = []; const prepare = db.prepare.bind(db);
+  db.prepare = (sql) => { statements.push(sql); return prepare(sql); };
+  store.intelligence.pending({ now: 200, limit: 16 }); db.prepare = prepare;
+  const fresh = statements.filter(sql => sql.includes("status='pending'"));
+  assert.equal(fresh.length, 2);
+  for (const sql of fresh) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(200n, 16n).map(row => row.detail).join(' | ');
+    assert.match(plan, /USING INDEX compact_token_discovery_retry/); assert.doesNotMatch(plan, /TEMP B-TREE FOR ORDER BY/, plan);
+  }
+  db.close();
+  // Fewer pending candidates than places: each is selected exactly once, never by both ends.
+  const small = queueFixture(5);
+  assert.deepEqual(small.store.intelligence.pending({ now: 100, limit: 16 }).map(row => row.key).sort(), small.items.map(row => row.key).sort());
+  small.db.close();
+  // Nineteen due retries and one pending candidate: eight retry places, the pending candidate, and the unused fresh
+  // places borrowed by the remaining due retries.
+  const mixed = queueFixture(20);
+  for (const row of mixed.items.slice(0, 19)) retry(mixed.store, row, 100);
+  const selected = mixed.store.intelligence.pending({ now: 3600100, limit: 16 }).map(row => row.key);
+  assert.equal(selected.length, 16); assert.equal(new Set(selected).size, 16);
+  assert.ok(selected.includes(mixed.items[19].key), 'the pending candidate is selected');
+  assert.equal(selected.filter(key => key !== mixed.items[19].key).length, 15, 'retries borrow the unused fresh places');
+  mixed.db.close();
+});
 await test('verified source unknown-source alone remains due retry eligible; pool/direct tokens stay terminal', async () => {
   const { db, store } = fixture(); const row = hour(0, { observation: false }); const sink = createIntelligenceSink({ registry });
   const stream = extensionStreams(registry).find(entry => entry.kind === 'launch');

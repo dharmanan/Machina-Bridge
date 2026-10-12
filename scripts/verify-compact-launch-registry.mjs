@@ -250,8 +250,8 @@ await test('source factory failure stays in existing cooldown/retry queue; sixte
     assert.deepEqual(store.intelligence.pending({ now: 3600100, limit: 16 }).map(item => item.key), [item.key]);
     assert.throws(() => store.intelligence.pending({ now: 100, limit: 17 }), /limit/);
     const source = readFileSync(new URL('../server/compact/intelligence-store.js', import.meta.url), 'utf8');
-    assert.match(source, /Math\.ceil\(limit \/ 2\)/); assert.match(source, /limit - retryCount/);
-    assert.match(source, /selected\.push\(\.\.\.retries\.slice/);
+    assert.match(source, /take\(retries, Math\.ceil\(limit \/ 2\)\)/);
+    assert.match(source, /for \(const rows of \[oldest, newest, retries\]\) take\(rows, limit - selected\.size\)/);
     // Full deterministic fresh/retry starvation + borrowing cases remain in the existing 60-test ecosystem verifier.
   } finally { db.close(); }
 });

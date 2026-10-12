@@ -128,17 +128,29 @@ export function createIntelligenceRepository(db, { archive } = {}) {
     },
     pending({ now, limit }) {
       if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 1 || limit > 16) throw new Error('invalid_discovery_limit');
-      // Separate bounded queues: at the production limit each gets eight places; unused quota is borrowed.
-      // Earliest retry eligibility rotates old attempts fairly. Terminal negatives never enter either queue.
-      const fresh = db.prepare(`SELECT candidate_json FROM compact_token_discoveries WHERE status='pending' AND not_before<=?
-        ORDER BY block_number ASC,candidate_key ASC LIMIT ?`).all(BigInt(now), BigInt(limit));
-      const retries = db.prepare(`SELECT candidate_json FROM compact_token_discoveries WHERE ${RETRY_DISCOVERY} AND not_before<=?
+      // Separate bounded queues: due retries keep up to half the places; the fresh places are split between the newest
+      // pending candidates (so the latest committed hours start verifying in the next pass, ahead of any historical
+      // backlog) and the oldest (so that backlog keeps draining in block order and is never starved). Unused places are
+      // borrowed, by the other fresh end first and then by retries; a candidate is taken at most once per pass.
+      // Earliest retry eligibility rotates old attempts fairly. Terminal negatives never enter any queue.
+      // Pending rows are inserted with not_before 0 and leave 'pending' on their first verification, so ordering by
+      // (not_before, block_number) is block order and follows the retry index: each read stops at the limit.
+      const fresh = (order) => db.prepare(`SELECT candidate_key,candidate_json FROM compact_token_discoveries WHERE status='pending'
+        AND not_before<=? ORDER BY not_before ${order},block_number ${order},candidate_key ASC LIMIT ?`).all(BigInt(now), BigInt(limit));
+      const newest = fresh('DESC'), oldest = fresh('ASC');
+      const retries = db.prepare(`SELECT candidate_key,candidate_json FROM compact_token_discoveries WHERE ${RETRY_DISCOVERY} AND not_before<=?
         ORDER BY not_before ASC,block_number ASC,candidate_key ASC LIMIT ?`).all(BigInt(now), BigInt(limit));
-      const retryCount = Math.min(retries.length, Math.ceil(limit / 2));
-      const freshCount = Math.min(fresh.length, limit - retryCount);
-      const selected = [...retries.slice(0, retryCount), ...fresh.slice(0, freshCount)];
-      selected.push(...retries.slice(retryCount, retryCount + limit - selected.length));
-      return selected.map((row) => JSON.parse(row.candidate_json));
+      const selected = new Map();
+      const take = (rows, places) => {
+        for (const row of rows) {
+          if (places <= 0 || selected.size >= limit) return;
+          if (!selected.has(row.candidate_key)) { selected.set(row.candidate_key, row); places--; }
+        }
+      };
+      take(retries, Math.ceil(limit / 2));
+      take(newest, Math.ceil((limit - selected.size) / 2));
+      for (const rows of [oldest, newest, retries]) take(rows, limit - selected.size);
+      return [...selected.values()].map((row) => JSON.parse(row.candidate_json));
     },
     recordVerification(result, { now }) {
       if (!['verified_erc20_like', 'rejected_not_erc20_like', 'unverified'].includes(result.status) || !Number.isSafeInteger(now)
