@@ -212,8 +212,8 @@ for (let report; (report = storeB.packedShards.maintain({ limit: 256 })).pruned 
 measurements.build = { hours: HOURS, ms: Math.round(performance.now() - buildStarted), markersAfterLiveHours: liveMarkers, drainPasses: drains.length };
 
 await test('configuration: strict, retention OFF by default, requires packing, a hot window of at least 48 hours', async () => {
-  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, expiry: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 });
-  assert.deepEqual(RETAIN, { enabled: true, retention: true, expiry: false, hotHours: 48, maintenanceScopes: 32, maintenanceMiB: 64 });
+  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, expiry: false, history: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 });
+  assert.deepEqual(RETAIN, { enabled: true, retention: true, expiry: false, history: false, hotHours: 48, maintenanceScopes: 32, maintenanceMiB: 64 });
   assert.equal(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'true', COMPACT_PACKED_RETENTION_ENABLED: 'true', COMPACT_PACKED_HOT_HOURS: '72' }).hotHours, 72);
   const refused = (env, code) => assert.throws(() => packedShardsConfig(env), (error) => error.code === code, code);
   refused({ COMPACT_PACKED_RETENTION_ENABLED: 'true' }, 'packed_retention_requires_packing');

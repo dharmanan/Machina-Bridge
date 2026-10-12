@@ -118,7 +118,12 @@ await test('projection and valuation deletion paths are replaced by permanent in
   for(const [t,r]of Object.entries(oldRows))insert(f.db,t,r);
   const cp=rows(f.db,'compact_hours')[0];
   for(let i=1;i<=841;i++)f.store.commitHour(fakeHour(i,{projections:true}));
-  for(const t of Object.keys(oldRows)){assert.equal(count(f.db,t),0);assert.equal(normalized(archivedRows(f.db,t,BASE)),normalized([oldRows[t]]));}
+  // DEX USD volume and fee totals stay hot for 61 days: the previous 30D volume and fees read them (read-model.js).
+  const totals=['compact_dex_volume_hours','compact_dex_fee_hours'];
+  for(const t of Object.keys(oldRows).filter(t=>!totals.includes(t))){assert.equal(count(f.db,t),0);assert.equal(normalized(archivedRows(f.db,t,BASE)),normalized([oldRows[t]]));}
+  for(const t of totals)assert.deepEqual(normalized(rows(f.db,t)),normalized([oldRows[t]]),t);
+  for(let i=842;i<=1465;i++)f.store.commitHour(fakeHour(i,{projections:true})); // archived first, deleted by the next commit
+  for(const t of totals){assert.equal(count(f.db,t),0);assert.equal(normalized(archivedRows(f.db,t,BASE)),normalized([oldRows[t]]));}
   assert.equal(f.db.prepare('SELECT reason FROM compact_projection_hours WHERE hour_start=? AND projection=?').get(BASE,'uniswap_v3_pools').reason,'recorded_failure');
   assert.equal(f.db.prepare('SELECT reason FROM compact_valuation_hours WHERE hour_start=? AND valuation=?').get(BASE,'token_prices').reason,'recorded_failure');
   assert.deepEqual(f.db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(BASE),cp);f.db.close();

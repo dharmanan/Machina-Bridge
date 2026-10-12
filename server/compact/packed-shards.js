@@ -31,7 +31,11 @@
 // compact_packed_pool_swaps. Deletion writes an immutable compact_packed_expired marker first: delete triggers allow
 // removing a set or piece only for a marked scope, a payload only when no piece references it, and no set can be packed
 // again for a marked scope. Readers never turn an expired scope into empty data: they fail closed or report it.
-// Canonical hours, status rows, the registry and every non-packed table are never touched here, so they keep growing.
+// History expiry (history-expiry.js, OFF unless COMPACT_HISTORY_EXPIRY_ENABLED=true, which requires expiry) raises the
+// history floor (compact_packed_history_floor, only grows): below it nothing is packed again (code and insert guards),
+// pool hours whose valuations are frozen (outside the pool-hour retention) are pruned without waiting for them, and only
+// below it may the prune and expiry markers of an expired scope be deleted (delete guards), so markers stop growing too.
+// Canonical hours, status rows and the registry are never touched here.
 import { createHash } from 'node:crypto';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { POOL_HOUR_RETENTION_HOURS } from './projections.js';
@@ -67,6 +71,9 @@ export const PACKED_DATASETS = Object.freeze({
   compact_daily_address_stage: Object.freeze({ scope: 'day_start', codec: 'address-b20' }),
 });
 export const PACKED_HOUR_DATASETS = Object.freeze(Object.keys(PACKED_DATASETS).filter((name) => PACKED_DATASETS[name].scope === 'hour_start'));
+// SQL: the scope of a packed row (NEW or OLD) ends before the history floor, so its rows are gone for good.
+const belowFloor = (row) => `EXISTS (SELECT 1 FROM compact_packed_history_floor f WHERE f.name = 'details'
+  AND ${row}.scope_start + CASE WHEN ${row}.dataset = 'compact_daily_address_stage' THEN ${DAY - HOUR} ELSE 0 END < f.hour_start)`;
 
 export const PACKED_SHARDS_SQL = `
 CREATE TABLE IF NOT EXISTS compact_packed_payloads (
@@ -92,9 +99,20 @@ CREATE TABLE IF NOT EXISTS compact_packed_pool_creation_swaps (
   protocol TEXT NOT NULL, pool TEXT NOT NULL, hour_start INTEGER NOT NULL, swap_count INTEGER CHECK (swap_count IS NULL OR swap_count >= 0),
   PRIMARY KEY (protocol, pool)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS compact_packed_history_floor (
+  name TEXT PRIMARY KEY CHECK (name IN ('details', 'observations')), hour_start INTEGER NOT NULL CHECK (hour_start % 3600 = 0)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS compact_packed_history_floor_no_delete BEFORE DELETE ON compact_packed_history_floor
+BEGIN SELECT RAISE(ABORT,'immutable_history_floor'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_history_floor_only_grow BEFORE UPDATE ON compact_packed_history_floor
+WHEN NEW.name <> OLD.name OR NEW.hour_start < OLD.hour_start BEGIN SELECT RAISE(ABORT,'immutable_history_floor'); END;
 DROP TRIGGER IF EXISTS compact_packed_payload_no_delete;
 DROP TRIGGER IF EXISTS compact_packed_set_no_delete;
 DROP TRIGGER IF EXISTS compact_packed_piece_no_delete;
+DROP TRIGGER IF EXISTS compact_packed_set_no_replace;
+DROP TRIGGER IF EXISTS compact_packed_piece_no_replace;
+DROP TRIGGER IF EXISTS compact_packed_pruned_no_delete;
+DROP TRIGGER IF EXISTS compact_packed_expired_no_delete;
 CREATE TRIGGER IF NOT EXISTS compact_packed_payload_no_update BEFORE UPDATE ON compact_packed_payloads BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_payload_delete_guard BEFORE DELETE ON compact_packed_payloads
 WHEN EXISTS (SELECT 1 FROM compact_packed_pieces WHERE payload_sha256 = OLD.payload_sha256) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
@@ -104,17 +122,17 @@ CREATE TRIGGER IF NOT EXISTS compact_packed_set_no_update BEFORE UPDATE ON compa
 CREATE TRIGGER IF NOT EXISTS compact_packed_set_delete_guard BEFORE DELETE ON compact_packed_sets
 WHEN NOT EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_set_no_replace BEFORE INSERT ON compact_packed_sets
+CREATE TRIGGER IF NOT EXISTS compact_packed_set_insert_guard BEFORE INSERT ON compact_packed_sets
 WHEN EXISTS (SELECT 1 FROM compact_packed_sets WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
-  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start) OR ${belowFloor('NEW')}
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_update BEFORE UPDATE ON compact_packed_pieces BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_piece_delete_guard BEFORE DELETE ON compact_packed_pieces
 WHEN NOT EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_piece_no_replace BEFORE INSERT ON compact_packed_pieces
+CREATE TRIGGER IF NOT EXISTS compact_packed_piece_insert_guard BEFORE INSERT ON compact_packed_pieces
 WHEN EXISTS (SELECT 1 FROM compact_packed_pieces WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start AND part = NEW.part)
-  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
+  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start) OR ${belowFloor('NEW')}
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TABLE IF NOT EXISTS compact_packed_pruned (
   dataset TEXT NOT NULL, scope_start INTEGER NOT NULL, row_count INTEGER NOT NULL CHECK (row_count >= 0), rows_sha256 TEXT NOT NULL,
@@ -125,7 +143,11 @@ CREATE TABLE IF NOT EXISTS compact_packed_pool_swaps (
   PRIMARY KEY (protocol, pool)
 ) STRICT, WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_update BEFORE UPDATE ON compact_packed_pruned BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_delete BEFORE DELETE ON compact_packed_pruned BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_delete_guard BEFORE DELETE ON compact_packed_pruned
+WHEN NOT ${belowFloor('OLD')}
+  OR EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+  OR EXISTS (SELECT 1 FROM compact_packed_sets WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_pruned_no_replace BEFORE INSERT ON compact_packed_pruned
 WHEN EXISTS (SELECT 1 FROM compact_packed_pruned WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start) BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_no_delete BEFORE DELETE ON compact_packed_pool_swaps BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
@@ -133,7 +155,11 @@ CREATE TRIGGER IF NOT EXISTS compact_packed_pool_swaps_only_grow BEFORE UPDATE O
 WHEN NEW.protocol <> OLD.protocol OR NEW.pool <> OLD.pool OR NEW.swap_count < OLD.swap_count OR NEW.row_count <= OLD.row_count
 BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_update BEFORE UPDATE ON compact_packed_expired BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
-CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_delete BEFORE DELETE ON compact_packed_expired BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
+CREATE TRIGGER IF NOT EXISTS compact_packed_expired_delete_guard BEFORE DELETE ON compact_packed_expired
+WHEN NOT ${belowFloor('OLD')}
+  OR EXISTS (SELECT 1 FROM compact_packed_sets WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+  OR EXISTS (SELECT 1 FROM compact_packed_pieces WHERE dataset = OLD.dataset AND scope_start = OLD.scope_start)
+BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;
 CREATE TRIGGER IF NOT EXISTS compact_packed_expired_no_replace BEFORE INSERT ON compact_packed_expired
 WHEN EXISTS (SELECT 1 FROM compact_packed_expired WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
   OR NOT EXISTS (SELECT 1 FROM compact_packed_pruned WHERE dataset = NEW.dataset AND scope_start = NEW.scope_start)
@@ -184,9 +210,12 @@ export function packedShardsConfig(env = process.env) {
   const enabled = flag('COMPACT_PACKED_SHARDS_ENABLED');
   const retention = flag('COMPACT_PACKED_RETENTION_ENABLED');
   const expiry = flag('COMPACT_PACKED_EXPIRY_ENABLED');
+  const history = flag('COMPACT_HISTORY_EXPIRY_ENABLED');
   if (retention && !enabled) fail('packed_retention_requires_packing');
   if (expiry && !retention) fail('packed_expiry_requires_retention');
-  return Object.freeze({ enabled, retention, expiry, hotHours: number('COMPACT_PACKED_HOT_HOURS', PACKED_MIN_HOT_HOURS, PACKED_MIN_HOT_HOURS, 400 * 24),
+  if (history && !expiry) fail('history_expiry_requires_packed_expiry');
+  return Object.freeze({ enabled, retention, expiry, history,
+    hotHours: number('COMPACT_PACKED_HOT_HOURS', PACKED_MIN_HOT_HOURS, PACKED_MIN_HOT_HOURS, 400 * 24),
     maintenanceScopes: number('COMPACT_PACKED_MAINTENANCE_SCOPES', 16, 1, 256),
     // Write-ahead log a pass may plan for its deletions; the first deletion of a pass is never refused by this alone.
     maintenanceMiB: number('COMPACT_PACKED_MAINTENANCE_MAX_MIB', 64, 1, 1024) });
@@ -241,7 +270,16 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   const hotHours = Number.isSafeInteger(config.hotHours) ? Math.max(config.hotHours, PACKED_MIN_HOT_HOURS) : PACKED_MIN_HOT_HOURS;
   const maintenanceScopes = Number.isSafeInteger(config.maintenanceScopes) ? config.maintenanceScopes : 16;
   const expiry = retention && config.expiry === true;
+  const history = expiry && config.history === true;
   const maintenanceBytes = (Number.isSafeInteger(config.maintenanceMiB) ? config.maintenanceMiB : 64) * MiB;
+  // The persisted history floor (history-expiry.js): every hour before it lost its detail rows. Null when never raised.
+  const historyFloor = () => (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_history_floor'").get()
+    ? db.prepare("SELECT hour_start FROM compact_packed_history_floor WHERE name = 'details'").get()?.hour_start ?? null : null);
+  // The oldest scope start packing may still touch: a scope whose last hour is before the floor is never packed again.
+  const lowestScope = (definition) => {
+    const floor = historyFloor();
+    return floor === null ? 0 : floor - (definition.scope === 'day_start' ? DAY - HOUR : 0);
+  };
   // Sets written by the current writer transaction (reset by begin()): such a set never authorizes removing hot rows.
   const created = new Set();
   const keyOf = (dataset, scope) => `${dataset}:${scope}`;
@@ -350,6 +388,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     if (!Number.isSafeInteger(scope) || scope % (definition.scope === 'day_start' ? DAY : HOUR) !== 0) fail('packed_scope_invalid');
     // A pruned scope's packed set is its only copy (immutable, verified on every read): a replayed hour leaves it as it is.
     if (isPruned(dataset, scope)) return { outcome: 'unchanged' };
+    if (scope < lowestScope(definition)) return { outcome: 'not_ready:history_expired' };
     const hours = canonicalHours(definition, scope);
     // Counts first: a set that is not final is never read row by row (a day's stage can hold a whole day of identities).
     const rowCount = db.prepare(`SELECT COUNT(*) AS count FROM ${dataset} WHERE ${definition.scope} = ?`).get(int(scope)).count;
@@ -464,6 +503,10 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   const retentionCutoff = (newest) => newest - hotHours * HOUR;
   const valuationsFinal = (hour) => db.prepare(`SELECT COUNT(*) AS count FROM compact_valuation_hours WHERE hour_start = ? AND status = 'available'
     AND valuation IN (${VALUATIONS.map(() => '?').join(', ')})`).get(int(hour), ...VALUATIONS).count === VALUATIONS.length;
+  // With history expiry, the newest pool hour whose valuations are frozen: outside the pool-hour retention no pass derives
+  // them again (store.js, valuation and projection backfill), and history expiry deletes their status rows later, so such a
+  // pool hour must not wait for them. Without history expiry nothing is frozen (-1): the step 2 rule holds unchanged.
+  const frozenCutoff = (newest) => (history ? newest - POOL_HOUR_RETENTION_HOURS * HOUR : -1);
 
   // A deletion writes the pages it touches to the write-ahead log before any space is freed. It is admitted only when the
   // store's storage check (free space after a reserve, database and WAL budget) accepts the pass's planned bytes; after the
@@ -487,7 +530,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     if (isPruned(dataset, scope)) return { outcome: 'unchanged' };
     const set = db.prepare('SELECT row_count, rows_sha256, raw_bytes FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
     if (!set) return { outcome: 'kept:not_packed' };
-    if (definition.projections && !valuationsFinal(scope)) return { outcome: 'kept:valuations_not_final' };
+    if (definition.projections && scope > frozenCutoff(newest) && !valuationsFinal(scope)) return { outcome: 'kept:valuations_not_final' };
     // The hot rows' pages (about twice their raw bytes) and their index pages.
     if (!admit(pass, 2 * set.raw_bytes + 64 * 1024)) return { outcome: 'kept:pass_budget' };
     // 1. The packed set verifies completely now, in a transaction after the one that wrote it (streamed, bounded).
@@ -554,7 +597,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     }
     // The set's payload pages and its index pages.
     if (!admit(pass, set.stored_bytes + 64 * 1024)) return { outcome: 'kept:pass_budget' };
-    if (dataset === 'compact_pool_hours') keepCreationSwaps(scope);
+    if (dataset === 'compact_pool_hours') keepCreationSwaps(scope, (onRow) => streamSet('compact_pool_hours', scope, onRow));
     db.prepare('INSERT INTO compact_packed_expired (dataset, scope_start, row_count, rows_sha256) VALUES (?, ?, ?, ?)')
       .run(dataset, int(scope), int(set.row_count), set.rows_sha256);
     const payloads = db.prepare('SELECT DISTINCT payload_sha256 FROM compact_packed_pieces WHERE dataset = ? AND scope_start = ?')
@@ -573,15 +616,16 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
 
   // Before an hour's pool rows are gone for good: the creation-hour swap count of every registered pool created in that
   // hour (NULL when the pool had no row in it), exactly what the ecosystem reads as early activity (intelligence-store.js).
-  // Reading the set verifies it; a pool registered only after this hour expired is never given a count.
-  function keepCreationSwaps(hour) {
+  // read(onRow) streams the hour's rows (the verified set, or the final hot rows a fold removes) and returns a falsy value
+  // when they cannot be read; a pool registered only after this hour expired is never given a count.
+  function keepCreationSwaps(hour, read) {
     const range = db.prepare('SELECT first_block, last_block FROM compact_hours WHERE hour_start = ?').get(int(hour));
     if (!range) fail('packed_expiry_hour_missing');
     const created = new Map(db.prepare(`SELECT kind, address FROM compact_registry WHERE kind IN ('uniswap_v3_pool', 'uniswap_v4_pool')
       AND created_block BETWEEN ? AND ?`).all(int(range.first_block), int(range.last_block))
       .map((row) => [`${row.kind === 'uniswap_v3_pool' ? 'uniswap_v3' : 'uniswap_v4'}:${row.address}`, null]));
     if (!created.size) return;
-    const verified = streamSet('compact_pool_hours', hour, (row) => {
+    const verified = read((row) => {
       const key = `${row.protocol}:${row.pool}`;
       if (created.has(key)) created.set(key, row.swap_count);
     });
@@ -591,6 +635,35 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
       const [protocol, pool] = key.split(':');
       insert.run(protocol, pool, int(hour), swaps === null ? null : int(swaps));
     }
+  }
+
+  // History expiry (history-expiry.js) of a pool hour before the history floor that was never packed (stored before
+  // packing, or reached the floor first): it keeps exactly what pruning and expiry keep of a pool hour, its swaps in the
+  // all-history totals and the creation-hour counts of the pools created in it, and then deletes its hot rows. Only a final
+  // hour (both pool projections available, every row present) is folded; anything else throws and its rows stay. Runs in
+  // the caller's savepoint.
+  function foldPoolHour(hour) {
+    if (!history) fail('history_expiry_disabled');
+    if (db.isTransaction !== true) fail('packed_transaction_required');
+    const floor = historyFloor();
+    if (floor === null || hour >= floor) fail('history_fold_not_expired');
+    const packedSet = db.prepare("SELECT 1 FROM compact_packed_sets WHERE dataset = 'compact_pool_hours' AND scope_start = ?").get(int(hour));
+    if (packedSet || isPruned('compact_pool_hours', hour)) fail('history_fold_packed');
+    const final = db.prepare(`SELECT COUNT(*) AS available, SUM(row_count) AS rows FROM compact_projection_hours WHERE hour_start = ?
+      AND projection IN (?, ?) AND status = 'available'`).get(int(hour), ...PACKED_DATASETS.compact_pool_hours.projections);
+    if (final.available !== 2) fail('history_fold_not_final');
+    const rows = () => db.prepare('SELECT protocol, pool, swap_count FROM compact_pool_hours WHERE hour_start = ? ORDER BY protocol, pool').iterate(int(hour));
+    const addSwaps = db.prepare(`INSERT INTO compact_packed_pool_swaps (protocol, pool, swap_count, row_count) VALUES (?, ?, ?, 1)
+      ON CONFLICT (protocol, pool) DO UPDATE SET swap_count = swap_count + excluded.swap_count, row_count = row_count + 1`);
+    let count = 0;
+    for (const row of rows()) {
+      addSwaps.run(row.protocol, row.pool, int(row.swap_count));
+      count++;
+    }
+    if (count !== final.rows) fail('history_fold_not_final');
+    keepCreationSwaps(hour, (onRow) => { for (const row of rows()) onRow(row); return true; });
+    if (Number(db.prepare('DELETE FROM compact_pool_hours WHERE hour_start = ?').run(int(hour)).changes) !== count) fail('history_fold_mismatch');
+    return { outcome: 'folded', rows: count };
   }
 
   // Oldest pruned scopes whose packed set nothing can reach any more and that are not expired yet.
@@ -607,12 +680,12 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   function pruneCandidates(dataset, newest, limit) {
     const definition = definitionOf(dataset);
     const cutoff = retentionCutoff(newest) - (definition.scope === 'day_start' ? DAY - HOUR : 0);
-    const valuations = definition.projections ? `AND (SELECT COUNT(*) FROM compact_valuation_hours v WHERE v.hour_start = s.scope_start
-      AND v.status = 'available' AND v.valuation IN (${VALUATIONS.map(() => '?').join(', ')})) = ${VALUATIONS.length}` : '';
+    const valuations = definition.projections ? `AND (s.scope_start <= ? OR (SELECT COUNT(*) FROM compact_valuation_hours v WHERE v.hour_start = s.scope_start
+      AND v.status = 'available' AND v.valuation IN (${VALUATIONS.map(() => '?').join(', ')})) = ${VALUATIONS.length})` : '';
     return db.prepare(`SELECT s.scope_start FROM compact_packed_sets s WHERE s.dataset = ? AND s.scope_start <= ?
       AND NOT EXISTS (SELECT 1 FROM compact_packed_pruned m WHERE m.dataset = s.dataset AND m.scope_start = s.scope_start)
       AND (SELECT COUNT(*) FROM ${dataset} t WHERE t.${definition.scope} = s.scope_start) = s.row_count ${valuations}
-      ORDER BY s.scope_start LIMIT ?`).all(dataset, int(cutoff), ...(definition.projections ? VALUATIONS : []), int(limit))
+      ORDER BY s.scope_start LIMIT ?`).all(dataset, int(cutoff), ...(definition.projections ? [int(frozenCutoff(newest)), ...VALUATIONS] : []), int(limit))
       .map((row) => row.scope_start).filter((scope) => !created.has(keyOf(dataset, scope)));
   }
 
@@ -623,26 +696,28 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     // Not packed and never pruned: an expired scope has neither hot rows nor a set and must not come back as a candidate.
     const unpacked = (scope) => `NOT EXISTS (SELECT 1 FROM compact_packed_sets s WHERE s.dataset = '${dataset}' AND s.scope_start = ${scope})
       AND NOT EXISTS (SELECT 1 FROM compact_packed_pruned m WHERE m.dataset = '${dataset}' AND m.scope_start = ${scope})`;
+    // Scopes before the history floor are skipped: their rows are gone, and an empty scope must not be packed again.
+    const lowest = int(lowestScope(definition));
     if (definition.scope === 'day_start') {
-      return db.prepare(`SELECT d.day_start AS scope FROM compact_daily_active_addresses d WHERE d.status = 'available' AND d.day_start <= ?
+      return db.prepare(`SELECT d.day_start AS scope FROM compact_daily_active_addresses d WHERE d.status = 'available' AND d.day_start BETWEEN ? AND ?
         AND ${unpacked('d.day_start')}
         AND (SELECT COUNT(*) FROM compact_hours h WHERE h.hour_start >= d.day_start AND h.hour_start < d.day_start + ${DAY}) = 24
         AND (SELECT COUNT(*) FROM compact_daily_address_hours c WHERE c.day_start = d.day_start) = 24
         AND (SELECT COUNT(*) FROM compact_daily_address_stage a WHERE a.day_start = d.day_start) = d.active_addresses
-        ORDER BY d.day_start LIMIT ?`).all(int(newest), int(limit)).map((row) => row.scope);
+        ORDER BY d.day_start LIMIT ?`).all(lowest, int(newest), int(limit)).map((row) => row.scope);
     }
     if (definition.codec === 'address-b20') {
-      return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start <= ? AND ${unpacked('h.hour_start')}
+      return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ? AND ${unpacked('h.hour_start')}
         AND (SELECT COUNT(*) FROM ${dataset} a WHERE a.hour_start = h.hour_start) = h.unique_active_addresses
-        ORDER BY h.hour_start LIMIT ?`).all(int(newest), int(limit)).map((row) => row.scope);
+        ORDER BY h.hour_start LIMIT ?`).all(lowest, int(newest), int(limit)).map((row) => row.scope);
     }
     const names = definition.projections.map(() => '?').join(', ');
-    return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start <= ? AND ${unpacked('h.hour_start')}
+    return db.prepare(`SELECT h.hour_start AS scope FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ? AND ${unpacked('h.hour_start')}
       AND (SELECT COUNT(*) FROM compact_projection_hours p WHERE p.hour_start = h.hour_start AND p.projection IN (${names})
         AND p.status = 'available') = ${definition.projections.length}
       AND (SELECT COUNT(*) FROM ${dataset} t WHERE t.hour_start = h.hour_start) = (SELECT SUM(p.row_count) FROM compact_projection_hours p
         WHERE p.hour_start = h.hour_start AND p.projection IN (${names}))
-      ORDER BY h.hour_start LIMIT ?`).all(int(newest), ...definition.projections, ...definition.projections, int(limit)).map((row) => row.scope);
+      ORDER BY h.hour_start LIMIT ?`).all(lowest, int(newest), ...definition.projections, ...definition.projections, int(limit)).map((row) => row.scope);
   }
 
   // One bounded retention pass inside the caller's writer transaction: with expiry ON, first delete the packed sets of
@@ -709,6 +784,8 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     isPruned,
     isExpired,
     prunedScopes,
+    historyFloor,
+    foldPoolHour,
     maintain,
     // Writer side (inside the caller's transaction): the hour's datasets, and the hour's UTC day once it is final.
     packHour(hourStart) {

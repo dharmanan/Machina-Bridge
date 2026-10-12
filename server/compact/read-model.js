@@ -231,12 +231,14 @@ const SQL = Object.freeze({
     HAVING COUNT(*) = 24
     ORDER BY (hour_start - (hour_start % 86400)) DESC
     LIMIT 1`,
+  // ?1: the history floor (0 without one); a day ending before it is gone, not missing (history-expiry.js).
   dauReplayCandidate: `SELECT h.hour_start
     FROM compact_hours h
     LEFT JOIN compact_daily_address_hours c ON c.hour_start = h.hour_start
     LEFT JOIN compact_daily_active_addresses d
       ON d.day_start = h.hour_start - (h.hour_start % 86400)
     WHERE c.hour_start IS NULL
+      AND h.hour_start - (h.hour_start % 86400) + 82800 >= ?1
       AND (
         d.day_start IS NULL
         OR (d.status = 'unavailable' AND d.reason = 'identity_not_captured')
@@ -249,6 +251,8 @@ const SQL = Object.freeze({
       ) = 24
     ORDER BY h.hour_start - (h.hour_start % 86400) DESC, h.hour_start ASC
     LIMIT 1`,
+  historyFloorTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_history_floor'",
+  historyFloor: "SELECT hour_start FROM compact_packed_history_floor WHERE name = 'details'",
   gatewayRepairEvidence: 'SELECT value FROM compact_meta WHERE key BETWEEN ? AND ? ORDER BY key',
   familyRows: `SELECT h.hour_start, f.status, f.reason, f.metrics_json FROM compact_hours h
     LEFT JOIN compact_family_hours f ON f.hour_start = h.hour_start AND f.family = ?
@@ -1169,7 +1173,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     // For the scheduler: the committed checkpoint, or null for a missing file or an empty store. Never a guess.
     dailyActiveReplayCandidate() {
       if (statement('dailyActiveAddressTable').get()) {
-        return statement('dauReplayCandidate').get()?.hour_start ?? null;
+        const floor = statement('historyFloorTable').get() ? statement('historyFloor').get()?.hour_start ?? 0 : 0;
+        return statement('dauReplayCandidate').get(int(floor))?.hour_start ?? null;
       }
       return statement('dauReplayBootstrapCandidate').get()?.hour_start ?? null;
     },

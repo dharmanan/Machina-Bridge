@@ -172,7 +172,7 @@ const onStore = liveStore(onDb, ON);
 const onCommit = onStore.commitHour(LIVE);
 
 await test('configuration is strict and OFF by default', async () => {
-  const defaults = { retention: false, expiry: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 };
+  const defaults = { retention: false, expiry: false, history: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 };
   assert.deepEqual(packedShardsConfig({}), { enabled: false, ...defaults });
   assert.deepEqual(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'false' }), { enabled: false, ...defaults });
   assert.deepEqual(packedShardsConfig({ COMPACT_PACKED_SHARDS_ENABLED: 'true' }), { enabled: true, ...defaults });
@@ -189,7 +189,7 @@ await test('OFF: no packed table is created, nothing is packed and the hour comm
 });
 
 await test('ON: every final dataset of the live hour is packed and reads back as the exact typed hot rows', async () => {
-  assert.equal(hasPackedTables(onDb), 7, 'sets, pieces, payloads and the (still empty) retention and expiry tables');
+  assert.equal(hasPackedTables(onDb), 8, 'sets, pieces, payloads and the (still empty) retention, expiry and history floor tables');
   for (const dataset of PACKED_HOUR_DATASETS) {
     const status = onStore.packedShards.status(dataset, HOUR);
     const rows = hot(onDb, dataset, HOUR);

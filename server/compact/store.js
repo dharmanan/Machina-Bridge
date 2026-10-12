@@ -22,6 +22,9 @@
 // Packed shards (packed-shards.js, OFF unless COMPACT_PACKED_SHARDS_ENABLED=true) are verified lossless copies of an hour's
 // final pool, price path, swap fee and identity rows (and of a completed day's identities), written in the same transaction
 // as those rows inside a savepoint: a packing failure is reported and never blocks or changes the hour. Hot rows stay.
+// History expiry (history-expiry.js, OFF unless COMPACT_HISTORY_EXPIRY_ENABLED=true, never with the evidence archive)
+// deletes detail rows before the 61-day history floor after each live hour; accessors then answer history_expired for
+// those hours instead of empty rows, and the DAU replay never selects a day before the floor.
 import { createHash } from 'node:crypto';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
 import {
@@ -40,7 +43,8 @@ import { sumWindow } from './windows.js';
 import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
 import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
 import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storagePreflight } from './evidence-archive.js';
-import { PACKED_JOURNAL_LIMIT_BYTES, PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
+import { PACKED_DATASETS, PACKED_JOURNAL_LIMIT_BYTES, PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
+import { createHistoryExpiry, historyFloorOf } from './history-expiry.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -375,6 +379,8 @@ const unavailableValuation = (reason) => ({ status: 'unavailable', reason: VALUA
 export function createCompactStore(db, { archive: archiveOptions, packedShards: packedOptions } = {}) {
   const archival={...archiveOptions,config:archiveOptions?.config??archiveConfig()};
   const packing = { config: packedOptions?.config ?? packedShardsConfig(), log: packedOptions?.log ?? console.warn, beforePack: packedOptions?.beforePack ?? null };
+  // The archive keeps every accepted record losslessly; history expiry deletes them for good. Refused before any write.
+  if (packing.config.history === true && archival.config.enabled) throw new StoreError('history_expiry_requires_archive_off');
   const persistent=Boolean(db.prepare('PRAGMA database_list').all().find(r=>r.name==='main')?.file);
   const checkCapacity=()=>{
     if(!persistent)return; // In-memory stores are disposable/local; production runners reject them.
@@ -441,8 +447,18 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   const int = (value) => BigInt(value); // bind as SQLite INTEGER, never REAL
   const archive = createEvidenceArchive(db, archival);
   // Same storage rule as every store writer: in-memory stores without an injected capacity are disposable and unchecked.
-  const packed = createPackedShards(db, { config: packing.config, log: packing.log, beforePack: packing.beforePack,
-    preflight: (plannedBytes) => (persistent || archival.capacity ? archive.preflight(plannedBytes) : { ok: true }) });
+  const preflight = (plannedBytes) => (persistent || archival.capacity ? archive.preflight(plannedBytes) : { ok: true });
+  const packed = createPackedShards(db, { config: packing.config, log: packing.log, beforePack: packing.beforePack, preflight });
+  const history = createHistoryExpiry(db, { config: packing.config, packed, preflight, log: packing.log });
+  // True for an hour before the history floor: its detail rows are deleted (or about to be), never served as empty.
+  const expiredHour = (hourStart) => {
+    const floor = packed.historyFloor();
+    return floor !== null && Number(hourStart) < floor;
+  };
+  const unexpired = (hourStart, read) => {
+    if (expiredHour(hourStart)) throw new StoreError('history_expired');
+    return read();
+  };
   const intelligence = createIntelligenceRepository(db, { archive });
   const dailyActiveAddresses = createDailyActiveAddressesStore(db, { archive });
   const sql = {
@@ -472,6 +488,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     setCoverage: db.prepare(`INSERT INTO compact_registry_coverage (kind, from_block, through_block, through_hash) VALUES (?, ?, ?, ?)
       ON CONFLICT (kind) DO UPDATE SET through_block = excluded.through_block, through_hash = excluded.through_hash`),
     hourRange: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash FROM compact_hours WHERE hour_start = ?'),
+    // Only days whose last hour is at or after the history floor (?1, 0 without one): a day before it is gone, not missing.
     dauReplayCandidate: db.prepare(`
       SELECT h.hour_start
       FROM compact_hours h
@@ -479,6 +496,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       LEFT JOIN compact_daily_active_addresses d
         ON d.day_start = h.hour_start - (h.hour_start % 86400)
       WHERE c.hour_start IS NULL
+        AND h.hour_start - (h.hour_start % 86400) + 82800 >= ?1
         AND (
           d.day_start IS NULL
           OR (d.status = 'unavailable' AND d.reason = 'identity_not_captured')
@@ -734,15 +752,17 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     for (const kind of ACTIVITY_KINDS) archive.prune('compact_dex_activity', `kind = ? AND (block_number,log_index) NOT IN
       (SELECT block_number,log_index FROM compact_dex_activity WHERE kind=? ORDER BY block_number DESC,log_index DESC LIMIT ?)`,
     [kind,kind,int(ACTIVITY_ROWS_PER_KIND)]);
-    pruneHours(poolHourCutoff(sql.newestHour.get().hour_start));
+    pruneHours(sql.newestHour.get().hour_start);
     return report;
   }
 
-  // Pool-hours, price paths, projection status rows and valuations share one retention (projections.js).
-  function pruneHours(cutoff) {
+  // Pool-hours, price paths, projection status rows and valuations share one retention (projections.js). DEX USD volume and
+  // fee totals are kept for the 61-day history span instead: the previous 30D volume and fees read them (read-model.js).
+  function pruneHours(newest) {
     // Small coverage/status rows remain indexed permanently; missing hot payload is not missing verified coverage.
-    for (const table of ['compact_pool_hours','compact_pool_price_hours','compact_token_price_hours','compact_dex_volume_hours',
-      'compact_pool_fee_hours','compact_dex_fee_hours','compact_pool_tvl_hours']) archive.prune(table, 'hour_start <= ?', [int(cutoff)]);
+    for (const table of ['compact_pool_hours','compact_pool_price_hours','compact_token_price_hours',
+      'compact_pool_fee_hours','compact_pool_tvl_hours']) archive.prune(table, 'hour_start <= ?', [int(poolHourCutoff(newest))]);
+    for (const table of ['compact_dex_volume_hours', 'compact_dex_fee_hours']) archive.prune(table, 'hour_start < ?', [int(historyFloorOf(newest))]);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -766,13 +786,24 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   // packed rows in the same primary-key order. keep() filters packed rows the way the hot statement filters (protocol).
   // A scope whose packed set expiry deleted has no rows anywhere: that is an error, never an empty hour.
   function retainedRows(dataset, hour, hot, keep = () => true) {
-    if (!packed.isPruned(dataset, hour)) return hot();
+    if (!packed.isPruned(dataset, hour)) {
+      // Before the history floor an hour holds only the rows history expiry kept (an unfinished or fresh hour): fewer rows
+      // than its available projections recorded are gone, never an empty or partial hour.
+      if (expiredHour(hour) && !hotComplete(dataset, hour)) throw new StoreError('history_expired');
+      return hot();
+    }
     const rows = [];
     if (!packed.forEachRow(dataset, Number(hour), (row) => { if (keep(row)) rows.push(row); })) {
       throw new StoreError(packed.isExpired(dataset, hour) ? 'packed_scope_expired' : 'packed_set_missing');
     }
     return rows;
   }
+  // The hour's hot rows are every row its available projections recorded (status rows are never expired).
+  const hotComplete = (dataset, hour) => {
+    const names = PACKED_DATASETS[dataset].projections?.map((name) => `'${name}'`).join(', ');
+    return Boolean(names) && db.prepare(`SELECT (SELECT COUNT(*) FROM ${dataset} WHERE hour_start = ?1) = (SELECT IFNULL(SUM(row_count), 0)
+      FROM compact_projection_hours WHERE hour_start = ?1 AND status = 'available' AND projection IN (${names})) AS complete`).get(int(hour)).complete === 1;
+  };
   const pricePathRowsOf = (hour, protocol) => retainedRows('compact_pool_price_hours', hour, () => sql.pricePaths.all(hour, protocol),
     (row) => row.protocol === protocol).map((row) => ({ pool: row.pool, swapCount: row.swap_count,
     firstSwapBlock: row.first_swap_block, lastSwapBlock: row.last_swap_block, pricedBlocks: row.priced_blocks, closeSqrtPriceX96: row.close_sqrt_price_x96,
@@ -1033,6 +1064,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       packed.packHour(range.hourStart);
       // Retention (OFF by default): one bounded pass per live hour, every scope in its own savepoint, never blocking.
       packed.maintain(sql.newestHour.get().hour_start);
+      // History expiry (OFF by default): the same, for detail rows before the 61-day floor of the checkpoint hour.
+      history.maintain(checkpoint().hourStart);
       return { outcome, checkpoint: checkpoint(), projections };
     }, beforeCommit);
   }
@@ -1153,6 +1186,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     const fromHour = endHourStart - (hours - 1) * HOUR;
     const rows = sql.windowFamily.all(family, int(fromHour), int(endHourStart));
     const base = { family, fromHour, toHour: endHourStart, hours };
+    if (expiredHour(fromHour)) return { ...base, status: 'unavailable', reason: 'history_expired', metrics: null };
     if (rows.length !== hours) return { ...base, status: 'unavailable', reason: 'hour_missing', metrics: null };
     const gap = rows.find((row) => row.status !== 'available');
     if (gap) return { ...base, status: 'unavailable', reason: gap.status ? 'family_unavailable' : 'family_not_processed', hourStart: gap.hour_start, metrics: null };
@@ -1177,11 +1211,21 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
         return packed.config.retention === true && newest !== null ? transaction(() => packed.maintain(newest, options)) : null;
       },
     }),
+    // History expiry: the persisted floor (null before the first pass) and, in its own writer transaction, one bounded pass
+    // (null when OFF or before the first checkpoint).
+    history: Object.freeze({
+      enabled: history.enabled,
+      floor: history.floor,
+      maintain: (options) => {
+        const current = checkpoint();
+        return history.enabled && current ? transaction(() => history.maintain(current.hourStart, options)) : null;
+      },
+    }),
     persistedActiveAddresses(hourStart) {
       const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
       if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
       // Expired identities exist nowhere any more: unknown (null), so a replay re-reads the hour instead.
-      if(packed.isExpired('compact_hour_addresses',hourStart))return null;
+      if(packed.isExpired('compact_hour_addresses',hourStart)||expiredHour(hourStart))return null;
       const hot=packed.isPruned('compact_hour_addresses',hourStart)?retainedRows('compact_hour_addresses',hourStart,()=>[])
         :db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
       let evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
@@ -1237,7 +1281,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       return row ? { hourStart: row.hour_start, firstBlock: row.first_block, parentHash: row.parent_hash } : null;
     },
     dailyActiveReplayCandidate() {
-      const row = sql.dauReplayCandidate.get();
+      const row = sql.dauReplayCandidate.get(int(packed.historyFloor() ?? 0));
       return row ? row.hour_start : null;
     },
     storedHour(hourStart) {
@@ -1262,8 +1306,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     uniqueActiveAddresses,
     familyWindow,
     hourCount: () => db.prepare('SELECT COUNT(*) AS count FROM compact_hours').get().count,
-    familyRows: (hourStart) => sql.families.all(int(hourStart)).map((row) => ({ family: row.family, status: row.status, reason: row.reason,
-      metrics: row.metrics_json === null ? null : JSON.parse(row.metrics_json) })),
+    familyRows: (hourStart) => unexpired(hourStart, () => sql.families.all(int(hourStart))).map((row) => ({ family: row.family, status: row.status,
+      reason: row.reason, metrics: row.metrics_json === null ? null : JSON.parse(row.metrics_json) })),
     v3Registry() {
       const current = coverage();
       return current && { ...current, pools: new Set(sql.pools.all(V3_POOL_KIND).map((row) => row.address)) };
@@ -1302,19 +1346,20 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     derivePendingValuations,
     rederiveValuations,
     swapFees: (hourStart) => swapFeeRowsOf(int(hourStart)),
-    dexFees: (hourStart) => sql.dexFees.all(int(hourStart)).map((row) => ({ protocol: row.protocol, feeUsdMicros: row.fee_usd_micros,
-      valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
-    valuationStatus: (hourStart) => sql.valuations.all(int(hourStart)).map((row) => ({ valuation: row.valuation, status: row.status, reason: row.reason,
-      rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
-    tokenPrices: (hourStart) => sql.tokenPrices.all(int(hourStart)).map((row) => ({ token: row.token, priceUsdE18: row.price_usd_e18,
-      sourceProtocol: row.source_protocol, sourcePool: row.source_pool, depthUsdMicros: row.depth_usd_micros, sourceCount: row.source_count })),
-    dexVolume: (hourStart) => sql.dexVolume.all(int(hourStart)).map((row) => ({ protocol: row.protocol, volumeUsdMicros: row.volume_usd_micros,
-      valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
+    dexFees: (hourStart) => unexpired(hourStart, () => sql.dexFees.all(int(hourStart))).map((row) => ({ protocol: row.protocol,
+      feeUsdMicros: row.fee_usd_micros, valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
+    valuationStatus: (hourStart) => unexpired(hourStart, () => sql.valuations.all(int(hourStart))).map((row) => ({ valuation: row.valuation,
+      status: row.status, reason: row.reason, rowCount: row.row_count, rowsSha256: row.rows_sha256 })),
+    tokenPrices: (hourStart) => unexpired(hourStart, () => sql.tokenPrices.all(int(hourStart))).map((row) => ({ token: row.token,
+      priceUsdE18: row.price_usd_e18, sourceProtocol: row.source_protocol, sourcePool: row.source_pool, depthUsdMicros: row.depth_usd_micros,
+      sourceCount: row.source_count })),
+    dexVolume: (hourStart) => unexpired(hourStart, () => sql.dexVolume.all(int(hourStart))).map((row) => ({ protocol: row.protocol,
+      volumeUsdMicros: row.volume_usd_micros, valuedSwaps: row.valued_swaps, unvaluedSwaps: row.unvalued_swaps })),
     // Pool liquidity snapshots.
     topPoolsOf,
     recordPoolTvl,
-    poolTvl: (hourStart, protocol) => sql.poolTvl.all(int(hourStart), protocol).map((row) => ({ pool: row.pool, status: row.status, reason: row.reason,
-      amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, blockNumber: row.block_number })),
+    poolTvl: (hourStart, protocol) => unexpired(hourStart, () => sql.poolTvl.all(int(hourStart), protocol)).map((row) => ({ pool: row.pool,
+      status: row.status, reason: row.reason, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, blockNumber: row.block_number })),
     // Token metadata cache.
     tokensNeedingMetadata,
     recordTokenMetadata,

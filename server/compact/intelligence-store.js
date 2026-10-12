@@ -433,12 +433,15 @@ function dexReadContext(db, tokens, endBlock, registry) {
   // Hours whose pool rows retention moved into packed sets (marked pruned) still count as stored hours: their rows are
   // read from the verified packed sets (streamed), never assumed absent. Without such hours this is the original query.
   const pruned = prunedPoolHours(db);
+  // History expiry (history-expiry.js) deletes the markers of expired pool hours before its floor and folds never-packed
+  // pool hours there into the same totals, so with a floor those hours are covered by the totals and kept counts only.
+  const floor = createPackedShards(db, { config: { enabled: false } }).historyFloor();
   const skipPruned = pruned.length ? " AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset='compact_pool_hours')" : '';
   for (const row of db.prepare(`SELECT h.protocol,h.pool,SUM(h.swap_count) AS swaps,COUNT(*) AS rows FROM compact_pool_hours h
     WHERE h.protocol IN ('uniswap_v3','uniswap_v4') AND h.pool IN (${addresses.map(() => '?').join(',')})
     AND h.hour_start IN (SELECT hour_start FROM compact_hours WHERE last_block<=?)${skipPruned} GROUP BY h.protocol,h.pool`)
     .all(...addresses, BigInt(endBlock))) context.activity.set(poolKey(row.protocol, row.pool), row);
-  if (pruned.length) addPrunedPoolHours(db, context, wanted, pruned, endBlock);
+  if (pruned.length || floor !== null) addPrunedPoolHours(db, context, wanted, pruned, endBlock, floor);
   return context;
 }
 
@@ -453,17 +456,20 @@ function prunedPoolHours(db) {
 // endBlock streamed directly, whichever needs fewer hours decoded. Any packed read that does not verify throws. A creation
 // hour whose set expiry deleted gives the count kept for the pool when it expired (compact_packed_pool_creation_swaps),
 // or, for a pool registered later, no count (early activity unavailable); an expired hour the share would have to
-// stream leaves those pools without a stored swap count instead of a smaller one.
-function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
+// stream leaves those pools without a stored swap count instead of a smaller one. Below the history floor (floor, or
+// null) a creation hour without hot pool rows reads like an expired one, and the share always comes from the totals.
+function addPrunedPoolHours(db, context, wanted, pruned, endBlock, floor = null) {
   const packed = createPackedShards(db, { config: { enabled: false } });
   const wantedKeys = new Set(wanted.map(({ key }) => key));
   const forPools = (hour, onRow) => packed.forEachRow('compact_pool_hours', hour, (row) => {
     if (wantedKeys.has(poolKey(row.protocol, row.pool))) onRow(row);
   });
   const prunedSet = new Set(pruned.map((row) => row.hour_start));
+  const hotHour = db.prepare('SELECT 1 FROM compact_pool_hours WHERE hour_start=? LIMIT 1');
+  const gone = (hour) => floor !== null && hour < floor && !hotHour.get(BigInt(hour));
   const early = new Map();
   for (const { key, creationHour } of wanted) {
-    if (creationHour && prunedSet.has(creationHour.hour_start)) early.set(key, creationHour.hour_start);
+    if (creationHour && (prunedSet.has(creationHour.hour_start) || gone(creationHour.hour_start))) early.set(key, creationHour.hour_start);
   }
   const kept = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_packed_pool_creation_swaps'").get()
     ? db.prepare('SELECT swap_count FROM compact_packed_pool_creation_swaps WHERE protocol=? AND pool=? AND hour_start=?') : null;
@@ -493,7 +499,7 @@ function addPrunedPoolHours(db, context, wanted, pruned, endBlock) {
   let complete = true;
   const late = pruned.filter((row) => row.last_block > endBlock);
   const upTo = pruned.filter((row) => row.last_block <= endBlock);
-  if (late.length <= upTo.length) {
+  if (late.length <= upTo.length || floor !== null) {
     const pools = [...new Set(wanted.map(({ row }) => row.address))];
     for (const row of db.prepare(`SELECT protocol,pool,swap_count,row_count FROM compact_packed_pool_swaps
       WHERE pool IN (${pools.map(() => '?').join(',')})`).all(...pools)) {

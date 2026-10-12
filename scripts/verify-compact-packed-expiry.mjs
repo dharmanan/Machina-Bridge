@@ -168,7 +168,7 @@ dbB.exec('PRAGMA wal_checkpoint(TRUNCATE)');
 measurements.build = { hours: HOURS, ms: Math.round(performance.now() - buildStarted) };
 
 await test('configuration: expiry is OFF by default, needs retention, and its pass budget is bounded', async () => {
-  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, expiry: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 });
+  assert.deepEqual(packedShardsConfig({}), { enabled: false, retention: false, expiry: false, history: false, hotHours: 48, maintenanceScopes: 16, maintenanceMiB: 64 });
   assert.equal(EXPIRE.expiry, true);
   const refused = (extra, code) => assert.throws(() => packedShardsConfig(extra), (error) => error.code === code, code);
   refused({ COMPACT_PACKED_EXPIRY_ENABLED: 'true' }, 'packed_expiry_requires_retention');
@@ -398,9 +398,11 @@ await test('migration of a packed file written before expiry: the old unconditio
     CREATE TRIGGER compact_packed_payload_no_delete BEFORE DELETE ON compact_packed_payloads BEGIN SELECT RAISE(ABORT,'immutable_packed_shards'); END;`);
   const store = createCompactStore(db, { packedShards: { config: EXPIRE, log: () => {} } });
   const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'compact_packed_*delete*' ORDER BY name").all().map((r) => r.name);
-  assert.deepEqual(triggers.filter((name) => name.endsWith('_no_delete')), ['compact_packed_creation_no_delete', 'compact_packed_expired_no_delete',
-    'compact_packed_pool_swaps_no_delete', 'compact_packed_pruned_no_delete']);
+  assert.deepEqual(triggers.filter((name) => name.endsWith('_no_delete')), ['compact_packed_creation_no_delete', 'compact_packed_history_floor_no_delete',
+    'compact_packed_pool_swaps_no_delete']);
   assert(triggers.includes('compact_packed_set_delete_guard') && triggers.includes('compact_packed_piece_delete_guard') && triggers.includes('compact_packed_payload_delete_guard'));
+  // History expiry (verify-compact-history-expiry.mjs): markers may be deleted only below the history floor, never here.
+  assert(triggers.includes('compact_packed_expired_delete_guard') && triggers.includes('compact_packed_pruned_delete_guard'));
   for (let i = HOURS + EXTRA; i < HOURS + EXTRA + 3; i++) { store.commitHour(hourFixture(i).result); writeHourRows(db, hourFixture(i)); }
   assert.deepEqual(keys(db, 'compact_packed_expired'), expectedExpired(db, NEWEST + (EXTRA + 3) * HOUR));
   db.close();
