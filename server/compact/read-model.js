@@ -8,6 +8,7 @@
 import { existsSync } from 'node:fs';
 import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
 import { createPackedShards } from './packed-shards.js';
+import { uniqueAddressesOfSpan } from './address-union.js';
 import { ECOSYSTEM_WINDOWS } from './intelligence-registry.js';
 import { ARC_ASSETS_BY_ADDRESS } from '../../api/_lib/arc-intelligence/assets.js';
 import { FAMILY_FIELDS, FAMILY_WINDOWS } from './families.js';
@@ -333,6 +334,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   let statements = new Map();
   let packedReader = null;
   const cache = new Map();
+  // Exact 7D/30D (and older 24H) unions already counted, keyed by the complete identity sets they used (address-union.js).
+  const unionCache = new Map();
   // Read-only access to packed sets (SELECT only, on this query_only connection); packing itself stays a writer concern.
   const packedSets = () => (packedReader ??= createPackedShards(connection(), { config: { enabled: false } }));
 
@@ -351,6 +354,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     db = opened;
     statements = new Map();
     packedReader = null;
+    unionCache.clear();
     return db;
   }
   const statement = (name) => {
@@ -402,9 +406,10 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function uniqueActiveAddresses(rows, from, to, hours, newestHour) {
     if (rows.length !== hours) return { status: 'unavailable', reason: 'insufficient_coverage', value: null };
     if (hours === 1) return { status: 'available', value: rows[0].unique_active_addresses };
-    // Identities are kept only for the newest ADDRESS_WINDOW_HOURS hours; older windows cannot be reconstructed exactly.
+    // A window reaching past the newest ADDRESS_WINDOW_HOURS hours (7D, 30D, the previous 24H) is the exact union of the
+    // stored daily and hourly identity sets, hot or packed; any incomplete set makes it unavailable, never estimated.
     if (from < newestHour - (ADDRESS_WINDOW_HOURS - 1) * HOUR) {
-      return { status: 'not_supported', reason: 'identity_retention_exceeded', value: null };
+      return uniqueAddressesOfSpan(connection(), from, to, { packed: packedSets(), cache: unionCache });
     }
     const counts = statement('identityCounts').all(int(from), int(to));
     if (counts.length !== hours || counts.some((row) => row.stored !== row.expected)) {
@@ -1234,6 +1239,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     },
     close() {
       cache.clear();
+      unionCache.clear();
       statements = new Map();
       packedReader = null;
       db?.close();

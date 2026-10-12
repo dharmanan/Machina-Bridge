@@ -199,8 +199,8 @@ try {
           assert.equal(series.buckets.reduce((sum, bucket) => sum + BigInt(bucket.dexUsdVolume.totalUsdMicros), 0n), BigInt(hours) * 6_000_000n);
           for (const protocol of ['v3', 'v4']) assert.equal(model.pools(protocol, key).pools[0].usdVolume.usdMicros, (BigInt(hours) * 3_000_000n).toString());
           if (hours > 24) {
-            assert.deepEqual(summary.network.uniqueActiveAddresses,
-              { status: 'not_supported', reason: 'identity_retention_exceeded', value: null });
+            // Every hour holds the same single identity: the exact 7D/30D union is 1, never the sum of hourly counts.
+            assert.deepEqual(summary.network.uniqueActiveAddresses, { status: 'available', value: 1 });
             assert.equal(series.window.start, iso(BASE + (720 - hours) * HOUR));
             assert.equal(series.window.end, iso(BASE + 720 * HOUR));
             for (const [index, bucket] of series.buckets.entries()) {
@@ -353,7 +353,7 @@ try {
       assert.equal(summary.network.gasUsedRaw, '549000');
       assert.equal(summary.network.transactionsPerSecond, 10 / HOUR, 'TPS uses 549 hours, not 720');
       assert.equal(summary.network.averageTransactionsPerBlock, 0.1);
-      assert.equal(summary.network.uniqueActiveAddresses.reason, 'identity_retention_exceeded');
+      assert.deepEqual(summary.network.uniqueActiveAddresses, { status: 'available', value: 1 }, 'exact union over the 549 stored hours');
       assert.equal(summary.network.previous.status, 'unavailable', 'no comparison to a full previous period');
       for (const section of [summary.assets, summary.lending, summary.crossChain]) {
         for (const entry of Object.values(section)) assert.equal(entry.status, 'available');

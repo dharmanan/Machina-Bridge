@@ -485,7 +485,8 @@ if (!sqlite) {
     assert.deepEqual(summary.coverage.families.usdc, { status: 'unavailable', reasons: ['malformed_usdc_transfer'], unavailableHours: [iso(BASE + 40 * HOUR)] });
     assert.equal(usdc.previous.status, 'available', 'the previous 24H (hours 2..25) does not contain hour 40');
     assert.equal(summary.network.uniqueActiveAddresses.value, (49 - 26) + 3);
-    assert.deepEqual(summary.network.previous.uniqueActiveAddresses, { status: 'not_supported', reason: 'identity_retention_exceeded', value: null });
+    // Older than the newest 24 hours: the exact union of the stored hourly sets of hours 2..25 (addresses 3..28), not 24 x 3.
+    assert.deepEqual(summary.network.previous.uniqueActiveAddresses, { status: 'available', value: (25 + 3) - (2 + 1) + 1 });
     assert.equal(summary.network.previous.status, 'available');
     assert.equal(summary.network.previous.transactions, sum(2, 25, txOf));
     for (const family of [summary.dex.uniswapV3, summary.lending.morphoBlue, summary.crossChain.gateway]) assert.equal(family.status, 'available');

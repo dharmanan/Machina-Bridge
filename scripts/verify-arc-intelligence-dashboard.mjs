@@ -2046,6 +2046,14 @@ await test('Completion 2 fully valued 7D and 30D render their own daily USD bars
     assert.equal(item(tree, 'network.total-volume').attrs['data-intel-status'], 'available', window);
     assert.equal(item(tree, 'volume-chart.volume').attrs['data-intel-status'], 'available', window);
     assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable', 'long-window uniques are not guessed');
+    // The backend's exact union of the window's identity sets is shown as it is, with its change against the previous window.
+    const counted = structuredClone(summary);
+    counted.network.uniqueActiveAddresses = { status: 'available', value: 54_321 };
+    counted.network.previous = { ...counted.network.previous, uniqueActiveAddresses: { status: 'available', value: 50_000 } };
+    const shown = item(render({ selectedWindow: window, data: { ...data, summary: counted }, borrowMarket: BORROW_AVAILABLE }).tree, 'network.active-addresses');
+    assert.equal(shown.attrs['data-intel-status'], 'available', window);
+    assert.equal(shown.attrs['data-intel-value'], '54321');
+    assert.match(textOf(shown), new RegExp(`\\+8\\.6% vs previous ${window.toUpperCase()}`));
     const bars = [...walk(sectionNode(tree, 'volume-chart'))].filter((node) => node.tag === 'button' && node.attrs['aria-label']);
     assert.equal(bars.length, days, window);
     assert.ok(bars.every((bar) => /\$/.test(bar.attrs['aria-label'])), 'only actually valued daily bins have values');
@@ -2400,7 +2408,7 @@ await test('Completion both 7D and 30D daily-active charts preserve persisted co
     const chart = textOf(sectionNode(tree, 'active-addresses-chart'));
     assert.match(chart, /Verified distinct addresses per completed UTC day/);
     assert.doesNotMatch(chart, /Daily active addresses are not available/);
-    assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'unavailable');
+    assert.equal(item(tree, 'network.active-addresses').attrs['data-intel-status'], 'collecting', 'the window\'s own state, not a fixed long-window refusal');
   }
 });
 const refreshTime = '2026-10-09T17:00:00.000Z';

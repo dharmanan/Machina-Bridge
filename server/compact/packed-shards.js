@@ -156,24 +156,24 @@ function encodePiece(codec, columns, rows) {
   return Buffer.from(JSON.stringify(rows.map((row) => columns.map((column) => columnValue(row[column])))));
 }
 
-function decodePiece(codec, columns, scopeColumn, scope, raw, rowCount) {
+// Decoded one row at a time, so an open set holds its raw piece and the current row only.
+function* decodePiece(codec, columns, scopeColumn, scope, raw, rowCount) {
   if (codec === 'address-b20') {
     if (raw.length !== rowCount * ADDRESS_BYTES) fail('packed_piece_corrupt');
-    const rows = [];
     for (let index = 0; index < rowCount; index++) {
-      rows.push({ [scopeColumn]: scope, address: new Uint8Array(raw.subarray(index * ADDRESS_BYTES, (index + 1) * ADDRESS_BYTES)) });
+      yield { [scopeColumn]: scope, address: new Uint8Array(raw.subarray(index * ADDRESS_BYTES, (index + 1) * ADDRESS_BYTES)) };
     }
-    return rows;
+    return;
   }
   let values;
   try { values = JSON.parse(raw.toString('utf8')); } catch { fail('packed_piece_corrupt'); }
   if (!Array.isArray(values) || values.length !== rowCount) fail('packed_piece_corrupt');
-  return values.map((value) => {
+  for (const value of values) {
     if (!Array.isArray(value) || value.length !== columns.length) fail('packed_piece_corrupt');
     const row = { [scopeColumn]: scope };
     columns.forEach((column, index) => { row[column] = value[index]; });
-    return row;
-  });
+    yield row;
+  }
 }
 
 // db: the store's DatabaseSync. Writes (packHour, packDay) must run inside the caller's open writer transaction; each set
@@ -321,12 +321,13 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
       newPayloadBytes: written.newPayloadBytes };
   }
 
-  // Streams a stored set, verified, in primary-key order with the table's column order. The set's binding to the current
-  // canonical hours and table schema (and its stored row count and digest) is checked first; each piece's payload and raw
-  // SHA256, size and order are checked before its rows are passed to onRow; the row count, row digest and byte totals are
-  // required at the end. Memory is bounded by one piece. Returns null when the set is not stored. On any mismatch it
-  // throws, and a caller must discard the rows it already received: only a returned call means the whole set verified.
-  function streamSet(dataset, scope, onRow = null) {
+  // Opens a stored set for a verified read in primary-key order with the table's column order: null when the set is not
+  // stored, else an iterator of its rows that returns { rowCount, pieces, rawBytes, storedBytes } when it is done. The set's
+  // binding to the current canonical hours and table schema (and its stored row count and digest) is checked when it is
+  // opened; each piece's payload and raw SHA256, size and order before its first row; the row count, row digest and byte
+  // totals at the end. Memory is bounded by one piece. On any mismatch it throws, and a caller must discard the rows it
+  // already received: only an iterator that reached its end means the whole set verified.
+  function openSet(dataset, scope) {
     if (!tablesExist()) return null;
     const definition = definitionOf(dataset);
     const set = db.prepare('SELECT * FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
@@ -339,33 +340,46 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     }
     const payload = db.prepare('SELECT * FROM compact_packed_payloads WHERE payload_sha256 = ?');
     const pieces = db.prepare('SELECT part, row_count, payload_sha256 FROM compact_packed_pieces WHERE dataset = ? AND scope_start = ? ORDER BY part');
-    const hash = createHash('sha256');
-    let count = 0;
-    let part = 0;
-    let rawBytes = 0;
-    let storedBytes = 0;
-    for (const piece of pieces.iterate(dataset, int(scope))) {
-      if (piece.part !== part || part >= set.pieces) fail('packed_pieces_corrupt');
-      part++;
-      const blob = payload.get(piece.payload_sha256);
-      if (!blob || sha256(blob.payload) !== piece.payload_sha256) fail('packed_payload_corrupt');
-      let raw;
-      try { raw = inflateRawSync(blob.payload, { maxOutputLength: PACKED_MAX_RAW_PIECE_BYTES }); } catch { fail('packed_payload_corrupt'); }
-      if (raw.length !== blob.raw_bytes || sha256(raw) !== blob.raw_sha256) fail('packed_payload_corrupt');
-      rawBytes += raw.length;
-      storedBytes += blob.payload.byteLength;
-      for (const decoded of decodePiece(definition.codec, definition.columns, definition.scope, scope, raw, piece.row_count)) {
-        const row = Object.fromEntries(definition.schema.map(({ name }) => [name, decoded[name]]));
-        hash.update(`${rowText(row)}\n`);
-        count++;
-        onRow?.(row);
+    return (function* rows() {
+      const hash = createHash('sha256');
+      let count = 0;
+      let part = 0;
+      let rawBytes = 0;
+      let storedBytes = 0;
+      for (const piece of pieces.iterate(dataset, int(scope))) {
+        if (piece.part !== part || part >= set.pieces) fail('packed_pieces_corrupt');
+        part++;
+        const blob = payload.get(piece.payload_sha256);
+        if (!blob || sha256(blob.payload) !== piece.payload_sha256) fail('packed_payload_corrupt');
+        let raw;
+        try { raw = inflateRawSync(blob.payload, { maxOutputLength: PACKED_MAX_RAW_PIECE_BYTES }); } catch { fail('packed_payload_corrupt'); }
+        if (raw.length !== blob.raw_bytes || sha256(raw) !== blob.raw_sha256) fail('packed_payload_corrupt');
+        rawBytes += raw.length;
+        storedBytes += blob.payload.byteLength;
+        for (const decoded of decodePiece(definition.codec, definition.columns, definition.scope, scope, raw, piece.row_count)) {
+          const row = Object.fromEntries(definition.schema.map(({ name }) => [name, decoded[name]]));
+          hash.update(`${rowText(row)}\n`);
+          count++;
+          yield row;
+        }
       }
+      if (part !== set.pieces) fail('packed_pieces_corrupt');
+      if (count !== set.row_count || hash.digest('hex') !== set.rows_sha256 || rawBytes !== set.raw_bytes || storedBytes !== set.stored_bytes) {
+        fail('packed_rows_corrupt');
+      }
+      return { rowCount: count, pieces: part, rawBytes, storedBytes };
+    })();
+  }
+
+  // Streams a stored set (openSet) to onRow; returns its totals, or null when the set is not stored. On any mismatch it
+  // throws, and a caller must discard the rows it already received: only a returned call means the whole set verified.
+  function streamSet(dataset, scope, onRow = null) {
+    const rows = openSet(dataset, scope);
+    if (!rows) return null;
+    for (let step = rows.next(); ; step = rows.next()) {
+      if (step.done) return step.value;
+      onRow?.(step.value);
     }
-    if (part !== set.pieces) fail('packed_pieces_corrupt');
-    if (count !== set.row_count || hash.digest('hex') !== set.rows_sha256 || rawBytes !== set.raw_bytes || storedBytes !== set.stored_bytes) {
-      fail('packed_rows_corrupt');
-    }
-    return { rowCount: count, pieces: part, rawBytes, storedBytes };
   }
 
   // Packs a set inside its own savepoint; a failure rolls back only that set and is reported, never thrown, so packing
@@ -552,7 +566,16 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
       return { compact_daily_address_stage: packSafely('compact_daily_address_stage', dayStart) };
     },
     // Reader side: forEachRow(dataset, scope, onRow) streams a verified set (see streamSet); null when not stored.
+    // openRows(dataset, scope) is the same read as an iterator (see openSet), for merging several sets in order.
     forEachRow: streamSet,
+    openRows: openSet,
+    // Stored set row counts of [from, to] (scope -> rowCount), without reading any piece.
+    storedScopes(dataset, from, to) {
+      if (!PACKED_DATASETS[dataset]) fail('packed_dataset_invalid');
+      if (!tablesExist()) return new Map();
+      return new Map(db.prepare('SELECT scope_start, row_count FROM compact_packed_sets WHERE dataset = ? AND scope_start BETWEEN ? AND ?')
+        .all(dataset, int(from), int(to)).map((row) => [row.scope_start, row.row_count]));
+    },
     status(dataset, scope) {
       if (!tablesExist()) return null;
       if (!PACKED_DATASETS[dataset]) fail('packed_dataset_invalid');

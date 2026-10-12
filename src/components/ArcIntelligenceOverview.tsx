@@ -164,7 +164,9 @@ const REASON_TEXT: Record<string, string> = {
   tick_out_of_range: 'Pool holdings could not be read consistently.',
   balance_unreadable: 'A token balance of this pool could not be read.',
   pool_not_initialized: 'This pool has no price yet.',
-  identity_retention_exceeded: 'Unique addresses are counted within 24H only. Longer windows would count the same address more than once.',
+  identity_retention_exceeded: 'The address sets of this period are not stored, so its unique addresses cannot be counted without counting an address twice.',
+  identity_incomplete: 'An hour of this window does not have its complete stored address set, so unique addresses are not counted.',
+  identity_unverified: 'A stored address set of this window did not pass verification, so unique addresses are not counted.',
   verified_protocol_registry_empty: 'No additional protocol sources have been verified for this dashboard.',
   verified_exchange_registry_empty: 'No exchange addresses have verified labels for this dashboard.',
   discovery_hour_missing_or_capped: 'Discovery checks cover only part of the stored history; additional records may exist.',
@@ -603,11 +605,12 @@ function averageFeeCell(ctx: ViewContext, entry: SwapFeesWindow | null | undefin
   return { status, note: usdNote(ctx, status, entry, 'Verified data does not include estimated swap fees yet.') }
 }
 
-// Unique active addresses: exact within 24H; over 7D and 30D never counted, because identities are kept for one day only.
+// Unique active addresses: the backend's exact distinct count for every window (24H, 7D, 30D), from the stored identity
+// sets; when a window cannot be counted exactly the backend's reason is shown, never a sum of smaller windows.
 function activeAddressesCell(ctx: ViewContext): Cell {
   const uniques = ctx.summary?.network?.uniqueActiveAddresses ?? null
-  if (ctx.mode === 'ready' && ctx.windowHours > 24) return { status: 'unavailable', note: reasonText('identity_retention_exceeded') }
-  return numberCell(ctx, uniques, uniques && isFiniteNumber(uniques.value) ? uniques.value : null, formatCount)
+  const cell = numberCell(ctx, uniques, uniques && isFiniteNumber(uniques.value) ? uniques.value : null, formatCount)
+  return ctx.mode === 'ready' && cell.status === 'unavailable' && uniques?.reason ? { ...cell, note: reasonText(uniques.reason) } : cell
 }
 
 function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }) {
