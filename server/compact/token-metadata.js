@@ -6,14 +6,18 @@
 // data, a revert, a malformed answer, decimals out of range, or a symbol or name that imitates a verified Arc asset) is
 // cached as rejected with symbol, name and decimals null. A transport, rate-limit or other node error caches nothing, so
 // the token is tried again on a later run. Each run reads at most METADATA_TOKENS_PER_RUN tokens, three calls per token in
-// batches of at most 50 calls: at most two batched requests per run.
+// batches of METADATA_CALLS_PER_BATCH calls: at most eight batched requests per run, paced by the provider. Observed on
+// 2026-10-13: one idle 48-call batch to the public Arc RPC drew -32005 for items 20 to 47, while three 12-call batches one
+// second apart were answered in full. One rate-limited item fails the whole batch (provider.js), so the former 48-call first
+// batch was refused every hour. A rate limit stops the run; finished batches stay cached and the rest is read later.
 import { ARC_VERIFIED_ASSETS } from '../../api/_lib/arc-intelligence/assets.js';
 import { ProviderError } from './provider.js';
 
 export const TOKEN_METADATA_VERSION = 'erc20-symbol-name-decimals-eth-call-v1';
 export const METADATA_TOKENS_PER_RUN = 32;
 export const METADATA_CALLS_PER_TOKEN = 3;
-export const METADATA_TOKENS_PER_BATCH = Math.floor(50 / METADATA_CALLS_PER_TOKEN);
+export const METADATA_CALLS_PER_BATCH = 12;
+export const METADATA_TOKENS_PER_BATCH = Math.floor(METADATA_CALLS_PER_BATCH / METADATA_CALLS_PER_TOKEN);
 export const MAX_TOKEN_DECIMALS = 36;
 export const METADATA_REJECT_REASONS = Object.freeze(['no_return_data', 'reverted', 'malformed_symbol', 'malformed_decimals',
   'decimals_out_of_range', 'imitates_verified_asset']);
@@ -141,6 +145,8 @@ export async function refreshTokenMetadata({ store, provider, blockNumber, limit
     report.skipped = result.skipped.length;
   } catch (error) {
     report.error = error instanceof ProviderError ? `provider_${error.code}` : error?.code ?? error?.message ?? 'metadata_error';
+    // Every candidate not cached in this run (the failed batch and the ones after it) is read again on a later run.
+    report.skipped = report.candidates - report.verified - report.rejected;
   }
   return report;
 }

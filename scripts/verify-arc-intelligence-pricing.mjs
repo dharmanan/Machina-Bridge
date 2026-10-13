@@ -23,8 +23,8 @@ import { bootstrapV3Registry, registrySnapshot, V3_POOL_KIND } from '../server/c
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from '../server/compact/sources.js';
 import { createCompactStore } from '../server/compact/store.js';
 import {
-  decodeAbiText, decodeAbiUint, METADATA_TOKENS_PER_BATCH, METADATA_TOKENS_PER_RUN, metadataExempt, metadataOf, readTokenMetadata,
-  refreshTokenMetadata,
+  decodeAbiText, decodeAbiUint, METADATA_CALLS_PER_BATCH, METADATA_TOKENS_PER_BATCH, METADATA_TOKENS_PER_RUN, metadataExempt, metadataOf,
+  readTokenMetadata, refreshTokenMetadata,
 } from '../server/compact/token-metadata.js';
 import {
   anchorDecimals, blockState, evaluateSource, hourVolumeOf, MAX_SQRT_PRICE_X96, microsToDecimal, MIN_SQRT_PRICE_X96, needsPrice, poolVolumeUsd,
@@ -132,14 +132,15 @@ function metadataProvider(table = new Map(), { failAt = null } = {}) {
 }
 const tokensFrom = (count, start = 0x5000) => Array.from({ length: count }, (_, index) => addressOf(start + index));
 
-await test('bounded RPC: metadata of at most 32 tokens per run, three eth_call each, at most 50 calls per batch: two batched requests', async () => {
+await test('bounded RPC: metadata of at most 32 tokens per run, three eth_call each, 12 calls per batch: eight batched requests', async () => {
   assert.equal(METADATA_TOKENS_PER_RUN, 32);
-  assert.equal(METADATA_TOKENS_PER_BATCH * 3 <= 50, true);
+  assert.deepEqual([METADATA_CALLS_PER_BATCH, METADATA_TOKENS_PER_BATCH], [12, 4]);
   const tokens = tokensFrom(32);
   const table = new Map(tokens.map((token, index) => [token, answers(ok(abiString(`T${index}`)), ok(abiString(`Token ${index}`)), ok(`0x${word(index % 19)}`))]));
   const provider = metadataProvider(table);
   const result = await readTokenMetadata(provider, tokens, { blockTag: '0xf4240' });
-  assert.deepEqual([result.requests, provider.batches.length, provider.batches.map((batch) => batch.length)], [2, 2, [48, 48]]);
+  assert.deepEqual([result.requests, provider.batches.length, provider.batches.map((batch) => batch.length)], [8, 8, Array(8).fill(12)]);
+  assert.equal(provider.batches.flat().length, 96, 'the same 96 eth_call as before, in smaller requests');
   assert.equal(result.rows.length, 32);
   assert.deepEqual(result.rows[5], { token: tokens[5], verified: true, symbol: 'T5', name: 'Token 5', decimals: 5, reason: null });
   // refreshTokenMetadata: never more than the cap, whatever the store offers; exempt tokens are dropped before any call.
@@ -149,15 +150,103 @@ await test('bounded RPC: metadata of at most 32 tokens per run, three eth_call e
   } };
   const refresh = metadataProvider(new Map(tokensFrom(40).map((token) => [token, answers(ok(abiString('X')), REVERT, ok(`0x${word(6)}`))])));
   const report = await refreshTokenMetadata({ store, provider: refresh, blockNumber: 1_000_000, limit: 500 });
-  assert.deepEqual(report, { candidates: 32, verified: 32, rejected: 0, skipped: 0, requests: 2, error: null });
+  assert.deepEqual(report, { candidates: 32, verified: 32, rejected: 0, skipped: 0, requests: 8, error: null });
   assert.equal(recorded.length, 32);
   assert(recorded.every(([token, block]) => !metadataExempt(token) && block === 1_000_000));
   // A failure after the first batch: the first batch stays cached, the run reports the error and never throws.
   const failing = [];
   const partial = await refreshTokenMetadata({ store: { ...store, recordTokenMetadata: (rows) => failing.push(...rows) },
     provider: metadataProvider(new Map(), { failAt: 2 }), blockNumber: 1_000_000 });
-  assert.deepEqual([partial.requests, partial.rejected, failing.length, partial.error], [2, 16, 16, 'rate_limited'],
-    'both attempted batches count, including the failed request; the completed batch remains cached');
+  assert.deepEqual([partial.requests, partial.rejected, failing.length, partial.error, partial.skipped], [2, 4, 4, 'rate_limited', 28],
+    'both attempted batches count, including the failed request; the completed batch remains cached; the rest is reported skipped');
+});
+
+// The public Arc RPC as observed on 2026-10-13: within one batch, eth_call items past a short-term budget (19 calls,
+// refilled every second) are answered with item-level -32005 "rate limit exceeded"; all other items are answered. The
+// real provider runs on a virtual clock that drives the budget too, so pacing and waits are measured, not slept.
+function arcLikeRpc(table, { capacity = 19, refillPerSecond = 12 } = {}) {
+  let clock = 0, budget = capacity, refilledAt = 0;
+  const requests = [];
+  const KIND = { '0x95d89b41': 'symbol', '0x06fdde03': 'name', '0x313ce567': 'decimals' };
+  const fetchImpl = async (_url, { body }) => {
+    const payload = JSON.parse(body);
+    budget = Math.min(capacity, budget + ((clock - refilledAt) / 1000) * refillPerSecond);
+    refilledAt = clock;
+    const answer = (item) => {
+      if (item.method === 'eth_chainId') return { jsonrpc: '2.0', id: item.id, result: hex(ARC_CHAIN_ID) };
+      if (budget < 1) return { jsonrpc: '2.0', id: item.id, error: { code: -32005, message: 'rate limit exceeded' } };
+      budget -= 1;
+      const [call] = item.params;
+      return { jsonrpc: '2.0', id: item.id, ...((table.get(call.to) ?? {})[KIND[call.data]] ?? REVERT) };
+    };
+    const out = Array.isArray(payload) ? payload.map(answer) : answer(payload);
+    if (Array.isArray(payload)) requests.push({ at: clock, calls: payload.length, limited: out.filter((item) => item.error?.code === -32005).length });
+    const text = JSON.stringify(out);
+    return { status: 200, ok: true, text: async () => text };
+  };
+  const provider = createProvider({ fetchImpl, minIntervalMs: 1000, cooldownMs: 15_000, now: () => clock, sleep: async (ms) => { clock += ms; } });
+  return { provider, requests, elapsed: () => clock, advance: (ms) => { clock += ms; } };
+}
+// A store double with the cache contract of store.js: tokens without cached metadata, rows written once.
+function metadataStore(tokens) {
+  const cached = new Map();
+  return { cached, tokensNeedingMetadata: ({ limit }) => tokens.filter((token) => !cached.has(token)).slice(0, limit),
+    recordTokenMetadata: (rows, { readBlock }) => { for (const row of rows) { assert.ok(!cached.has(row.token), 'written once'); cached.set(row.token, { ...row, readBlock }); } } };
+}
+// 32 tokens: plain ones, a symbol that imitates USDC, a name that imitates Circle, decimals out of range, a reverting symbol.
+const RATE_TOKENS = tokensFrom(32, 0x7000);
+const RATE_TABLE = new Map(RATE_TOKENS.map((token, index) => [token, index === 3 ? answers(ok(abiString('USDC')), ok(abiString('Fake Dollar')), ok(`0x${word(6)}`))
+  : index === 9 ? answers(ok(abiString('CRC')), ok(abiString('Circle Coin')), ok(`0x${word(6)}`))
+    : index === 14 ? answers(ok(abiString('BIG')), ok(abiString('Big')), ok(`0x${word(99)}`))
+      : index === 21 ? answers(REVERT, ok(abiString('Broken')), ok(`0x${word(18)}`))
+        : answers(ok(abiString(`R${index}`)), index % 5 ? ok(abiString(`Rate ${index}`)) : REVERT, ok(`0x${word(index % 19)}`))]));
+const RATE_EXPECTED = new Map(RATE_TOKENS.map((token) => [token, metadataOf(token, RATE_TABLE.get(token))]));
+const invariant = (report) => assert.equal(report.verified + report.rejected + report.skipped, report.candidates, JSON.stringify(report));
+
+await test('rate limit root cause: one 48-call batch draws item-level -32005 past the 19th call and the provider refuses it whole', async () => {
+  const rpc = arcLikeRpc(RATE_TABLE);
+  const calls = RATE_TOKENS.slice(0, 16).flatMap((token) => ['0x95d89b41', '0x06fdde03', '0x313ce567'].map((data) => ['eth_call', [{ to: token, data }, '0x10']]));
+  await assert.rejects(rpc.provider.batch(calls, { allowItemErrors: true, retryRateLimited: false }), (error) => error.code === 'rate_limited');
+  assert.deepEqual(rpc.requests, [{ at: 1000, calls: 48, limited: 29 }], 'the former first batch: refused although 19 items were answered');
+});
+
+await test('rate limit fix: 12-call batches finish all 32 tokens within the same budget, eight paced requests, no extra wait', async () => {
+  const rpc = arcLikeRpc(RATE_TABLE);
+  const store = metadataStore(RATE_TOKENS);
+  const report = await refreshTokenMetadata({ store, provider: rpc.provider, blockNumber: 0x10 });
+  assert.deepEqual(report, { candidates: 32, verified: 28, rejected: 4, skipped: 0, requests: 8, error: null });
+  invariant(report);
+  assert.deepEqual(rpc.requests.map((request) => [request.calls, request.limited]), Array(8).fill([12, 0]));
+  assert.equal(rpc.elapsed(), 8000, 'one chain check and eight batches at the provider pacing of one per second; no cooldown');
+  assert.equal(rpc.provider.stats.calls.eth_call, 96, 'the same 96 eth_call per run as the former two batches');
+  for (const token of RATE_TOKENS) assert.deepEqual(store.cached.get(token), { ...RATE_EXPECTED.get(token), readBlock: 0x10 }, token);
+  // Validation is unchanged: imitations of verified assets and out-of-range decimals are still rejected.
+  assert.deepEqual([3, 9, 14, 21].map((index) => store.cached.get(RATE_TOKENS[index]).reason),
+    ['imitates_verified_asset', 'imitates_verified_asset', 'decimals_out_of_range', 'reverted']);
+});
+
+await test('rate limit, slower budget: finished batches stay cached, limited tokens are never rejected and are read on later runs', async () => {
+  const rpc = arcLikeRpc(RATE_TABLE, { refillPerSecond: 4 });
+  const store = metadataStore(RATE_TOKENS);
+  const reports = [];
+  for (let run = 0; run < 12 && store.cached.size < RATE_TOKENS.length; run++) {
+    const report = await refreshTokenMetadata({ store, provider: rpc.provider, blockNumber: 0x10 + run });
+    invariant(report);
+    reports.push(report);
+    rpc.advance(3_600_000); // the next hourly run
+  }
+  // First run: the first batch (three plain tokens and the USDC imitation) is answered and cached, the second is refused
+  // whole; the rest waits for later runs.
+  assert.deepEqual(reports[0], { candidates: 32, verified: 3, rejected: 1, skipped: 28, requests: 2, error: 'provider_rate_limited' });
+  assert.ok(reports.length > 1 && reports.every((report) => report.verified + report.rejected > 0), 'every run makes progress');
+  assert.equal(store.cached.size, 32, 'the backlog is cleared over a few runs');
+  for (const token of RATE_TOKENS) {
+    const { readBlock, ...row } = store.cached.get(token);
+    assert.deepEqual(row, RATE_EXPECTED.get(token), `${token}: a rate limit never changes or rejects a result`);
+  }
+  assert.equal(reports.reduce((sum, report) => sum + report.rejected, 0), 4, 'only the four genuinely invalid tokens are rejected');
+  assert.equal(rpc.requests.reduce((sum, request) => sum + request.calls, 0) - rpc.requests.filter((request) => request.limited).reduce((sum, request) => sum + request.calls, 0), 96,
+    'every eth_call outside a refused batch is used exactly once');
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
