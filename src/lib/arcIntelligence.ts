@@ -401,7 +401,9 @@ export function parseArcEcosystem(value: Record<string, unknown> | null, selecte
       && (row.dex.firstDexActivity.firstObserved === null && row.dex.firstDexActivity.status === 'insufficient_coverage'
         || observed(row.dex.firstDexActivity.firstObserved) && typeof row.dex.firstDexActivity.firstObserved.firstProven === 'boolean'
           && (row.dex.firstDexActivity.status !== 'available' || row.dex.firstDexActivity.firstObserved.firstProven === true)))
-    && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 128))
+    // The backend's bound (decodeAbiText in server/compact/token-metadata.js): a contract-reported symbol of up to 256
+    // printable characters is valid, so one long symbol never blanks every verified row of the window.
+    && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 256))
   if (!validTokens(data.discoveredTokens.rows) || !validTokens(data.launches.rows)
     || data.launches.rows.some((row) => !['direct_deployment', 'verified_factory', 'verified_launchpad'].includes(row.launch.status))) return null
   return data

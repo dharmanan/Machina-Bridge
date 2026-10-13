@@ -17,6 +17,7 @@ import { ARC_VERIFIED_ASSETS } from '../api/_lib/arc-intelligence/assets.js';
 import { ACTIVITY_SCHEMA, DATA_CACHE_CONTROL, ECOSYSTEM_SCHEMA, NO_STORE, POOLS_SCHEMA, resolveIntelligenceRoute, SUMMARY_SCHEMA, TIMESERIES_SCHEMA } from '../api/_lib/intelligence-proxy.js';
 import { ECOSYSTEM_SCHEMA as BACKEND_ECOSYSTEM_SCHEMA } from '../server/compact/intelligence-registry.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
+import { decodeAbiText } from '../server/compact/token-metadata.js';
 import { ACTIVITY_SCHEMA as BACKEND_ACTIVITY_SCHEMA, POOLS_SCHEMA as BACKEND_POOLS_SCHEMA, SUMMARY_SCHEMA as BACKEND_SUMMARY_SCHEMA,
   TIMESERIES_SCHEMA as BACKEND_TIMESERIES_SCHEMA } from '../server/compact/read-model.js';
 
@@ -2280,6 +2281,31 @@ await test('Ecosystem schema rejects malformed or contradictory activity and tok
     pool.firstSwap = { ...structuredClone(pool.firstLiquidity), status: 'available', firstProven: true, reason: null };
     assert.ok(lib.parseArcEcosystem(proven, window), 'genuinely proven activity still validates');
   }
+});
+// A verified contract may report any symbol the backend decoder accepts (server/compact/token-metadata.js). One long
+// symbol must not blank the window's verified lists; anything beyond the decoder's bound still fails closed.
+await test('Ecosystem schema accepts every token symbol the backend decoder returns and still rejects longer ones', async () => {
+  const abiText = (text) => `0x${(32).toString(16).padStart(64, '0')}${text.length.toString(16).padStart(64, '0')}`
+    + Buffer.from(text, 'latin1').toString('hex').padEnd(Math.ceil(text.length / 32) * 64, '0');
+  const longest = decodeAbiText(abiText('LONG-SYMBOL-'.repeat(22).slice(0, 256)));
+  assert.equal(longest?.length, 256); assert.equal(decodeAbiText(abiText('X'.repeat(257))), null);
+  for (const window of ['24h', '7d', '30d']) for (const list of ['discoveredTokens', 'launches']) {
+    const body = missingActivityEcosystem(window); body[list].rows[0].symbol = longest;
+    const parsed = lib.parseArcEcosystem(body, window);
+    assert.ok(parsed, `${window} ${list}`); assert.equal(parsed[list].rows.length, list === 'launches' ? 50 : 19);
+    for (const symbol of [`${longest}X`, 7, undefined]) {
+      const bad = missingActivityEcosystem(window); bad[list].rows[0].symbol = symbol;
+      assert.equal(lib.parseArcEcosystem(bad, window), null, `${window} ${list} ${typeof symbol}`);
+    }
+  }
+  const body = missingActivityEcosystem('24h'); body.launches.rows[0].symbol = longest;
+  const harness = tokenListHarness('launches', lib.parseArcEcosystem(body, '24h'));
+  const cell = [...walk(harness.draw().tree)].find(node => node.tag === 'p' && node.attrs.title === longest);
+  assert.ok(cell, 'long symbol shown in its row'); assert.match(cell.attrs.class, /truncate/);
+  harness.expand(body.launches.rows[0].address);
+  const evidence = byAttr(harness.draw().tree, 'data-token-evidence', body.launches.rows[0].address)[0];
+  const line = evidence && [...walk(evidence)].find(node => node.tag === 'p' && textOf(node).includes(longest));
+  assert.ok(line, 'long symbol shown in the evidence'); assert.match(line.attrs.class, /\[overflow-wrap:anywhere\]/);
 });
 
 // Drive the actual list's hook state and native button handlers without external network or a DOM dependency.

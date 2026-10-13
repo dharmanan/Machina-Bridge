@@ -1498,7 +1498,7 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
     <div className="grid gap-3 md:grid-cols-2">
       <div><p className="font-semibold text-slate-800">Contract and identity</p><p className="break-all">{row.address}</p>
         <p>Verified ERC-20-like contract; unverified asset identity.</p>
-        <p>{row.name ?? 'Contract name unavailable'} · {row.symbol ?? 'Contract symbol unavailable'}</p>
+        <p className="[overflow-wrap:anywhere]">{row.name ?? 'Contract name unavailable'} · {row.symbol ?? 'Contract symbol unavailable'}</p>
         <p>Decimals: {row.decimals ?? 'Not recorded'}</p>
         <p>Discovered {formatUtcDateTime(row.discoveredAt)} · observed block {formatCount(row.observedBlock)}</p></div>
       <div {...launchFieldProps('launches.transaction', row.deployment.transactionHash ? 'available' : 'unavailable')}>
