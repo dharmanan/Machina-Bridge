@@ -25,6 +25,12 @@ export const REPAIR_COOLDOWN_MS = HOUR_MS;
 // first, one hour per tick, and retries the same hour at most once per hour.
 export const PROJECTION_REPAIR_WINDOW_HOURS = 35 * 24;
 export const PROJECTION_REPAIR_COOLDOWN_MS = HOUR_MS;
+// Discovery drain (lowest priority, at most 16 candidates per pass): after a finished pass the next one may start after
+// this interval instead of a full tick. A failed or terminated pass still waits a full tick. No pass starts within the
+// live margin of the next live hour, and a pass still running at that hour is terminated (each verification is its own
+// committed transaction, and the writer lock of a terminated child is released as stale), so the live hour runs next.
+export const DEFAULT_DISCOVERY_DRAIN_INTERVAL_MS = 60_000;
+export const DISCOVERY_DRAIN_LIVE_MARGIN_MS = 90_000;
 export const DEFAULT_CHILD_KILL_GRACE_MS = 15_000;
 // Equivalent to the proven production command: node --max-old-space-size=64 --max-semi-space-size=2 run-compact-hour.mjs
 export const CHILD_NODE_ARGS = Object.freeze(['--max-old-space-size=64', '--max-semi-space-size=2']);
@@ -132,7 +138,8 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
   now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
   safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
   maxBackoffMs = MAX_BACKOFF_MS, repairWindowHours = REPAIR_WINDOW_HOURS, repairCooldownMs = REPAIR_COOLDOWN_MS,
-  projectionRepairWindowHours = PROJECTION_REPAIR_WINDOW_HOURS, projectionRepairCooldownMs = PROJECTION_REPAIR_COOLDOWN_MS }) {
+  projectionRepairWindowHours = PROJECTION_REPAIR_WINDOW_HOURS, projectionRepairCooldownMs = PROJECTION_REPAIR_COOLDOWN_MS,
+  discoveryDrainIntervalMs = DEFAULT_DISCOVERY_DRAIN_INTERVAL_MS }) {
   let stopped = false;
   let active = null; // the single in-flight run loop
   let child = null; // the single running child
@@ -310,22 +317,25 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
         return { again: false, wakeAt: nextHourDue };
       }
     }
-    // Lowest priority, same single child. One pass per tick, then yield even if unresolved work remains.
-    // A newly due live hour is checked at the top of the next iteration; no independent timer/daemon.
-    if (runDiscoveryDrain && readModel.discoveryPending?.({ nowMs: now() })) {
+    // Lowest priority, same single child. One pass per step, then yield even if unresolved work remains.
+    // A newly due live hour is checked at the top of the next iteration; no independent timer/daemon. No pass starts
+    // within the live margin, and a running pass is terminated at the next live hour.
+    if (runDiscoveryDrain && nextHourDue - now() >= DISCOVERY_DRAIN_LIVE_MARGIN_MS && readModel.discoveryPending?.({ nowMs: now() })) {
       const handle = runDiscoveryDrain();
       child = { kind: 'discovery_drain', terminate: () => handle.terminate() };
       log('SCHEDULER_CHILD_START kind=discovery_drain');
+      const deadline = setTimer(() => { void handle.terminate(); }, Math.max(0, nextHourDue - now()));
       let outcome;
-      try { outcome = await handle.done; } finally { child = null; }
+      try { outcome = await handle.done; } finally { clearTimer(deadline); child = null; }
       if (stopped) return { again: false };
       const after = readModel.checkpoint();
       if (!after || after.hourStart !== checkpoint.hourStart || after.lastBlock !== checkpoint.lastBlock) {
         throw new Error('discovery_checkpoint_changed');
       }
-      status.lastRun = { kind: 'discovery_drain', ok: outcome.exitCode === 0 && !outcome.error, ...outcome };
+      const ok = outcome.exitCode === 0 && !outcome.error;
+      status.lastRun = { kind: 'discovery_drain', ok, ...outcome };
       log(`SCHEDULER_DISCOVERY_DONE exit=${outcome.exitCode}`);
-      return { again: false, wakeAt: Math.min(nextHourDue, now() + tickMs) };
+      return { again: false, wakeAt: Math.min(nextHourDue, now() + (ok ? discoveryDrainIntervalMs : tickMs)) };
     }
 
     return { again: false, wakeAt: nextHourDue };

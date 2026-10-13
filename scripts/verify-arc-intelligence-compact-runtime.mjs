@@ -11,7 +11,7 @@ import { createIntelligenceServer } from '../server/compact/http.js';
 import { POOL_HOUR_RETENTION_HOURS } from '../server/compact/projections.js';
 import {
   assertHourIso, backoffMs, CHILD_NODE_ARGS, createChildHourRunner, createChildHistoryRunner, createChildDiscoveryRunner, createScheduler, DEFAULT_SAFETY_DELAY_MS, hourIso, latestSafeHourStart,
-  MAX_BACKOFF_MS, PROJECTION_REPAIR_COOLDOWN_MS, PROJECTION_REPAIR_WINDOW_HOURS,
+  DEFAULT_DISCOVERY_DRAIN_INTERVAL_MS, DISCOVERY_DRAIN_LIVE_MARGIN_MS, DEFAULT_TICK_MS, MAX_BACKOFF_MS, PROJECTION_REPAIR_COOLDOWN_MS, PROJECTION_REPAIR_WINDOW_HOURS,
 } from '../server/compact/scheduler.js';
 import { DISCOVERY_DRAIN_SCRIPT, PROJECTION_REPAIR_SCRIPT, RUNNER_SCRIPT, serviceConfig, startIntelligenceService } from './serve-compact-intelligence.mjs';
 
@@ -384,7 +384,8 @@ await test('discovery drain: only due durable work starts a child; one bounded p
   const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true });
   await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery']);
   assert.equal(scheduler.status().lastRun.kind, 'discovery_drain'); assert.equal(scheduler.status().lastRun.ok, true);
-  assert.equal(state.checkpoint, BASE + 9 * H); assert.equal(state.timers.length, 1); assert.equal(state.timers[0].ms, 5 * 60_000);
+  // A finished pass: the next one after the drain interval (formerly a full five-minute tick).
+  assert.equal(state.checkpoint, BASE + 9 * H); assert.equal(state.timers.length, 1); assert.equal(state.timers[0].ms, 60_000);
   await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery', 'discovery']); assert.equal(state.maxRunning, 1);
   const idle = world({ checkpoint: BASE + 9 * H, discovery: () => false });
   await idle.scheduler.tick(); assert.deepEqual(idle.state.kinds, []);
@@ -418,6 +419,50 @@ await test('discovery drain: failure is visible and yields, never fake checkpoin
   await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery']);
   assert.equal(scheduler.status().lastRun.ok, false); assert.equal(scheduler.status().lastRun.exitCode, 1);
   assert.equal(state.checkpoint, BASE + 9 * H); assert.equal(state.timers[0].ms, 5 * 60_000);
+});
+await test('discovery drain: 60 s after a finished pass, a full tick after a failed one; other maintenance keeps its wake', async () => {
+  assert.deepEqual([DEFAULT_DISCOVERY_DRAIN_INTERVAL_MS, DISCOVERY_DRAIN_LIVE_MARGIN_MS, DEFAULT_TICK_MS], [60_000, 90_000, 5 * 60_000]);
+  // Simulated hour 10:06 -> 11:05 with instant passes: about one pass per minute instead of one per five minutes.
+  const passes = (behavior) => {
+    const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true, discoveryBehavior: behavior });
+    return (async () => {
+      while (state.clock < at(11, 5)) { await scheduler.tick(); state.clock += state.timers.at(-1).ms; }
+      return { drains: startsOf(state, 'discovery').length, hours: startsOf(state, 'hour').length, maxRunning: state.maxRunning };
+    })();
+  };
+  const ok = await passes(() => 'repair');
+  assert.equal(ok.maxRunning, 1);
+  assert.ok(ok.drains >= 55 && ok.drains <= 59, `finished passes per hour: ${ok.drains}`);
+  const failing = await passes(() => 'fail');
+  assert.ok(failing.drains >= 11 && failing.drains <= 13, `failed passes keep the full tick: ${failing.drains}`);
+  // A projection repair still waits as before: the next step at the live hour or after a full tick.
+  const projection = world({ checkpoint: BASE + 9 * H, projectionCandidates: () => ({ hours: [BASE + 8 * H] }), discovery: () => true });
+  await projection.scheduler.tick(); assert.deepEqual(projection.state.kinds, ['projection']); assert.equal(projection.state.timers.at(-1).ms, 5 * 60_000);
+});
+await test('discovery drain: no pass starts within 90 s of the next live hour; the live hour runs when due', async () => {
+  // 11:03:30 is exactly 90 s before 11:05 (10:00-11:00 safe at 11:05): the last moment a pass may start.
+  const edge = world({ checkpoint: BASE + 9 * H, clock: at(11, 3) + 30_000, discovery: () => true });
+  await edge.scheduler.tick(); assert.deepEqual(edge.state.kinds, ['discovery']);
+  const late = world({ checkpoint: BASE + 9 * H, clock: at(11, 3) + 31_000, discovery: () => true });
+  await late.scheduler.tick(); assert.deepEqual(late.state.kinds, []);
+  assert.equal(late.state.timers.at(-1).ms, 89_000, 'it wakes exactly when the live hour is due');
+  late.state.clock = at(11, 5); await late.scheduler.tick(); assert.deepEqual(late.state.kinds, ['hour', 'discovery']);
+  assert.equal(late.state.checkpoint, BASE + 10 * H);
+});
+await test('discovery drain: a pass still running at the next live hour is terminated and the live hour runs next', async () => {
+  // Only the first pass hangs (a long or rate-limited pass); later passes finish.
+  const { state, scheduler } = world({ checkpoint: BASE + 9 * H, clock: at(10, 30), discovery: () => true,
+    discoveryBehavior: (_hour, current) => (startsOf(current, 'discovery').length === 1 ? 'hold' : 'repair') });
+  const running = scheduler.tick(); await settle();
+  assert.equal(scheduler.status().runningKind, 'discovery_drain');
+  const deadline = state.timers.find((timer) => timer.ms === 35 * 60_000);
+  assert.ok(deadline, 'the deadline is the next live hour (11:05)');
+  state.clock = at(11, 5); deadline.fn(); await running;
+  assert.equal(state.terminated.length, 1); assert.equal(scheduler.status().lastRun.ok, false); assert.equal(scheduler.status().lastRun.signal, 'SIGTERM');
+  assert.ok(!state.timers.includes(deadline), 'the deadline timer is cleared');
+  assert.equal(state.checkpoint, BASE + 9 * H, 'a terminated pass never moves the checkpoint');
+  await scheduler.tick(); assert.deepEqual(state.kinds, ['discovery', 'hour', 'discovery']); assert.equal(state.checkpoint, BASE + 10 * H);
+  assert.equal(state.maxRunning, 1);
 });
 await test('discovery drain: shutdown terminates the owned child and prevents further work', async () => {
   const { state, scheduler } = world({ checkpoint: BASE + 9 * H, discovery: () => true, discoveryBehavior: () => 'hold' });
