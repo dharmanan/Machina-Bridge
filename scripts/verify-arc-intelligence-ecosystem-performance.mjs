@@ -23,7 +23,7 @@ const address = (n) => `0x${n.toString(16).padStart(40, '0')}`;
 const hash = (n) => `0x${n.toString(16).padStart(64, '0')}`;
 const BASE = Date.parse('2026-09-16T11:00:00.000Z') / 1000;
 export const FIXTURE_SIZE = { hours: 560, unresolvedCandidates: 142562, verifiedTokens: 50, pools: 2000,
-  poolHours: 560000, poolsPerToken: 4 };
+  poolHours: 560000, poolsPerToken: 4, v4Pools: 20 };
 
 export function createPerformanceFixture(path = ':memory:') {
   const db = new DatabaseSync(path), store = createCompactStore(db);
@@ -62,7 +62,7 @@ export function createPerformanceFixture(path = ':memory:') {
       const relevant = i < FIXTURE_SIZE.verifiedTokens * FIXTURE_SIZE.poolsPerToken;
       const token = relevant ? address(800 + Math.floor(i / FIXTURE_SIZE.poolsPerToken)) : address(200000 + i);
       insertPool.run('uniswap_v3_pool', address(500000 + i), 102n, BigInt(i), hash(102),
-        JSON.stringify({ token0: token, token1: '0x3600000000000000000000000000000000000000' }));
+        JSON.stringify({ token0: token, token1: '0x3600000000000000000000000000000000000000', fee: 3000, tickSpacing: 60 }));
       if (relevant) insertObservation.run(BigInt(BASE + 559 * 3600), 'uniswap_v3', address(500000 + i), 'swap', 5695n,
         BigInt(i), BigInt(BASE + 559 * 3600 + 20), hash(5695));
     }
@@ -70,8 +70,16 @@ export function createPerformanceFixture(path = ':memory:') {
       const pool = address(500000 + i % 1000), hourStart = BASE + Math.floor(i / 1000) * 3600;
       insertPoolHour.run(BigInt(hourStart), 'uniswap_v3', pool, 1n, '0', '0', '0', '0', 0n, 0n, 0n, '0', '0', '0', '0');
     }
-    for (let i = 0; i < 560; i++) db.prepare('INSERT INTO compact_projection_hours VALUES(?,?,?,?,?,?)')
-      .run(BigInt(BASE + i * 3600), 'uniswap_v3_pools', 'available', null, 1000n, 'synthetic_fixture');
+    for(let i=0;i<FIXTURE_SIZE.v4Pools;i++) {
+      const pool=hash(600000+i);
+      insertPool.run('uniswap_v4_pool',pool,102n,BigInt(i),hash(102),JSON.stringify({currency0:address(800+i),
+        currency1:'0x3600000000000000000000000000000000000000',hooks:address(0),fee:3000,tickSpacing:60}));
+      for(let hour=0;hour<560;hour++) insertPoolHour.run(BigInt(BASE+hour*3600),'uniswap_v4',pool,1n,
+        '0','0','0','0',0n,0n,0n,null,null,null,null);
+    }
+    for (let i = 0; i < 560; i++) for(const projection of ['uniswap_v3_pools','uniswap_v4_pools'])
+      db.prepare('INSERT INTO compact_projection_hours VALUES(?,?,?,?,?,?)')
+        .run(BigInt(BASE + i * 3600), projection, 'available', null, 1000n, 'synthetic_fixture');
     for (const kind of ['uniswap_v3_pool', 'uniswap_v4_pool']) db.prepare('INSERT INTO compact_registry_coverage VALUES(?,?,?,?)')
       .run(kind, 0n, 5699n, hash(5699));
     db.exec('COMMIT');
@@ -118,6 +126,8 @@ async function workerRegressions(db, expected) {
   let stored,reader,model,server,busyReader;
   try {
     await backup(db,path); stored=new DatabaseSync(path);
+    // The in-memory fixture's backup defaults to rollback journaling; production uses WAL.
+    assert.equal(stored.prepare('PRAGMA journal_mode=WAL').get().journal_mode,'wal');
     const schema=stored.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY type,name').all();
     const dataVersion=stored.prepare('PRAGMA data_version').get().data_version;
     const checkpoint=stored.prepare('SELECT * FROM compact_checkpoint').get();
@@ -139,15 +149,45 @@ async function workerRegressions(db, expected) {
     assert.ok(changed.launches.rows.some(row=>row.symbol==='CHANGED'));
     assert.deepEqual(stored.prepare('SELECT * FROM compact_checkpoint').get(),checkpoint);
     console.log('PASS cache invalidates after another connection commits discovery evidence without checkpoint movement');
+    model=createCompactReadModel({path,DatabaseSync});
+    for(const window of ['24h','7d','30d']) for(const protocol of ['v3','v4']) {
+      const expected=model.pools(protocol,window),at=performance.now();
+      const cold=await reader.readPools(protocol,window),coldMs=performance.now()-at;
+      const warm=await reader.readPools(protocol,window);
+      const withoutFreshness=({freshness,...value})=>value;
+      assert.deepEqual(withoutFreshness(cold),withoutFreshness(expected));
+      assert.deepEqual(withoutFreshness(warm),withoutFreshness(expected));
+      assert.ok(coldMs<3000,`${protocol}/${window} cold pool read ${coldMs}ms`);
+      console.log(JSON.stringify({test:'readonly_pool_worker',protocol,window,coldMs,status:cold.status}));
+    }
+    // A WAL writer remains able to commit while this worker serves reads. This simulates the drain's
+    // independent verification transactions, not a discovery run or a historical scan.
+    const preserveTables=['compact_hours','compact_family_hours','compact_registry','compact_projection_hours','compact_checkpoint',
+      ...schema.filter(row=>row.type==='table'&&row.name.startsWith('compact_evidence_archive')).map(row=>row.name)];
+    const preserved=()=>createHash('sha256').update(JSON.stringify(preserveTables.map(table=>[
+      table,stored.prepare(`SELECT * FROM ${table} ORDER BY 1,2`).all()]))).digest('hex');
+    const preservedBefore=preserved();
+    const duringDrain=reader.read('30d');
+    duringDrain.catch(()=>{}); // Keep a write assertion failure from hiding its cause during reader cleanup.
+    for(let i=0;i<32;i++) stored.prepare("UPDATE compact_token_discoveries SET reason=? WHERE candidate_key=?")
+      .run(`local_drain_commit_${i}`,`fixture-${50+i}`);
+    assert.equal((await duringDrain).schema,'machina.intelligence.ecosystem.v1');
+    const afterDrain=await reader.read('30d');
+    assert.ok(afterDrain.launches.rows.some(row=>row.symbol==='CHANGED'));
+    assert.deepEqual(stored.prepare('SELECT * FROM compact_checkpoint').get(),checkpoint);
+    assert.equal(preserved(),preservedBefore,'canonical, families, registry, projections and archive changed');
+    assert.deepEqual(stored.prepare('SELECT type,name,sql FROM sqlite_master ORDER BY type,name').all(),schema);
+    console.log('PASS 32 local WAL drain-style commits coexist with reads; checkpoint/schema unchanged');
+    model.close();model=null;
     await reader.close(); reader=null;
 
     model=createCompactReadModel({path,DatabaseSync}); model.summary('24h'); model.activity('all');
     let startedResolve; const started=new Promise(resolve=>{startedResolve=resolve;});
     busyReader=createEcosystemReader({path,workerFactory:(_,options)=>{
       const worker=new Worker(`const {parentPort,workerData}=require('node:worker_threads');
-        parentPort.on('message',({window})=>{parentPort.postMessage({started:true});
+        parentPort.on('message',({id,window})=>{parentPort.postMessage({started:true});
           const until=Date.now()+1200; while(Date.now()<until){};
-          parentPort.postMessage({window,value:workerData.value});});`,
+          parentPort.postMessage({id,window,value:workerData.value});});`,
         {...options,eval:true,workerData:{value:changed}});
       worker.on('message',message=>{if(message.started) startedResolve();}); return worker;
     }});
@@ -175,20 +215,23 @@ async function queueRegressions() {
   const workers=[];let live=0,peak=0;
   const reader=createEcosystemReader({path:'/tmp/synthetic-never-opened.sqlite',timeoutMs:40,workerFactory:()=>{
     const worker=new EventEmitter(); workers.push(worker);live++;peak=Math.max(peak,live);
-    worker.postMessage=({window})=>{if(workers.length>1) queueMicrotask(()=>worker.emit('message',{window,value:{window}}));};
+    worker.postMessage=({id,window})=>{if(workers.length>1) queueMicrotask(()=>worker.emit('message',{id,window,value:{window}}));};
     worker.terminate=async()=>{live--;};return worker;
   }});
   try {
     const first=reader.read('30d'); assert.strictEqual(reader.read('30d'),first);
     const queued=reader.read('24h');
     const failures=await Promise.allSettled([first,queued]);
-    assert.ok(failures.every(row=>row.status==='rejected'&&row.reason.code==='ecosystem_read_timeout'));
+    assert.equal(failures[0].status,'rejected'); assert.equal(failures[0].reason.code,'ecosystem_read_timeout');
+    // Its own near-simultaneous deadline can expire, or the fresh worker can finish before it.
+    if(failures[1].status==='fulfilled') assert.deepEqual(failures[1].value,{window:'24h'});
+    else assert.equal(failures[1].reason.code,'ecosystem_read_timeout');
     const next=reader.read('7d'); workers[0].emit('message',{window:'7d',value:'late obsolete response'});
     assert.deepEqual(await next,{window:'7d'});assert.equal(peak,1);
     await assert.rejects(reader.read('1h'),error=>error.code==='unsupported_window');
   } finally {await reader.close();}
   assert.equal(live,0);await assert.rejects(reader.read('24h'),error=>error.code==='ecosystem_reader_closed');
-  console.log('PASS bounded window queue coalesces duplicates; timeout terminates worker, rejects queued work, ignores late replies and recovers');
+  console.log('PASS bounded window queue coalesces duplicates; timeout restarts worker, keeps independent deadlines, ignores late replies and recovers');
 }
 
 async function main() {
@@ -209,7 +252,7 @@ async function main() {
     }
     await workerRegressions(db,expected);
     await queueRegressions();
-    console.log('VERIFIER PASS ecosystem-performance 9 scenarios (three query profiles, three read-only worker/cache windows, invalidation, HTTP isolation, queue recovery)');
+    console.log('VERIFIER PASS ecosystem-performance 16 scenarios (query profiles, worker/cache windows, six pool reads, WAL drain commits, invalidation, HTTP isolation, queue recovery)');
   } finally { db.close(); }
 }
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) await main();

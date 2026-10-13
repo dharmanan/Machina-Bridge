@@ -485,15 +485,35 @@ const WINDOW_REQUESTS: Partial<Record<ArcIntelligenceWindow, { summary: string; 
 
 type FetchLike = (url: string, init: { method: 'GET'; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
   ok: boolean
+  status?: number
   json(): Promise<unknown>
 }>
 
+class IntelligenceHttpError extends Error {
+  constructor(readonly status: number | undefined) { super('intelligence_unavailable') }
+}
+
 async function fetchObject(url: string, fetchImpl: FetchLike, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const response = await fetchImpl(url, { method: 'GET', headers: { accept: 'application/json' }, signal })
-  if (!response.ok) throw new Error('intelligence_unavailable')
+  if (!response.ok) throw new IntelligenceHttpError(response.status)
   const payload: unknown = await response.json()
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('intelligence_unavailable')
   return payload as Record<string, unknown>
+}
+
+// One retry for an actual transient HTTP 503, never for malformed evidence or a cancelled window.
+async function readDashboardObject(url: string, request: FetchLike, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  try { return await fetchObject(url, request, signal) } catch (error) {
+    if (!(error instanceof IntelligenceHttpError) || error.status !== 503 || signal?.aborted) throw error
+  }
+  await new Promise<void>((resolve, reject) => {
+    const cancel = () => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); reject(new Error('refresh_cancelled')) }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve() }, 250)
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
+  })
+  if (signal?.aborted) throw new Error('refresh_cancelled')
+  return fetchObject(url, request, signal)
 }
 
 // Exact shape checks for pools.v1 and activity.v1: a single malformed field makes the whole answer null (fail closed).
@@ -633,18 +653,29 @@ export async function loadArcIntelligence(
   const requests = ARC_INTELLIGENCE_BACKEND_WINDOWS[selected] ? WINDOW_REQUESTS[selected] : undefined
   if (!requests) return { window: selected, summary: null, timeseries: null, failed: false }
   const request = fetchImpl ?? (fetch as unknown as FetchLike)
-  const read = (url: string) => fetchObject(url, request, signal)
+  const read = (url: string) => readDashboardObject(url, request, signal)
   const urls = [requests.summary, requests.timeseries, requests.poolsV3, requests.poolsV4, requests.ecosystem,
     ...ARC_ACTIVITY_TYPES.map((type) => ACTIVITY_REQUESTS[type])]
   const settled: PromiseSettledResult<Record<string, unknown>>[] = new Array(urls.length)
   let cursor = 0
-  // Long-window SQLite reads share one server event loop. Avoid a nine-request burst on every refresh.
+  let heavyTail = Promise.resolve()
+  const heavyRead = async (url: string) => {
+    const prior = heavyTail
+    let release!: () => void
+    heavyTail = new Promise<void>((resolve) => { release = resolve })
+    await prior
+    try {
+      if (signal?.aborted) throw new Error('refresh_cancelled')
+      return await read(url)
+    } finally { release() }
+  }
+  // Two GETs at most, but never overlap cold V3/V4/Ecosystem reads. A retry retains its lane.
   await Promise.all([0, 1].map(async () => {
     while (cursor < urls.length) {
       const index = cursor++
       try {
         if (signal?.aborted) throw new Error('refresh_cancelled')
-        settled[index] = { status: 'fulfilled', value: await read(urls[index]) }
+        settled[index] = { status: 'fulfilled', value: await (index >= 2 && index <= 4 ? heavyRead(urls[index]) : read(urls[index])) }
       } catch (reason) { settled[index] = { status: 'rejected', reason } }
     }
   }))

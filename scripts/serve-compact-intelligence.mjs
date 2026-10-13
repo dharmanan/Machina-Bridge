@@ -136,8 +136,9 @@ async function main() {
     runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair, runDiscoveryRecovery,
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
   });
-  const ecosystemReader = createEcosystemReader({ path: config.sqlitePath });
+  const ecosystemReader = createEcosystemReader({ path: config.sqlitePath, log });
   const httpReadModel = { ...readModel, ecosystem: (window) => ecosystemReader.read(window),
+    pools: (protocol, window) => ecosystemReader.readPools(protocol, window),
     async close() { await recoveryPlanner?.close(); await ecosystemReader.close(); readModel.close(); } };
   const server = createIntelligenceServer({ readModel: httpReadModel, log, onFatal: fatal });
   service = startIntelligenceService({ config, readModel: httpReadModel, scheduler, server, log });

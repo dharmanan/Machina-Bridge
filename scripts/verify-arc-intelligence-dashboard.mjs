@@ -2603,6 +2603,70 @@ await test('Refresh 1 success validates each section independently and limits co
   }
 });
 
+await test('Refresh 10 first load serializes heavy sections in 24H/7D/30D without losing any API section', async () => {
+  for (const window of ['24h', '7d', '30d']) {
+    let heavy = 0, heavyPeak = 0, total = 0, totalPeak = 0;
+    const serve = refreshFetch(refreshFixture(window));
+    const result = await lib.loadArcIntelligence(window, { fetchImpl: async (url, init) => {
+      const view = new URL(url, 'https://fixture.invalid').searchParams.get('view');
+      const expensive = view === 'pools' || view === 'ecosystem';
+      total++; totalPeak = Math.max(totalPeak, total);
+      if (expensive) { heavy++; heavyPeak = Math.max(heavyPeak, heavy); }
+      await new Promise(resolve => setImmediate(resolve));
+      if (expensive) heavy--; total--;
+      return serve(url, init);
+    } });
+    assert.equal(heavyPeak, 1); assert.equal(totalPeak, 2);
+    for (const section of lib.ARC_READ_SECTIONS) assert.ok(refreshSection(result, section), `${window}:${section}`);
+  }
+});
+
+await test('Refresh 11 first-load Ecosystem and V4 HTTP 503 retry once and recover in all windows', async () => {
+  for (const window of ['24h', '7d', '30d']) {
+    const counts = new Map(), serve = refreshFetch(refreshFixture(window));
+    const result = await lib.loadArcIntelligence(window, { fetchImpl: async (url, init) => {
+      const n = (counts.get(url) ?? 0) + 1; counts.set(url, n);
+      const query = new URL(url, 'https://fixture.invalid').searchParams;
+      if (n === 1 && (query.get('view') === 'ecosystem' || query.get('protocol') === 'v4')) {
+        return { ok: false, status: 503, json: async () => { throw Error('error body must not be parsed'); } };
+      }
+      return serve(url, init);
+    } });
+    assert.equal([...counts.values()].reduce((a, b) => a + b, 0), 11);
+    assert.ok(result.ecosystem); assert.ok(result.pools.v4);
+    assert.deepEqual(result.readErrors, {});
+  }
+});
+
+await test('Refresh 12 persistent 503 is bounded; validation and other HTTP failures never trigger extra reads', async () => {
+  for (const status of [503, 502, 500]) {
+    const counts = new Map(), serve = refreshFetch(refreshFixture());
+    const result = await lib.loadArcIntelligence('24h', { fetchImpl: async (url, init) => {
+      counts.set(url, (counts.get(url) ?? 0) + 1);
+      if (url.includes('view=ecosystem')) return { ok: false, status, json: async () => ({}) };
+      return serve(url, init);
+    } });
+    assert.equal(counts.get(lib.ARC_INTELLIGENCE_REQUESTS.ecosystem24h), status === 503 ? 2 : 1);
+    assert.equal(result.ecosystem, null); assert.ok(result.pools.v4); assert.ok(result.summary);
+  }
+  let calls = 0;
+  const malformed = await lib.loadArcIntelligence('24h', { fetchImpl: refreshFetch(refreshFixture(), (section, body) => {
+    if (section === 'ecosystem') { calls++; return { ...body, schema: 'wrong' }; } return body;
+  }) });
+  assert.equal(calls, 1); assert.equal(malformed.readErrors.ecosystem, 'invalid_response');
+});
+
+await test('Refresh 13 abort during HTTP 503 backoff does not issue a retry or remaining queued GETs', async () => {
+  const controller = new AbortController(); let calls = 0;
+  const result = await lib.loadArcIntelligence('30d', { signal: controller.signal, fetchImpl: async () => {
+    calls++;
+    if (calls === 1) setImmediate(() => controller.abort());
+    return { ok: false, status: 503, json: async () => ({}) };
+  } });
+  assert.equal(calls, 2); assert.equal(result.failed, true);
+  assert.equal(result.ecosystem, null); assert.equal(result.pools.v4, null);
+});
+
 await test('Refresh 2 a failed 30D reload preserves every verified section and shows stale response timestamps', async () => {
   const previous = lib.retainArcIntelligenceLoad(undefined, refreshFixture('30d'), refreshTime);
   const failure = await lib.loadArcIntelligence('30d', { fetchImpl: async () => { throw new TypeError('offline'); } });

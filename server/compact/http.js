@@ -44,6 +44,8 @@ const KNOWN_PATHS = new Set([
 ]);
 // Read-model failures that may be named publicly; everything else is reported as `unavailable`.
 const PUBLIC_READ_ERRORS = new Set(['not_ready']);
+const READ_DIAGNOSTICS = new Set(['pool_registry_missing', 'pool_registry_metadata_malformed', 'pool_tvl_malformed',
+  'packed_set_missing', 'checkpoint_not_contiguous', 'ERR_SQLITE_ERROR']);
 
 function headerValue(value) {
   return Array.isArray(value) ? value.join(',') : value;
@@ -74,20 +76,25 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
     res.end(text);
   }
 
-  function readFailed(error, res) {
+  function readFailed(error, res, route, started) {
     const code = error?.code;
     if (code === 'incompatible') onFatal?.(error);
-    log(`HTTP_READ_FAILED code=${typeof code === 'string' ? code : 'unknown'}`);
+    const safeCode = typeof code === 'string' && /^[a-z_]{1,64}$/.test(code) ? code : 'unknown';
+    const detail = READ_DIAGNOSTICS.has(error?.detail) ? error.detail : 'unknown';
+    log(`HTTP_READ_FAILED code=${safeCode} route=${route?.kind ?? 'unknown'} protocol=${route?.protocol ?? 'none'}`
+      + ` window=${route?.window ?? 'none'} elapsedMs=${Math.round(performance.now() - started)} detail=${detail}`);
     try { return send(res, 503, { error: PUBLIC_READ_ERRORS.has(code) ? code : 'unavailable' }); }
     catch { res.destroy(); }
   }
 
   return function handle(req, res) {
+    let route;
+    const started = performance.now();
     try {
       const raw = req.url;
       if (typeof raw !== 'string' || !raw.startsWith('/')) return send(res, 400, { error: 'bad_request' });
       if (raw.length > MAX_URL_LENGTH) return send(res, 414, { error: 'uri_too_long' });
-      const route = ROUTES.get(raw);
+      route = ROUTES.get(raw);
       if (!route) {
         const path = raw.split('?', 1)[0];
         return KNOWN_PATHS.has(path) ? send(res, 400, { error: 'bad_request' }) : send(res, 404, { error: 'not_found' });
@@ -110,7 +117,7 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
         const text = JSON.stringify(payload);
         const bytes = Buffer.byteLength(text);
         if (bytes > maxResponseBytes) {
-          log(`HTTP_RESPONSE_TOO_LARGE route=${route.kind} bytes=${bytes}`);
+          log(`HTTP_RESPONSE_TOO_LARGE route=${route.kind} protocol=${route.protocol ?? 'none'} window=${route.window ?? 'none'} bytes=${bytes}`);
           return send(res, 503, { error: 'response_too_large' });
         }
         if (route.kind === 'health') {
@@ -129,13 +136,13 @@ export function createIntelligenceHandler({ readModel, authorize = null, onFatal
           'Referrer-Policy': 'no-referrer', ...cacheHeaders });
         return res.end(text);
       };
-      // Production Ecosystem uses a bounded read-only worker. Other routes remain synchronous and independent.
+      // Production Ecosystem and pools share the existing bounded read-only worker.
       if (payload && typeof payload.then === 'function') return payload.then((value) => {
-        try { return deliver(value); } catch (error) { return readFailed(error, res); }
-      }, (error) => readFailed(error, res));
+        try { return deliver(value); } catch (error) { return readFailed(error, res, route, started); }
+      }, (error) => readFailed(error, res, route, started));
       return deliver(payload);
     } catch (error) {
-      return readFailed(error, res);
+      return readFailed(error, res, route, started);
     }
   };
 }
