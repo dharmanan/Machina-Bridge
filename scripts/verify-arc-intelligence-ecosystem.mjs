@@ -1,5 +1,5 @@
 // No network. Codespace Node 24 acceptance, real in-memory node:sqlite; no production file or provider is opened.
-import { boundEcosystemResponse } from '../server/compact/intelligence-store.js';
+import { boundEcosystemResponse, summarizeTokenRow } from '../server/compact/intelligence-store.js';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
@@ -817,6 +817,114 @@ await test('incremental byte budgeting preserves legacy trimming exactly, includ
         truncated: variant % 2 === 0, ...(variant % 3 ? {} : { reason: 'initial_reason' }) }])) };
     assert.deepEqual(boundEcosystemResponse(structuredClone(out)), reference(structuredClone(out)));
   }
+});
+// Production shape (Preview, 2026-10-13: every window returned 1 discovered token and 41 launches, bounded_response_limit):
+// launchpad tokens with factory provenance and stored pools take about 4.6 KB per row, and each appears in both lists.
+function launchpadFixture({ tokens = 60, pools = 2, pending = 60 } = {}) {
+  const { db, store } = fixture(); for (let i = 0; i < 24; i++) store.commitHour(hour(i));
+  const entry = INTELLIGENCE_REGISTRY.launches[0], spec = entry.events[0];
+  const discovery = db.prepare(`INSERT INTO compact_token_discoveries(candidate_key,hour_start,block_number,address,candidate_json,status,result_json)
+    VALUES (?,?,?,?,?,?,?)`);
+  const observation = db.prepare('INSERT INTO compact_token_dex_observations VALUES (?,?,?,?,?,?,?,?)');
+  for (let n = 0; n < tokens; n++) {
+    const i = n % 24, blockNumber = 101 + i * 10 + Math.floor(n / 24) * 2, readBlock = 109 + i * 10, token = address(0xa000 + n);
+    const source = { key: hash(0x7000 + n), kind: 'source', address: token, txHash: hash(0x7000 + n), blockNumber, blockHash: hash(blockNumber),
+      timestamp: BASE + i * 3600 + 30 + n, transactionIndex: 3, caller: address(0xc000 + n), deployer: null, readBlock,
+      launchEvidence: { emitter: entry.addresses[0], version: entry.version, logIndex: 7, eventSignature: spec.event.signature,
+        creator: address(0xc000 + n), codeVerified: false } };
+    const result = { ...source, status: 'verified_erc20_like', reason: null, symbol: `L${n}`, name: `Launch ${n}`, decimals: 18,
+      directDeploymentVerified: false, verification: { basis: 'historical_code_totalSupply_balanceOf_with_negative_control',
+        blockTag: `0x${readBlock.toString(16)}`, scope: 'erc20_like_not_full_standard_or_proxy_identity' },
+      launchEvidence: { ...source.launchEvidence, codeVerified: true, factoryEvidence: { blockTag: `0x${readBlock.toString(16)}`, status: 'verified',
+        codePresent: true, eventTopic: spec.event.topic, eventTopicInBytecode: true, viewVerified: true, viewResult: null, reason: null } } };
+    result.launch = classifyLaunch(result, INTELLIGENCE_REGISTRY);
+    assert.equal(result.launch.status, 'verified_launchpad');
+    discovery.run(source.key, BigInt(BASE + i * 3600), BigInt(blockNumber), token, JSON.stringify(source), 'verified_erc20_like', JSON.stringify(result));
+    for (let p = 0; p < pools; p++) {
+      const pool = hash(0xd0000 + n * 64 + p), created = blockNumber + 1, tx = hash(0xe0000 + n * 64 + p);
+      db.prepare('INSERT INTO compact_registry VALUES(?,?,?,?,?,?)').run('uniswap_v4_pool', pool, BigInt(created), BigInt(p), tx,
+        JSON.stringify({ currency0: address(0), currency1: token, fee: 3000, tickSpacing: 60, hooks: address(0) }));
+      for (const [activity, offset] of [['creation', 0], ['liquidity', 1], ['swap', 2]]) observation.run(BigInt(BASE + i * 3600), 'uniswap_v4', pool, activity,
+        BigInt(created + offset), BigInt(offset), BigInt(BASE + i * 3600 + 40 + n + offset), offset ? hash(0xf0000 + n * 64 + p * 4 + offset) : tx);
+    }
+  }
+  for (const kind of ['uniswap_v3_pool', 'uniswap_v4_pool']) db.prepare('INSERT INTO compact_registry_coverage VALUES(?,?,?,?)').run(kind, 0n, 10n ** 9n, hash(1));
+  for (let n = 0; n < pending; n++) {
+    const i = n % 24, blockNumber = 102 + i * 10 + (n % 2) * 4;
+    discovery.run(hash(0x9000 + n), BigInt(BASE + i * 3600), BigInt(blockNumber), null, JSON.stringify({ key: hash(0x9000 + n), kind: 'creation', address: null,
+      txHash: hash(0x9000 + n), blockNumber, blockHash: hash(blockNumber), timestamp: BASE + i * 3600 + 500 + n, transactionIndex: 1,
+      deployer: address(0xb000 + n), readBlock: 109 + i * 10 }), 'pending', null);
+  }
+  return db;
+}
+const launchpadEcosystem = (db, window) => readModel(db, window, { registry: INTELLIGENCE_REGISTRY });
+await test('production-shaped launch evidence never shrinks verified lists to one record in any window', () => {
+  for (const pools of [2, 50]) {
+    const db = launchpadFixture({ pools });
+    try {
+      for (const window of ['24h', '7d', '30d']) {
+        const data = launchpadEcosystem(db, window), label = `${pools} pools ${window}`;
+        assert.ok(Buffer.byteLength(JSON.stringify(data)) <= 240 * 1024, label);
+        assert.deepEqual(data.discoveredTokens.rows.map((row) => row.address), data.launches.rows.map((row) => row.address));
+        for (const name of ['discoveredTokens', 'launches']) {
+          const list = data[name];
+          // 60 verified tokens: the 50-row cap holds (truncated), and no further row is lost to the byte cap.
+          assert.equal(list.rows.length, 50, `${label} ${name}`); assert.equal(list.truncated, true); assert.equal(list.reason, 'bounded_response_limit');
+          assert.deepEqual(list.rows.map((row) => row.observedBlock), [...list.rows.map((row) => row.observedBlock)].sort((a, b) => b - a));
+          const first = list.rows.findIndex((row) => row.evidence);
+          assert.ok(first >= (pools === 2 ? 1 : 0), `${label} ${name}: newest rows keep full evidence where it fits`);
+          assert.ok(list.rows.slice(first).every((row) => row.evidence?.status === 'summary'), 'only the oldest rows are shortened');
+          for (const row of list.rows) {
+            assert.equal(row.status, 'verified_erc20_like'); assert.equal(row.launch.status, 'verified_launchpad');
+            assert.equal(row.launch.source, 'argus'); assert.equal(typeof row.launch.observedAt, 'string');
+            if (!row.evidence) { assert.equal(row.dex.observedPools.length, pools); assert.ok(row.launch.provenance); continue; }
+            const n = parseInt(row.address.slice(2), 16) - 0xa000;
+            assert.equal(row.launch.provenance, undefined); assert.equal(row.dex.firstPool, null); assert.deepEqual(row.dex.observedPools, []);
+            assert.deepEqual(row.dex.poolSummary, { observedPoolCount: pools, firstVerified: true, first: { protocol: 'uniswap_v4',
+              pool: hash(0xd0000 + n * 64), creationBlock: row.observedBlock + 1, creationTimestamp: new Date((BASE + (n % 24) * 3600 + 40 + n) * 1000).toISOString() } });
+            assert.equal(row.dex.firstDexActivity.firstObserved.blockNumber, row.observedBlock + 2);
+          }
+        }
+        assert.equal(data.contractCandidates.rows.length, 1); assert.equal(data.contractCandidates.truncated, true);
+      }
+    } finally { db.close(); }
+  }
+  // Under the byte cap nothing is shortened or marked.
+  const db = launchpadFixture({ pools: 0 });
+  try {
+    const data = launchpadEcosystem(db, '24h');
+    for (const name of ['discoveredTokens', 'launches']) {
+      assert.equal(data[name].rows.length, 50); assert.equal(data[name].reason, undefined);
+      assert.ok(data[name].rows.every((row) => row.evidence === undefined && row.dex.poolSummary === undefined && row.launch.provenance));
+    }
+    assert.equal(data.contractCandidates.rows.length, 50);
+  } finally { db.close(); }
+});
+await test('a shortened verified row keeps every identity, time and first activity field of its full row', () => {
+  const db = launchpadFixture({ tokens: 1, pools: 3, pending: 0 });
+  try {
+    const full = launchpadEcosystem(db, '24h').launches.rows[0], before = structuredClone(full);
+    assert.equal(full.evidence, undefined); assert.equal(full.dex.status, 'available');
+    const summary = summarizeTokenRow(full);
+    assert.deepEqual(full, before, 'the full row, which both lists may share, is never modified');
+    assert.deepEqual(Object.keys(summary).sort(), [...Object.keys(full), 'evidence'].sort());
+    for (const key of ['address', 'status', 'reason', 'verifiedAsset', 'symbol', 'name', 'decimals', 'discoveredAt', 'observedBlock', 'deployment', 'verification']) {
+      assert.deepEqual(summary[key], full[key], key);
+    }
+    const launch = { ...full.launch }; delete launch.provenance;
+    assert.deepEqual(summary.launch, launch);
+    const { firstPool, observedPools, firstDexActivity, ...dex } = full.dex;
+    assert.deepEqual(summary.dex, { ...dex, firstPool: null, observedPools: [], firstDexActivity: { status: firstDexActivity.status,
+      reason: firstDexActivity.reason, firstObserved: firstDexActivity.firstObserved }, poolSummary: { observedPoolCount: observedPools.length,
+      firstVerified: true, first: { protocol: firstPool.protocol, pool: firstPool.pool, creationBlock: firstPool.creationBlock, creationTimestamp: firstPool.creationTimestamp } } });
+    assert.deepEqual(summary.evidence, { status: 'summary', reason: 'bounded_response_limit' });
+    // An observed first pool of an incomplete registry is never promoted; no pool at all invents nothing.
+    const partial = summarizeTokenRow({ ...full, dex: { ...full.dex, status: 'insufficient_coverage', reason: 'pool_registry_history_incomplete_or_limit', firstPool: null } });
+    assert.equal(partial.dex.poolSummary.firstVerified, false); assert.equal(partial.dex.poolSummary.first.pool, observedPools[0].pool);
+    const none = summarizeTokenRow({ ...full, dex: { status: 'unavailable', reason: 'no_verified_pool', firstPool: null, observedPools: [] } });
+    assert.deepEqual(none.dex, { status: 'unavailable', reason: 'no_verified_pool', firstPool: null, observedPools: [],
+      poolSummary: { observedPoolCount: 0, firstVerified: false, first: null } });
+  } finally { db.close(); }
 });
 await test('thin candidate selection preserves earliest identity scope and verified preference in every window', async () => {
   const { db, store } = fixture();

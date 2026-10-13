@@ -18,6 +18,7 @@ import { ACTIVITY_SCHEMA, DATA_CACHE_CONTROL, ECOSYSTEM_SCHEMA, NO_STORE, POOLS_
 import { ECOSYSTEM_SCHEMA as BACKEND_ECOSYSTEM_SCHEMA } from '../server/compact/intelligence-registry.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { decodeAbiText } from '../server/compact/token-metadata.js';
+import { summarizeTokenRow } from '../server/compact/intelligence-store.js';
 import { ACTIVITY_SCHEMA as BACKEND_ACTIVITY_SCHEMA, POOLS_SCHEMA as BACKEND_POOLS_SCHEMA, SUMMARY_SCHEMA as BACKEND_SUMMARY_SCHEMA,
   TIMESERIES_SCHEMA as BACKEND_TIMESERIES_SCHEMA } from '../server/compact/read-model.js';
 
@@ -2306,6 +2307,61 @@ await test('Ecosystem schema accepts every token symbol the backend decoder retu
   const evidence = byAttr(harness.draw().tree, 'data-token-evidence', body.launches.rows[0].address)[0];
   const line = evidence && [...walk(evidence)].find(node => node.tag === 'p' && textOf(node).includes(longest));
   assert.ok(line, 'long symbol shown in the evidence'); assert.match(line.attrs.class, /\[overflow-wrap:anywhere\]/);
+});
+// The API shortens verified rows to fit its byte cap (summarizeTokenRow in server/compact/intelligence-store.js): they keep
+// their place, identity, launch time and first pool; the page says what was left out and never reads it as missing.
+const summarizedEcosystem = (window) => {
+  const body = missingActivityEcosystem(window);
+  for (const list of [body.discoveredTokens, body.launches]) list.rows = list.rows.map((row, i) => i === 0 || i >= 3 ? summarizeTokenRow(row) : row);
+  return body;
+};
+await test('Ecosystem summary rows keep their place in every window and say which evidence was left out', async () => {
+  for (const window of ['24h', '7d', '30d']) {
+    const parsed = lib.parseArcEcosystem(summarizedEcosystem(window), window);
+    assert.ok(parsed, window); assert.equal(parsed.discoveredTokens.rows.length, 19); assert.equal(parsed.launches.rows.length, 50);
+  }
+  const body = summarizedEcosystem('30d'), parsed = lib.parseArcEcosystem(body, '30d');
+  const [verifiedFirst, , none, , observed] = body.launches.rows;
+  assert.equal(verifiedFirst.dex.poolSummary.firstVerified, true); assert.equal(observed.dex.poolSummary.firstVerified, false);
+  const harness = tokenListHarness('launches', parsed), list = textOf(harness.draw().tree);
+  assert.match(list, /Showing 50 launches \(list is capped\)/);
+  assert.match(list, /Pool-by-pool and launch source evidence is left out for 48 of these records to keep the response small/);
+  const cell = (row) => textOf(byAttr(harness.draw().tree, 'data-launch-token', row.address)[0]);
+  assert.match(cell(verifiedFirst), /Verified first pool/); assert.match(cell(observed), /Observed pool/); assert.match(cell(none), /Not observed/);
+  assert.match(cell(observed), /First observed activity/);
+  harness.expand(verifiedFirst.address);
+  const evidence = byAttr(harness.draw().tree, 'data-token-evidence', verifiedFirst.address)[0], text = textOf(evidence);
+  assert.match(text, /First verified pool/); assert.match(text, new RegExp(verifiedFirst.dex.poolSummary.first.pool));
+  assert.match(text, /left out for this record to keep the response small \(1 observed pool\)/);
+  assert.equal(byAttr(evidence, 'data-token-evidence-summary', 'bounded_response_limit').length, 1);
+  assert.equal([...walk(evidence)].filter((node) => node.tag === 'details').length, 0, 'no pool or launch source evidence is shown as present');
+  assert.doesNotMatch(text, /No verified pool record is stored/);
+  const full = missingActivityEcosystem('30d');
+  assert.equal(byAttr(tokenListHarness('launches', lib.parseArcEcosystem(full, '30d')).draw().tree, 'data-token-list-summarized').length, 0);
+});
+await test('Ecosystem schema rejects summary rows that hide, add or contradict evidence', async () => {
+  const pool = (body) => structuredClone(body.launches.rows[1].dex.observedPools[0]);
+  const mutations = [
+    (row) => row.evidence.status = 'full', (row) => row.evidence.reason = 'other', (row) => row.evidence = 'summary',
+    (row, body) => row.dex.firstPool = pool(body), (row, body) => row.dex.observedPools = [pool(body)], (row) => row.launch.provenance = {},
+    (row) => delete row.dex.poolSummary, (row) => row.dex.poolSummary.observedPoolCount = 51, (row) => row.dex.poolSummary.observedPoolCount = 1.5,
+    (row) => row.dex.poolSummary.observedPoolCount = 0, (row) => row.dex.poolSummary.firstVerified = true,
+    (row) => row.dex.poolSummary.firstVerified = 'yes', (row) => row.dex.poolSummary.first = null,
+    (row) => row.dex.poolSummary.first.pool = 'guessed', (row) => row.dex.poolSummary.first.pool = `0x${'12'.repeat(20)}`,
+    (row) => row.dex.poolSummary.first.creationBlock = -1, (row) => row.dex.poolSummary.first.creationTimestamp = 'invalid',
+  ];
+  for (const window of ['24h', '7d', '30d']) for (const list of ['discoveredTokens', 'launches']) {
+    for (const mutate of mutations) {
+      const body = summarizedEcosystem(window); mutate(body[list].rows[4], body);
+      assert.equal(lib.parseArcEcosystem(body, window), null, `${window} ${list}: ${mutate}`);
+    }
+    const added = summarizedEcosystem(window); added[list].rows[1].dex.poolSummary = structuredClone(added[list].rows[4].dex.poolSummary);
+    assert.equal(lib.parseArcEcosystem(added, window), null, 'a full row never carries a summary');
+    const invented = summarizedEcosystem(window), rows = invented[list].rows;
+    rows[2] = summarizeTokenRow(rows[2]); assert.ok(lib.parseArcEcosystem(structuredClone(invented), window));
+    rows[2].dex.poolSummary.first = structuredClone(rows[4].dex.poolSummary.first);
+    assert.equal(lib.parseArcEcosystem(invented, window), null, 'no observed pool never gains one');
+  }
 });
 
 // Drive the actual list's hook state and native button handlers without external network or a DOM dependency.

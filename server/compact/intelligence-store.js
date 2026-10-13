@@ -324,25 +324,55 @@ export function readEcosystem(db, windowKey, { registry = INTELLIGENCE_REGISTRY 
       : exchangeComplete ? null : 'insufficient_coverage', definitions: registry.exchanges, unit: 'per_asset_raw',
       rows: exchangeComplete ? sumExchange(exchangeBuckets) : null, buckets: exchangeBuckets } };
   // Existing per-list caps still apply. An unresolved queue or duplicate discovery details must not blank proven
-  // launches when the combined response exceeds the byte cap. Keep explicit truncated lists, oldest rows last.
+  // launches when the combined response exceeds the byte cap: verified rows shed detail before any row is dropped.
   return boundEcosystemResponse(out) ?? empty('bounded_response_limit');
 }
 
+// The list form of a verified row in a response that would exceed its byte cap: identity, deployment, launch type and
+// time, DEX status, the first pool's identity and the first observed activity, all unchanged. Pool-by-pool evidence and
+// launch-source provenance are left out (one pool alone is about 1.1 KB) and the row says so; nothing is guessed.
+export function summarizeTokenRow(row) {
+  const launch = { ...row.launch }; delete launch.provenance;
+  const { firstPool = null, observedPools = [], firstDexActivity, ...dex } = row.dex;
+  const first = firstPool ?? observedPools[0] ?? null;
+  return { ...row, launch, dex: { ...dex, firstPool: null, observedPools: [],
+    ...(firstDexActivity ? { firstDexActivity: { status: firstDexActivity.status, reason: firstDexActivity.reason, firstObserved: firstDexActivity.firstObserved } } : {}),
+    poolSummary: { observedPoolCount: observedPools.length, firstVerified: firstPool !== null, first: first && { protocol: first.protocol, pool: first.pool,
+      creationBlock: first.creationBlock, creationTimestamp: first.creationTimestamp } } },
+    evidence: { status: 'summary', reason: 'bounded_response_limit' } };
+}
+
 export function boundEcosystemResponse(out) {
+  const LIMIT = 240 * 1024;
   const bytes = (value) => Buffer.byteLength(intelligenceJson(value));
+  const header = (list) => bytes({ ...list, rows: [] });
   let total = bytes(out);
-  // Give proven launches priority, preserve at least one row from each non-empty collection, never invent completeness.
-  for (const name of ['contractCandidates', 'discoveredTokens', 'launches']) {
+  // One change to a list's rows (its byte delta) and the list marked bounded, keeping the running total exact.
+  const edit = (list, change) => {
+    const before = header(list);
+    total += change(); list.reason = 'bounded_response_limit';
+    total += header(list) - before;
+  };
+  // Never invent completeness: a dropped row marks its list truncated, and at least one row of each list is kept.
+  const drop = (name) => {
     const list = out[name];
-    let header = bytes({ ...list, rows: [] });
-    while (total > 240 * 1024 && list.rows.length > 1) {
-      total -= bytes(list.rows.pop()) + 1; // One serialized row and its comma, retaining at least one row.
-      list.truncated = true; list.reason = 'bounded_response_limit';
-      const changed = bytes({ ...list, rows: [] });
-      total += changed - header; header = changed;
+    while (total > LIMIT && list.rows.length > 1) edit(list, () => { list.truncated = true; return -(bytes(list.rows.pop()) + 1); });
+  };
+  drop('contractCandidates');
+  // Verified rows then keep their place and shed only detail (summarizeTokenRow): oldest first, discovered tokens before
+  // proven launches at each position, so neither list collapses to one record while the newest keep full evidence.
+  const verified = [out.discoveredTokens, out.launches];
+  for (let index = Math.max(0, ...verified.map((list) => list.rows.length)) - 1; index >= 0 && total > LIMIT; index--) {
+    for (const list of verified) {
+      const row = list.rows[index];
+      if (total <= LIMIT || !row || row.evidence || !row.dex || typeof row.dex !== 'object' || !row.launch || typeof row.launch !== 'object') continue;
+      edit(list, () => { const summary = summarizeTokenRow(row); list.rows[index] = summary; return bytes(summary) - bytes(row); });
     }
   }
-  return total > 240 * 1024 ? null : out;
+  // Last resort, as before: drop the oldest rows, discovered tokens before proven launches.
+  drop('discoveredTokens');
+  drop('launches');
+  return total > LIMIT ? null : out;
 }
 
 export function sumProtocols(buckets) {

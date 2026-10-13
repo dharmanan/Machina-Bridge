@@ -327,12 +327,16 @@ export type DiscoveryActivity = { status: 'unavailable'; reason: 'activity_not_s
 export type DiscoveryPool = { protocol: string; pool: string; pairedToken: string; creationBlock: number;
   creationTimestamp: string | null; creationTxHash: string; firstSwap: DiscoveryActivity; firstLiquidity: DiscoveryActivity;
   earlyActivity: { status: string; reason: string | null; hourStart: string | null; swapCount: number | null; basis: string } }
+// The first pool's identity in a row the API shortened to fit its byte cap (evidence.status 'summary').
+export type DiscoveryPoolIdentity = { protocol: string; pool: string; creationBlock: number; creationTimestamp: string | null }
 export type DiscoveredToken = { address: string; status: 'verified_erc20_like'; verifiedAsset: false; symbol: string | null;
   name: string | null; decimals: number | null; discoveredAt: string; observedBlock: number;
   deployment: { status?: string; reason?: string; timestamp?: string; transactionHash?: string; blockNumber?: number; deployer?: string };
   launch: { status: string; source: string | null; reason?: string; provenance?: unknown; observedAt?: string };
   dex: { status: string; reason?: string; firstPool?: DiscoveryPool | null; observedPools?: DiscoveryPool[];
-    firstDexActivity?: { status: string; reason: string | null; firstObserved: { timestamp: string; blockNumber: number; txHash: string; firstProven: boolean } | null } } }
+    poolSummary?: { observedPoolCount: number; firstVerified: boolean; first: DiscoveryPoolIdentity | null };
+    firstDexActivity?: { status: string; reason: string | null; firstObserved: { timestamp: string; blockNumber: number; txHash: string; firstProven: boolean } | null } };
+  evidence?: { status: 'summary'; reason: 'bounded_response_limit' } }
 export type ArcEcosystem = { schema: typeof ECOSYSTEM_SCHEMA; window: IntelligenceWindow;
   coverage: { status: string; reason?: string; requiredHours: number; availableHours: number; unresolvedCandidateCount?: number;
     candidateVerificationComplete?: boolean };
@@ -379,6 +383,15 @@ export function parseArcEcosystem(value: Record<string, unknown> | null, selecte
     && count(value.creationBlock) && hash(value.creationTxHash) && activity(value.firstSwap) && activity(value.firstLiquidity)
     && isRecord(value.earlyActivity) && typeof value.earlyActivity.status === 'string'
     && (value.earlyActivity.swapCount === null || count(value.earlyActivity.swapCount))
+  const poolIdentity = (value: unknown) => isRecord(value) && (value.protocol === 'uniswap_v3' || value.protocol === 'uniswap_v4')
+    && typeof value.pool === 'string' && (value.protocol === 'uniswap_v3' ? /^0x[0-9a-f]{40}$/ : /^0x[0-9a-f]{64}$/).test(value.pool)
+    && count(value.creationBlock) && (value.creationTimestamp === null || date(value.creationTimestamp))
+  // A row the API shortened to fit its byte cap carries no pool-by-pool or launch-source evidence and says so. Its first
+  // pool is verified only where the full row's would be (dex status 'available'); no pool at all means none observed.
+  const poolSummary = (value: unknown, dexStatus: unknown) => isRecord(value) && count(value.observedPoolCount)
+    && (value.observedPoolCount as number) <= 50 && typeof value.firstVerified === 'boolean'
+    && (value.first === null ? value.observedPoolCount === 0 && value.firstVerified === false
+      : (value.observedPoolCount as number) > 0 && poolIdentity(value.first) && (value.firstVerified === false || dexStatus === 'available'))
   if (!count(data.coverage.availableHours) || !count(data.coverage.requiredHours) || data.coverage.requiredHours > 720
     || data.coverage.availableHours > data.coverage.requiredHours || !date(data.window.start) || !date(data.window.end)) return null
   const validTokens = (rows: unknown) => Array.isArray(rows) && rows.length <= 50 && rows.every((row) => isRecord(row)
@@ -403,7 +416,11 @@ export function parseArcEcosystem(value: Record<string, unknown> | null, selecte
           && (row.dex.firstDexActivity.status !== 'available' || row.dex.firstDexActivity.firstObserved.firstProven === true)))
     // The backend's bound (decodeAbiText in server/compact/token-metadata.js): a contract-reported symbol of up to 256
     // printable characters is valid, so one long symbol never blanks every verified row of the window.
-    && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 256))
+    && (row.symbol === null || typeof row.symbol === 'string' && row.symbol.length <= 256)
+    && (row.evidence === undefined ? row.dex.poolSummary === undefined
+      : isRecord(row.evidence) && row.evidence.status === 'summary' && row.evidence.reason === 'bounded_response_limit'
+        && row.dex.firstPool === null && Array.isArray(row.dex.observedPools) && row.dex.observedPools.length === 0
+        && row.launch.provenance === undefined && poolSummary(row.dex.poolSummary, row.dex.status)))
   if (!validTokens(data.discoveredTokens.rows) || !validTokens(data.launches.rows)
     || data.launches.rows.some((row) => !['direct_deployment', 'verified_factory', 'verified_launchpad'].includes(row.launch.status))) return null
   return data

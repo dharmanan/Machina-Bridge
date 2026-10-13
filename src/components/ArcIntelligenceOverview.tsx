@@ -1463,7 +1463,8 @@ const TOKEN_PAGE_SIZE = 10
 const TOKEN_CONTROL = 'rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6E0C] disabled:cursor-default disabled:opacity-40'
 const launchType = (row: DiscoveredToken) => ({ direct_deployment: 'Direct deployment', verified_factory: 'Verified factory',
   verified_launchpad: 'Verified launchpad', unknown_source: 'Source unproven' }[row.launch.status] ?? 'Source unproven')
-const firstTokenPool = (row: DiscoveredToken) => row.dex.firstPool ?? row.dex.observedPools?.[0]
+const firstTokenPool = (row: DiscoveredToken) => row.dex.firstPool ?? row.dex.observedPools?.[0] ?? row.dex.poolSummary?.first ?? undefined
+const firstPoolVerified = (row: DiscoveredToken) => Boolean(row.dex.firstPool) || row.dex.poolSummary?.firstVerified === true
 const tokenDexStatus = (row: DiscoveredToken) => row.dex.firstDexActivity?.firstObserved
   ? row.dex.firstDexActivity.status === 'available' ? 'Proven first activity' : 'First observed activity'
   : 'Activity not observed'
@@ -1477,6 +1478,7 @@ const tokenListStatus = (ctx: ViewContext, kind: 'launches' | 'discoveredTokens'
 function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind: 'launches' | 'discoveredTokens' }) {
   const list = ecosystem[kind], state = tokenListState(ecosystem, kind)
   const unresolved = ecosystem.coverage.unresolvedCandidateCount
+  const summarized = list.rows.filter((row) => row.evidence).length
   return <div data-api-reason={ecosystem.coverage.reason} data-token-list-state={state} className="mt-3 min-w-0 space-y-1 rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-xs text-slate-600">
     <p className="font-semibold text-slate-800">Token discovery covers {ecosystem.coverage.availableHours} of {ecosystem.coverage.requiredHours} hours.</p>
     {state === 'complete' && <p>Every candidate found in these hours has been checked.</p>}
@@ -1485,12 +1487,15 @@ function TokenListCoverage({ ecosystem, kind }: { ecosystem: ArcEcosystem; kind:
       : state === 'verifying' && <p>Candidate checks are not finished, so this list may be incomplete.</p>}
     <p>Showing {list.rows.length} {kind === 'launches' ? list.rows.length === 1 ? 'launch' : 'launches' : list.rows.length === 1 ? 'token' : 'tokens'}{list.truncated ? ' (list is capped)' : ''}.
       {' '}{list.truncated ? 'This is not the total number of launches or tokens.' : 'This is not a chain-wide total.'}</p>
+    {summarized > 0 && <p data-token-list-summarized={summarized}>Pool-by-pool and launch source evidence is left out for {formatCount(summarized)} of
+      {' '}these {summarized === 1 ? 'record' : 'records'} to keep the response small.</p>}
     {ecosystem.coverage.status !== 'available' && <p>{reasonText(ecosystem.coverage.reason, 'Discovery is incomplete, so more tokens may exist.')}</p>}
   </div>
 }
 
 function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredToken; kind: 'launches' | 'discoveredTokens' }) {
   const pool = firstTokenPool(row), activity = row.dex.firstDexActivity?.firstObserved
+  const early = (row.dex.firstPool ?? row.dex.observedPools?.[0])?.earlyActivity
   const transaction = (hash: string | undefined, reason: string) => hash
     ? ctx.explorerUrl ? <a href={`${ctx.explorerUrl}/tx/${hash}`} target="_blank" rel="noopener noreferrer" className="break-all text-[#2F6E0C] underline">{hash}</a>
       : <span className="break-all">{hash}</span> : reason
@@ -1511,7 +1516,7 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
         {row.launch.observedAt && <p>Launch observed {formatUtcDateTime(row.launch.observedAt)}</p>}
         {row.launch.reason && <p data-api-reason={row.launch.reason}>{reasonText(row.launch.reason)}</p>}</div>
       <div {...launchFieldProps('launches.initial-pool', pool ? 'available' : 'unavailable')}>
-        <p className="font-semibold text-slate-800">{row.dex.firstPool ? 'First verified pool' : 'Observed pool'}</p>
+        <p className="font-semibold text-slate-800">{firstPoolVerified(row) ? 'First verified pool' : 'Observed pool'}</p>
         <p>{row.dex.status === 'available' ? 'Pool history verified' : 'Partial DEX history'}</p>
         {pool ? <><p className="break-all">{protocolName(pool.protocol)} · {pool.pool}</p><p>Block {formatCount(pool.creationBlock)}</p>
           <p>{pool.creationTimestamp ? formatUtcDateTime(pool.creationTimestamp) : 'Creation timestamp unavailable'}</p></>
@@ -1521,9 +1526,11 @@ function TokenEvidence({ ctx, row, kind }: { ctx: ViewContext; row: DiscoveredTo
         {activity && <><p>{formatUtcDateTime(activity.timestamp)} · block {formatCount(activity.blockNumber)}</p>
           <p>{transaction(activity.txHash, 'Activity transaction unavailable')}</p></>}
         {row.dex.firstDexActivity?.status !== 'available' && <p data-api-reason={row.dex.firstDexActivity?.reason ?? row.dex.reason}>Lifetime first unproven: {reasonText(row.dex.firstDexActivity?.reason ?? row.dex.reason, 'No activity observation has been stored.')}</p>}
-        {pool?.earlyActivity.status === 'available' && <p>{pool.earlyActivity.swapCount} swaps in pool creation UTC hour</p>}
+        {early?.status === 'available' && <p>{early.swapCount} swaps in pool creation UTC hour</p>}
         {row.dex.reason && <p data-api-reason={row.dex.reason}>{reasonText(row.dex.reason)}</p>}</div>
     </div>
+    {row.evidence && <p data-token-evidence-summary={row.evidence.reason}>Pool-by-pool and launch source evidence is left out for this record to keep
+      {' '}the response small{row.dex.poolSummary?.observedPoolCount ? ` (${formatCount(row.dex.poolSummary.observedPoolCount)} observed ${row.dex.poolSummary.observedPoolCount === 1 ? 'pool' : 'pools'})` : ''}.</p>}
     {(row.dex.observedPools ?? []).map((observedPool) => <details key={observedPool.pool} className="rounded-lg border border-slate-200 px-3 py-2">
       <summary className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#2F6E0C]">{protocolName(observedPool.protocol)} pool evidence · {shortenHash(observedPool.pool)}</summary>
       <div className="mt-2 space-y-1 break-all"><p>{observedPool.pool}</p><p>Paired token {observedPool.pairedToken}</p>
@@ -1622,7 +1629,7 @@ function TokenListRow({ row, expanded, evidenceId, timestamp, ctx, launches, onT
       <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">{launches ? 'Launch time (UTC)' : 'Discovered (UTC)'}</span>
         {timestamp ? formatUtcDateTime(timestamp) : 'Time not proven'}</td>
       <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">Launch type</span>{launchType(row)}</td>
-      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">Pool</span>{pool ? row.dex.firstPool ? 'Verified first pool' : 'Observed pool' : 'Not observed'}</td>
+      <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">Pool</span>{pool ? firstPoolVerified(row) ? 'Verified first pool' : 'Observed pool' : 'Not observed'}</td>
       <td className="block md:table-cell"><span className="block text-[10px] text-slate-400 md:hidden">DEX activity</span>{tokenDexStatus(row)}</td>
     </tr>
     {expanded && <tr className="block md:table-row"><td colSpan={5} className="block pb-3 md:table-cell">
