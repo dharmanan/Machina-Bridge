@@ -875,7 +875,10 @@ await test('UI 4 verified values come from the summary and timeseries exactly, w
   assert.equal(valueIn('ready', 'cross-chain.cctp'), '20');
   assert.match(textOf(item(rendered.ready.tree, 'cross-chain.cctp')),
     /Outbound From Arc to other chains 9 transfers 9 USDC Inbound From other chains to Arc 11 transfers 11 USDC/);
-  assert.match(textOf(item(rendered.ready.tree, 'rwa-other.rwa')), /USYC Tokenized fund RWA Transfers 12 Mints 3 Burns 1 Amount moved 250 USYC/);
+  assert.match(textOf(item(rendered.ready.tree, 'rwa-other.rwa')), new RegExp('USYC Tokenized fund RWA Between addresses 8 to 9 Not mints or burns '
+    + 'Mints 3 New USYC, from the zero address Burns 1 USYC removed, to the zero address All transfer events 12 Mints and burns included '
+    + 'Gross amount 250 USYC All events added up'));
+  assert.equal(valueIn('ready', 'rwa-other.rwa'), '12', 'the marker keeps transferCount, mints and burns included');
   // Swap chart: latest complete hour is 13:00-14:00 UTC (V3 123 + V4 73); gaps are drawn as gaps, never as zero.
   assert.equal(valueIn('ready', 'volume-chart.latest'), '196');
   assert.equal(valueIn('ready', 'active-addresses-chart.latest'), '1230');
@@ -2981,6 +2984,121 @@ await test('Archery 6 the ecosystem card has one row for further protocols and a
   assert.equal(byAttr(flows, 'data-api-reason', 'verified_exchange_registry_empty').length, 1);
   assert.doesNotMatch(withoutAllowedDigits(textOf(flows)), /\d|\$/, 'no flow amount without a verified exchange address');
   assert.match(textOf(flows), /^Exchange flows Not tracked yet/);
+});
+
+// RWA / USYC (summary.assets.verifiedAssets, server/compact/families.js): transferCount counts every Transfer event, mints
+// (from the zero address) and burns (to the zero address) included, and amountRaw adds all of them. The card separates
+// the kinds without changing those fields; the events between addresses are exact only when they can be.
+const USYC_ADDRESS = '0x8a5d989bbb96929f689b0200f435f53da42bf490';
+function rwaView({ usyc, window = '24h', hours = 24, family, mode } = {}) {
+  const summary = summaryFixture({ window, hours });
+  const metrics = structuredClone(FAMILY_METRICS.assets);
+  metrics.items = metrics.items.filter((entry) => entry.symbol !== 'USYC');
+  if (usyc) metrics.items.push({ symbol: 'USYC', address: USYC_ADDRESS, decimals: 6, ...usyc });
+  summary.assets.verifiedAssets = family ?? available(metrics);
+  const data = mode === 'failed' ? { window, summary: null, timeseries: null, failed: true } : { ...READY_DATA, window, summary };
+  const { tree } = render({ selectedWindow: window, initialDexView: 'swaps', borrowMarket: BORROW_AVAILABLE, data });
+  checkScope(tree, SCOPE);
+  const card = item(tree, 'rwa-other.rwa');
+  const metric = (key) => byAttr(card, 'data-rwa-metric', key)[0];
+  return { tree, card, metric, text: textOf(card), row: item(tree, 'assets.usyc') };
+}
+
+await test('RWA 1 transferBreakdown: exact when the window has no mints or no burns, otherwise the range it must lie in', async () => {
+  const split = (transferCount, mintCount, burnCount) => lib.transferBreakdown({ transferCount, mintCount, burnCount });
+  assert.deepEqual(split(10, 0, 0), { betweenMin: 10, betweenMax: 10, exact: true });
+  assert.deepEqual(split(10, 4, 0), { betweenMin: 6, betweenMax: 6, exact: true });
+  assert.deepEqual(split(10, 0, 3), { betweenMin: 7, betweenMax: 7, exact: true });
+  assert.deepEqual(split(1, 1, 0), { betweenMin: 0, betweenMax: 0, exact: true });
+  // Mints and burns together: one event from and to the zero address would be both, so only a range is known.
+  assert.deepEqual(split(12, 3, 1), { betweenMin: 8, betweenMax: 9, exact: false });
+  assert.deepEqual(split(6, 3, 3), { betweenMin: 0, betweenMax: 3, exact: false }, 'Arc mainnet history: 3 mints, 3 burns');
+  assert.deepEqual(split(1, 1, 1), { betweenMin: 0, betweenMax: 0, exact: true }, 'a single zero-to-zero event leaves nothing between addresses');
+  for (const bad of [[2, 3, 0], [2, 0, 3], [-1, 0, 0], [1.5, 0, 0], [Number.NaN, 0, 0]]) assert.equal(split(...bad), null, `${bad}`);
+});
+
+await test('RWA 2 the USYC card separates mints, burns and transfers between addresses; gross amount is never volume or USD', async () => {
+  const exact = rwaView({ usyc: { transferCount: 7, mintCount: 2, burnCount: 0, amountRaw: '4500000' } });
+  assert.equal(exact.card.attrs['data-intel-status'], 'available');
+  assert.equal(exact.card.attrs['data-intel-value'], '7', 'the marker value is still transferCount');
+  assert.equal(textOf(exact.metric('between')), 'Between addresses 5 Not mints or burns');
+  assert.equal(exact.metric('between').attrs['data-rwa-exact'], 'true');
+  assert.equal(textOf(exact.metric('mints')), 'Mints 2 New USYC, from the zero address');
+  assert.equal(textOf(exact.metric('burns')), 'Burns 0 USYC removed, to the zero address');
+  assert.equal(textOf(exact.metric('all')), 'All transfer events 7 Mints and burns included');
+  assert.equal(textOf(exact.metric('gross')), 'Gross amount 4.5 USYC All events added up');
+  assert.equal(byAttr(exact.card, 'data-rwa-note', 'range').length, 0);
+  assert.match(textOf(byAttr(exact.card, 'data-rwa-note', 'gross')[0]),
+    /^Gross amount adds every transfer event, mints and burns included\. It is not subscription volume, net holdings or a USD value\. Mints and burns are token events, not counted as Teller subscriptions or redemptions\.$/);
+  assert.doesNotMatch(exact.text, /\$|Amount moved|Transfers 7|APY|NAV|price|supply/i);
+  // Both mints and burns: a range with its reason, never a guessed single number.
+  const range = rwaView({ usyc: { transferCount: 6, mintCount: 3, burnCount: 3, amountRaw: '6345326' } });
+  assert.equal(textOf(range.metric('between')), 'Between addresses 0 to 3 Not mints or burns');
+  assert.equal(range.metric('between').attrs['data-rwa-exact'], 'false');
+  assert.match(textOf(byAttr(range.card, 'data-rwa-note', 'range')[0]), /^Between addresses is a range: this window has both mints and burns/);
+  assert.equal(textOf(range.metric('gross')), 'Gross amount 6.34 USYC All events added up', 'the existing amount format (formatAmount)');
+});
+
+await test('RWA 3 the Verified Assets table labels USYC the same way and keeps every marker and value', async () => {
+  const { tree, row } = rwaView({ usyc: { transferCount: 6, mintCount: 3, burnCount: 3, amountRaw: '6345326' } });
+  assert.equal(row.attrs['data-intel-status'], 'available');
+  assert.equal(row.attrs['data-intel-value'], '6');
+  assert.match(textOf(row), /USYC .*All transfers 6 .*Mints 3 Burns 3 Gross amount 6\.34 USYC$/);
+  const section = sectionNode(tree, 'assets');
+  assert.match(textOf(section), /Asset All transfers Mints Burns Gross amount/);
+  assert.match(textOf(section), /All transfers include mints and burns; gross amount adds every event\. Amounts are in token units, not USD\./);
+  assert.doesNotMatch(textOf(section), /Amount moved|Transfer activity/);
+  for (const id of ['assets.usdc', 'assets.eurc', 'assets.cirbtc', 'assets.weth', 'assets.usyc']) assert.ok(item(tree, id), id);
+});
+
+await test('RWA 4 no data, verified zero and not verified read differently in 24H, 7D and 30D', async () => {
+  for (const [window, hours] of [['24h', 24], ['7d', 168], ['30d', 720]]) {
+    // Verified zero: the window is verified and USYC had no events (with or without an explicit zero entry).
+    for (const usyc of [{ transferCount: 0, mintCount: 0, burnCount: 0, amountRaw: '0' }, undefined]) {
+      const zero = rwaView({ usyc, window, hours });
+      assert.equal(zero.card.attrs['data-intel-status'], 'available', window);
+      assert.equal(zero.card.attrs['data-intel-value'], '0', window);
+      assert.match(textOf(byAttr(zero.card, 'data-rwa-note', 'verified-zero')[0]),
+        /^No verified transfers in this window: no USYC transfers, mints or burns in its verified hours\.$/, window);
+      assert.equal(byAttr(zero.card, 'data-rwa-metric').length, 0, window);
+    }
+    // No data yet: history still being collected; no value, no zero.
+    const collecting = rwaView({ window, hours, family: unavailableFamily('insufficient_coverage') });
+    assert.equal(collecting.card.attrs['data-intel-status'], 'collecting', window);
+    assert.equal(collecting.card.attrs['data-intel-value'], undefined, window);
+    assert.match(collecting.text, /History is still being collected/, window);
+    // Not verified: the family failed for this window; its reason is stated, no value, no zero.
+    const failed = rwaView({ window, hours, family: unavailableFamily('family_hour_unavailable') });
+    assert.equal(failed.card.attrs['data-intel-status'], 'unavailable', window);
+    assert.equal(failed.card.attrs['data-intel-value'], undefined, window);
+    assert.match(failed.text, /Some hours of this window are not verified\./, window);
+    for (const view of [collecting, failed]) {
+      assert.doesNotMatch(view.text, /No verified transfers|Between addresses|Gross amount/, window);
+      assert.doesNotMatch(withoutAllowedDigits(view.text), /\d/, `${window}: no number without verified data`);
+    }
+  }
+  const unloaded = rwaView({ mode: 'failed' });
+  assert.equal(unloaded.card.attrs['data-intel-status'], 'unavailable');
+  assert.match(unloaded.text, /Could not be loaded right now/);
+  // Counts that contradict each other are not shown at all.
+  const contradictory = rwaView({ usyc: { transferCount: 1, mintCount: 3, burnCount: 0, amountRaw: '1' } });
+  assert.equal(contradictory.card.attrs['data-intel-status'], 'unavailable');
+  assert.equal(contradictory.card.attrs['data-intel-value'], undefined);
+  assert.match(contradictory.text, /The USYC counts of this window do not agree with each other, so none is shown\./);
+  assert.equal(byAttr(contradictory.card, 'data-rwa-metric').length, 0);
+});
+
+await test('RWA 5 a partial verified window states its coverage next to the USYC counts', async () => {
+  const hours = Array.from({ length: 20 }, (_, index) => isoAt(END - (24 - index) * HOUR_MS));
+  const missing = Array.from({ length: 4 }, (_, index) => isoAt(END - (4 - index) * HOUR_MS));
+  const metrics = structuredClone(FAMILY_METRICS.assets);
+  metrics.items = metrics.items.map((entry) => (entry.symbol === 'USYC' ? { ...entry, transferCount: 2, mintCount: 1, burnCount: 0, amountRaw: '1200000' } : entry));
+  const family = { ...unavailableFamily('family_hour_unavailable'), unavailableHours: missing,
+    verifiedSubset: { status: 'available', scope: 'verified_hours_only', metrics, coverage: { expectedHours: 24, availableHours: 20, missingHours: 4, verifiedHours: hours } } };
+  const view = rwaView({ family });
+  assert.equal(view.card.attrs['data-intel-status'], 'available');
+  assert.match(view.text, /Partial: 20 of 24 hours\. 4 missing hours are not counted\./);
+  assert.equal(textOf(view.metric('between')), 'Between addresses 1 Not mints or burns');
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

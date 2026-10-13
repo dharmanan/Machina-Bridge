@@ -904,6 +904,20 @@ export function verifiedAssetItems(family: FamilyWindow | null | undefined): Ver
   })
 }
 
+// Transfer events of one verified asset by kind. transferCount counts every Transfer event, mints (from the zero
+// address) and burns (to the zero address) included, so the events between two non-zero addresses are what is left.
+// One event from and to the zero address would be counted as both a mint and a burn, and the stored counts cannot show
+// it: the result is exact only when the window has no mints or no burns, otherwise the range it must lie in. null when
+// the counts contradict each other.
+export function transferBreakdown(item: Pick<VerifiedAssetItem, 'transferCount' | 'mintCount' | 'burnCount'>):
+  { betweenMin: number; betweenMax: number; exact: boolean } | null {
+  const { transferCount: total, mintCount: mints, burnCount: burns } = item
+  if (![total, mints, burns].every((value) => Number.isSafeInteger(value) && value >= 0) || Math.max(mints, burns) > total) return null
+  const betweenMax = total - Math.max(mints, burns)
+  const betweenMin = Math.max(0, total - mints - burns)
+  return { betweenMin, betweenMax, exact: betweenMin === betweenMax }
+}
+
 // Relative change against an equal previous window; null when either side is missing or the base is zero.
 export function percentChange(current: number | null, previous: number | null): number | null {
   if (current === null || previous === null || previous <= 0) return null

@@ -44,6 +44,7 @@ import {
   shortenHash,
   shortenMarketId,
   tokenListState,
+  transferBreakdown,
   usdMicrosToNumber,
   usdVolumeStatus,
   V4_SWAP_TO_BLOCKER,
@@ -1706,11 +1707,11 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
   return (
     <section data-intel-section="assets" aria-label="Assets" className={CARD}>
       <CardHeader title="Verified asset transfers"
-        subtitle={`Transfers, mints and burns of verified Arc assets, last ${ctx.windowLabel}. Amounts are in token units, not USD. Prices are for the latest hour.`}
+        subtitle={`Transfer events of verified Arc assets, last ${ctx.windowLabel}. All transfers include mints and burns; gross amount adds every event. Amounts are in token units, not USD. Prices are for the latest hour.`}
         right={shared ? <StatusPill status={shared} /> : undefined} />
       <div className={`mt-3 hidden gap-4 border-b border-slate-100 pb-1.5 md:grid ${grid}`}>
-        <span className={LABEL}>Asset</span><span className={LABEL}>Transfer activity</span><span className={`${LABEL} text-right`}>Mints</span>
-        <span className={`${LABEL} text-right`}>Burns</span><span className={`${LABEL} text-right`}>Amount moved</span>
+        <span className={LABEL}>Asset</span><span className={LABEL}>All transfers</span><span className={`${LABEL} text-right`}>Mints</span>
+        <span className={`${LABEL} text-right`}>Burns</span><span className={`${LABEL} text-right`}>Gross amount</span>
       </div>
       <ul className="mt-3 space-y-2 md:mt-0 md:space-y-0">
         {rows.map((row) => (
@@ -1733,7 +1734,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
               <>
                 <div className="mt-2 md:mt-0">
                   <p className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="text-slate-500 md:hidden">Transfers</span>
+                    <span className="text-slate-500 md:hidden">All transfers</span>
                     <span className="font-semibold tabular-nums text-slate-950">{formatCount(row.transfers)}</span>
                   </p>
                   <div className="mt-1"><ActivityBar value={row.transfers} max={maxTransfers} /></div>
@@ -1745,7 +1746,7 @@ function AssetsSection({ ctx }: { ctx: ViewContext }) {
                   </p>
                 ))}
                 <p className="mt-1 flex justify-between gap-3 text-sm md:mt-0 md:block md:text-right">
-                  <span className="shrink-0 text-slate-500 md:hidden">Amount moved</span>
+                  <span className="shrink-0 text-slate-500 md:hidden">Gross amount</span>
                   {row.amount ? <span className="text-right font-semibold tabular-nums text-slate-950">{row.amount}</span> : <InlineStatus status="unavailable" />}
                 </p>
               </>
@@ -2253,7 +2254,21 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
   const items = verifiedAssetItems(verified)
   const usycEntry = items?.find((entry) => entry.symbol === 'USYC')
   const usyc = usycEntry && usycEntry.transferCount + usycEntry.mintCount + usycEntry.burnCount > 0 ? usycEntry : undefined
-  const shown: DisplayStatus = status === 'available' && !items ? 'unavailable' : status
+  // transferCount includes mints and burns (tokens.js); the events between addresses are what is left, exact or a range.
+  const split = usyc ? transferBreakdown(usyc) : null
+  const contradictory = Boolean(usyc && !split)
+  const shown: DisplayStatus = status === 'available' && (!items || contradictory) ? 'unavailable' : status
+  // No data yet (loading, collecting, not tracked), not verified (with its reason) and verified zero read differently.
+  const note = shown !== 'unavailable' || ctx.mode === 'failed' ? noteFor(ctx, shown)
+    : contradictory ? 'The USYC counts of this window do not agree with each other, so none is shown.' : reasonText(firstReason(verified))
+  const tiles = usyc && split ? [
+    ['between', 'Between addresses', split.exact ? formatCount(split.betweenMin) : `${formatCount(split.betweenMin)} to ${formatCount(split.betweenMax)}`,
+      'Not mints or burns'],
+    ['mints', 'Mints', formatCount(usyc.mintCount), 'New USYC, from the zero address'],
+    ['burns', 'Burns', formatCount(usyc.burnCount), 'USYC removed, to the zero address'],
+    ['all', 'All transfer events', formatCount(usyc.transferCount), 'Mints and burns included'],
+    ['gross', 'Gross amount', `${formatAmount(usyc.amountRaw, usyc.decimals)} USYC`, 'All events added up'],
+  ] as const : null
   return (
     <section data-intel-section="rwa-other" aria-label="RWA and Other Verified Protocols" className="grid gap-4 lg:grid-cols-2">
       <div {...markerProps('rwa-other.rwa', shown, shown === 'available' ? usyc?.transferCount ?? 0 : null)} className={`${CARD} min-w-0`}>
@@ -2267,20 +2282,31 @@ function RwaOtherSection({ ctx }: { ctx: ViewContext }) {
               <p className="mt-0.5 flex flex-wrap gap-1"><Chip tone={toneFor('USYC')}>Tokenized fund</Chip><Chip>RWA</Chip></p>
             </div>
           </div>
+          {shown === 'available' && <FamilyCoverage family={verified} />}
           {shown !== 'available' ? (
-            <p className="mt-2 text-xs text-slate-500">{noteFor(ctx, shown)}</p>
-          ) : usyc ? (
-            <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,7rem),1fr))] gap-2">
-              {([['Transfers', formatCount(usyc.transferCount)], ['Mints', formatCount(usyc.mintCount)], ['Burns', formatCount(usyc.burnCount)],
-                ['Amount moved', `${formatAmount(usyc.amountRaw, usyc.decimals)} USYC`]] as const).map(([label, value]) => (
-                <div key={label} className="min-w-0 rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-slate-100">
-                  <p className="text-[11px] text-slate-500">{label}</p>
-                  <p className="text-sm font-semibold tabular-nums text-slate-950 [overflow-wrap:anywhere]">{value}</p>
-                </div>
-              ))}
-            </div>
+            <p className="mt-2 text-xs text-slate-500">{note}</p>
+          ) : tiles && split ? (
+            <>
+              <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,7rem),1fr))] gap-2">
+                {tiles.map(([key, label, value, detail]) => (
+                  <div key={key} data-rwa-metric={key} {...(key === 'between' ? { 'data-rwa-exact': String(split.exact) } : {})}
+                    className="min-w-0 rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-slate-100">
+                    <p className="text-[11px] text-slate-500">{label}</p>
+                    <p className="text-sm font-semibold tabular-nums text-slate-950 [overflow-wrap:anywhere]">{value}</p>
+                    <p className="text-[10px] leading-3 text-slate-400">{detail}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-2 space-y-1 text-[11px] leading-4 text-slate-500">
+                {!split.exact && <p data-rwa-note="range">Between addresses is a range: this window has both mints and burns, and one event from
+                  {' '}and to the zero address would be counted as both.</p>}
+                <p data-rwa-note="gross">Gross amount adds every transfer event, mints and burns included. It is not subscription volume,
+                  {' '}net holdings or a USD value. Mints and burns are token events, not counted as Teller subscriptions or redemptions.</p>
+              </div>
+            </>
           ) : (
-            <p className="mt-2 text-xs text-slate-500">No verified transfers in this window</p>
+            <p data-rwa-note="verified-zero" className="mt-2 text-xs text-slate-500">No verified transfers in this window: no USYC transfers, mints or burns
+              {' '}in its verified hours.</p>
           )}
           <p className="mt-2 text-[11px] text-slate-400">Amounts are in token units, not USD.</p>
         </div>
