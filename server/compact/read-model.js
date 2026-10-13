@@ -280,17 +280,20 @@ const SQL = Object.freeze({
   projectionHour: 'SELECT status, reason FROM compact_projection_hours WHERE hour_start = ? AND projection = ?',
   // The top pools by summed swap count (ties by pool id), then only their own hourly rows: bounded by the pool limit, never
   // every pool of the window in memory. Raw token totals are summed in BigInt afterwards, never in SQL.
-  topPoolRows: `WITH top AS (SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours
-      WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3 GROUP BY pool HAVING total > 0 ORDER BY total DESC, pool ASC LIMIT ?4)
+  topPoolRows: `WITH top AS (SELECT p.pool, SUM(p.swap_count) AS total FROM compact_hours h CROSS JOIN compact_pool_hours p
+      WHERE h.hour_start BETWEEN ?2 AND ?3 AND p.hour_start=h.hour_start AND p.protocol=?1
+      GROUP BY p.pool HAVING total > 0 ORDER BY total DESC, p.pool ASC LIMIT ?4)
     SELECT p.pool, top.total, p.hour_start, p.swap_count, p.token0_in_raw, p.token0_out_raw, p.token1_in_raw, p.token1_out_raw, p.add_count,
       p.remove_count, p.poke_count, p.add_amount0_raw, p.add_amount1_raw, p.remove_amount0_raw, p.remove_amount1_raw
-    FROM compact_pool_hours p JOIN top ON top.pool = p.pool
-    WHERE p.protocol = ?1 AND p.hour_start BETWEEN ?2 AND ?3 ORDER BY top.total DESC, p.pool ASC, p.hour_start ASC`,
+    FROM top CROSS JOIN compact_hours h CROSS JOIN compact_pool_hours p
+    WHERE h.hour_start BETWEEN ?2 AND ?3 AND p.hour_start=h.hour_start AND p.protocol=?1 AND p.pool=top.pool
+    ORDER BY top.total DESC, p.pool ASC, p.hour_start ASC`,
   // Windows that include hours whose pool rows retention moved into packed sets (packed-shards.js): every pool's total over
   // the window's other hours. A marked hour is read only from its packed set, so its hot rows (there are none) never count.
-  hotPoolTotals: `SELECT pool, SUM(swap_count) AS total FROM compact_pool_hours WHERE protocol = ?1 AND hour_start BETWEEN ?2 AND ?3
-    AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
-    GROUP BY pool`,
+  hotPoolTotals: `SELECT p.pool, SUM(p.swap_count) AS total FROM compact_hours h CROSS JOIN compact_pool_hours p
+    WHERE h.hour_start BETWEEN ?2 AND ?3 AND p.hour_start=h.hour_start AND p.protocol=?1
+    AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
+    GROUP BY p.pool`,
   // Valuations and token metadata (store.js). Optional tables: a database written before them still serves everything
   // else, and these reads report valuation_not_ready (or no contract metadata).
   optionalTables: `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('compact_valuation_hours', 'compact_dex_volume_hours',
@@ -345,6 +348,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   let statements = new Map();
   let packedReader = null;
   const cache = new Map();
+  // Only one window's at-most 2 x 10 x 720 ranked rows, shared by V3/V4 in the same commit version.
+  let packedPoolWindow = null;
   // Exact 7D/30D (and older 24H) unions already counted, keyed by the complete identity sets they used (address-union.js).
   const unionCache = new Map();
   // Read-only access to packed sets (SELECT only, on this query_only connection); packing itself stays a writer concern.
@@ -366,6 +371,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     statements = new Map();
     packedReader = null;
     unionCache.clear();
+    packedPoolWindow = null;
     return db;
   }
   const statement = (name) => {
@@ -972,37 +978,93 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function topPoolRowsOf(protocol, from, to) {
     const pruned = packedSets().prunedScopes('compact_pool_hours', from, to);
     if (!pruned.length) return statement('topPoolRows').all(protocol, int(from), int(to), int(POOL_LIMIT));
-    const forPrunedRows = (onRow) => {
-      for (const hour of pruned) {
+    const version = connection().prepare('PRAGMA data_version').get().data_version;
+    if (packedPoolWindow?.version === version && packedPoolWindow.from === from && packedPoolWindow.to === to) {
+      return packedPoolWindow.rows.get(protocol);
+    }
+    const forPackedHours = (hours, onRow) => {
+      for (const hour of hours) {
         // An expired set (never inside a served window) or a missing one fails the answer closed, never as an empty hour.
-        if (!packedSets().forEachRow('compact_pool_hours', hour, (row) => { if (row.protocol === protocol) onRow(row); })) {
+        if (!packedSets().forEachPoolSwap(hour, onRow)) {
           throw new ReadModelError('inconsistent_state', 'packed_set_missing');
         }
       }
     };
-    // Pass 1: the window totals and the same ranking as the statement (total desc, then pool id; zero totals left out).
-    const totals = new Map(statement('hotPoolTotals').all(protocol, int(from), int(to)).map((row) => [row.pool, row.total]));
-    forPrunedRows((row) => totals.set(row.pool, (totals.get(row.pool) ?? 0) + row.swap_count));
-    const top = [...totals].filter(([, total]) => total > 0).sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, POOL_LIMIT);
-    totals.clear();
-    if (!top.length) return [];
-    // Pass 2: only the chosen pools' hourly rows, hot and packed, with the statement's columns.
-    const rank = new Map(top.map(([pool, total], index) => [pool, { index, total }]));
-    const rows = [];
+    const protocols = ['uniswap_v3', 'uniswap_v4'];
+    const hot = new Map(protocols.map(p => [p, new Map(statement('hotPoolTotals').all(p, int(from), int(to)).map(row => [row.pool, row.total]))]));
+    const totals = new Map(protocols.map(p => [p, new Map(hot.get(p))]));
+    const addSwap = (target, protocol, pool, count, sign = 1) => {
+      const values = target.get(protocol);
+      if (!values) throw new ReadModelError('inconsistent_state', 'packed_pool_swaps_inconsistent');
+      values.set(pool, (values.get(pool) ?? 0) + sign * count);
+    };
+    const add = (target, row) => addSwap(target, row.protocol, row.pool, row.swap_count);
+    const current = connection();
+    const floor = packedSets().historyFloor();
+    const first = statement('bounds').get().first;
+    const ledgerExists = current.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_packed_pool_swaps'").get();
+    const expiredTable = current.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_packed_expired'").get();
+    const expired = expiredTable && current.prepare("SELECT 1 FROM compact_packed_expired WHERE dataset='compact_pool_hours' LIMIT 1").get();
+    const outsideCount = current.prepare(`SELECT COUNT(*) AS n FROM compact_packed_pruned WHERE dataset='compact_pool_hours'
+      AND (scope_start<? OR scope_start>?)`).get(int(from), int(to)).n;
+    // All-history prune totals are only a bounded ranking HINT, never window evidence. Decode and verify EVERY
+    // in-window row to independently compute the true totals and ranking. No out-of-window decode is necessary.
+    // If the hint chose different pools, collect again using the proved ranking; expired/folded history keeps
+    // the existing two-pass path. A stale or corrupt secondary total cannot become an accepted metric.
+    const predict = ledgerExists && !expired && (floor === null || floor <= first) && outsideCount < pruned.length;
+    if (predict) {
+      for (const row of current.prepare('SELECT protocol,pool,swap_count FROM compact_packed_pool_swaps').iterate()) add(totals, row);
+    } else forPackedHours(pruned, (protocol, pool, count) => addSwap(totals, protocol, pool, count));
+    const rankTotals = values => new Map(protocols.map(p => [p, new Map([...values.get(p)].filter(([, total]) => total > 0)
+      .sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, POOL_LIMIT)
+      .map(([pool, total], index) => [pool, { index, total }]))]));
+    let ranks = rankTotals(totals);
+    const rows = new Map(protocols.map(p => [p, []]));
+    const maxRows = 2 * POOL_LIMIT * ((to - from) / HOUR + 1);
+    let retainedRows = 0;
+    const observed = predict ? new Map(protocols.map(p => [p, new Map(hot.get(p))])) : null;
     const keep = (row) => {
-      const entry = rank.get(row.pool);
+      const entry = ranks.get(row.protocol)?.get(row.pool);
       if (!entry) return;
-      rows.push({ pool: row.pool, total: entry.total, hour_start: row.hour_start, swap_count: row.swap_count, token0_in_raw: row.token0_in_raw,
+      if (++retainedRows > maxRows) throw new ReadModelError('inconsistent_state', 'pool_projection_malformed');
+      rows.get(row.protocol).push({ pool: row.pool, total: entry.total, hour_start: row.hour_start, swap_count: row.swap_count, token0_in_raw: row.token0_in_raw,
         token0_out_raw: row.token0_out_raw, token1_in_raw: row.token1_in_raw, token1_out_raw: row.token1_out_raw, add_count: row.add_count,
         remove_count: row.remove_count, poke_count: row.poke_count, add_amount0_raw: row.add_amount0_raw, add_amount1_raw: row.add_amount1_raw,
         remove_amount0_raw: row.remove_amount0_raw, remove_amount1_raw: row.remove_amount1_raw });
     };
-    const pools = top.map(([pool]) => pool);
-    for (const row of connection().prepare(`SELECT * FROM compact_pool_hours WHERE protocol = ? AND hour_start BETWEEN ? AND ?
-      AND hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ? AND ?)
-      AND pool IN (${pools.map(() => '?').join(', ')})`).iterate(protocol, int(from), int(to), int(from), int(to), ...pools)) keep(row);
-    forPrunedRows(keep);
-    return rows.sort((a, b) => rank.get(a.pool).index - rank.get(b.pool).index || a.hour_start - b.hour_start);
+    const collect = observed => {
+      retainedRows = 0;
+      for (const p of protocols) {
+        rows.set(p, []);
+        const pools = [...ranks.get(p).keys()];
+        if (!pools.length) continue;
+        for (const row of current.prepare(`WITH wanted(pool) AS (VALUES ${pools.map(() => '(?)').join(',')})
+          SELECT r.* FROM wanted CROSS JOIN compact_hours h CROSS JOIN compact_pool_hours r
+          WHERE h.hour_start BETWEEN ? AND ? AND r.hour_start=h.hour_start AND r.protocol=? AND r.pool=wanted.pool
+          AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset='compact_pool_hours' AND scope_start BETWEEN ? AND ?)`)
+          .iterate(...pools, int(from), int(to), p, int(from), int(to))) keep(row);
+      }
+      forPackedHours(pruned, (protocol, pool, count, values, columns, hour) => {
+        if (observed) addSwap(observed, protocol, pool, count);
+        if (!ranks.get(protocol)?.has(pool)) return;
+        // The packed reader verified every full typed row. Only the <= 20 ranked pools need row objects retained.
+        const row = { hour_start: hour };
+        for (let i = 0; i < columns.length; i++) row[columns[i]] = values[i];
+        keep(row);
+      });
+    };
+    collect(observed);
+    if (observed) {
+      const verifiedRanks = rankTotals(observed);
+      const covered = protocols.every(p => verifiedRanks.get(p).size === ranks.get(p).size
+        && [...verifiedRanks.get(p).keys()].every(pool => ranks.get(p).has(pool)));
+      ranks = verifiedRanks;
+      if (!covered) collect(null);
+      else for (const p of protocols) for (const row of rows.get(p)) row.total = ranks.get(p).get(row.pool).total;
+    }
+    for (const p of protocols) rows.get(p).sort((a, b) => ranks.get(p).get(a.pool).index - ranks.get(p).get(b.pool).index || a.hour_start - b.hour_start);
+    packedPoolWindow = { version, from, to, rows };
+    return rows.get(protocol);
   }
 
   // Top pools of one protocol over the window, ranked by swap count (the only verified ranking: USD volume and liquidity
@@ -1312,6 +1374,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     },
     close() {
       cache.clear();
+      packedPoolWindow = null;
       unionCache.clear();
       statements = new Map();
       packedReader = null;
