@@ -5,6 +5,7 @@
 // versions are checked inside every snapshot: an incompatible database fails closed instead of being misread.
 // Windows are anchored to the committed checkpoint, never to the wall clock. Values require verified evidence for their
 // stated interval; 30D exposes a shorter stored interval with explicit coverage, never missing hours turned into zero.
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
 import { createPackedShards } from './packed-shards.js';
@@ -294,6 +295,16 @@ const SQL = Object.freeze({
     WHERE h.hour_start BETWEEN ?2 AND ?3 AND p.hour_start=h.hour_start AND p.protocol=?1
     AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset = 'compact_pool_hours' AND scope_start BETWEEN ?2 AND ?3)
     GROUP BY p.pool`,
+  // Everything the window's pool rows are a function of (topPoolRowsOf memo): the canonical hours, each hour's pool
+  // projections (store.js inserts an hour's hot pool rows only together with its projection row and rows_sha256, and never
+  // rewrites an available one; deletions happen only past the pool-hour retention, outside every pools window), and each
+  // prune marker with its packed set (immutable by trigger; a missing set reads as null and fails the recomputation).
+  poolWindowHours: 'SELECT hour_start, first_block, last_block, last_hash FROM compact_hours WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start',
+  poolWindowProjections: `SELECT hour_start, projection, status, row_count, rows_sha256 FROM compact_projection_hours
+    WHERE hour_start BETWEEN ? AND ? AND projection IN ('uniswap_v3_pools', 'uniswap_v4_pools') ORDER BY hour_start, projection`,
+  poolWindowPacked: `SELECT m.scope_start, s.binding_sha256, s.rows_sha256, s.row_count, s.pieces, s.raw_bytes, s.stored_bytes
+    FROM compact_packed_pruned m LEFT JOIN compact_packed_sets s ON s.dataset = m.dataset AND s.scope_start = m.scope_start
+    WHERE m.dataset = 'compact_pool_hours' AND m.scope_start BETWEEN ? AND ? ORDER BY m.scope_start`,
   // Valuations and token metadata (store.js). Optional tables: a database written before them still serves everything
   // else, and these reads report valuation_not_ready (or no contract metadata).
   optionalTables: `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('compact_valuation_hours', 'compact_dex_volume_hours',
@@ -348,8 +359,9 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   let statements = new Map();
   let packedReader = null;
   const cache = new Map();
-  // Only one window's at-most 2 x 10 x 720 ranked rows, shared by V3/V4 in the same commit version.
-  let packedPoolWindow = null;
+  // The ranked rows (at most 2 x 10 x 720) of the two newest packed windows (7D, 30D), shared by V3/V4 and keyed by the
+  // window's input fingerprint, not by data_version: unrelated commits (discovery drain, metadata) keep them valid.
+  const packedPoolWindows = new Map();
   // Exact 7D/30D (and older 24H) unions already counted, keyed by the complete identity sets they used (address-union.js).
   const unionCache = new Map();
   // Read-only access to packed sets (SELECT only, on this query_only connection); packing itself stays a writer concern.
@@ -371,7 +383,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     statements = new Map();
     packedReader = null;
     unionCache.clear();
-    packedPoolWindow = null;
+    packedPoolWindows.clear();
     return db;
   }
   const statement = (name) => {
@@ -978,16 +990,26 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function topPoolRowsOf(protocol, from, to) {
     const pruned = packedSets().prunedScopes('compact_pool_hours', from, to);
     if (!pruned.length) return statement('topPoolRows').all(protocol, int(from), int(to), int(POOL_LIMIT));
-    const version = connection().prepare('PRAGMA data_version').get().data_version;
-    if (packedPoolWindow?.version === version && packedPoolWindow.from === from && packedPoolWindow.to === to) {
-      return packedPoolWindow.rows.get(protocol);
+    // Same fingerprint of every input (SQL poolWindow*), same rows: commits that touch none of them keep the memo.
+    const key = `${from}:${to}`;
+    const fingerprint = createHash('sha256').update(JSON.stringify([from, to, statement('poolWindowHours').all(int(from), int(to)),
+      statement('poolWindowProjections').all(int(from), int(to)), statement('poolWindowPacked').all(int(from), int(to))])).digest('hex');
+    const memo = packedPoolWindows.get(key);
+    if (memo?.fingerprint === fingerprint) {
+      packedPoolWindows.delete(key);
+      packedPoolWindows.set(key, memo);
+      return memo.rows.get(protocol);
     }
+    // Each pruned hour is verified completely the first time it is read here. A second read in this computation (the
+    // verified ranking after a wrong hint, or the rows after the expiry/floor totals pass) must be byte-identical to that
+    // run (packed-shards proof), so only its typed row digest is not computed twice.
+    const proofs = new Map();
     const forPackedHours = (hours, onRow) => {
       for (const hour of hours) {
         // An expired set (never inside a served window) or a missing one fails the answer closed, never as an empty hour.
-        if (!packedSets().forEachPoolSwap(hour, onRow)) {
-          throw new ReadModelError('inconsistent_state', 'packed_set_missing');
-        }
+        const read = packedSets().forEachPoolSwap(hour, onRow, proofs.get(hour) ?? null);
+        if (!read) throw new ReadModelError('inconsistent_state', 'packed_set_missing');
+        proofs.set(hour, read.proof);
       }
     };
     const protocols = ['uniswap_v3', 'uniswap_v4'];
@@ -1010,7 +1032,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     // All-history prune totals are only a bounded ranking HINT, never window evidence. Decode and verify EVERY
     // in-window row to independently compute the true totals and ranking. No out-of-window decode is necessary.
     // If the hint chose different pools, collect again using the proved ranking; expired/folded history keeps
-    // the existing two-pass path. A stale or corrupt secondary total cannot become an accepted metric.
+    // the existing two-pass path. Both second reads are proof re-reads (forPackedHours), never a second typed digest.
+    // A stale or corrupt secondary total cannot become an accepted metric.
     const predict = ledgerExists && !expired && (floor === null || floor <= first) && outsideCount < pruned.length;
     if (predict) {
       for (const row of current.prepare('SELECT protocol,pool,swap_count FROM compact_packed_pool_swaps').iterate()) add(totals, row);
@@ -1063,7 +1086,9 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       else for (const p of protocols) for (const row of rows.get(p)) row.total = ranks.get(p).get(row.pool).total;
     }
     for (const p of protocols) rows.get(p).sort((a, b) => ranks.get(p).get(a.pool).index - ranks.get(p).get(b.pool).index || a.hour_start - b.hour_start);
-    packedPoolWindow = { version, from, to, rows };
+    packedPoolWindows.delete(key);
+    packedPoolWindows.set(key, { fingerprint, rows });
+    while (packedPoolWindows.size > 2) packedPoolWindows.delete(packedPoolWindows.keys().next().value);
     return rows.get(protocol);
   }
 
@@ -1374,7 +1399,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     },
     close() {
       cache.clear();
-      packedPoolWindow = null;
+      packedPoolWindows.clear();
       unionCache.clear();
       statements = new Map();
       packedReader = null;

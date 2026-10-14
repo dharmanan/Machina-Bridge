@@ -289,6 +289,8 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   // Fixed scratch for synchronous typed-row hashing. Each piece flushes before yielding, so iterators may safely
   // interleave without retaining or sharing unhashed bytes. Native SHA update consumes the buffer synchronously.
   const digestBuffer = Buffer.allocUnsafe(64 * 1024);
+  // Proofs this reader issued for sets that verified completely (openPieces). Only an object from this set is accepted.
+  const issuedProofs = new WeakSet();
   const tablesExist = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_sets'").get());
   const prunedTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_pruned'").get());
   const expiredTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_expired'").get());
@@ -451,8 +453,12 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   // binding to the current canonical hours and table schema (and its stored row count and digest) is checked when it is
   // opened; each piece's payload and raw SHA256, size and order before its first row; the row count, row digest and byte
   // totals at the end. Memory is bounded by one piece. On any mismatch it throws, and a caller must discard the rows it
-  // already received: only an iterator that reached its end means the whole set verified.
-  function openPieces(dataset, scope) {
+  // already received: only an iterator that reached its end means the whole set verified. That end also returns a proof.
+  // proof: one this reader returned for the same set. The typed row digest is a function of the set's binding (schema,
+  // columns, codec, canonical hours, row count and digest) and the raw bytes alone, so with a proof every piece is still
+  // read, size-checked and SHA256-hashed (payload and raw) and must be byte-identical to the verified run; only the typed
+  // row digest is not computed a second time. Any difference from the proof throws packed_proof_mismatch.
+  function openPieces(dataset, scope, proof = null) {
     if (!tablesExist()) return null;
     const definition = definitionOf(dataset);
     const set = db.prepare('SELECT * FROM compact_packed_sets WHERE dataset = ? AND scope_start = ?').get(dataset, int(scope));
@@ -463,45 +469,59 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     if (bindingOf(dataset, definition, scope, canonicalHours(definition, scope), { count: set.row_count, sha256: set.rows_sha256 }) !== set.binding_sha256) {
       fail('packed_binding_mismatch');
     }
+    if (proof !== null && (!issuedProofs.has(proof) || proof.dataset !== dataset || proof.scope !== Number(scope) || proof.binding !== set.binding_sha256
+      || proof.rowsSha256 !== set.rows_sha256 || proof.rowCount !== set.row_count || proof.pieces.length !== set.pieces)) fail('packed_proof_mismatch');
     const payload = db.prepare('SELECT * FROM compact_packed_payloads WHERE payload_sha256 = ?');
     const digestRow = rowDigestEncoder(definition.schema, definition.columns, definition.scope);
     const pieces = db.prepare('SELECT part, row_count, payload_sha256 FROM compact_packed_pieces WHERE dataset = ? AND scope_start = ? ORDER BY part');
     return (function* rows() {
-      const hash = createHash('sha256');
+      const hash = proof ? null : createHash('sha256');
+      const verifiedPieces = [];
       let count = 0;
       let part = 0;
       let rawBytes = 0;
       let storedBytes = 0;
       for (const piece of pieces.iterate(dataset, int(scope))) {
         if (piece.part !== part || part >= set.pieces) fail('packed_pieces_corrupt');
+        const expected = proof?.pieces[part];
         part++;
         const blob = payload.get(piece.payload_sha256);
         if (!blob || sha256(blob.payload) !== piece.payload_sha256) fail('packed_payload_corrupt');
         let raw;
         try { raw = inflateRawSync(blob.payload, { maxOutputLength: PACKED_MAX_RAW_PIECE_BYTES }); } catch { fail('packed_payload_corrupt'); }
         if (raw.length !== blob.raw_bytes || sha256(raw) !== blob.raw_sha256) fail('packed_payload_corrupt');
+        if (expected && (expected.payloadSha256 !== piece.payload_sha256 || expected.rawSha256 !== blob.raw_sha256
+          || expected.rowCount !== piece.row_count)) fail('packed_proof_mismatch');
         rawBytes += raw.length;
         storedBytes += blob.payload.byteLength;
         const values = decodePiece(definition.codec, definition.columns, raw, piece.row_count);
         // Same UTF-8 bytes and row order as the independent writer's rowText+newline, with fixed 64 KiB scratch.
         // Avoid a piece-sized array of checksum strings and its concatenated copy. An unusually large single row
         // is hashed directly (still bounded by the decoded piece); no truncation, skipped rows or weaker digest.
-        let used = 0;
-        for (const value of values) {
-          const line = `${digestRow(value, scope)}\n`, bytes = Buffer.byteLength(line);
-          if (used + bytes > digestBuffer.length) { if (used) hash.update(digestBuffer.subarray(0, used)); used = 0; }
-          if (bytes > digestBuffer.length) hash.update(line);
-          else used += digestBuffer.write(line, used, bytes, 'utf8');
+        if (hash) {
+          let used = 0;
+          for (const value of values) {
+            const line = `${digestRow(value, scope)}\n`, bytes = Buffer.byteLength(line);
+            if (used + bytes > digestBuffer.length) { if (used) hash.update(digestBuffer.subarray(0, used)); used = 0; }
+            if (bytes > digestBuffer.length) hash.update(line);
+            else used += digestBuffer.write(line, used, bytes, 'utf8');
+          }
+          if (used) hash.update(digestBuffer.subarray(0, used));
+          verifiedPieces.push(Object.freeze({ payloadSha256: piece.payload_sha256, rawSha256: blob.raw_sha256, rowCount: piece.row_count }));
         }
-        if (used) hash.update(digestBuffer.subarray(0, used));
         count += values.length;
         yield { definition, values };
       }
       if (part !== set.pieces) fail('packed_pieces_corrupt');
-      if (count !== set.row_count || hash.digest('hex') !== set.rows_sha256 || rawBytes !== set.raw_bytes || storedBytes !== set.stored_bytes) {
+      if (count !== set.row_count || (hash && hash.digest('hex') !== set.rows_sha256) || rawBytes !== set.raw_bytes || storedBytes !== set.stored_bytes) {
         fail('packed_rows_corrupt');
       }
-      return { rowCount: count, pieces: part, rawBytes, storedBytes };
+      if (!proof) {
+        proof = Object.freeze({ dataset, scope: Number(scope), binding: set.binding_sha256, rowsSha256: set.rows_sha256, rowCount: set.row_count,
+          pieces: Object.freeze(verifiedPieces) });
+        issuedProofs.add(proof);
+      }
+      return { rowCount: count, pieces: part, rawBytes, storedBytes, proof };
     })();
   }
 
@@ -522,9 +542,10 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
   }
 
   // Streams a verified set without per-row generator transitions. The pool-only callback observes existing column
-  // values, and materializes only ranked rows in the read model. All checksum/binding/count checks remain identical.
-  function streamSet(dataset, scope, onRow = null, onPoolSwap = null) {
-    const pieces = openPieces(dataset, scope);
+  // values, and materializes only ranked rows in the read model. All checksum/binding/count checks remain identical;
+  // with a proof (openPieces) the set's bytes must match the run that verified it and its row digest is not recomputed.
+  function streamSet(dataset, scope, onRow = null, onPoolSwap = null, proof = null) {
+    const pieces = openPieces(dataset, scope, proof);
     if (!pieces) return null;
     try {
       for (let step = pieces.next(); ; step = pieces.next()) {
@@ -862,7 +883,8 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     // Reader side: forEachRow(dataset, scope, onRow) streams a verified set (see streamSet); null when not stored.
     // openRows(dataset, scope) is the same read as an iterator (see openSet), for merging several sets in order.
     forEachRow: streamSet,
-    forEachPoolSwap: (scope, onSwap) => streamSet('compact_pool_hours', scope, null, onSwap),
+    // Returns the set totals with a proof; passing that proof back re-reads the same verified bytes (see openPieces).
+    forEachPoolSwap: (scope, onSwap, proof = null) => streamSet('compact_pool_hours', scope, null, onSwap, proof),
     openRows: openSet,
     // Stored set row counts of [from, to] (scope -> rowCount), without reading any piece.
     storedScopes(dataset, from, to) {
