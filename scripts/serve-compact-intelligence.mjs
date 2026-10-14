@@ -8,7 +8,8 @@
 // COMPACT_SCHEDULER_ENABLED (maintenance gate): unset, empty or "true" runs the scheduler; "false" serves the read API
 // only, starts no indexing child and writes nothing; any other value refuses to start.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] [PORT=8080] [COMPACT_SCHEDULER_ENABLED=true] \
-//   node --max-old-space-size=128 scripts/serve-compact-intelligence.mjs
+//   node --max-old-space-size=48 --max-semi-space-size=4 scripts/serve-compact-intelligence.mjs
+// Parent V8 flags override Worker resourceLimits: keep the parent's explicit limits aligned with the HTTP read worker.
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
