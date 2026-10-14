@@ -134,6 +134,7 @@ export function createChildDiscoveryRunner(options) {
 // runHistoryBackfill(): one historical hour child. runDiscoveryDrain(): one capped enrichment pass, lowest priority.
 // Live checkpoint catch-up always has priority.
 export function createScheduler({ readModel, runHour, runProjectionRepair = null, runHistoryBackfill = null, runDiscoveryDrain = null,
+  snapshotRunner = null,
   runDailyActiveReplay = null, runGatewayRepair = null, runDiscoveryRecovery = null, historyStartHour = null,
   now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout, log = () => {}, onFatal = null,
   safetyDelayMs = DEFAULT_SAFETY_DELAY_MS, tickMs = DEFAULT_TICK_MS, baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
@@ -202,6 +203,26 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
       log(`SCHEDULER_HOUR_FAILED hour=${hourIso(next)} exit=${outcome.exitCode} signal=${outcome.signal} failures=${failures} `
         + `retry_at=${new Date(retryAt).toISOString()}`);
       return { again: false, wakeAt: retryAt };
+    }
+
+    // Preparation occupies this same single child slot, only after live catch-up. Failure never becomes a live failure.
+    // Leave enough time for the bounded stages, and terminate/await the child before the next live slot.
+    const snapshotLiveDue = (target + 2 * HOUR_SECONDS) * 1000 + safetyDelayMs;
+    if (snapshotRunner && snapshotLiveDue - now() >= 30_000) {
+      try {
+        const needed = await snapshotRunner.needed();
+        if (latestSafeHourStart(now(), safetyDelayMs) > target) return { again: true };
+        if (needed) {
+          const handle = snapshotRunner.run();
+          child = { kind: 'dashboard_snapshot', terminate: () => handle.terminate() };
+          const deadline = setTimer(() => { void handle.terminate(); }, Math.max(0, snapshotLiveDue - now()));
+          let outcome;
+          try { outcome = await handle.done; } finally { clearTimer(deadline); child = null; }
+          status.lastRun = { kind: 'dashboard_snapshot', ...outcome };
+          if (stopped) return { again: false };
+          return { again: true }; // Recheck live priority before any maintenance or retry.
+        }
+      } catch { log('SCHEDULER_SNAPSHOT_FAILED'); }
     }
 
     if (runDiscoveryRecovery) return fairMaintenance(checkpoint, target);

@@ -45,6 +45,10 @@ export const PACKED_SHARDS_VERSION = 'arc-packed-shards-v1';
 export const PACKED_COLUMN_ROWS = 256;
 export const PACKED_ADDRESS_ROWS = 4096;
 export const PACKED_MAX_RAW_PIECE_BYTES = 256 * 1024;
+export const PACKED_POOL_PROOF_MAX_SCOPES = 744;
+export const PACKED_POOL_PROOF_MAX_BYTES = 4 * 1024 * 1024;
+// Conservative metadata accounting, not raw rows. Also impose a piece-count bound independently of byte accounting.
+const PROOF_SCOPE_BYTES = 1024, PROOF_PIECE_BYTES = 512, PROOF_MAX_PIECES = 8192;
 // The 24H window plus a full day of margin: nothing a 24H read, the TVL top-pool choice or a pending valuation touches
 // is ever removed from the hot tables.
 export const PACKED_MIN_HOT_HOURS = 48;
@@ -285,12 +289,31 @@ const materializeRow = (definition, scope, values) => {
 // db: the store's DatabaseSync. Writes (packHour, packDay) must run inside the caller's open writer transaction; each set
 // is written inside its own savepoint so a failure leaves the caller's rows untouched and is only reported.
 // preflight(plannedBytes): the store's storage check ({ ok, reason }). beforePack(dataset, scope): test hook.
-export function createPackedShards(db, { config = packedShardsConfig(), preflight = () => ({ ok: true }), log = console.warn, beforePack = null } = {}) {
+export function createPackedShards(db, { config = packedShardsConfig(), preflight = () => ({ ok: true }), log = console.warn,
+  beforePack = null, reusePoolProofs = false, onPieceRead = null } = {}) {
   // Fixed scratch for synchronous typed-row hashing. Each piece flushes before yielding, so iterators may safely
   // interleave without retaining or sharing unhashed bytes. Native SHA update consumes the buffer synchronously.
   const digestBuffer = Buffer.allocUnsafe(64 * 1024);
   // Proofs this reader issued for sets that verified completely (openPieces). Only an object from this set is accepted.
   const issuedProofs = new WeakSet();
+  // Opt-in read-model cache only. Writers keep their original behavior. A proof never contains decoded rows or raw bytes.
+  const poolProofs = new Map();
+  let proofBytes = 0, proofPieces = 0;
+  const proofStats = { hits: 0, misses: 0, evictions: 0, verifiedSets: 0, verifiedRows: 0, proofReads: 0 };
+  const dropProof = (scope, evicted = true) => {
+    const entry = poolProofs.get(scope);
+    if (!entry) return;
+    poolProofs.delete(scope); proofBytes -= entry.bytes; proofPieces -= entry.proof.pieces.length;
+    if (evicted) proofStats.evictions++;
+  };
+  const rememberProof = (scope, proof) => {
+    const bytes = PROOF_SCOPE_BYTES + proof.pieces.length * PROOF_PIECE_BYTES;
+    if (bytes > PACKED_POOL_PROOF_MAX_BYTES || proof.pieces.length > PROOF_MAX_PIECES) return;
+    dropProof(scope, false);
+    while (poolProofs.size >= PACKED_POOL_PROOF_MAX_SCOPES || proofBytes + bytes > PACKED_POOL_PROOF_MAX_BYTES
+      || proofPieces + proof.pieces.length > PROOF_MAX_PIECES) dropProof(poolProofs.keys().next().value);
+    poolProofs.set(scope, { proof, bytes }); proofBytes += bytes; proofPieces += proof.pieces.length;
+  };
   const tablesExist = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_sets'").get());
   const prunedTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_pruned'").get());
   const expiredTableExists = () => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_packed_expired'").get());
@@ -469,6 +492,14 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     if (bindingOf(dataset, definition, scope, canonicalHours(definition, scope), { count: set.row_count, sha256: set.rows_sha256 }) !== set.binding_sha256) {
       fail('packed_binding_mismatch');
     }
+    const cacheable = reusePoolProofs && dataset === 'compact_pool_hours';
+    if (proof === null && cacheable) {
+      const cached = poolProofs.get(Number(scope))?.proof;
+      if (cached && cached.binding === set.binding_sha256 && cached.rowsSha256 === set.rows_sha256
+        && cached.rowCount === set.row_count && cached.pieces.length === set.pieces) {
+        proof = cached; proofStats.hits++;
+      } else { if (cached) dropProof(Number(scope)); proofStats.misses++; }
+    }
     if (proof !== null && (!issuedProofs.has(proof) || proof.dataset !== dataset || proof.scope !== Number(scope) || proof.binding !== set.binding_sha256
       || proof.rowsSha256 !== set.rows_sha256 || proof.rowCount !== set.row_count || proof.pieces.length !== set.pieces)) fail('packed_proof_mismatch');
     const payload = db.prepare('SELECT * FROM compact_packed_payloads WHERE payload_sha256 = ?');
@@ -510,6 +541,7 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
           verifiedPieces.push(Object.freeze({ payloadSha256: piece.payload_sha256, rawSha256: blob.raw_sha256, rowCount: piece.row_count }));
         }
         count += values.length;
+        onPieceRead?.();
         yield { definition, values };
       }
       if (part !== set.pieces) fail('packed_pieces_corrupt');
@@ -520,7 +552,11 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
         proof = Object.freeze({ dataset, scope: Number(scope), binding: set.binding_sha256, rowsSha256: set.rows_sha256, rowCount: set.row_count,
           pieces: Object.freeze(verifiedPieces) });
         issuedProofs.add(proof);
+        if (cacheable) { proofStats.verifiedSets++; proofStats.verifiedRows += count; }
+      } else if (cacheable) {
+        proofStats.proofReads++;
       }
+      if (cacheable) rememberProof(Number(scope), proof);
       return { rowCount: count, pieces: part, rawBytes, storedBytes, proof };
     })();
   }
@@ -885,6 +921,8 @@ export function createPackedShards(db, { config = packedShardsConfig(), prefligh
     forEachRow: streamSet,
     // Returns the set totals with a proof; passing that proof back re-reads the same verified bytes (see openPieces).
     forEachPoolSwap: (scope, onSwap, proof = null) => streamSet('compact_pool_hours', scope, null, onSwap, proof),
+    poolProofStats: () => ({ ...proofStats, scopes: poolProofs.size, pieces: proofPieces, accountedBytes: proofBytes,
+      maxScopes: PACKED_POOL_PROOF_MAX_SCOPES, maxBytes: PACKED_POOL_PROOF_MAX_BYTES, maxPieces: PROOF_MAX_PIECES }),
     openRows: openSet,
     // Stored set row counts of [from, to] (scope -> rowCount), without reading any piece.
     storedScopes(dataset, from, to) {

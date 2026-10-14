@@ -5,7 +5,7 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
 import { get } from 'node:http';
-import { createEcosystemReader, ECOSYSTEM_READ_TIMEOUT_MS } from '../server/compact/ecosystem-reader.js';
+import { createEcosystemReader, ECOSYSTEM_READ_TIMEOUT_MS, ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from '../server/compact/ecosystem-reader.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
 
 globalThis.fetch = async () => { throw Error('external_network_forbidden'); };
@@ -27,6 +27,7 @@ function controlled(options = {}) {
 
 await test('timeouts remain six seconds in the worker and eight in the proxy', () => {
   assert.equal(ECOSYSTEM_READ_TIMEOUT_MS, 6000);
+  assert.equal(ECOSYSTEM_RESPONSE_TIMEOUT_MS, 7000);
   assert.match(readFileSync(new URL('../api/_lib/intelligence-proxy.js', import.meta.url), 'utf8'), /const REQUEST_TIMEOUT_MS = 8_000\b/);
 });
 
@@ -47,7 +48,7 @@ await test('all nine fixed route keys coalesce independently and run on one exis
       ctx.reply(worker, worker.sent[i], i); assert.equal(await work[i], i);
     }
     assert.equal(ctx.peak(), 1); assert.equal(ctx.workers.length, 1);
-    assert.deepEqual(worker.config.resourceLimits, { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 8 });
+    assert.deepEqual(worker.config.resourceLimits, READ_WORKER_RESOURCE_LIMITS);
   } finally { await ctx.reader.close(); }
   assert.equal(ctx.live(), 0);
 });
@@ -112,6 +113,136 @@ await test('close rejects active and queued reads and leaves no worker running',
   assert.equal(await active, 'ecosystem_reader_closed'); assert.equal(await queued, 'ecosystem_reader_closed');
   assert.equal(ctx.live(), 0);
   await assert.rejects(ctx.reader.read('30d'), error => error.code === 'ecosystem_reader_closed');
+});
+
+await test('invalid active/total budgets cannot exceed the fixed production ceilings', () => {
+  for(const options of [{timeoutMs:6001},{responseTimeoutMs:8000},{timeoutMs:200,responseTimeoutMs:199}])
+    assert.throws(()=>createEcosystemReader({path:'/tmp/not-opened',...options}),/invalid_ecosystem/);
+});
+
+await test('5342 ms V3 leaves queued V4 and Ecosystem their active budget within the total response ceiling', async () => {
+  const timers=[];
+  const ctx=controlled({timeoutMs:6000,responseTimeoutMs:7000,onSend(worker,job){
+    const ms=job.protocol==='v3'?5342:job.protocol==='v4'?180:800;
+    timers.push(setTimeout(()=>worker.emit('message',{id:job.id,value:job.kind,workerMs:ms}),ms));
+  }});
+  const at=performance.now(),done={};
+  try {
+    const values=await Promise.all([['v3',()=>ctx.reader.readPools('v3','30d')],['v4',()=>ctx.reader.readPools('v4','30d')],
+      ['ecosystem',()=>ctx.reader.read('30d')]].map(([key,run])=>run().then(value=>{done[key]=performance.now()-at;return value;})));
+    assert.deepEqual(values,['pools','pools','ecosystem']);assert.equal(ctx.workers.length,1);
+    assert.ok(done.ecosystem>6000 && done.ecosystem<7000);
+    console.log(JSON.stringify({test:'railway_5342_queue',done,workers:ctx.workers.length}));
+  } finally {timers.forEach(clearTimeout);await ctx.reader.close();}
+});
+
+await test('5342 ms V3 and 180 ms V4 succeed; queued 2100 ms Ecosystem correctly times out at the total ceiling', async () => {
+  const timers=[],dispatched=new Map();
+  const durations={v3:5342,v4:180,ecosystem:2100};
+  const ctx=controlled({timeoutMs:6000,responseTimeoutMs:7000,onSend(worker,job){
+    const key=job.protocol??'ecosystem';
+    dispatched.set(key,performance.now());
+    worker.emit('message',{id:job.id,phase:'started'});
+    timers.push(setTimeout(()=>worker.emit('message',{id:job.id,value:job.kind,workerMs:durations[key]}),durations[key]));
+  }});
+  try {
+    // Enqueue all three synchronously; settle failures as failures so every request is reported before asserting.
+    const results=await Promise.all([['v3',()=>ctx.reader.readPools('v3','30d')],['v4',()=>ctx.reader.readPools('v4','30d')],
+      ['ecosystem',()=>ctx.reader.read('30d')]].map(([key,run])=>{
+      const enqueuedAt=performance.now();
+      const report=(status,value,error)=>{
+        const settledAt=performance.now(),startedAt=dispatched.get(key);
+        return {request:key,status,...(error?{error:error.code}:{value}),
+          plannedWorkerMs:durations[key],queueMs:Math.round((startedAt??settledAt)-enqueuedAt),
+          activeElapsedMs:startedAt===undefined?0:Math.round(settledAt-startedAt),
+          totalResponseMs:Math.round(settledAt-enqueuedAt)};
+      };
+      return run().then(value=>report('fulfilled',value),error=>report('rejected',undefined,error));
+    }));
+    console.log(JSON.stringify({test:'railway_5342_180_2100_queue',backendResponseLimitMs:7000,proxyLimitMs:8000,
+      expectedEcosystemError:'ecosystem_read_timeout',results,workers:ctx.workers.length,
+      allRequestsSucceeded:results.every(result=>result.status==='fulfilled')}));
+    // 5342 + 180 + 2100 exceeds 7000 ms. This is a negative queue regression, not successful Dashboard loading.
+    assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled','rejected']);
+    assert.deepEqual(results.slice(0,2).map(result=>result.value),['pools','pools']);
+    assert.equal(results[2].error,'ecosystem_read_timeout');
+    assert.equal(ctx.workers.length,1);
+    assert.equal(ctx.peak(),1);
+    assert.ok(results.slice(0,2).every(result=>result.totalResponseMs<7000));
+    assert.ok(results[2].queueMs>=durations.v3+durations.v4-20);
+    assert.ok(results[2].activeElapsedMs>0 && results[2].activeElapsedMs<durations.ecosystem);
+    assert.ok(results[2].totalResponseMs>=6990 && results[2].totalResponseMs<8000);
+    assert.ok(ctx.logs.some(line=>/kind=ecosystem.*code=ecosystem_read_timeout.*phase=read/.test(line)));
+  } finally {timers.forEach(clearTimeout);await ctx.reader.close();}
+});
+
+await test('active six-second cap restarts once; queued independent work retains its own remaining budget', async () => {
+  const ctx=controlled({timeoutMs:6000,responseTimeoutMs:7000,onTerminate:()=>sleep(20),onSend(worker,job,generation){
+    if(generation>1)queueMicrotask(()=>worker.emit('message',{id:job.id,value:'independent verified result',workerMs:1}));
+  }});
+  try {
+    const at=performance.now(),stalled=ctx.reader.readPools('v3','30d').catch(e=>e.code);
+    const peer=ctx.reader.read('24h');
+    assert.equal(await stalled,'pools_read_timeout');assert.equal(await peer,'independent verified result');
+    assert.equal(ctx.workers.length,2);assert.equal(ctx.peak(),1);
+    assert.ok(performance.now()-at<7000);
+    ctx.workers[0].emit('message',{id:ctx.workers[0].sent[0].id,value:'obsolete'});
+    console.log(JSON.stringify({test:'active_timeout_restart',elapsedMs:performance.now()-at,workers:2,peakWorkers:ctx.peak()}));
+  } finally {await ctx.reader.close();}
+});
+
+await test('total response budget clips late dispatch; timers never extend it with a second full active budget', async () => {
+  const timers=[];
+  const ctx=controlled({timeoutMs:100,responseTimeoutMs:150,onSend(worker,job){
+    if(job.protocol==='v3')timers.push(setTimeout(()=>worker.emit('message',{id:job.id,value:'first'}),80));
+  }});
+  try {
+    const at=performance.now(),a=ctx.reader.readPools('v3','30d'),b=ctx.reader.readPools('v4','30d').catch(e=>e.code);
+    assert.equal(await a,'first');assert.equal(await b,'pools_read_timeout');
+    const elapsed=performance.now()-at;assert.ok(elapsed>=140 && elapsed<180);
+    await sleep(50);assert.equal(ctx.logs.filter(line=>/protocol=v4/.test(line)).length,1);
+  } finally {timers.forEach(clearTimeout);await ctx.reader.close();}
+});
+
+await test('a late reply is rejected even if its timer callback has not run', async () => {
+  const ctx=controlled({timeoutMs:20,responseTimeoutMs:30});
+  try {
+    const result=ctx.reader.read('24h').catch(e=>e.code),w=ctx.workers[0];
+    const until=performance.now()+35;while(performance.now()<until){};
+    ctx.reply(w,w.sent[0],{late:true});assert.equal(await result,'ecosystem_read_timeout');
+    await sleep(40);assert.equal(ctx.logs.length,1);assert.equal(ctx.live(),0);
+  } finally {await ctx.reader.close();}
+});
+
+await test('failed worker termination rejects every waiter without creating a second worker', async () => {
+  const ctx=controlled({onTerminate:()=>{throw Error('private teardown detail');}});
+  try {
+    const first=ctx.reader.read('30d').catch(e=>e.code),peer=ctx.reader.readPools('v4','24h').catch(e=>e.code);
+    ctx.workers[0].emit('error',Error('worker failed'));
+    assert.equal(await first,'ecosystem_worker_failed');assert.equal(await peer,'ecosystem_worker_termination_failed');
+    assert.equal(ctx.workers.length,1);assert.equal(ctx.peak(),1);
+    await assert.rejects(ctx.reader.read('24h'),e=>e.code==='ecosystem_reader_closed');
+    assert.ok(ctx.logs.every(line=>!line.includes('private')));
+  }finally{await ctx.reader.close();}
+});
+
+await test('Node 24 worker resource limits cap the total V8 heap below 64 MiB', async () => {
+  const w=new Worker(`require('node:worker_threads').parentPort.postMessage(require('node:v8').getHeapStatistics().heap_size_limit)`,
+    {eval:true,resourceLimits:READ_WORKER_RESOURCE_LIMITS});
+  try {
+    const limit=await new Promise((resolve,reject)=>{w.once('message',resolve);w.once('error',reject);});
+    assert.ok(limit<=64*1024*1024);console.log(JSON.stringify({workerHeapSizeLimit:limit}));
+  } finally {await w.terminate();}
+});
+
+await test('an oversized reported V8 limit fails before any SQLite read', async () => {
+  const source=readFileSync(new URL('../server/compact/ecosystem-worker.js',import.meta.url),'utf8')
+    .replace("import { getHeapStatistics } from 'node:v8';",'const getHeapStatistics=()=>({heap_size_limit:96*1024*1024});')
+    .replace("from './read-model.js'",`from '${new URL('../server/compact/read-model.js',import.meta.url).href}'`);
+  const reader=createEcosystemReader({path:'/tmp/never-opened.sqlite',workerFactory:(_url,options)=>
+    new Worker(new URL('data:text/javascript;base64,'+Buffer.from(source).toString('base64')),options)});
+  try{await assert.rejects(reader.read('30d'),e=>e.code==='ecosystem_worker_heap_limit');}
+  finally{await reader.close();}
 });
 
 const localGet = (server, path) => new Promise((resolve, reject) => {

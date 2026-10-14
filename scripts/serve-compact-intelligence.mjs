@@ -14,6 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createIntelligenceServer } from '../server/compact/http.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
 import { createEcosystemReader } from '../server/compact/ecosystem-reader.js';
+import { createDashboardSnapshotStore, createSnapshotRunner } from '../server/compact/dashboard-snapshot.js';
 import { createDiscoveryRecoveryPlanner } from '../server/compact/discovery-recovery-planner.js';
 import { createChildHistoryRunner, createChildHourRunner, createChildDiscoveryRunner, createChildDiscoveryRecoveryRunner, createScheduler } from '../server/compact/scheduler.js';
 import { ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR } from './backfill-compact-history.mjs';
@@ -131,14 +132,19 @@ async function main() {
   log(`DISCOVERY_RECOVERY_ENABLED ${config.discoveryRecoveryEnabled}`);
   log(`EVIDENCE_ARCHIVE_ENABLED ${archiveConfig(childEnv).enabled}`);
   const recoveryPlanner = config.discoveryRecoveryEnabled ? createDiscoveryRecoveryPlanner({ path: config.sqlitePath }) : null;
+  const snapshotStore = createDashboardSnapshotStore({ path: config.sqlitePath,
+    verifyCheckpoint: cp => readModel.snapshotCheckpointMatches(cp) });
+  const snapshotRunner = createSnapshotRunner({ path: config.sqlitePath, store: snapshotStore, readModel, log });
   const scheduler = createScheduler({
     readModel: recoveryPlanner ? { ...readModel, discoveryRecoveryPlan: ({ nowMs }) => recoveryPlanner.read(nowMs) } : readModel,
     runHour, runProjectionRepair, runHistoryBackfill, runDiscoveryDrain, runDailyActiveReplay, runGatewayRepair, runDiscoveryRecovery,
-    historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, log, onFatal: fatal,
+    historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, snapshotRunner, log, onFatal: fatal,
   });
   const ecosystemReader = createEcosystemReader({ path: config.sqlitePath, log });
-  const httpReadModel = { ...readModel, ecosystem: (window) => ecosystemReader.read(window),
-    pools: (protocol, window) => ecosystemReader.readPools(protocol, window),
+  const httpReadModel = { ...readModel, ecosystem: (window) => window === '30d'
+    ? snapshotStore.read('ecosystem', readModel.snapshotIdentity()) : ecosystemReader.read(window),
+    pools: (protocol, window) => window === '30d'
+      ? snapshotStore.read(protocol, readModel.snapshotIdentity()) : ecosystemReader.readPools(protocol, window),
     async close() { await recoveryPlanner?.close(); await ecosystemReader.close(); readModel.close(); } };
   const server = createIntelligenceServer({ readModel: httpReadModel, log, onFatal: fatal });
   service = startIntelligenceService({ config, readModel: httpReadModel, scheduler, server, log });

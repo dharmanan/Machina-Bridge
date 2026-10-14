@@ -9,16 +9,17 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
-import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { inflateRawSync, deflateRawSync } from 'node:zlib';
 import { createCompactStore } from '../server/compact/store.js';
 import { createPackedShards, packedShardsConfig } from '../server/compact/packed-shards.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
-import { createEcosystemReader, ECOSYSTEM_READ_TIMEOUT_MS } from '../server/compact/ecosystem-reader.js';
+import { createEcosystemReader, ECOSYSTEM_READ_TIMEOUT_MS, ECOSYSTEM_RESPONSE_TIMEOUT_MS } from '../server/compact/ecosystem-reader.js';
 import { COMPACT_DEFINITION_VERSION } from '../server/compact/sources.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { VALUATIONS } from '../server/compact/valuation.js';
+import { handleIntelligenceProxy } from '../api/_lib/intelligence-proxy.js';
 
 globalThis.fetch = async () => { throw Error('external_network_forbidden'); };
 for (const key of ['COMPACT_PACKED_SHARDS_ENABLED','COMPACT_PACKED_RETENTION_ENABLED','COMPACT_PACKED_EXPIRY_ENABLED','COMPACT_PACKED_HOT_HOURS',
@@ -33,6 +34,25 @@ const old=path?await import(pathToFileURL(join(baselineRoot,'server/compact/read
 const expected=new Map(),timings=[],failed=[];
 let passed=0;
 let trace;
+const telemetry=[];
+function measuredReader(extra={}) {
+  let workers=0;
+  const reader=createEcosystemReader({...extra,path,workerFactory:(url,options)=>{
+    workers++;
+    const worker=new Worker(extra.workerURL??url,{...options,workerData:{...options.workerData,collectMetrics:true}});
+    worker.on('message',message=>{
+      if(!message.metrics)return;
+      const record={id:message.id,workerMs:message.workerMs,...message.metrics};telemetry.push(record);
+    });
+    return worker;
+  }});
+  return {reader,workers:()=>workers};
+}
+function assertTelemetry(record) {
+  assert.ok(record.memory.heapSizeLimit<=64*1024*1024,'total V8 heap cap, not just old generation');
+  assert.ok(record.memory.heapUsed<=record.memory.heapSizeLimit);
+  if(record.proofCache){const c=record.proofCache;assert.ok(c.scopes<=c.maxScopes && c.accountedBytes<=c.maxBytes && c.pieces<=c.maxPieces);}
+}
 class TracedDatabase extends DatabaseSync {
   prepare(sql) {
     const statement=super.prepare(sql),record=trace;
@@ -333,6 +353,58 @@ async function windowScenarios() {
     passed++;console.log('PASS the second read of every set is guarded by its proof (wrong hint and expiry paths)');
   }
   {
+    const db=new DatabaseSync(copy('r.sqlite','hourly-proof-cache.sqlite'));
+    const cached=createPackedShards(db,{config:{enabled:false},reusePoolProofs:true});
+    try {
+      const hours=cached.prunedScopes('compact_pool_hours',W_FROM,W_NEWEST),h=hours[0];
+      db.exec('BEGIN');const issued=cached.forEachPoolSwap(h,()=>{}).proof;db.exec('COMMIT');
+      const first=cached.poolProofStats();
+      db.prepare("INSERT INTO compact_meta VALUES('proof-cache-unrelated','1')").run();
+      assert.ok(cached.forEachPoolSwap(h,()=>{}));
+      assert.equal(cached.poolProofStats().verifiedSets,first.verifiedSets);assert.equal(cached.poolProofStats().hits,1);
+      const other=createPackedShards(db,{config:{enabled:false}}),foreign=other.forEachPoolSwap(h,()=>{}).proof;
+      assert.throws(()=>cached.forEachPoolSwap(h,()=>{},foreign),e=>e.code==='packed_proof_mismatch');
+      assert.throws(()=>cached.forEachPoolSwap(h,()=>{},{...issued}),e=>e.code==='packed_proof_mismatch');
+      const canonical=db.prepare('SELECT last_hash FROM compact_hours WHERE hour_start=?').get(BigInt(h));
+      db.prepare('UPDATE compact_hours SET last_hash=? WHERE hour_start=?').run(hash(999999),BigInt(h));
+      assert.throws(()=>cached.forEachPoolSwap(h,()=>{}),e=>e.code==='packed_binding_mismatch');
+      db.prepare('UPDATE compact_hours SET last_hash=? WHERE hour_start=?').run(canonical.last_hash,BigInt(h));
+      const blob=db.prepare(`SELECT b.* FROM compact_packed_pieces p JOIN compact_packed_payloads b USING(payload_sha256)
+        WHERE p.dataset='compact_pool_hours' AND p.scope_start=? LIMIT 1`).get(BigInt(h));
+      db.exec('DROP TRIGGER compact_packed_payload_no_update');
+      db.prepare('UPDATE compact_packed_payloads SET raw_sha256=? WHERE payload_sha256=?').run(hash(123).slice(2),blob.payload_sha256);
+      assert.throws(()=>cached.forEachPoolSwap(h,()=>{}),e=>e.code==='packed_payload_corrupt');
+      db.prepare('UPDATE compact_packed_payloads SET raw_sha256=? WHERE payload_sha256=?').run(blob.raw_sha256,blob.payload_sha256);
+      // A cached proof must also reject valid hashes over DIFFERENT bytes, not only damaged hashes.
+      const piece=db.prepare("SELECT * FROM compact_packed_pieces WHERE dataset='compact_pool_hours' AND scope_start=? LIMIT 1").get(BigInt(h));
+      const newRaw=Buffer.from(JSON.stringify(JSON.parse(inflateRawSync(blob.payload).toString()).reverse()));
+      const newPayload=deflateRawSync(newRaw,{level:1}),digest=b=>createHash('sha256').update(b).digest('hex');
+      db.prepare('INSERT OR IGNORE INTO compact_packed_payloads VALUES(?,?,?,?)').run(digest(newPayload),digest(newRaw),BigInt(newRaw.length),newPayload);
+      db.exec('DROP TRIGGER compact_packed_piece_no_update');
+      db.prepare("UPDATE compact_packed_pieces SET payload_sha256=? WHERE dataset='compact_pool_hours' AND scope_start=? AND part=?")
+        .run(digest(newPayload),BigInt(h),BigInt(piece.part));
+      assert.throws(()=>cached.forEachPoolSwap(h,()=>{}),e=>e.code==='packed_proof_mismatch');
+      db.prepare("UPDATE compact_packed_pieces SET payload_sha256=? WHERE dataset='compact_pool_hours' AND scope_start=? AND part=?")
+        .run(piece.payload_sha256,BigInt(h),BigInt(piece.part));
+      db.exec('BEGIN');
+      try {
+        db.exec('ALTER TABLE compact_pool_hours ADD COLUMN test_schema_change TEXT');
+        assert.throws(()=>cached.forEachPoolSwap(h,()=>{}),e=>e.code==='packed_definition_mismatch');
+      }finally{db.exec('ROLLBACK');}
+      assert.ok(cached.forEachPoolSwap(h,()=>{}));
+      const allHours=cached.prunedScopes('compact_pool_hours',W.day0,W_NEWEST);
+      for(const hour of allHours)cached.forEachPoolSwap(hour,()=>{});
+      const stats=cached.poolProofStats();assert.ok(stats.evictions>0 && stats.scopes<=stats.maxScopes && stats.accountedBytes<=stats.maxBytes && stats.pieces<=stats.maxPieces);
+      const before=stats.verifiedSets;cached.forEachPoolSwap(allHours[0],()=>{});
+      assert.ok(cached.poolProofStats().verifiedSets>before,'evicted proof is fully reverified');
+      const restarted=createPackedShards(db,{config:{enabled:false},reusePoolProofs:true});
+      assert.equal(restarted.poolProofStats().scopes,0);restarted.forEachPoolSwap(h,()=>{});
+      assert.equal(restarted.poolProofStats().verifiedSets,1);
+      results.hourProofCache=stats;passed++;
+      console.log('PASS bounded hourly proofs: cross-commit reuse, eviction, cold restart, foreign proof, canonical and raw SHA rejection');
+    } finally {db.close();}
+  }
+  {
     // The fingerprint memo: an unrelated commit (as the discovery drain makes every minute) rebuilds the response but
     // reads no packed set; a pool input change (another hour pruned, a changed projection commitment) recomputes.
     const path=copy('r.sqlite','memo.sqlite');
@@ -411,11 +483,11 @@ for(const window of ['24h','7d','30d']) for(const protocol of ['v3','v4']) {
   const reference=old.createCompactReadModel({path,DatabaseSync:TracedDatabase}),at=performance.now();
   try {expected.set(`${protocol}:${window}`,stripFreshness(reference.pools(protocol,window)));
     const ms=performance.now()-at;
-    console.log(JSON.stringify({test:'baseline_841766e',protocol,window,ms,...trace,nonSqlMs:ms-trace.sqlMs}));}
+    console.log(JSON.stringify({test:'baseline_source_reference',protocol,window,ms,...trace,nonSqlMs:ms-trace.sqlMs}));}
   finally {reference.close();}
   let workers=0;const workerTimes=[];
   const reader=createEcosystemReader({path,workerFactory:(url,options)=>{
-    workers++;const w=new Worker(url,options);w.on('message',m=>{if(Number.isFinite(m.workerMs))workerTimes.push(m.workerMs);});return w;
+    workers++;const w=new Worker(url,{...options,workerData:{...options.workerData,collectMetrics:true}});w.on('message',m=>{if(Number.isFinite(m.workerMs))workerTimes.push(m.workerMs);if(m.metrics){assertTelemetry(m.metrics);telemetry.push({protocol,window,workerMs:m.workerMs,...m.metrics});}});return w;
   }});
   try {
     const coldAt=performance.now();let value;
@@ -431,6 +503,18 @@ for(const window of ['24h','7d','30d']) for(const protocol of ['v3','v4']) {
     const record={protocol,window,coldMs,warmMs,workerTimes,nearDeadline:coldMs>=5500};timings.push(record);
     console.log(JSON.stringify({test:'cold_warm_equal',...record}));
   } finally {await reader.close();}
+}
+// Truly cold Ecosystem also uses the same enforced worker limit and is compared with the immutable reference.
+{
+  for(const ecoWindow of ['24h','7d','30d']) {
+  const reference=old.createCompactReadModel({path,DatabaseSync});let answer;
+  try{answer=reference.ecosystem(ecoWindow);}finally{reference.close();}
+  const ctx=measuredReader(),at=performance.now();
+  try{
+    assert.deepEqual(await ctx.reader.read(ecoWindow),answer);passed++;
+    console.log(JSON.stringify({test:'cold_ecosystem',window:ecoWindow,ms:performance.now()-at,workers:ctx.workers()}));
+  } finally{await ctx.reader.close();}
+  }
 }
 // Shared packed proof must be reused across protocols, but only for the same window and committed version.
 trace={queries:0,payloadGets:0,sqlMs:0};
@@ -515,9 +599,108 @@ try {
       }
     } finally {await reader.close();}
   }
+  // Run the real worker module, substituting only the SQLite constructor for a read-only wrong-hint regression.
+  {
+    const workerSource=readFileSync(new URL('../server/compact/ecosystem-worker.js',import.meta.url),'utf8')
+      .replace("import { DatabaseSync } from 'node:sqlite';",`import { DatabaseSync as RealDatabase } from 'node:sqlite';
+        class DatabaseSync extends RealDatabase { prepare(sql) {
+          const s=super.prepare(sql);
+          if(sql==='SELECT protocol,pool,swap_count FROM compact_packed_pool_swaps') {
+            const it=s.iterate;s.iterate=function* (...args) {
+              for(const r of it.apply(s,args))yield r.protocol===${JSON.stringify(hintRow.protocol)} && r.pool===${JSON.stringify(hintRow.pool)}
+                ? {...r,swap_count:r.swap_count+1000000}:r;
+            };
+          }return s;
+        }}`)
+      .replace("from './read-model.js'",`from '${new URL('../server/compact/read-model.js',import.meta.url).href}'`);
+    const ctx=measuredReader({workerURL:new URL('data:text/javascript;base64,'+Buffer.from(workerSource).toString('base64'))}),at=performance.now();
+    try {
+      assert.deepEqual(stripFreshness(await ctx.reader.readPools('v3','30d')),expected.get('v3:30d'));passed++;
+      console.log(JSON.stringify({test:'incorrect_hint_cold_worker',ms:performance.now()-at,workers:ctx.workers()}));
+    } finally {await ctx.reader.close();}
+  }
+  {
+    const ctx=measuredReader(),at=performance.now(),done={};
+    try {
+      const results=await Promise.all(['v3','v4','ecosystem'].map(async job=>{
+        let sent;
+        await handleIntelligenceProxy({method:'GET',query:job==='ecosystem'?{view:'ecosystem',window:'30d'}:{view:'pools',protocol:job,window:'30d'},
+          send:value=>{sent=value;},fetchImpl:async (_url,{signal})=>{
+            const value=await (job==='ecosystem'?ctx.reader.read('30d'):ctx.reader.readPools(job,'30d'));
+            await new Promise((resolve,reject)=>{
+              const cancel=()=>{clearTimeout(timer);reject(Error('proxy_cancelled'));};
+              const timer=setTimeout(()=>{signal.removeEventListener('abort',cancel);resolve();},500);
+              signal.addEventListener('abort',cancel,{once:true});if(signal.aborted)cancel();
+            });
+            return new Response(JSON.stringify(value),{status:200,headers:{'content-type':'application/json'}});
+          }});
+        done[job]=performance.now()-at;assert.equal(sent.status,200);return JSON.parse(sent.body);
+      }));
+      assert.deepEqual(stripFreshness(results[0]),expected.get('v3:30d'));assert.deepEqual(stripFreshness(results[1]),expected.get('v4:30d'));
+      assert.equal(ctx.workers(),1);assert.ok(Math.max(...Object.values(done))<8000);passed++;
+      console.log(JSON.stringify({test:'unchanged_proxy_30d_queue',done,workers:ctx.workers(),simulatedDeliveryMs:500}));
+    }finally{await ctx.reader.close();}
+  }
+  // Advance ONLY this isolated synthetic fixture by ONE hour, using the existing compact writer and existing rows.
+  {
+    const ctx=measuredReader();
+    try {
+      await ctx.reader.readPools('v3','30d');
+      const beforeStats=telemetry.at(-1).proofCache;
+      const prior=writer.prepare('SELECT * FROM compact_hours ORDER BY hour_start DESC LIMIT 1').get();
+      const range={kind:'hour',hourStart:prior.hour_start+HOUR,hourEnd:prior.hour_start+2*HOUR,
+        firstBlock:prior.last_block+1,lastBlock:prior.last_block+10,parentHash:prior.last_hash,
+        firstHash:hash(prior.last_block+1),lastHash:hash(prior.last_block+10)};
+      const store=createCompactStore(writer,{packedShards:{config:{enabled:false},log:()=>{}}});
+      store.commitHour({definitionVersion:COMPACT_DEFINITION_VERSION,sourceVersions:{},chainId:5042,range,complete:false,
+        network:JSON.parse(prior.network_json),activeAddresses:[],families:Object.fromEntries(Object.entries(FAMILY_FIELDS).map(([name,fields])=>
+          [name,{status:'unavailable',reason:'synthetic_fixture',...Object.fromEntries(fields.map(f=>[f,null]))}])),registry:{uniswapV3:null}});
+      checkpoint=writer.prepare('SELECT * FROM compact_checkpoint WHERE id=1').get();
+      writer.exec('BEGIN');
+      try {
+        for(const table of ['compact_pool_hours','compact_projection_hours','compact_valuation_hours','compact_token_price_hours',
+          'compact_dex_volume_hours','compact_dex_fee_hours','compact_pool_tvl_hours']) {
+          const columns=writer.prepare(`PRAGMA table_info(${table})`).all().map(c=>c.name);
+          if(!columns.length)continue;
+          writer.prepare(`INSERT INTO ${table} (${columns.join(',')}) SELECT ${columns.map(c=>c==='hour_start'?'?':c).join(',')}
+            FROM ${table} WHERE hour_start=?`).run(BigInt(range.hourStart),BigInt(prior.hour_start));
+        }
+        writer.prepare('UPDATE compact_registry_coverage SET through_block=?,through_hash=?').run(BigInt(range.lastBlock),range.lastHash);
+        writer.exec('COMMIT');
+      } catch(e){writer.exec('ROLLBACK');throw e;}
+      const packed=createPackedShards(writer,{config:{enabled:true,retention:true,hotHours:48},log:()=>{}});
+      packed.begin();writer.exec('BEGIN');const prune=packed.maintain(range.hourStart,{limit:16});writer.exec('COMMIT');
+      assert.deepEqual(prune.failed,[]);
+      const reference=old.createCompactReadModel({path,DatabaseSync}),advanced={};
+      try{for(const p of ['v3','v4'])advanced[p]=stripFreshness(reference.pools(p,'30d'));advanced.ecosystem=reference.ecosystem('30d');}
+      finally{reference.close();}
+      const at=performance.now(),done={},sampleStart=telemetry.length;
+      const answers=await Promise.all([['v3',()=>ctx.reader.readPools('v3','30d')],['v4',()=>ctx.reader.readPools('v4','30d')],
+        ['ecosystem',()=>ctx.reader.read('30d')]].map(([job,run])=>run().then(value=>{done[job]=performance.now()-at;return value;})));
+      assert.deepEqual(stripFreshness(answers[0]),advanced.v3);assert.deepEqual(stripFreshness(answers[1]),advanced.v4);
+      assert.deepEqual(answers[2],advanced.ecosystem);assert.equal(ctx.workers(),1);
+      const poolStats=telemetry[sampleStart].proofCache;
+      assert.ok(poolStats.hits>beforeStats.hits+500,'overlapping historical hours reuse their byte-identical proofs');
+      assert.ok(poolStats.verifiedSets-beforeStats.verifiedSets<=16,'only newly pruned scopes need a full typed-row digest');
+      assert.ok(Math.max(...Object.values(done))<ECOSYSTEM_RESPONSE_TIMEOUT_MS);passed++;
+      console.log(JSON.stringify({test:'advanced_hour_30d',done,workers:ctx.workers(),prune,
+        reused:poolStats.hits-beforeStats.hits,newFullVerifications:poolStats.verifiedSets-beforeStats.verifiedSets,proofCache:poolStats}));
+      await ctx.reader.close();
+      const restarted=measuredReader(),restartAt=performance.now();
+      try {
+        assert.deepEqual(stripFreshness(await restarted.reader.readPools('v3','30d')),advanced.v3);
+        const metrics=telemetry.at(-1);assert.ok(metrics.proofCache.verifiedSets>500,'a restarted worker has no cached proof');passed++;
+        console.log(JSON.stringify({test:'advanced_hour_cold_restart',ms:performance.now()-restartAt,metrics}));
+      }finally{await restarted.reader.close();}
+      // This fixture is disposable: preserve its NEW valid checkpoint, not the old 900-hour anchor.
+      checkpoint=writer.prepare('SELECT * FROM compact_checkpoint WHERE id=1').get();
+    } finally {await ctx.reader.close();}
+  }
 } finally {
   if(writer && checkpoint) writer.prepare('UPDATE compact_checkpoint SET hour_start=? WHERE id=1 AND hour_start!=?').run(checkpoint.hour_start,checkpoint.hour_start);
   writer?.close();model.close();
 }
-console.log(JSON.stringify({summary:{passed,failed:failed.length,timings},workerDeadlineMs:6000,proxyDeadlineMs:8000,noRetry:true}));
+for(const record of telemetry)assertTelemetry(record);
+console.log(JSON.stringify({workerTelemetry:telemetry}));
+console.log(JSON.stringify({summary:{passed,failed:failed.length,timings},workerDeadlineMs:6000,responseDeadlineMs:7000,proxyDeadlineMs:8000,noRetry:true}));
 if(failed.length)process.exitCode=1;

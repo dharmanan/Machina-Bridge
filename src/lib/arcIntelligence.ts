@@ -180,6 +180,7 @@ export type ArcPool = {
 
 // Top pools of one Uniswap version, ranked by swap count. USD volume and USD liquidity are shown beside the count.
 export type ArcPools = {
+  snapshot?: ArcDashboardSnapshot
   schema: typeof POOLS_SCHEMA
   protocol: 'v3' | 'v4'
   window: IntelligenceWindow
@@ -337,7 +338,22 @@ export type DiscoveredToken = { address: string; status: 'verified_erc20_like'; 
     poolSummary?: { observedPoolCount: number; firstVerified: boolean; first: DiscoveryPoolIdentity | null };
     firstDexActivity?: { status: string; reason: string | null; firstObserved: { timestamp: string; blockNumber: number; txHash: string; firstProven: boolean } | null } };
   evidence?: { status: 'summary'; reason: 'bounded_response_limit' } }
-export type ArcEcosystem = { schema: typeof ECOSYSTEM_SCHEMA; window: IntelligenceWindow;
+export type ArcDashboardSnapshot = { status: 'current' | 'stale'; checkpointHour: string; verifiedThrough: string;
+  preparedAt: string; latestCheckpointHour: string; lagHours: number; ageSeconds: number }
+function validDashboardSnapshot(value: unknown, window: unknown): boolean {
+  if (value === undefined) return true // Existing 24H/7D and pre-snapshot API contracts remain valid.
+  if (!isRecord(value) || !isRecord(window) || window.key !== '30d'
+    || !['current', 'stale'].includes(value.status as string)
+    || !['checkpointHour', 'verifiedThrough', 'preparedAt', 'latestCheckpointHour'].every(key => typeof value[key] === 'string'
+      && Number.isFinite(Date.parse(value[key] as string)))
+    || !Number.isSafeInteger(value.lagHours) || (value.lagHours as number) < 0
+    || !Number.isSafeInteger(value.ageSeconds) || (value.ageSeconds as number) < 0) return false
+  return value.verifiedThrough === window.end
+    && Date.parse(value.verifiedThrough as string) - Date.parse(value.checkpointHour as string) === 3600000
+    && Date.parse(value.latestCheckpointHour as string) - Date.parse(value.checkpointHour as string) === (value.lagHours as number) * 3600000
+    && (value.status === 'stale' || value.lagHours === 0)
+}
+export type ArcEcosystem = { schema: typeof ECOSYSTEM_SCHEMA; window: IntelligenceWindow; snapshot?: ArcDashboardSnapshot;
   coverage: { status: string; reason?: string; requiredHours: number; availableHours: number; unresolvedCandidateCount?: number;
     candidateVerificationComplete?: boolean };
   discoveredTokens: { status: string; truncated?: boolean; rows: DiscoveredToken[] };
@@ -356,7 +372,8 @@ export function tokenListState(ecosystem: ArcEcosystem, kind: 'launches' | 'disc
 }
 
 export function parseArcEcosystem(value: Record<string, unknown> | null, selected: string): ArcEcosystem | null {
-  if (!value || value.schema !== ECOSYSTEM_SCHEMA || !validWindowCoverage(value.window)) return null
+  if (!value || value.schema !== ECOSYSTEM_SCHEMA || !validWindowCoverage(value.window)
+    || !validDashboardSnapshot(value.snapshot, value.window)) return null
   const data = value as unknown as ArcEcosystem
   if (data.window?.key !== selected || !data.coverage || !data.discoveredTokens || !data.launches
     || !data.otherProtocols || !data.exchangeFlows) return null
@@ -606,7 +623,8 @@ function isArcPool(value: unknown, protocol: 'v3' | 'v4'): value is ArcPool {
 export function parseArcPools(value: unknown, protocol: 'v3' | 'v4', window: ArcIntelligenceWindow = '24h'): ArcPools | null {
   if (!isRecord(value) || value.schema !== POOLS_SCHEMA || value.protocol !== protocol || !isRecord(value.window) || value.window.key !== window
     || !isRecord(value.ranking) || value.ranking.by !== 'swap_count' || !isNullableCount(value.poolsTracked) || !isNullableCount(value.newPools)
-    || !Array.isArray(value.pools) || value.pools.length > 10 || !validWindowCoverage(value.window)) return null
+    || !Array.isArray(value.pools) || value.pools.length > 10 || !validWindowCoverage(value.window)
+    || !validDashboardSnapshot(value.snapshot, value.window)) return null
   if (value.status === 'available') return value.pools.every((pool) => isArcPool(pool, protocol)) ? value as unknown as ArcPools : null
   return value.status === 'unavailable' && value.pools.length === 0 ? value as unknown as ArcPools : null
 }
@@ -695,6 +713,14 @@ export async function loadArcIntelligence(
     pools: { v3: parseArcPools(settledObject(poolsV3), 'v3', selected), v4: parseArcPools(settledObject(poolsV4), 'v4', selected) },
     activity: Object.fromEntries(ARC_ACTIVITY_TYPES.map((type, index) => [type, parseArcActivity(settledObject(activity[index]), type)])) as
       Record<ArcActivityType, ArcActivity | null>,
+  }
+  // Atomic files cannot pin several separate HTTP/CDN requests. Fail closed if activation happened between requests;
+  // the existing refresh merger retains the prior successful bundle while Summary/Timeseries/Activity stay isolated.
+  const snapshotVersions = [result.pools?.v3?.snapshot, result.pools?.v4?.snapshot, result.ecosystem?.snapshot]
+    .filter(value => value !== undefined).map(value => `${value.checkpointHour}:${value.preparedAt}`)
+  if (new Set(snapshotVersions).size > 1) {
+    result.pools = { v3: null, v4: null }
+    result.ecosystem = null
   }
   result.readErrors = Object.fromEntries(ARC_READ_SECTIONS.flatMap((section, index) => sectionValue(result, section) !== null ? []
     : [[section, settled[index].status === 'rejected' ? 'request_failed' : 'invalid_response']]))

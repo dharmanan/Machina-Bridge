@@ -351,13 +351,14 @@ const SQL = Object.freeze({
 // path: the compact SQLite file. DatabaseSync: node:sqlite's class (injected so the module loads on any Node version).
 // onSnapshotStarted: test hook, called inside every snapshot right after its first read.
 export function createCompactReadModel({ path, DatabaseSync, now = () => Date.now(), busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
-  onSnapshotStarted = null }) {
+  onSnapshotStarted = null, onReadSample = null }) {
   if (typeof path !== 'string' || !path || path === ':memory:' || path.startsWith('file:')) throw new ReadModelError('invalid_path');
   if (typeof DatabaseSync !== 'function') throw new ReadModelError('sqlite_unavailable');
   if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) throw new ReadModelError('invalid_busy_timeout');
   let db = null;
   let statements = new Map();
   let packedReader = null;
+  let preparingSnapshot = false;
   const cache = new Map();
   // The ranked rows (at most 2 x 10 x 720) of the two newest packed windows (7D, 30D), shared by V3/V4 and keyed by the
   // window's input fingerprint, not by data_version: unrelated commits (discovery drain, metadata) keep them valid.
@@ -365,7 +366,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   // Exact 7D/30D (and older 24H) unions already counted, keyed by the complete identity sets they used (address-union.js).
   const unionCache = new Map();
   // Read-only access to packed sets (SELECT only, on this query_only connection); packing itself stays a writer concern.
-  const packedSets = () => (packedReader ??= createPackedShards(connection(), { config: { enabled: false } }));
+  const packedSets = () => (packedReader ??= createPackedShards(connection(), { config: { enabled: false },
+    reusePoolProofs: true, onPieceRead: onReadSample }));
 
   function connection() {
     if (db) return db;
@@ -395,6 +397,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   // this function returns, so no snapshot is ever held between requests.
   function snapshot(work, { requireDefinitions = true } = {}) {
     const current = connection();
+    // Background preparation pins one WAL read snapshot across three bounded stages. Public reads never use this mode.
+    if (preparingSnapshot) return work(definitionState(current));
     if (current.isTransaction === true) current.exec('ROLLBACK');
     current.exec('BEGIN');
     try {
@@ -1278,6 +1282,42 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   const chain = Object.freeze({ id: ARC_CHAIN_ID, name: 'Arc' });
 
   return Object.freeze({
+    // Internal diagnostics only: no API field, endpoint, writer or persisted cache.
+    poolProofStats: () => packedReader?.poolProofStats() ?? null,
+    snapshotIdentity() {
+      const dataVersion = connection().prepare('PRAGMA data_version').get().data_version;
+      return snapshot(() => {
+        anchor();
+        const cp = statement('checkpoint').get();
+        return { hourStart: cp.hour_start, lastBlock: cp.last_block, lastHash: cp.last_hash, dataVersion };
+      });
+    },
+    snapshotCheckpointMatches(cp) {
+      return snapshot(() => {
+        anchor();
+        const row = connection().prepare('SELECT last_block,last_hash FROM compact_hours WHERE hour_start=?').get(cp.hourStart);
+        return row?.last_block === cp.lastBlock && row?.last_hash === cp.lastHash;
+      });
+    },
+    beginPrepared30d(expected) {
+      if (preparingSnapshot) throw new ReadModelError('snapshot_already_started');
+      const current = connection();
+      current.exec('BEGIN');
+      try {
+        if (definitionState(current).state !== 'ok') throw new ReadModelError('incompatible');
+        anchor();
+        const cp = statement('checkpoint').get();
+        if (cp.hour_start !== expected.hourStart || cp.last_block !== expected.lastBlock || cp.last_hash !== expected.lastHash)
+          throw new ReadModelError('snapshot_checkpoint_changed');
+        cache.clear();
+        preparingSnapshot = true;
+      } catch (error) { current.exec('ROLLBACK'); throw error; }
+    },
+    endPrepared30d() {
+      if (!preparingSnapshot) throw new ReadModelError('snapshot_not_started');
+      connection().exec('COMMIT');
+      preparingSnapshot = false;
+    },
     ecosystem(windowKey) {
       if (typeof windowKey !== 'string' || !Object.hasOwn(ECOSYSTEM_WINDOWS, windowKey)) throw new ReadModelError('unsupported_window');
       return cached(`ecosystem:${windowKey}`, () => snapshot(() => { anchor(); return readEcosystem(connection(), windowKey); }));
