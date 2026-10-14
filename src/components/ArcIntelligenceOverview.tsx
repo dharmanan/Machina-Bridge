@@ -2377,6 +2377,7 @@ function RefreshStatus({ data }: { data: ArcIntelligenceLoad | null }) {
   const earlier = names(true), missing = names(false)
   const savedSnapshot = (section: ArcReadSection) => section === 'poolsV3' ? data?.pools?.v3?.snapshot
     : section === 'poolsV4' ? data?.pools?.v4?.snapshot : section === 'ecosystem' ? data?.ecosystem?.snapshot : undefined
+  const snapshotMetadata = data?.window === '30d' ? savedSnapshot('poolsV3') ?? savedSnapshot('poolsV4') ?? savedSnapshot('ecosystem') : null
   return <>
     {failures.length > 0 && <Banner tone="warn">
       Some parts could not be refreshed.
@@ -2395,6 +2396,12 @@ function RefreshStatus({ data }: { data: ArcIntelligenceLoad | null }) {
           {state.verifiedThrough && <> Data through {formatUtcDateTime(state.verifiedThrough)}.</>}
           {state.error === 'invalid_response' && ' The latest response did not pass its checks.'}
         </li>)}
+        {snapshotMetadata && <li data-refresh-section="snapshot">
+          <strong>30D snapshot</strong>: {snapshotMetadata.status}.
+          {' '}Checkpoint: {formatUtcDateTime(snapshotMetadata.checkpointHour)}.
+          {' '}Prepared: {formatUtcDateTime(snapshotMetadata.preparedAt)}.
+          {' '}Latest checkpoint: {formatUtcDateTime(snapshotMetadata.latestCheckpointHour)}.
+        </li>}
       </ul>
     </details>
   </>
@@ -2425,8 +2432,6 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
   const snapshots = [loaded?.pools?.v3?.snapshot, loaded?.pools?.v4?.snapshot, loaded?.ecosystem?.snapshot]
     .filter((value) => value !== undefined)
   const snapshotThrough = snapshots.length ? snapshots.map(value => value.verifiedThrough).sort()[0] : null
-  const snapshotWindow = loaded?.pools?.v3?.snapshot ? loaded.pools.v3.window : loaded?.pools?.v4?.snapshot
-    ? loaded.pools.v4.window : loaded?.ecosystem?.snapshot ? loaded.ecosystem.window : null
   const snapshotDelayed = snapshots.some(value => value.status === 'stale')
     || Boolean(snapshotThrough && verifiedThrough && Date.parse(snapshotThrough) < Date.parse(verifiedThrough))
   const networkCollecting = mode === 'ready' && windowStatus(summary?.network) === 'collecting'
@@ -2467,28 +2472,16 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
       )}
       {mode === 'failed' && <Banner tone="warn">Arc Intelligence data could not be loaded right now. The layout stays in place; try Refresh in a moment.</Banner>}
       <RefreshStatus data={loaded} />
-      {coverage && (
-        <Banner tone="info"><span data-history-coverage={coverage.status}>
-          {partialHistory
-            ? <><strong>Partial 30D history</strong>: {coverage.availableHours} of {coverage.expectedHours} hours are available
-              {' '}({coverage.completedUtcDays} complete days), so 30D totals cover only these hours. Missing hours are never counted as zero.</>
-            : <><strong>Full 30D history</strong>: all {coverage.expectedHours} hours.</>}
-          {' '}Period: {formatUtcDateTime(coverage.start)} to {formatUtcDateTime(coverage.end)}.
-        </span></Banner>
-      )}
-      {networkCollecting && (
+      {coverage && <p data-history-coverage={coverage.status} className={`text-xs leading-5 ${snapshotDelayed ? 'text-amber-700' : 'text-slate-500'}`}>
+        <strong>30D:</strong> {coverage.availableHours}/{coverage.expectedHours} verified hours ({coverage.completedUtcDays} complete days).
+        {partialHistory ? ' Missing hours are excluded from totals.' : ' Full 30D coverage.'}
+        {snapshotDelayed && snapshotThrough && <> Saved Uniswap/Ecosystem data is delayed (through {formatUtcDateTime(snapshotThrough)}).</>}
+      </p>}
+      {networkCollecting && selectedWindow !== '30d' && (
         <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the {selectedWindow === '24h'
           ? 'hourly charts already show each verified hour' : 'daily charts already show each complete day'}.</Banner>
       )}
       {mode === 'ready' && summary?.freshness.stale && <Banner tone="warn">Updates are delayed. The latest verified hour is older than usual.</Banner>}
-      {selectedWindow === '30d' && snapshotThrough && <Banner tone={snapshotDelayed ? 'warn' : 'info'}>
-        30D Uniswap and Ecosystem use a saved verified snapshot. Data through {formatUtcDateTime(snapshotThrough)}.
-        {' '}Prepared {formatUtcDateTime(snapshots[0].preparedAt)}.
-        {snapshotWindow?.coverage && <> Snapshot coverage: {snapshotWindow.coverage.availableHours} of 720 verified hours,
-          {' '}{formatUtcDateTime(snapshotWindow.coverage.start)} to {formatUtcDateTime(snapshotWindow.coverage.end)}.</>}
-        {snapshotDelayed && <> Newer results are not ready; these retained values are delayed by at least {Math.max(
-          ...snapshots.map(value => Math.max(value.lagHours, Math.floor(value.ageSeconds / 3600))), verifiedThrough ? Math.max(0, (Date.parse(verifiedThrough) - Date.parse(snapshotThrough)) / 3600000) : 0)} hours.</>}
-      </Banner>}
       {selectedWindow === '30d' && loaded && !snapshotThrough && !loaded.pools?.v3 && !loaded.pools?.v4 && !loaded.ecosystem && <Banner tone="info">
         No saved verified 30D Uniswap or Ecosystem results have loaded yet. These sections remain unavailable until a snapshot is ready.
       </Banner>}
