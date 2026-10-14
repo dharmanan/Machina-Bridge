@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from './ecosystem-reader.js';
 import { MAX_RESPONSE_BYTES } from './http.js';
+import { safeSnapshotError, safeExitCode, safeExitSignal, createSnapshotFatalScanner } from './snapshot-diagnostics.js';
 
 const FORMAT = 'machina.dashboard.30d.snapshot.v1';
 export const SNAPSHOT_MAX_BYTES = 3 * MAX_RESPONSE_BYTES + 4096;
@@ -16,8 +17,6 @@ const fail = code => Object.assign(new Error(code), { code });
 const digest = text => createHash('sha256').update(text).digest('hex');
 const iso = seconds => new Date(seconds * 1000).toISOString();
 const sections = ['v3', 'v4', 'ecosystem'];
-const PREPARE_ERRORS = new Set(['snapshot_disk_budget', 'snapshot_size_limit', 'snapshot_invalid',
-  'snapshot_inputs_changed', 'snapshot_write_failed']);
 const checkpointEqual = (a,b) => a?.hourStart === b?.hourStart && a?.lastBlock === b?.lastBlock && a?.lastHash === b?.lastHash;
 
 // A deployment changing any compact/API source cannot silently reuse a cache produced under different rules.
@@ -172,13 +171,28 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
     const child = spawnImpl(process.execPath, ['--max-old-space-size='+READ_WORKER_RESOURCE_LIMITS.maxOldGenerationSizeMb,
       '--max-semi-space-size='+READ_WORKER_RESOURCE_LIMITS.maxYoungGenerationSizeMb,
       fileURLToPath(new URL('../../scripts/prepare-compact-dashboard-snapshot.mjs', import.meta.url))],
-      { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env: { PATH: process.env.PATH } });
+      { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], env: { PATH: process.env.PATH } });
     running = true;
     let timer, deadline, failed = null, closed = false, completed = false, stopped = false, stage = 0;
+    let detail, terminationRequested = false, exitRecord = null, stderrEnded = !child.stderr, failureLogged = false;
+    const fatalScanner = createSnapshotFatalScanner();
     const stages = ['begin','v3','v4','ecosystem','end'];
+    const reportFailure = () => {
+      if (!exitRecord || !stderrEnded || failureLogged) return;
+      failureLogged = true;
+      log(`SNAPSHOT_FAILED code=${exitRecord.reason} stage=${exitRecord.stage} detail=${exitRecord.detail ?? 'unknown'}`
+        + ` exit=${exitRecord.exitCode ?? 'null'} signal=${exitRecord.signal ?? 'none'} fatalMarker=${fatalScanner.marker()}`
+        + ` termination=${terminationRequested ? 'parent_requested' : 'none'}`);
+    };
+    // Drain stderr without forwarding or retaining it. Only fixed V8 fatal markers survive in one bounded failure line.
+    child.stderr?.on('data', chunk => fatalScanner.write(chunk));
+    const stderrFinished = () => { stderrEnded = true; reportFailure(); };
+    child.stderr?.on('end', stderrFinished);
+    child.stderr?.on('close', stderrFinished);
+    child.stderr?.on('error', () => {}); // Raw stream errors are never printed.
     let resolve;
     const done = new Promise(r => { resolve = r; }).finally(() => { running = false; });
-    const stop = code => { failed ??= code; clearTimeout(timer); if (!closed) child.kill('SIGKILL'); };
+    const stop = code => { failed ??= code; clearTimeout(timer); if (!closed) { terminationRequested = true; child.kill('SIGKILL'); } };
     const dispatch = () => {
       const name = stages[stage];
       if (name === 'end' && key(readModel.snapshotIdentity()) !== key(cp)) return stop('snapshot_inputs_changed');
@@ -192,7 +206,11 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
       clearTimeout(timer);
       if (performance.now() >= deadline) return stop('snapshot_stage_timeout');
       if (!message || message.stage !== stages[stage]) return stop('snapshot_prepare_failed');
-      if (message.error) return stop(PREPARE_ERRORS.has(message.error) ? message.error : 'snapshot_prepare_failed');
+      if (message.error) {
+        const diagnostic = safeSnapshotError({ code: message.error, detail: message.detail });
+        detail = diagnostic.detail;
+        return stop(diagnostic.code);
+      }
       stage++;
       if (stage === stages.length) {
         completed = true;
@@ -201,11 +219,16 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
       else dispatch();
     });
     // An IPC error is not an exit. Only a failed spawn (no pid) or `exit` releases the scheduler's child slot.
-    child.on('error', () => {
+    child.on('error', error => {
+      detail ??= safeSnapshotError(error).code;
       if (child.pid) stop('snapshot_child_failed');
-      else { closed = true; clearTimeout(timer); failed = 'snapshot_child_failed'; resolve({exitCode:1,error:failed}); }
+      else {
+        closed = true; clearTimeout(timer); failed = 'snapshot_child_failed';
+        exitRecord = { reason: failed, detail, stage: stages[stage], exitCode: null, signal: null };
+        reportFailure(); resolve({exitCode:1,error:failed});
+      }
     });
-    child.on('exit', async code => {
+    child.on('exit', async (code, signal) => {
       closed = true; clearTimeout(timer);
       try {
         if (stopped || failed || !completed || code !== 0) throw fail(failed ?? 'snapshot_prepare_failed');
@@ -213,8 +236,10 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
         log(`SNAPSHOT_READY hour=${iso(cp.hourStart)}`);
         resolve({exitCode:0,error:null});
       } catch (error) {
-        const reason = /^[a-z_]{1,64}$/.test(error.code) ? error.code : 'snapshot_prepare_failed';
-        log(`SNAPSHOT_FAILED code=${reason} stage=${stages[Math.min(stage, stages.length - 1)]}`); resolve({exitCode:1,error:reason});
+        const diagnostic = safeSnapshotError(error), reason = diagnostic.code;
+        exitRecord = { reason, detail: detail ?? diagnostic.detail, stage: stages[Math.min(stage, stages.length - 1)],
+          exitCode: safeExitCode(code), signal: safeExitSignal(signal) };
+        reportFailure(); resolve({exitCode:1,error:reason});
       }
     });
     dispatch();
