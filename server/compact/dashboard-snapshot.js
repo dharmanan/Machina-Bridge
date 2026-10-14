@@ -5,12 +5,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { ECOSYSTEM_READ_TIMEOUT_MS, ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from './ecosystem-reader.js';
+import { ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from './ecosystem-reader.js';
 import { MAX_RESPONSE_BYTES } from './http.js';
 
 const FORMAT = 'machina.dashboard.30d.snapshot.v1';
 export const SNAPSHOT_MAX_BYTES = 3 * MAX_RESPONSE_BYTES + 4096;
 export const SNAPSHOT_FREE_RESERVE_BYTES = 256 * 1024 * 1024;
+export const SNAPSHOT_STAGE_TIMEOUT_MS = 30_000;
 const fail = code => Object.assign(new Error(code), { code });
 const digest = text => createHash('sha256').update(text).digest('hex');
 const iso = seconds => new Date(seconds * 1000).toISOString();
@@ -148,11 +149,11 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
   return { load, publish, read, activePath, compatibility };
 }
 
-// Uses the scheduler's existing single child-process slot, not another HTTP worker. Each read stage gets the same 6s
-// execution bound; HTTP's 7s total / proxy's 8s remain untouched. A pinned read transaction survives between stages.
+// Uses the scheduler's existing single child-process slot, not another HTTP worker. Background stages have their own
+// 30s bound; HTTP's 6s active / 7s total / proxy's 8s remain untouched. Live-hour preemption still terminates the child.
 export function createSnapshotRunner({ path, store, readModel, log = () => {}, spawnImpl = spawn,
-  timeoutMs = ECOSYSTEM_READ_TIMEOUT_MS, now = Date.now }) {
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 6000) throw fail('invalid_snapshot_timeout');
+  timeoutMs = SNAPSHOT_STAGE_TIMEOUT_MS, now = Date.now }) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > SNAPSHOT_STAGE_TIMEOUT_MS) throw fail('invalid_snapshot_timeout');
   let attempted = null, retryAt = 0, running = false;
   const key = cp => JSON.stringify(cp);
   const checkpointKey = cp => JSON.stringify([cp.hourStart, cp.lastBlock, cp.lastHash]);

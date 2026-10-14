@@ -12,7 +12,8 @@ import { createCompactStore } from '../server/compact/store.js';
 import { COMPACT_DEFINITION_VERSION } from '../server/compact/sources.js';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { createCompactReadModel } from '../server/compact/read-model.js';
-import { createDashboardSnapshotStore, createSnapshotRunner, SNAPSHOT_MAX_BYTES } from '../server/compact/dashboard-snapshot.js';
+import { createDashboardSnapshotStore, createSnapshotRunner, SNAPSHOT_MAX_BYTES, SNAPSHOT_STAGE_TIMEOUT_MS } from '../server/compact/dashboard-snapshot.js';
+import { ECOSYSTEM_READ_TIMEOUT_MS, ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from '../server/compact/ecosystem-reader.js';
 import { createScheduler } from '../server/compact/scheduler.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
 
@@ -43,6 +44,28 @@ const options={path,now:()=>clock,verifyCheckpoint:cp=>model.snapshotCheckpointM
 const snapshots=createDashboardSnapshotStore(options), runner=createSnapshotRunner({path,store:snapshots,readModel:model,now:()=>clock});
 let original;
 try {
+ await test('background snapshot stage exceeds 6s safely; 30s cap, HTTP deadlines and heap limits stay separate',async()=>{
+   assert.equal(SNAPSHOT_STAGE_TIMEOUT_MS,30000);
+   assert.equal(ECOSYSTEM_READ_TIMEOUT_MS,6000);assert.equal(ECOSYSTEM_RESPONSE_TIMEOUT_MS,7000);
+   assert.match(readFileSync(new URL('../api/_lib/intelligence-proxy.js',import.meta.url),'utf8'),/const REQUEST_TIMEOUT_MS = 8_000\b/);
+   assert.deepEqual(READ_WORKER_RESOURCE_LIMITS,{maxOldGenerationSizeMb:48,maxYoungGenerationSizeMb:4});
+   for(const timeoutMs of [0,30001])assert.throws(()=>createSnapshotRunner({path,store:snapshots,readModel:model,timeoutMs}),/invalid_snapshot_timeout/);
+   let timer;
+   class SlowPreparation extends EventEmitter {
+     send(m){if(m.stage==='v3')timer=setTimeout(()=>this.emit('message',{stage:m.stage}),6100);
+       else queueMicrotask(()=>this.emit('message',{stage:m.stage}));}
+     disconnect(){queueMicrotask(()=>this.emit('exit',0));}
+     kill(){clearTimeout(timer);queueMicrotask(()=>this.emit('exit',null));}
+   }
+   const slow=createSnapshotRunner({path,store:snapshots,readModel:model,spawnImpl:(_exec,args)=>{
+     assert.deepEqual(args.slice(0,2),['--max-old-space-size=48','--max-semi-space-size=4']);return new SlowPreparation();
+   }});
+   const at=performance.now(),handle=slow.run();
+   assert.throws(()=>slow.run(),/snapshot_already_running/);
+   assert.equal((await handle.done).exitCode,0);
+   const elapsedMs=performance.now()-at;assert.ok(elapsedMs>6000 && elapsedMs<30000);
+   console.log(JSON.stringify({test:'simulated_background_stage_over_http_cap',elapsedMs,snapshotStageLimitMs:30000,httpActiveMs:6000,httpTotalMs:7000,proxyMs:8000}));
+ });
  await test('no snapshot: explicit not_ready, no heavy fallback',async()=>assert.rejects(snapshots.read('v3',model.snapshotIdentity()),e=>e.code==='not_ready'));
  await test('all three real read-model outputs prepared and atomically activated',async()=>{
    assert.equal(await runner.needed(),true);assert.equal((await runner.run().done).exitCode,0);original=await snapshots.load();
@@ -73,7 +96,7 @@ try {
    values.v4.freshness.checkpointBlock--;
    await assert.rejects(snapshots.publish(cp,values));assert.deepEqual(await snapshots.load(),original);
  });
- await test('failed prepare and 6s timeout preserve successful bundle; retries are bounded',async()=>{
+ await test('failed prepare and bounded stage timeout preserve successful bundle; retries are bounded',async()=>{
    class FailingChild extends EventEmitter {send(m){queueMicrotask(()=>this.emit('message',{stage:m.stage,error:'forced'}));}kill(){queueMicrotask(()=>this.emit('exit',null));}}
    const bad=createSnapshotRunner({path,store:snapshots,readModel:model,now:()=>clock,spawnImpl:()=>new FailingChild()});
    // This runner starts with the older bundle, so the current hour genuinely needs a rebuild.
