@@ -18,7 +18,7 @@ const LEGACY_MESSAGES = new Set(['snapshot_inputs_changed','invalid_stage']);
 const DETAILS = new Set([
   ...CODES, 'ENOSPC','invalid_stage','database_missing','database_empty','no_checkpoint','query_only_unavailable',
   'schema_tables_mismatch','schema_version_mismatch','family_unknown','family_definition_mismatch','family_version_missing',
-  'checkpoint_not_contiguous','pool_registry_missing','pool_registry_metadata_malformed','pool_projection_malformed',
+  'checkpoint_not_contiguous','pool_registry_missing','pool_registry_metadata_malformed','pool_projection_malformed','pool_ranking_memory_budget_exceeded',
   'pool_tvl_malformed','packed_set_missing','packed_pool_swaps_inconsistent','token_price_malformed',
   'dex_volume_malformed','dex_volume_missing','dex_fee_malformed','dex_fee_missing','network_gas_malformed',
   'daily_active_addresses_malformed','map_size_limit','array_length_invalid','call_stack_limit',

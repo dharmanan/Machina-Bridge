@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readEcosystem, discoveryWorkDue } from './intelligence-store.js';
 import { createPackedShards } from './packed-shards.js';
+import { createPoolTotals } from './pool-totals.js';
 import { uniqueAddressesOfSpan } from './address-union.js';
 import { ECOSYSTEM_WINDOWS } from './intelligence-registry.js';
 import { ARC_ASSETS_BY_ADDRESS } from '../../api/_lib/arc-intelligence/assets.js';
@@ -47,6 +48,7 @@ export const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const HOUR = 3600;
 const ACTIVITY_LIMIT = 25;
 const POOL_LIMIT = 10;
+const POOL_MEMO_MAX_BYTES = 16 * 1024 * 1024;
 const FAMILIES = Object.keys(FAMILY_FIELDS);
 const TABLES = Object.freeze(['compact_meta', 'compact_hours', 'compact_family_hours', 'compact_hour_addresses', 'compact_registry',
   'compact_registry_coverage', 'compact_checkpoint']);
@@ -323,6 +325,7 @@ const SQL = Object.freeze({
     WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, protocol`,
   tokenPriceRows: `SELECT hour_start, token, price_usd_e18, source_protocol, source_pool, depth_usd_micros, source_count
     FROM compact_token_price_hours WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start, token`,
+  tokenPriceOne: 'SELECT price_usd_e18 FROM compact_token_price_hours WHERE hour_start = ? AND token = ?',
   tokenMetadata: 'SELECT symbol, name, decimals FROM compact_token_metadata WHERE token = ? AND verified = 1',
   activityRows: `SELECT block_number, log_index, block_timestamp, tx_hash, tx_from, protocol, kind, pool, amount0_raw, amount1_raw,
     amount_basis, counterparty, counterparty_kind FROM compact_dex_activity WHERE kind = ?1
@@ -359,6 +362,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   let statements = new Map();
   let packedReader = null;
   let preparingSnapshot = false;
+  let poolTotals = null; // One reusable, fixed-size native buffer; never one JS Map per distinct pool.
   const cache = new Map();
   // The ranked rows (at most 2 x 10 x 720) of the two newest packed windows (7D, 30D), shared by V3/V4 and keyed by the
   // window's input fingerprint, not by data_version: unrelated commits (discovery drain, metadata) keep them valid.
@@ -989,11 +993,23 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
 
   // The top pools' hourly rows of [from, to] with their window totals, in the order of the topPoolRows statement (total
   // desc, pool asc, hour asc). Hours whose pool rows retention moved into packed sets (marked pruned) are read from those
-  // verified sets, streamed; a window without such an hour runs the original statement unchanged. Memory holds one total
-  // per pool of the window (as the SQL grouping does) and the chosen pools' rows, never a pruned hour's whole set.
+  // verified sets, streamed. Only top-K identities and bounded selected rows are kept as JS objects.
+  function* streamRankedPoolRows(protocol, from, to, ranks, pruned) {
+    const selected = ranks.get(protocol), pools = [...selected.keys()];
+    if (pools.length) for (const row of connection().prepare(`WITH wanted(pool) AS (VALUES ${pools.map(() => '(?)').join(',')})
+      SELECT r.* FROM wanted CROSS JOIN compact_hours h CROSS JOIN compact_pool_hours r
+      WHERE h.hour_start BETWEEN ? AND ? AND r.hour_start=h.hour_start AND r.protocol=? AND r.pool=wanted.pool
+      AND h.hour_start NOT IN (SELECT scope_start FROM compact_packed_pruned WHERE dataset='compact_pool_hours' AND scope_start BETWEEN ? AND ?)`)
+      .iterate(...pools, int(from), int(to), protocol, int(from), int(to))) yield { ...row, total: selected.get(row.pool).total };
+    for (const hour of pruned) {
+      const iterator = packedSets().openRows('compact_pool_hours', hour);
+      if (!iterator) throw new ReadModelError('inconsistent_state', 'packed_set_missing');
+      for (const row of iterator) if (row.protocol === protocol && selected.has(row.pool)) yield { ...row, total: selected.get(row.pool).total };
+    }
+  }
   function topPoolRowsOf(protocol, from, to) {
     const pruned = packedSets().prunedScopes('compact_pool_hours', from, to);
-    if (!pruned.length) return statement('topPoolRows').all(protocol, int(from), int(to), int(POOL_LIMIT));
+    if (!pruned.length) return statement('topPoolRows').iterate(protocol, int(from), int(to), int(POOL_LIMIT));
     // Same fingerprint of every input (SQL poolWindow*), same rows: commits that touch none of them keep the memo.
     const key = `${from}:${to}`;
     const fingerprint = createHash('sha256').update(JSON.stringify([from, to, statement('poolWindowHours').all(int(from), int(to)),
@@ -1002,29 +1018,27 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     if (memo?.fingerprint === fingerprint) {
       packedPoolWindows.delete(key);
       packedPoolWindows.set(key, memo);
-      return memo.rows.get(protocol);
+      return memo.rows ? memo.rows.get(protocol) : streamRankedPoolRows(protocol, from, to, memo.ranks, pruned);
     }
+    packedPoolWindows.delete(key);
+    const heldMemoBytes = [...packedPoolWindows.values()].reduce((sum, item) => sum + item.bytes, 0);
     // Each pruned hour is verified completely the first time it is read here. A second read in this computation (the
     // verified ranking after a wrong hint, or the rows after the expiry/floor totals pass) must be byte-identical to that
     // run (packed-shards proof), so only its typed row digest is not computed twice.
-    const proofs = new Map();
     const forPackedHours = (hours, onRow) => {
       for (const hour of hours) {
         // An expired set (never inside a served window) or a missing one fails the answer closed, never as an empty hour.
-        const read = packedSets().forEachPoolSwap(hour, onRow, proofs.get(hour) ?? null);
+        // Use the existing bounded proof cache; don't retain a second unbounded array of per-piece proofs.
+        const read = packedSets().forEachPoolSwap(hour, onRow);
         if (!read) throw new ReadModelError('inconsistent_state', 'packed_set_missing');
-        proofs.set(hour, read.proof);
       }
     };
     const protocols = ['uniswap_v3', 'uniswap_v4'];
-    const hot = new Map(protocols.map(p => [p, new Map(statement('hotPoolTotals').all(p, int(from), int(to)).map(row => [row.pool, row.total]))]));
-    const totals = new Map(protocols.map(p => [p, new Map(hot.get(p))]));
-    const addSwap = (target, protocol, pool, count, sign = 1) => {
-      const values = target.get(protocol);
-      if (!values) throw new ReadModelError('inconsistent_state', 'packed_pool_swaps_inconsistent');
-      values.set(pool, (values.get(pool) ?? 0) + sign * count);
+    const totals = poolTotals ??= createPoolTotals({ errorFactory: detail => new ReadModelError('inconsistent_state', detail) });
+    const addHot = () => {
+      for (const p of protocols) for (const row of statement('hotPoolTotals').iterate(p, int(from), int(to))) totals.add(p,row.pool,row.total);
     };
-    const add = (target, row) => addSwap(target, row.protocol, row.pool, row.swap_count);
+    totals.clear(); addHot();
     const current = connection();
     const floor = packedSets().historyFloor();
     const first = statement('bounds').get().first;
@@ -1038,29 +1052,40 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     // If the hint chose different pools, collect again using the proved ranking; expired/folded history keeps
     // the existing two-pass path. Both second reads are proof re-reads (forPackedHours), never a second typed digest.
     // A stale or corrupt secondary total cannot become an accepted metric.
-    const predict = ledgerExists && !expired && (floor === null || floor <= first) && outsideCount < pruned.length;
+    let predict = ledgerExists && !expired && (floor === null || floor <= first) && outsideCount < pruned.length;
     if (predict) {
-      for (const row of current.prepare('SELECT protocol,pool,swap_count FROM compact_packed_pool_swaps').iterate()) add(totals, row);
-    } else forPackedHours(pruned, (protocol, pool, count) => addSwap(totals, protocol, pool, count));
-    const rankTotals = values => new Map(protocols.map(p => [p, new Map([...values.get(p)].filter(([, total]) => total > 0)
-      .sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)).slice(0, POOL_LIMIT)
-      .map(([pool, total], index) => [pool, { index, total }]))]));
-    let ranks = rankTotals(totals);
+      try {
+        for (const row of current.prepare('SELECT protocol,pool,swap_count FROM compact_packed_pool_swaps').iterate()) totals.add(row.protocol,row.pool,row.swap_count);
+      } catch (error) {
+        if (error?.detail !== 'pool_ranking_memory_budget_exceeded') throw error;
+        predict = false; totals.clear(); addHot(); // Oversized all-history hints must not cap the verified window.
+      }
+    }
+    if (!predict) forPackedHours(pruned, (protocol, pool, count) => totals.add(protocol,pool,count));
+    const rankTotals = () => new Map(protocols.map(p => [p, totals.top(p,POOL_LIMIT)]));
+    let ranks = rankTotals();
     const rows = new Map(protocols.map(p => [p, []]));
     const maxRows = 2 * POOL_LIMIT * ((to - from) / HOUR + 1);
     let retainedRows = 0;
-    const observed = predict ? new Map(protocols.map(p => [p, new Map(hot.get(p))])) : null;
+    let rowBytes = 0, cacheRows = true;
+    if (predict) { totals.clear(); addHot(); } // Reuse the same fixed buffer for the independent verified totals.
     const keep = (row) => {
       const entry = ranks.get(row.protocol)?.get(row.pool);
       if (!entry) return;
       if (++retainedRows > maxRows) throw new ReadModelError('inconsistent_state', 'pool_projection_malformed');
+      if (!cacheRows) return;
+      rowBytes += 256;
+      for (const value of Object.values(row)) if (typeof value === 'string') rowBytes += 32 + value.length * 2;
+      if (rowBytes + heldMemoBytes > POOL_MEMO_MAX_BYTES) {
+        cacheRows = false; for (const p of protocols) rows.set(p, []); return;
+      }
       rows.get(row.protocol).push({ pool: row.pool, total: entry.total, hour_start: row.hour_start, swap_count: row.swap_count, token0_in_raw: row.token0_in_raw,
         token0_out_raw: row.token0_out_raw, token1_in_raw: row.token1_in_raw, token1_out_raw: row.token1_out_raw, add_count: row.add_count,
         remove_count: row.remove_count, poke_count: row.poke_count, add_amount0_raw: row.add_amount0_raw, add_amount1_raw: row.add_amount1_raw,
         remove_amount0_raw: row.remove_amount0_raw, remove_amount1_raw: row.remove_amount1_raw });
     };
-    const collect = observed => {
-      retainedRows = 0;
+    const collect = observe => {
+      retainedRows = 0; rowBytes = 0; cacheRows = true;
       for (const p of protocols) {
         rows.set(p, []);
         const pools = [...ranks.get(p).keys()];
@@ -1072,7 +1097,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
           .iterate(...pools, int(from), int(to), p, int(from), int(to))) keep(row);
       }
       forPackedHours(pruned, (protocol, pool, count, values, columns, hour) => {
-        if (observed) addSwap(observed, protocol, pool, count);
+        if (observe) totals.add(protocol,pool,count);
         if (!ranks.get(protocol)?.has(pool)) return;
         // The packed reader verified every full typed row. Only the <= 20 ranked pools need row objects retained.
         const row = { hour_start: hour };
@@ -1080,20 +1105,21 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
         keep(row);
       });
     };
-    collect(observed);
-    if (observed) {
-      const verifiedRanks = rankTotals(observed);
+    collect(predict);
+    if (predict) {
+      const verifiedRanks = rankTotals();
       const covered = protocols.every(p => verifiedRanks.get(p).size === ranks.get(p).size
         && [...verifiedRanks.get(p).keys()].every(pool => ranks.get(p).has(pool)));
       ranks = verifiedRanks;
-      if (!covered) collect(null);
-      else for (const p of protocols) for (const row of rows.get(p)) row.total = ranks.get(p).get(row.pool).total;
+      if (!covered) collect(false);
+      else if (cacheRows) for (const p of protocols) for (const row of rows.get(p)) row.total = ranks.get(p).get(row.pool).total;
     }
-    for (const p of protocols) rows.get(p).sort((a, b) => ranks.get(p).get(a.pool).index - ranks.get(p).get(b.pool).index || a.hour_start - b.hour_start);
+    if (cacheRows) for (const p of protocols) rows.get(p).sort((a, b) => ranks.get(p).get(a.pool).index - ranks.get(p).get(b.pool).index || a.hour_start - b.hour_start);
     packedPoolWindows.delete(key);
-    packedPoolWindows.set(key, { fingerprint, rows });
-    while (packedPoolWindows.size > 2) packedPoolWindows.delete(packedPoolWindows.keys().next().value);
-    return rows.get(protocol);
+    packedPoolWindows.set(key, { fingerprint, ranks, rows: cacheRows ? rows : null, bytes: cacheRows ? rowBytes : 0 });
+    while (packedPoolWindows.size > 2 || [...packedPoolWindows.values()].reduce((sum,item)=>sum+item.bytes,0) > POOL_MEMO_MAX_BYTES)
+      packedPoolWindows.delete(packedPoolWindows.keys().next().value);
+    return cacheRows ? rows.get(protocol) : streamRankedPoolRows(protocol, from, to, ranks, pruned);
   }
 
   // Top pools of one protocol over the window, ranked by swap count (the only verified ranking: USD volume and liquidity
@@ -1123,14 +1149,25 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     // valued with that hour's own stored prices; a pool with any swap hour it cannot value has no USD volume.
     const tables = optionalTables();
     const valuation = valuationWindow('dex_usd_volume', from, to, hours, tables);
-    const prices = new Map();
-    if (valuation.status === 'available') {
-      for (const row of statement('tokenPriceRows').all(int(from), int(to))) {
+    const validatePrices = (fromHour,toHour) => {
+      for (const row of statement('tokenPriceRows').iterate(int(fromHour),int(toHour)))
         if (!USD_DIGITS.test(row.price_usd_e18)) throw new ReadModelError('inconsistent_state', 'token_price_malformed');
-        if (!prices.has(row.hour_start)) prices.set(row.hour_start, new Map());
-        prices.get(row.hour_start).set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
-      }
+    };
+    if (valuation.status === 'available') {
+      validatePrices(from,to); // Preserve validation of EVERY stored price, including unneeded tokens, without .all().
     }
+    const pricesFor = (hour,token0,token1) => {
+      const book = new Map();
+      for (const token of new Set([token0,token1])) {
+        if (priceableDecimals(token) === null) continue;
+        const row = statement('tokenPriceOne').get(int(hour),token);
+        if (row) {
+          if (!USD_DIGITS.test(row.price_usd_e18)) throw new ReadModelError('inconsistent_state','token_price_malformed');
+          book.set(token,{priceUsdE18:BigInt(row.price_usd_e18)});
+        }
+      }
+      return book;
+    };
     const details = new Map();
     const detailsOf = (pool) => {
       if (!details.has(pool)) details.set(pool, registryDetails(spec.registryKind, pool, tables));
@@ -1155,7 +1192,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       if (valuation.status === 'available' && row.swap_count > 0) {
         const { token0, token1 } = detailsOf(row.pool);
         const value = poolVolumeUsd({ token0: token0.address, token1: token1.address, side0Raw: BigInt(flows[0]) + BigInt(flows[1]),
-          side1Raw: BigInt(flows[2]) + BigInt(flows[3]) }, prices.get(row.hour_start) ?? new Map());
+          side1Raw: BigInt(flows[2]) + BigInt(flows[3]) }, pricesFor(row.hour_start,token0.address,token1.address));
         if (value) {
           entry.usdMicros += value.usdMicros;
           entry.bases.add(value.basis);
@@ -1165,15 +1202,13 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     // Latest stored snapshot of each ranked pool inside this window, valued only with that snapshot's prices.
     // No RPC, no larger collection cap, and an older snapshot is explicitly dated rather than called current liquidity.
     const hasTvlSnapshots = tables.has('compact_pool_tvl_hours') && statement('poolTvlCount').get(spec.protocol, int(from), int(to)).count > 0;
-    const snapshotPrices = new Map();
-    const pricesAt = (hour) => {
-      if (snapshotPrices.has(hour)) return snapshotPrices.get(hour);
-      const book = new Map();
+    const verifiedPriceHours = new Set();
+    const pricesAt = (hour,token0,token1) => {
       if (valuationReady(tables) && valuationWindow('token_prices', hour, hour, 1, tables).status === 'available') {
-        for (const row of statement('tokenPriceRows').all(int(hour), int(hour))) book.set(row.token, { priceUsdE18: BigInt(row.price_usd_e18) });
+        if (valuation.status !== 'available' && !verifiedPriceHours.has(hour)) { validatePrices(hour,hour); verifiedPriceHours.add(hour); }
+        return pricesFor(hour,token0,token1);
       }
-      snapshotPrices.set(hour, book);
-      return book;
+      return new Map();
     };
     const liquidityOf = (pool) => {
       const row = tables.has('compact_pool_tvl_hours') ? statement('poolTvlLatest').get(spec.protocol, pool, int(from), int(to)) : null;
@@ -1185,7 +1220,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       if (row.status !== 'available') return { ...missing, reason: row.reason, ...date };
       if (!isDigits(row.amount0_raw) || !isDigits(row.amount1_raw)) throw new ReadModelError('inconsistent_state', 'pool_tvl_malformed');
       const { token0, token1 } = detailsOf(pool);
-      const book = pricesAt(row.hour_start);
+      const book = pricesAt(row.hour_start,token0.address,token1.address);
       const usdMicros = poolTvlUsd({ token0: token0.address, token1: token1.address, amount0: BigInt(row.amount0_raw), amount1: BigInt(row.amount1_raw) }, book);
       const amounts = { calculation, amount0Raw: row.amount0_raw, amount1Raw: row.amount1_raw, ...date };
       const blockedTokens = [[token0, row.amount0_raw], [token1, row.amount1_raw]].filter(([token, raw]) => BigInt(raw) !== 0n
@@ -1201,7 +1236,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       return { status: 'available', reason: null, usdMicros: entry.usdMicros.toString(10),
         basis: entry.bases.size === 1 ? [...entry.bases][0] : entry.bases.size ? 'mixed' : 'usd_anchor' };
     };
-    const pools = [...totals].map(([pool, entry]) => {
+    // The bounded streaming fallback can visit hot rows before older packed winners. Sort only these <= 10 entries.
+    const pools = [...totals].sort(([a,x],[b,y]) => y.swapCount-x.swapCount || (a<b?-1:a>b?1:0)).map(([pool, entry]) => {
       const [token0In, token0Out, token1In, token1Out] = raw(entry.flows);
       const [addAmount0Raw, addAmount1Raw, removeAmount0Raw, removeAmount1Raw] = raw(entry.liquidity);
       return { ...detailsOf(pool), swapCount: entry.swapCount, flowsRaw: { token0In, token0Out, token1In, token1Out },
@@ -1284,6 +1320,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   return Object.freeze({
     // Internal diagnostics only: no API field, endpoint, writer or persisted cache.
     poolProofStats: () => packedReader?.poolProofStats() ?? null,
+    poolMemoryStats: () => ({ totals: poolTotals?.stats() ?? null, memoWindows: packedPoolWindows.size,
+      memoBytes: [...packedPoolWindows.values()].reduce((sum,item)=>sum+item.bytes,0), maxMemoBytes: POOL_MEMO_MAX_BYTES }),
     snapshotIdentity() {
       const dataVersion = connection().prepare('PRAGMA data_version').get().data_version;
       return snapshot(() => {
@@ -1443,6 +1481,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
       unionCache.clear();
       statements = new Map();
       packedReader = null;
+      poolTotals = null;
       db?.close();
       db = null;
     },
