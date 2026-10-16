@@ -376,7 +376,10 @@ export default function MainnetDashboard() {
     <Container className="py-10">
       <div className="space-y-6">
         <div>
-          <h2 className="text-3xl font-bold tracking-tight">Mainnet Dashboard</h2>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h2 className="text-3xl font-bold tracking-tight">Mainnet Dashboard</h2>
+            <span className="inline-flex shrink-0 items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-medium text-slate-600">Beta</span>
+          </div>
           <p className="mt-2 text-sm text-slate-500">
             Arc Intelligence, wallets, USDC balances, completed routes, recent activity, and Solana deposit tracking.
           </p>

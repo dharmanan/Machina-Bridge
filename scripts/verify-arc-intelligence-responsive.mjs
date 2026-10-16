@@ -109,6 +109,14 @@ try {
           overflow:node.scrollWidth>node.clientWidth+1};
       });
       const headers = [];
+      for (const heading of document.querySelectorAll('h1,h2')) {
+        const group = heading.parentElement.tagName === 'A' ? heading.parentElement.parentElement : heading.parentElement;
+        const badge = [...group.children].find(node => node.tagName === 'SPAN' && ['Beta','Public Beta'].includes(node.textContent.trim()));
+        if (!badge || !visible(badge)) continue;
+        const a=heading.getBoundingClientRect(),b=badge.getBoundingClientRect();
+        if (Math.min(a.right,b.right)-Math.max(a.left,b.left)>1 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>1) headers.push(heading.textContent);
+        if (badge.scrollWidth > badge.clientWidth + 1) headers.push('clipped ' + badge.textContent);
+      }
       for (const heading of document.querySelectorAll('h4')) {
         const badge = heading.parentElement.parentElement.querySelector('[data-status-pill]');
         if (!badge || !visible(badge)) continue;

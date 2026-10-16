@@ -2445,7 +2445,6 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
               <Activity className="h-5 w-5" />
             </span>
             <h2 className="text-xl font-bold tracking-tight text-slate-950">Arc Intelligence</h2>
-            <span className="inline-flex shrink-0 items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">Beta</span>
           </div>
           <p className="mt-1.5 text-sm text-slate-500">Verified Arc network activity</p>
         </div>

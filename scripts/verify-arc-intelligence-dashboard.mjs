@@ -3249,19 +3249,23 @@ await test('RWA 5 a partial verified window states its coverage next to the USYC
   assert.equal(textOf(view.metric('between')), 'Between addresses 1 Not mints or burns');
 });
 
-await test('Public Beta 1 the actual brand markup labels both profiles without claiming mainnet swaps or automatic advice', async () => {
-  const filename = sourcePath('src/App.tsx');
+function releaseSubtree(relative, matches) {
+  const filename = sourcePath(relative);
   const source = ts.createSourceFile(filename, readFileSync(filename, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  let branding;
+  let subtree;
   function visit(node) {
-    if (ts.isJsxElement(node) && node.openingElement.attributes.properties.some(attribute =>
-      ts.isJsxAttribute(attribute) && attribute.name.getText(source) === 'className'
-      && attribute.initializer?.text === 'min-w-0 pt-0.5')) branding = node;
+    if (ts.isJsxElement(node) && matches(node, source)) subtree = node;
     ts.forEachChild(node, visit);
   }
   visit(source);
-  assert.ok(branding, 'render the existing brand subtree, not a separate copy');
-  const Brand = loadMutated(filename, `export default function Brand({appNetwork}) { return (${branding.getText(source)}); }`).default;
+  assert.ok(subtree, `render the actual JSX subtree from ${relative}`);
+  return loadMutated(filename, `export default function Fragment({appNetwork}) { return (${subtree.getText(source)}); }`).default;
+}
+const releaseBrand = () => releaseSubtree('src/App.tsx', (node, source) => node.openingElement.attributes.properties.some(attribute =>
+  ts.isJsxAttribute(attribute) && attribute.name.getText(source) === 'className' && attribute.initializer?.text === 'min-w-0 pt-0.5'));
+
+await test('Public Beta 1 the actual brand markup labels both profiles without claiming mainnet swaps or automatic advice', async () => {
+  const Brand = releaseBrand();
   for (const appNetwork of ['mainnet', 'testnet']) {
     const { tree } = render({ appNetwork }, Brand);
     assert.equal([...walk(tree)].filter(node => node.tag === 'h1').map(textOf).join(), 'Machina Bridge');
@@ -3296,13 +3300,13 @@ await test('Public Beta 2 SEO titles descriptions and canonical agree with the d
     assert.doesNotMatch(readFileSync(sourcePath(file), 'utf8'), /machinabridge\.vercel\.app/, `${file}: no obsolete live URL`);
 });
 
-await test('Public Beta 3 Intelligence remains Beta and Borrow remains a read-only Preview in every window', async () => {
+await test('Public Beta 3 Intelligence has no duplicate Beta and Borrow remains a read-only Preview in every window', async () => {
   for (const [window, hours] of [['24h', 24], ['7d', 168], ['30d', 720]]) {
     const summary = summaryFixture({ window, hours });
     summary.network.uniqueActiveAddresses = { status: 'unavailable', reason: 'identity_evidence_missing', value: null };
     for (const borrowMarket of [BORROW_AVAILABLE, BORROW_UNAVAILABLE]) {
       const { tree } = render({ selectedWindow: window, data: { ...READY_DATA, window, summary }, borrowMarket });
-      assert.equal([...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Beta').length, 1);
+      assert.equal([...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Beta').length, 0);
       const borrow = sectionNode(tree, 'borrow');
       assert.match(textOf(borrow), /Preview.*Read-only preview.*cirBTC collateral and USDC borrowing/);
       assert.match(textOf(borrow), /no wallet action is offered here/);
@@ -3328,6 +3332,50 @@ await test('Public Beta 4 Borrow write gate and supported transaction boundaries
   assert.match(earn, /Deposit or withdraw USDC in supported Arc mainnet vaults/);
   assert.match(earn, /MAINNET_EARN_WRITES_ENABLED && <MainnetEarnActions \/>/);
   assert.match(readFileSync(sourcePath('src/components/MainnetPreviewGate.tsx'), 'utf8'), /Choose a verified mainnet route, review the transfer checks, and bridge USDC/);
+});
+
+await test('Public Beta 5 the Mainnet Dashboard heading owns the only Dashboard Beta; export actual headers for responsive QA', async () => {
+  const Header = releaseSubtree('src/components/MainnetDashboard.tsx', (node, source) => node.openingElement.tagName.getText(source) === 'div'
+    && node.children.some(child => ts.isJsxElement(child) && child.openingElement.tagName.getText(source) === 'h2'
+      && child.getText(source).includes('>Mainnet Dashboard</h2>')));
+  const { html, tree } = render({}, Header);
+  const heading = [...walk(tree)].find(node => node.tag === 'h2');
+  const badges = [...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Beta');
+  assert.equal(textOf(heading), 'Mainnet Dashboard');
+  assert.equal(badges.length, 1);
+  assert.equal(heading.parent, badges[0].parent, 'badge is next to the main heading, outside Intelligence');
+  assert.match(heading.parent.attrs.class, /flex-wrap/);
+  assert.match(badges[0].attrs.class, /shrink-0/);
+  const combined = parseHtml(html + rendered.ready.html);
+  assert.equal([...walk(combined)].filter(node => node.tag === 'span' && textOf(node) === 'Beta').length, 1);
+  if (process.env.ARC_DASHBOARD_BETA_FIXTURE) {
+    const Brand = releaseBrand();
+    const fixtures = ['mainnet', 'testnet'].map(appNetwork => ({ name: `beta-${appNetwork}`, usd: [],
+      html: `<div data-arc-intelligence><header class="mb-6 max-w-[460px]"><div class="flex items-start gap-4"><div class="h-12 w-12 shrink-0"></div>${render({ appNetwork }, Brand).html}</div></header>${html}</div>` }));
+    writeFileSync(process.env.ARC_DASHBOARD_BETA_FIXTURE, JSON.stringify(fixtures));
+  }
+});
+
+await test('Public Beta 6 README documents current capabilities commands and public contract identities without upgrading evidence', async () => {
+  const readme = readFileSync(sourcePath('README.md'), 'utf8');
+  for (const title of ['# Machina Bridge — Public Beta', '## Product Overview', '## Current Features and Availability', '## Arc Intelligence',
+    '## Data Integrity and Limitations', '## Borrow Preview', '## Bridge and Earn', '## Architecture', '## Development and Validation',
+    '## Security, Disclaimer and Links']) assert.ok(readme.includes(`${title}\n`), title);
+  for (const phrase of ['independent Arc DeFi platform', 'Testnet-only', 'Read-only Preview', 'MAINNET_BORROW_WRITES_ENABLED=false',
+    'Not verified', 'unavailable/null', 'Galaxy USDC', 'Gauntlet USDC Prime', 'Node.js 24.x']) assert.ok(readme.includes(phrase), phrase);
+  assert.match(readme, /share one verified checkpoint/);
+  const pkg = JSON.parse(readFileSync(sourcePath('package.json'), 'utf8'));
+  for (const [, command] of readme.matchAll(/npm run ([\w:-]+)/g)) assert.ok(pkg.scripts[command], `documented npm script ${command} exists`);
+  for (const [, file] of readme.matchAll(/node (scripts\/[\w.-]+\.mjs)/g)) assert.ok(readFileSync(sourcePath(file)).length, file);
+  const configs = ['src/config/mainnet.ts', 'src/config/mainnetNetworks.ts', 'src/config/mainnetSolana.ts'].map(file =>
+    readFileSync(sourcePath(file), 'utf8').toLowerCase()).join('\n');
+  for (const address of new Set(readme.match(/0x[0-9a-fA-F]{40}/g))) assert.ok(configs.includes(address.toLowerCase()), `documented contract ${address} matches current config`);
+  for (const address of ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
+    'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe']) assert.ok(readme.includes(address) && configs.includes(address.toLowerCase()), 'public Solana contract identity');
+  assert.doesNotMatch(readme, /Node\.js 18\+|pending as of 2026-09-28|machinabridge\.vercel\.app|-----BEGIN .*PRIVATE KEY/);
+  assert.match(readme, /does not provide automated investment advice/);
+  assert.match(readme, /not an official Arc or Circle product/);
+  assert.equal(borrowConfig.MAINNET_BORROW_WRITES_ENABLED, false);
 });
 
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);
