@@ -445,7 +445,7 @@ export default function MainnetEarnPreview() {
                 <h2 className="text-2xl font-semibold tracking-tight">Earn USDC</h2>
               </div>
               <p className="mt-2 max-w-xl text-sm leading-6 text-slate-500">
-                Choose a vault, review the quote, and manage your USDC position on Arc.
+                Deposit or withdraw USDC in supported Arc mainnet vaults. Review each quote before confirming in your wallet.
               </p>
             </div>
             <button

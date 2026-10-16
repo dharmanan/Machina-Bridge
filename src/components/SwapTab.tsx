@@ -27,7 +27,7 @@ export function SwapTab() {
       <div className="max-w-lg mx-auto">
         <Card>
           <h2 className="text-2xl font-bold mb-2">ETH ↔ USDC Swap</h2>
-          <p className="text-slate-500 text-sm mb-6">Swap on Sepolia using Uniswap V2 Protocol</p>
+          <p className="text-slate-500 text-sm mb-6">Testnet swaps on Sepolia using Uniswap V2. Testnet assets have no real monetary value.</p>
 
           {!isConnected && (
             <div className="mb-4 flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">

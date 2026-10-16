@@ -3249,4 +3249,85 @@ await test('RWA 5 a partial verified window states its coverage next to the USYC
   assert.equal(textOf(view.metric('between')), 'Between addresses 1 Not mints or burns');
 });
 
+await test('Public Beta 1 the actual brand markup labels both profiles without claiming mainnet swaps or automatic advice', async () => {
+  const filename = sourcePath('src/App.tsx');
+  const source = ts.createSourceFile(filename, readFileSync(filename, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let branding;
+  function visit(node) {
+    if (ts.isJsxElement(node) && node.openingElement.attributes.properties.some(attribute =>
+      ts.isJsxAttribute(attribute) && attribute.name.getText(source) === 'className'
+      && attribute.initializer?.text === 'min-w-0 pt-0.5')) branding = node;
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  assert.ok(branding, 'render the existing brand subtree, not a separate copy');
+  const Brand = loadMutated(filename, `export default function Brand({appNetwork}) { return (${branding.getText(source)}); }`).default;
+  for (const appNetwork of ['mainnet', 'testnet']) {
+    const { tree } = render({ appNetwork }, Brand);
+    assert.equal([...walk(tree)].filter(node => node.tag === 'h1').map(textOf).join(), 'Machina Bridge');
+    assert.equal([...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Public Beta').length, 1);
+    assert.doesNotMatch(textOf(tree), /recommendation|signal|one.click|complete ecosystem/i);
+    assert.match(textOf(tree), appNetwork === 'mainnet' ? /on-chain analytics, USDC bridging, and Earn/ : /Testnet swap and bridge flows/);
+  }
+});
+
+await test('Public Beta 2 SEO titles descriptions and canonical agree with the documented public URL', async () => {
+  const tree = parseHtml(readFileSync(sourcePath('index.html'), 'utf8').replace(/<!doctype html>/i, ''));
+  const meta = (attribute, value) => byAttr(tree, attribute, value)[0]?.attrs.content;
+  const title = textOf([...walk(tree)].find(node => node.tag === 'title'));
+  assert.equal(title, 'Machina Bridge | Arc DeFi Public Beta');
+  assert.equal(meta('property', 'og:title'), title);
+  assert.equal(meta('name', 'twitter:title'), title);
+  const description = meta('name', 'description');
+  assert.equal(meta('property', 'og:description'), description);
+  assert.equal(meta('name', 'twitter:description'), description);
+  for (const phrase of ['on-chain analytics', 'supported mainnet routes', 'USDC Earn', 'Testnet swaps', 'read-only Borrow Preview'])
+    assert.ok(description.includes(phrase), phrase);
+  const canonical = byAttr(tree, 'rel', 'canonical')[0]?.attrs.href;
+  assert.equal(canonical, 'https://www.machinabridge.xyz/');
+  assert.equal(meta('property', 'og:url'), canonical);
+  assert.ok(readFileSync(sourcePath('public/sitemap.xml'), 'utf8').includes(`<loc>${canonical}</loc>`));
+  assert.ok(readFileSync(sourcePath('public/robots.txt'), 'utf8').includes(`Sitemap: ${canonical}sitemap.xml`));
+  const readme = readFileSync(sourcePath('README.md'), 'utf8');
+  assert.ok(readme.includes(`[Live App](${canonical})`));
+  assert.ok(readme.includes(`- Live app: ${canonical}`));
+  assert.ok(readme.includes(`${canonical}.well-known/security.txt`));
+  for (const file of ['index.html', 'public/sitemap.xml', 'public/robots.txt', 'README.md'])
+    assert.doesNotMatch(readFileSync(sourcePath(file), 'utf8'), /machinabridge\.vercel\.app/, `${file}: no obsolete live URL`);
+});
+
+await test('Public Beta 3 Intelligence remains Beta and Borrow remains a read-only Preview in every window', async () => {
+  for (const [window, hours] of [['24h', 24], ['7d', 168], ['30d', 720]]) {
+    const summary = summaryFixture({ window, hours });
+    summary.network.uniqueActiveAddresses = { status: 'unavailable', reason: 'identity_evidence_missing', value: null };
+    for (const borrowMarket of [BORROW_AVAILABLE, BORROW_UNAVAILABLE]) {
+      const { tree } = render({ selectedWindow: window, data: { ...READY_DATA, window, summary }, borrowMarket });
+      assert.equal([...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Beta').length, 1);
+      const borrow = sectionNode(tree, 'borrow');
+      assert.match(textOf(borrow), /Preview.*Read-only preview.*cirBTC collateral and USDC borrowing/);
+      assert.match(textOf(borrow), /no wallet action is offered here/);
+      assert.equal([...walk(borrow)].filter(node => ['button', 'a', 'form', 'input'].includes(node.tag)).length, 0);
+      const active = item(tree, 'network.active-addresses');
+      assert.equal(active.attrs['data-intel-status'], 'unavailable');
+      assert.equal(active.attrs['data-intel-value'], undefined);
+      assert.match(textOf(active), /Not verified/);
+    }
+  }
+});
+
+await test('Public Beta 4 Borrow write gate and supported transaction boundaries stay unchanged', async () => {
+  assert.equal(borrowConfig.MAINNET_BORROW_WRITES_ENABLED, false);
+  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
+  const app = readFileSync(sourcePath('src/App.tsx'), 'utf8');
+  const mainnetNav = app.slice(app.indexOf("{appNetwork === 'mainnet' && (", app.indexOf('{/* Row 1')), app.indexOf('<main className="flex-1">'));
+  assert.match(mainnetNav, /id: 'earn'/, 'inspect the populated mainnet navigation');
+  assert.doesNotMatch(mainnetNav, /id: 'swap'/, 'no mainnet Swap navigation');
+  assert.match(app, /activeTab === 'swap' && <SwapTab \/>/);
+  assert.match(readFileSync(sourcePath('src/components/SwapTab.tsx'), 'utf8'), /Testnet swaps on Sepolia/);
+  const earn = readFileSync(sourcePath('src/components/MainnetEarnPreview.tsx'), 'utf8');
+  assert.match(earn, /Deposit or withdraw USDC in supported Arc mainnet vaults/);
+  assert.match(earn, /MAINNET_EARN_WRITES_ENABLED && <MainnetEarnActions \/>/);
+  assert.match(readFileSync(sourcePath('src/components/MainnetPreviewGate.tsx'), 'utf8'), /Choose a verified mainnet route, review the transfer checks, and bridge USDC/);
+});
+
 console.log(`VERIFIER PASS arc-intelligence-dashboard ${tests.length} tests`);

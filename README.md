@@ -2,7 +2,7 @@
 
 **USDC bridging between Arc, major EVM networks, and Solana, plus Arc Mainnet USDC Earn.**
 
-[Live App](https://machinabridge.vercel.app) · [Repository](https://github.com/dharmanan/Machina-Bridge)
+[Live App](https://www.machinabridge.xyz/) · [Repository](https://github.com/dharmanan/Machina-Bridge)
 
 ---
 
@@ -359,7 +359,7 @@ Mainnet routes move real assets. Always verify:
 
 The production deployment includes security headers and a public `security.txt` file:
 
-https://machinabridge.vercel.app/.well-known/security.txt
+https://www.machinabridge.xyz/.well-known/security.txt
 
 ---
 
@@ -375,7 +375,7 @@ Machina currently charges no service commission.
 
 ## Links
 
-- Live app: https://machinabridge.vercel.app
+- Live app: https://www.machinabridge.xyz/
 - Repository: https://github.com/dharmanan/Machina-Bridge
 - X: https://x.com/KohenEric
 - Arc docs: https://docs.arc.network/

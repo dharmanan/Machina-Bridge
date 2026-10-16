@@ -1862,7 +1862,7 @@ function BorrowSection({ borrowMarket }: { borrowMarket: BorrowMarketState }) {
             </span>
             <BorrowAsset symbol="USDC" role="Borrow" />
           </div>
-          <p className="mt-2 text-[11px] text-slate-500">Deposit cirBTC as collateral and borrow USDC from a Morpho market on Arc.</p>
+          <p className="mt-2 text-[11px] text-slate-500">Read-only preview of Morpho markets on Arc with cirBTC collateral and USDC borrowing.</p>
         </div>
         <div {...markerProps('borrow.market-list', listStatus, markets.length || null)} className="min-w-0">
           <div className="flex items-center justify-between gap-2">
@@ -2440,11 +2440,12 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
     <>
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
             <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#eef7e8] text-[#2F6E0C]">
               <Activity className="h-5 w-5" />
             </span>
             <h2 className="text-xl font-bold tracking-tight text-slate-950">Arc Intelligence</h2>
+            <span className="inline-flex shrink-0 items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">Beta</span>
           </div>
           <p className="mt-1.5 text-sm text-slate-500">Verified Arc network activity</p>
         </div>

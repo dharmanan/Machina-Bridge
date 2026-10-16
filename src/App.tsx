@@ -279,18 +279,21 @@ export default function App() {
             <div className="flex items-start gap-4">
               <img src={arcLogo} alt="Machina Bridge Logo" className="h-12 w-12 flex-shrink-0 rounded-2xl border border-slate-200 bg-white p-1 shadow-sm lg:h-14 lg:w-14" />
               <div className="min-w-0 pt-0.5">
-                <a
-                  href="https://docs.arc.network/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="transition-colors hover:text-[#2F6E0C]"
-                >
-                  <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Machina Bridge</h1>
-                </a>
+                <div className="flex flex-wrap items-center gap-2">
+                  <a
+                    href="https://docs.arc.network/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="transition-colors hover:text-[#2F6E0C]"
+                  >
+                    <h1 className="text-[1.9rem] font-semibold leading-[0.95] tracking-tight text-slate-900 sm:text-[2.05rem] lg:text-[2.15rem]">Machina Bridge</h1>
+                  </a>
+                  <span className="inline-flex shrink-0 items-center rounded-full border border-[#66D121]/30 bg-[#eef7e8] px-2.5 py-0.5 text-xs font-medium text-[#2F6E0C]">Public Beta</span>
+                </div>
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
                   {appNetwork === 'testnet'
                     ? 'Testnet swap and bridge flows for Arc, Sepolia, and Solana.'
-                    : 'Bridge USDC across verified Arc mainnet routes.'}
+                    : 'Arc on-chain analytics, USDC bridging, and Earn in one app.'}
                 </p>
               </div>
             </div>
