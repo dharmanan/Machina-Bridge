@@ -312,7 +312,7 @@ await test('static: the HTTP and read paths cannot write SQLite, call Arc RPC, r
   }
   // The only statements the read path executes directly are pragmas and read-transaction control.
   for (const match of read.matchAll(/\.exec\(([`'])([^`']*)\1\)/g)) {
-    assert.match(match[2], /^(PRAGMA (query_only = ON|busy_timeout = \$\{busyTimeoutMs\})|BEGIN|COMMIT|ROLLBACK)$/, match[2]);
+    assert.match(match[2], /^(PRAGMA (temp_store = FILE|query_only = ON|busy_timeout = \$\{busyTimeoutMs\})|BEGIN|COMMIT|ROLLBACK)$/, match[2]);
   }
   // Only the explicit routes exist, and no route takes a free-form value.
   assert.deepEqual([...http.matchAll(/^ {2}\['(\/[^']*)'/gm)].map((match) => match[1]), VALID);

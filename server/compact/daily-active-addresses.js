@@ -1,3 +1,4 @@
+import { recordIdentityCommitment } from './identity-evidence.js';
 const HOUR = 3600;
 const DAY = 24 * HOUR;
 const ADDRESS = /^0x[0-9a-f]{40}$/;
@@ -40,7 +41,7 @@ export function dayStartOf(hourStart) {
   return Math.floor(hourStart / DAY) * DAY;
 }
 
-export function createDailyActiveAddressesStore(db, { archive } = {}) {
+export function createDailyActiveAddressesStore(db, { archive, reconcileDay = null } = {}) {
   const insertHour = db.prepare(
     'INSERT OR IGNORE INTO compact_daily_address_hours (day_start, hour_start) VALUES (?, ?)'
   );
@@ -68,7 +69,7 @@ export function createDailyActiveAddressesStore(db, { archive } = {}) {
     "INSERT INTO compact_daily_active_addresses (day_start, status, reason, active_addresses) VALUES (?, 'unavailable', 'identity_not_captured', NULL)"
   );
 
-  function observeHour(hourStart, addresses, { replay = false } = {}) {
+  function observeHour(hourStart, addresses, { replay = false, membershipPreserved = false } = {}) {
     const dayStart = dayStartOf(hourStart);
     if (!Array.isArray(addresses) || addresses.some((address) => !ADDRESS.test(address))) {
       throw new Error('invalid_dau_addresses');
@@ -80,15 +81,18 @@ export function createDailyActiveAddressesStore(db, { archive } = {}) {
       .run(dayStart,stored.status,stored.reason,'arc-dau-v1');
     if (archive?.config.enabled) {
       const finalized = db.prepare(`SELECT day_start FROM compact_daily_active_addresses WHERE status='available'
-        AND day_start<=? AND (EXISTS(SELECT 1 FROM compact_daily_address_stage s WHERE s.day_start=compact_daily_active_addresses.day_start)
-        OR EXISTS(SELECT 1 FROM compact_daily_address_hours h WHERE h.day_start=compact_daily_active_addresses.day_start)) ORDER BY day_start LIMIT ?`)
+        AND day_start<=?
+        AND (SELECT COUNT(*) FROM compact_daily_address_hours h WHERE h.day_start=compact_daily_active_addresses.day_start)=24
+        AND (SELECT COUNT(*) FROM compact_daily_address_stage s WHERE s.day_start=compact_daily_active_addresses.day_start)=active_addresses
+        AND active_addresses>0 ORDER BY day_start LIMIT ?`)
         .all(dayStart,archive.config.maxPruneHours);
       for (const row of finalized) {
-        archive.prune('compact_daily_address_hours','day_start=?',[row.day_start],'day_start');
+        // These 24 tiny provenance markers are required for future packing/revalidation. Keep them, including when
+        // archival is OFF or a large daily membership exceeds the bounded archive writer's row budget.
         archive.prune('compact_daily_address_stage','day_start=?',[row.day_start],'day_start');
       }
     }
-    if (stored?.status === 'available') {
+    if (stored?.status === 'available' && (!replay || membershipPreserved)) {
       return {
         dayStart,
         status: 'available',
@@ -98,7 +102,7 @@ export function createDailyActiveAddressesStore(db, { archive } = {}) {
       };
     }
 
-    if (stored) {
+    if (stored && stored.status !== 'available') {
       if (!replay || stored.reason !== 'identity_not_captured') {
         return {
           dayStart,
@@ -120,14 +124,33 @@ export function createDailyActiveAddressesStore(db, { archive } = {}) {
       }
     }
 
-    const hours = Number(capturedHours.get(dayStart).count);
+    let hours = Number(capturedHours.get(dayStart).count);
     const storedHourCount = Number(storedHours.get(dayStart, dayStart + DAY).count);
+
+    // Finalize only after reconciling the day against complete hourly inputs. A damaged staging row/marker must not
+    // turn into a newly checksummed but incorrect daily fact. Failure keeps this canonical hour and the staging evidence.
+    if(storedHourCount===24&&reconcileDay){
+      db.exec('SAVEPOINT daily_identity_reconcile');
+      try{
+        const count=reconcileDay(dayStart);
+        if(stored?.status==='available'&&stored.active_addresses!==count)throw new Error('identity_daily_count_conflict');
+        db.exec('RELEASE daily_identity_reconcile');hours=24;
+      }catch(e){
+        db.exec('ROLLBACK TO daily_identity_reconcile; RELEASE daily_identity_reconcile');
+        const safe=/^(identity_|archive_|packed_|storage_)[a-z_]{1,80}$/.test(e.code??e.message)?e.code??e.message:'identity_reconcile_failed';
+        db.prepare('INSERT OR IGNORE INTO compact_daily_address_status_history VALUES(?,?,?,?)').run(dayStart,'unavailable',safe,'arc-dau-v1');
+        if(!stored)finalizeUnavailable.run(dayStart);
+        return {dayStart,status:'unavailable',reason:safe,activeAddresses:null,finalized:true};
+      }
+    }
 
     if (hours === 24) {
       const count = Number(activeCount.get(dayStart).count);
+      if(stored?.status==='available' && stored.active_addresses!==count)throw new Error('identity_daily_count_conflict');
       finalize.run(dayStart, count);
-      archive?.prune('compact_daily_address_hours','day_start=?',[dayStart],'day_start');
-      archive?.prune('compact_daily_address_stage','day_start=?',[dayStart],'day_start');
+      recordIdentityCommitment(db,'compact_daily_address_stage',dayStart);
+      // Packing runs AFTER observeHour, in the same canonical transaction. Never archive/prune this newly finalized
+      // stage before packDay can see its 24 captured hours. Later transactions still use verified archive/packed pruning.
 
       return {
         dayStart,

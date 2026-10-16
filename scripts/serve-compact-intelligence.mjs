@@ -142,7 +142,8 @@ async function main() {
     historyStartHour: ARC_PUBLIC_MAINNET_FIRST_COMPLETE_HOUR, snapshotRunner, log, onFatal: fatal,
   });
   const ecosystemReader = createEcosystemReader({ path: config.sqlitePath, log });
-  const httpReadModel = { ...readModel, ecosystem: (window) => window === '30d'
+  const httpReadModel = { ...readModel, summary: window => window === '30d'
+    ? snapshotStore.read('summary',readModel.snapshotIdentity()) : readModel.summary(window), ecosystem: (window) => window === '30d'
     ? snapshotStore.read('ecosystem', readModel.snapshotIdentity()) : ecosystemReader.read(window),
     pools: (protocol, window) => window === '30d'
       ? snapshotStore.read(protocol, readModel.snapshotIdentity()) : ecosystemReader.readPools(protocol, window),

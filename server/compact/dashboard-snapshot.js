@@ -9,45 +9,58 @@ import { ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_RESOURCE_LIMITS } from './ec
 import { MAX_RESPONSE_BYTES } from './http.js';
 import { safeSnapshotError, safeExitCode, safeExitSignal, createSnapshotFatalScanner } from './snapshot-diagnostics.js';
 
-const FORMAT = 'machina.dashboard.30d.snapshot.v1';
+export const SNAPSHOT_FORMAT = 'machina.dashboard.30d.snapshot.v2';
+const LEGACY_FORMAT = 'machina.dashboard.30d.snapshot.v1';
+const FORMAT = SNAPSHOT_FORMAT;
 export const SNAPSHOT_MAX_BYTES = 3 * MAX_RESPONSE_BYTES + 4096;
 export const SNAPSHOT_FREE_RESERVE_BYTES = 256 * 1024 * 1024;
 export const SNAPSHOT_STAGE_TIMEOUT_MS = 30_000;
 const fail = code => Object.assign(new Error(code), { code });
 const digest = text => createHash('sha256').update(text).digest('hex');
 const iso = seconds => new Date(seconds * 1000).toISOString();
-const sections = ['v3', 'v4', 'ecosystem'];
+export const SNAPSHOT_SECTIONS = Object.freeze(['summary','v3','v4','ecosystem']);
+const sections = SNAPSHOT_SECTIONS;
 const checkpointEqual = (a,b) => a?.hourStart === b?.hourStart && a?.lastBlock === b?.lastBlock && a?.lastHash === b?.lastHash;
 
 // A deployment changing any compact/API source cannot silently reuse a cache produced under different rules.
 export function snapshotCompatibility() {
   const roots = [new URL('./', import.meta.url), new URL('../../api/_lib/arc-intelligence/', import.meta.url)];
-  const hash = createHash('sha256');
+  const hash = createHash('sha256').update(FORMAT);
   for (const root of roots) {
     const dir = fileURLToPath(root);
     for (const entry of readdirSync(dir, { recursive: true }).filter(p => /\.(js|mjs)$/.test(p)).sort()) {
       hash.update(entry); hash.update(readFileSync(join(dir, entry)));
     }
   }
+  hash.update(readFileSync(new URL('../../scripts/prepare-compact-dashboard-snapshot.mjs',import.meta.url)));
   return hash.digest('hex');
 }
 
-export function validateSnapshot(bundle, compatibility) {
+function validateBundle(bundle, compatibility, format, keys) {
   const { sha256, ...contents } = bundle ?? {};
   if (sha256 !== digest(JSON.stringify(contents))) throw fail('snapshot_invalid');
-  if (!bundle || bundle.format !== FORMAT || bundle.compatibility !== compatibility || !bundle.checkpoint
+  if (!bundle || bundle.format !== format || bundle.compatibility !== compatibility || !bundle.checkpoint
     || !Number.isSafeInteger(bundle.checkpoint.hourStart) || bundle.checkpoint.hourStart < 0 || bundle.checkpoint.hourStart % 3600
     || !Number.isSafeInteger(bundle.checkpoint.lastBlock) || bundle.checkpoint.lastBlock < 0
     || !/^0x[0-9a-f]{64}$/.test(bundle.checkpoint.lastHash) || !Number.isFinite(Date.parse(bundle.preparedAt))) throw fail('snapshot_invalid');
+  if(!bundle.sections||Object.keys(bundle.sections).sort().join(',')!==[...keys].sort().join(','))throw fail('snapshot_invalid');
   const end = iso(bundle.checkpoint.hourStart + 3600);
-  for (const key of sections) {
+  for (const key of keys) {
     const part = bundle.sections?.[key];
-    if (typeof part?.json !== 'string' || Buffer.byteLength(part.json) > MAX_RESPONSE_BYTES - 1024
-      || digest(part.json) !== part.sha256) throw fail('snapshot_invalid');
+    if(typeof part?.json!=='string'||digest(part.json)!==part.sha256)throw fail('snapshot_invalid');
+    if(Buffer.byteLength(part.json)>MAX_RESPONSE_BYTES-1024)throw fail('snapshot_size_limit');
     const body = JSON.parse(part.json);
     if (body.chain?.id !== 5042 || body.window?.key !== '30d' || body.window.end !== end
       || !Number.isFinite(Date.parse(body.window.start)) || Date.parse(body.window.start) >= Date.parse(end)) throw fail('snapshot_invalid');
-    if (key === 'ecosystem') {
+    if (key === 'summary') {
+      if(body.schema !== 'machina.intelligence.summary.v1' || !validNetwork(body.network)
+        || !validNetwork(body.network?.previous) || body.network.start !== (body.window.coverage?.start??body.window.start) || body.network.end !== end
+        || !body.assets || !body.dex || !body.lending || !body.crossChain || !body.coverage || !body.definitions)
+        throw fail('snapshot_invalid');
+      const previousEnd=Date.parse(end)-720*3600000;
+      if(Date.parse(body.network.previous.end)!==previousEnd || Date.parse(body.network.previous.start)!==previousEnd-720*3600000)
+        throw fail('snapshot_invalid');
+    } else if (key === 'ecosystem') {
       if (body.schema !== 'machina.intelligence.ecosystem.v1' || typeof body.coverage?.status !== 'string'
         || !Array.isArray(body.discoveredTokens?.rows) || body.discoveredTokens.rows.length > 50
         || !Array.isArray(body.launches?.rows) || body.launches.rows.length > 50) throw fail('snapshot_invalid');
@@ -55,14 +68,32 @@ export function validateSnapshot(bundle, compatibility) {
       || body.freshness?.checkpointHour !== iso(bundle.checkpoint.hourStart)
       || body.freshness?.verifiedThrough !== end || body.freshness?.checkpointBlock !== bundle.checkpoint.lastBlock) throw fail('snapshot_invalid');
   }
-  const bodies = sections.map(k => JSON.parse(bundle.sections[k].json));
+  const bodies = keys.map(k => JSON.parse(bundle.sections[k].json));
   if (bodies.some(body => JSON.stringify(body.window) !== JSON.stringify(bodies[0].window))) throw fail('snapshot_window_mismatch');
+  for(const key of keys.filter(k=>k!=='ecosystem')){
+    const body=JSON.parse(bundle.sections[key].json);
+    if(body.freshness?.checkpointHour!==iso(bundle.checkpoint.hourStart)||body.freshness?.verifiedThrough!==end
+      ||body.freshness?.checkpointBlock!==bundle.checkpoint.lastBlock)throw fail('snapshot_invalid');
+  }
   return bundle;
 }
+function validNetwork(value){
+  if(!value||!['available','unavailable'].includes(value.status)||!Number.isFinite(Date.parse(value.start))
+    ||!Number.isFinite(Date.parse(value.end))||Date.parse(value.start)>=Date.parse(value.end))return false;
+  const metric=value.uniqueActiveAddresses;
+  if(!metric||!['available','unavailable'].includes(metric.status))return false;
+  if(metric.status==='available'?(!Number.isSafeInteger(metric.value)||metric.value<0):(metric.value!==null||typeof metric.reason!=='string'))return false;
+  if(value.status==='unavailable')return typeof value.reason==='string'&&['blocks','transactions','transactionsPerSecond','averageTransactionsPerBlock','gasUsedRaw'].every(k=>value[k]===null);
+  return ['blocks','transactions'].every(k=>Number.isSafeInteger(value[k])&&value[k]>=0)
+    &&['transactionsPerSecond','averageTransactionsPerBlock'].every(k=>typeof value[k]==='number'&&Number.isFinite(value[k])&&value[k]>=0)
+    &&typeof value.gasUsedRaw==='string'&&/^\d+$/.test(value.gasUsedRaw);
+}
+export const validateSnapshot=(bundle,compatibility)=>validateBundle(bundle,compatibility,FORMAT,sections);
 
 export function createDashboardSnapshotStore({ path, compatibility = snapshotCompatibility(), now = Date.now,
   freeReserveBytes = SNAPSHOT_FREE_RESERVE_BYTES, filesystem = fs, verifyCheckpoint = () => false }) {
   const directory = `${path}.dashboard-30d`, activePath = join(directory, 'active.json'), pendingPath = join(directory, 'pending.json');
+  const legacyPath=join(directory,'legacy-v1.json'),legacyPending=join(directory,'legacy-v1.pending.json');
   const previousPath = join(directory, 'previous.json'), previousPending = join(directory, 'previous.pending.json');
   let cache = null, fingerprint = null, loading = null;
   async function load() {
@@ -72,7 +103,11 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
         if (stat.size > SNAPSHOT_MAX_BYTES || !stat.isFile()) throw fail('snapshot_invalid');
         const nextFingerprint = `${file}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
         if (cache && fingerprint === nextFingerprint) return cache;
-        const bundle = validateSnapshot(JSON.parse(await filesystem.readFile(file, 'utf8')), compatibility);
+        const raw=JSON.parse(await filesystem.readFile(file,'utf8'));
+        // A valid obsolete generation is NOT a v2 bundle. An incompatible deployment starts explicitly not_ready.
+        if(raw?.format===LEGACY_FORMAT){validateBundle(raw,raw.compatibility,LEGACY_FORMAT,['v3','v4','ecosystem']);throw fail('not_ready');}
+        const bundle=validateSnapshot(raw,raw?.compatibility);
+        if(raw.compatibility!==compatibility)throw fail('not_ready');
         cache = bundle; fingerprint = nextFingerprint;
         return bundle;
       };
@@ -80,7 +115,7 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
       catch (error) {
         // Never accept the corrupt bundle. The independently verified previous generation remains usable.
         try { return await readBundle(previousPath); }
-        catch { throw fail(error.code === 'ENOENT' ? 'not_ready' : 'snapshot_invalid'); }
+        catch { throw fail(['ENOENT','not_ready'].includes(error.code) ? 'not_ready' : 'snapshot_invalid'); }
       }
     })().finally(() => { loading = null; });
     let timer;
@@ -98,15 +133,32 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
     validateSnapshot(bundle, compatibility);
     const text = JSON.stringify(bundle);
     if (Buffer.byteLength(text) > SNAPSHOT_MAX_BYTES) throw fail('snapshot_size_limit');
-    // Two committed generations + two bounded staging files, at most 3.02 MiB, independent of window row counts.
+    // Four sections SHARE the existing bundle cap. Two generations/staging + one v1 rollback pair: <4.53 MiB.
     const capacity = await filesystem.statfs(dirname(path));
-    if (Number(capacity.bavail) * Number(capacity.bsize) < freeReserveBytes + 4 * SNAPSHOT_MAX_BYTES) throw fail('snapshot_disk_budget');
+    if (Number(capacity.bavail) * Number(capacity.bsize) < freeReserveBytes + 6 * SNAPSHOT_MAX_BYTES) throw fail('snapshot_disk_budget');
     await filesystem.mkdir(directory, { recursive: true, mode: 0o700 });
     let handle;
     try {
       handle = await filesystem.open(pendingPath, 'w', 0o600);
       await handle.writeFile(text); await handle.sync(); await handle.close(); handle = null;
       validateSnapshot(JSON.parse(await filesystem.readFile(pendingPath, 'utf8')), compatibility);
+      // Keep the latest v1 bytes separately for an explicit software rollback; NEVER serve them as v2.
+      // Interrupted staging is not a completion marker. Copy is bounded and verified before atomic rename.
+      let legacy;
+      try{
+        const stat=await filesystem.stat(activePath);
+        if(stat.size<=SNAPSHOT_MAX_BYTES){
+          const bytes=await filesystem.readFile(activePath,'utf8'),raw=JSON.parse(bytes);
+          if(raw.format===LEGACY_FORMAT){validateBundle(raw,raw.compatibility,LEGACY_FORMAT,['v3','v4','ecosystem']);legacy=bytes;}
+        }
+      }catch(error){if(!['ENOENT'].includes(error.code)&&error.code!=='snapshot_invalid'&&!(error instanceof SyntaxError))throw error;}
+      if(legacy){
+        handle=await filesystem.open(legacyPending,'w',0o600);await handle.writeFile(legacy);await handle.sync();await handle.close();handle=null;
+        const copied=JSON.parse(await filesystem.readFile(legacyPending,'utf8'));
+        validateBundle(copied,copied.compatibility,LEGACY_FORMAT,['v3','v4','ecosystem']);
+        await filesystem.rename(legacyPending,legacyPath);
+        const dir=await filesystem.open(directory,'r');try{await dir.sync();}finally{await dir.close();}
+      }
       // Retain the old verified generation before replacing active, including after an ambiguous fsync failure.
       let previous;
       try { previous = await load(); } catch { /* no compatible valid generation yet */ }
@@ -118,7 +170,7 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
         const directoryHandle = await filesystem.open(directory, 'r');
         try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
       }
-      await filesystem.rename(pendingPath, activePath); // Same-filesystem atomic activation; never an incomplete triple.
+      await filesystem.rename(pendingPath, activePath); // Same-filesystem atomic activation; never an incomplete four-section bundle.
       const dir = await filesystem.open(directory, 'r');
       try { await dir.sync(); } finally { await dir.close(); }
       cache = null; fingerprint = null;
@@ -145,13 +197,13 @@ export function createDashboardSnapshotStore({ path, compatibility = snapshotCom
     if (performance.now() - started >= ECOSYSTEM_RESPONSE_TIMEOUT_MS) throw fail('snapshot_read_timeout');
     return body;
   }
-  return { load, publish, read, activePath, compatibility };
+  return { load, publish, read, activePath, legacyPath, compatibility };
 }
 
 // Uses the scheduler's existing single child-process slot, not another HTTP worker. Background stages have their own
 // 30s bound; HTTP's 6s active / 7s total / proxy's 8s remain untouched. Live-hour preemption still terminates the child.
 export function createSnapshotRunner({ path, store, readModel, log = () => {}, spawnImpl = spawn,
-  timeoutMs = SNAPSHOT_STAGE_TIMEOUT_MS, now = Date.now }) {
+  timeoutMs = SNAPSHOT_STAGE_TIMEOUT_MS, now = Date.now, onStage = () => {} }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > SNAPSHOT_STAGE_TIMEOUT_MS) throw fail('invalid_snapshot_timeout');
   let attempted = null, retryAt = 0, running = false;
   const key = cp => JSON.stringify(cp);
@@ -176,7 +228,7 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
     let timer, deadline, failed = null, closed = false, completed = false, stopped = false, stage = 0;
     let detail, terminationRequested = false, exitRecord = null, stderrEnded = !child.stderr, failureLogged = false;
     const fatalScanner = createSnapshotFatalScanner();
-    const stages = ['begin','v3','v4','ecosystem','end'];
+    const stages = ['begin','summary','v3','v4','ecosystem','end'];
     const reportFailure = () => {
       if (!exitRecord || !stderrEnded || failureLogged) return;
       failureLogged = true;
@@ -211,6 +263,7 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
         detail = diagnostic.detail;
         return stop(diagnostic.code);
       }
+      onStage({stage:stages[stage],...(message.metrics??{})});
       stage++;
       if (stage === stages.length) {
         completed = true;

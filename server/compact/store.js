@@ -1,8 +1,8 @@
 // Compact engine: durable store for finished hours on built-in node:sqlite. The caller opens the DatabaseSync, so this
 // module loads on any Node version. Raw blocks, transactions, receipts and logs are never stored. Per hour: one network
 // row (only for a complete, validated block spine), one row per protocol family (available with metrics, or unavailable
-// with null metrics, never zero), and the hour's active-address identities, kept only for the latest 24 hours so 1H, 6H
-// and 24H unique counts are exact. Plus the official Uniswap V3 pool registry and its explicit coverage. An hour, its
+// with null metrics, never zero), and the hour's active-address identities. Older memberships remain accessible through
+// complete hot, packed or archived sets, so 24H/7D/30D unions stay exact. Plus the official Uniswap V3 pool registry. An hour, its
 // family rows, its addresses, its registry rows and the contiguous checkpoint are written in one transaction.
 // Family definitions: every family's definition version is recorded in compact_meta (`family_version:<name>`) the first
 // time the database is opened with that family. A database whose recorded version differs from the running code is refused
@@ -46,6 +46,7 @@ import { ARCHIVE_SQL, createEvidenceArchive, archivedRows, archiveConfig, storag
 import { PACKED_DATASETS, PACKED_JOURNAL_LIMIT_BYTES, PACKED_SHARDS_SQL, createPackedShards, packedShardsConfig } from './packed-shards.js';
 import { createHistoryExpiry, historyFloorOf } from './history-expiry.js';
 import { ARCHERY_CL_KEEP_HOURS, ARCHERY_CL_META_PREFIX, archeryHourRecord, archeryMetaKey } from './archery-cl.js';
+import { identitySource, populateDailyFromHours, recordIdentityCommitment, IDENTITY_COMMITMENTS_SQL } from './identity-evidence.js';
 
 export const COMPACT_SCHEMA_VERSION = '2';
 export const ADDRESS_WINDOW_HOURS = 24;
@@ -407,6 +408,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     db.exec(INTELLIGENCE_SQL);
     db.exec(DAILY_ACTIVE_ADDRESSES_SQL);
     db.exec(ARCHIVE_SQL);
+    db.exec(IDENTITY_COMMITMENTS_SQL);
     // OFF: no packed table is created, so the file stays exactly as before.
     if (packing.config.enabled) db.exec(PACKED_SHARDS_SQL);
     const setMeta = db.prepare('INSERT OR IGNORE INTO compact_meta (key, value) VALUES (?, ?)');
@@ -449,7 +451,17 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   const archive = createEvidenceArchive(db, archival);
   // Same storage rule as every store writer: in-memory stores without an injected capacity are disposable and unchecked.
   const preflight = (plannedBytes) => (persistent || archival.capacity ? archive.preflight(plannedBytes) : { ok: true });
-  const packed = createPackedShards(db, { config: packing.config, log: packing.log, beforePack: packing.beforePack, preflight });
+  const packed = createPackedShards(db, { config: packing.config, log: packing.log, preflight, beforePack:(dataset,scope)=>{
+    if(['compact_hour_addresses','compact_daily_address_stage'].includes(dataset)){
+      const count=dataset==='compact_hour_addresses'
+        ?db.prepare('SELECT unique_active_addresses AS n FROM compact_hours WHERE hour_start=?').get(scope)?.n
+        :db.prepare("SELECT active_addresses AS n FROM compact_daily_active_addresses WHERE day_start=? AND status='available'").get(scope)?.n;
+      const source=identitySource(db,dataset,scope,count);
+      if(!source||source.source!=='hot')throw new StoreError('identity_membership_missing');
+      for(const _row of source.openRows()){} // Do not freeze damaged hot membership into a new "verified" packed copy.
+    }
+    packing.beforePack?.(dataset,scope);
+  } });
   const history = createHistoryExpiry(db, { config: packing.config, packed, preflight, log: packing.log });
   // True for an hour before the history floor: its detail rows are deleted (or about to be), never served as empty.
   const expiredHour = (hourStart) => {
@@ -461,7 +473,12 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     return read();
   };
   const intelligence = createIntelligenceRepository(db, { archive });
-  const dailyActiveAddresses = createDailyActiveAddressesStore(db, { archive });
+  const dailyActiveAddresses = createDailyActiveAddressesStore(db, { archive,
+    reconcileDay:day=>{
+      const rows=db.prepare('SELECT SUM(unique_active_addresses) AS n FROM compact_hours WHERE hour_start>=? AND hour_start<?').get(day,day+86400).n??0;
+      const check=preflight(rows*64);if(!check.ok)throw new StoreError(check.reason);
+      return populateDailyFromHours(db,day,{packed});
+    } });
   const sql = {
     hour: db.prepare('SELECT hour_start, first_block, last_block, parent_hash, last_hash, network_sha256 FROM compact_hours WHERE hour_start = ?'),
     insertHour: db.prepare(`INSERT INTO compact_hours (hour_start, definition_version, first_block, last_block, parent_hash, first_hash,
@@ -621,11 +638,12 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
     }
   }
 
-  // Identities only for the latest 24 hours (by the newest stored hour): no supported window needs anything older.
+  // Old identities remain durable: only verified archive/packed copies may replace hot membership, including 7D/30D.
   function storeAddresses(hourStart, addresses) {
     const horizon = sql.newestHour.get().hour_start - ADDRESS_WINDOW_HOURS * HOUR;
     // Keep older replay identities too. OFF/failed archival must never silently discard accepted evidence.
     for (const address of addresses) sql.insertAddress.run(int(hourStart), Buffer.from(address.slice(2), 'hex'));
+    recordIdentityCommitment(db,'compact_hour_addresses',hourStart);
     archive.prune('compact_hour_addresses', 'hour_start <= ?', [int(horizon)]);
   }
 
@@ -1235,18 +1253,8 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
       if(!hour||hour.definition_version!==COMPACT_DEFINITION_VERSION)return null;
       // Expired identities exist nowhere any more: unknown (null), so a replay re-reads the hour instead.
       if(packed.isExpired('compact_hour_addresses',hourStart)||expiredHour(hourStart))return null;
-      const hot=packed.isPruned('compact_hour_addresses',hourStart)?retainedRows('compact_hour_addresses',hourStart,()=>[])
-        :db.prepare('SELECT * FROM compact_hour_addresses WHERE hour_start=? ORDER BY address').all(int(hourStart));
-      let evidence=hot.length===hour.unique_active_addresses?hot:archivedRows(db,'compact_hour_addresses',hourStart);
-      // Packed identities (streamed and verified on read) only while packing is ON; OFF keeps the previous hot/archive
-      // behaviour. Like the hot read above, this holds one hour's identities, which this accessor returns.
-      if(packed.config.enabled&&evidence.length!==hour.unique_active_addresses){
-        const packedRows=[];
-        if(packed.forEachRow('compact_hour_addresses',hourStart,(row)=>packedRows.push(row)))evidence=packedRows;
-      }
-      if(evidence.some(r=>Number(r.hour_start)!==hourStart||!ArrayBuffer.isView(r.address)||r.address.byteLength!==20))throw new StoreError('archived_address_evidence_invalid');
-      const addresses=[...new Set(evidence.map(r=>`0x${Buffer.from(r.address).toString('hex')}`))].sort();
-      return addresses.length===hour.unique_active_addresses?addresses:null;
+      const source=identitySource(db,'compact_hour_addresses',hourStart,hour.unique_active_addresses,{packed});
+      return source?[...source.openRows()].map(row=>`0x${Buffer.from(row.address).toString('hex')}`):null;
     },
     intelligence,
     commitHour,
@@ -1303,12 +1311,63 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
         lastHash: row.last_hash,
       } : null;
     },
-    replayDailyActiveAddresses(hourStart, addresses) {
+    replayDailyActiveAddresses(hourStart, addresses, {beforeCommit=null}={}) {
       return transaction(() => {
-        if (!sql.hourRange.get(int(hourStart))) throw new StoreError('hour_missing');
-        const observed = dailyActiveAddresses.observeHour(hourStart, addresses, { replay: true });
+        const hour=db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(int(hourStart));
+        if(!hour)throw new StoreError('hour_missing');
+        if(!Array.isArray(addresses)||addresses.length!==hour.unique_active_addresses||new Set(addresses).size!==addresses.length
+          ||addresses.some(a=>!ADDRESS.test(a)))throw new StoreError('identity_hour_count_conflict');
+        const prior=identitySource(db,'compact_hour_addresses',hourStart,hour.unique_active_addresses,{packed});
+        if(prior){
+          const wanted=new Set(addresses);
+          for(const row of prior.openRows())if(!wanted.has(`0x${Buffer.from(row.address).toString('hex')}`))throw new StoreError('identity_evidence_conflict');
+        }else{
+          const wanted=new Set(addresses);
+          for(const row of db.prepare('SELECT address FROM compact_hour_addresses WHERE hour_start=?').iterate(hourStart))
+            if(!wanted.has(`0x${Buffer.from(row.address).toString('hex')}`))throw new StoreError('identity_evidence_conflict');
+          const insert=db.prepare('INSERT OR IGNORE INTO compact_hour_addresses VALUES(?,?)');
+          for(const address of addresses)insert.run(hourStart,Buffer.from(address.slice(2),'hex'));
+          recordIdentityCommitment(db,'compact_hour_addresses',hourStart);
+          packed.packHour(hourStart);
+        }
+        const dayStart=Math.floor(hourStart/86400)*86400;
+        const daily=db.prepare('SELECT * FROM compact_daily_active_addresses WHERE day_start=?').get(dayStart);
+        let membershipPreserved=false;
+        if(daily?.status==='available'){
+          const source=identitySource(db,'compact_daily_address_stage',dayStart,daily.active_addresses,{packed});
+          if(source){for(const _row of source.openRows()){}membershipPreserved=true;}
+        }
+        const observed = dailyActiveAddresses.observeHour(hourStart, addresses, { replay: true, membershipPreserved });
         if (observed.finalized && observed.status === 'available') packed.packDay(observed.dayStart);
         return observed;
+      },beforeCommit);
+    },
+    // Explicit operator-only, zero-RPC repair of ONE day from complete independently verified hourly memberships.
+    // No scheduler candidate changes: deploying this code cannot silently start a historical replay.
+    repairDailyIdentity(dayStart,{beforeCommit=null}={}){
+      if(!Number.isSafeInteger(dayStart)||dayStart%86400!==0)throw new StoreError('invalid_dau_day');
+      if(packed.historyFloor()!==null&&dayStart+23*HOUR<packed.historyFloor())throw new StoreError('history_expired');
+      let pinnedCheckpoint;
+      return transaction(()=>{
+        pinnedCheckpoint=checkpoint();
+        const hours=db.prepare('SELECT hour_start,unique_active_addresses FROM compact_hours WHERE hour_start>=? AND hour_start<? ORDER BY hour_start').all(dayStart,dayStart+86400);
+        if(hours.length!==24)throw new StoreError('identity_canonical_incomplete');
+        const planned=hours.reduce((n,h)=>n+h.unique_active_addresses*64,0),check=preflight(planned);
+        if(!check.ok)throw new StoreError(check.reason);
+        const old=db.prepare('SELECT status,active_addresses FROM compact_daily_active_addresses WHERE day_start=?').get(dayStart);
+        const count=populateDailyFromHours(db,dayStart,{packed});
+        if(old?.status==='available'&&old.active_addresses!==count)throw new StoreError('identity_daily_count_conflict');
+        if(old?.status==='unavailable'&&db.prepare("SELECT 1 FROM sqlite_master WHERE name='compact_daily_address_status_history'").get())
+          db.prepare('INSERT OR IGNORE INTO compact_daily_address_status_history VALUES(?,?,?,?)').run(dayStart,old.status,
+            db.prepare('SELECT reason FROM compact_daily_active_addresses WHERE day_start=?').get(dayStart).reason,'arc-dau-v1');
+        db.prepare(`INSERT INTO compact_daily_active_addresses VALUES(?,'available',NULL,?) ON CONFLICT(day_start)
+          DO UPDATE SET status='available',reason=NULL,active_addresses=excluded.active_addresses
+          WHERE status<>'available' OR reason IS NOT NULL OR active_addresses<>excluded.active_addresses`).run(dayStart,count);
+        recordIdentityCommitment(db,'compact_daily_address_stage',dayStart);packed.packDay(dayStart);
+        return {dayStart,status:'available',activeAddresses:count,source:'verified_hourly_membership'};
+      },()=>{
+        beforeCommit?.();
+        if(JSON.stringify(checkpoint())!==JSON.stringify(pinnedCheckpoint))throw new StoreError('identity_checkpoint_changed');
       });
     },
     extendRegistry,

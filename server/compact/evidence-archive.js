@@ -105,9 +105,11 @@ export function storagePreflight(db, config = archiveConfig(), { plannedBytes = 
   } catch { return { ok: false, reason: 'storage_capacity_unknown', plannedBytes }; }
 }
 
-function verifiedSet(db, record, { maxBytes = 8 * MiB } = {}) {
-  if (!record || record.raw_bytes > maxBytes || record.row_count > 32768) throw error('archive_read_budget');
-  const manifest = JSON.parse(record.manifest_json);
+function verifiedManifest(db, record, maxBytes = 8 * MiB) {
+  if (!record || record.raw_bytes < 0 || record.raw_bytes > maxBytes || record.row_count < 0 || record.row_count > 32768
+    || record.manifest_json.length > MiB) throw error('archive_read_budget');
+  let manifest;try{manifest=JSON.parse(record.manifest_json);}catch{throw error('archive_manifest_corrupt');}
+  if(!manifest||typeof manifest!=='object'||Array.isArray(manifest)||!Array.isArray(manifest.definitions))throw error('archive_manifest_corrupt');
   const identity = { ...manifest }; delete identity.archiveId;
   if (manifest.version !== ARCHIVE_VERSION || manifest.archiveId !== record.archive_id || hash(JSON.stringify(identity)) !== record.archive_id
     || manifest.dataset !== record.dataset || manifest.scopeStart !== record.scope_start || manifest.rows !== record.row_count
@@ -117,9 +119,13 @@ function verifiedSet(db, record, { maxBytes = 8 * MiB } = {}) {
   if (!Array.isArray(manifest.canonicalHours) || !manifest.canonicalHours.length || manifest.canonicalHours.length > (day ? 24 : 1)
     || hash(JSON.stringify(manifest.canonicalHours)) !== record.canonical_sha256) throw error('archive_canonical_conflict');
   for (const h of manifest.canonicalHours) {
-    if (h.hour_start < record.scope_start || h.hour_start >= record.scope_start + (day ? 86400 : 1)
+    if (!h || h.hour_start < record.scope_start || h.hour_start >= record.scope_start + (day ? 86400 : 1)
       || JSON.stringify(db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(h.hour_start)) !== JSON.stringify(h)) throw error('archive_canonical_conflict');
   }
+  return manifest;
+}
+function verifiedSet(db, record, { maxBytes = 8 * MiB } = {}) {
+  const manifest = verifiedManifest(db, record, maxBytes);
   const parts = db.prepare('SELECT * FROM compact_evidence_archive_parts WHERE archive_id=? ORDER BY part LIMIT 129').all(record.archive_id);
   if (parts.length !== manifest.parts || parts.length > 128) throw error('archive_parts_corrupt');
   let bytes = 0, stored = 0; const rawParts = [];
@@ -138,6 +144,60 @@ function verifiedSet(db, record, { maxBytes = 8 * MiB } = {}) {
   });
   if (bytes !== record.raw_bytes || stored !== record.stored_bytes || rows.length !== record.row_count || hash(rowsText(rows)) !== manifest.rowsSha256) throw error('archive_rows_corrupt');
   return { rows, manifest };
+}
+
+// Address-only reader for existing v1 archives, independent of the archive WRITE feature flag. A complete individual
+// revision is required; partial revisions are never stitched into invented coverage. No all-rows JSON/Set allocation.
+export function archivedIdentitySet(db, dataset, scope, expected) {
+  if (!['compact_hour_addresses','compact_daily_address_stage'].includes(dataset)) throw error('archive_dataset_invalid');
+  if (!exists(db)) return null;
+  const records=db.prepare(`SELECT archive_id,row_count FROM compact_evidence_archive
+    WHERE dataset=? AND scope_start=? ORDER BY sequence DESC LIMIT 33`).all(dataset,scope);
+  if(records.length>32)throw error('archive_revision_budget');
+  let selected=null;
+  for(const item of records){
+    if(item.row_count!==expected)continue;
+    const record=db.prepare('SELECT * FROM compact_evidence_archive WHERE archive_id=?').get(item.archive_id);
+    const manifest=verifiedManifest(db,record);
+    if(dataset==='compact_daily_address_stage' && (manifest.canonicalHours.length!==24
+      || manifest.canonicalHours.some((h,i)=>h.hour_start!==scope+i*3600)))throw error('archive_canonical_conflict');
+    if(selected && selected.manifest.rowsSha256!==manifest.rowsSha256)throw error('archive_identity_conflict');
+    // The pinned read transaction and immutable archive protect this verified metadata. Retain only the tiny fields
+    // needed by the byte reader, not hundreds of provenance/canonical objects for every hour in a 30D plan.
+    selected ??= {record:{archive_id:record.archive_id,raw_bytes:record.raw_bytes,stored_bytes:record.stored_bytes},
+      manifest:{rowsSha256:manifest.rowsSha256,parts:manifest.parts}};
+  }
+  if(!selected)return null;
+  const {record,manifest}=selected,scopeColumn=dataset==='compact_hour_addresses'?'hour_start':'day_start';
+  return { id:record.archive_id, openRows:()=> (function*(){
+    const digest=createHash('sha256');let bytes=0,stored=0,parts=0,rows=0,pending='',opened=false,closed=false,separator=false,last='';
+    const query=db.prepare(`SELECT archive_id,part,raw_bytes,raw_sha256,stored_sha256,length(payload) AS payload_bytes
+      FROM compact_evidence_archive_parts WHERE archive_id=? ORDER BY part`);
+    for(const part of query.iterate(record.archive_id)){
+      if(part.part!==parts++||parts>128||part.raw_bytes<1||part.raw_bytes>MiB||part.payload_bytes>MiB+1024)throw error('archive_part_corrupt');
+      const {payload}=db.prepare('SELECT payload FROM compact_evidence_archive_parts WHERE archive_id=? AND part=?').get(record.archive_id,part.part);
+      if(hash(payload)!==part.stored_sha256)throw error('archive_part_corrupt');
+      let raw;try{raw=inflateRawSync(payload,{maxOutputLength:Math.min(MiB,record.raw_bytes-bytes)});}catch{throw error('archive_part_corrupt');}
+      bytes+=raw.length;stored+=payload.byteLength;
+      if(raw.length!==part.raw_bytes||hash(raw)!==part.raw_sha256)throw error('archive_part_corrupt');
+      digest.update(raw);pending+=raw.toString('utf8');
+      if(!opened){if(pending[0]!=='[')throw error('archive_rows_corrupt');pending=pending.slice(1);opened=true;}
+      while(pending.length&&!closed){
+        if(pending[0]===']'){closed=true;pending=pending.slice(1);break;}
+        if(separator){if(pending[0]!==',')throw error('archive_rows_corrupt');pending=pending.slice(1);separator=false;}
+        const end=pending.indexOf(']]]');if(end<0)break;
+        const text=pending.slice(0,end+3);pending=pending.slice(end+3);
+        const match=/^\[\["address",\["blob","([0-9a-f]{40})"\]\],\["(hour_start|day_start)",\["integer","(\d+)"\]\]\]$/.exec(text);
+        if(!match||match[2]!==scopeColumn||Number(match[3])!==scope||match[1]<=last)throw error('archive_rows_corrupt');
+        last=match[1];rows++;separator=true;
+        if(rows>expected)throw error('archive_rows_corrupt');
+        yield {[scopeColumn]:scope,address:Buffer.from(last,'hex')};
+      }
+      if(pending.length>256)throw error('archive_rows_corrupt'); // At most an incomplete fixed-size typed address row.
+    }
+    if(!closed||pending.length||parts!==manifest.parts||bytes!==record.raw_bytes||stored!==record.stored_bytes
+      ||rows!==expected||digest.digest('hex')!==manifest.rowsSha256)throw error('archive_rows_corrupt');
+  })() };
 }
 
 // Indexed exact scope only. Consumers must ALSO check their own proof/count/source compatibility before reuse.
@@ -234,6 +294,25 @@ export function createEvidenceArchive(db, { config = archiveConfig(), capacity, 
       const rows=readSQL(db,`SELECT * FROM ${dataset} WHERE ${scopeColumn}=? AND (${where}) LIMIT ?`,scope,...args,config.maxTransactionRows+1);
       let covered=false;
       try {
+        if(['compact_hour_addresses','compact_daily_address_stage'].includes(dataset)&&rows.length<=config.maxTransactionRows){
+          const day=dataset==='compact_daily_address_stage';
+          const expected=day?db.prepare("SELECT active_addresses AS n FROM compact_daily_active_addresses WHERE day_start=? AND status='available'").get(scope)?.n
+            :db.prepare('SELECT unique_active_addresses AS n FROM compact_hours WHERE hour_start=?').get(scope)?.n;
+          if(expected===undefined||rows.length!==expected)throw error('archive_identity_incomplete');
+          const commitment=db.prepare('SELECT value FROM compact_meta WHERE key=?').get(`identity_membership:v1:${dataset}:${scope}`);
+          if(commitment){
+            const saved=JSON.parse(commitment.value),digest=createHash('sha256');
+            const sorted=rows.map(row=>{
+              if(!ArrayBuffer.isView(row.address)||row.address.byteLength!==20)throw error('archive_identity_commitment_conflict');
+              return row.address;
+            }).sort(Buffer.compare);
+            for(const address of sorted)digest.update(address);
+            const canonical=db.prepare(`SELECT hour_start,definition_version,network_sha256 FROM compact_hours
+              WHERE hour_start>=? AND hour_start<? ORDER BY hour_start`).all(scope,scope+(day?86400:1));
+            if(saved.version!==1||saved.count!==expected||saved.sha256!==digest.digest('hex')||saved.canonical!==hash(JSON.stringify(canonical)))
+              throw error('archive_identity_commitment_conflict');
+          }
+        }
         const records=db.prepare('SELECT * FROM compact_evidence_archive WHERE dataset=? AND scope_start=? ORDER BY sequence DESC LIMIT 33').all(dataset,scope);
         if(records.length>32)throw error('archive_revision_budget');
         const saved=new Set(),identities=new Map();let bytes=0;

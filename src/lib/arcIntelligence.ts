@@ -109,6 +109,7 @@ export type UsdPricesHour = { hour: string; status: 'available' | 'unavailable';
     sourceCount: number })[] }
 
 export type ArcSummary = {
+  snapshot?: ArcDashboardSnapshot
   schema: typeof SUMMARY_SCHEMA
   window: IntelligenceWindow
   freshness: ArcFreshness
@@ -699,7 +700,7 @@ export async function loadArcIntelligence(
   }))
   const [summary, timeseries, poolsV3, poolsV4, ecosystem, ...activity] = settled
   const summaryValue = summary.status === 'fulfilled' && summary.value.schema === SUMMARY_SCHEMA
-    && isRecord(summary.value.window) && summary.value.window.key === selected && validWindowCoverage(summary.value.window)
+    && isRecord(summary.value.window) && summary.value.window.key === selected && validWindowCoverage(summary.value.window) && validDashboardSnapshot(summary.value.snapshot, summary.value.window)
     ? summary.value as unknown as ArcSummary : null
   const timeseriesValue = timeseries.status === 'fulfilled' && timeseries.value.schema === TIMESERIES_SCHEMA
     && isRecord(timeseries.value.window) && timeseries.value.window.key === selected && validWindowCoverage(timeseries.value.window)
@@ -715,12 +716,13 @@ export async function loadArcIntelligence(
       Record<ArcActivityType, ArcActivity | null>,
   }
   // Atomic files cannot pin several separate HTTP/CDN requests. Fail closed if activation happened between requests;
-  // the existing refresh merger retains the prior successful bundle while Summary/Timeseries/Activity stay isolated.
-  const snapshotVersions = [result.pools?.v3?.snapshot, result.pools?.v4?.snapshot, result.ecosystem?.snapshot]
+  // the existing refresh merger retains the prior successful bundle while Timeseries/Activity stay isolated.
+  const snapshotVersions = [result.summary?.snapshot, result.pools?.v3?.snapshot, result.pools?.v4?.snapshot, result.ecosystem?.snapshot]
     .filter(value => value !== undefined).map(value => `${value.checkpointHour}:${value.preparedAt}`)
   if (new Set(snapshotVersions).size > 1) {
     result.pools = { v3: null, v4: null }
     result.ecosystem = null
+    if (result.summary?.snapshot) { result.summary = null; result.failed = true }
   }
   result.readErrors = Object.fromEntries(ARC_READ_SECTIONS.flatMap((section, index) => sectionValue(result, section) !== null ? []
     : [[section, settled[index].status === 'rejected' ? 'request_failed' : 'invalid_response']]))

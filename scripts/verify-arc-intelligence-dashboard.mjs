@@ -1004,7 +1004,9 @@ await test('UI 9 every window reads exactly its own summary, timeseries and pool
   assert.doesNotMatch(componentSource, /\bfetch\(/, 'the component only loads through loadArcIntelligence');
   assert.match(componentSource, /if \(!ARC_INTELLIGENCE_BACKEND_WINDOWS\[target\]\) return/);
   for (const [name, hours] of [['7d', 168], ['30d', 720]]) {
-    assert.match(textOf(rendered[name].tree), new RegExp(`History is still being collected \\(${STORED_HOURS} of ${hours} hours so far\\)\\. ${name.toUpperCase()} totals appear once every hour of the window is verified; the daily charts already show each complete day\\.`), name);
+    // a05b90f removed the repeated 30D global banner; per-metric coverage remains asserted below.
+    if(name==='7d')assert.match(textOf(rendered[name].tree), new RegExp(`History is still being collected \\(${STORED_HOURS} of ${hours} hours so far\\)\\. ${name.toUpperCase()} totals appear once every hour of the window is verified; the daily charts already show each complete day\\.`), name);
+    else assert.doesNotMatch(textOf(rendered[name].tree), /30D totals appear once every hour/);
     assert.equal(statusIn(name, 'network.transactions'), 'collecting', name);
     assert.equal(statusIn(name, 'active-addresses-chart.series'), 'unavailable', `${name}: daily unique addresses are never summed`);
   }
@@ -1994,7 +1996,7 @@ await test('Partial 30D displays 549 verified hours, all supported numeric secti
   const { tree } = render({ selectedWindow: '30d', data, borrowMarket: BORROW_AVAILABLE });
   checkScope(tree, SCOPE);
   const text = textOf(tree);
-  assert.match(text, /Partial 30D history : 549 of 720 hours are available \(22 complete days\), so 30D totals cover only these hours\. Missing hours are never counted as zero\./);
+  assert.match(text, /30D: 549\/720 verified hours \(22 complete days\)\. Missing hours are excluded from totals\./);
   assert.match(text, /Total transactions, last partial 30D \(549 of 720 hours\)/);
   assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.start)));
   assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.end)));
@@ -2679,7 +2681,7 @@ await test('Refresh 2 a failed 30D reload preserves every verified section and s
   const tree = render({ selectedWindow: '30d', data: kept }).tree;
   assert.equal(item(tree, 'network.transactions').attrs['data-intel-status'], 'available');
   assert.equal(byAttr(tree, 'data-refresh-section', 'summary')[0].attrs['data-refresh-status'], 'stale');
-  assert.match(textOf(tree), /560 of 720 hours are available/);
+  assert.match(textOf(tree), /560\/720 verified hours/);
   assert.match(textOf(tree), /Some parts could not be refreshed\. Showing earlier data, which may be out of date: Overview, Charts, /);
   assert.match(textOf(tree), /Technical details Overview : showing earlier data/);
   assert.match(textOf(tree), /Last good update: Oct 9, 17:00 UTC/);

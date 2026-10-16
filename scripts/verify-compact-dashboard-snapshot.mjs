@@ -1,5 +1,7 @@
 // Small isolated SQLite acceptance cases only. No mainnet/RPC, collector, recovery or production files.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { createEvidenceArchive,archiveConfig } from '../server/compact/evidence-archive.js';
 import { DatabaseSync } from 'node:sqlite';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
@@ -41,7 +43,7 @@ function append(i){
 for(let i=0;i<4;i++)append(i);
 const model=createCompactReadModel({path,DatabaseSync,now:()=>clock});
 const options={path,now:()=>clock,verifyCheckpoint:cp=>model.snapshotCheckpointMatches(cp)};
-const snapshots=createDashboardSnapshotStore(options), runner=createSnapshotRunner({path,store:snapshots,readModel:model,now:()=>clock});
+const snapshots=createDashboardSnapshotStore(options), runner=createSnapshotRunner({path,store:snapshots,readModel:model,now:()=>clock,log:line=>console.log(line)});
 let original;
 try {
  await test('background snapshot stage exceeds 6s safely; 30s cap, HTTP deadlines and heap limits stay separate',async()=>{
@@ -67,15 +69,41 @@ try {
    console.log(JSON.stringify({test:'simulated_background_stage_over_http_cap',elapsedMs,snapshotStageLimitMs:30000,httpActiveMs:6000,httpTotalMs:7000,proxyMs:8000}));
  });
  await test('no snapshot: explicit not_ready, no heavy fallback',async()=>assert.rejects(snapshots.read('v3',model.snapshotIdentity()),e=>e.code==='not_ready'));
- await test('all three real read-model outputs prepared and atomically activated',async()=>{
+ await test('all four real read-model outputs prepared and atomically activated',async()=>{
    assert.equal(await runner.needed(),true);assert.equal((await runner.run().done).exitCode,0);original=await snapshots.load();
-   for(const section of ['v3','v4','ecosystem']){
-     const direct=section==='ecosystem'?model.ecosystem('30d'):model.pools(section,'30d');
+   for(const section of ['summary','v3','v4','ecosystem']){
+     const direct=section==='summary'?model.summary('30d'):section==='ecosystem'?model.ecosystem('30d'):model.pools(section,'30d');
      const saved=JSON.parse(original.sections[section].json);delete direct.freshness;delete saved.freshness;assert.deepEqual(saved,JSON.parse(JSON.stringify(direct)));
    }
    assert.equal(JSON.parse(original.sections.v3.json).pools[0].swapCount,10);
    assert.equal(JSON.parse(original.sections.v4.json).pools[0].flowsRaw.token0In,'40000000000000000000004');
    assert.equal(await runner.needed(),false);
+ });
+ await test('v1 transition: no Summary fallback, complete v2 activation and exact legacy rollback bytes retained',async()=>{
+   const migrated=createDashboardSnapshotStore({...options,path:join(directory,'legacy-fixture.sqlite')});
+   const legacy=structuredClone(original);legacy.format='machina.dashboard.30d.snapshot.v1';delete legacy.sections.summary;
+   const seal=value=>{const {sha256,...body}=value;return {...body,sha256:createHash('sha256').update(JSON.stringify(body)).digest('hex')};};
+   const bytes=JSON.stringify(seal(legacy));await fs.mkdir(join(directory,'legacy-fixture.sqlite.dashboard-30d'));
+   await fs.writeFile(migrated.activePath,bytes);
+   await assert.rejects(migrated.read('summary',model.snapshotIdentity()),e=>e.code==='not_ready');
+   await migrated.publish(model.snapshotIdentity(),{summary:model.summary('30d'),v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')});
+   assert.equal((await migrated.load()).format,'machina.dashboard.30d.snapshot.v2');assert.equal(await fs.readFile(migrated.legacyPath,'utf8'),bytes);
+   assert.equal((await migrated.read('summary',model.snapshotIdentity())).network.uniqueActiveAddresses.value,1);
+ });
+ await test('oversized Summary cannot bypass existing response or bundle caps and leaves the prior generation intact',async()=>{
+   const cp=model.snapshotIdentity(),summary=structuredClone(model.summary('30d'));summary.testOnlyOversize='x'.repeat(256*1024);
+   await assert.rejects(snapshots.publish(cp,{summary,v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')}),e=>e.code==='snapshot_size_limit');
+   assert.deepEqual(await snapshots.load(),original);
+ });
+ await test('Summary integrity, previous-period interval and four-section completeness cannot be bypassed by resealing',async()=>{
+   const {validateSnapshot}=await import('../server/compact/dashboard-snapshot.js');
+   for(const mutate of [b=>delete b.sections.summary,b=>{const v=JSON.parse(b.sections.summary.json);v.network.uniqueActiveAddresses.value=-1;b.sections.summary.json=JSON.stringify(v);},
+     b=>{const v=JSON.parse(b.sections.summary.json);v.network.previous.end=v.window.end;b.sections.summary.json=JSON.stringify(v);}]){
+     const b=structuredClone(original);mutate(b);
+     for(const part of Object.values(b.sections))part.sha256=createHash('sha256').update(part.json).digest('hex');
+     const {sha256,...contents}=b;b.sha256=createHash('sha256').update(JSON.stringify(contents)).digest('hex');
+     assert.throws(()=>validateSnapshot(b,snapshots.compatibility),/snapshot_invalid/);
+   }
  });
  await test('ready snapshot quick reads: bounded body, explicit verified time',async()=>{
    const at=performance.now();for(let i=0;i<30;i++){const b=await snapshots.read('v3',model.snapshotIdentity());assert.equal(b.snapshot.status,'current');assert.equal(b.snapshot.verifiedThrough,new Date((BASE+4*HOUR)*1000).toISOString());}
@@ -91,7 +119,7 @@ try {
    assert.equal(b.freshness.stale,true);assert.equal(b.pools[0].swapCount,10);
  });
  await test('partial, mixed-checkpoint and changed window bundles cannot activate',async()=>{
-   const cp=model.snapshotIdentity(),values={v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')};
+   const cp=model.snapshotIdentity(),values={summary:model.summary('30d'),v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')};
    await assert.rejects(snapshots.publish(cp,{...values,ecosystem:undefined}));
    values.v4.freshness.checkpointBlock--;
    await assert.rejects(snapshots.publish(cp,values));assert.deepEqual(await snapshots.load(),original);
@@ -118,17 +146,17 @@ try {
  });
  await test('low disk leaves old file untouched',async()=>{
    const low=createDashboardSnapshotStore({...options,filesystem:{...fs,statfs:async()=>({bavail:0,bsize:4096})}});
-   await assert.rejects(low.publish(model.snapshotIdentity(),{v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')}),e=>e.code==='snapshot_disk_budget');
+   await assert.rejects(low.publish(model.snapshotIdentity(),{summary:model.summary('30d'),v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')}),e=>e.code==='snapshot_disk_budget');
    assert.deepEqual(await snapshots.load(),original);
  });
  await test('crash before atomic rename cannot replace active bundle',async()=>{
    const crash=createDashboardSnapshotStore({...options,filesystem:{...fs,rename:async()=>{throw Error('simulated_crash');}}});
-   await assert.rejects(crash.publish(model.snapshotIdentity(),{v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')}));
+   await assert.rejects(crash.publish(model.snapshotIdentity(),{summary:model.summary('30d'),v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')}));
    assert.deepEqual(await createDashboardSnapshotStore(options).load(),original);
  });
  await test('new hour refresh: all values and checkpoint advance together',async()=>{
    assert.equal((await runner.run().done).exitCode,0);const b=await snapshots.load();assert.equal(b.checkpoint.hourStart,BASE+4*HOUR);
-   for(const s of ['v3','v4','ecosystem'])assert.equal((await snapshots.read(s,model.snapshotIdentity())).snapshot.lagHours,0);
+   for(const s of ['summary','v3','v4','ecosystem'])assert.equal((await snapshots.read(s,model.snapshotIdentity())).snapshot.lagHours,0);
    assert.equal((await snapshots.read('v3',model.snapshotIdentity())).pools[0].swapCount,15);
  });
  await test('pinned transaction: concurrent local commit cannot mix stages',async()=>{
@@ -149,9 +177,9 @@ try {
    assert.equal((await changed.run().done).error,'snapshot_inputs_changed');assert.deepEqual((await snapshots.load()).checkpoint,cp);
  });
  await test('HTTP 30D serves only saved bundle; 24H/7D unchanged',async()=>{
-   let heavy=0,exposed=snapshots;const httpModel={...model,pools:(p,w)=>w==='30d'?exposed.read(p,model.snapshotIdentity()):(heavy++,model.pools(p,w)),ecosystem:w=>w==='30d'?exposed.read('ecosystem',model.snapshotIdentity()):(heavy++,model.ecosystem(w))};
+   let heavy=0,exposed=snapshots;const httpModel={...model,summary:w=>w==='30d'?exposed.read('summary',model.snapshotIdentity()):(heavy++,model.summary(w)),pools:(p,w)=>w==='30d'?exposed.read(p,model.snapshotIdentity()):(heavy++,model.pools(p,w)),ecosystem:w=>w==='30d'?exposed.read('ecosystem',model.snapshotIdentity()):(heavy++,model.ecosystem(w))};
    const server=createIntelligenceServer({readModel:httpModel});await new Promise(r=>server.listen(0,'127.0.0.1',r));
-   try{for(const route of ['pools?protocol=v3','pools?protocol=v4','ecosystem?']){
+   try{for(const route of ['summary?','pools?protocol=v3','pools?protocol=v4','ecosystem?']){
      const url=`http://127.0.0.1:${server.address().port}/v1/intelligence/${route}${route.endsWith('?')?'':'&'}window=30d`;
      const at=performance.now(),response=await fetch(url),body=await response.json();assert.equal(response.status,200);assert.equal(body.snapshot.status,'stale');
      console.log(JSON.stringify({route,totalMs:performance.now()-at}));
@@ -205,11 +233,16 @@ try {
    assert.ok(lib.parseArcPools(v3,'v3','30d'));assert.ok(lib.parseArcEcosystem(eco,'30d'));
    assert.equal(lib.parseArcPools({...v3,snapshot:{...v3.snapshot,lagHours:-1}},'v3','30d'),null);
    assert.equal(lib.parseArcEcosystem({...eco,snapshot:{...eco.snapshot,verifiedThrough:'2026-09-15T00:00:00Z'}},'30d'),null);
-   const data={window:'30d',summary:model.summary('30d'),timeseries:model.timeseries('30d'),pools:{v3,v4},ecosystem:eco,failed:false,
-     refresh:Object.fromEntries(['poolsV3','poolsV4','ecosystem'].map(section=>[section,{lastSuccessAt:new Date(clock).toISOString(),verifiedThrough:v3.snapshot.verifiedThrough,retained:false,error:null}]))};
+   const data={window:'30d',summary:await snapshots.read('summary',model.snapshotIdentity()),timeseries:model.timeseries('30d'),pools:{v3,v4},ecosystem:eco,failed:false,
+     refresh:Object.fromEntries(['summary','poolsV3','poolsV4','ecosystem'].map(section=>[section,{lastSuccessAt:new Date(clock).toISOString(),verifiedThrough:v3.snapshot.verifiedThrough,retained:false,error:null}]))};
    const html=renderToStaticMarkup(React.createElement(components.ArcIntelligenceDashboard,{selectedWindow:'30d',data}));
-   assert.match(html,/saved verified snapshot/);assert.doesNotMatch(html,/up to date/);assert.match(html,/Newer results are not ready/);assert.match(html,/delayed by at least 1 hours/);
-   assert.ok(html.includes('5 of 720 verified hours'),'snapshot evidence keeps its own partial window');
+   // a05b90f consolidated repeated warnings. Keep testing the actual delayed-data warning and technical provenance.
+   assert.match(html,/saved verified snapshot/);assert.doesNotMatch(html,/up to date/);
+   assert.match(html,/Saved 30D data is delayed/);assert.match(html,/data-refresh-section="snapshot"/);
+   assert.match(html,/30D snapshot<\/strong>: stale/);assert.match(html,/Latest checkpoint:/);
+   assert.equal(v3.window.coverage.availableHours,5,'saved evidence keeps its own partial window');
+   assert.equal(data.summary.window.coverage.availableHours,5,'Summary keeps the saved bundle coverage');
+   assert.match(html,/5\/720 verified hours/); // a05b90f shows current coverage once, with the saved-data delay above.
    const urls=(await import('../api/_lib/intelligence-proxy.js')).resolveIntelligenceRoute;
    const load=await lib.loadArcIntelligence('30d',{fetchImpl:async url=>{
      const query=Object.fromEntries(new URL(url,'http://local').searchParams),route=urls(query);
@@ -219,13 +252,13 @@ try {
      else if(query.view==='pools')value=query.protocol==='v3'?v3:v4;else value=model.activity(query.type);
      assert.ok(route);return{ok:true,status:200,json:async()=>value};
    }});
-   assert.equal(load.pools.v3,null);assert.equal(load.pools.v4,null);assert.equal(load.ecosystem,null);assert.ok(load.summary);
+   assert.equal(load.pools.v3,null);assert.equal(load.pools.v4,null);assert.equal(load.ecosystem,null);assert.equal(load.summary,null);assert.equal(load.failed,true);
  });
  await test('crash after activation: durable bundle prevents unnecessary repeated preparation',async()=>{
    class CommittedThenFailed extends EventEmitter {
      send(m){queueMicrotask(async()=>{
        if(m.stage==='end'){
-         const cp=model.snapshotIdentity();await snapshots.publish(cp,{v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')});
+         const cp=model.snapshotIdentity();await snapshots.publish(cp,{summary:model.summary('30d'),v3:model.pools('v3','30d'),v4:model.pools('v4','30d'),ecosystem:model.ecosystem('30d')});
          this.emit('message',{stage:'end',error:'lost_acknowledgement'});
        }else this.emit('message',{stage:m.stage});
      });}
@@ -234,6 +267,24 @@ try {
    const r=createSnapshotRunner({path,store:snapshots,readModel:model,spawnImpl:()=>new CommittedThenFailed()});
    assert.equal(await r.needed(),true);assert.equal((await r.run().done).exitCode,1);assert.equal(await r.needed(),false);
    assert.equal((await createDashboardSnapshotStore(options).read('v3',model.snapshotIdentity())).pools[0].swapCount,21);
+ });
+ await test('missing identities and a corrupt archived hour remain explicit null metrics in the saved Summary',async()=>{
+   writer.exec('PRAGMA wal_checkpoint(TRUNCATE)');const copy=join(directory,'missing-identity.sqlite');await fs.copyFile(path,copy);
+   const local=new DatabaseSync(copy),reader=createCompactReadModel({path:copy,DatabaseSync,now:()=>clock});
+   try{
+     const archive=createEvidenceArchive(local,{config:{...archiveConfig({COMPACT_EVIDENCE_ARCHIVE_ENABLED:'true'}),maxTransactionMs:2000},capacity:()=>({freeBytes:8*1024**3,databaseBytes:0}),log:()=>{}});
+     archive.begin();local.exec('BEGIN');archive.preserve('compact_hour_addresses',BASE,archive.readRows('compact_hour_addresses','hour_start=?',[BASE]));local.exec('COMMIT');
+     local.prepare('DELETE FROM compact_hour_addresses WHERE hour_start=?').run(BASE);
+     const saved=createDashboardSnapshotStore({path:copy,now:()=>clock,verifyCheckpoint:cp=>reader.snapshotCheckpointMatches(cp)});
+     const prepare=createSnapshotRunner({path:copy,store:saved,readModel:reader,now:()=>clock});
+     assert.equal((await prepare.run().done).exitCode,0);assert.equal((await saved.read('summary',reader.snapshotIdentity())).network.uniqueActiveAddresses.value,1);
+     local.exec('DROP TRIGGER compact_archive_part_no_update; UPDATE compact_evidence_archive_parts SET payload=zeroblob(length(payload))');
+     assert.equal((await prepare.run().done).exitCode,0);
+     let body=await saved.read('summary',reader.snapshotIdentity());assert.equal(body.network.uniqueActiveAddresses.value,null);assert.equal(body.network.uniqueActiveAddresses.reason,'identity_unverified');
+     local.exec('DROP TRIGGER compact_archive_part_no_delete; DROP TRIGGER compact_archive_no_delete; DELETE FROM compact_evidence_archive_parts; DELETE FROM compact_evidence_archive');
+     assert.equal((await prepare.run().done).exitCode,0);body=await saved.read('summary',reader.snapshotIdentity());
+     assert.equal(body.network.uniqueActiveAddresses.value,null);assert.equal(body.network.uniqueActiveAddresses.reason,'identity_incomplete');assert.equal(body.network.transactions,6);
+   }finally{reader.close();local.close();}
  });
  await test('SQLite integrity and accepted canonical/projection values preserved',async()=>{
    assert.equal(writer.prepare('PRAGMA quick_check').get().quick_check,'ok');assert.equal(writer.prepare('SELECT count(*) AS n FROM compact_hours').get().n,6);

@@ -19,7 +19,7 @@ import { CIRCLE_ARC } from './protocols/circle.js';
 import { ARC_CHAIN_ID } from './provider.js';
 import { V3_POOL_KIND } from './registry.js';
 import { COMPACT_DEFINITION_VERSION, FAMILY_VERSIONS } from './sources.js';
-import { ADDRESS_WINDOW_HOURS, COMPACT_SCHEMA_VERSION } from './store.js';
+import { COMPACT_SCHEMA_VERSION } from './store.js';
 import { poolTvlUsd, TVL_VERSION } from './tvl.js';
 import { familyRetryPolicy } from './repair-policy.js';
 import { ARCHERY_CL, ARCHERY_CL_DEFINITION_VERSION } from '../../api/_lib/arc-intelligence/archery.js';
@@ -33,8 +33,8 @@ export const POOLS_SCHEMA = 'machina.intelligence.pools.v1';
 export const ACTIVITY_SCHEMA = 'machina.intelligence.activity.v1';
 // 24H and 7D require full windows. 30D uses all contiguous committed hours inside the selected window,
 // with an explicit coverage interval; metric-specific verification still fails closed.
-// Unique active addresses over 7D/30D are not_supported (identities are kept for 24 hours only); everything additive is
-// summed from hourly rows. Daily timeseries expose completed UTC days; 30D also identifies incomplete boundary days.
+// Unique active addresses use verified membership unions, never sums of hourly/daily unique counts. Daily timeseries
+// expose completed UTC days; 30D also identifies incomplete boundary days.
 export const SUMMARY_WINDOWS = Object.freeze({ '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const TIMESERIES_WINDOWS = Object.freeze({ '6h': 6, '24h': 24, '7d': 168, '30d': 720 });
 export const POOLS_WINDOWS = Object.freeze({ '24h': 24, '7d': 168, '30d': 720 });
@@ -227,10 +227,6 @@ const SQL = Object.freeze({
   bounds: 'SELECT MIN(hour_start) AS first, MAX(hour_start) AS last, COUNT(*) AS count FROM compact_hours',
   networkRows: `SELECT hour_start, block_count, transaction_count, unique_active_addresses, network_json FROM compact_hours
     WHERE hour_start BETWEEN ? AND ? ORDER BY hour_start`,
-  identityCounts: `SELECT h.hour_start, h.unique_active_addresses AS expected,
-    (SELECT COUNT(*) FROM compact_hour_addresses a WHERE a.hour_start = h.hour_start) AS stored
-    FROM compact_hours h WHERE h.hour_start BETWEEN ? AND ?`,
-  identityUnion: 'SELECT COUNT(DISTINCT address) AS count FROM compact_hour_addresses WHERE hour_start BETWEEN ? AND ?',
   dailyActiveAddressTable: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compact_daily_active_addresses'",
   dailyActiveAddress: `SELECT status, reason, active_addresses FROM compact_daily_active_addresses WHERE day_start = ?`,
   dauReplayBootstrapCandidate: `SELECT MIN(hour_start) AS hour_start
@@ -354,7 +350,7 @@ const SQL = Object.freeze({
 // path: the compact SQLite file. DatabaseSync: node:sqlite's class (injected so the module loads on any Node version).
 // onSnapshotStarted: test hook, called inside every snapshot right after its first read.
 export function createCompactReadModel({ path, DatabaseSync, now = () => Date.now(), busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
-  onSnapshotStarted = null, onReadSample = null }) {
+  onSnapshotStarted = null, onIdentityProgress = undefined, onReadSample = null }) {
   if (typeof path !== 'string' || !path || path === ':memory:' || path.startsWith('file:')) throw new ReadModelError('invalid_path');
   if (typeof DatabaseSync !== 'function') throw new ReadModelError('sqlite_unavailable');
   if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) throw new ReadModelError('invalid_busy_timeout');
@@ -378,6 +374,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
     if (!existsSync(path)) throw new ReadModelError('not_ready', 'database_missing');
     const opened = new DatabaseSync(path, { readOnly: true, timeout: busyTimeoutMs });
     try {
+      opened.exec('PRAGMA temp_store = FILE');
       opened.exec('PRAGMA query_only = ON');
       opened.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
       if (opened.prepare('PRAGMA query_only').get()?.query_only !== 1) throw new ReadModelError('incompatible', 'query_only_unavailable');
@@ -401,7 +398,7 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   // this function returns, so no snapshot is ever held between requests.
   function snapshot(work, { requireDefinitions = true } = {}) {
     const current = connection();
-    // Background preparation pins one WAL read snapshot across three bounded stages. Public reads never use this mode.
+    // Background preparation pins one WAL read snapshot across four bounded sections. Public reads never use this mode.
     if (preparingSnapshot) return work(definitionState(current));
     if (current.isTransaction === true) current.exec('ROLLBACK');
     current.exec('BEGIN');
@@ -443,16 +440,9 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
   function uniqueActiveAddresses(rows, from, to, hours, newestHour) {
     if (rows.length !== hours) return { status: 'unavailable', reason: 'insufficient_coverage', value: null };
     if (hours === 1) return { status: 'available', value: rows[0].unique_active_addresses };
-    // A window reaching past the newest ADDRESS_WINDOW_HOURS hours (7D, 30D, the previous 24H) is the exact union of the
-    // stored daily and hourly identity sets, hot or packed; any incomplete set makes it unavailable, never estimated.
-    if (from < newestHour - (ADDRESS_WINDOW_HOURS - 1) * HOUR) {
-      return uniqueAddressesOfSpan(connection(), from, to, { packed: packedSets(), cache: unionCache });
-    }
-    const counts = statement('identityCounts').all(int(from), int(to));
-    if (counts.length !== hours || counts.some((row) => row.stored !== row.expected)) {
-      return { status: 'unavailable', reason: 'identity_incomplete', value: null };
-    }
-    return { status: 'available', value: statement('identityUnion').get(int(from), int(to)).count };
+    // Exact union of complete stored daily/hourly identities, hot, packed or independently verified archive evidence.
+    // The same source/count/commitment checks apply to 24H and historical windows; incomplete sets are never estimated.
+    return uniqueAddressesOfSpan(connection(), from, to, { packed: packedSets(), cache: unionCache, onProgress:onIdentityProgress });
   }
 
   function dailyActiveAddresses(dayStart) {

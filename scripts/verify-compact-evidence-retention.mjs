@@ -128,13 +128,17 @@ await test('projection and valuation deletion paths are replaced by permanent in
   assert.equal(f.db.prepare('SELECT reason FROM compact_valuation_hours WHERE hour_start=? AND valuation=?').get(BASE,'token_prices').reason,'recorded_failure');
   assert.deepEqual(f.db.prepare('SELECT * FROM compact_hours WHERE hour_start=?').get(BASE),cp);f.db.close();
 });
-await test('DAU stage and captured-hour deletion paths preserve finalized membership and remain resumable',()=>{
+await test('DAU stage archives after finalization; captured-hour provenance stays durable and resumable',()=>{
   const f=fixture();for(let i=1;i<24;i++)f.store.commitHour(fakeHour(i,{identities:[address(i+1)]}));
   assert.equal(count(f.db,'compact_daily_address_stage'),24);assert.equal(count(f.db,'compact_daily_address_hours'),24);
   assert.equal(f.db.prepare('SELECT active_addresses FROM compact_daily_active_addresses WHERE day_start=?').get(BASE).active_addresses,24);
   f.store.commitHour(fakeHour(24));
-  assert.equal(count(f.db,'compact_daily_address_stage',`WHERE day_start=${BASE}`),0);assert.equal(count(f.db,'compact_daily_address_hours',`WHERE day_start=${BASE}`),0);
-  assert.equal(archivedRows(f.db,'compact_daily_address_stage',BASE).length,24);assert.equal(archivedRows(f.db,'compact_daily_address_hours',BASE).length,24);f.db.close();
+  // Finalization keeps the stage through its canonical commit so packed readers can capture it first. Archive pruning
+  // still requires a prior committed copy; the next transaction may remove the originals.
+  assert.equal(count(f.db,'compact_daily_address_stage',`WHERE day_start=${BASE}`),24);
+  f.store.commitHour(fakeHour(25));
+  assert.equal(count(f.db,'compact_daily_address_stage',`WHERE day_start=${BASE}`),0);assert.equal(count(f.db,'compact_daily_address_hours',`WHERE day_start=${BASE}`),24);
+  assert.equal(archivedRows(f.db,'compact_daily_address_stage',BASE).length,24);f.db.close();
 });
 await test('20,000-address daily evidence remains lossless under the bounded writer heap and row budget',()=>{
   const db=new DatabaseSync(':memory:'),store=createCompactStore(db,{archive:options});
@@ -146,7 +150,7 @@ await test('20,000-address daily evidence remains lossless under the bounded wri
   assert.deepEqual(store.persistedActiveAddresses(BASE),identities.sort());db.close();
 });
 await test('DAU unavailable-status deletion path becomes nondestructive replay upgrade with permanent failure reason',()=>{
-  const f=fixture({archive:{config:archiveConfig({}),log:()=>{}}});for(let i=1;i<24;i++)f.store.commitHour(fakeHour(i));
+  const f=fixture({archive:{config:archiveConfig({}),log:()=>{}}});for(let i=1;i<24;i++)f.store.commitHour(fakeHour(i,{identities:[address(i+1)]}));
   f.db.exec('DELETE FROM compact_daily_active_addresses; DELETE FROM compact_daily_address_hours; DELETE FROM compact_daily_address_stage'); // disposable legacy gap
   insert(f.db,'compact_daily_active_addresses',{day_start:BASE,status:'unavailable',reason:'identity_not_captured',active_addresses:null});
   for(let i=0;i<24;i++)f.store.replayDailyActiveAddresses(BASE+i*3600,[address(i+1)]);

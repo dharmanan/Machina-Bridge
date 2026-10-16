@@ -2375,9 +2375,9 @@ function RefreshStatus({ data }: { data: ArcIntelligenceLoad | null }) {
   const failures = entries.filter(([, state]) => state?.error)
   const names = (retained: boolean) => failures.filter(([, state]) => Boolean(state?.retained) === retained).map(([section]) => READ_SECTION_LABELS[section])
   const earlier = names(true), missing = names(false)
-  const savedSnapshot = (section: ArcReadSection) => section === 'poolsV3' ? data?.pools?.v3?.snapshot
+  const savedSnapshot = (section: ArcReadSection) => section === 'summary' ? data?.summary?.snapshot : section === 'poolsV3' ? data?.pools?.v3?.snapshot
     : section === 'poolsV4' ? data?.pools?.v4?.snapshot : section === 'ecosystem' ? data?.ecosystem?.snapshot : undefined
-  const snapshotMetadata = data?.window === '30d' ? savedSnapshot('poolsV3') ?? savedSnapshot('poolsV4') ?? savedSnapshot('ecosystem') : null
+  const snapshotMetadata = data?.window === '30d' ? savedSnapshot('summary') ?? savedSnapshot('poolsV3') ?? savedSnapshot('poolsV4') ?? savedSnapshot('ecosystem') : null
   return <>
     {failures.length > 0 && <Banner tone="warn">
       Some parts could not be refreshed.
@@ -2429,7 +2429,7 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
     collectingNote: 'History is still being collected', pools: mode === 'ready' ? loaded?.pools ?? null : null,
     activity: mode === 'ready' ? loaded?.activity ?? null : null, ecosystem: mode === 'ready' ? loaded?.ecosystem ?? null : null, explorerUrl }
   const verifiedThrough = summary?.freshness.verifiedThrough ?? timeseries?.freshness.verifiedThrough ?? lastVerifiedThrough
-  const snapshots = [loaded?.pools?.v3?.snapshot, loaded?.pools?.v4?.snapshot, loaded?.ecosystem?.snapshot]
+  const snapshots = [loaded?.summary?.snapshot, loaded?.pools?.v3?.snapshot, loaded?.pools?.v4?.snapshot, loaded?.ecosystem?.snapshot]
     .filter((value) => value !== undefined)
   const snapshotThrough = snapshots.length ? snapshots.map(value => value.verifiedThrough).sort()[0] : null
   const snapshotDelayed = snapshots.some(value => value.status === 'stale')
@@ -2475,15 +2475,16 @@ export function ArcIntelligenceDashboard({ selectedWindow, data, refreshing = fa
       {coverage && <p data-history-coverage={coverage.status} className={`text-xs leading-5 ${snapshotDelayed ? 'text-amber-700' : 'text-slate-500'}`}>
         <strong>30D:</strong> {coverage.availableHours}/{coverage.expectedHours} verified hours ({coverage.completedUtcDays} complete days).
         {partialHistory ? ' Missing hours are excluded from totals.' : ' Full 30D coverage.'}
-        {snapshotDelayed && snapshotThrough && <> Saved Uniswap/Ecosystem data is delayed (through {formatUtcDateTime(snapshotThrough)}).</>}
+        {' '}Period: {formatUtcDateTime(coverage.start)} to {formatUtcDateTime(coverage.end)}.
+        {snapshotDelayed && snapshotThrough && <> Saved 30D data is delayed (through {formatUtcDateTime(snapshotThrough)}).</>}
       </p>}
       {networkCollecting && selectedWindow !== '30d' && (
         <Banner tone="info">History is still being collected{progress}. {windowLabel} totals appear once every hour of the window is verified; the {selectedWindow === '24h'
           ? 'hourly charts already show each verified hour' : 'daily charts already show each complete day'}.</Banner>
       )}
       {mode === 'ready' && summary?.freshness.stale && <Banner tone="warn">Updates are delayed. The latest verified hour is older than usual.</Banner>}
-      {selectedWindow === '30d' && loaded && !snapshotThrough && !loaded.pools?.v3 && !loaded.pools?.v4 && !loaded.ecosystem && <Banner tone="info">
-        No saved verified 30D Uniswap or Ecosystem results have loaded yet. These sections remain unavailable until a snapshot is ready.
+      {selectedWindow === '30d' && loaded && !snapshotThrough && !loaded.summary && !loaded.pools?.v3 && !loaded.pools?.v4 && !loaded.ecosystem && <Banner tone="info">
+        No saved verified 30D Summary, Uniswap or Ecosystem results have loaded yet. These sections remain unavailable until a snapshot is ready.
       </Banner>}
     </>
   )

@@ -95,9 +95,9 @@ if(process.argv[2]==='--probe'){
   db.exec('PRAGMA wal_checkpoint(TRUNCATE)');db.close();
   const model=createCompactReadModel({path,DatabaseSync}),snapshots=createDashboardSnapshotStore({path,verifyCheckpoint:cp=>model.snapshotCheckpointMatches(cp)});
   const runner=createSnapshotRunner({path,store:snapshots,readModel:model});
-  await test('unchanged 48/4 snapshot child prepares and persists all three 30D sections',async()=>{
+  await test('unchanged 48/4 snapshot child prepares and persists all four 30D sections',async()=>{
     assert.equal((await runner.run().done).exitCode,0);
-    const bundle=await snapshots.load();assert.ok(bundle.sections.v3&&bundle.sections.v4&&bundle.sections.ecosystem);
+    const bundle=await snapshots.load();assert.ok(bundle.sections.summary&&bundle.sections.v3&&bundle.sections.v4&&bundle.sections.ecosystem);
     assert.equal(JSON.parse(bundle.sections.v3.json).pools[0].swapCount,168);assert.equal(JSON.parse(bundle.sections.v4.json).pools[0].swapCount,336);
   });
   const digest=async p=>createHash('sha256').update(await fs.readFile(p)).digest('hex');
@@ -137,7 +137,7 @@ if(process.argv[2]==='--probe'){
       assert.equal((await localGet('/health')).status,200);
       for(const window of ['24h','7d','30d'])for(const kind of ['summary','timeseries']){
         const result=await localGet(`/v1/intelligence/${kind}?window=${window}`);assert.equal(result.status,200,log);
-        assert.deepEqual(result.body,JSON.parse(JSON.stringify(model[kind](window))));
+        assert.deepEqual(result.body,window==='30d'&&kind==='summary'?await snapshots.read('summary',model.snapshotIdentity()):JSON.parse(JSON.stringify(model[kind](window))));
       }
       for(const section of ['v3','v4','ecosystem']){
         const route=section==='ecosystem'?'/v1/intelligence/ecosystem?window=30d':`/v1/intelligence/pools?protocol=${section}&window=30d`;
