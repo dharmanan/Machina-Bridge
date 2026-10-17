@@ -125,13 +125,15 @@ test('the Borrow tab imports only read functions, the pure plan and the read-onl
   const names = (path) => (body.match(new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*'${path}'`))?.[1] ?? '').split(',').map((name) => name.trim()).filter(Boolean)
   const values = (path) => names(path).filter((name) => !name.startsWith('type ')).sort()
   assert.ok(names('../lib/mainnetBorrow').length > 0, 'imports the guarded Borrow boundary')
-  assert.deepEqual(values('../lib/mainnetBorrow'), ['detectAtomicBatchCapability', 'getBorrowLoans', 'getBorrowMarket', 'planBorrowWrite', 'prepareBorrowQuote', 'quoteMaxBorrow', 'quoteRequiredCollateral'])
-  assert.deepEqual(values('../lib/borrowWriteSafety'), ['borrowReadiness', 'borrowWalletSession', 'healthTargetMet', 'orderWriteChecks', 'unitsToDecimal'])
+  assert.deepEqual(values('../lib/mainnetBorrow'), ['detectAtomicBatchCapability', 'getBorrowLoans', 'getBorrowMarket', 'planBorrowWrite', 'prepareBorrowQuoteForTarget', 'quoteMaxBorrow', 'quoteRequiredCollateral', 'summarizeCapabilityAnswer'])
+  assert.deepEqual(values('../lib/borrowWriteSafety'), ['borrowAttemptScope', 'borrowReadiness', 'borrowWalletSession', 'explainAttempt', 'explainAttemptLog', 'healthTargetMet', 'orderWriteChecks', 'unitsToDecimal'])
+  assert.deepEqual(values('../lib/borrowAttemptLedger'), ['browserAttemptStorage', 'createPersistentAttemptLedger'], 'only the persistent ledger; never the in-memory one')
   assert.ok(!/borrow-kit/.test(body), 'the SDK is only reached through the guarded boundary')
   assert.ok(!/executeBorrowWrite|verifyBorrowWriteBoundary|createBorrowAttemptLedger|BorrowWriteClient|MAINNET_BORROW_WRITE/.test(body), 'no execution, boundary or attempt path')
   assert.ok(!/useWalletClient|useWriteContract|useSendTransaction|useSignMessage|useSignTypedData|useSwitchChain|walletClient|getAdapter|wallet_(?!getCapabilities)|eth_/.test(body.replace(/wallet_getCapabilities/g, '')), 'the only wallet request is the read-only capability question')
   assert.ok(!/signTypedData|sendTransaction|writeContract|approve\(|\.borrow\(|\.repay\(|\.closeLoan\(|\.addCollateral\(/.test(body))
-  assert.ok(!/localStorage|sessionStorage|document\.cookie/.test(body), 'no stored state, amounts or addresses')
+  assert.ok(!/localStorage|sessionStorage|document\.cookie|indexedDB/.test(body), 'the tab touches no storage itself: the attempt ledger module is the only place, and it saves attempts only')
+  assert.ok(!/[lL]edger\??\.(begin|finish|resolve|discard)\(/.test(body) && /attemptLedger \? attemptLedger\.list\(\)/.test(body), 'the tab only reads the attempt history; it never writes or clears it')
 })
 
 test('every action button in the Borrow tab is permanently disabled and has no handler', () => {
@@ -382,7 +384,7 @@ test('the tab shows the pair and short ID, flags facts only, and never ranks or 
   assert.ok(!/\.sort\(|\.toSorted\(|reduce\(\s*\(best/.test(body.replace(/\[\.\.\.[^\]]+\]\.sort/g, '')), 'the tab never reorders markets')
   assert.ok(!/best (rate|market)|recommended|safest|top pick|lowest (rate|apy)|highest (liquidity|apy)/i.test(body))
   assert.ok(tabSource.includes('The maximum sits at the liquidation threshold'))
-  assert.ok(tabSource.includes('Selected safety target not met') && tabSource.includes('does not prepare a transaction with different collateral'))
+  assert.ok(tabSource.includes('Selected safety target not met') && tabSource.replace(/\s+/g, ' ').includes('Machina does not lower your target or prepare a different borrow'))
   assert.ok(!tabSource.includes('Below your selected target') && !tabSource.includes('It is not an error'), 'the gap is no longer presented as harmless')
 })
 
@@ -442,6 +444,16 @@ test('the screen separates the current loan from the new estimate, stays short, 
   assert.ok(body.includes('Show {label}') && body.includes('Hide {label}') && body.includes('label="technical checks"') && body.includes('label="estimate details"') && body.includes('label="optional collateral comparison"'))
   assert.ok(body.includes('Market details'))
   assert.ok(!/RiskChecks|Risk summary|Show risk checks/.test(body), 'the old risk card is replaced by Transaction Readiness')
+
+  // Wallet compatibility, in the words a person needs; anything but "supported" is not suitable.
+  for (const label of ['Atomic transactions supported', 'Not supported', 'Could not verify']) assert.ok(body.includes(`label: '${label}'`), label)
+  assert.ok(body.includes('(not suitable for Borrow)') && body.includes('data-borrow-wallet-compat') && body.includes('wallet check details'))
+  assert.ok(body.includes('Machina asked your wallet one read-only question'), 'the details say what the wallet was asked')
+  // Why nothing can continue after an unresolved attempt, in the card itself.
+  assert.ok(body.includes('data-borrow-history-note') && body.includes('explainAttempt(') && body.includes('explainAttemptLog('))
+  // Only a real quote for the wallet is the estimate; Circle's sizing preview is reference only.
+  assert.ok(!/sizedOnly/.test(body) && body.includes('Reference only') && body.includes('not a quote for a transaction and nothing can be sent with it'))
+  assert.ok(body.includes('Connect a wallet to get a quote') && body.includes('Includes a ${bufferPercent} collateral buffer to reach your target'))
 })
 
 console.log(`\nBorrow preview checks: ${passed} passed`)

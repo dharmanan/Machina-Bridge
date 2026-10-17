@@ -5,6 +5,7 @@ import {
   MAINNET_BORROW_HIGH_UTILIZATION,
   MAINNET_BORROW_MAX_EVIDENCE_AGE_MS,
   MAINNET_BORROW_MAX_LTV,
+  MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS,
   MAINNET_BORROW_MAX_SLIPPAGE_BPS,
   MAINNET_BORROW_NATIVE_BACKED_TOKEN,
   MAINNET_BORROW_NATIVE_DECIMALS,
@@ -96,6 +97,7 @@ export type BorrowWriteBlocker =
   | 'insufficient_balance'
   | 'insufficient_gas_balance'
   | 'attempt_unresolved'
+  | 'attempt_store_unreliable'
   | 'not_confirmed'
   | 'wallet_changed'
   | 'quote_changed'
@@ -145,10 +147,16 @@ export type BorrowWriteEvidence = {
   targetHealthFactor: number | null
 }
 
-export type BorrowAttemptStatus = 'in-flight' | 'submitted' | 'failed' | 'confirmed'
+// 'interrupted': the page was closed or reloaded while the write was being sent, so whether it reached the chain is not known.
+export type BorrowAttemptStatus = 'in-flight' | 'submitted' | 'interrupted' | 'failed' | 'confirmed'
 
 export type BorrowAttemptRecord = {
+  // One unresolved attempt per wallet, network and market or loan: a second write on the same target waits for the first,
+  // whatever its amount, slippage or kind (see borrowAttemptScope).
+  scopeId: string
+  // The exact action that was attempted (amount and slippage included), for explaining it.
   actionId: string
+  kind: BorrowWriteAction['kind']
   status: BorrowAttemptStatus
   idempotencyKey: string
   startedAt: number
@@ -170,12 +178,22 @@ export type WriteCheck = {
   text: string
 }
 
+// Whether the attempt history can be trusted. It must be saved across reloads and readable: if it is not, an earlier send cannot
+// be ruled out, so nothing is prepared.
+export type AttemptLogHealth = {
+  ok: boolean
+  persistent: boolean
+  reason: 'storage_unavailable' | 'records_unreadable' | 'storage_write_failed' | null
+}
+
 export type WriteSafetyInput = {
   action: BorrowWriteAction
   wallet: BorrowWalletState | null
   quote: PreparedBorrowQuote | null
   evidence: BorrowWriteEvidence | null
   attempts: readonly BorrowAttemptRecord[]
+  // null: the history was not provided, which is treated as not trustworthy.
+  attemptLog: AttemptLogHealth | null
   now: number
   // The SDK's own Arc definition: its chain ID and Borrow Adapter address.
   chain: { chainId: number | null; adapter: string | null }
@@ -183,6 +201,7 @@ export type WriteSafetyInput = {
 
 export type WriteSafetyReport = {
   actionId: string
+  scopeId: string
   owner: Hex | null
   walletRequests: BorrowWalletRequest[]
   checks: WriteCheck[]
@@ -328,6 +347,42 @@ export function borrowActionId(action: BorrowWriteAction, owner: string | null):
   return [action.kind, MAINNET_BORROW_CHAIN_ID, owner?.toLowerCase() ?? '', target.toLowerCase(), borrowActionAmount(action), slippage === null ? 'none' : String(slippage)].join('|')
 }
 
+// What an unresolved attempt blocks: any write on the same market (first borrow) or loan (everything else) for the same wallet and
+// network, not only an identical one. A second borrow with another amount or buffer, or a repay while the first outcome is
+// unknown, is no safer than the same one twice.
+export function borrowAttemptScope(action: BorrowWriteAction, owner: string | null): string {
+  if (!borrowActionIsValid(action) || !owner || !isAddress(owner)) return ''
+  const target = action.kind === 'borrow' ? action.marketId : action.loanId
+  return [MAINNET_BORROW_CHAIN_ID, owner.toLowerCase(), target.toLowerCase()].join('|')
+}
+
+// Plain words for an unresolved attempt: why nothing more is sent on this market or loan.
+export function explainAttempt(record: BorrowAttemptRecord, sameAction: boolean, target: 'market' | 'loan'): string {
+  const earlier = sameAction ? 'This action' : `An earlier ${record.kind} on this ${target}`
+  switch (record.status) {
+    case 'in-flight':
+      return `${earlier} is already being sent from this page. Nothing else is sent on this ${target} meanwhile.`
+    case 'interrupted':
+      return `${earlier} was being sent when the page was closed or reloaded. Whether it reached the chain is not known, so nothing is sent on this ${target} until you have checked the loan and confirmed.`
+    case 'submitted':
+      return `${earlier} was submitted and its outcome is not known yet. Nothing is sent on this ${target} until it is settled, the position has been read again and you have confirmed.`
+    case 'confirmed':
+      return `${earlier} already went through. Read the position again and confirm before preparing another on this ${target}.`
+    default:
+      return `${earlier} failed and may still have reached the chain. Nothing is sent on this ${target} until the position has been read again and you have confirmed.`
+  }
+}
+
+// Plain words for the state of the attempt history itself.
+export function explainAttemptLog(log: AttemptLogHealth | null): string {
+  if (log !== null && log.ok && log.persistent) return 'Attempts are recorded in this browser and survive a reload. They do not cover other devices or cleared browser data.'
+  if (log === null) return 'The attempt history was not checked, so an earlier send cannot be ruled out.'
+  if (!log.persistent) return 'The attempt history is not saved across reloads, so an earlier send cannot be ruled out after one.'
+  if (log.reason === 'storage_unavailable') return "This browser's storage is not available, so an earlier send cannot be ruled out after a reload."
+  if (log.reason === 'storage_write_failed') return "This browser's storage refused the last write, so the attempt history may be out of date."
+  return 'The saved attempt history could not be read, so an earlier send cannot be ruled out. It is not cleared automatically.'
+}
+
 // Does this action add new debt? Only those are held to the new-borrow limits.
 const addsDebt = (action: BorrowWriteAction) => action.kind === 'borrow' || action.kind === 'borrow-more'
 const usesOracle = (action: BorrowWriteAction) => addsDebt(action) || action.kind === 'withdraw-collateral'
@@ -351,7 +406,7 @@ export function borrowQuoteGasWei(quote: BorrowQuote | null): bigint | null {
 }
 
 export function evaluateBorrowWriteSafety(input: WriteSafetyInput): WriteSafetyReport {
-  const { action, wallet, quote: prepared, evidence, attempts, now, chain } = input
+  const { action, wallet, quote: prepared, evidence, attempts, attemptLog, now, chain } = input
   const checks: WriteCheck[] = []
   const add = (id: string, blocker: BorrowWriteBlocker | null, status: WriteCheckStatus, text: string) => { checks.push({ id, blocker, status, text }) }
   const ageOf = (at: number) => now - at
@@ -373,9 +428,9 @@ export function evaluateBorrowWriteSafety(input: WriteSafetyInput): WriteSafetyR
     wallet?.chainId === MAINNET_BORROW_CHAIN_ID ? `The wallet is on Arc mainnet (chain ${MAINNET_BORROW_CHAIN_ID}).` : `The wallet must be on Arc mainnet (chain ${MAINNET_BORROW_CHAIN_ID}).`)
   const capability = wallet?.atomicBatch ?? 'unknown'
   add('wallet-capability', 'wallet_capability_missing', capability === 'supported' ? 'pass' : capability === 'unsupported' ? 'fail' : 'unknown',
-    capability === 'supported' ? 'The wallet reports atomic batch support (EIP-5792) on Arc.'
-      : capability === 'unsupported' ? 'This wallet does not report atomic batch support (EIP-5792) on Arc, so it cannot run a Borrow transaction. Machina does not fall back to separate approval and borrow transactions.'
-        : 'The wallet has not reported whether it supports atomic batches (EIP-5792) on Arc.')
+    capability === 'supported' ? 'Atomic transactions supported: the wallet reports EIP-5792 atomic batch support on Arc.'
+      : capability === 'unsupported' ? 'Not supported: this wallet does not report atomic batch support (EIP-5792) on Arc, so it cannot run a Borrow transaction. Machina does not fall back to separate approval and borrow transactions.'
+        : 'Could not verify: the wallet did not give a usable answer about atomic batch support (EIP-5792) on Arc, so it is treated as not suitable.')
   const sessionOk = session !== null && wallet?.atomicBatchFor === session && (!evidence || evidence.session === session)
   if (owner && wallet?.chainId === MAINNET_BORROW_CHAIN_ID) {
     add('wallet-session', 'stale_wallet_session', sessionOk ? 'pass' : 'unknown',
@@ -390,22 +445,29 @@ export function evaluateBorrowWriteSafety(input: WriteSafetyInput): WriteSafetyR
     adapterOk ? `Approvals and the batch go to the Circle Borrow Adapter ${MAINNET_BORROW_ADAPTER_CONTRACT} on chain ${MAINNET_BORROW_CHAIN_ID} only.`
       : 'The Borrow Kit chain definition does not match the Arc chain and Borrow Adapter address Machina pins, so nothing would be approved or sent.')
 
-  // 4. Slippage.
+  // 4. Slippage. For new debt it is the collateral buffer Circle adds to the collateral it sizes; elsewhere it only sets repayment headroom.
   const slippage = valid ? effectiveSlippageBps(action) : null
+  const buffer = valid && (action.kind === 'borrow' || action.kind === 'borrow-more')
+  const cap = buffer ? MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS : MAINNET_BORROW_MAX_SLIPPAGE_BPS
+  const name = buffer ? 'Collateral buffer' : 'Slippage bound'
   if (!valid || slippage === null) add('slippage', 'slippage_invalid', 'not-applicable', 'This action takes no slippage bound.')
-  else if (slippage > MAINNET_BORROW_MAX_SLIPPAGE_BPS) {
-    add('slippage', 'slippage_invalid', 'fail', `Slippage ${(slippage / 100).toFixed(2)}% is above the ${(MAINNET_BORROW_MAX_SLIPPAGE_BPS / 100).toFixed(2)}% Machina allows.`)
-  } else add('slippage', 'slippage_invalid', 'pass', `Slippage bound ${(slippage / 100).toFixed(2)}%${action.kind !== 'repay' && action.kind !== 'add-collateral' && action.slippageBps === undefined ? ' (service default)' : ''}.`)
+  else if (slippage > cap) {
+    add('slippage', 'slippage_invalid', 'fail', `${name} ${(slippage / 100).toFixed(2)}% is above the ${(cap / 100).toFixed(2)}% Machina allows.`)
+  } else {
+    const how = action.kind !== 'repay' && action.kind !== 'add-collateral' && action.slippageBps === undefined ? ' (service default)'
+      : buffer ? " (Circle's slippage setting, which adds this much to the collateral it sizes)" : ''
+    add('slippage', 'slippage_invalid', 'pass', `${name} ${(slippage / 100).toFixed(2)}%${how}.`)
+  }
 
-  // 5. Previous attempts of this very action are never repeated blindly.
+  // 5. Earlier attempts on the same market or loan are never repeated blindly, and the history that says so must be trustworthy.
   const actionId = borrowActionId(action, owner)
-  const previous = actionId ? attempts.find((attempt) => attempt.actionId === actionId) : undefined
+  const scopeId = borrowAttemptScope(action, owner)
+  const previous = scopeId ? attempts.find((attempt) => attempt.scopeId === scopeId) : undefined
+  const target = valid && action.kind === 'borrow' ? 'market' : 'loan'
   add('attempt', 'attempt_unresolved', previous ? 'fail' : 'pass',
-    previous ? previous.status === 'in-flight' ? 'This action is already being sent. It is not sent twice.'
-      : previous.status === 'submitted' ? 'This action was submitted and its outcome is not known yet. It is not sent again until the position has been read again.'
-        : previous.status === 'confirmed' ? 'This action already went through. Read the position again before preparing another.'
-          : 'This action failed and may still have reached the chain. It is not sent again until the position has been read again.'
-      : 'No earlier attempt of this action is unresolved.')
+    previous ? explainAttempt(previous, previous.actionId === actionId, target) : `No unresolved earlier attempt on this ${target} is recorded in this browser.`)
+  const logOk = attemptLog !== null && attemptLog.ok && attemptLog.persistent
+  add('attempt-log', 'attempt_store_unreliable', logOk ? 'pass' : 'unknown', explainAttemptLog(attemptLog))
 
   if (!evidence) {
     add('evidence', 'evidence_missing', 'unknown', 'The market, position and wallet reads this transaction depends on are not available.')
@@ -566,6 +628,7 @@ export function evaluateBorrowWriteSafety(input: WriteSafetyInput): WriteSafetyR
   function finish(): WriteSafetyReport {
     return {
       actionId,
+      scopeId,
       owner,
       walletRequests: valid ? WALLET_REQUESTS[action.kind] : [],
       checks,
@@ -822,7 +885,8 @@ export const WRITE_BLOCKER_TEXT: Record<BorrowWriteBlocker, string> = {
   balance_unknown: 'The wallet balance is not known.',
   insufficient_balance: 'The wallet does not hold enough tokens.',
   insufficient_gas_balance: 'The wallet does not hold enough for gas.',
-  attempt_unresolved: 'An earlier attempt of this action is unresolved.',
+  attempt_unresolved: 'An earlier attempt on this market or loan is unresolved.',
+  attempt_store_unreliable: 'The attempt history cannot be trusted, so an earlier send cannot be ruled out.',
   not_confirmed: 'The action was not confirmed by the user.',
   wallet_changed: 'The wallet that would sign is not the wallet this action was prepared for.',
   quote_changed: 'The quote changed after it was reviewed.',
@@ -881,45 +945,4 @@ export function describeBorrowWrite(action: BorrowWriteAction, quote: BorrowQuot
 
 function totalGasWei0(quote: BorrowQuote | null): bigint | null {
   return quote ? totalGasWei(quote) : null
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Attempts: a write whose outcome is unknown, failed or done is never sent again on the same terms
-
-export type BorrowAttemptLedger = {
-  list(): BorrowAttemptRecord[]
-  get(actionId: string): BorrowAttemptRecord | null
-  // Registers an attempt synchronously. False when one already exists, so two clicks cannot both go ahead.
-  begin(actionId: string, idempotencyKey: string, now: number): boolean
-  // Removes an attempt that provably never reached the SDK (the adapter could not be built or belongs to another wallet).
-  discard(actionId: string): void
-  finish(actionId: string, status: Exclude<BorrowAttemptStatus, 'in-flight'>, now: number, detail?: { batchId?: string; txHash?: string; errorCode?: string }): void
-  // Clears an unresolved attempt once the position has been read again after it. Returns whether it cleared.
-  resolve(actionId: string, positionReadAt: number): boolean
-}
-
-export function createBorrowAttemptLedger(): BorrowAttemptLedger {
-  const records = new Map<string, BorrowAttemptRecord>()
-  return {
-    list: () => [...records.values()].map((record) => ({ ...record })),
-    get: (actionId) => (records.has(actionId) ? { ...(records.get(actionId) as BorrowAttemptRecord) } : null),
-    begin(actionId, idempotencyKey, now) {
-      if (!actionId || records.has(actionId)) return false
-      records.set(actionId, { actionId, status: 'in-flight', idempotencyKey, startedAt: now, updatedAt: now })
-      return true
-    },
-    discard(actionId) {
-      if (records.get(actionId)?.status === 'in-flight') records.delete(actionId)
-    },
-    finish(actionId, status, now, detail = {}) {
-      const record = records.get(actionId)
-      if (record) records.set(actionId, { ...record, ...detail, status, updatedAt: now })
-    },
-    resolve(actionId, positionReadAt) {
-      const record = records.get(actionId)
-      if (!record || record.status === 'in-flight' || !(positionReadAt > record.updatedAt)) return false
-      records.delete(actionId)
-      return true
-    },
-  }
 }

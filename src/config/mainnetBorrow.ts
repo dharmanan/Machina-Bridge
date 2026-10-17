@@ -42,8 +42,13 @@ export const MAINNET_BORROW_HIGH_UTILIZATION = 0.9
 // A quote, position, market read, on-chain check or wallet balance older than this is not used to prepare a transaction. The
 // Borrow Service gives no quote expiry of its own, so this is Machina's own bound.
 export const MAINNET_BORROW_MAX_EVIDENCE_AGE_MS = 60_000
-// Highest slippage bound Machina would pass for service-sized legs. The SDK default (300) sits below it.
+// Highest slippage bound Machina would pass for Repay-side legs: Withdraw collateral and Close loan, where it only sets how much
+// repayment headroom the wallet must cover. The SDK default (300) sits below it.
 export const MAINNET_BORROW_MAX_SLIPPAGE_BPS = 500
+// For Borrow and Borrow more the service adds this setting to the collateral it sizes (a "drift buffer": at 0 it sizes the exact base
+// collateral, at 300 it adds 3%), so it is how a quote reaches a higher Health Factor. It can only add collateral, never reduce it, and
+// the Health Factor, LTV and wallet balance checks still apply to the quote it produces. 10 000 is the SDK's own maximum.
+export const MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS = 10_000
 // Arc's native gas currency is USDC with 18 decimals (see MAINNET_ARC_NATIVE_CURRENCY). Its ERC-20 interface is this
 // token. A wallet that pays gas and a loan in USDC is checked for both together.
 export const MAINNET_BORROW_NATIVE_DECIMALS = 18

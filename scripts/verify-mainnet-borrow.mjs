@@ -463,6 +463,7 @@ const PUBLIC_EXPORTS = [
   'normalizeBorrowQuote',
   'planBorrowWrite',
   'prepareBorrowQuote',
+  'prepareBorrowQuoteForTarget',
   'quoteAddCollateral',
   'quoteBorrow',
   'quoteCloseLoan',
@@ -470,6 +471,7 @@ const PUBLIC_EXPORTS = [
   'quoteRepay',
   'quoteRequiredCollateral',
   'quoteWithdrawCollateral',
+  'summarizeCapabilityAnswer',
   'toBorrowError',
   'verifyBorrowWriteBoundary',
 ]
@@ -735,6 +737,7 @@ await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reach
       'src/components/ArcIntelligenceOverview.tsx',
       'src/components/MainnetBorrow.tsx',
       'src/lib/arcIntelligence.ts',
+      'src/lib/borrowAttemptLedger.ts',
       'src/lib/borrowMarketVerification.ts',
       'src/lib/borrowPreview.ts',
       'src/lib/borrowWalletBalances.ts',
