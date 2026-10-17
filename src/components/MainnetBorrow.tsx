@@ -25,11 +25,9 @@ import {
 } from '../lib/arcIntelligence'
 import {
   compareDecimals,
-  compareHealthFactor,
   describeBorrowError,
   describeVerificationReason,
   displayDigits,
-  evaluateBorrowRisk,
   formatHealthFactor,
   formatOraclePrice,
   formatUnitsText,
@@ -43,18 +41,32 @@ import {
   parsePositiveAmount,
   sanitizeDecimalInput,
   smallestShown,
-  summarizeRisk,
   thresholdStatus,
   totalGasWei,
   type HealthTone,
-  type Reading,
-  type RiskReport,
-  type RiskStatus,
 } from '../lib/borrowPreview'
 import { createViemMarketReader, verifyBorrowMarket, type MarketChainReader, type MarketVerification } from '../lib/borrowMarketVerification'
+import { createViemBalanceReader, type WalletBalanceReader, type WalletBalances } from '../lib/borrowWalletBalances'
 import {
+  borrowReadiness,
+  borrowWalletSession,
+  healthTargetMet,
+  orderWriteChecks,
+  unitsToDecimal,
+  type BorrowWalletCapability,
+  type BorrowWalletState,
+  type BorrowWriteAction,
+  type BorrowWriteEvidence,
+  type PreparedBorrowQuote,
+  type WriteCheck,
+  type WriteCheckStatus,
+} from '../lib/borrowWriteSafety'
+import {
+  detectAtomicBatchCapability,
   getBorrowLoans,
-  quoteBorrow,
+  getBorrowMarket,
+  planBorrowWrite,
+  prepareBorrowQuote,
   quoteMaxBorrow,
   quoteRequiredCollateral,
   type BorrowAmount,
@@ -65,29 +77,39 @@ import {
   type BorrowPosition,
   type BorrowQuote,
   type BorrowReadClient,
+  type Eip1193Request,
 } from '../lib/mainnetBorrow'
-import { MAINNET_BORROW_HIGH_UTILIZATION, MAINNET_BORROW_MAX_LTV } from '../config/mainnetBorrow'
+import { MAINNET_BORROW_CHAIN_ID, MAINNET_BORROW_HIGH_UTILIZATION, MAINNET_BORROW_MAX_EVIDENCE_AGE_MS } from '../config/mainnetBorrow'
 import { MAINNET_CONFIG } from '../config/mainnet'
 import { MAINNET_ARC_NATIVE_CURRENCY } from '../config/mainnetNetworks'
 import { Container } from './ui'
 
-// Borrow tab (Mainnet), read only. Every number comes from the guarded Borrow Kit reads in src/lib/mainnetBorrow.ts, the
-// same-origin market proxy or Morpho Blue on-chain (view calls); a missing value is shown as "Not reported", never
-// estimated. This module imports no write path (executeBorrowWrite, planBorrowWrite, wallet capability probes): it cannot
-// sign, approve or send anything, and its only action buttons are permanently disabled.
+// Borrow tab (Mainnet), preview only. Every number comes from the guarded Borrow Kit reads in src/lib/mainnetBorrow.ts, the
+// same-origin market proxy or Morpho Blue and the wallet's token balances on-chain (view calls); a missing value is shown as
+// "Not reported" or "Unavailable", never estimated. The Transaction Readiness card runs the same shared safety checks the
+// write boundary runs (planBorrowWrite), but nothing here can send anything: this module never imports executeBorrowWrite,
+// verifyBorrowWriteBoundary or a wallet adapter, and its only action button is permanently disabled. The wallet is asked one
+// read-only question (wallet_getCapabilities); it is never asked to sign, approve or send.
 
 const TARGET_HEALTH_FACTORS = [1.25, 1.5, 2] as const
 const POSITIONS_PAGE_SIZE = 20
 const DEBOUNCE_MS = 450
+const CLOCK_TICK_MS = 5_000
 
 const UNEXPECTED: BorrowAvailability<never> = { status: 'unavailable', error: { code: 'unexpected_error', retryable: false } }
 
-type Query<T> = { status: 'idle' } | { status: 'loading' } | BorrowAvailability<T>
+// `at` is when the read started, so a slow answer is never made to look younger than it is.
+type Stamped = { at: number }
+type Query<T> = { status: 'idle' } | { status: 'loading' } | (BorrowAvailability<T> & Stamped)
 type IconType = typeof Clock
 
 let chainReader: MarketChainReader | null = null
 // Public Arc RPC view calls only; one reader (and its chain ID check) is shared by every market check.
 const defaultVerifyMarket = (market: BorrowMarket) => verifyBorrowMarket(market, (chainReader ??= createViemMarketReader(MAINNET_CONFIG.arcRpcUrl)))
+
+let balanceReader: WalletBalanceReader | null = null
+const defaultReadBalances: WalletBalanceReader = (owner, loanToken, collateralToken) =>
+  (balanceReader ??= createViemBalanceReader(MAINNET_CONFIG.arcRpcUrl))(owner, loanToken, collateralToken)
 
 const shortAddress = (value: string) => (value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value)
 
@@ -100,17 +122,28 @@ function useDebounced<T>(value: T, ms = DEBOUNCE_MS): T {
   return debounced
 }
 
+// Ticks, so a read that has aged past its limit stops counting as ready without waiting for a click.
+function useNow(ms = CLOCK_TICK_MS): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), ms)
+    return () => clearInterval(timer)
+  }, [ms])
+  return now
+}
+
 // One read keyed by its inputs. A null key is idle; a result for an older key is never shown for the current one.
 function useBorrowRead<T>(key: string | null, load: () => Promise<BorrowAvailability<T>>): Query<T> {
-  const [settled, setSettled] = useState<{ key: string; result: BorrowAvailability<T> } | null>(null)
+  const [settled, setSettled] = useState<{ key: string; result: BorrowAvailability<T> & Stamped } | null>(null)
   const loadRef = useRef(load)
   loadRef.current = load
   useEffect(() => {
     if (key === null) return undefined
     let live = true
+    const at = Date.now()
     loadRef.current().then(
-      (result) => { if (live) setSettled({ key, result }) },
-      () => { if (live) setSettled({ key, result: UNEXPECTED }) },
+      (result) => { if (live) setSettled({ key, result: { ...result, at } }) },
+      () => { if (live) setSettled({ key, result: { ...UNEXPECTED, at } }) },
     )
     return () => { live = false }
   }, [key])
@@ -147,6 +180,80 @@ function usePositions(walletAddress: string | null, client: BorrowReadClient | u
     moreError: current?.error ?? null,
     loadMore,
   }
+}
+
+type Positions = ReturnType<typeof usePositions>
+
+// The wallet as the safety checks see it. The atomic batch answer is tied to the address and network it was read for: a
+// different wallet or network is a different session, and the old answer (and every read made for it) no longer counts.
+function useWalletState(address: string | null, chainId: number | null, requestWallet: Eip1193Request | undefined): { session: string | null; state: BorrowWalletState | null } {
+  const session = borrowWalletSession(address, chainId)
+  const [answer, setAnswer] = useState<{ session: string; value: BorrowWalletCapability } | null>(null)
+  const requestRef = useRef(requestWallet)
+  requestRef.current = requestWallet
+  const hasRequest = requestWallet !== undefined
+  useEffect(() => {
+    const request = requestRef.current
+    if (!address || !session || chainId !== MAINNET_BORROW_CHAIN_ID || !request) return undefined
+    let live = true
+    detectAtomicBatchCapability(request, address).then(
+      (value) => { if (live) setAnswer({ session, value }) },
+      () => { if (live) setAnswer({ session, value: 'unknown' }) },
+    )
+    return () => { live = false }
+  }, [address, chainId, session, hasRequest])
+  const current = answer && answer.session === session ? answer : null
+  if (!address) return { session, state: null }
+  return { session, state: { address, chainId, atomicBatch: current ? current.value : 'unknown', atomicBatchFor: current ? current.session : null } }
+}
+
+// The wallet's real token balances for the selected market, read on-chain. Separate from the collateral a user may type.
+function useWalletBalances(owner: string | null, session: string | null, market: BorrowMarket | null, readBalances: WalletBalanceReader | undefined, refresh: number): Query<WalletBalances> {
+  const key = owner && market ? `balances:${session ?? 'none'}:${owner.toLowerCase()}:${market.marketId}:${refresh}` : null
+  const readRef = useRef(readBalances)
+  readRef.current = readBalances
+  return useBorrowRead<WalletBalances>(key, async () => {
+    if (!owner || !market) return UNEXPECTED
+    try {
+      return { status: 'available', data: await (readRef.current ?? defaultReadBalances)(owner, market.loanAsset.address, market.collateralAsset.address) }
+    } catch {
+      return UNEXPECTED
+    }
+  })
+}
+
+type BorrowReads = {
+  // null when no quote can be asked for (a new loan needs a wallet).
+  quote: BorrowAvailability<PreparedBorrowQuote> | null
+  market: BorrowAvailability<BorrowMarket> & Stamped
+  verification: { result: MarketVerification; at: number } | null
+}
+
+// The reads a borrow transaction would depend on, taken fresh for this exact action: the wallet-bound quote, the market
+// itself and its on-chain check. Nothing is reused from the market list.
+function useBorrowReads(action: BorrowWriteAction | null, marketId: string | null, walletAddress: string | null, session: string | null, client: BorrowReadClient | undefined,
+  verifyMarket: ((market: BorrowMarket) => Promise<MarketVerification>) | undefined, refresh: number): Query<BorrowReads> {
+  const key = action && marketId ? `reads:${session ?? 'none'}:${JSON.stringify(action)}:${refresh}` : null
+  const verifyRef = useRef(verifyMarket)
+  verifyRef.current = verifyMarket
+  return useBorrowRead<BorrowReads>(key, async () => {
+    if (!action || !marketId) return UNEXPECTED
+    const marketAt = Date.now()
+    const [quote, market] = await Promise.all([
+      walletAddress || action.kind !== 'borrow' ? prepareBorrowQuote(action, walletAddress, client) : Promise.resolve(null),
+      getBorrowMarket(marketId, client),
+    ])
+    let verification: BorrowReads['verification'] = null
+    if (market.status === 'available') {
+      const at = Date.now()
+      try {
+        verification = { result: await (verifyRef.current ?? defaultVerifyMarket)(market.data), at }
+      } catch {
+        verification = { result: { status: 'unavailable' }, at }
+      }
+    }
+    return { status: 'available', data: { quote, market: { ...market, at: marketAt }, verification } }
+  })
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -488,29 +595,12 @@ function quoteOf<K extends BorrowQuote['kind']>(query: Query<BorrowQuote>, kind:
   return query.status === 'available' && query.data.kind === kind ? (query.data as Extract<BorrowQuote, { kind: K }>) : null
 }
 
-// A read for the risk checks: its value, null when the read failed, 'pending' while it is idle or loading.
-function reading<T>(query: Query<BorrowQuote>, pick: (quote: BorrowQuote) => T | null): Reading<T> {
-  if (query.status === 'available') return pick(query.data)
-  return query.status === 'unavailable' ? null : 'pending'
-}
-
 function QueryState({ query, idle, onRetry }: { query: Query<BorrowQuote>; idle: string; onRetry?: () => void }) {
   if (query.status === 'idle') return <p className="text-xs leading-5 text-slate-400">{idle}</p>
   if (query.status === 'loading') return <LoadingBars rows={3} />
   if (query.status === 'unavailable') return <ReadFailure error={query.error} onRetry={onRetry} />
   return null
 }
-
-const RISK_STYLE: Record<RiskStatus, { icon: IconType; className: string; label: string }> = {
-  pass: { icon: CheckCircle2, className: 'text-emerald-600', label: 'Pass' },
-  warn: { icon: AlertTriangle, className: 'text-amber-600', label: 'Warning' },
-  fail: { icon: XCircle, className: 'text-red-600', label: 'Fail' },
-  unknown: { icon: HelpCircle, className: 'text-red-600', label: 'Cannot be evaluated' },
-  pending: { icon: Clock, className: 'text-slate-400', label: 'Waiting' },
-  skipped: { icon: MinusCircle, className: 'text-slate-400', label: 'Not applicable' },
-}
-
-const SUMMARY_CLASS = { fail: 'text-red-700', warn: 'text-amber-700', pending: 'text-slate-500', pass: 'text-emerald-700' } as const
 
 // Toggle text for a native <details>: "Show ..." while closed, "Hide ..." while open.
 function ToggleSummary({ label }: { label: string }) {
@@ -522,35 +612,87 @@ function ToggleSummary({ label }: { label: string }) {
   )
 }
 
-// One short summary on the main screen; the individual checks stay behind "Show risk checks".
-function RiskChecks({ report }: { report: RiskReport }) {
-  if (report.checks.length === 0) return null
-  const summary = summarizeRisk(report)
+// ---------------------------------------------------------------------------------------------------------------------
+// Transaction readiness
+
+const CHECK_STYLE: Record<WriteCheckStatus, { icon: IconType; className: string; label: string }> = {
+  'pass': { icon: CheckCircle2, className: 'text-emerald-600', label: 'Pass' },
+  'warn': { icon: AlertTriangle, className: 'text-amber-600', label: 'Warning' },
+  'fail': { icon: XCircle, className: 'text-red-600', label: 'Blocked' },
+  'unknown': { icon: HelpCircle, className: 'text-amber-600', label: 'Unavailable' },
+  'not-applicable': { icon: MinusCircle, className: 'text-slate-400', label: 'Not applicable' },
+}
+
+const READINESS_CHIP = {
+  ready: { label: 'Ready for review', className: 'border-emerald-200 bg-emerald-50 text-emerald-800' },
+  blocked: { label: 'Blocked', className: 'border-red-200 bg-red-50 text-red-700' },
+  unavailable: { label: 'Unavailable', className: 'border-amber-200 bg-amber-50 text-amber-800' },
+  checking: { label: 'Checking', className: 'border-slate-200 bg-slate-50 text-slate-600' },
+} as const
+
+type ReadinessView =
+  | { kind: 'idle'; text: string }
+  | { kind: 'checking' }
+  | { kind: 'result'; title: string; checks: WriteCheck[]; requests: string[]; quoteAgeSeconds: number | null }
+
+// What the wallet would be asked for if transactions were enabled. Only the kinds of request, never an amount or a prompt.
+function requestsSentence(requests: readonly string[]): string {
+  const parts = [
+    requests.some((request) => request.endsWith('approval-if-short') || request === 'allowance-reset-if-partial')
+      ? 'an exact token approval to the Circle Borrow Adapter only, when your allowance is short' : null,
+    requests.includes('morpho-authorization-grant') ? 'a temporary Morpho authorization, revoked in the same batch' : null,
+    'one atomic batch',
+  ].filter(Boolean)
+  return `If transactions were enabled, your wallet would be asked for ${parts.join(', ')}. Machina never falls back to separate transactions.`
+}
+
+function ReadinessCard({ view, bump }: { view: ReadinessView; bump: () => void }) {
+  const readiness = view.kind === 'result' ? borrowReadiness(view.checks) : null
+  const chip = view.kind === 'checking' ? READINESS_CHIP.checking : readiness ? READINESS_CHIP[readiness.status] : null
+  // Without a wallet every wallet-bound check is waiting too; "+N more" would only repeat "Connect a wallet".
+  const extra = readiness && readiness.reasonId !== 'wallet' ? Math.max(0, (readiness.status === 'blocked' ? readiness.failed : readiness.unavailable) - 1) : 0
+  const reason = view.kind === 'idle' ? view.text
+    : view.kind === 'checking' ? 'Reading the quote, the market, your wallet and your loans.'
+      : readiness?.status === 'ready' ? `All checks pass for this ${view.title.toLowerCase()}.${readiness.warnings > 0 ? ` ${readiness.warnings} warning${readiness.warnings === 1 ? '' : 's'}.` : ''}`
+        : `${readiness?.reason ?? ''}${extra > 0 ? ` (+${extra} more)` : ''}`
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4" data-borrow-risk>
-      <h3 className="text-sm font-semibold text-slate-900">Risk summary</h3>
-      <p className={`mt-1 text-xs font-semibold ${SUMMARY_CLASS[summary.tone]}`} data-risk-summary>{summary.text}</p>
-      <details className="group mt-2" data-borrow-risk-details>
-        <ToggleSummary label="risk checks" />
-        <p className="mb-2 mt-2 text-[11px] leading-4 text-slate-500">
-          Limits Machina would apply to a future borrow: {formatRatioPercent(MAINNET_BORROW_MAX_LTV)} loan-to-value and a {formatRatioPercent(MAINNET_BORROW_HIGH_UTILIZATION)} utilization
-          flag. They are fixed labels, not market data, and a pass is not a guarantee against liquidation. Missing data is never counted as a pass.
-        </p>
-        <ul className="space-y-2">
-          {report.checks.map((check) => {
-            const style = RISK_STYLE[check.status]
-            return (
-              <li key={check.id} data-risk-check={check.id} data-risk-status={check.status} className="flex items-start gap-2 text-xs leading-5 text-slate-700">
-                <style.icon size={14} className={`mt-0.5 shrink-0 ${style.className}`} />
-                <span className="min-w-0 [overflow-wrap:anywhere]"><span className={`font-semibold ${style.className}`}>{style.label}.</span> {check.text}</span>
-              </li>
-            )
-          })}
-        </ul>
-      </details>
+    <div className="rounded-2xl border border-slate-200 bg-white p-4" data-borrow-readiness={view.kind === 'result' ? readiness?.status : view.kind}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-slate-900">Transaction readiness</h3>
+        {chip && <span className={`rounded-lg border px-2 py-0.5 text-[11px] font-semibold leading-4 ${chip.className}`} data-readiness-status>{chip.label}</span>}
+      </div>
+      <p className="mt-1 text-xs leading-5 text-slate-700" data-readiness-reason>{reason}</p>
+      <p className="mt-1 text-[11px] leading-4 text-slate-500">Preview only: real transactions are switched off in this release, whatever the status.</p>
+      {view.kind === 'result' && (
+        <details className="group mt-2" data-borrow-readiness-details>
+          <ToggleSummary label="technical checks" />
+          <ul className="mt-2 space-y-2">
+            {orderWriteChecks(view.checks).map((check) => {
+              const style = CHECK_STYLE[check.status]
+              return (
+                <li key={check.id} data-readiness-check={check.id} data-readiness-check-status={check.status} className="flex items-start gap-2 text-xs leading-5 text-slate-700">
+                  <style.icon size={14} className={`mt-0.5 shrink-0 ${style.className}`} />
+                  <span className="min-w-0 [overflow-wrap:anywhere]"><span className={`font-semibold ${style.className}`}>{style.label}.</span> {check.text}</span>
+                </li>
+              )
+            })}
+          </ul>
+          <p className="mt-2 text-[11px] leading-4 text-slate-500">
+            {view.quoteAgeSeconds === null ? 'No quote has been read.' : `Quote read ${view.quoteAgeSeconds} s ago; a quote is only used for ${MAINNET_BORROW_MAX_EVIDENCE_AGE_MS / 1000} s.`}{' '}
+            {requestsSentence(view.requests)}
+          </p>
+          <button type="button" onClick={bump} className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+            <RefreshCw size={11} />
+            Read again
+          </button>
+        </details>
+      )}
     </div>
   )
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// New borrow estimate
 
 type QuoteInputs = {
   collateralText: string
@@ -565,11 +707,32 @@ function SubHeading({ children }: { children: ReactNode }) {
   return <h4 className="mb-1 text-xs font-semibold text-slate-700">{children}</h4>
 }
 
-function QuoteBuilder({ market, verification, walletAddress, client, refresh, bump, inputs }: {
+// Two decimals, unless the two figures would look the same at two decimals: then enough digits to tell them apart.
+function healthPair(value: number, other: number): string {
+  const short = formatHealthFactor(value)
+  if (short !== formatHealthFactor(other)) return short
+  return String(Number(value.toFixed(6)))
+}
+
+function balanceLine(walletAddress: string | null, balances: Query<WalletBalances>, market: BorrowMarket | null): string {
+  if (!walletAddress) return 'Connect a wallet'
+  if (balances.status === 'idle' || balances.status === 'loading') return 'Reading…'
+  if (balances.status === 'unavailable' || !market || balances.data.collateralToken.raw === null) return 'Unavailable'
+  const decimals = market.collateralAsset.decimals
+  const shown = formatDecimalString(unitsToDecimal(balances.data.collateralToken.raw, decimals), displayDigits(decimals))
+  return shown === null ? 'Unavailable' : `${shown} ${market.collateralAsset.symbol}`
+}
+
+function QuoteBuilder({ market, verification, walletAddress, walletState, session, positions, client, verifyMarket, readBalances, refresh, bump, inputs }: {
   market: BorrowMarket | null
   verification: MarketVerification | undefined
   walletAddress: string | null
+  walletState: BorrowWalletState | null
+  session: string | null
+  positions: Positions
   client: BorrowReadClient | undefined
+  verifyMarket: ((market: BorrowMarket) => Promise<MarketVerification>) | undefined
+  readBalances: WalletBalanceReader | undefined
   refresh: number
   bump: () => void
   inputs: QuoteInputs
@@ -583,72 +746,95 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
   const loanSymbol = market?.loanAsset.symbol ?? 'USDC'
   const target = targetHealthFactor.toFixed(2)
 
+  // Optional comparison, outside the main flow: the service maximum for a collateral amount the user types.
   const maxBorrow = useBorrowRead(
     marketId && collateralInput ? `max:${marketId}:${collateralInput}:${refresh}` : null,
     () => quoteMaxBorrow({ marketId: marketId ?? '', collateralAmount: collateralInput ?? '' }, client),
   )
+  // What the Borrow Service would size for the selected target. Information only: there is no write path that takes it.
   const sizing = useBorrowRead(
     marketId && borrowInput ? `size:${marketId}:${borrowInput}:${targetHealthFactor}:${refresh}` : null,
     () => quoteRequiredCollateral({ marketId: marketId ?? '', borrowAmount: borrowInput ?? '', targetHealthFactor }, client),
   )
-  const borrowQuote = useBorrowRead(
-    marketId && borrowInput && walletAddress ? `borrow:${marketId}:${walletAddress.toLowerCase()}:${borrowInput}:${refresh}` : null,
-    () => quoteBorrow({ marketId: marketId ?? '', walletAddress: walletAddress ?? '', borrowAmount: borrowInput ?? '' }, client),
-  )
 
-  const max = quoteOf(maxBorrow, 'max-borrow')
-  const required = quoteOf(sizing, 'required-collateral')
-  const full = quoteOf(borrowQuote, 'borrow')
+  // One loan per market and wallet: with an existing loan in the selected market the borrow is "Borrow more" on that loan.
+  const loansRead = positions.first
+  const allLoans = loansRead.status === 'available' ? [...loansRead.data.items, ...positions.extra] : []
+  const activeLoan = market ? allLoans.find((loan) => loan.marketId.toLowerCase() === market.marketId.toLowerCase() && loan.lifecycle !== 'closed') ?? null : null
+  const action: BorrowWriteAction | null = market && borrowInput
+    ? activeLoan ? { kind: 'borrow-more', loanId: activeLoan.loanId, borrowAmount: borrowInput } : { kind: 'borrow', marketId: market.marketId, borrowAmount: borrowInput }
+    : null
 
-  const risk = evaluateBorrowRisk({
-    market,
-    verification: market ? verification ?? { status: 'checking' } : null,
-    borrowAmount: borrowInput,
-    collateralAmount: collateralInput,
-    targetHealthFactor,
-    maxBorrow: reading(maxBorrow, (quote) => (quote.kind === 'max-borrow' ? quote.maxBorrow : null)),
-    sizing: reading(sizing, (quote) => (quote.kind === 'required-collateral' ? { healthFactor: quote.resultingHealthFactor } : null)),
-    full: reading(borrowQuote, (quote) => (quote.kind === 'borrow' ? { ltv: quote.resultingLtv, healthFactor: quote.resultingHealthFactor } : null)),
-    limits: { maxLtv: MAINNET_BORROW_MAX_LTV, highUtilization: MAINNET_BORROW_HIGH_UTILIZATION },
-  })
+  const reads = useBorrowReads(action, marketId, walletAddress, session, client, verifyMarket, refresh)
+  const balances = useWalletBalances(walletAddress, session, market, readBalances, refresh)
+  const now = useNow()
 
-  // The main quote is the wallet's Borrow Kit quote. Without a wallet (or when that quote fails) it falls back to the collateral
-  // the Borrow Service sizes for the selected target, which needs no wallet.
-  const primary = walletAddress ? borrowQuote : sizing
-  const sizedOnly = full === null && required !== null && (!walletAddress || borrowQuote.status === 'unavailable')
+  const readsData = reads.status === 'available' ? reads.data : null
+  const prepared = readsData?.quote?.status === 'available' ? readsData.quote.data : null
+  const walletQuoteError = readsData?.quote?.status === 'unavailable' ? readsData.quote.error : null
+  const full = prepared && prepared.quote.kind === 'borrow' ? prepared.quote : null
+  const max = maxBorrow.status === 'available' && maxBorrow.data.kind === 'max-borrow' ? maxBorrow.data : null
+  const required = sizing.status === 'available' && sizing.data.kind === 'required-collateral' ? sizing.data : null
+
+  // The main estimate is the wallet's Borrow Kit quote. Without a wallet (or when that quote fails) it falls back to the
+  // collateral the Borrow Service sizes for the selected target, which needs no wallet and cannot be sent.
+  const sizedOnly = full === null && required !== null && (!walletAddress || walletQuoteError !== null)
   const shown = full
     ? { collateral: full.collateral, healthFactor: full.resultingHealthFactor, band: full.resultingBand as BorrowHealthBand | null, liquidationPrice: full.liquidationPrice, apy: full.borrowApy }
     : sizedOnly && required
       ? { collateral: required.requiredCollateral, healthFactor: required.resultingHealthFactor, band: null, liquidationPrice: required.liquidationPrice, apy: market?.borrowApy ?? null }
       : null
+  const estimateLoading = walletAddress ? reads.status === 'loading' || (reads.status === 'idle' && borrowInput !== null) : sizing.status === 'loading'
 
   const gasWei = full ? totalGasWei(full.gasFees) : null
-  const quotedHealthFactor = full ? full.resultingHealthFactor : null
-  const gap = quotedHealthFactor !== null ? compareHealthFactor(targetHealthFactor, quotedHealthFactor) : null
+  const feeParts = full ? [
+    gasWei === null ? null : `${formatUnitsText(gasWei, MAINNET_ARC_NATIVE_CURRENCY.decimals, 6)} ${MAINNET_ARC_NATIVE_CURRENCY.symbol} gas`,
+    ...full.fees.map((fee) => { const text = amountText(fee.amount); return text === null ? null : `${text} ${fee.type} fee` }),
+  ].filter((part): part is string => part !== null) : []
+  const gasFeesText = full ? (feeParts.length === 0 ? null : full.fees.length === 0 ? `${feeParts.join(' + ')}, no service fee` : feeParts.join(' + ')) : null
+  // Raw comparison with the selected target; the two-decimal display never decides it.
+  const met = shown ? healthTargetMet(shown.healthFactor, targetHealthFactor) : null
   const interest = full ? illustrativeYearlyInterest(full.loanAsset.amount, full.borrowApy) : null
   const loanDigits = displayDigits(market?.loanAsset.decimals ?? 6)
-  const borrowShown = borrowInput ? `${formatDecimalString(borrowInput, loanDigits) ?? borrowInput} ${loanSymbol}` : null
+  const borrowShown = borrowInput ? `${formatDecimalString(borrowInput, loanDigits) ?? borrowInput} ${loanSymbol}` : null
   const collateralNotice = collateralInput && required
     ? compareDecimals(collateralInput, required.requiredCollateral.amount) < 0
-      ? { tone: 'note' as const, text: `Your collateral is below the ${amountText(required.requiredCollateral)} sized for a ${target} health factor.` }
-      : { tone: 'info' as const, text: `Your collateral covers the ${amountText(required.requiredCollateral)} sized for a ${target} health factor.` }
+      ? { tone: 'note' as const, text: `The collateral you typed is below the ${amountText(required.requiredCollateral)} sized for a ${target} health factor.` }
+      : { tone: 'info' as const, text: `The collateral you typed covers the ${amountText(required.requiredCollateral)} sized for a ${target} health factor.` }
     : null
   const noMarket = market === null
   const unverified = market && verification && verification.status !== 'verified' && verification.status !== 'checking'
+
+  // Transaction readiness: the shared safety checks, run on reads taken for this exact action.
+  const evidence: BorrowWriteEvidence | null = session && readsData && market ? {
+    session,
+    market: readsData.market.status === 'available' ? { data: readsData.market.data, fetchedAt: readsData.market.at } : null,
+    verification: readsData.verification ? { marketId: market.marketId, result: readsData.verification.result, checkedAt: readsData.verification.at } : null,
+    position: activeLoan && loansRead.status === 'available' ? { data: activeLoan, fetchedAt: loansRead.at } : null,
+    loans: loansRead.status === 'available' ? { data: { items: allLoans, complete: positions.next === null && positions.moreError === null }, fetchedAt: loansRead.at } : null,
+    balances: balances.status === 'available' ? { data: balances.data, fetchedAt: balances.at } : null,
+    targetHealthFactor,
+  } : null
+  const plan = action ? planBorrowWrite(action, { wallet: walletAddress ? walletState : null, quote: prepared, evidence, now }) : null
+  const checking = action !== null && (reads.status === 'loading' || (walletAddress !== null && (loansRead.status === 'loading' || balances.status === 'loading')))
+  const readinessView: ReadinessView = !action ? { kind: 'idle', text: noMarket ? 'Choose a market to check readiness.' : 'Enter a borrow amount to check readiness.' }
+    : checking || !plan ? { kind: 'checking' }
+      : { kind: 'result', title: action.kind === 'borrow-more' ? 'Borrow more' : 'Borrow', checks: plan.checks, requests: plan.walletRequests, quoteAgeSeconds: prepared ? Math.max(0, Math.round((now - prepared.fetchedAt) / 1000)) : null }
 
   return (
     <Panel>
       <div data-borrow-section="quote">
         <SectionTitle
-          title="Borrow quote"
-          hint="Enter what you want to borrow. Quotes are estimates read from the Borrow Service."
+          title="New borrow estimate"
+          hint="Enter what you want to borrow. This is an estimate for a new borrow, not your current loan."
           right={<span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600"><Lock size={11} />Preview only</span>}
         />
-        {noMarket && <div className="mb-4"><Notice tone="info">Choose a market above to start a quote.</Notice></div>}
+        {noMarket && <div className="mb-4"><Notice tone="info">Choose a market above to start an estimate.</Notice></div>}
         {market && (
           <p className="mb-3 text-xs text-slate-500" data-borrow-selected>
-            Quoting <span className="font-semibold text-slate-800">{market.collateralAsset.symbol} / {market.loanAsset.symbol}</span>{' '}
+            Estimating <span className="font-semibold text-slate-800">{market.collateralAsset.symbol} / {market.loanAsset.symbol}</span>{' '}
             <span className="font-mono" title={market.marketId}>{shortenMarketId(market.marketId)}</span>
+            {action?.kind === 'borrow-more' && <span className="ml-2 font-semibold text-slate-700" data-borrow-kind="borrow-more">Borrow more on your existing loan</span>}
           </p>
         )}
         {unverified && (
@@ -658,14 +844,16 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
         )}
         <div className="grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
           <div className="min-w-0 space-y-4">
-            <AmountField id="borrow-amount" label={`Borrow amount (${loanSymbol})`} symbol={loanSymbol} value={borrowText}
-              disabled={noMarket} hint={`Up to ${market?.loanAsset.decimals ?? 6} decimals.`}
-              onChange={(value) => inputs.setBorrowText(sanitizeDecimalInput(value, market?.loanAsset.decimals ?? 6))} />
-            <AmountField id="borrow-collateral" label={`Collateral you hold (${collateralSymbol})`} symbol={collateralSymbol} value={collateralText}
-              disabled={noMarket} hint={`Optional, up to ${market?.collateralAsset.decimals ?? 8} decimals. Used for the quote details.`}
-              onChange={(value) => inputs.setCollateralText(sanitizeDecimalInput(value, market?.collateralAsset.decimals ?? 8))} />
             <div>
-              <p className="text-sm font-medium text-slate-700">Target health factor</p>
+              <AmountField id="borrow-amount" label={`Borrow amount (${loanSymbol})`} symbol={loanSymbol} value={borrowText}
+                disabled={noMarket} hint={`Up to ${market?.loanAsset.decimals ?? 6} decimals.`}
+                onChange={(value) => inputs.setBorrowText(sanitizeDecimalInput(value, market?.loanAsset.decimals ?? 6))} />
+              <p className="mt-2 text-xs text-slate-500" data-borrow-wallet-balance>
+                Your wallet {collateralSymbol} balance: <span className="font-semibold text-slate-800">{balanceLine(walletAddress, balances, market)}</span>
+              </p>
+            </div>
+            <div>
+              <p className="text-sm font-medium text-slate-700">Your target health factor</p>
               <div className="mt-1.5 inline-flex rounded-xl border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="Target health factor">
                 {TARGET_HEALTH_FACTORS.map((value) => (
                   <button key={value} type="button" aria-pressed={targetHealthFactor === value} onClick={() => inputs.setTargetHealthFactor(value)}
@@ -676,48 +864,82 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
                   </button>
                 ))}
               </div>
-              <p className="mt-1 text-[11px] leading-4 text-slate-400">Higher keeps more distance from the liquidation threshold (1.0).</p>
+              <p className="mt-1 text-[11px] leading-4 text-slate-400">The estimate must reach this. Higher keeps more distance from the liquidation threshold (1.0).</p>
             </div>
             {!walletAddress && (
               <Notice tone="info">
                 <span className="inline-flex items-center gap-1.5 font-semibold"><Wallet size={12} />No wallet connected</span>
-                <p className="mt-1">Connect a wallet for the full quote with estimated gas.</p>
+                <p className="mt-1">Connect a wallet for the full estimate with gas and fees, and for transaction readiness.</p>
               </Notice>
             )}
+            <details className="group rounded-xl border border-slate-200 bg-white p-3" data-borrow-optional>
+              <ToggleSummary label="optional collateral comparison" />
+              <div className="mt-3 space-y-3">
+                <AmountField id="borrow-collateral" label={`Collateral to compare (${collateralSymbol}, optional)`} symbol={collateralSymbol} value={collateralText}
+                  disabled={noMarket} hint={`Typed by you. It is not your wallet balance and it is not used for the estimate or the readiness checks. Up to ${market?.collateralAsset.decimals ?? 8} decimals.`}
+                  onChange={(value) => inputs.setCollateralText(sanitizeDecimalInput(value, market?.collateralAsset.decimals ?? 8))} />
+                <QueryState query={maxBorrow} idle="Type a collateral amount to see the service maximum for it." onRetry={bump} />
+                {max && (
+                  <>
+                    <dl className="divide-y divide-slate-100">
+                      <Metric label="Maximum borrow" value={amountText(max.maxBorrow)} strong />
+                      <Metric label="Health factor at that borrow" value={healthValue(max.resultingHealthFactor, null)} />
+                      <Metric label="Liquidation price" note={`${collateralSymbol} price in ${loanSymbol} at which the loan can be liquidated`} value={amountText(max.liquidationPrice)} />
+                    </dl>
+                    <p className="text-[11px] leading-4 text-slate-500" data-borrow-max-note>
+                      The maximum sits at the liquidation threshold (health factor {max.resultingHealthFactor === null ? 'not reported' : formatHealthFactor(max.resultingHealthFactor)}).
+                      A price move or accrued interest can take the loan below it.
+                    </p>
+                  </>
+                )}
+                {collateralNotice && <Notice tone={collateralNotice.tone}>{collateralNotice.text}</Notice>}
+              </div>
+            </details>
           </div>
 
           <div className="min-w-0 space-y-4">
             <div className="rounded-2xl border border-slate-200 bg-slate-50/60 p-4" data-borrow-summary>
-              <h3 className="text-sm font-semibold text-slate-900">Your quote</h3>
+              <h3 className="text-sm font-semibold text-slate-900">Estimate</h3>
               <p className="mb-2 mt-0.5 text-[11px] leading-4 text-slate-500">
                 {full ? 'Borrow Kit quote for your wallet. Preview only.'
-                  : shown ? `Sized for your selected target of ${target}. Preview only.` : 'Preview only.'}
+                  : shown ? `Sized for your selected target of ${target}; connect a wallet for the exact quote. Preview only.` : 'Preview only.'}
               </p>
-              {borrowInput === null && <p className="text-xs leading-5 text-slate-400">Enter a borrow amount to see your quote.</p>}
-              {borrowInput !== null && primary.status === 'loading' && <LoadingBars rows={5} />}
-              {borrowInput !== null && primary.status === 'unavailable' && <ReadFailure error={primary.error} onRetry={bump} />}
+              {borrowInput === null && <p className="text-xs leading-5 text-slate-400">Enter a borrow amount to see the estimate.</p>}
+              {borrowInput !== null && estimateLoading && !shown && <LoadingBars rows={5} />}
+              {borrowInput !== null && walletQuoteError && <ReadFailure error={walletQuoteError} onRetry={bump} />}
+              {borrowInput !== null && !walletAddress && sizing.status === 'unavailable' && <ReadFailure error={sizing.error} onRetry={bump} />}
               {borrowInput !== null && shown && (
                 <>
                   <dl className="divide-y divide-slate-100">
-                    <Metric label="Borrow amount" value={borrowShown} strong />
-                    <Metric label="Collateral needed" value={amountText(shown.collateral)} strong />
+                    <Metric label="Borrow Amount" value={borrowShown} strong />
+                    <Metric label="Collateral Required" note="Sized by the Borrow Service" value={amountText(shown.collateral)} strong />
                     <Metric label="Borrow APY" note="Variable" value={percentText(shown.apy)} />
-                    <Metric label="Estimated gas" value={full
-                      ? (gasWei === null ? null : `${formatUnitsText(gasWei, MAINNET_ARC_NATIVE_CURRENCY.decimals, 6)} ${MAINNET_ARC_NATIVE_CURRENCY.symbol}`)
+                    <Metric label="Estimated Gas / Fees" value={full ? gasFeesText
                       : <span className="font-normal text-slate-400">{walletAddress ? 'Not available' : 'Needs a wallet'}</span>} />
-                    <Metric label="Health factor" value={healthValue(shown.healthFactor, shown.band)} />
-                    <Metric label="Liquidation price" value={amountText(shown.liquidationPrice)} />
+                    <Metric label="Estimated Health Factor" note={activeLoan ? 'After borrowing more; not your current Health Factor' : 'For this new borrow; not a current loan'}
+                      value={healthValue(shown.healthFactor, shown.band)} />
+                    <Metric label="Target Health Factor" note="Your selection" value={(
+                      <span className="inline-flex flex-wrap items-center justify-end gap-2">
+                        <span>{target}</span>
+                        {met !== null && (
+                          <span className={`rounded-lg border px-2 py-0.5 text-[11px] font-semibold leading-4 ${met ? TONE_CLASS.safe : TONE_CLASS.danger}`} data-borrow-target-status={met ? 'met' : 'not-met'}>
+                            {met ? 'Met' : 'Not met'}
+                          </span>
+                        )}
+                      </span>
+                    )} />
+                    <Metric label="Liquidation Price" value={amountText(shown.liquidationPrice)} />
                   </dl>
-                  {full && gap && (
-                    <div className="mt-3" data-borrow-target-note={gap.relation}>
-                      {gap.relation === 'below' ? (
+                  {full && met !== null && (
+                    <div className="mt-3" data-borrow-target-note={met ? 'met' : 'below'}>
+                      {!met && shown.healthFactor !== null ? (
                         <Notice tone="error">
-                          <p><span className="font-semibold" data-borrow-hf-gap="below">Selected safety target not met.</span> You selected {target}; this quote
-                            comes out at {formatHealthFactor(gap.delta + targetHealthFactor)}. The Borrow Service sizes the collateral itself, so a gap like this
-                            is not a service error, but a future borrow would be blocked on this quote.{required ? ` Collateral for ${target} is ${amountText(required.requiredCollateral)}.` : ''}</p>
+                          <p><span className="font-semibold" data-borrow-hf-gap="below">Selected safety target not met.</span> The estimate is {healthPair(shown.healthFactor, targetHealthFactor)} against
+                            your {target} target. The Borrow Service sizes the collateral itself and Machina does not prepare a transaction with different collateral, so this
+                            borrow is blocked.{required ? ` Collateral for ${target} would be ${amountText(required.requiredCollateral)}.` : ''}</p>
                         </Notice>
                       ) : (
-                        <p className="text-[11px] font-semibold text-emerald-700" data-borrow-hf-gap={gap.relation}>Meets your selected target of {target}.</p>
+                        <p className="text-[11px] font-semibold text-emerald-700" data-borrow-hf-gap="met">Meets your selected target of {target}.</p>
                       )}
                     </div>
                   )}
@@ -725,39 +947,21 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
               )}
             </div>
 
-            <RiskChecks report={risk} />
+            <ReadinessCard view={readinessView} bump={bump} />
 
             <details className="group rounded-2xl border border-slate-200 bg-white p-4" data-borrow-more>
-              <ToggleSummary label="quote details" />
+              <ToggleSummary label="estimate details" />
               <div className="mt-3 space-y-4">
-                <section>
-                  <SubHeading>For your collateral</SubHeading>
-                  <QueryState query={maxBorrow} idle="Enter the collateral you hold to see the maximum borrow." onRetry={bump} />
-                  {max && (
-                    <>
-                      <dl className="divide-y divide-slate-100">
-                        <Metric label="Maximum borrow" value={amountText(max.maxBorrow)} strong />
-                        <Metric label="Health factor at that borrow" value={healthValue(max.resultingHealthFactor, null)} />
-                        <Metric label="Liquidation price" note={`${collateralSymbol} price in ${loanSymbol} at which the loan can be liquidated`} value={amountText(max.liquidationPrice)} />
-                      </dl>
-                      <p className="mt-1 text-[11px] leading-4 text-slate-500" data-borrow-max-note>
-                        The maximum sits at the liquidation threshold (health factor {max.resultingHealthFactor === null ? 'not reported' : formatHealthFactor(max.resultingHealthFactor)}).
-                        A price move or accrued interest can take the loan below it. Preview only.
-                      </p>
-                    </>
-                  )}
-                </section>
                 <section>
                   <SubHeading>Collateral sized for your selected target ({target})</SubHeading>
                   <QueryState query={sizing} idle="Enter a borrow amount to size the collateral." onRetry={bump} />
                   {required && (
                     <dl className="divide-y divide-slate-100">
-                      <Metric label="Collateral needed" value={amountText(required.requiredCollateral)} strong />
-                      <Metric label="Health factor" value={healthValue(required.resultingHealthFactor, null)} />
-                      <Metric label="Liquidation price" value={amountText(required.liquidationPrice)} />
+                      <Metric label="Collateral Required" value={amountText(required.requiredCollateral)} strong />
+                      <Metric label="Estimated Health Factor" value={healthValue(required.resultingHealthFactor, null)} />
+                      <Metric label="Liquidation Price" value={amountText(required.liquidationPrice)} />
                     </dl>
                   )}
-                  {collateralNotice && <div className="mt-2"><Notice tone={collateralNotice.tone}>{collateralNotice.text}</Notice></div>}
                 </section>
                 {full && (
                   <section>
@@ -769,7 +973,7 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
                       {full.fees.length === 0 && <Metric label="Fees" value="None in this quote" />}
                       <Metric label="Resulting LTV" value={percentText(full.resultingLtv)} />
                       <Metric label="Illustrative interest, one year" note="Machina arithmetic: amount × quoted APY, if the rate never changed. Not a service figure."
-                        value={interest === null ? null : `≈ ${interest} ${full.loanAsset.token}`} />
+                        value={interest === null ? null : `≈ ${interest} ${full.loanAsset.token}`} />
                     </dl>
                   </section>
                 )}
@@ -795,7 +999,7 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Positions
+// Current loans
 
 function PositionCard({ position, known, listLoaded }: { position: BorrowPosition; known: BorrowMarket | null; listLoaded: boolean }) {
   const pending = position.economics === 'pending'
@@ -822,7 +1026,7 @@ function PositionCard({ position, known, listLoaded }: { position: BorrowPositio
         <Metric label="Accrued interest" value={amountText(position.accruedInterest)} />
         <Metric label="Borrow APY" note="Variable" value={percentText(position.borrowApy)} />
         <Metric label="LTV" value={percentText(position.ltv)} />
-        <Metric label="Health factor" value={noDebt && position.healthFactor === null ? 'No outstanding debt' : healthValue(position.healthFactor, position.healthBand)} />
+        <Metric label="Current Health Factor" value={noDebt && position.healthFactor === null ? 'No outstanding debt' : healthValue(position.healthFactor, position.healthBand)} />
         <Metric label="Liquidation price" value={noDebt && position.liquidationPrice === null ? 'No outstanding debt' : amountText(position.liquidationPrice)} />
       </dl>
       <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
@@ -837,22 +1041,33 @@ function PositionCard({ position, known, listLoaded }: { position: BorrowPositio
   )
 }
 
-function PositionsSection({ walletAddress, client, markets, refresh, bump }: {
+// Each loan keeps its own Health Factor. No wallet-wide Health Factor is ever computed: with several loans there is none, and
+// with no active loan it does not apply.
+function PositionsSection({ walletAddress, positions, markets, bump }: {
   walletAddress: string | null
-  client: BorrowReadClient | undefined
+  positions: Positions
   markets: BorrowMarket[]
-  refresh: number
   bump: () => void
 }) {
-  const { first, extra, next, busy, moreError, loadMore } = usePositions(walletAddress, client, refresh)
-  const items = first.status === 'available' ? [...first.data.items, ...extra] : []
+  const { first, extra, next, busy, moreError, loadMore } = positions
+  const loaded = first.status === 'available' ? [...first.data.items, ...extra] : []
+  const active = loaded.filter((position) => position.lifecycle === 'active')
+  const unreported = loaded.filter((position) => position.lifecycle === 'unreported')
+  const items = [...active, ...unreported, ...loaded.filter((position) => position.lifecycle === 'closed')]
   const marketById = useMemo(() => new Map(markets.map((market) => [market.marketId.toLowerCase(), market])), [markets])
+  // "No active loan" is only said when every loan was read and none is active or of unreported status.
+  const noActive = first.status === 'available' && active.length === 0 && unreported.length === 0 && next === null && moreError === null
+  const summary: { loan: string; health: string } | null = !walletAddress ? { loan: 'Connect a wallet to see it', health: 'Not applicable' }
+    : first.status === 'unavailable' ? { loan: 'Unavailable', health: 'Unavailable' }
+      : noActive ? { loan: 'No active loan', health: 'Not applicable' }
+        : first.status === 'available' && active.length === 0 ? { loan: unreported.length > 0 ? 'Status not reported' : 'Not all loans are loaded yet', health: 'Not reported' }
+          : null
   return (
     <Panel>
       <div data-borrow-section="positions">
         <SectionTitle
           title="Your loans"
-          hint="Read only. Collateral, debt and health come from the Borrow Service for the connected wallet."
+          hint="Your current position, read from the Borrow Service for the connected wallet. Separate from any new borrow estimate."
           right={walletAddress && (
             <button type="button" onClick={bump} disabled={first.status === 'loading'}
               className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60">
@@ -861,14 +1076,16 @@ function PositionsSection({ walletAddress, client, markets, refresh, bump }: {
             </button>
           )}
         />
-        {!walletAddress && <Notice tone="info">Connect a wallet to see its Borrow positions on Arc. Nothing is read until a wallet is connected.</Notice>}
-        {walletAddress && first.status === 'loading' && <LoadingBars rows={4} />}
-        {walletAddress && first.status === 'unavailable' && <ReadFailure error={first.error} onRetry={bump} />}
-        {walletAddress && first.status === 'available' && items.length === 0 && (
-          <Notice tone="info">The Borrow Service reports no loans for this wallet on Arc. Debt and collateral are not available because no loan exists.</Notice>
+        {walletAddress && first.status === 'loading' && <LoadingBars rows={2} />}
+        {summary && (
+          <dl className="divide-y divide-slate-100" data-borrow-current-loan={summary.loan}>
+            <Metric label="Current loan" value={<span data-current-loan>{summary.loan}</span>} strong />
+            <Metric label="Current Health Factor" value={<span data-current-health-factor>{summary.health}</span>} />
+          </dl>
         )}
+        {walletAddress && first.status === 'unavailable' && <div className="mt-2"><ReadFailure error={first.error} onRetry={bump} /></div>}
         {items.length > 0 && (
-          <ul className="grid gap-3 lg:grid-cols-2">
+          <ul className="mt-3 grid gap-3 lg:grid-cols-2">
             {items.map((position) => (
               <PositionCard key={position.loanId} position={position} known={marketById.get(position.marketId.toLowerCase()) ?? null} listLoaded={markets.length > 0} />
             ))}
@@ -891,13 +1108,17 @@ function PositionsSection({ walletAddress, client, markets, refresh, bump }: {
 
 export type BorrowWorkspaceProps = {
   walletAddress: string | null
+  walletChainId?: number | null
+  // Read-only wallet requests (wallet_getCapabilities). Production passes the connected wallet's EIP-1193 request.
+  requestWallet?: Eip1193Request
   // Test seams. Production passes none: reads go through the guarded Borrow Kit boundary, the market proxy and the Arc RPC.
   client?: BorrowReadClient
   loadMarkets?: () => Promise<BorrowMarketState>
   verifyMarket?: (market: BorrowMarket) => Promise<MarketVerification>
+  readBalances?: WalletBalanceReader
 }
 
-export function BorrowWorkspace({ walletAddress, client, loadMarkets, verifyMarket }: BorrowWorkspaceProps) {
+export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWallet, client, loadMarkets, verifyMarket, readBalances }: BorrowWorkspaceProps) {
   const [refresh, setRefresh] = useState(0)
   const [marketsState, setMarketsState] = useState<BorrowMarketState>({ status: 'loading' })
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -909,6 +1130,9 @@ export function BorrowWorkspace({ walletAddress, client, loadMarkets, verifyMark
   loadMarketsRef.current = loadMarkets
   const verifyMarketRef = useRef(verifyMarket)
   verifyMarketRef.current = verifyMarket
+
+  const wallet = useWalletState(walletAddress, walletChainId, requestWallet)
+  const positions = usePositions(walletAddress, client, refresh)
 
   useEffect(() => {
     let live = true
@@ -969,9 +1193,10 @@ export function BorrowWorkspace({ walletAddress, client, loadMarkets, verifyMark
         <RiskNotice />
         <MarketsSection state={marketsState} verifications={verifications} borrowAmount={parsePositiveAmount(borrowText)} selectedId={selectedId}
           onSelect={setSelectedId} onReload={bump} />
+        <PositionsSection walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
         <QuoteBuilder market={selected} verification={selected ? verifications[selected.marketId.toLowerCase()] : undefined}
-          walletAddress={walletAddress} client={client} refresh={refresh} bump={bump} inputs={inputs} />
-        <PositionsSection walletAddress={walletAddress} client={client} markets={markets} refresh={refresh} bump={bump} />
+          walletAddress={walletAddress} walletState={wallet.state} session={wallet.session} positions={positions} client={client}
+          verifyMarket={verifyMarket} readBalances={readBalances} refresh={refresh} bump={bump} inputs={inputs} />
       </div>
 
       <p className="mt-6 text-[11px] leading-5 text-slate-500">
@@ -983,6 +1208,12 @@ export function BorrowWorkspace({ walletAddress, client, loadMarkets, verifyMark
 }
 
 export default function MainnetBorrow() {
-  const { address } = useAccount()
-  return <BorrowWorkspace walletAddress={address ?? null} />
+  const { address, chainId, connector } = useAccount()
+  // One read-only question to the wallet (wallet_getCapabilities). Never a signature, approval or transaction request.
+  const requestWallet = useMemo<Eip1193Request | undefined>(() => (connector ? async (args) => {
+    const provider = await connector.getProvider() as { request?: Eip1193Request } | undefined
+    if (!provider?.request) throw new Error('wallet provider unavailable')
+    return provider.request(args)
+  } : undefined), [connector])
+  return <BorrowWorkspace walletAddress={address ?? null} walletChainId={chainId ?? null} requestWallet={requestWallet} />
 }

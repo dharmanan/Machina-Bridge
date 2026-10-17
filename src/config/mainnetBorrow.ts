@@ -33,5 +33,18 @@ export const MAINNET_BORROW_MORPHO_BLUE = '0x34cd04070dd72b14e241112f6d83812df5a
 // hardcoded, and nothing here ranks or recommends a market.
 // MAX_LTV is the starting cap a future borrow would be checked against. Staying below it does not protect against liquidation.
 export const MAINNET_BORROW_MAX_LTV = 0.7
-// Utilization at or above this ratio is flagged: little liquidity is left to borrow and the rate can move quickly.
+// Utilization at or above this ratio is flagged as a market-wide rate risk: most supplied funds are lent out and the variable rate can
+// move quickly. It says nothing about the absolute amount available.
 export const MAINNET_BORROW_HIGH_UTILIZATION = 0.9
+
+// Transaction safety limits (Stage 2). Fixed labels like the two above: the checks that use them run in planBorrowWrite and are
+// re-run inside executeBorrowWrite, so a caller cannot skip them by skipping the UI.
+// A quote, position, market read, on-chain check or wallet balance older than this is not used to prepare a transaction. The
+// Borrow Service gives no quote expiry of its own, so this is Machina's own bound.
+export const MAINNET_BORROW_MAX_EVIDENCE_AGE_MS = 60_000
+// Highest slippage bound Machina would pass for service-sized legs. The SDK default (300) sits below it.
+export const MAINNET_BORROW_MAX_SLIPPAGE_BPS = 500
+// Arc's native gas currency is USDC with 18 decimals (see MAINNET_ARC_NATIVE_CURRENCY). Its ERC-20 interface is this
+// token. A wallet that pays gas and a loan in USDC is checked for both together.
+export const MAINNET_BORROW_NATIVE_DECIMALS = 18
+export const MAINNET_BORROW_NATIVE_BACKED_TOKEN = '0x3600000000000000000000000000000000000000' as const
