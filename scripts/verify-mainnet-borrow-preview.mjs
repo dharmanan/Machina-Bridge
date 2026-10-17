@@ -150,12 +150,11 @@ test('every action button in the Borrow tab is permanently disabled and has no h
 
 test('the Borrow tab states the risks and never recommends a market or amount', () => {
   for (const phrase of ['Liquidation risk', 'health factor falls', 'Below 1.0', 'Variable interest', 'not a fixed rate', 'Limited liquidity',
-    'Borrowing itself is not enabled yet', 'never asks your wallet to sign']) {
+    'Borrowing itself is not enabled yet', 'Nothing is sent from this page: no signature, approval or transaction']) {
     assert.ok(tabSource.includes(phrase) || tabSource.replace(/\s+/g, ' ').includes(phrase), phrase)
   }
   assert.ok(!/recommend(ed)? (market|amount)|best (rate|market)|safe amount to borrow|guaranteed/i.test(code(tabSource)))
-  assert.ok(tabSource.includes('the order is not a ranking'))
-  assert.ok(tabSource.includes('not a safe amount'))
+  assert.ok(tabSource.includes('are not ranked'))
   assert.ok(tabSource.includes('Not reported') && !/\?\? 0\b|\|\| 0\b/.test(code(tabSource)), 'missing values stay "Not reported", never 0')
 })
 
@@ -430,9 +429,47 @@ test('the tab shows the pair and short ID, flags facts only, and never ranks or 
   for (const flag of ['Insufficient Liquidity', 'High utilization', 'Oracle data missing', 'Verified on-chain', 'Not verified']) assert.ok(tabSource.includes(flag), flag)
   assert.ok(!/\.sort\(|\.toSorted\(|reduce\(\s*\(best/.test(body.replace(/\[\.\.\.[^\]]+\]\.sort/g, '')), 'the tab never reorders markets')
   assert.ok(!/best (rate|market)|recommended|safest|top pick|lowest (rate|apy)|highest (liquidity|apy)/i.test(body))
-  assert.ok(tabSource.includes('The maximum borrow is not a safe borrow amount'))
-  assert.ok(tabSource.includes('Quote vs your target'))
-  assert.ok(!/unverified[^\n]*(safe|ok)\b/i.test(body.replace(/not a safe/g, '')))
+  assert.ok(tabSource.includes('The maximum sits at the liquidation threshold'))
+  assert.ok(tabSource.includes('Below your selected target') && tabSource.includes('It is not an error'))
+})
+
+test('the tab says "Preview only" and uses status language, never "safe"', () => {
+  // Internal identifiers (the service's 'SAFE' band key, the 'safe' colour tone) are never rendered; everything else must be free of it.
+  const visible = (source) => code(source).replace(/\bsafe: '/g, '').replace(/'(safe|SAFE)'/g, '')
+  for (const [file, source] of [['MainnetBorrow.tsx', tabSource], ['borrowPreview.ts', helperSource]]) {
+    assert.ok(!/\bsafe\w*/i.test(visible(source)), `${file} has no "safe" wording`)
+  }
+  assert.ok(!/\bSAFE\b/.test(visible(tabSource)), 'the service band name is never shown')
+  assert.deepEqual(['SAFE', 'WARN', 'URGENT', 'IMMINENT', 'LIQUIDATABLE'].map(preview.healthBandLabel), [
+    'Above liquidation threshold', 'Approaching liquidation threshold', 'Close to liquidation threshold', 'Very close to liquidation', 'Below liquidation threshold'])
+  assert.deepEqual([2.6, 1.004, 1, 0.99, 0.5].map((hf) => preview.thresholdStatus(hf).label), [
+    'Above liquidation threshold', 'At liquidation threshold', 'At liquidation threshold', 'Below liquidation threshold', 'Below liquidation threshold'])
+  assert.equal(preview.thresholdStatus(1.2).tone, 'safe'); assert.equal(preview.thresholdStatus(0.9).tone, 'danger')
+  for (const phrase of ['Preview only', 'Below your selected target']) assert.ok(tabSource.includes(phrase), phrase)
+})
+
+test('the main screen is short: a six-row quote, one risk line, details behind toggles', () => {
+  const body = tabSource
+  // The market card button holds only the pair, APY, available liquidity, LLTV and the short labels.
+  const start = body.indexOf('<button type="button" role="radio"')
+  const card = body.slice(start, body.indexOf('</button>', start))
+  assert.deepEqual([...card.matchAll(/<Metric label="([^"]+)"/g)].map((m) => m[1]), ['Borrow APY', 'Available liquidity', 'LLTV'])
+  assert.ok(!/<Metric label="(Oracle|Rate model|Utilization|Total borrowed|Market ID|Liquidity on-chain)|shortenMarketId|verificationSentence|details\.params|market\.marketId\}<\/span>/.test(card), 'long details stay out of the card button')
+  const details = body.slice(body.indexOf('data-borrow-details'), body.indexOf('function MarketsSection'))
+  for (const label of ['Market ID', 'On-chain check', 'Oracle', 'Oracle price', 'Rate model', 'Liquidity on-chain', 'Utilization', 'Total borrowed', 'Updated']) assert.ok(details.includes(`label="${label}"`), label)
+  // The summary quote: exactly these six rows, in this order.
+  const summary = body.slice(body.indexOf('data-borrow-summary'), body.indexOf('<RiskChecks report={risk} />'))
+  assert.deepEqual([...summary.matchAll(/<Metric label="([^"]+)"/g)].map((m) => m[1]), ['Borrow amount', 'Collateral needed', 'Borrow APY', 'Estimated gas', 'Health factor', 'Liquidation price'])
+  // Risk checks and the remaining quote rows sit in <details> that start closed, with Show/Hide toggles.
+  assert.ok(/<details className="group mt-2" data-borrow-risk-details>/.test(body) && /<details className="group rounded-2xl[^"]*" data-borrow-more>/.test(body))
+  assert.ok(!/<details[^>]*\bopen\b/.test(body), 'every details starts closed')
+  assert.ok(body.includes('Show {label}') && body.includes('Hide {label}') && body.includes('label="risk checks"') && body.includes('label="quote details"'))
+  assert.ok(body.includes('Market details'))
+  const summarize = (statuses, flags) => preview.summarizeRisk({ checks: statuses.map((status, i) => ({ id: String(i), status, text: '' })), ...flags })
+  assert.equal(summarize(['fail', 'unknown'], { blocked: true, pending: false }).text, 'Would be blocked: 1 failed, 1 cannot be evaluated.')
+  assert.deepEqual(summarize(['warn', 'warn'], { blocked: false, pending: false }), { tone: 'warn', text: 'No check failed, 2 warnings.' })
+  assert.equal(summarize(['pending'], { blocked: false, pending: true }).tone, 'pending')
+  assert.deepEqual(summarize(['pass'], { blocked: false, pending: false }), { tone: 'pass', text: 'All checks pass.' })
 })
 
 console.log(`\nBorrow preview checks: ${passed} passed`)

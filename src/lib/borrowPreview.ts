@@ -71,6 +71,31 @@ export function illustrativeYearlyInterest(borrowAmount: string, apy: number | n
 
 export type HealthTone = 'safe' | 'caution' | 'danger'
 
+// Plain status wording for the bands the Borrow Service reports (the band names are the service's). It only says where the
+// loan stands against the liquidation threshold, which is a health factor of 1.0.
+export function healthBandLabel(band: BorrowHealthBand): string {
+  switch (band) {
+    case 'SAFE':
+      return 'Above liquidation threshold'
+    case 'WARN':
+      return 'Approaching liquidation threshold'
+    case 'URGENT':
+      return 'Close to liquidation threshold'
+    case 'IMMINENT':
+      return 'Very close to liquidation'
+    case 'LIQUIDATABLE':
+      return 'Below liquidation threshold'
+  }
+}
+
+// Where a health factor stands against the liquidation threshold, judged on the number as it is shown (two decimals).
+export function thresholdStatus(healthFactor: number): { label: string; tone: HealthTone } {
+  const shown = healthFactor >= 1000 ? healthFactor : Number(formatHealthFactor(healthFactor))
+  if (shown < 1) return { label: 'Below liquidation threshold', tone: 'danger' }
+  if (shown === 1) return { label: 'At liquidation threshold', tone: 'danger' }
+  return { label: 'Above liquidation threshold', tone: 'safe' }
+}
+
 export function healthBandTone(band: BorrowHealthBand): HealthTone {
   if (band === 'SAFE') return 'safe'
   return band === 'WARN' || band === 'URGENT' ? 'caution' : 'danger'
@@ -256,7 +281,7 @@ export function evaluateBorrowRisk(input: RiskInput): RiskReport {
   else if (input.maxBorrow === 'pending') add('max-borrow', 'pending', 'Reading the service maximum for this collateral.')
   else if (input.maxBorrow === null) add('max-borrow', 'unknown', 'The Borrow Service maximum for this collateral is not available.')
   else if (compareDecimals(input.borrowAmount, input.maxBorrow.amount) > 0) add('max-borrow', 'fail', 'The borrow amount is above the maximum the Borrow Service reports for this collateral.')
-  else add('max-borrow', 'pass', 'The borrow amount is within the service maximum. The maximum itself sits at the liquidation threshold and is not a safe amount.')
+  else add('max-borrow', 'pass', 'The borrow amount is within the service maximum, which itself sits at the liquidation threshold.')
 
   // LTV cap: the Borrow Kit quote's own LTV, else LLTV divided by the sized health factor (Morpho: health = LLTV / LTV).
   const { full, sizing } = input
@@ -291,4 +316,21 @@ export function evaluateBorrowRisk(input: RiskInput): RiskReport {
     blocked: checks.some((check) => check.status === 'fail' || check.status === 'unknown'),
     pending: checks.some((check) => check.status === 'pending'),
   }
+}
+
+export type RiskSummary = { tone: 'fail' | 'warn' | 'pending' | 'pass'; text: string }
+
+// One short line for the main screen; the individual checks stay behind "Show risk checks".
+export function summarizeRisk(report: RiskReport): RiskSummary {
+  const count = (status: RiskStatus) => report.checks.filter((check) => check.status === status).length
+  const failed = count('fail')
+  const unknown = count('unknown')
+  const warnings = count('warn')
+  if (report.blocked) {
+    const parts = [failed ? `${failed} failed` : null, unknown ? `${unknown} cannot be evaluated` : null].filter(Boolean)
+    return { tone: 'fail', text: `Would be blocked: ${parts.join(', ')}.` }
+  }
+  if (report.pending) return { tone: 'pending', text: 'Some checks are still waiting for input or data.' }
+  if (warnings > 0) return { tone: 'warn', text: `No check failed, ${warnings} warning${warnings === 1 ? '' : 's'}.` }
+  return { tone: 'pass', text: 'All checks pass.' }
 }
