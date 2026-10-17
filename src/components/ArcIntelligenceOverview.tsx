@@ -620,6 +620,22 @@ function activeAddressesCell(ctx: ViewContext): Cell {
   return ctx.mode === 'ready' && cell.status === 'unavailable' && uniques?.reason ? { ...cell, note: reasonText(uniques.reason) } : cell
 }
 
+function dexSwapsCell(ctx: ViewContext): Cell {
+  const families = [ctx.summary?.dex.uniswapV3, ctx.summary?.dex.uniswapV4]
+  const counts = families.map(family => family?.status === 'available' ? family.metrics?.swapCount : null)
+  const start = ctx.summary?.window.coverage?.start ?? ctx.summary?.window.start
+  const end = ctx.summary?.window.coverage?.end ?? ctx.summary?.window.end
+  if (ctx.mode === 'ready' && counts.every((value): value is number => Number.isSafeInteger(value) && (value as number) >= 0)
+    && families.every(family => family?.start === start && family?.end === end)) {
+    const total = counts[0] + counts[1]
+    if (Number.isSafeInteger(total)) return { status: 'available', raw: total, text: formatCount(total) }
+  }
+  const status = ctx.mode === 'ready'
+    ? families.some(family => family?.reason === 'insufficient_coverage') ? 'collecting' : 'unavailable'
+    : liveStatus(ctx, null)
+  return { status, note: ctx.mode === 'ready' ? 'Both Uniswap V3 and V4 swap counts must be verified for the same period.' : noteFor(ctx, status) }
+}
+
 function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }) {
   const network = ctx.summary?.network ?? null
   const active = activeAddressesCell(ctx)
@@ -644,15 +660,7 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
   const unvalued = usdVolume?.status === 'available' && isFiniteNumber(usdVolume.unvaluedSwaps) ? usdVolume.unvaluedSwaps : 0
   const volumeCaption = `${DEX_VOLUME_SCOPE} Total, last ${ctx.windowLabel}.${unvalued > 0
     ? ` Excludes ${formatCount(unvalued)} swaps without a verified price.` : ''}`
-  const swapFees = ctx.summary?.dex.swapFees
-  const fee = averageFeeCell(ctx, swapFees)
-  const previousFee = swapFees?.previous?.status === 'available' ? usdMicrosToNumber(swapFees.previous.averageFeeUsdMicros) : null
-  const feeDelta = fee.status === 'available' ? percentChange(usdMicrosToNumber(String(fee.raw)), previousFee) : null
-  const feeTotal = fee.status === 'available' ? usdMicrosToNumber(swapFees?.totalFeeUsdMicros) : null
-  const unvaluedFees = fee.status === 'available' && isFiniteNumber(swapFees?.unvaluedSwaps) ? swapFees.unvaluedSwaps : 0
-  const feeCaption = `Estimated Uniswap pool fee per swap, last ${ctx.windowLabel}. Not Arc gas. Excludes hook fees and rounding.${feeTotal !== null && isFiniteNumber(swapFees?.valuedSwaps)
-    ? ` ${usdText(feeTotal)} in fees across ${formatCount(swapFees.valuedSwaps)} swaps.` : ''}${unvaluedFees > 0
-    ? ` Excludes ${formatCount(unvaluedFees)} swaps without a fee value.` : ''}`
+  const swaps = dexSwapsCell(ctx)
 
   return (
     <section data-intel-section="network" aria-label="Network Activity" className="space-y-4">
@@ -664,7 +672,8 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
         <KpiCard item="network.transactions" label="Transactions" cell={transactions} delta={transactionsDelta} windowLabel={ctx.previousLabel}
           caption={`Total transactions, last ${ctx.windowLabel}`} />
         <KpiCard item="network.total-volume" label="DEX Volume" cell={volume} delta={volumeDelta} windowLabel={ctx.previousLabel} caption={volumeCaption} />
-        <KpiCard item="network.average-fee" label="Avg DEX Pool Fee" cell={fee} delta={feeDelta} windowLabel={ctx.previousLabel} caption={feeCaption} />
+        <KpiCard item="network.dex-swaps" label="DEX Swaps" cell={swaps} windowLabel={ctx.previousLabel}
+          caption={`Verified Uniswap V3 and V4 swaps, last ${ctx.windowLabel}. Counts, not amounts.`} />
       </div>
       <div className="grid grid-cols-1 divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white px-4 shadow-sm sm:grid-cols-3 sm:divide-x sm:divide-y-0 sm:px-0">
         {([
@@ -684,6 +693,32 @@ function NetworkSection({ ctx, header }: { ctx: ViewContext; header: ReactNode }
         ))}
       </div>
     </section>
+  )
+}
+
+function EstimatedPoolFee({ ctx }: { ctx: ViewContext }) {
+  const entry = ctx.summary?.dex.swapFees
+  const fee = averageFeeCell(ctx, entry)
+  const valued = entry?.valuedSwaps, unvalued = entry?.unvaluedSwaps
+  const total = typeof valued === 'number' && typeof unvalued === 'number' ? valued + unvalued : null
+  const verifiedCoverage = ctx.mode === 'ready' && entry?.status === 'available'
+    && Number.isSafeInteger(valued) && valued! >= 0 && Number.isSafeInteger(unvalued) && unvalued! >= 0
+    && total !== null && Number.isSafeInteger(total)
+  const percentage = verifiedCoverage && total! > 0 ? valued! / total! * 100 : null
+  const percentageText = percentage === null ? null : unvalued! > 0 && percentage >= 99.95 ? '<100' : formatDecimal(percentage, 1)
+  return (
+    <div {...markerProps('volume-chart.estimated-fee', fee.status, fee.raw)} className="mt-3 border-t border-slate-100 pt-3 text-[11px] leading-5 text-slate-500">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="font-medium text-slate-600">Estimated Pool Fee</span>
+        {fee.status === 'available' ? <span className="font-semibold tabular-nums text-slate-700" title={fee.title}>{fee.text} per swap</span>
+          : <StatusPill status={fee.status} />}
+        <span>Not network gas</span>
+      </div>
+      <p>{verifiedCoverage && total !== null ? total > 0
+        ? `Fee-valued: ${formatCount(valued!)} / ${formatCount(total)} swaps (${percentageText}%).`
+        : 'No swaps in the reported fee coverage.' : 'Fee coverage is not verified.'}{' '}Last {ctx.windowLabel}. Excludes hook fees and rounding.</p>
+      {fee.status !== 'available' && <p>{fee.note}</p>}
+    </div>
   )
 }
 
@@ -749,6 +784,7 @@ function VolumeChartSection({ ctx, initialView }: { ctx: ViewContext; initialVie
             detail={ctx.mode === 'history' ? ctx.historyNote : status === 'collecting' ? collectingText(ctx) : noteFor(ctx, status)} />
         </>
       )}
+      <EstimatedPoolFee ctx={ctx} />
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
         <span {...markerProps('volume-chart.uniswap-v3', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V3_BAR}`} />Uniswap V3</span>
         <span {...markerProps('volume-chart.uniswap-v4', shownStatus)} className="inline-flex items-center gap-1.5"><span className={`h-2.5 w-2.5 rounded-sm ${V4_BAR}`} />Uniswap V4</span>

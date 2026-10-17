@@ -822,7 +822,7 @@ await test('UI 1 manifest: the thirteen stable sections in order (Borrow after l
   }
   assert.deepEqual([...new Set(SCOPE.map((section) => section.group))],
     ['Network Activity', 'Markets', 'Recent Activity', 'Assets', 'New Token Launches', 'Borrow', 'Lending', 'Cross-chain', 'Ecosystem']);
-  for (const id of ['window.24h', 'window.7d', 'window.30d', 'network.total-volume', 'network.average-fee', 'top-pools-v3.all-pairs', 'top-pools-v4.all-pairs',
+  for (const id of ['window.24h', 'window.7d', 'window.30d', 'network.total-volume', 'volume-chart.estimated-fee', 'top-pools-v3.all-pairs', 'top-pools-v4.all-pairs',
     'recent-activity.transaction-links', 'launches.initial-pool', 'borrow.route', 'borrow.market-terms', 'borrow.action', 'lending.morpho-vaults',
     'cross-chain.across', 'rwa-other.exchange-flows', 'rwa-other.more-protocols']) assert.ok(ids.includes(id), id);
   assert.deepEqual([...ARC_INTELLIGENCE_REMOVED_SCOPE], ['successful transaction count', 'failed transaction count', 'success rate',
@@ -846,7 +846,7 @@ await test('UI 3 header, window selector, refresh, KPI cards, chart tabs, activi
   assert.equal(button('24H').attrs['aria-selected'], 'true');
   const text = textOf(tree);
   for (const label of ['Arc Intelligence', 'Verified Arc network activity', 'Verified through Oct 3, 14:00 UTC', 'Active Addresses', 'Transactions', 'DEX Volume',
-    'Avg DEX Pool Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'New Token Launches',
+    'DEX Swaps', 'Estimated Pool Fee', 'Top Protocols', 'Top Pools (Uniswap V3)', 'Top Pools (Uniswap V4)', 'Latest DEX activity', 'Verified asset transfers', 'New Token Launches',
     'Borrow on Arc', 'Powered by Circle Borrow Kit on Arc', 'Aave', 'Morpho Blue', 'Morpho Vaults', 'CCTP', 'Gateway', 'Across', 'RWA',
     'Other Verified Protocols', 'Exchange flows', 'Other verified Arc protocols', 'Hours in UTC']) {
     assert.ok(text.includes(label), label);
@@ -920,7 +920,7 @@ await test('UI 5 missing data never appears as a number or as zero, in any state
 });
 
 await test('UI 6 without the API\'s USD valuation no USD value exists; the protocol USD ranking stays blocked with its reason', async () => {
-  const VOLUME = ['network.total-volume', 'network.average-fee', 'volume-chart.volume', 'top-pools-v3.volume', 'top-pools-v4.volume', 'top-pools-v3.liquidity',
+  const VOLUME = ['network.total-volume', 'volume-chart.estimated-fee', 'volume-chart.volume', 'top-pools-v3.volume', 'top-pools-v4.volume', 'top-pools-v3.liquidity',
     'top-pools-v4.liquidity', 'lending.aave-usd', 'lending.morpho-blue-usd', 'lending.morpho-vaults-usd', 'cross-chain.cctp-usd', 'cross-chain.gateway-usd',
     'cross-chain.across-usd'];
   for (const [name, { tree, html }] of Object.entries(rendered)) {
@@ -934,7 +934,7 @@ await test('UI 6 without the API\'s USD valuation no USD value exists; the proto
   // An API without valuation (the ready fixtures carry none) reads as not available yet, never as zero or unavailable.
   for (const id of VOLUME) assert.equal(statusIn('ready', id), 'source_pending', id);
   assert.equal(statusIn('ready-default-view', 'volume-chart.volume'), 'source_pending');
-  assert.match(textOf(item(rendered.ready.tree, 'network.average-fee')), /Avg DEX Pool Fee Not tracked yet Pool fees are not tracked yet\./);
+  assert.match(textOf(item(rendered.ready.tree, 'volume-chart.estimated-fee')), /Estimated Pool Fee Not tracked yet Not network gas.*Pool fees are not tracked yet\./);
   assert.match(textOf(item(rendered.ready.tree, 'network.total-volume')), /DEX Volume Not tracked yet USD value of Uniswap V3 and V4 swaps on Arc\. USD values are not tracked yet\./);
 });
 
@@ -1091,7 +1091,7 @@ await test('UI 15 mutation: removing a manifest entry or a rendered marker fails
   assert.throws(() => checkScope(tree, extraItem), /item launches\.extra not rendered/);
   assert.throws(() => checkScope(parseHtml(html.replace('data-intel-section="launches"', 'data-removed="launches"')), SCOPE), /section launches not rendered/);
   assert.throws(() => checkScope(parseHtml(html.replaceAll('data-intel-item="cross-chain.gateway"', 'data-removed="x"')), SCOPE), /item cross-chain\.gateway not rendered/);
-  assert.throws(() => checkScope(parseHtml(html.replace(/data-intel-item="network\.average-fee" data-intel-status="source_pending"/, '$& data-intel-value="0"')), SCOPE),
+  assert.throws(() => checkScope(parseHtml(html.replace(/data-intel-item="volume-chart\.estimated-fee" data-intel-status="source_pending"/, '$& data-intel-value="0"')), SCOPE),
     /value without data/);
 });
 
@@ -1949,10 +1949,10 @@ await test('Volume 3 pool volume is each listed pool\'s exact USD value; a pool 
 
 await test('Completion 1 fee estimate, state-based liquidity and protocol USD remain visible with their exact source or blocker', async () => {
   const tree = rendered['ready-complete'].tree;
-  assert.equal(statusIn('ready-complete', 'network.average-fee'), 'available');
-  assert.equal(valueIn('ready-complete', 'network.average-fee'), '300000');
-  assert.match(textOf(item(tree, 'network.average-fee')), /Avg DEX Pool Fee \$0\.3/);
-  assert.match(textOf(item(tree, 'network.average-fee')), /Not Arc gas\. Excludes hook fees and rounding\./);
+  assert.equal(statusIn('ready-complete', 'volume-chart.estimated-fee'), 'available');
+  assert.equal(valueIn('ready-complete', 'volume-chart.estimated-fee'), '300000');
+  assert.match(textOf(item(tree, 'volume-chart.estimated-fee')), /Estimated Pool Fee \$0\.3 per swap/);
+  assert.match(textOf(item(tree, 'volume-chart.estimated-fee')), /Not network gas.*Excludes hook fees and rounding\./);
   assert.match(textOf(sectionNode(tree, 'top-pools-v3')), /Holds \$3\.5M/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /Estimated reserves \$820/);
   assert.match(textOf(sectionNode(tree, 'top-pools-v4')), /excluding uncollected fees and position rounding/);
@@ -2002,7 +2002,7 @@ await test('Partial 30D displays 549 verified hours, all supported numeric secti
   assert.match(text, new RegExp(lib.formatUtcDateTime(summary.window.coverage.end)));
   assert.match(text, /Period: /);
   assert.doesNotMatch(text, /30D totals appear once every hour|Total transactions, last 30D|vs previous 30D/);
-  for (const id of ['network.transactions', 'network.blocks', 'network.tps', 'network.gas-used', 'network.total-volume', 'network.average-fee',
+  for (const id of ['network.transactions', 'network.blocks', 'network.tps', 'network.gas-used', 'network.total-volume', 'volume-chart.estimated-fee',
     'top-protocols.uniswap-v3', 'top-protocols.uniswap-v4', 'top-pools-v3.volume', 'top-pools-v4.volume', 'assets.usdc',
     'lending.aave', 'lending.morpho-blue', 'lending.morpho-vaults', 'cross-chain.cctp', 'cross-chain.gateway', 'cross-chain.across']) {
     assert.equal(item(tree, id).attrs['data-intel-status'], 'available', id);
@@ -3247,6 +3247,87 @@ await test('RWA 5 a partial verified window states its coverage next to the USYC
   assert.equal(view.card.attrs['data-intel-status'], 'available');
   assert.match(view.text, /Partial: 20 of 24 hours\. 4 missing hours are not counted\./);
   assert.equal(textOf(view.metric('between')), 'Between addresses 1 Not mints or burns');
+});
+
+await test('DEX UI 1 four Network cards have the requested order and sum current V3/V4 counts in every window', async () => {
+  for (const [window, hours] of [['24h', 24], ['7d', 168], ['30d', 720]]) {
+    const summary = summaryFixture({ window, hours, storedHours: hours });
+    for (const [name, count] of [['uniswapV3', 123 * hours], ['uniswapV4', 9 * hours]])
+      summary.dex[name] = { ...summary.dex[name], start: summary.window.start, end: summary.window.end,
+        metrics: { ...summary.dex[name].metrics, swapCount: count } };
+    const tree = render({ selectedWindow: window, data: { ...READY_DATA, window, summary }, borrowMarket: BORROW_AVAILABLE }).tree;
+    checkScope(tree, SCOPE);
+    const network = sectionNode(tree, 'network');
+    const cards = byAttr(network, 'data-intel-item').filter(node => node.attrs.class?.includes('rounded-2xl'));
+    assert.deepEqual(cards.map(node => node.attrs['data-intel-item']),
+      ['network.active-addresses', 'network.transactions', 'network.total-volume', 'network.dex-swaps']);
+    assert.equal(item(tree, 'network.dex-swaps').attrs['data-intel-value'], String(132 * hours));
+    assert.match(textOf(item(tree, 'network.dex-swaps')), new RegExp(`last ${window.toUpperCase()}`));
+    assert.doesNotMatch(textOf(network), /Pool Fee/);
+  }
+  for (const [name, { tree }] of Object.entries(rendered)) checkScope(tree, SCOPE, { allowLoading: LOADING_STATES.includes(name) });
+});
+
+await test('DEX UI 2 missing unequal partial or invalid protocol counts never become a full combined total', async () => {
+  const broken = [null, unavailableFamily('family_hour_unavailable'), { ...available({ swapCount: 1 }), end: isoAt(END - HOUR_MS) },
+    available({}), available({ swapCount: -1 }), available({ swapCount: 1.5 }), available({ swapCount: Number.MAX_SAFE_INTEGER })];
+  for (const v4 of broken) {
+    const summary = summaryFixture({ families: { uniswapV4: v4 } });
+    const swaps = item(render({ selectedWindow: '24h', data: { ...READY_DATA, summary } }).tree, 'network.dex-swaps');
+    assert.equal(swaps.attrs['data-intel-value'], undefined);
+    assert.notEqual(swaps.attrs['data-intel-status'], 'available');
+  }
+  const zero = summaryFixture({ families: { uniswapV3: available({ swapCount: 0 }), uniswapV4: available({ swapCount: 0 }) } });
+  assert.equal(item(render({ selectedWindow: '24h', data: { ...READY_DATA, summary: zero } }).tree, 'network.dex-swaps').attrs['data-intel-value'], '0');
+});
+
+await test('DEX UI 3 partial 30D swaps keep actual hour coverage and missing family subsets are not added', async () => {
+  const summary = summaryFixture({ window: '30d', hours: 720, storedHours: 549 });
+  const start = isoAt(END - 549 * HOUR_MS);
+  summary.window.coverage = { status: 'partial', expectedHours: 720, availableHours: 549, missingHours: 171,
+    start, end: isoAt(END), completedUtcDays: 22 };
+  for (const family of [summary.dex.uniswapV3, summary.dex.uniswapV4]) family.start = start;
+  let tree = render({ selectedWindow: '30d', data: { ...READY_DATA, window: '30d', summary } }).tree;
+  let swaps = item(tree, 'network.dex-swaps');
+  assert.equal(swaps.attrs['data-intel-value'], String(FAMILY_METRICS.uniswapV3.swapCount + FAMILY_METRICS.uniswapV4.swapCount));
+  assert.match(textOf(swaps), /partial 30D \(549 of 720 hours\)/);
+  summary.dex.uniswapV4 = { ...unavailableFamily('family_hour_unavailable'), start: summary.window.start, end: summary.window.end,
+    unavailableHours: [summary.window.start], verifiedSubset: { status: 'available', scope: 'verified_hours_only', metrics: { swapCount: 19 },
+      coverage: { expectedHours: 720, availableHours: 719, missingHours: 1, verifiedHours: Array.from({ length: 719 }, (_, i) => isoAt(END - (719 - i) * HOUR_MS)) } } };
+  assert.ok(lib.verifiedFamilyCoverage(summary.dex.uniswapV4));
+  tree = render({ selectedWindow: '30d', data: { ...READY_DATA, window: '30d', summary } }).tree;
+  swaps = item(tree, 'network.dex-swaps');
+  assert.equal(swaps.attrs['data-intel-value'], undefined, 'a differently covered subset cannot masquerade as the full V3/V4 count');
+});
+
+await test('DEX UI 4 secondary pool fee uses only swapFees and reports dynamic coverage on both chart tabs', async () => {
+  for (const [window, hours] of [['24h', 24], ['7d', 168], ['30d', 720]]) for (const initialDexView of ['volume', 'swaps']) {
+    const summary = summaryFixture({ window, hours, swapFees: feesWindow('22500000', 75, { unvaluedSwaps: 25 }) });
+    const tree = render({ selectedWindow: window, initialDexView, data: { ...READY_DATA, window, summary } }).tree;
+    const fee = item(tree, 'volume-chart.estimated-fee');
+    assert.equal(fee.attrs['data-intel-value'], '300000');
+    assert.match(textOf(fee), /Estimated Pool Fee \$0\.3 per swap Not network gas/);
+    assert.match(textOf(fee), /Fee-valued: 75 \/ 100 swaps \(75\.0%\)/);
+    assert.match(textOf(fee), new RegExp(`Last ${window.toUpperCase()}`));
+    assert.ok(byAttr(sectionNode(tree, 'volume-chart'), 'data-intel-item', 'volume-chart.estimated-fee').length);
+  }
+  const summary = summaryFixture({ swapFees: feesWindow('9999900000', 99999, { unvaluedSwaps: 1 }) });
+  const fee = item(render({ selectedWindow: '24h', data: { ...READY_DATA, summary } }).tree, 'volume-chart.estimated-fee');
+  assert.match(textOf(fee), /99,999 \/ 100,000 swaps \(<100%\)/, 'rounding must not claim full coverage');
+});
+
+await test('DEX UI 5 unavailable fees and empty coverage never fabricate a zero USD fee or percentage', async () => {
+  for (const swapFees of [undefined, { status: 'unavailable', reason: 'prices_unavailable', averageFeeUsdMicros: null,
+    totalFeeUsdMicros: null, valuedSwaps: null, unvaluedSwaps: null },
+    { status: 'available', totalFeeUsdMicros: '0', averageFeeUsdMicros: null, valuedSwaps: 0, unvaluedSwaps: 0 }]) {
+    const summary = summaryFixture({ swapFees });
+    const tree = render({ selectedWindow: '24h', data: { ...READY_DATA, summary } }).tree;
+    const fee = item(tree, 'volume-chart.estimated-fee');
+    assert.equal(fee.attrs['data-intel-value'], undefined);
+    assert.doesNotMatch(textOf(fee), /\$0|NaN|Infinity|100%/);
+    assert.match(textOf(fee), /Not network gas/);
+    assert.equal(item(tree, 'network.dex-swaps').attrs['data-intel-value'], '5555', 'counts do not depend on fee or price coverage');
+  }
 });
 
 function releaseSubtree(relative, matches) {
