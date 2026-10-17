@@ -13,7 +13,7 @@ Machina Bridge is an independent, community-built interface for exploring activi
 | **Arc Intelligence** | Explore Arc network activity, DEX markets, token discovery, lending activity, and cross-chain observations. | Mainnet · Read-only Beta |
 | **Bridge** | Transfer USDC between Arc and supported Ethereum, Base, OP Mainnet, Arbitrum, and Solana routes. | Mainnet · Wallet-confirmed transactions |
 | **Earn** | Explore selected Arc USDC vaults and request deposits or withdrawals through Circle Earn Kit. | Mainnet · Supported vaults |
-| **Borrow** | View selected Morpho cirBTC-collateral / USDC-loan markets and their available terms. | Mainnet · **Read-only Preview** |
+| **Borrow** | View Morpho cirBTC-collateral / USDC-loan markets, price a borrow with Circle Borrow Kit quotes, and review a wallet's existing loans. | Mainnet · **Read-only Preview** |
 | **Swap** | Swap test assets using the Ethereum Sepolia interface. | **Testnet only** |
 
 The app also includes a separate testnet experience for development and experimentation. **Mainnet Gateway forwarding is not enabled.** Availability, supported routes, market terms, and liquidity may change.
@@ -60,9 +60,11 @@ Vaults are operated by third parties. Yields are not guaranteed, and funds remai
 
 ## Borrow Preview
 
-The Borrow Preview displays available terms for selected **Morpho cirBTC / USDC** markets on Arc using Circle Borrow Kit market data. Terms may include Borrow APY, liquidation LTV, utilization, and available liquidity.
+The Borrow tab shows the **Morpho cirBTC / USDC** markets on Arc through Circle Borrow Kit, with Borrow APY, liquidation LTV, utilization, and available liquidity for each market. After choosing a market, enter collateral and a borrow amount to see the maximum borrow for that collateral, the collateral needed for a chosen target health factor and, with a connected wallet, a full quote with fees, estimated gas, health factor, and liquidation price. A connected wallet's existing loans (collateral, debt, health factor, liquidation price) are listed read-only.
 
-**Borrow transactions are not enabled.** Users cannot open loans, repay debt, change collateral, or close loans through this preview. Transaction functionality will require a separately reviewed release; read-only market availability does not imply that borrowing is live.
+Anything the Borrow Service does not report is shown as "Not reported" rather than estimated. The borrow rate is variable, and a position can be liquidated when its health factor falls below 1.0; the tab states both risks.
+
+**Borrow transactions are not enabled.** The tab never asks a wallet to sign, approve a token, or send a transaction, and its action buttons are permanently disabled. Transaction functionality will require a separately reviewed release; read-only quotes do not imply that borrowing is live.
 
 The current source-level control is defined in [`src/config/mainnetBorrow.ts`](src/config/mainnetBorrow.ts).
 

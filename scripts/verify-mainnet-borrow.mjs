@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
@@ -800,7 +800,7 @@ await test('SDK write calls exist only behind the write gate in executeBorrowWri
   assert.ok(body.indexOf('getAdapter()') > gate, 'adapter is created after the gate')
 })
 
-await test('Borrow stays isolated from UI, Earn, Bridge and the intelligence engine', () => {
+await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reaches it only through read-only imports', () => {
   const sourceFiles = (directory) => readdirSync(directory).flatMap((entry) => {
     const path = join(directory, entry)
     return statSync(path).isDirectory() ? sourceFiles(path) : [path]
@@ -808,7 +808,23 @@ await test('Borrow stays isolated from UI, Earn, Bridge and the intelligence eng
   const importers = sourceFiles(join(root, 'src'))
     .filter((path) => /\.(ts|tsx)$/.test(path) && path !== libPath && path !== configPath)
     .filter((path) => /mainnetBorrow|borrow-kit/.test(readFileSync(path, 'utf8')))
-  assert.deepEqual(importers, [], 'no UI or other module imports Borrow yet')
+  // The Borrow tab, its pure helpers and the dashboard card are the only places that may import Borrow. Anything new
+  // has to be added here on purpose, after checking that it cannot reach a write.
+  assert.deepEqual(
+    importers.map((path) => relative(root, path)).sort(),
+    [
+      'src/components/ArcIntelligenceOverview.tsx',
+      'src/components/MainnetBorrow.tsx',
+      'src/lib/arcIntelligence.ts',
+      'src/lib/borrowPreview.ts',
+    ],
+    'unexpected module imports Borrow',
+  )
+  const WRITE_PATHS = /executeBorrowWrite|planBorrowWrite|detectAtomicBatchCapability|BorrowWriteClient|BorrowWriteAction|MAINNET_BORROW_WRITE_METHODS|getAdapter|useWalletClient|signTypedData|sendTransaction|writeContract|eth_sendTransaction|personal_sign/
+  for (const path of importers) {
+    const code = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+    assert.ok(!WRITE_PATHS.test(code), `${relative(root, path)} must not reach a Borrow write path`)
+  }
   const engine = sourceFiles(join(root, 'server/compact')).filter((path) => /borrow-kit|mainnetBorrow/.test(readFileSync(path, 'utf8')))
   assert.deepEqual(engine, [])
   assert.ok(!/earn-kit|bridge-kit|server\//.test(libSource))
