@@ -1101,7 +1101,8 @@ export const BORROW_MARKETS_SCHEMA = 'machina.borrow.markets.v2'
 
 export type BorrowMarketState =
   | { status: 'loading' }
-  | { status: 'available'; markets: BorrowMarket[] }
+  // complete is present (false) only when the proxy could not read every page Circle reported; a complete list carries no flag.
+  | { status: 'available'; markets: BorrowMarket[]; complete?: false }
   | { status: 'unavailable' }
 
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/
@@ -1154,7 +1155,8 @@ export async function loadArcBorrowMarkets(
     const valid = markets as BorrowMarket[]
     const ids = valid.map((entry) => entry.marketId.toLowerCase())
     if (!valid.length || new Set(ids).size !== ids.length) return { status: 'unavailable' }
-    return { status: 'available', markets: [...valid].sort((a, b) => (a.marketId.toLowerCase() < b.marketId.toLowerCase() ? -1 : 1)) }
+    const sorted = [...valid].sort((a, b) => (a.marketId.toLowerCase() < b.marketId.toLowerCase() ? -1 : 1))
+    return payload.complete === false ? { status: 'available', markets: sorted, complete: false } : { status: 'available', markets: sorted }
   } catch {
     return { status: 'unavailable' }
   }

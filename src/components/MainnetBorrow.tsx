@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useAccount } from 'wagmi'
-import { AlertTriangle, Banknote, Info, Lock, RefreshCw, ShieldAlert, Wallet } from 'lucide-react'
+import {
+  AlertTriangle,
+  Banknote,
+  CheckCircle2,
+  Clock,
+  HelpCircle,
+  Info,
+  Lock,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  Wallet,
+  XCircle,
+} from 'lucide-react'
 import {
   formatDecimalString,
   formatRatioPercent,
@@ -10,18 +23,31 @@ import {
   type BorrowMarketState,
 } from '../lib/arcIntelligence'
 import {
-  compareDecimals,
+  compareHealthFactor,
   describeBorrowError,
+  describeVerificationReason,
+  evaluateBorrowRisk,
   formatHealthFactor,
+  formatOraclePrice,
   formatUnitsText,
   healthBandTone,
   illustrativeYearlyInterest,
+  isHighUtilization,
   isZeroDecimal,
+  displayDigits,
+  liquidityStatus,
+  marketLiquidity,
+  smallestShown,
   parsePositiveAmount,
   sanitizeDecimalInput,
   totalGasWei,
+  compareDecimals,
   type HealthTone,
+  type Reading,
+  type RiskReport,
+  type RiskStatus,
 } from '../lib/borrowPreview'
+import { createViemMarketReader, verifyBorrowMarket, type MarketChainReader, type MarketVerification } from '../lib/borrowMarketVerification'
 import {
   getBorrowLoans,
   quoteBorrow,
@@ -36,13 +62,15 @@ import {
   type BorrowQuote,
   type BorrowReadClient,
 } from '../lib/mainnetBorrow'
+import { MAINNET_BORROW_HIGH_UTILIZATION, MAINNET_BORROW_MAX_LTV } from '../config/mainnetBorrow'
+import { MAINNET_CONFIG } from '../config/mainnet'
 import { MAINNET_ARC_NATIVE_CURRENCY } from '../config/mainnetNetworks'
 import { Container } from './ui'
 
-// Borrow tab (Mainnet), read only. Every number comes from the guarded Borrow Kit reads in src/lib/mainnetBorrow.ts or the
-// same-origin market proxy; a missing value is shown as "Not reported", never estimated. This module imports no write path
-// (executeBorrowWrite, planBorrowWrite, wallet capability probes): it cannot sign, approve or send anything, and its only
-// action buttons are permanently disabled.
+// Borrow tab (Mainnet), read only. Every number comes from the guarded Borrow Kit reads in src/lib/mainnetBorrow.ts, the
+// same-origin market proxy or Morpho Blue on-chain (view calls); a missing value is shown as "Not reported", never
+// estimated. This module imports no write path (executeBorrowWrite, planBorrowWrite, wallet capability probes): it cannot
+// sign, approve or send anything, and its only action buttons are permanently disabled.
 
 const TARGET_HEALTH_FACTORS = [1.25, 1.5, 2] as const
 const POSITIONS_PAGE_SIZE = 20
@@ -51,6 +79,13 @@ const DEBOUNCE_MS = 450
 const UNEXPECTED: BorrowAvailability<never> = { status: 'unavailable', error: { code: 'unexpected_error', retryable: false } }
 
 type Query<T> = { status: 'idle' } | { status: 'loading' } | BorrowAvailability<T>
+type IconType = typeof Clock
+
+let chainReader: MarketChainReader | null = null
+// Public Arc RPC view calls only; one reader (and its chain ID check) is shared by every market check.
+const defaultVerifyMarket = (market: BorrowMarket) => verifyBorrowMarket(market, (chainReader ??= createViemMarketReader(MAINNET_CONFIG.arcRpcUrl)))
+
+const shortAddress = (value: string) => (value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value)
 
 function useDebounced<T>(value: T, ms = DEBOUNCE_MS): T {
   const [debounced, setDebounced] = useState(value)
@@ -114,11 +149,10 @@ function usePositions(walletAddress: string | null, client: BorrowReadClient | u
 // Formatting
 
 const NOT_REPORTED = 'Not reported'
-const digitsFor = (decimals: number) => (decimals > 6 ? 8 : 2)
 
 function amountText(amount: BorrowAmount | null): string | null {
   if (!amount) return null
-  const shown = formatDecimalString(amount.amount, digitsFor(amount.decimals))
+  const shown = formatDecimalString(amount.amount, displayDigits(amount.decimals))
   return shown === null ? null : `${shown}\u00a0${amount.token}`
 }
 
@@ -243,9 +277,58 @@ function RiskNotice() {
 // ---------------------------------------------------------------------------------------------------------------------
 // Markets
 
-function MarketOption({ market, selected, onSelect, index }: { market: BorrowMarket; selected: boolean; onSelect: () => void; index: number }) {
-  const liquidity = amountText(market.liquidity)
-  const borrowed = amountText(market.borrowAssets)
+type BadgeTone = 'good' | 'bad' | 'warn' | 'neutral'
+
+const BADGE_CLASS: Record<BadgeTone, string> = {
+  good: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+  bad: 'border-red-200 bg-red-50 text-red-700',
+  warn: 'border-amber-200 bg-amber-50 text-amber-800',
+  neutral: 'border-slate-200 bg-slate-50 text-slate-600',
+}
+
+function Badge({ tone, icon: Icon, title, children }: { tone: BadgeTone; icon: IconType; title?: string; children: ReactNode }) {
+  return (
+    <span title={title} className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${BADGE_CLASS[tone]}`}>
+      <Icon size={11} />
+      {children}
+    </span>
+  )
+}
+
+// Only a completed on-chain match is "verified"; every other state, including a failed check, reads as not verified.
+function VerificationBadge({ verification }: { verification: MarketVerification | undefined }) {
+  if (!verification || verification.status === 'checking') return <Badge tone="neutral" icon={Clock}>Checking on-chain</Badge>
+  if (verification.status === 'verified') {
+    return (
+      <Badge tone="good" icon={ShieldCheck} title="The market ID, tokens and LLTV match Morpho on Arc, and the market has an oracle and rate model. A data check, not a safety rating.">
+        Verified on-chain
+      </Badge>
+    )
+  }
+  if (verification.status === 'unverified') return <Badge tone="bad" icon={ShieldAlert}>Not verified</Badge>
+  return <Badge tone="warn" icon={ShieldAlert} title="Morpho could not be read, so nothing was checked.">Not verified · on-chain check unavailable</Badge>
+}
+
+function MarketOption({ market, verification, borrowAmount, selected, onSelect }: {
+  market: BorrowMarket
+  verification: MarketVerification | undefined
+  borrowAmount: string | null
+  selected: boolean
+  onSelect: () => void
+}) {
+  const details = verification && (verification.status === 'verified' || verification.status === 'unverified') ? verification.details : null
+  const view = marketLiquidity(market, verification)
+  const loanDigits = displayDigits(market.loanAsset.decimals)
+  const liquidity = liquidityStatus(view, borrowAmount, loanDigits)
+  const insufficient = liquidity.status === 'none' || liquidity.status === 'short'
+  const highUtilization = isHighUtilization(market.utilization, MAINNET_BORROW_HIGH_UTILIZATION)
+  const oracleMissing = details !== null && details.oraclePrice === null
+  const oraclePrice = details && details.oraclePrice !== null
+    ? formatOraclePrice(details.oraclePrice, market.loanAsset.decimals, market.collateralAsset.decimals) : null
+  const loanText = (value: string | null) => {
+    const shown = value === null ? null : formatDecimalString(value, loanDigits)
+    return shown === null ? null : `${shown} ${market.loanAsset.symbol}`
+  }
   return (
     <button
       type="button"
@@ -257,18 +340,61 @@ function MarketOption({ market, selected, onSelect, index }: { market: BorrowMar
         selected ? 'border-[#66D121]/60 bg-[#eef7e8] ring-1 ring-[#66D121]/30' : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'
       }`}
     >
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-sm font-semibold text-slate-900">Market {index + 1}</span>
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-sm font-semibold text-slate-900">{market.collateralAsset.symbol} / {market.loanAsset.symbol}</span>
         <span title={market.marketId} className="font-mono text-[11px] text-slate-500">{shortenMarketId(market.marketId)}</span>
       </div>
-      <p className="mt-0.5 text-[11px] text-slate-500">{market.collateralAsset.symbol} collateral · {market.loanAsset.symbol} loan · Morpho</p>
+      <p className="mt-0.5 text-[11px] text-slate-500">Morpho · {market.collateralAsset.symbol} collateral, {market.loanAsset.symbol} loan</p>
+      <div className="mt-2 flex flex-wrap gap-1.5" data-borrow-flags>
+        <VerificationBadge verification={verification} />
+        {insufficient && <Badge tone="bad" icon={XCircle}>Insufficient Liquidity</Badge>}
+        {highUtilization && <Badge tone="warn" icon={AlertTriangle}>High utilization</Badge>}
+        {oracleMissing && <Badge tone="bad" icon={XCircle}>Oracle data missing</Badge>}
+      </div>
       <dl className="mt-2 divide-y divide-slate-100">
         <Metric label="Borrow APY" note="Variable" value={percentText(market.borrowApy)} strong />
         <Metric label="Liquidation LTV (LLTV)" value={percentText(market.lltv)} />
-        <Metric label="Available liquidity" value={liquidity} />
+        <Metric label="Available liquidity" value={amountText(market.liquidity)} />
+        {view.onchain !== null && <Metric label="Liquidity on-chain" note="Morpho supply minus borrow" value={loanText(view.onchain)} />}
         <Metric label="Utilization" value={percentText(market.utilization)} />
-        <Metric label="Total borrowed" value={borrowed} />
+        <Metric label="Total borrowed" value={amountText(market.borrowAssets)} />
       </dl>
+      {insufficient && (
+        <p className="mt-2 text-[11px] leading-4 text-red-700">
+          {liquidity.status === 'none'
+            ? `No usable liquidity: less than ${smallestShown(loanDigits)} ${market.loanAsset.symbol} is available to borrow.`
+            : `Only ${loanText(view.available) ?? 'a smaller amount'} is available, below your borrow amount.`}
+        </p>
+      )}
+      {highUtilization && (
+        <p className="mt-2 text-[11px] leading-4 text-amber-800">
+          Utilization is at or above {formatRatioPercent(MAINNET_BORROW_HIGH_UTILIZATION)}: little liquidity is left and the rate can move quickly.
+        </p>
+      )}
+      {verification?.status === 'unverified' && (
+        <ul className="mt-2 space-y-0.5 text-[11px] leading-4 text-red-700">
+          {verification.reasons.map((reason) => <li key={reason}>{describeVerificationReason(reason)}</li>)}
+        </ul>
+      )}
+      {verification?.status === 'unavailable' && (
+        <p className="mt-2 text-[11px] leading-4 text-amber-800">Morpho could not be read on-chain, so this market is not verified. Do not rely on it.</p>
+      )}
+      {details && (
+        <dl className="mt-2 space-y-0.5 border-t border-slate-100 pt-2 text-[11px] leading-5 text-slate-500">
+          <div className="flex justify-between gap-2">
+            <dt>Oracle</dt>
+            <dd className="font-mono" title={details.params.oracle}>{shortAddress(details.params.oracle)}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt>Oracle price</dt>
+            <dd className="text-right">{oraclePrice === null ? 'Not available' : `${oraclePrice} ${market.loanAsset.symbol} per ${market.collateralAsset.symbol}`}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt>Rate model</dt>
+            <dd className="font-mono" title={details.params.irm}>{shortAddress(details.params.irm)}</dd>
+          </div>
+        </dl>
+      )}
       <p className="mt-2 text-[11px] text-slate-400">
         {market.refreshedAt ? `Updated ${formatUtcDateTime(market.refreshedAt)}` : 'Update time not reported'}
       </p>
@@ -276,8 +402,10 @@ function MarketOption({ market, selected, onSelect, index }: { market: BorrowMar
   )
 }
 
-function MarketsSection({ state, selectedId, onSelect, onReload }: {
+function MarketsSection({ state, verifications, borrowAmount, selectedId, onSelect, onReload }: {
   state: BorrowMarketState
+  verifications: Record<string, MarketVerification>
+  borrowAmount: string | null
   selectedId: string | null
   onSelect: (marketId: string) => void
   onReload: () => void
@@ -288,7 +416,7 @@ function MarketsSection({ state, selectedId, onSelect, onReload }: {
       <div data-borrow-section="markets">
         <SectionTitle
           title="Arc cirBTC / USDC markets"
-          hint="Borrow USDC against cirBTC. Choose the market to quote; markets are listed by ID and the order is not a ranking."
+          hint="Borrow USDC against cirBTC. Choose the market to quote; markets are listed by ID and the order is not a ranking. Flags state facts about a market; they are not advice."
         />
         {state.status === 'loading' && <LoadingBars rows={4} />}
         {state.status === 'unavailable' && (
@@ -297,18 +425,27 @@ function MarketsSection({ state, selectedId, onSelect, onReload }: {
             <button type="button" onClick={onReload} className="mt-2 font-semibold underline underline-offset-2">Try again</button>
           </Notice>
         )}
+        {state.status === 'available' && state.complete === false && (
+          <div className="mb-3" data-borrow-incomplete>
+            <Notice tone="warn">
+              The market list may be incomplete: Circle reported more markets than could be read in one request. A market that matters to you
+              may be missing. Try again later.
+            </Notice>
+          </div>
+        )}
         {state.status === 'available' && (
           <div role="radiogroup" aria-label="Borrow market" className={`grid gap-3 ${markets.length > 1 ? 'md:grid-cols-2' : ''}`}>
-            {markets.map((market, index) => (
-              <MarketOption key={market.marketId} market={market} index={index} selected={market.marketId === selectedId}
-                onSelect={() => onSelect(market.marketId)} />
+            {markets.map((market) => (
+              <MarketOption key={market.marketId} market={market} verification={verifications[market.marketId.toLowerCase()]}
+                borrowAmount={borrowAmount} selected={market.marketId === selectedId} onSelect={() => onSelect(market.marketId)} />
             ))}
           </div>
         )}
         {state.status === 'available' && (
           <p className="mt-3 text-[11px] leading-5 text-slate-400">
-            Market terms come from Circle Borrow Kit through Machina&apos;s read-only proxy and may be up to five minutes old. APY and
-            utilization change with the market.
+            Terms come from Circle Borrow Kit through Machina&apos;s read-only proxy and may be up to five minutes old. Each market is also
+            checked against Morpho on Arc: the market ID must hash from the on-chain parameters, and the tokens and LLTV must match. Oracle and
+            rate model addresses are read from the same on-chain parameters. A market that cannot be checked is never shown as verified.
           </p>
         )}
       </div>
@@ -355,6 +492,12 @@ function quoteOf<K extends BorrowQuote['kind']>(query: Query<BorrowQuote>, kind:
   return query.status === 'available' && query.data.kind === kind ? (query.data as Extract<BorrowQuote, { kind: K }>) : null
 }
 
+// A read for the risk checks: its value, null when the read failed, 'pending' while it is idle or loading.
+function reading<T>(query: Query<BorrowQuote>, pick: (quote: BorrowQuote) => T | null): Reading<T> {
+  if (query.status === 'available') return pick(query.data)
+  return query.status === 'unavailable' ? null : 'pending'
+}
+
 function QueryState({ query, idle, onRetry }: { query: Query<BorrowQuote>; idle: string; onRetry?: () => void }) {
   if (query.status === 'idle') return <p className="text-xs leading-5 text-slate-400">{idle}</p>
   if (query.status === 'loading') return <LoadingBars rows={3} />
@@ -372,16 +515,68 @@ function QuotePanel({ title, hint, children }: { title: string; hint: string; ch
   )
 }
 
-function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
+const RISK_STYLE: Record<RiskStatus, { icon: IconType; className: string; label: string }> = {
+  pass: { icon: CheckCircle2, className: 'text-emerald-600', label: 'Pass' },
+  warn: { icon: AlertTriangle, className: 'text-amber-600', label: 'Warning' },
+  fail: { icon: XCircle, className: 'text-red-600', label: 'Fail' },
+  unknown: { icon: HelpCircle, className: 'text-red-600', label: 'Cannot be evaluated' },
+  pending: { icon: Clock, className: 'text-slate-400', label: 'Waiting' },
+}
+
+function RiskChecks({ report }: { report: RiskReport }) {
+  if (report.checks.length === 0) return null
+  const failed = report.checks.filter((check) => check.status === 'fail').length
+  const unknown = report.checks.filter((check) => check.status === 'unknown').length
+  const warnings = report.checks.filter((check) => check.status === 'warn').length
+  const summary = report.blocked
+    ? { tone: 'text-red-700', text: `A borrow would be blocked: ${failed} failed, ${unknown} cannot be evaluated.` }
+    : report.pending
+      ? { tone: 'text-slate-500', text: 'Some checks are waiting for input or data.' }
+      : warnings > 0
+        ? { tone: 'text-amber-700', text: `No check failed, but ${warnings} warning${warnings === 1 ? '' : 's'} need${warnings === 1 ? 's' : ''} attention. This does not protect against liquidation.` }
+        : { tone: 'text-emerald-700', text: 'All checks pass. This does not protect against liquidation.' }
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4" data-borrow-risk>
+      <h3 className="text-sm font-semibold text-slate-900">Risk checks (read only)</h3>
+      <p className="mb-2 mt-0.5 text-[11px] leading-4 text-slate-500">
+        Limits Machina would apply to a future borrow: {formatRatioPercent(MAINNET_BORROW_MAX_LTV)} loan-to-value and a {formatRatioPercent(MAINNET_BORROW_HIGH_UTILIZATION)} utilization
+        flag. They are fixed labels, not market data, and a pass is not a guarantee against liquidation. Missing data is never counted as a pass.
+      </p>
+      <ul className="space-y-2">
+        {report.checks.map((check) => {
+          const style = RISK_STYLE[check.status]
+          return (
+            <li key={check.id} data-risk-check={check.id} data-risk-status={check.status} className="flex items-start gap-2 text-xs leading-5 text-slate-700">
+              <style.icon size={14} className={`mt-0.5 shrink-0 ${style.className}`} />
+              <span className="min-w-0 [overflow-wrap:anywhere]"><span className={`font-semibold ${style.className}`}>{style.label}.</span> {check.text}</span>
+            </li>
+          )
+        })}
+      </ul>
+      <p className={`mt-3 text-xs font-semibold ${summary.tone}`} data-risk-summary>{summary.text}</p>
+    </div>
+  )
+}
+
+type QuoteInputs = {
+  collateralText: string
+  borrowText: string
+  targetHealthFactor: number
+  setCollateralText: (value: string) => void
+  setBorrowText: (value: string) => void
+  setTargetHealthFactor: (value: number) => void
+}
+
+function QuoteBuilder({ market, verification, walletAddress, client, refresh, bump, inputs }: {
   market: BorrowMarket | null
+  verification: MarketVerification | undefined
   walletAddress: string | null
   client: BorrowReadClient | undefined
   refresh: number
   bump: () => void
+  inputs: QuoteInputs
 }) {
-  const [collateralText, setCollateralText] = useState('')
-  const [borrowText, setBorrowText] = useState('')
-  const [targetHealthFactor, setTargetHealthFactor] = useState<number>(1.5)
+  const { collateralText, borrowText, targetHealthFactor } = inputs
 
   const collateralInput = useDebounced(market ? parsePositiveAmount(collateralText) : null)
   const borrowInput = useDebounced(market ? parsePositiveAmount(borrowText) : null)
@@ -406,22 +601,29 @@ function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
   const required = quoteOf(sizing, 'required-collateral')
   const full = quoteOf(borrowQuote, 'borrow')
 
-  // Comparisons between what was typed and what the service reported; nothing here is estimated.
-  const checks: { tone: 'warn' | 'info'; text: string }[] = []
-  if (market && borrowInput && market.liquidity && compareDecimals(borrowInput, market.liquidity.amount) > 0) {
-    checks.push({ tone: 'warn', text: `The borrow amount is above the market's reported available liquidity (${amountText(market.liquidity)}).` })
-  }
-  if (borrowInput && max && compareDecimals(borrowInput, max.maxBorrow.amount) > 0) {
-    checks.push({ tone: 'warn', text: `The borrow amount is above the maximum the service reports for your collateral (${amountText(max.maxBorrow)}).` })
-  }
-  if (collateralInput && required) {
-    checks.push(compareDecimals(collateralInput, required.requiredCollateral.amount) < 0
-      ? { tone: 'warn', text: `Your collateral is below the ${amountText(required.requiredCollateral)} the service sizes for a ${targetHealthFactor} health factor on this borrow.` }
-      : { tone: 'info', text: `Your collateral covers the ${amountText(required.requiredCollateral)} the service sizes for a ${targetHealthFactor} health factor on this borrow.` })
-  }
+  // The collateral the user typed against what the service sizes for the chosen target; nothing here is estimated.
+  const collateralNotice = collateralInput && required
+    ? compareDecimals(collateralInput, required.requiredCollateral.amount) < 0
+      ? { tone: 'warn' as const, text: `Your collateral is below the ${amountText(required.requiredCollateral)} the service sizes for a ${targetHealthFactor.toFixed(2)} health factor on this borrow.` }
+      : { tone: 'info' as const, text: `Your collateral covers the ${amountText(required.requiredCollateral)} the service sizes for a ${targetHealthFactor.toFixed(2)} health factor on this borrow.` }
+    : null
+
+  const risk = evaluateBorrowRisk({
+    market,
+    verification: market ? verification ?? { status: 'checking' } : null,
+    borrowAmount: borrowInput,
+    collateralAmount: collateralInput,
+    targetHealthFactor,
+    maxBorrow: reading(maxBorrow, (quote) => (quote.kind === 'max-borrow' ? quote.maxBorrow : null)),
+    sizing: reading(sizing, (quote) => (quote.kind === 'required-collateral' ? { healthFactor: quote.resultingHealthFactor } : null)),
+    full: reading(borrowQuote, (quote) => (quote.kind === 'borrow' ? { ltv: quote.resultingLtv, healthFactor: quote.resultingHealthFactor } : null)),
+    limits: { maxLtv: MAINNET_BORROW_MAX_LTV, highUtilization: MAINNET_BORROW_HIGH_UTILIZATION },
+  })
 
   const gasWei = full ? totalGasWei(full.gasFees) : null
   const interest = full ? illustrativeYearlyInterest(full.loanAsset.amount, full.borrowApy) : null
+  const quotedHealthFactor = full ? full.resultingHealthFactor : null
+  const gap = quotedHealthFactor !== null ? compareHealthFactor(targetHealthFactor, quotedHealthFactor) : null
   const noMarket = market === null
 
   return (
@@ -433,19 +635,24 @@ function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
           right={<span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600"><Lock size={11} />Preview only</span>}
         />
         {noMarket && <div className="mb-4"><Notice tone="info">Choose a market above to start a quote.</Notice></div>}
+        {market && verification && verification.status !== 'verified' && verification.status !== 'checking' && (
+          <div className="mb-4" data-borrow-unverified>
+            <Notice tone="warn">This market is not verified on-chain. Treat these quotes as unconfirmed and do not rely on them.</Notice>
+          </div>
+        )}
         <div className="grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
           <div className="min-w-0 space-y-4">
             <AmountField id="borrow-collateral" label={`Collateral (${collateralSymbol})`} symbol={collateralSymbol} value={collateralText}
               disabled={noMarket} hint={`Up to ${market?.collateralAsset.decimals ?? 8} decimals.`}
-              onChange={(value) => setCollateralText(sanitizeDecimalInput(value, market?.collateralAsset.decimals ?? 8))} />
+              onChange={(value) => inputs.setCollateralText(sanitizeDecimalInput(value, market?.collateralAsset.decimals ?? 8))} />
             <AmountField id="borrow-amount" label={`Borrow amount (${loanSymbol})`} symbol={loanSymbol} value={borrowText}
               disabled={noMarket} hint={`Up to ${market?.loanAsset.decimals ?? 6} decimals.`}
-              onChange={(value) => setBorrowText(sanitizeDecimalInput(value, market?.loanAsset.decimals ?? 6))} />
+              onChange={(value) => inputs.setBorrowText(sanitizeDecimalInput(value, market?.loanAsset.decimals ?? 6))} />
             <div>
               <p className="text-sm font-medium text-slate-700">Target health factor</p>
               <div className="mt-1.5 inline-flex rounded-xl border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="Target health factor">
                 {TARGET_HEALTH_FACTORS.map((value) => (
-                  <button key={value} type="button" aria-pressed={targetHealthFactor === value} onClick={() => setTargetHealthFactor(value)}
+                  <button key={value} type="button" aria-pressed={targetHealthFactor === value} onClick={() => inputs.setTargetHealthFactor(value)}
                     className={`h-8 rounded-[9px] px-3 text-xs font-semibold transition-colors ${
                       targetHealthFactor === value ? 'bg-white text-slate-900 shadow-sm ring-1 ring-[#66D121]/30' : 'text-slate-500 hover:bg-white/70 hover:text-slate-800'
                     }`}>
@@ -453,7 +660,7 @@ function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
                   </button>
                 ))}
               </div>
-              <p className="mt-1 text-[11px] leading-4 text-slate-400">Used to size the collateral for your borrow amount. Higher means a wider margin above liquidation.</p>
+              <p className="mt-1 text-[11px] leading-4 text-slate-400">Used to size the collateral for your borrow amount. Higher means a wider margin above liquidation. The full wallet quote sizes collateral on its own terms, so its health factor can differ.</p>
             </div>
             {!walletAddress && (
               <Notice tone="info">
@@ -467,15 +674,24 @@ function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
             <QuotePanel title="For your collateral" hint="What your collateral supports, from the Borrow Service.">
               <QueryState query={maxBorrow} idle="Enter a collateral amount to see the maximum borrow." onRetry={bump} />
               {max && (
-                <dl className="divide-y divide-slate-100">
-                  <Metric label="Maximum borrow" note="At the liquidation threshold, not a safe amount" value={amountText(max.maxBorrow)} strong />
-                  <Metric label="Health factor at that borrow" value={healthValue(max.resultingHealthFactor, null)} />
-                  <Metric label="Liquidation price" note={`${collateralSymbol} price in ${loanSymbol} at which the loan becomes liquidatable`} value={amountText(max.liquidationPrice)} />
-                </dl>
+                <>
+                  <dl className="divide-y divide-slate-100">
+                    <Metric label="Maximum borrow" note="At the liquidation threshold, not a safe amount" value={amountText(max.maxBorrow)} strong />
+                    <Metric label="Health factor at that borrow" value={healthValue(max.resultingHealthFactor, null)} />
+                    <Metric label="Liquidation price" note={`${collateralSymbol} price in ${loanSymbol} at which the loan becomes liquidatable`} value={amountText(max.liquidationPrice)} />
+                  </dl>
+                  <div className="mt-2" data-borrow-max-warning>
+                    <Notice tone="warn">
+                      The maximum borrow is not a safe borrow amount. It is the most this collateral supports: the health factor there is{' '}
+                      {max.resultingHealthFactor === null ? 'not reported' : formatHealthFactor(max.resultingHealthFactor)}, and liquidation starts
+                      below 1.0, so a small price move or the interest that accrues can make the loan liquidatable. Borrow well below it.
+                    </Notice>
+                  </div>
+                </>
               )}
             </QuotePanel>
 
-            <QuotePanel title="For your borrow amount" hint={`Collateral the service sizes to reach a ${targetHealthFactor} health factor.`}>
+            <QuotePanel title="For your borrow amount" hint={`Collateral the service sizes to reach a ${targetHealthFactor.toFixed(2)} health factor.`}>
               <QueryState query={sizing} idle="Enter a borrow amount to size the collateral." onRetry={bump} />
               {required && (
                 <dl className="divide-y divide-slate-100">
@@ -484,36 +700,50 @@ function QuoteBuilder({ market, walletAddress, client, refresh, bump }: {
                   <Metric label="Liquidation price" value={amountText(required.liquidationPrice)} />
                 </dl>
               )}
+              {collateralNotice && <div className="mt-2"><Notice tone={collateralNotice.tone}>{collateralNotice.text}</Notice></div>}
             </QuotePanel>
 
             <QuotePanel title="Full quote for your wallet" hint="Priced by the Borrow Service for the connected wallet, with fees and gas. Collateral is sized by the service.">
               {!walletAddress && <p className="text-xs leading-5 text-slate-400">Connect a wallet and enter a borrow amount to see this quote.</p>}
               {walletAddress && <QueryState query={borrowQuote} idle="Enter a borrow amount to see this quote." onRetry={bump} />}
               {full && (
-                <dl className="divide-y divide-slate-100">
-                  <Metric label="You receive" value={amountText(full.loanAsset)} strong />
-                  <Metric label="Collateral the service sizes" value={amountText(full.collateral)} />
-                  <Metric label="Borrow APY" note="Variable" value={percentText(full.borrowApy)} />
-                  <Metric label="Resulting LTV" value={percentText(full.resultingLtv)} />
-                  <Metric label="Health factor" value={healthValue(full.resultingHealthFactor, full.resultingBand)} />
-                  <Metric label="Liquidation price" value={amountText(full.liquidationPrice)} />
-                  {full.fees.map((fee, index) => (
-                    <Metric key={`${fee.type}-${index}`} label={`Fee · ${fee.type}`} value={amountText(fee.amount)} />
-                  ))}
-                  {full.fees.length === 0 && <Metric label="Fees" value="None in this quote" />}
-                  <Metric label="Estimated network gas" note={gasWei === null ? undefined : `${full.gasFees.length} step${full.gasFees.length === 1 ? '' : 's'}`}
-                    value={gasWei === null ? null : `${formatUnitsText(gasWei, MAINNET_ARC_NATIVE_CURRENCY.decimals, 6)} ${MAINNET_ARC_NATIVE_CURRENCY.symbol}`} />
-                  <Metric label="Illustrative interest, one year" note="Machina arithmetic: amount × quoted APY, if the rate never changed. Not a service figure."
-                    value={interest === null ? null : `≈\u00a0${interest}\u00a0${full.loanAsset.token}`} />
-                </dl>
+                <>
+                  <dl className="divide-y divide-slate-100">
+                    <Metric label="You receive" value={amountText(full.loanAsset)} strong />
+                    <Metric label="Collateral the service sizes" value={amountText(full.collateral)} />
+                    <Metric label="Borrow APY" note="Variable" value={percentText(full.borrowApy)} />
+                    <Metric label="Resulting LTV" value={percentText(full.resultingLtv)} />
+                    <Metric label="Health factor in this quote" value={healthValue(full.resultingHealthFactor, full.resultingBand)} />
+                    <Metric label="Your target health factor" value={targetHealthFactor.toFixed(2)} />
+                    <Metric label="Quote vs your target" value={gap === null ? null : (
+                      <span data-borrow-hf-gap={gap.relation} className={gap.relation === 'below' ? 'text-amber-700' : 'text-slate-800'}>
+                        {gap.relation === 'at' ? 'Matches the target' : `${Math.abs(gap.delta).toFixed(2)} ${gap.relation} the target`}
+                      </span>
+                    )} />
+                    <Metric label="Liquidation price" value={amountText(full.liquidationPrice)} />
+                    {full.fees.map((fee, index) => (
+                      <Metric key={`${fee.type}-${index}`} label={`Fee · ${fee.type}`} value={amountText(fee.amount)} />
+                    ))}
+                    {full.fees.length === 0 && <Metric label="Fees" value="None in this quote" />}
+                    <Metric label="Estimated network gas" note={gasWei === null ? undefined : `${full.gasFees.length} step${full.gasFees.length === 1 ? '' : 's'}`}
+                      value={gasWei === null ? null : `${formatUnitsText(gasWei, MAINNET_ARC_NATIVE_CURRENCY.decimals, 6)} ${MAINNET_ARC_NATIVE_CURRENCY.symbol}`} />
+                    <Metric label="Illustrative interest, one year" note="Machina arithmetic: amount × quoted APY, if the rate never changed. Not a service figure."
+                      value={interest === null ? null : `≈ ${interest} ${full.loanAsset.token}`} />
+                  </dl>
+                  {gap && gap.relation === 'below' && quotedHealthFactor !== null && (
+                    <div className="mt-2" data-borrow-hf-warning>
+                      <Notice tone="warn">
+                        This quote's health factor ({formatHealthFactor(quotedHealthFactor)}) is {Math.abs(gap.delta).toFixed(2)} below the {targetHealthFactor.toFixed(2)} you
+                        chose, because the Borrow Kit quote sizes collateral on its own terms.
+                        {required ? ` The ${amountText(required.requiredCollateral)} above is what the service sizes for ${targetHealthFactor.toFixed(2)}.` : ''}
+                      </Notice>
+                    </div>
+                  )}
+                </>
               )}
             </QuotePanel>
 
-            {checks.length > 0 && (
-              <div className="space-y-2" data-borrow-checks>
-                {checks.map((check) => <Notice key={check.text} tone={check.tone}>{check.text}</Notice>)}
-              </div>
-            )}
+            <RiskChecks report={risk} />
           </div>
         </div>
 
@@ -630,17 +860,24 @@ function PositionsSection({ walletAddress, client, markets, refresh, bump }: {
 
 export type BorrowWorkspaceProps = {
   walletAddress: string | null
-  // Test seams. Production passes neither: reads go through the guarded Borrow Kit boundary and the market proxy.
+  // Test seams. Production passes none: reads go through the guarded Borrow Kit boundary, the market proxy and the Arc RPC.
   client?: BorrowReadClient
   loadMarkets?: () => Promise<BorrowMarketState>
+  verifyMarket?: (market: BorrowMarket) => Promise<MarketVerification>
 }
 
-export function BorrowWorkspace({ walletAddress, client, loadMarkets }: BorrowWorkspaceProps) {
+export function BorrowWorkspace({ walletAddress, client, loadMarkets, verifyMarket }: BorrowWorkspaceProps) {
   const [refresh, setRefresh] = useState(0)
   const [marketsState, setMarketsState] = useState<BorrowMarketState>({ status: 'loading' })
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [verifications, setVerifications] = useState<Record<string, MarketVerification>>({})
+  const [collateralText, setCollateralText] = useState('')
+  const [borrowText, setBorrowText] = useState('')
+  const [targetHealthFactor, setTargetHealthFactor] = useState<number>(1.5)
   const loadMarketsRef = useRef(loadMarkets)
   loadMarketsRef.current = loadMarkets
+  const verifyMarketRef = useRef(verifyMarket)
+  verifyMarketRef.current = verifyMarket
 
   useEffect(() => {
     let live = true
@@ -656,9 +893,25 @@ export function BorrowWorkspace({ walletAddress, client, loadMarkets }: BorrowWo
     return () => { live = false }
   }, [refresh])
 
+  // Every listed market is checked against Morpho on-chain; the check never changes which markets are listed or their order.
+  useEffect(() => {
+    if (marketsState.status !== 'available') return undefined
+    let live = true
+    const verify = verifyMarketRef.current ?? defaultVerifyMarket
+    setVerifications(Object.fromEntries(marketsState.markets.map((market) => [market.marketId.toLowerCase(), { status: 'checking' } as MarketVerification])))
+    for (const market of marketsState.markets) {
+      verify(market).then(
+        (result) => { if (live) setVerifications((current) => ({ ...current, [market.marketId.toLowerCase()]: result })) },
+        () => { if (live) setVerifications((current) => ({ ...current, [market.marketId.toLowerCase()]: { status: 'unavailable' } })) },
+      )
+    }
+    return () => { live = false }
+  }, [marketsState])
+
   const markets = marketsState.status === 'available' ? marketsState.markets : []
   const selected = markets.find((market) => market.marketId === selectedId) ?? null
   const bump = useCallback(() => setRefresh((value) => value + 1), [])
+  const inputs: QuoteInputs = { collateralText, borrowText, targetHealthFactor, setCollateralText, setBorrowText, setTargetHealthFactor }
 
   return (
     <Container className="py-8">
@@ -683,8 +936,10 @@ export function BorrowWorkspace({ walletAddress, client, loadMarkets }: BorrowWo
 
       <div className="space-y-5">
         <RiskNotice />
-        <MarketsSection state={marketsState} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
-        <QuoteBuilder market={selected} walletAddress={walletAddress} client={client} refresh={refresh} bump={bump} />
+        <MarketsSection state={marketsState} verifications={verifications} borrowAmount={parsePositiveAmount(borrowText)} selectedId={selectedId}
+          onSelect={setSelectedId} onReload={bump} />
+        <QuoteBuilder market={selected} verification={selected ? verifications[selected.marketId.toLowerCase()] : undefined}
+          walletAddress={walletAddress} client={client} refresh={refresh} bump={bump} inputs={inputs} />
         <PositionsSection walletAddress={walletAddress} client={client} markets={markets} refresh={refresh} bump={bump} />
       </div>
 

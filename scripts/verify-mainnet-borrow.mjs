@@ -816,6 +816,7 @@ await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reach
       'src/components/ArcIntelligenceOverview.tsx',
       'src/components/MainnetBorrow.tsx',
       'src/lib/arcIntelligence.ts',
+      'src/lib/borrowMarketVerification.ts',
       'src/lib/borrowPreview.ts',
     ],
     'unexpected module imports Borrow',

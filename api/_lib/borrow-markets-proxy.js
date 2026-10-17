@@ -1,7 +1,8 @@
-// Vercel /api/borrow-markets: a strict, read-only, same-origin proxy for the Borrow card's market terms. It makes exactly
-// one request, to one fixed keyless Circle Borrow Kit URL (the same route @circle-fin/borrow-kit exploreMarkets uses for
-// Arc); no user input reaches the URL, no request header or credential is forwarded, and nothing here can sign, approve
-// or write. The upstream wire format ({ data: { markets } } with { raw, decimals } amounts) is validated and mapped the
+// Vercel /api/borrow-markets: a strict, read-only, same-origin proxy for the Borrow card's market terms. It requests one
+// fixed keyless Circle Borrow Kit URL (the same route @circle-fin/borrow-kit exploreMarkets uses for Arc). Only when Circle
+// itself returns a next-page cursor does it follow it, at most MAX_PAGES pages in total within the one timeout; the cursor
+// must be a short plain token and is the only addition to the URL. No user input reaches the URL, no request header or
+// credential is forwarded, and nothing here can sign, approve or write. The upstream wire format ({ data: { markets } } with { raw, decimals } amounts) is validated and mapped the
 // way the Borrow Kit SDK maps it (toMarketInfo), with the same rules as the guarded read boundary in
 // src/lib/mainnetBorrow.ts: anything malformed fails the whole answer instead of being guessed, and a missing value
 // stays null, never zero. Failures become fixed, sanitized errors; success is briefly CDN-cacheable.
@@ -16,6 +17,10 @@ const UPSTREAM_URL = 'https://api.circle.com/v1/borrowKit/markets?chain=ARC&page
 const UPSTREAM_CHAIN = 'ARC'
 const REQUEST_TIMEOUT_MS = 8_000
 const MAX_UPSTREAM_BYTES = 256 * 1024
+// Circle serves markets in pages of 20 with an opaque cursor; 14 markets fit one page today. The cap keeps the work and the
+// memory bounded, and a list that does not finish inside it is reported as incomplete, never as complete.
+const MAX_PAGES = 5
+const CURSOR = /^[A-Za-z0-9_\-+=.:~/]{1,512}$/
 const UNAVAILABLE = 'Borrow market data is temporarily unavailable'
 
 export const BORROW_MARKETS_SCHEMA = 'machina.borrow.markets.v2'
@@ -96,6 +101,14 @@ export function normalizeBorrowMarketsPage(payload) {
   return data.markets.map(market)
 }
 
+// Circle's next-page cursor: absent on the last page. A cursor that is not a short plain token is not followed.
+export function nextPage(payload) {
+  const pagination = record(record(payload).data).pagination
+  const after = pagination && typeof pagination === 'object' ? pagination.pageAfter : undefined
+  if (after === undefined || after === null) return { more: false, cursor: null }
+  return { more: true, cursor: typeof after === 'string' && CURSOR.test(after) ? after : null }
+}
+
 // Every validated cirBTC/USDC market of the page, by verified token identity, ordered by market ID (display only).
 // Throws MalformedMarket when a canonical token address carries another identity or a market ID repeats.
 export function compatibleBorrowMarkets(markets) {
@@ -118,6 +131,31 @@ const errorResponse = (status, message = UNAVAILABLE, extraHeaders = {}) => ({
   body: JSON.stringify({ error: message }),
 })
 
+// One upstream page: { markets, next } or { failure: 503 | 502 }. Never throws and never exposes upstream text.
+async function fetchPage(fetchImpl, pageUrl, signal) {
+  let text
+  try {
+    const response = await fetchImpl(pageUrl, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      redirect: 'manual',
+      signal,
+    })
+    if (response.status >= 500) return { failure: 503 }
+    if (response.status !== 200) return { failure: 502 }
+    text = await response.text()
+  } catch {
+    return { failure: 503 }
+  }
+  if (typeof text !== 'string' || text.length > MAX_UPSTREAM_BYTES) return { failure: 502 }
+  try {
+    const payload = JSON.parse(text)
+    return { markets: normalizeBorrowMarketsPage(payload), next: nextPage(payload) }
+  } catch {
+    return { failure: 502 }
+  }
+}
+
 // send({ status, headers, body }): body is always a JSON string.
 export async function handleBorrowMarketsProxy({ method, headers = {}, query = {}, send, fetchImpl = fetch }) {
   if (method !== 'GET') return send(errorResponse(405, 'Method not allowed', { Allow: 'GET' }))
@@ -128,34 +166,48 @@ export async function handleBorrowMarketsProxy({ method, headers = {}, query = {
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  let response
-  let text
+  const found = []
+  const followed = new Set()
+  let complete = true
   try {
-    response = await fetchImpl(UPSTREAM_URL, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      redirect: 'manual',
-      signal: controller.signal,
-    })
-    if (response.status >= 500) return send(errorResponse(503))
-    if (response.status !== 200) return send(errorResponse(502))
-    text = await response.text()
-  } catch {
-    return send(errorResponse(503))
+    let pageUrl = UPSTREAM_URL
+    for (let pages = 1; ; pages += 1) {
+      const page = await fetchPage(fetchImpl, pageUrl, controller.signal)
+      if (page.failure) {
+        // The first page decides the answer; a later page that cannot be read only leaves the list incomplete.
+        if (pages === 1) return send(errorResponse(page.failure))
+        complete = false
+        break
+      }
+      found.push(...page.markets)
+      if (!page.next.more) break
+      if (page.next.cursor === null || followed.has(page.next.cursor) || pages >= MAX_PAGES) {
+        complete = false
+        break
+      }
+      followed.add(page.next.cursor)
+      pageUrl = `${UPSTREAM_URL}&pageAfter=${encodeURIComponent(page.next.cursor)}`
+    }
   } finally {
     clearTimeout(timer)
   }
 
-  if (typeof text !== 'string' || text.length > MAX_UPSTREAM_BYTES) return send(errorResponse(502))
   let markets
   try {
-    markets = compatibleBorrowMarkets(normalizeBorrowMarketsPage(JSON.parse(text)))
+    markets = compatibleBorrowMarkets(found)
   } catch {
     return send(errorResponse(502))
   }
   return send({
     status: 200,
-    headers: { 'Content-Type': JSON_TYPE, 'Cache-Control': BORROW_CACHE_CONTROL },
-    body: JSON.stringify({ schema: BORROW_MARKETS_SCHEMA, chain: 'Arc', pair: { collateral: BORROW_COLLATERAL_ASSET, loan: BORROW_LOAN_ASSET }, markets }),
+    // An incomplete list is not cached, so the next request tries the remaining pages again.
+    headers: { 'Content-Type': JSON_TYPE, 'Cache-Control': complete ? BORROW_CACHE_CONTROL : NO_STORE },
+    body: JSON.stringify({
+      schema: BORROW_MARKETS_SCHEMA,
+      chain: 'Arc',
+      pair: { collateral: BORROW_COLLATERAL_ASSET, loan: BORROW_LOAN_ASSET },
+      markets,
+      ...(complete ? {} : { complete: false }),
+    }),
   })
 }

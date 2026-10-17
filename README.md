@@ -62,6 +62,10 @@ Vaults are operated by third parties. Yields are not guaranteed, and funds remai
 
 The Borrow tab shows the **Morpho cirBTC / USDC** markets on Arc through Circle Borrow Kit, with Borrow APY, liquidation LTV, utilization, and available liquidity for each market. After choosing a market, enter collateral and a borrow amount to see the maximum borrow for that collateral, the collateral needed for a chosen target health factor and, with a connected wallet, a full quote with fees, estimated gas, health factor, and liquidation price. A connected wallet's existing loans (collateral, debt, health factor, liquidation price) are listed read-only.
 
+Each market is also checked against Morpho Blue on Arc: its ID must hash from the on-chain parameters, and the tokens and LLTV must match Circle's data; the oracle and rate model shown are read from those same parameters. A market that cannot be checked is labelled **Not verified** and is never shown as verified. Market cards flag **Insufficient Liquidity** and high utilization (90% or more) as facts, not advice, and markets are never ranked or recommended. The quote also shows how its health factor differs from the target you chose, and that the maximum borrow is not a safe amount.
+
+A read-only risk check evaluates the quote against fixed limits Machina would apply to a future borrow, including a 70% loan-to-value starting limit. A pass is not a guarantee against liquidation, and missing data is reported as "cannot be evaluated", never as a pass. `node scripts/verify-mainnet-borrow-markets-onchain.mjs` repeats the on-chain market check from the command line.
+
 Anything the Borrow Service does not report is shown as "Not reported" rather than estimated. The borrow rate is variable, and a position can be liquidated when its health factor falls below 1.0; the tab states both risks.
 
 **Borrow transactions are not enabled.** The tab never asks a wallet to sign, approve a token, or send a transaction, and its action buttons are permanently disabled. Transaction functionality will require a separately reviewed release; read-only quotes do not imply that borrowing is live.

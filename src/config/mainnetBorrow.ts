@@ -24,3 +24,14 @@ export const MAINNET_BORROW_REQUIRED_WALLET_CAPABILITY = 'eip5792-atomic-batch' 
 
 // Slippage bound Machina would pass for service-sized legs (SDK default).
 export const MAINNET_BORROW_DEFAULT_SLIPPAGE_BPS = 300
+
+// Morpho Blue singleton on Arc mainnet (official Morpho address list, Arc rows; the same address the compact engine reads
+// in server/compact/protocols/morpho.js). Borrow markets are verified against its on-chain market parameters.
+export const MAINNET_BORROW_MORPHO_BLUE = '0x34cd04070dd72b14e241112f6d83812df5af7fcd' as const
+
+// Fixed, read-only risk labels for the Borrow preview. They are thresholds, not data: no APY, liquidity amount or price is
+// hardcoded, and nothing here ranks or recommends a market.
+// MAX_LTV is the starting cap a future borrow would be checked against. Staying below it does not protect against liquidation.
+export const MAINNET_BORROW_MAX_LTV = 0.7
+// Utilization at or above this ratio is flagged: little liquidity is left to borrow and the rate can move quickly.
+export const MAINNET_BORROW_HIGH_UTILIZATION = 0.9
