@@ -205,10 +205,21 @@ function definitionState(db) {
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'compact_*'").all().map((row) => row.name);
   if (!tables.length) return { state: 'not_ready', code: 'database_empty' };
   if (TABLES.some((table) => !tables.includes(table))) return { state: 'incompatible', code: 'schema_tables_mismatch' };
-  const meta = new Map(db.prepare('SELECT key, value FROM compact_meta').all().map((row) => [row.key, row.value]));
-  if (meta.get('schema_version') !== COMPACT_SCHEMA_VERSION) return { state: 'incompatible', code: 'schema_version_mismatch' };
-  const stored = [...meta.keys()].filter((key) => key.startsWith(FAMILY_VERSION_PREFIX)).map((key) => key.slice(FAMILY_VERSION_PREFIX.length));
-  if (stored.some((name) => !Object.hasOwn(FAMILY_VERSIONS, name))) return { state: 'incompatible', code: 'family_unknown' };
+  // compact_meta also holds growing discovery/archive evidence; loading all values on every HTTP read
+  // exhausts the deliberately restricted (48 MiB old-space) parent heap. Read ONLY version keys.
+  // A corrupt oversized version value must fail closed rather than enter the JS heap.
+  const smallValue = 'CASE WHEN length(CAST(value AS BLOB)) <= 256 THEN value END AS value';
+  const schemaVersion = db.prepare(`SELECT ${smallValue} FROM compact_meta WHERE key='schema_version'`).get()?.value;
+  if (schemaVersion !== COMPACT_SCHEMA_VERSION) return { state: 'incompatible', code: 'schema_version_mismatch' };
+  const keys = Object.keys(FAMILY_VERSIONS).map((name) => `${FAMILY_VERSION_PREFIX}${name}`);
+  const slots = keys.map(() => '?').join(','); // Built only from known, versioned family definitions.
+  // Preserve the original fail-closed behavior for any unexpected family_version:* key.
+  if (db.prepare(`SELECT 1 FROM compact_meta WHERE key GLOB 'family_version:*' AND key NOT IN (${slots}) LIMIT 1`).get(...keys)) {
+    return { state: 'incompatible', code: 'family_unknown' };
+  }
+  // The IN list bounds the result count regardless of how large compact_meta becomes.
+  const meta = new Map(db.prepare(`SELECT key, ${smallValue} FROM compact_meta WHERE key IN (${slots})`)
+    .all(...keys).map((row) => [row.key, row.value]));
   let missing = false;
   for (const [name, version] of Object.entries(FAMILY_VERSIONS)) {
     const value = meta.get(`${FAMILY_VERSION_PREFIX}${name}`);

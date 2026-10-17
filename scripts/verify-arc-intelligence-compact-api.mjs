@@ -627,6 +627,24 @@ if (!sqlite) {
     assert.throws(() => open(main.path).summary('48h'), (error) => error.code === 'unsupported_window');
   });
 
+  await test('read model: growing compact_meta evidence is never materialized during definition checks', () => {
+    const fixture = buildDatabase('growing-meta', 2);
+    const insert = fixture.db.prepare('INSERT INTO compact_meta(key,value) VALUES(?,?)');
+    const payload = 'x'.repeat(128 * 1024);
+    for (let i = 0; i < 64; i += 1) insert.run(`discovery_evidence:test:${i}`, payload);
+    fixture.db.close();
+    class BoundedMetaDatabase extends DatabaseSync {
+      prepare(sql) {
+        if (/SELECT\s+key\s*,\s*value\s+FROM\s+compact_meta\s*$/i.test(sql.trim())) throw new Error('unbounded_compact_meta_read');
+        return super.prepare(sql);
+      }
+    }
+    const model = open(fixture.path, { DatabaseSync: BoundedMetaDatabase });
+    assert.equal(model.health().status, 'ok');
+    assert.equal(model.summary('1h').schema, SUMMARY_SCHEMA);
+    model.close();
+  });
+
   await test('consistency: a reader sees the old committed snapshot while a writer transaction is open, and the new one only after commit', () => {
     const fixture = buildDatabase('consistency', 6);
     const model = open(fixture.path);
