@@ -301,7 +301,7 @@ test('risk checks: pass, fail, unknown and pending are distinct, and missing dat
   assert.deepEqual(statuses(pass), { verification: 'pass', oracle: 'pass', liquidity: 'pass', utilization: 'pass', 'max-borrow': 'pass', ltv: 'pass', 'target-health-factor': 'pass' })
   assert.deepEqual([pass.blocked, pass.pending], [false, false])
   const warn = statuses(preview.evaluateBorrowRisk(riskInput({ market: borrowMarket({ utilization: 0.95 }), full: { ltv: 0.6, healthFactor: 1.2 } })))
-  assert.deepEqual([warn.utilization, warn['target-health-factor']], ['warn', 'warn'])
+  assert.deepEqual([warn.utilization, warn['target-health-factor']], ['warn', 'fail'], 'high utilization warns; a quote below the selected target is a blocker')
   const over = preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.7000001, healthFactor: 1.5 } }))
   assert.equal(statuses(over).ltv, 'fail'); assert.equal(over.blocked, true)
   assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.7, healthFactor: 1.5 } }))).ltv, 'pass', 'exactly at the limit is within it')
@@ -314,9 +314,65 @@ test('risk checks: pass, fail, unknown and pending are distinct, and missing dat
   assert.equal(missing.blocked, true)
   // Not requested yet or still loading: pending, which blocks nothing but is not final.
   const waiting = preview.evaluateBorrowRisk(riskInput({ verification: { status: 'checking' }, borrowAmount: null, collateralAmount: null, maxBorrow: 'pending', sizing: 'pending', full: 'pending' }))
-  assert.deepEqual(statuses(waiting), { verification: 'pending', oracle: 'pending', liquidity: 'pending', utilization: 'pass', 'max-borrow': 'pending', ltv: 'pending', 'target-health-factor': 'pending' })
+  assert.deepEqual(statuses(waiting), { verification: 'pending', oracle: 'pending', liquidity: 'pending', utilization: 'pass', 'max-borrow': 'skipped', ltv: 'pending', 'target-health-factor': 'pending' })
   assert.deepEqual([waiting.blocked, waiting.pending], [false, true])
   assert.deepEqual(preview.evaluateBorrowRisk(riskInput({ market: null })), { checks: [], blocked: false, pending: true })
+})
+
+test('risk checks: a quote below the selected health factor target is a blocker, not a warning', () => {
+  // Selected 1.50, the Circle quote comes out at 1.24.
+  const missed = preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.6, healthFactor: 1.24 } }))
+  const target = missed.checks.find((c) => c.id === 'target-health-factor')
+  assert.equal(target.status, 'fail'); assert.equal(missed.blocked, true)
+  assert.match(target.text, /^Selected safety target not met: .*1\.24.*0\.26 below the 1\.50 you selected.*blocked/)
+  assert.equal(preview.summarizeRisk(missed).text, 'Would be blocked: 1 failed.')
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.6, healthFactor: 1.5 } })))['target-health-factor'], 'pass', 'meeting the target passes')
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.6, healthFactor: 1.496 } })))['target-health-factor'], 'pass', 'the gap is judged at the two decimals shown')
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.6, healthFactor: 1.49 } })))['target-health-factor'], 'fail')
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ full: { ltv: 0.6, healthFactor: null } })))['target-health-factor'], 'unknown', 'a missing health factor is never a pass')
+})
+
+test('risk checks: empty optional collateral skips only the max-borrow check, everything else is still evaluated', () => {
+  const noCollateral = preview.evaluateBorrowRisk(riskInput({ collateralAmount: null, maxBorrow: 'pending' }))
+  assert.deepEqual(statuses(noCollateral), { verification: 'pass', oracle: 'pass', liquidity: 'pass', utilization: 'pass', 'max-borrow': 'skipped', ltv: 'pass', 'target-health-factor': 'pass' })
+  assert.deepEqual([noCollateral.blocked, noCollateral.pending], [false, false], 'skipped neither blocks nor leaves the summary waiting')
+  assert.match(noCollateral.checks.find((c) => c.id === 'max-borrow').text, /^Skipped: no collateral entered/)
+  assert.deepEqual(preview.summarizeRisk(noCollateral), { tone: 'pass', text: 'All applicable checks pass. 1 skipped.' })
+  // The checks that can run still catch problems without collateral.
+  const missed = preview.evaluateBorrowRisk(riskInput({ collateralAmount: null, maxBorrow: 'pending', full: { ltv: 0.6, healthFactor: 1.24 } }))
+  assert.equal(statuses(missed)['target-health-factor'], 'fail'); assert.equal(missed.blocked, true)
+  const short = preview.evaluateBorrowRisk(riskInput({ collateralAmount: null, maxBorrow: 'pending', borrowAmount: '2000' }))
+  assert.equal(statuses(short).liquidity, 'fail'); assert.equal(short.blocked, true)
+  const warned = preview.evaluateBorrowRisk(riskInput({ collateralAmount: null, maxBorrow: 'pending', market: borrowMarket({ utilization: 0.95 }) }))
+  assert.deepEqual(preview.summarizeRisk(warned), { tone: 'warn', text: 'No check failed, 1 warning. 1 skipped.' })
+  // A real wait (the quote is still loading) is still a wait; collateral entered but no borrow amount is waiting for input.
+  assert.equal(preview.evaluateBorrowRisk(riskInput({ collateralAmount: null, maxBorrow: 'pending', full: 'pending', sizing: 'pending' })).pending, true)
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ borrowAmount: null, maxBorrow: 'pending' })))['max-borrow'], 'pending')
+  // With collateral entered the comparison is unchanged.
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ borrowAmount: '900' })))['max-borrow'], 'fail')
+  assert.equal(statuses(preview.evaluateBorrowRisk(riskInput({ maxBorrow: null })))['max-borrow'], 'unknown')
+})
+
+test('risk checks: real blockers are listed first, then warnings, then everything else', () => {
+  const report = preview.evaluateBorrowRisk(riskInput({
+    market: borrowMarket({ utilization: 0.95 }), collateralAmount: null, maxBorrow: 'pending', borrowAmount: '2000', full: { ltv: 0.6, healthFactor: 1.24 },
+  }))
+  const order = report.checks.map((c) => `${c.id}:${c.status}`)
+  assert.deepEqual(order, ['liquidity:fail', 'target-health-factor:fail', 'utilization:warn', 'max-borrow:skipped', 'verification:pass', 'oracle:pass', 'ltv:pass'],
+    'blockers keep their evaluation order, warnings follow, skipped and passing checks come last')
+  assert.equal(preview.summarizeRisk(report).text, 'Would be blocked: 2 failed, 1 warning.')
+  const unknownFirst = preview.evaluateBorrowRisk(riskInput({ market: borrowMarket({ utilization: 0.95 }), verification: { status: 'unavailable' } }))
+  assert.deepEqual(unknownFirst.checks.slice(0, 3).map((c) => c.status), ['unknown', 'unknown', 'warn'], 'cannot-be-evaluated counts as a blocker and precedes warnings')
+  assert.deepEqual(preview.orderRiskChecks([]), [])
+})
+
+test('the utilization text describes market-wide rate risk and does not claim the available amount is small', () => {
+  const warn = preview.evaluateBorrowRisk(riskInput({ market: borrowMarket({ utilization: 0.95 }) })).checks.find((c) => c.id === 'utilization')
+  assert.equal(warn.status, 'warn')
+  assert.match(warn.text, /^High market utilization \(95%\): most supplied funds are already lent out.*variable borrow rate can rise quickly/)
+  assert.match(warn.text, /does not mean the available amount is small/)
+  assert.ok(!/little liquidity|liquidity is left|low liquidity/i.test(`${warn.text} ${tabSource}`), 'no wording that treats absolute liquidity as low')
+  assert.match(tabSource.replace(/\s+/g, ' '), /High market utilization \(at or above .*most supplied funds are already lent out.*variable borrow rate can rise quickly.*rate risk, not the amount available/)
 })
 
 test('risk checks: unverified and oracle-less markets block; the 70% cap falls back to LLTV ÷ sized health factor', () => {
@@ -430,12 +486,14 @@ test('the tab shows the pair and short ID, flags facts only, and never ranks or 
   assert.ok(!/\.sort\(|\.toSorted\(|reduce\(\s*\(best/.test(body.replace(/\[\.\.\.[^\]]+\]\.sort/g, '')), 'the tab never reorders markets')
   assert.ok(!/best (rate|market)|recommended|safest|top pick|lowest (rate|apy)|highest (liquidity|apy)/i.test(body))
   assert.ok(tabSource.includes('The maximum sits at the liquidation threshold'))
-  assert.ok(tabSource.includes('Below your selected target') && tabSource.includes('It is not an error'))
+  assert.ok(tabSource.includes('Selected safety target not met') && tabSource.includes('a future borrow would be blocked'))
+  assert.ok(!tabSource.includes('Below your selected target') && !tabSource.includes('It is not an error'), 'the gap is no longer presented as harmless')
 })
 
 test('the tab says "Preview only" and uses status language, never "safe"', () => {
   // Internal identifiers (the service's 'SAFE' band key, the 'safe' colour tone) are never rendered; everything else must be free of it.
-  const visible = (source) => code(source).replace(/\bsafe: '/g, '').replace(/'(safe|SAFE)'/g, '')
+  // The one allowed phrase is the label "Selected safety target not met": it names the user's own target, it does not call anything safe.
+  const visible = (source) => code(source).replace(/\bsafe: '/g, '').replace(/'(safe|SAFE)'/g, '').replace(/Selected safety target not met/g, '')
   for (const [file, source] of [['MainnetBorrow.tsx', tabSource], ['borrowPreview.ts', helperSource]]) {
     assert.ok(!/\bsafe\w*/i.test(visible(source)), `${file} has no "safe" wording`)
   }
@@ -445,7 +503,7 @@ test('the tab says "Preview only" and uses status language, never "safe"', () =>
   assert.deepEqual([2.6, 1.004, 1, 0.99, 0.5].map((hf) => preview.thresholdStatus(hf).label), [
     'Above liquidation threshold', 'At liquidation threshold', 'At liquidation threshold', 'Below liquidation threshold', 'Below liquidation threshold'])
   assert.equal(preview.thresholdStatus(1.2).tone, 'safe'); assert.equal(preview.thresholdStatus(0.9).tone, 'danger')
-  for (const phrase of ['Preview only', 'Below your selected target']) assert.ok(tabSource.includes(phrase), phrase)
+  for (const phrase of ['Preview only', 'Selected safety target not met']) assert.ok(tabSource.includes(phrase), phrase)
 })
 
 test('the main screen is short: a six-row quote, one risk line, details behind toggles', () => {

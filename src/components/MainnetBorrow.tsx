@@ -8,6 +8,7 @@ import {
   HelpCircle,
   Info,
   Lock,
+  MinusCircle,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -393,7 +394,8 @@ function MarketCard({ market, verification, borrowAmount, selected, onSelect }: 
         )}
         {highUtilization && (
           <p className="pb-3 text-[11px] leading-4 text-amber-800">
-            Utilization is at or above {formatRatioPercent(MAINNET_BORROW_HIGH_UTILIZATION)}: little liquidity is left and the rate can move quickly.
+            High market utilization (at or above {formatRatioPercent(MAINNET_BORROW_HIGH_UTILIZATION)}): most supplied funds are already lent out, so the
+            variable borrow rate can rise quickly. This flags rate risk, not the amount available.
           </p>
         )}
       </details>
@@ -505,6 +507,7 @@ const RISK_STYLE: Record<RiskStatus, { icon: IconType; className: string; label:
   fail: { icon: XCircle, className: 'text-red-600', label: 'Fail' },
   unknown: { icon: HelpCircle, className: 'text-red-600', label: 'Cannot be evaluated' },
   pending: { icon: Clock, className: 'text-slate-400', label: 'Waiting' },
+  skipped: { icon: MinusCircle, className: 'text-slate-400', label: 'Not applicable' },
 }
 
 const SUMMARY_CLASS = { fail: 'text-red-700', warn: 'text-amber-700', pending: 'text-slate-500', pass: 'text-emerald-700' } as const
@@ -708,10 +711,10 @@ function QuoteBuilder({ market, verification, walletAddress, client, refresh, bu
                   {full && gap && (
                     <div className="mt-3" data-borrow-target-note={gap.relation}>
                       {gap.relation === 'below' ? (
-                        <Notice tone="note">
-                          <p><span className="font-semibold" data-borrow-hf-gap="below">Below your selected target.</span> You selected {target}; this quote
+                        <Notice tone="error">
+                          <p><span className="font-semibold" data-borrow-hf-gap="below">Selected safety target not met.</span> You selected {target}; this quote
                             comes out at {formatHealthFactor(gap.delta + targetHealthFactor)}. The Borrow Service sizes the collateral itself, so a gap like this
-                            is expected. It is not an error.{required ? ` Collateral for ${target} is ${amountText(required.requiredCollateral)}.` : ''}</p>
+                            is not a service error, but a future borrow would be blocked on this quote.{required ? ` Collateral for ${target} is ${amountText(required.requiredCollateral)}.` : ''}</p>
                         </Notice>
                       ) : (
                         <p className="text-[11px] font-semibold text-emerald-700" data-borrow-hf-gap={gap.relation}>Meets your selected target of {target}.</p>

@@ -212,7 +212,9 @@ export function compareHealthFactor(target: number, quoted: number): { delta: nu
   return { delta, relation: delta < 0 ? 'below' : delta > 0 ? 'above' : 'at' }
 }
 
-export type RiskStatus = 'pass' | 'warn' | 'fail' | 'unknown' | 'pending'
+// 'skipped' is a check that does not apply to this input (optional collateral left empty). It is not a pass, it blocks nothing,
+// and it is not waiting for anything.
+export type RiskStatus = 'pass' | 'warn' | 'fail' | 'unknown' | 'pending' | 'skipped'
 
 export type RiskCheck = { id: string; status: RiskStatus; text: string }
 
@@ -273,11 +275,14 @@ export function evaluateBorrowRisk(input: RiskInput): RiskReport {
   // Utilization.
   if (market.utilization === null) add('utilization', 'unknown', 'Utilization is not reported.')
   else if (isHighUtilization(market.utilization, limits.highUtilization)) {
-    add('utilization', 'warn', `High utilization (${percent(market.utilization)}): little liquidity is left and the rate can move quickly.`)
+    // A market-wide rate risk. It says nothing about the absolute amount available; the liquidity check covers that.
+    add('utilization', 'warn', `High market utilization (${percent(market.utilization)}): most supplied funds are already lent out, so the variable borrow rate can rise quickly. This flags rate risk; it does not mean the available amount is small.`)
   } else add('utilization', 'pass', `Utilization is ${percent(market.utilization)}, below the ${percent(limits.highUtilization)} flag.`)
 
-  // Borrow amount against the service maximum for the collateral.
-  if (!input.borrowAmount || !input.collateralAmount) add('max-borrow', 'pending', 'Enter collateral and a borrow amount to compare with the service maximum.')
+  // Borrow amount against the service maximum for the collateral. The collateral is optional: without it only this comparison
+  // is skipped, every other check still runs on the quote.
+  if (!input.collateralAmount) add('max-borrow', 'skipped', 'Skipped: no collateral entered. The optional "Collateral you hold" field is needed to compare with the service maximum.')
+  else if (!input.borrowAmount) add('max-borrow', 'pending', 'Enter a borrow amount to compare with the service maximum.')
   else if (input.maxBorrow === 'pending') add('max-borrow', 'pending', 'Reading the service maximum for this collateral.')
   else if (input.maxBorrow === null) add('max-borrow', 'unknown', 'The Borrow Service maximum for this collateral is not available.')
   else if (compareDecimals(input.borrowAmount, input.maxBorrow.amount) > 0) add('max-borrow', 'fail', 'The borrow amount is above the maximum the Borrow Service reports for this collateral.')
@@ -304,18 +309,27 @@ export function evaluateBorrowRisk(input: RiskInput): RiskReport {
   // The health factor the Borrow Kit quote actually gives against the target the user chose.
   if (full && full !== 'pending' && full.healthFactor !== null) {
     const gap = compareHealthFactor(input.targetHealthFactor, full.healthFactor)
-    add('target-health-factor', gap.relation === 'below' ? 'warn' : 'pass', gap.relation === 'below'
-      ? `The quote's health factor ${formatHealthFactor(full.healthFactor)} is ${Math.abs(gap.delta).toFixed(2)} below your ${input.targetHealthFactor.toFixed(2)} target.`
+    // Below the target the user picked is a blocker, not a warning: a future borrow would not go ahead on this quote.
+    add('target-health-factor', gap.relation === 'below' ? 'fail' : 'pass', gap.relation === 'below'
+      ? `Selected safety target not met: the quote's health factor ${formatHealthFactor(full.healthFactor)} is ${Math.abs(gap.delta).toFixed(2)} below the ${input.targetHealthFactor.toFixed(2)} you selected. A future borrow would be blocked.`
       : `The quote's health factor ${formatHealthFactor(full.healthFactor)} meets your ${input.targetHealthFactor.toFixed(2)} target.`)
   } else if (full === null) add('target-health-factor', 'unknown', 'The full quote is not available, so its health factor cannot be compared with your target.')
   else if (full && full !== 'pending') add('target-health-factor', 'unknown', 'The quote does not report a health factor.')
   else add('target-health-factor', 'pending', 'The full wallet quote is needed to compare its health factor with your target.')
 
   return {
-    checks,
+    checks: orderRiskChecks(checks),
     blocked: checks.some((check) => check.status === 'fail' || check.status === 'unknown'),
     pending: checks.some((check) => check.status === 'pending'),
   }
+}
+
+// Real blockers first (failed or not evaluable), then warnings, then what is waiting, skipped, and passing. Stable within a group.
+const RISK_ORDER: Record<RiskStatus, number> = { fail: 0, unknown: 0, warn: 1, pending: 2, skipped: 3, pass: 4 }
+export function orderRiskChecks(checks: RiskCheck[]): RiskCheck[] {
+  return checks.map((check, index) => ({ check, index }))
+    .sort((a, b) => RISK_ORDER[a.check.status] - RISK_ORDER[b.check.status] || a.index - b.index)
+    .map(({ check }) => check)
 }
 
 export type RiskSummary = { tone: 'fail' | 'warn' | 'pending' | 'pass'; text: string }
@@ -326,11 +340,15 @@ export function summarizeRisk(report: RiskReport): RiskSummary {
   const failed = count('fail')
   const unknown = count('unknown')
   const warnings = count('warn')
+  const skipped = count('skipped')
+  const warningText = `${warnings} warning${warnings === 1 ? '' : 's'}`
+  const skippedText = skipped > 0 ? ` ${skipped} skipped.` : ''
+  // Blockers are named first, then warnings.
   if (report.blocked) {
-    const parts = [failed ? `${failed} failed` : null, unknown ? `${unknown} cannot be evaluated` : null].filter(Boolean)
+    const parts = [failed ? `${failed} failed` : null, unknown ? `${unknown} cannot be evaluated` : null, warnings ? warningText : null].filter(Boolean)
     return { tone: 'fail', text: `Would be blocked: ${parts.join(', ')}.` }
   }
   if (report.pending) return { tone: 'pending', text: 'Some checks are still waiting for input or data.' }
-  if (warnings > 0) return { tone: 'warn', text: `No check failed, ${warnings} warning${warnings === 1 ? '' : 's'}.` }
-  return { tone: 'pass', text: 'All checks pass.' }
+  if (warnings > 0) return { tone: 'warn', text: `No check failed, ${warningText}.${skippedText}` }
+  return { tone: 'pass', text: skipped > 0 ? `All applicable checks pass.${skippedText}` : 'All checks pass.' }
 }
