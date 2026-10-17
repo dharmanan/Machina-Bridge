@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { createEvidenceArchive,archiveConfig } from '../server/compact/evidence-archive.js';
 import { DatabaseSync } from 'node:sqlite';
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { EventEmitter } from 'node:events';
@@ -19,7 +20,7 @@ import { ECOSYSTEM_READ_TIMEOUT_MS, ECOSYSTEM_RESPONSE_TIMEOUT_MS, READ_WORKER_R
 import { createScheduler } from '../server/compact/scheduler.js';
 import { createIntelligenceServer } from '../server/compact/http.js';
 
-const directory = await fs.mkdtemp('/workspace/machina-snapshot-test-'), path=join(directory,'fixture.sqlite');
+const directory = await fs.mkdtemp(join(tmpdir(), 'machina-snapshot-test-')), path=join(directory,'fixture.sqlite');
 const BASE=Date.parse('2026-09-16T00:00:00Z')/1000, HOUR=3600;
 const hash=n=>'0x'+n.toString(16).padStart(64,'0'), address=n=>'0x'+n.toString(16).padStart(40,'0');
 let clock=(BASE+4*HOUR+60)*1000, passed=0;
