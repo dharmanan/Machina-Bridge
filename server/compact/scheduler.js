@@ -179,6 +179,26 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
     }
   }
 
+  // Restore a missing 30D snapshot before the next catch-up hour. A verified stale snapshot
+  // keeps live ingestion at full priority. The preparation uses the same single child slot
+  // and never runs concurrently with an hourly writer.
+  async function restoreMissingSnapshot() {
+    if (typeof snapshotRunner?.recoveryNeeded !== 'function') return false;
+    try {
+      if (!(await snapshotRunner.recoveryNeeded())) return false;
+      const handle = snapshotRunner.run();
+      child = { kind: 'dashboard_snapshot_recovery', terminate: () => handle.terminate() };
+      let outcome;
+      try { outcome = await handle.done; } finally { child = null; }
+      status.lastRun = { kind: 'dashboard_snapshot_recovery', ...outcome };
+      log(`SCHEDULER_SNAPSHOT_RECOVERY_DONE exit=${outcome.exitCode} error=${outcome.error ?? 'none'}`);
+      return true; // Re-evaluate the latest committed hour before starting any further work.
+    } catch (error) {
+      log(`SCHEDULER_SNAPSHOT_RECOVERY_FAILED code=${typeof error?.code === 'string' ? error.code : 'unknown'}`);
+      return false; // Snapshot failures must never block the canonical hourly collection.
+    }
+  }
+
   // One unit of work. Returns { again } when another unit may run immediately, else the time to wake up.
   async function step() {
     const target = latestSafeHourStart(now(), safetyDelayMs);
@@ -186,6 +206,8 @@ export function createScheduler({ readModel, runHour, runProjectionRepair = null
     // Empty store: only the latest safe hour, never a historical backfill.
     const next = checkpoint ? checkpoint.hourStart + HOUR_SECONDS : target;
     if (next <= target) {
+      // Without this recovery path, a deploy-invalidated 30D stays unavailable for the entire backlog.
+      if (await restoreMissingSnapshot()) return { again: true };
       if (now() < retryAt) return { again: false, wakeAt: retryAt };
       const outcome = await runChild(next, 'catch_up');
       if (stopped) return { again: false };

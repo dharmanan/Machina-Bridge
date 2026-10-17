@@ -216,6 +216,18 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
     // A successful checkpoint is prepared once, not rebuilt after every Discovery Drain commit.
     return attempted !== checkpointKey(cp) || now() >= retryAt;
   }
+  // Recover an unavailable 30D during catch-up, but retain any verified compatible stale bundle.
+  // Validation includes the stored snapshot's digest, source compatibility and canonical checkpoint.
+  async function recoveryNeeded() {
+    if (running) return false;
+    const cp = readModel.snapshotIdentity();
+    try { await store.read('summary', cp); return false; }
+    catch (error) {
+      if (!['not_ready', 'snapshot_invalid', 'snapshot_checkpoint_mismatch'].includes(error?.code)) throw error;
+    }
+    // Share the ordinary five-minute retry gate so failed rebuilds cannot starve live ingestion.
+    return attempted !== checkpointKey(cp) || now() >= retryAt;
+  }
   function run() {
     if (running) throw fail('snapshot_already_running');
     const cp = readModel.snapshotIdentity();
@@ -298,5 +310,5 @@ export function createSnapshotRunner({ path, store, readModel, log = () => {}, s
     dispatch();
     return { hour: iso(cp.hourStart), done, async terminate() { stopped = true; stop('snapshot_cancelled'); return done; } };
   }
-  return { needed, run };
+  return { needed, recoveryNeeded, run };
 }

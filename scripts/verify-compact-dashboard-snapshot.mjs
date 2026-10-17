@@ -68,6 +68,9 @@ try {
    const elapsedMs=performance.now()-at;assert.ok(elapsedMs>6000 && elapsedMs<30000);
    console.log(JSON.stringify({test:'simulated_background_stage_over_http_cap',elapsedMs,snapshotStageLimitMs:30000,httpActiveMs:6000,httpTotalMs:7000,proxyMs:8000}));
  });
+ await test('missing 30D is eligible for recovery while no stored verified bundle exists',async()=>{
+   assert.equal(await runner.recoveryNeeded(),true);
+ });
  await test('no snapshot: explicit not_ready, no heavy fallback',async()=>assert.rejects(snapshots.read('v3',model.snapshotIdentity()),e=>e.code==='not_ready'));
  await test('all four real read-model outputs prepared and atomically activated',async()=>{
    assert.equal(await runner.needed(),true);assert.equal((await runner.run().done).exitCode,0);original=await snapshots.load();
@@ -111,11 +114,13 @@ try {
  });
  await test('restart uses same durable bundle without recomputation',async()=>{
    const restart=createDashboardSnapshotStore(options), r=createSnapshotRunner({path,store:restart,readModel:model,now:()=>clock});
-   assert.equal(await r.needed(),false);assert.deepEqual(await restart.read('ecosystem',model.snapshotIdentity()),await snapshots.read('ecosystem',model.snapshotIdentity()));
+   assert.equal(await r.needed(),false);assert.equal(await r.recoveryNeeded(),false);
+   assert.deepEqual(await restart.read('ecosystem',model.snapshotIdentity()),await snapshots.read('ecosystem',model.snapshotIdentity()));
  });
  await test('new hour: previous bundle retained with old timestamp and explicit lag',async()=>{
    append(4);clock+=HOUR*1000;assert.equal(await runner.needed(),true);
    const b=await snapshots.read('v4',model.snapshotIdentity());assert.equal(b.snapshot.status,'stale');assert.equal(b.snapshot.lagHours,1);
+   assert.equal(await runner.recoveryNeeded(),false,'a verified stale snapshot must not be rebuilt during catch-up');
    assert.equal(b.freshness.stale,true);assert.equal(b.pools[0].swapCount,10);
  });
  await test('partial, mixed-checkpoint and changed window bundles cannot activate',async()=>{
@@ -199,6 +204,32 @@ try {
  await test('canonical identity mismatch is not accepted even for an older bundle',async()=>{
    const rejecting=createDashboardSnapshotStore({...options,verifyCheckpoint:()=>false});
    await assert.rejects(rejecting.read('ecosystem',model.snapshotIdentity()),e=>e.code==='snapshot_checkpoint_mismatch');
+ });
+ await test('missing 30D is prepared once during catch-up without overlapping collectors',async()=>{
+   let cp=BASE+3*HOUR,recovered=false,active=0;const calls=[];
+   const handle=(name,fn)=>{assert.equal(active,0,'only one memory-limited child');active++;calls.push(name);
+     return{done:Promise.resolve().then(()=>{fn?.();active--;return{exitCode:0,error:null};}),terminate:async()=>{}};};
+   const s=createScheduler({readModel:{checkpoint:()=>({hourStart:cp,lastBlock:100}),repairCandidates:()=>[]},
+     runHour:hour=>({hour,...handle('collector',()=>{cp+=HOUR;})}),
+     snapshotRunner:{recoveryNeeded:async()=>!recovered,needed:async()=>false,
+       run:()=>handle('snapshot-recovery',()=>{recovered=true;})},
+     now:()=>(BASE+7*HOUR+60)*1000,safetyDelayMs:0,setTimer:()=>1,clearTimer:()=>{}});
+   await s.tick();await s.stop();
+   assert.deepEqual(calls,['snapshot-recovery','collector','collector','collector']);
+   assert.equal(cp,BASE+6*HOUR);
+ });
+ await test('failed snapshot recovery cannot block live collection',async()=>{
+   let cp=BASE+3*HOUR,attempted=false;const calls=[];
+   const s=createScheduler({readModel:{checkpoint:()=>({hourStart:cp,lastBlock:100}),repairCandidates:()=>[]},
+     runHour:hour=>{calls.push('collector');cp+=HOUR;return{hour,done:Promise.resolve({exitCode:0}),terminate:async()=>{}};},
+     snapshotRunner:{recoveryNeeded:async()=>!attempted,needed:async()=>false,run:()=>{
+       attempted=true;calls.push('failed-snapshot');
+       return{done:Promise.resolve({exitCode:1,error:'snapshot_prepare_failed'}),terminate:async()=>{}};
+     }},
+     now:()=>(BASE+6*HOUR+60)*1000,safetyDelayMs:0,setTimer:()=>1,clearTimer:()=>{}});
+   await s.tick();await s.stop();
+   assert.deepEqual(calls,['failed-snapshot','collector','collector']);
+   assert.equal(cp,BASE+5*HOUR);
  });
  await test('scheduler live priority, failure independent and no child overlap',async()=>{
    let cp=BASE+3*HOUR,work=0,need=true;const calls=[];
