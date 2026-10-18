@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
@@ -444,93 +444,8 @@ await test('invalid read input is refused before the SDK is called', async () =>
   assert.deepEqual(calls, [])
 })
 
-const READY_WALLET = { address: WALLET, chainId: 5042, atomicBatch: 'supported' }
-const BORROW_QUOTE = { kind: 'borrow', collateral: collateral('0.05'), loanAsset: usdc('1000'), borrowApy: 0.06, resultingHealthFactor: 2.6, liquidationPrice: null, resultingLtv: 0.33, resultingBand: 'SAFE', fees: [], gasFees: [] }
-const outcomeOnly = { resultingHealthFactor: 2, liquidationPrice: null, resultingLtv: 0.3, resultingBand: 'SAFE', fees: [], gasFees: [] }
-const WRITE_CASES = [
-  [{ kind: 'borrow', marketId: MARKET, borrowAmount: '1000' }, BORROW_QUOTE],
-  [{ kind: 'borrow-more', loanId: LOAN, borrowAmount: '1000.000' }, BORROW_QUOTE],
-  [{ kind: 'repay', loanId: LOAN, repayAmount: '10' }, { kind: 'repay', repayAmount: usdc('10.0'), ...outcomeOnly }],
-  [{ kind: 'add-collateral', loanId: LOAN, collateralAmount: '0.01' }, { kind: 'add-collateral', collateral: collateral('0.01'), ...outcomeOnly }],
-  [{ kind: 'withdraw-collateral', loanId: LOAN, collateralAmount: '0.01' }, { kind: 'withdraw-collateral', maxRepayment: usdc('0'), collateral: collateral('0.01'), ...outcomeOnly }],
-  [{ kind: 'close-loan', loanId: LOAN }, { kind: 'close-loan', maxRepayment: usdc('1030'), collateral: collateral('0.05'), ...outcomeOnly }],
-]
-
-await test('with the gate false every write plan is blocked only by writes_disabled', () => {
-  for (const [action, quote] of WRITE_CASES) {
-    const plan = borrow.planBorrowWrite(action, READY_WALLET, quote)
-    assert.deepEqual(plan.blockers, ['writes_disabled'], action.kind)
-    assert.equal(plan.ready, false)
-    assert.equal(plan.chainId, 5042)
-    assert.equal(plan.approvalSpender, config.MAINNET_BORROW_ADAPTER_CONTRACT)
-    assert.ok(plan.actionId.startsWith(`${action.kind}|5042|${WALLET}|`))
-  }
-  const borrowPlan = borrow.planBorrowWrite(WRITE_CASES[0][0], READY_WALLET, WRITE_CASES[0][1])
-  assert.deepEqual(borrowPlan.walletRequests, ['collateral-approval-if-short', 'morpho-authorization-grant', 'adapter-execution', 'morpho-authorization-revoke'])
-  const repayPlan = borrow.planBorrowWrite(WRITE_CASES[2][0], READY_WALLET, WRITE_CASES[2][1])
-  assert.deepEqual(repayPlan.walletRequests, ['usdc-approval-if-short', 'adapter-execution'])
-})
-
-await test('wrong chain, missing wallet, missing capability and bad quotes are blocked', () => {
-  const [action, quote] = WRITE_CASES[0]
-  const blockersOf = (wallet, nextQuote = quote, nextAction = action) => borrow.planBorrowWrite(nextAction, wallet, nextQuote).blockers
-  assert.ok(blockersOf({ ...READY_WALLET, chainId: 5042002 }).includes('wrong_chain'))
-  assert.ok(blockersOf({ ...READY_WALLET, chainId: 1 }).includes('wrong_chain'))
-  assert.deepEqual(blockersOf(null), ['writes_disabled', 'wallet_missing', 'wrong_chain', 'wallet_capability_missing'])
-  assert.ok(blockersOf({ ...READY_WALLET, address: undefined }).includes('wallet_missing'))
-  assert.ok(blockersOf({ ...READY_WALLET, address: '0x12' }).includes('wallet_missing'))
-  assert.ok(blockersOf({ ...READY_WALLET, atomicBatch: 'unsupported' }).includes('wallet_capability_missing'))
-  assert.ok(blockersOf({ ...READY_WALLET, atomicBatch: 'unknown' }).includes('wallet_capability_missing'))
-  assert.ok(blockersOf(READY_WALLET, null).includes('quote_missing'))
-  assert.ok(blockersOf(READY_WALLET, { ...quote, loanAsset: usdc('999') }).includes('quote_mismatch'))
-  assert.ok(blockersOf(READY_WALLET, WRITE_CASES[2][1]).includes('quote_mismatch'))
-  assert.ok(blockersOf(READY_WALLET, quote, { ...action, borrowAmount: '-5' }).includes('invalid_action'))
-  assert.ok(blockersOf(READY_WALLET, quote, { ...action, marketId: 'market' }).includes('invalid_action'))
-})
-
-await test('disabled writes refuse before any adapter or SDK write method runs', async () => {
-  for (const [action, quote] of WRITE_CASES) {
-    const { client, calls } = fakeClient()
-    let adapterRequests = 0
-    const plan = borrow.planBorrowWrite(action, READY_WALLET, quote)
-    const outcome = await borrow.executeBorrowWrite({
-      action,
-      wallet: READY_WALLET,
-      quote,
-      confirmedActionId: plan.actionId,
-      getAdapter: async () => {
-        adapterRequests += 1
-        throw new Error('adapter must not be created')
-      },
-      client,
-    })
-    assert.deepEqual(outcome, { status: 'refused', blockers: ['writes_disabled'] }, action.kind)
-    assert.equal(adapterRequests, 0)
-    assert.deepEqual(calls, [])
-  }
-})
-
-await test('the private default kit is never reached for writes, even through executeBorrowWrite', async () => {
-  const requestsBefore = fetchRequests.length
-  for (const [action, quote] of WRITE_CASES) {
-    let adapterRequests = 0
-    const plan = borrow.planBorrowWrite(action, READY_WALLET, quote)
-    const outcome = await borrow.executeBorrowWrite({
-      action,
-      wallet: READY_WALLET,
-      quote,
-      confirmedActionId: plan.actionId,
-      getAdapter: async () => {
-        adapterRequests += 1
-        throw new Error('adapter must not be created')
-      },
-    })
-    assert.deepEqual(outcome, { status: 'refused', blockers: ['writes_disabled'] }, action.kind)
-    assert.equal(adapterRequests, 0)
-  }
-  assert.deepEqual(defaultKitWriteCalls, [])
-  assert.equal(fetchRequests.length, requestsBefore, 'no Borrow Service call either')
-})
+// The write plan, the safety checks and the write boundary are covered by scripts/verify-mainnet-borrow-write-safety.mjs, with
+// fake SDK and wallet clients. The write gate stays closed there too.
 
 // Every export the application may import. A new export must be added here
 // on purpose, after checking it cannot hand out the raw kit.
@@ -547,6 +462,8 @@ const PUBLIC_EXPORTS = [
   'normalizeBorrowPosition',
   'normalizeBorrowQuote',
   'planBorrowWrite',
+  'prepareBorrowQuote',
+  'prepareBorrowQuoteForTarget',
   'quoteAddCollateral',
   'quoteBorrow',
   'quoteCloseLoan',
@@ -554,7 +471,9 @@ const PUBLIC_EXPORTS = [
   'quoteRepay',
   'quoteRequiredCollateral',
   'quoteWithdrawCollateral',
+  'summarizeCapabilityAnswer',
   'toBorrowError',
+  'verifyBorrowWriteBoundary',
 ]
 
 // Fields the adapter may send per SDK read. Anything else is an injection.
@@ -639,7 +558,7 @@ await test('application-facing exports cannot reach the raw Borrow Kit or its wr
   for (const line of kitLines) {
     assert.ok(allowedKitLines.some((pattern) => pattern.test(line)), `unexpected use of the raw kit: ${line.trim()}`)
   }
-  const readFunctions = PUBLIC_EXPORTS.filter((name) => /^(explore|get|quote)/.test(name)).length
+  const readFunctions = PUBLIC_EXPORTS.filter((name) => /^(explore|get|quote|prepare)/.test(name)).length
   assert.equal(kitLines.filter((line) => line.includes('client: BorrowReadClient = getMainnetBorrowKit()')).length, readFunctions)
   const executor = libSource.slice(libSource.indexOf('export async function executeBorrowWrite('))
   assert.ok(executor.indexOf('getMainnetBorrowKit()') > executor.indexOf("blockers: ['writes_disabled'] }"), 'the kit is reached only after the gate')
@@ -783,7 +702,7 @@ await test('no private key, seed phrase, API key, approval or transaction path i
   }
 })
 
-await test('SDK write calls exist only behind the write gate in executeBorrowWrite', () => {
+await test('SDK write calls exist only behind the write gate in executeBorrowWrite; the wallet adapter only in the boundary that follows it', () => {
   const start = libSource.indexOf('export async function executeBorrowWrite(')
   assert.ok(start > 0)
   const body = libSource.slice(start)
@@ -797,10 +716,12 @@ await test('SDK write calls exist only behind the write gate in executeBorrowWri
     assert.equal(total, guarded, `${method} is only called inside executeBorrowWrite`)
     assert.ok(body.search(pattern) > gate, `${method} follows the gate`)
   }
-  assert.ok(body.indexOf('getAdapter()') > gate, 'adapter is created after the gate')
+  assert.ok(body.indexOf('verifyBorrowWriteBoundary(request)') > gate, 'the boundary (wallet read, fresh reads, adapter) runs after the gate')
+  assert.equal(libSource.match(/request\.getAdapter\(\)/g)?.length, 1, 'the adapter is built in one place')
+  assert.ok(libSource.indexOf('request.getAdapter()') < start, 'and that place is the boundary, which executeBorrowWrite calls only after its gate')
 })
 
-await test('Borrow stays isolated from UI, Earn, Bridge and the intelligence engine', () => {
+await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reaches it only through read-only imports', () => {
   const sourceFiles = (directory) => readdirSync(directory).flatMap((entry) => {
     const path = join(directory, entry)
     return statSync(path).isDirectory() ? sourceFiles(path) : [path]
@@ -808,7 +729,29 @@ await test('Borrow stays isolated from UI, Earn, Bridge and the intelligence eng
   const importers = sourceFiles(join(root, 'src'))
     .filter((path) => /\.(ts|tsx)$/.test(path) && path !== libPath && path !== configPath)
     .filter((path) => /mainnetBorrow|borrow-kit/.test(readFileSync(path, 'utf8')))
-  assert.deepEqual(importers, [], 'no UI or other module imports Borrow yet')
+  // The Borrow tab, its pure helpers and the dashboard card are the only places that may import Borrow. Anything new
+  // has to be added here on purpose, after checking that it cannot reach a write.
+  assert.deepEqual(
+    importers.map((path) => relative(root, path)).sort(),
+    [
+      'src/components/ArcIntelligenceOverview.tsx',
+      'src/components/MainnetBorrow.tsx',
+      'src/lib/arcIntelligence.ts',
+      'src/lib/borrowAttemptLedger.ts',
+      'src/lib/borrowMarketVerification.ts',
+      'src/lib/borrowPreview.ts',
+      'src/lib/borrowWalletBalances.ts',
+      'src/lib/borrowWriteSafety.ts',
+    ],
+    'unexpected module imports Borrow',
+  )
+  // The Borrow tab may build the pure plan (planBorrowWrite), type actions and ask the wallet its read-only capability question
+  // (detectAtomicBatchCapability). It may never execute, build an adapter or ask the wallet to sign, approve, switch or send.
+  const WRITE_PATHS = /executeBorrowWrite|verifyBorrowWriteBoundary|BorrowWriteClient|MAINNET_BORROW_WRITE_METHODS|getAdapter|createViemAdapter|useWalletClient|signTypedData|sendTransaction|writeContract|eth_sendTransaction|wallet_sendCalls|wallet_switchEthereumChain|personal_sign/
+  for (const path of importers) {
+    const code = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+    assert.ok(!WRITE_PATHS.test(code), `${relative(root, path)} must not reach a Borrow write path`)
+  }
   const engine = sourceFiles(join(root, 'server/compact')).filter((path) => /borrow-kit|mainnetBorrow/.test(readFileSync(path, 'utf8')))
   assert.deepEqual(engine, [])
   assert.ok(!/earn-kit|bridge-kit|server\//.test(libSource))

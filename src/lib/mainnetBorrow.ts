@@ -1,11 +1,31 @@
-import { BorrowChain, BorrowKit, isKitError } from '@circle-fin/borrow-kit'
+import { Blockchain, BorrowChain, BorrowKit, getChainByEnum, isKitError } from '@circle-fin/borrow-kit'
 import {
   MAINNET_BORROW_ADAPTER_CONTRACT,
+  MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS,
   MAINNET_BORROW_CHAIN,
   MAINNET_BORROW_CHAIN_ID,
   MAINNET_BORROW_READ_ONLY_ENABLED,
   MAINNET_BORROW_WRITES_ENABLED,
 } from '../config/mainnetBorrow'
+import {
+  borrowActionAmount,
+  borrowActionId,
+  borrowAttemptScope,
+  borrowQuoteChange,
+  effectiveSlippageBps,
+  evaluateBorrowWriteSafety,
+  type AttemptLogHealth,
+  type BorrowAttemptRecord,
+  type BorrowWalletCapability,
+  type BorrowWalletRequest,
+  type BorrowWalletState,
+  type BorrowWriteAction,
+  type BorrowWriteBlocker,
+  type BorrowWriteEvidence,
+  type PreparedBorrowQuote,
+  type WriteCheck,
+} from './borrowWriteSafety'
+import type { BorrowAttemptLedger } from './borrowAttemptLedger'
 
 // Machina's only boundary to @circle-fin/borrow-kit. SDK responses are
 // normalized here once; the UI sees the small types below. Missing or
@@ -641,29 +661,94 @@ export function quoteWithdrawCollateral(
 // ---------------------------------------------------------------------------
 // Guarded writes. Disabled by MAINNET_BORROW_WRITES_ENABLED; nothing below
 // signs, approves or broadcasts while that constant is false.
+//
+// The checks themselves live in ./borrowWriteSafety (pure, shared with the UI
+// preview). planBorrowWrite and the boundary below run them again, so a write
+// cannot skip them by skipping the UI.
 // ---------------------------------------------------------------------------
 
-export type BorrowWalletCapability = 'supported' | 'unsupported' | 'unknown'
+export type {
+  AttemptLogHealth,
+  BorrowAttemptLedger,
+  BorrowAttemptRecord,
+  BorrowWalletCapability,
+  BorrowWalletRequest,
+  BorrowWalletState,
+  BorrowWriteAction,
+  BorrowWriteBlocker,
+  BorrowWriteEvidence,
+  PreparedBorrowQuote,
+  WriteCheck,
+}
 
-type Eip1193Request = (args: { method: string; params?: unknown[] }) => Promise<unknown>
+export type Eip1193Request = (args: { method: string; params?: unknown[] }) => Promise<unknown>
+
+// How long the wallet gets to answer the capability question before the answer is "could not verify".
+const CAPABILITY_TIMEOUT_MS = 8_000
+
+// A wallet that does not implement wallet_getCapabilities answers with a JSON-RPC "unsupported method" error: that is a clear "not
+// supported". Any other failure (a timeout, the person closing a prompt, a network error) says nothing about the wallet, so it
+// is "could not verify" and the wallet is treated as not suitable.
+function isUnsupportedMethod(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const { code, message } = error as { code?: unknown; message?: unknown }
+  if (code === 4200 || code === -32601) return true
+  return typeof message === 'string' && /method\b.*(not (found|supported|exist|implemented)|unsupported|unknown)|unsupported method|not implemented/i.test(message)
+}
+
+const CAPABILITY_TIMED_OUT = Symbol('capability timed out')
+
+function chainEntryOf(response: unknown): unknown {
+  const chainHex = `0x${MAINNET_BORROW_CHAIN_ID.toString(16)}`
+  const byChain = response as Record<string, unknown>
+  return byChain[chainHex] ?? byChain[String(MAINNET_BORROW_CHAIN_ID)] ?? byChain['0x0']
+}
+
+// One plain sentence about what the wallet answered, for the technical details. Shown as text only; the wallet's own words are cut
+// short and never interpreted.
+export function summarizeCapabilityAnswer(answer: { response?: unknown; error?: unknown; timedOut?: boolean }): string {
+  const chainHex = `0x${MAINNET_BORROW_CHAIN_ID.toString(16)}`
+  if (answer.timedOut) return `No answer from the wallet within ${CAPABILITY_TIMEOUT_MS / 1000} s.`
+  if (answer.error !== undefined) {
+    const { code, message } = (typeof answer.error === 'object' && answer.error !== null ? answer.error : {}) as { code?: unknown; message?: unknown }
+    const detail = typeof message === 'string' ? message.replace(/\s+/g, ' ').slice(0, 120) : 'no message'
+    return `The wallet returned an error${typeof code === 'number' ? ` (code ${code})` : ''}: ${detail}`
+  }
+  const response = answer.response
+  if (typeof response !== 'object' || response === null) return 'The wallet answered with something that is not a capabilities object.'
+  const entry = chainEntryOf(response)
+  if (typeof entry !== 'object' || entry === null) return `The wallet's answer has no entry for Arc (${chainHex}).`
+  const atomic = (entry as Record<string, unknown>).atomic
+  if (typeof atomic !== 'object' || atomic === null) return `The wallet's entry for Arc (${chainHex}) has no atomic capability.`
+  const { status, supported } = atomic as { status?: unknown; supported?: unknown }
+  const shown = typeof status === 'string' && status.length <= 40 ? `atomic.status = "${status}"` : typeof supported === 'boolean' ? `atomic.supported = ${supported}` : 'atomic capability without a status'
+  return `The wallet answered for Arc (${chainHex}): ${shown}.`
+}
 
 // EIP-5792 read: asks the wallet whether it can settle an atomic batch on Arc.
-// No signature and no transaction. Any failure reports the wallet as unable.
+// No signature and no transaction. "supported" and "unsupported" are the wallet's own
+// answers; anything it could not or did not answer is "unknown" (could not verify).
 export async function detectAtomicBatchCapability(
   request: Eip1193Request,
   address: string,
+  options: { timeoutMs?: number } = {},
 ): Promise<BorrowWalletCapability> {
   if (!isAddress(address)) return 'unknown'
   const chainHex = `0x${MAINNET_BORROW_CHAIN_ID.toString(16)}`
   let response: unknown
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    response = await request({ method: 'wallet_getCapabilities', params: [address, [chainHex]] })
-  } catch {
-    return 'unsupported'
+    response = await Promise.race([
+      request({ method: 'wallet_getCapabilities', params: [address, [chainHex]] }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(CAPABILITY_TIMED_OUT), options.timeoutMs ?? CAPABILITY_TIMEOUT_MS) }),
+    ])
+  } catch (error) {
+    return error !== CAPABILITY_TIMED_OUT && isUnsupportedMethod(error) ? 'unsupported' : 'unknown'
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
   if (typeof response !== 'object' || response === null) return 'unknown'
-  const byChain = response as Record<string, unknown>
-  const chainCapabilities = byChain[chainHex] ?? byChain[String(MAINNET_BORROW_CHAIN_ID)] ?? byChain['0x0']
+  const chainCapabilities = chainEntryOf(response)
   if (typeof chainCapabilities !== 'object' || chainCapabilities === null) return 'unsupported'
   const atomic = (chainCapabilities as Record<string, unknown>).atomic
   if (typeof atomic !== 'object' || atomic === null) return 'unsupported'
@@ -673,161 +758,301 @@ export async function detectAtomicBatchCapability(
   return status === 'unsupported' || supported === false ? 'unsupported' : 'unknown'
 }
 
-export type BorrowWriteAction =
-  | { kind: 'borrow'; marketId: string; borrowAmount: string; slippageBps?: number }
-  | { kind: 'borrow-more'; loanId: string; borrowAmount: string; slippageBps?: number }
-  | { kind: 'repay'; loanId: string; repayAmount: string }
-  | { kind: 'add-collateral'; loanId: string; collateralAmount: string }
-  | { kind: 'withdraw-collateral'; loanId: string; collateralAmount: string; slippageBps?: number }
-  | { kind: 'close-loan'; loanId: string; slippageBps?: number }
-
-export type BorrowWalletState = {
-  address?: string | null
-  chainId?: number | null
-  atomicBatch: BorrowWalletCapability
+// The SDK's own Arc definition: the chain ID and Borrow Adapter it would approve and send to. Compared with the constants
+// Machina pins, so a different SDK build cannot silently change where funds go.
+function sdkArcFacts(): { chainId: number | null; adapter: string | null } {
+  try {
+    const definition = getChainByEnum(Blockchain.Arc) as unknown as { chainId?: unknown; kitContracts?: { adapter?: unknown } }
+    return {
+      chainId: typeof definition.chainId === 'number' ? definition.chainId : null,
+      adapter: typeof definition.kitContracts?.adapter === 'string' ? definition.kitContracts.adapter : null,
+    }
+  } catch {
+    return { chainId: null, adapter: null }
+  }
 }
 
-export type BorrowWriteBlocker =
-  | 'writes_disabled'
-  | 'wallet_missing'
-  | 'wrong_chain'
-  | 'wallet_capability_missing'
-  | 'invalid_action'
-  | 'quote_missing'
-  | 'quote_mismatch'
-  | 'not_confirmed'
+// A Borrow Kit quote for a write action, bound to the request it answers and stamped with when it was asked for. The stamp is
+// taken before the call, so a slow answer is never made to look younger than it is. Read only.
+export async function prepareBorrowQuote(
+  action: BorrowWriteAction,
+  walletAddress: string | null,
+  client: BorrowReadClient = getMainnetBorrowKit(),
+  clock: () => number = Date.now,
+): Promise<BorrowAvailability<PreparedBorrowQuote>> {
+  const fetchedAt = clock()
+  let quote: BorrowAvailability<BorrowQuote>
+  switch (action.kind) {
+    case 'borrow':
+      quote = await quoteBorrow({ marketId: action.marketId, walletAddress: walletAddress ?? '', borrowAmount: action.borrowAmount, slippageBps: action.slippageBps }, client)
+      break
+    case 'borrow-more':
+      quote = await quoteBorrow({ loanId: action.loanId, borrowAmount: action.borrowAmount, slippageBps: action.slippageBps }, client)
+      break
+    case 'repay':
+      quote = await quoteRepay({ loanId: action.loanId, repayAmount: action.repayAmount }, client)
+      break
+    case 'add-collateral':
+      quote = await quoteAddCollateral({ loanId: action.loanId, collateralAmount: action.collateralAmount }, client)
+      break
+    case 'withdraw-collateral':
+      quote = await quoteWithdrawCollateral({ loanId: action.loanId, collateralAmount: action.collateralAmount, slippageBps: action.slippageBps }, client)
+      break
+    case 'close-loan':
+      quote = await quoteCloseLoan({ loanId: action.loanId, slippageBps: action.slippageBps }, client)
+      break
+    default:
+      return unavailable('invalid_input', 'kind')
+  }
+  if (quote.status === 'unavailable') return quote
+  return {
+    status: 'available',
+    data: {
+      quote: quote.data,
+      fetchedAt,
+      request: {
+        kind: action.kind,
+        marketId: action.kind === 'borrow' ? action.marketId : null,
+        loanId: action.kind === 'borrow' ? null : action.loanId,
+        walletAddress: action.kind === 'borrow' && isAddress(walletAddress) ? walletAddress : null,
+        amount: borrowActionAmount(action),
+        slippageBps: effectiveSlippageBps(action),
+      },
+    },
+  }
+}
 
-// What the wallet would be asked to sign, in batch order. Every write is one
-// atomic batch; approvals are exact and go to the Circle Borrow Adapter only.
-export type BorrowWalletRequest =
-  | 'allowance-reset-if-partial'
-  | 'collateral-approval-if-short'
-  | 'usdc-approval-if-short'
-  | 'morpho-authorization-grant'
-  | 'adapter-execution'
-  | 'morpho-authorization-revoke'
+export type TargetQuoteOutcome = 'as-requested' | 'buffered' | 'not-reached'
 
+export type TargetQuoteSearch = {
+  // 'as-requested': the quote Circle gives for the request already reaches the target. 'buffered': a larger collateral buffer
+  // reached it. 'not-reached': none did within the allowed buffer; `prepared` is then the as-requested quote, for showing why.
+  outcome: TargetQuoteOutcome
+  // The real quote to judge and to prepare a transaction from.
+  prepared: PreparedBorrowQuote
+  // What the action must carry so that it is the request this quote answers (undefined: the service default).
+  slippageBps: number | undefined
+  // Health Factor of the as-requested quote and of the exact sized collateral (buffer 0); null when not read.
+  requestedHealthFactor: number | null
+  baseHealthFactor: number | null
+  reads: number
+}
+
+const healthOf = (prepared: PreparedBorrowQuote): number | null => {
+  const value = prepared.quote.resultingHealthFactor
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+// Circle's Borrow Kit quote has no parameter for a target Health Factor or for the collateral (neither does the borrow call). It
+// sizes the collateral itself, and its `slippageBps` is added to that collateral as a buffer: measured live on Arc, the Health
+// Factor of the quote is the base Health Factor of the exact sizing (slippage 0) times (1 + slippageBps / 10 000). So a target is
+// reached by asking for the buffer that gets there. The arithmetic only proposes a number; the quote Circle returns for that
+// number is the only thing that counts, and it must reach the target on its own raw Health Factor. The same buffer is then the
+// slippage of the action, so the quote and the write are one request. If no allowed buffer reaches the target the result is
+// 'not-reached' and the target is never lowered.
+export async function prepareBorrowQuoteForTarget(
+  action: Extract<BorrowWriteAction, { kind: 'borrow' | 'borrow-more' }>,
+  walletAddress: string | null,
+  targetHealthFactor: number,
+  client: BorrowReadClient = getMainnetBorrowKit(),
+  clock: () => number = Date.now,
+): Promise<BorrowAvailability<TargetQuoteSearch>> {
+  if (!Number.isFinite(targetHealthFactor) || targetHealthFactor <= 1) return unavailable('invalid_input', 'targetHealthFactor')
+  let reads = 0
+  const ask = (slippageBps: number | undefined) => {
+    reads += 1
+    return prepareBorrowQuote({ ...action, slippageBps }, walletAddress, client, clock)
+  }
+  const meets = (prepared: PreparedBorrowQuote) => {
+    const health = healthOf(prepared)
+    return health !== null && health >= targetHealthFactor
+  }
+  const first = await ask(action.slippageBps)
+  if (first.status === 'unavailable') return first
+  const requestedHealthFactor = healthOf(first.data)
+  const result = (outcome: TargetQuoteOutcome, prepared: PreparedBorrowQuote, slippageBps: number | undefined, baseHealthFactor: number | null): BorrowAvailability<TargetQuoteSearch> =>
+    ({ status: 'available', data: { outcome, prepared, slippageBps, requestedHealthFactor, baseHealthFactor, reads } })
+  if (meets(first.data)) return result('as-requested', first.data, action.slippageBps, null)
+
+  const base = await ask(0)
+  const baseHealthFactor = base.status === 'available' ? healthOf(base.data) : null
+  if (baseHealthFactor === null || baseHealthFactor <= 0) return result('not-reached', first.data, action.slippageBps, baseHealthFactor)
+  // Rounding of the collateral to the token's decimals can leave a proposal a hair short (more so for small amounts). Each miss is
+  // corrected from the Health Factor Circle actually returned for it, up to three real quotes in all.
+  let slippageBps = Math.max(1, Math.ceil((targetHealthFactor / baseHealthFactor - 1) * 10_000))
+  for (let attempt = 0; attempt < 3 && slippageBps <= MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS; attempt += 1) {
+    const candidate = await ask(slippageBps)
+    if (candidate.status === 'unavailable') break
+    if (meets(candidate.data)) return result('buffered', candidate.data, slippageBps, baseHealthFactor)
+    const seen = healthOf(candidate.data)
+    if (seen === null || seen <= 0) break
+    slippageBps = Math.max(slippageBps + 1, Math.ceil(((1 + slippageBps / 10_000) * targetHealthFactor / seen - 1) * 10_000) + 1)
+  }
+  return result('not-reached', first.data, action.slippageBps, baseHealthFactor)
+}
+
+export type BorrowWriteContext = {
+  wallet: BorrowWalletState | null
+  quote: PreparedBorrowQuote | null
+  evidence: BorrowWriteEvidence | null
+  attempts?: readonly BorrowAttemptRecord[]
+  // Whether the attempt history can be trusted (see the ledger). Left out, it is treated as not trustworthy.
+  attemptLog?: AttemptLogHealth | null
+  // Milliseconds since the epoch. Defaults to now; tests fix it.
+  now?: number
+}
+
+// What the wallet would be asked to sign, in batch order, and every reason it could not go ahead.
 export type BorrowWritePlan = {
   actionId: string
+  scopeId: string
   action: BorrowWriteAction
-  owner: Hex | null
+  owner: `0x${string}` | null
   chain: typeof MAINNET_BORROW_CHAIN
   chainId: number
   approvalSpender: typeof MAINNET_BORROW_ADAPTER_CONTRACT
   walletRequests: BorrowWalletRequest[]
+  checks: WriteCheck[]
   blockers: BorrowWriteBlocker[]
   ready: boolean
 }
 
-const WALLET_REQUESTS: Record<BorrowWriteAction['kind'], BorrowWalletRequest[]> = {
-  'borrow': ['collateral-approval-if-short', 'morpho-authorization-grant', 'adapter-execution', 'morpho-authorization-revoke'],
-  'borrow-more': ['collateral-approval-if-short', 'morpho-authorization-grant', 'adapter-execution', 'morpho-authorization-revoke'],
-  'repay': ['usdc-approval-if-short', 'adapter-execution'],
-  'add-collateral': ['allowance-reset-if-partial', 'collateral-approval-if-short', 'adapter-execution'],
-  'withdraw-collateral': ['usdc-approval-if-short', 'morpho-authorization-grant', 'adapter-execution', 'morpho-authorization-revoke'],
-  'close-loan': ['usdc-approval-if-short', 'morpho-authorization-grant', 'adapter-execution', 'morpho-authorization-revoke'],
-}
-
-const QUOTE_KIND: Record<BorrowWriteAction['kind'], BorrowQuote['kind']> = {
-  'borrow': 'borrow',
-  'borrow-more': 'borrow',
-  'repay': 'repay',
-  'add-collateral': 'add-collateral',
-  'withdraw-collateral': 'withdraw-collateral',
-  'close-loan': 'close-loan',
-}
-
-function sameDecimal(left: string, right: string) {
-  const normalize = (value: string) => {
-    const [whole, fraction = ''] = value.split('.')
-    return `${whole.replace(/^0+(?=\d)/, '')}.${fraction.replace(/0+$/, '')}`
+// Pure: reports every reason a write could not run, without touching the SDK, the wallet or the network. The UI shows the
+// checks; the write gate is one more blocker on top of them.
+export function planBorrowWrite(action: BorrowWriteAction, context: BorrowWriteContext): BorrowWritePlan {
+  let report: ReturnType<typeof evaluateBorrowWriteSafety>
+  try {
+    report = evaluateBorrowWriteSafety({
+      action,
+      wallet: context.wallet,
+      quote: context.quote,
+      evidence: context.evidence,
+      attempts: context.attempts ?? [],
+      attemptLog: context.attemptLog ?? null,
+      now: context.now ?? Date.now(),
+      chain: sdkArcFacts(),
+    })
+  } catch {
+    // Data the checks cannot even read is a refusal, not a crash.
+    report = {
+      actionId: '',
+      scopeId: '',
+      owner: null,
+      walletRequests: [],
+      checks: [{ id: 'checks', blocker: 'quote_mismatch', status: 'fail', text: 'The checks could not run on the data given, so nothing is prepared.' }],
+      blockers: ['quote_mismatch'],
+    }
   }
-  return DECIMAL.test(left) && DECIMAL.test(right) && normalize(left) === normalize(right)
-}
-
-function actionIsValid(action: BorrowWriteAction) {
-  switch (action.kind) {
-    case 'borrow':
-      return isMarketId(action.marketId) && isAmount(action.borrowAmount) && isSlippage(action.slippageBps)
-    case 'borrow-more':
-      return isLoanId(action.loanId) && isAmount(action.borrowAmount) && isSlippage(action.slippageBps)
-    case 'repay':
-      return isLoanId(action.loanId) && isAmount(action.repayAmount)
-    case 'add-collateral':
-      return isLoanId(action.loanId) && isAmount(action.collateralAmount)
-    case 'withdraw-collateral':
-      return isLoanId(action.loanId) && isAmount(action.collateralAmount) && isSlippage(action.slippageBps)
-    case 'close-loan':
-      return isLoanId(action.loanId) && isSlippage(action.slippageBps)
-    default:
-      return false
-  }
-}
-
-function quoteMatches(action: BorrowWriteAction, quote: BorrowQuote) {
-  if (quote.kind !== QUOTE_KIND[action.kind]) return false
-  switch (action.kind) {
-    case 'borrow':
-    case 'borrow-more':
-      return quote.kind === 'borrow' && sameDecimal(quote.loanAsset.amount, action.borrowAmount)
-    case 'repay':
-      return quote.kind === 'repay' && sameDecimal(quote.repayAmount.amount, action.repayAmount)
-    case 'add-collateral':
-      return quote.kind === 'add-collateral' && sameDecimal(quote.collateral.amount, action.collateralAmount)
-    case 'withdraw-collateral':
-      return quote.kind === 'withdraw-collateral' && sameDecimal(quote.collateral.amount, action.collateralAmount)
-    case 'close-loan':
-      return true
-  }
-}
-
-function actionIdOf(action: BorrowWriteAction, owner: string | null) {
-  const target = action.kind === 'borrow' ? action.marketId : action.loanId
-  const value = 'borrowAmount' in action ? action.borrowAmount
-    : 'repayAmount' in action ? action.repayAmount
-      : 'collateralAmount' in action ? action.collateralAmount : ''
-  const slippage = 'slippageBps' in action && action.slippageBps !== undefined ? String(action.slippageBps) : 'default'
-  return [action.kind, MAINNET_BORROW_CHAIN_ID, owner?.toLowerCase() ?? '', target.toLowerCase(), value, slippage].join('|')
-}
-
-// Pure: reports every reason a write could not run, without touching the SDK,
-// the wallet or the network. The UI shows the plan and its blockers.
-export function planBorrowWrite(
-  action: BorrowWriteAction,
-  wallet: BorrowWalletState | null,
-  quote: BorrowQuote | null,
-): BorrowWritePlan {
-  const blockers: BorrowWriteBlocker[] = []
-  if (MAINNET_BORROW_WRITES_ENABLED !== true) blockers.push('writes_disabled')
-  const owner = wallet?.address && isAddress(wallet.address) ? wallet.address as Hex : null
-  if (!owner) blockers.push('wallet_missing')
-  if (wallet?.chainId !== MAINNET_BORROW_CHAIN_ID) blockers.push('wrong_chain')
-  if (wallet?.atomicBatch !== 'supported') blockers.push('wallet_capability_missing')
-  const valid = actionIsValid(action)
-  if (!valid) blockers.push('invalid_action')
-  if (!quote) blockers.push('quote_missing')
-  else if (!valid || !quoteMatches(action, quote)) blockers.push('quote_mismatch')
+  const blockers: BorrowWriteBlocker[] = MAINNET_BORROW_WRITES_ENABLED !== true ? ['writes_disabled', ...report.blockers] : report.blockers
   return {
-    actionId: valid ? actionIdOf(action, owner) : '',
+    actionId: report.actionId,
+    scopeId: report.scopeId,
     action,
-    owner,
+    owner: report.owner,
     chain: MAINNET_BORROW_CHAIN,
     chainId: MAINNET_BORROW_CHAIN_ID,
     approvalSpender: MAINNET_BORROW_ADAPTER_CONTRACT,
-    walletRequests: valid ? WALLET_REQUESTS[action.kind] : [],
+    walletRequests: report.walletRequests,
+    checks: report.checks,
     blockers,
     ready: blockers.length === 0,
   }
 }
 
-export type BorrowWriteRequest = {
+type BorrowAdapter = Parameters<BorrowKit['repay']>[0]['from']['adapter']
+
+export type BorrowBoundaryRequest = {
   action: BorrowWriteAction
-  wallet: BorrowWalletState | null
-  quote: BorrowQuote | null
-  // The actionId of the plan the user explicitly reviewed and executed.
+  // The quote the user reviewed, and the actionId of the plan they confirmed.
+  reviewedQuote: PreparedBorrowQuote | null
   confirmedActionId: string
-  // Builds the connected-wallet adapter; only called after every check passes.
-  getAdapter: () => Promise<Parameters<BorrowKit['repay']>[0]['from']['adapter']>
+  // Reads the wallet again, now: address, network and atomic batch capability. Read only; never prompts.
+  readWallet: () => Promise<BorrowWalletState | null>
+  // Reads the quote, market, on-chain market check, loan, loans and balances again for that wallet. Nothing from the review is reused.
+  refresh: (wallet: BorrowWalletState) => Promise<{ quote: PreparedBorrowQuote | null; evidence: BorrowWriteEvidence | null }>
+  // Builds the connected-wallet adapter; only called after the fresh checks pass.
+  getAdapter: () => Promise<BorrowAdapter>
+  // Required, and it must be one that is saved across reloads and readable (see borrowAttemptLedger): without it a reload or a second
+  // tab could send the same write again, so a ledger that is not trustworthy refuses the write.
+  attempts: BorrowAttemptLedger
+  clock?: () => number
+  newIdempotencyKey?: () => string
+}
+
+export type BorrowBoundaryResult =
+  | { status: 'refused'; blockers: BorrowWriteBlocker[] }
+  | { status: 'cleared'; plan: BorrowWritePlan; adapter: BorrowAdapter; idempotencyKey: string; attempts: BorrowAttemptLedger }
+
+function createIdempotencyKey(): string {
+  try {
+    return globalThis.crypto.randomUUID()
+  } catch {
+    return ''
+  }
+}
+
+// Everything that must hold right before a write, on fresh reads. It has no access to any SDK write method: it only decides
+// whether one may run. It does not look at the write gate; executeBorrowWrite does, first, and calls this only when open.
+//
+// Order: the confirmed action must be this action; the attempt is registered at once (a second call is refused while the
+// first is running or unresolved); the wallet, quote and on-chain conditions are read again and every safety check is
+// evaluated on those fresh reads; the quote must not have changed since it was reviewed; the wallet adapter must belong to the
+// wallet the plan was made for. Any refusal that happens before the SDK is reached removes the attempt again.
+export async function verifyBorrowWriteBoundary(request: BorrowBoundaryRequest): Promise<BorrowBoundaryResult> {
+  const ledger = request.attempts
+  const clock = request.clock ?? Date.now
+  const refuse = (blockers: BorrowWriteBlocker[], scopeId?: string): BorrowBoundaryResult => {
+    if (scopeId) ledger.discard(scopeId)
+    return { status: 'refused', blockers }
+  }
+
+  let wallet: BorrowWalletState | null
+  try {
+    wallet = await request.readWallet()
+  } catch {
+    return refuse(['wallet_missing'])
+  }
+  const owner = wallet?.address && isAddress(wallet.address) ? wallet.address : null
+  const actionId = borrowActionId(request.action, owner)
+  if (!wallet || !actionId) return refuse([!actionId ? 'invalid_action' : 'wallet_missing'])
+  if (request.confirmedActionId !== actionId) return refuse(['not_confirmed'])
+
+  // The history must be saved across reloads and readable before anything is recorded or sent. It is never cleared to get past this.
+  const log = ledger.health()
+  if (!log.ok || !log.persistent) return refuse(['attempt_store_unreliable'])
+  const scopeId = borrowAttemptScope(request.action, owner)
+  const key = request.newIdempotencyKey?.() ?? createIdempotencyKey()
+  if (!ledger.begin({ scopeId, actionId, kind: request.action.kind, idempotencyKey: key }, clock())) {
+    // Either an attempt already exists on this market or loan, or this one could not be saved: neither may go ahead.
+    return refuse([ledger.health().ok ? 'attempt_unresolved' : 'attempt_store_unreliable'])
+  }
+
+  let fresh: Awaited<ReturnType<BorrowBoundaryRequest['refresh']>>
+  try {
+    fresh = await request.refresh(wallet)
+  } catch {
+    return refuse(['evidence_missing'], scopeId)
+  }
+  // Our own just-registered attempt is not an earlier one.
+  const earlier = ledger.list().filter((attempt) => attempt.scopeId !== scopeId)
+  const plan = planBorrowWrite(request.action, { wallet, quote: fresh.quote, evidence: fresh.evidence, attempts: earlier, attemptLog: ledger.health(), now: clock() })
+  const blockers = plan.blockers.filter((blocker) => blocker !== 'writes_disabled')
+  if (blockers.length > 0) return refuse(blockers, scopeId)
+
+  if (!request.reviewedQuote || !fresh.quote || borrowQuoteChange(request.reviewedQuote, fresh.quote) !== null) return refuse(['quote_changed'], scopeId)
+
+  let adapter: BorrowAdapter
+  try {
+    adapter = await request.getAdapter()
+    const adapterOwner = await adapter.getAddress(getChainByEnum(Blockchain.Arc))
+    if (typeof adapterOwner !== 'string' || adapterOwner.toLowerCase() !== (owner as string).toLowerCase()) return refuse(['wallet_changed'], scopeId)
+  } catch {
+    return refuse(['wallet_changed'], scopeId)
+  }
+  return { status: 'cleared', plan, adapter, idempotencyKey: key, attempts: ledger }
+}
+
+export type BorrowWriteRequest = BorrowBoundaryRequest & {
   client?: BorrowWriteClient
 }
 
@@ -838,41 +1063,52 @@ export type BorrowWriteOutcome =
   | { status: 'failed'; error: BorrowError }
 
 export async function executeBorrowWrite(request: BorrowWriteRequest): Promise<BorrowWriteOutcome> {
-  // The gate is checked first: while it is false no adapter is created and no
-  // SDK write method is reached, so no wallet prompt can appear.
+  // The gate is checked first: while it is false no wallet is read, no quote is requested, no adapter is created and no SDK
+  // write method is reached, so no wallet prompt can appear.
   if (MAINNET_BORROW_WRITES_ENABLED !== true) return { status: 'refused', blockers: ['writes_disabled'] }
-  const plan = planBorrowWrite(request.action, request.wallet, request.quote)
-  if (!plan.ready) return { status: 'refused', blockers: plan.blockers }
-  if (request.confirmedActionId !== plan.actionId) return { status: 'refused', blockers: ['not_confirmed'] }
+  const boundary = await verifyBorrowWriteBoundary(request)
+  if (boundary.status === 'refused') return boundary
+  const { plan, adapter, idempotencyKey, attempts } = boundary
+  const clock = request.clock ?? Date.now
 
   try {
     const client = request.client ?? getMainnetBorrowKit()
-    const from = { adapter: await request.getAdapter(), chain: ARC }
+    const from = { adapter, chain: ARC }
+    const key = idempotencyKey || undefined
     const action = request.action
     const result = await (() => {
       switch (action.kind) {
         case 'borrow':
-          return client.borrow({ from, marketId: action.marketId, borrowAmount: action.borrowAmount, slippageBps: action.slippageBps })
+          return client.borrow({ from, marketId: action.marketId, borrowAmount: action.borrowAmount, slippageBps: action.slippageBps, idempotencyKey: key })
         case 'borrow-more':
-          return client.borrow({ from, loanId: action.loanId, borrowAmount: action.borrowAmount, slippageBps: action.slippageBps })
+          return client.borrow({ from, loanId: action.loanId, borrowAmount: action.borrowAmount, slippageBps: action.slippageBps, idempotencyKey: key })
         case 'repay':
-          return client.repay({ from, loanId: action.loanId, repayAmount: action.repayAmount })
+          return client.repay({ from, loanId: action.loanId, repayAmount: action.repayAmount, idempotencyKey: key })
         case 'add-collateral':
-          return client.addCollateral({ from, loanId: action.loanId, collateralAmount: action.collateralAmount })
+          return client.addCollateral({ from, loanId: action.loanId, collateralAmount: action.collateralAmount, idempotencyKey: key })
         case 'withdraw-collateral':
           return client.withdrawCollateralRepayIfNeeded({
             from,
             loanId: action.loanId,
             collateralAmount: action.collateralAmount,
             slippageBps: action.slippageBps,
+            idempotencyKey: key,
           })
         case 'close-loan':
-          return client.closeLoan({ from, loanId: action.loanId, slippageBps: action.slippageBps })
+          return client.closeLoan({ from, loanId: action.loanId, slippageBps: action.slippageBps, idempotencyKey: key })
       }
     })()
-    if (result.status === 'submitted') return { status: 'submitted', loanId: result.loanId, batchId: result.batchId }
+    // A submitted batch has an unknown outcome and a confirmed one has happened: neither is ever sent again as it is.
+    if (result.status === 'submitted') {
+      attempts.finish(plan.scopeId, 'submitted', clock(), { batchId: result.batchId })
+      return { status: 'submitted', loanId: result.loanId, batchId: result.batchId }
+    }
+    attempts.finish(plan.scopeId, 'confirmed', clock(), { batchId: result.batchId, txHash: result.txHash })
     return { status: result.status, loanId: result.loanId, batchId: result.batchId, txHash: result.txHash }
   } catch (error) {
-    return { status: 'failed', error: toBorrowError(error) }
+    // A thrown write may or may not have reached the chain; it stays unresolved until the position has been read again.
+    const failure = toBorrowError(error)
+    attempts.finish(plan.scopeId, 'failed', clock(), { errorCode: failure.code })
+    return { status: 'failed', error: failure }
   }
 }
