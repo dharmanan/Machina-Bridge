@@ -3374,8 +3374,8 @@ await test('Public Beta 2 SEO titles descriptions and canonical agree with the d
   assert.ok(readFileSync(sourcePath('public/sitemap.xml'), 'utf8').includes(`<loc>${canonical}</loc>`));
   assert.ok(readFileSync(sourcePath('public/robots.txt'), 'utf8').includes(`Sitemap: ${canonical}sitemap.xml`));
   const readme = readFileSync(sourcePath('README.md'), 'utf8');
-  assert.ok(readme.includes(`[Live App](${canonical})`));
-  assert.ok(readme.includes(`- Live app: ${canonical}`));
+  assert.ok(readme.includes(`[Launch Machina Bridge](${canonical})`));
+  assert.ok(readme.includes('The application is available as a **Public Beta**.'));
   assert.ok(readme.includes(`${canonical}.well-known/security.txt`));
   for (const file of ['index.html', 'public/sitemap.xml', 'public/robots.txt', 'README.md'])
     assert.doesNotMatch(readFileSync(sourcePath(file), 'utf8'), /machinabridge\.vercel\.app/, `${file}: no obsolete live URL`);
