@@ -77,7 +77,7 @@ const decimalFixtures = [
 ]
 
 const tokenRows = decimalFixtures.map(([tokenDecimal], index) => ({
-  hash: txHash,
+  hash: `0x${String(index + 1).padStart(64, '0')}`,
   contractAddress: `0x${String(index + 1).padStart(40, '0')}`,
   from: wallet,
   to: other,
@@ -89,16 +89,29 @@ const tokenRows = decimalFixtures.map(([tokenDecimal], index) => ({
 }))
 
 const originalFetch = globalThis.fetch
-process.env.ETHERSCAN_API_KEY = 'wallet-activity-fixture-key'
+const originalApiKey = process.env.BLOCKSCOUT_PRO_API_KEY
+process.env.BLOCKSCOUT_PRO_API_KEY = 'wallet-activity-fixture-key'
+process.on('exit', () => {
+  if (originalApiKey === undefined) delete process.env.BLOCKSCOUT_PRO_API_KEY
+  else process.env.BLOCKSCOUT_PRO_API_KEY = originalApiKey
+})
+const blockAddress = hash => hash == null ? null : { hash }
+const blockTransaction = row => ({
+  hash: row.hash, timestamp: row.timeStamp, from: blockAddress(row.from), to: blockAddress(row.to), value: row.value,
+  raw_input: row.input, block_number: 1,
+  status: row.isError === '1' || row.txreceipt_status === '0' ? 'error' : row.isError === '0' || row.txreceipt_status === '1' ? 'ok' : null,
+})
+const blockTransfer = (row, log_index) => ({
+  transaction_hash: row.hash, from: blockAddress(row.from), to: blockAddress(row.to),
+  total: { value: row.value }, token: { address_hash: row.contractAddress, symbol: row.tokenSymbol, decimals: row.tokenDecimal, type: 'ERC-20' },
+  timestamp: row.timeStamp, confirmations: row.confirmations, log_index,
+})
+const pageResponse = (items, next_page_params = null) => new Response(JSON.stringify({ items, next_page_params }), {
+  headers: { 'content-type': 'application/json' },
+})
 globalThis.fetch = async (input) => {
-  const action = new URL(String(input)).searchParams.get('action')
-  return {
-    ok: true,
-    json: async () => ({
-      status: '1',
-      result: action === 'tokentx' ? tokenRows : [],
-    }),
-  }
+  const transfers = new URL(String(input)).pathname.endsWith('/token-transfers')
+  return pageResponse(transfers ? tokenRows.map(blockTransfer) : [])
 }
 
 const responseHeaders = {}
@@ -142,13 +155,7 @@ console.log('token confirmations API fixtures passed: digit string and safe inte
 
 async function normalizeApiTransactions(transactionRows) {
   const previousFetch = globalThis.fetch
-  globalThis.fetch = async (input) => ({
-    ok: true,
-    json: async () => ({
-      status: '1',
-      result: new URL(String(input)).searchParams.get('action') === 'txlist' ? transactionRows : [],
-    }),
-  })
+  globalThis.fetch = async input => pageResponse(new URL(String(input)).pathname.endsWith('/transactions') ? transactionRows.map(blockTransaction) : [])
   const apiResponse = {
     statusCode: 200,
     body: null,
@@ -446,3 +453,306 @@ assert.doesNotMatch(earnPreviewSource, /formatUsdc\(vault\.liquidityProfile\?\.a
 console.log('request lifecycle guards passed: generation, wallet identity, abort, manual refresh, and address-scoped rendering')
 console.log('Activity navigation and UI fixtures passed: mainnet tab, no Dashboard card, hidden Unknown badge, normal page scrolling')
 console.log('Earn UI fixtures passed: metadata driven dropdown labels; withdrawal flow order unchanged; Withdrawal/Checked at review copy and conditional liquidity note')
+
+// Blockscout contract regressions: synthetic identities, in-memory Responses, no live requests or credentials.
+let blockscoutChecks = 0
+let clientSequence = 20
+const hashOf = number => `0x${number.toString(16).padStart(64, '0')}`
+const ARC_NATIVE_SENTINEL = '0xfffffffffffffffffffffffffffffffffffffffe'
+const blockTx = (number, overrides = {}) => ({
+  hash: hashOf(number), from: { hash: wallet }, to: { hash: other }, value: '0', raw_input: '0x',
+  timestamp: '2026-10-01T12:00:00.000Z', block_number: 123, status: 'ok', ...overrides,
+})
+const blockToken = (number, overrides = {}) => ({
+  transaction_hash: hashOf(number), from: { hash: other }, to: { hash: wallet }, log_index: 0,
+  total: { value: '1000000', decimals: '6' }, token: { address_hash: tokenA, symbol: 'FIX', decimals: '6', type: 'ERC-20' },
+  timestamp: '2026-10-01T12:01:00Z', confirmations: '3', ...overrides,
+})
+async function checkBlockscout(name, work) {
+  await work()
+  blockscoutChecks += 1
+  console.log(`PASS Blockscout ${name}`)
+}
+async function apiCall(fetchImpl, { method = 'GET', query = { address: wallet, limit: '30' }, client } = {}) {
+  const saved = globalThis.fetch
+  const calls = [], headers = {}
+  const result = { statusCode: null, body: null,
+    setHeader(name, value) { headers[name] = value; return this },
+    status(code) { this.statusCode = code; return this }, send(body) { this.body = JSON.parse(body); return this } }
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    assert.ok(fetchImpl, 'rejected requests must not fetch')
+    return fetchImpl(new URL(String(url)), init)
+  }
+  try {
+    await handler({ method, query, headers: { 'x-vercel-forwarded-for': client ?? `192.0.2.${clientSequence++}` } }, result)
+  } finally { globalThis.fetch = saved }
+  assert.equal(headers['Cache-Control'], 'no-store')
+  assert.equal(headers['Content-Type'], 'application/json; charset=utf-8')
+  return { ...result, headers, calls }
+}
+const feeds = (transactions = [], transfers = []) => async url => pageResponse(url.pathname.endsWith('/transactions') ? transactions : transfers)
+
+await checkBlockscout('nested addresses timestamp status and server-only Authorization preserve the public contract', async () => {
+  const res = await apiCall(feeds([blockTx(1001, { value: '1000000000000000000' }), blockTx(1002, { status: 'error' }),
+    blockTx(1003, { block_number: null, timestamp: null, status: null })]))
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(Object.keys(res.body).sort(), ['limit', 'tokenTransfers', 'transactions'])
+  assert.deepEqual(Object.keys(res.body.transactions[0]).sort(), ['approval', 'from', 'hash', 'input', 'isError', 'receiptStatus', 'timeStamp', 'to', 'value'])
+  const rows = new Map(normalizeWalletActivity(wallet, res.body).map(row => [row.txHash, row]))
+  assert.equal(rows.get(hashOf(1001)).status, 'Confirmed')
+  assert.equal(rows.get(hashOf(1001)).amount, '−1 USDC')
+  assert.equal(rows.get(hashOf(1001)).timestamp, Date.parse('2026-10-01T12:00:00Z'))
+  assert.equal(rows.get(hashOf(1002)).status, 'Failed')
+  assert.equal(rows.get(hashOf(1002)).amount, null)
+  assert.equal(rows.get(hashOf(1003)).status, 'Unknown')
+  for (const call of res.calls) {
+    const url = new URL(call.url)
+    assert.equal(url.origin, 'https://api.blockscout.com')
+    assert.match(url.pathname, /^\/5042\/api\/v2\/addresses\/0x[a-f0-9]{40}\/(transactions|token-transfers)$/)
+    assert.equal(url.search, '')
+    assert.equal(call.init.headers.Authorization, 'Bearer wallet-activity-fixture-key')
+    assert.equal(call.init.redirect, 'error')
+    assert.equal(call.init.method, 'GET')
+  }
+  assert.doesNotMatch(JSON.stringify(res.body), /fixture-key|Authorization|raw_input/)
+})
+
+await checkBlockscout('transaction_hash transfers and exact amounts join their transaction without duplicate activity', async () => {
+  const res = await apiCall(feeds([blockTx(1100, { to: { hash: tokenA }, raw_input: '0xa9059cbb' })], [blockToken(1100, {
+    from: { hash: wallet }, to: { hash: other }, total: { value: '12345678901234567890', decimals: '6' },
+  }), blockToken(1101)]))
+  const rows = normalizeWalletActivity(wallet, res.body)
+  assert.equal(rows.length, 2)
+  assert.equal(rows.find(row => row.txHash === hashOf(1100)).amount, '−12,345,678,901,234.56789 FIX')
+  assert.equal(rows.find(row => row.txHash === hashOf(1101)).amount, '+1 FIX')
+  assert.equal(rows.find(row => row.txHash === hashOf(1101)).status, 'Confirmed')
+  assert.deepEqual(Object.keys(res.body.tokenTransfers[0]).sort(), ['confirmations', 'contractAddress', 'decimals', 'from', 'hash', 'symbol', 'timeStamp', 'to', 'value'])
+})
+
+await checkBlockscout('approval calldata and paired Earn movements retain existing classification', async () => {
+  const res = await apiCall(feeds([blockTx(1200, { to: { hash: arcUsdc }, raw_input: approveInput(spender, '2500000') }), blockTx(1201)], [
+    blockToken(1201, { from: { hash: wallet }, to: { hash: other }, token: { address_hash: arcUsdc, type: 'ERC-20', symbol: 'USDC', decimals: '6' } }),
+    blockToken(1201, { log_index: 1, total: { value: '1000000000000000000', decimals: '18' },
+      token: { address_hash: earnVaults[0], type: 'ERC-20', symbol: 'arcUSDC', decimals: '18' } }),
+  ]))
+  const rows = normalizeWalletActivity(wallet, res.body)
+  assert.equal(rows.find(row => row.txHash === hashOf(1200)).amount, 'Limit 2.5 USDC')
+  assert.equal(rows.find(row => row.txHash === hashOf(1200)).approvalAmountRaw, '2500000')
+  assert.equal(rows.find(row => row.txHash === hashOf(1201)).title, 'Earn deposit · Galaxy USDC')
+  assert.equal(rows.find(row => row.txHash === hashOf(1201)).amount, '−1 USDC')
+})
+
+await checkBlockscout('empty account stays empty; missing status or confirmations never invent confirmation', async () => {
+  const empty = await apiCall(feeds())
+  assert.equal(empty.statusCode, 200)
+  assert.deepEqual(empty.body, { transactions: [], tokenTransfers: [], limit: 30 })
+  const res = await apiCall(feeds([blockTx(1300, { status: null }), blockTx(1301, { status: 'ok', block_number: null })], [
+    blockToken(1302, { confirmations: undefined, block_number: 123, block_hash: hashOf(77) }),
+    blockToken(1303, { confirmations: '0' }),
+  ]))
+  assert.ok(normalizeWalletActivity(wallet, res.body).every(row => row.status === 'Unknown'))
+})
+
+await checkBlockscout('malformed identities decimals integers NFTs and unrelated rows are not exposed as valid amounts', async () => {
+  const transfer = blockToken(1400)
+  const bad = [
+    { ...transfer, transaction_hash: 'invalid' }, { ...transfer, from: { hash: 'bad' } },
+    { ...transfer, total: { value: '-1' } }, { ...transfer, total: { value: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...transfer, total: { value: '1', decimals: '18' } }, { ...transfer, token: { ...transfer.token, decimals: 'unknown' } },
+    { ...transfer, token: { ...transfer.token, address_hash: ARC_NATIVE_SENTINEL } },
+    { ...transfer, token: { ...transfer.token, type: 'ERC-721' } }, { ...transfer, token: { ...transfer.token, symbol: '<svg>' } },
+    { ...transfer, from: { hash: tokenA }, to: { hash: tokenB } }, { ...transfer, log_index: -1 },
+  ]
+  const res = await apiCall(feeds([blockTx(1401, { value: 'bad' }), blockTx(1402, { from: { hash: 'bad' } }),
+    blockTx(1403, { raw_input: '0xa9059cbbZZ', value: '1' }), blockTx(1404, { from: { hash: tokenA }, to: { hash: tokenB } })], bad))
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(res.body.transactions, [])
+  assert.deepEqual(res.body.tokenTransfers, [])
+  const conflict = await apiCall(feeds([], [transfer, { ...transfer, log_index: 1, total: { value: 'bad' } }]))
+  assert.deepEqual(conflict.body.tokenTransfers, [], 'a malformed ERC20 leg must not leave a misleading partial aggregate')
+  const missingType = await apiCall(feeds([], [transfer, { ...transfer, log_index: 1, token: { ...transfer.token, type: undefined } }]))
+  assert.deepEqual(missingType.body.tokenTransfers, [], 'a malformed token record cannot be treated as an unrelated NFT')
+  const badParent = await apiCall(feeds([blockTx(1400, { value: 'bad' })], [transfer]))
+  assert.deepEqual(badParent.body.tokenTransfers, [], 'invalid transaction evidence must not reappear as a confirmed token-only row')
+})
+
+await checkBlockscout('UTC fractional timestamps are seconds, invalid calendars are not fabricated, contract creation stays supported', async () => {
+  const res = await apiCall(feeds([blockTx(1500, { timestamp: '2026-10-01T12:00:00.123456Z', to: null }),
+    blockTx(1501, { timestamp: '2026-02-30T12:00:00Z' }), blockTx(1502, { raw_input: undefined, value: '1000000' })]))
+  const byHash = new Map(res.body.transactions.map(row => [row.hash, row]))
+  assert.equal(byHash.get(hashOf(1500)).to, null)
+  assert.equal(byHash.get(hashOf(1500)).timeStamp, String(Date.parse('2026-10-01T12:00:00Z') / 1000))
+  assert.equal(byHash.get(hashOf(1501)).timeStamp, null)
+  assert.equal(byHash.get(hashOf(1501)).receiptStatus, '')
+  assert.equal(normalizeWalletActivity(wallet, res.body).find(row => row.txHash === hashOf(1502)).type, 'interaction')
+})
+
+await checkBlockscout('bounded cursor pagination deduplicates events across pages and retains distinct same-amount logs', async () => {
+  const res = await apiCall(async url => {
+    if (url.pathname.endsWith('/transactions')) return pageResponse([blockTx(1600, { to: { hash: tokenA }, raw_input: '0xa9059cbb' })])
+    if (!url.search) return pageResponse([blockToken(1600, { from: { hash: wallet }, to: { hash: other } }),
+      blockToken(1600, { from: { hash: wallet }, to: { hash: other }, log_index: 1 })], { block_number: 123, index: 1, items_count: 50, batch_block_hash: null })
+    assert.equal(url.searchParams.get('block_number'), '123')
+    return pageResponse([blockToken(1600, { from: { hash: wallet }, to: { hash: other }, log_index: 1 }),
+      blockToken(1600, { from: { hash: wallet }, to: { hash: other }, log_index: 2 }), blockToken(1601)])
+  })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.calls.length, 3)
+  assert.equal(res.body.tokenTransfers.filter(row => row.hash === hashOf(1600)).length, 3)
+  assert.equal(normalizeWalletActivity(wallet, res.body).find(row => row.txHash === hashOf(1600)).amount, '−3 FIX')
+})
+
+await checkBlockscout('at most four HTTP reads and 100 raw rows per feed; a cut transfer group is not summed', async () => {
+  const res = await apiCall(async url => {
+    const second = Boolean(url.search), first = second ? 51 : 1
+    const rows = url.pathname.endsWith('/transactions') ? Array.from({ length: 50 }, (_, i) => blockTx(1700 + first + i))
+      : Array.from({ length: 50 }, (_, i) => blockToken(1999, { log_index: first + i }))
+    return pageResponse(rows, { block_number: second ? 100 : 123, index: 1, items_count: 50 })
+  })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.calls.length, 4)
+  assert.equal(res.body.tokenTransfers.length, 0, 'the boundary transaction has more logs: no partial amount')
+  assert.equal(res.body.transactions.length, 30)
+  assert.equal(normalizeWalletActivity(wallet, res.body).length, 30)
+})
+
+await checkBlockscout('observed six-field transaction and two-field transfer cursors retain exact decimals and microseconds across 50-row pages', async () => {
+  const timestamp = '2026-10-18T18:38:59.000000Z'
+  const transactionCursor = { index: 49, value: '542090165354999999092', hash: hashOf(3049),
+    inserted_at: '2026-10-18T18:38:59.123456Z', block_number: 123, fee: '12345678901234567890.000000001' }
+  const transferCursor = { index: 49, block_number: 123 }
+  const amount = '542090165354999999092'
+  const res = await apiCall(async url => {
+    const transactions = url.pathname.endsWith('/transactions')
+    const second = Boolean(url.search)
+    const cursor = transactions ? transactionCursor : transferCursor
+    if (second) assert.deepEqual(Object.fromEntries(url.searchParams),
+      Object.fromEntries(Object.entries(cursor).map(([key, value]) => [key, String(value)])), 'cursor values are not rounded or converted to seconds')
+    const items = Array.from({ length: 50 }, (_, index) => {
+      if (!transactions) return blockToken(3000, { from: { hash: wallet }, to: { hash: other }, log_index: index + (second ? 50 : 0),
+        timestamp, total: { decimals: '18', ui_multiplier: null, value: amount },
+        token: { address_hash: tokenA, type: 'ERC-20', decimals: '18', symbol: 'FIX' } })
+      const number = 3000 + index + (second ? 50 : 0)
+      return blockTx(number, { timestamp, to: { hash: number === 3003 ? arcUsdc : tokenA },
+        raw_input: number === 3003 ? approveInput(spender, '2500000') : '0xa9059cbb', status: number === 3002 ? 'error' : 'ok' })
+    })
+    return pageResponse(items, second ? null : cursor)
+  })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.calls.length, 4)
+  assert.equal(res.body.transactions.length, 30)
+  assert.equal(res.body.tokenTransfers.length, 100, 'all 100 related logs survive; the 30 limit counts transactions, not their legs')
+  for (const transfer of res.body.tokenTransfers) {
+    assert.equal(transfer.hash, hashOf(3000))
+    assert.equal(transfer.value, amount)
+    assert.equal(transfer.decimals, 18)
+    assert.equal(transfer.timeStamp, String(Date.parse(timestamp) / 1000))
+  }
+  const rows = new Map(normalizeWalletActivity(wallet, res.body).map(row => [row.txHash, row]))
+  assert.equal(rows.size, 30)
+  assert.equal(rows.get(hashOf(3000)).amount, '−54,209.016535 FIX')
+  assert.equal(rows.get(hashOf(3000)).status, 'Confirmed')
+  assert.equal(rows.get(hashOf(3002)).status, 'Failed')
+  assert.equal(rows.get(hashOf(3002)).amount, null)
+  assert.equal(rows.get(hashOf(3003)).amount, 'Limit 2.5 USDC')
+})
+
+await checkBlockscout('shared 30-transaction cap preserves all associated transfers of selected transactions', async () => {
+  const txs = Array.from({ length: 35 }, (_, i) => blockTx(2000 + i))
+  const res = await apiCall(feeds(txs, [blockToken(2100), blockToken(2100, { log_index: 1 }), blockToken(2000, { log_index: 2 })]),
+    { query: { address: wallet, limit: '9999' } })
+  const hashes = new Set([...res.body.transactions, ...res.body.tokenTransfers].map(row => row.hash))
+  assert.equal(res.body.limit, 30)
+  assert.equal(hashes.size, 30)
+  assert.equal(res.body.tokenTransfers.filter(row => row.hash === hashOf(2100)).length, 2)
+  assert.equal(normalizeWalletActivity(wallet, res.body).length, 30)
+})
+
+await checkBlockscout('repeated conflicting or unsafe cursors fail closed without following an arbitrary URL', async () => {
+  for (const cursor of [{ url: 'https://invalid.example/' }, { address: other }, { block_number: -1 },
+    { index: Number.MAX_SAFE_INTEGER + 1 }, { hash: 'bad' }, { value: '-1' }, { value: '1e18' },
+    { fee: '1&url=https://invalid.example' }, { inserted_at: '2026-02-30T12:00:00Z' }, { inserted_at: '1700000000' }, [], {}]) {
+    const res = await apiCall(async () => pageResponse([blockTx(2200)], cursor))
+    assert.equal(res.statusCode, 502)
+    assert.ok(res.calls.every(call => new URL(call.url).origin === 'https://api.blockscout.com'))
+  }
+  const repeated = await apiCall(async url => url.pathname.endsWith('/transactions')
+    ? pageResponse([blockTx(2200)], { block_number: 1, index: 1 }) : pageResponse([]))
+  assert.equal(repeated.statusCode, 502)
+  const duplicate = await apiCall(feeds([], [blockToken(2201), blockToken(2201, { total: { value: '2000000', decimals: '6' } })]))
+  assert.equal(duplicate.statusCode, 502)
+  const conflictingStatus = await apiCall(feeds([blockTx(2202), blockTx(2202, { status: 'error' })]))
+  assert.equal(conflictingStatus.statusCode, 502)
+})
+
+await checkBlockscout('HTTP authorization rate-limit redirects malformed JSON and schemas return only sanitized errors', async () => {
+  for (const status of [302, 401, 403, 429, 500]) {
+    const res = await apiCall(async () => new Response('provider-private-details', { status }))
+    assert.equal(res.statusCode, 502)
+    assert.deepEqual(res.body, { error: 'Wallet activity could not be loaded right now' })
+  }
+  for (const reply of [() => new Response('<html>invalid</html>'), () => new Response(JSON.stringify({ result: [] })),
+    () => new Response(JSON.stringify({ items: {}, next_page_params: null })), () => pageResponse(Array(51).fill(blockTx(2300))),
+    () => { throw Error('provider-private-details') }]) {
+    const res = await apiCall(reply)
+    assert.equal(res.statusCode, 502)
+    assert.doesNotMatch(JSON.stringify(res.body), /provider|html|fixture-key/)
+  }
+})
+
+await checkBlockscout('response size and body-read errors fail safely and cancel the other feed', async () => {
+  for (const reply of [() => new Response('oversized', { headers: { 'content-length': String(2 * 1024 * 1024 + 1) } }),
+    () => new Response(new Uint8Array(2 * 1024 * 1024 + 1)),
+    () => new Response(new ReadableStream({ start(controller) { controller.error(Error('private body error')) } }))]) {
+    const res = await apiCall(reply)
+    assert.equal(res.statusCode, 502)
+    assert.ok(res.calls.every(call => call.init.signal.aborted))
+  }
+})
+
+await checkBlockscout('method address and missing server key checks reject before any provider call', async () => {
+  const post = await apiCall(null, { method: 'POST' })
+  assert.equal(post.statusCode, 405)
+  assert.equal(post.headers.Allow, 'GET')
+  for (const address of ['bad', [wallet], ` ${wallet}`]) assert.equal((await apiCall(null, { query: { address } })).statusCode, 400)
+  delete process.env.BLOCKSCOUT_PRO_API_KEY
+  try { assert.equal((await apiCall(null)).statusCode, 503) }
+  finally { process.env.BLOCKSCOUT_PRO_API_KEY = 'wallet-activity-fixture-key' }
+})
+
+await checkBlockscout('existing 30-per-minute local refresh limit is preserved', async () => {
+  const client = '198.51.100.200'
+  for (let i = 0; i < 30; i += 1) assert.equal((await apiCall(feeds(), { client })).statusCode, 200)
+  const res = await apiCall(null, { client })
+  assert.equal(res.statusCode, 429)
+  assert.deepEqual(res.body, { error: 'Please wait before refreshing wallet activity' })
+})
+
+await checkBlockscout('one shared 10-second deadline covers stalled headers and stalled body reads without more pages', async () => {
+  for (const stalledBody of [false, true]) {
+    const savedSet = globalThis.setTimeout, savedClear = globalThis.clearTimeout
+    let expire, cancelled = 0, cleared = false
+    globalThis.setTimeout = (callback, milliseconds) => {
+      assert.equal(milliseconds, 10_000)
+      expire = callback
+      return 12345
+    }
+    globalThis.clearTimeout = () => { cleared = true }
+    try {
+      const pending = apiCall(async (_url, init) => stalledBody
+        ? new Response(new ReadableStream({ cancel() { cancelled += 1 } }))
+        : new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(Error('private timeout')), { once: true })))
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      assert.ok(expire)
+      expire()
+      const res = await pending
+      assert.equal(res.statusCode, 502)
+      assert.equal(res.calls.length, 2)
+      assert.ok(res.calls.every(call => call.init.signal.aborted))
+      assert.equal(cleared, true)
+      if (stalledBody) assert.equal(cancelled, 2)
+    } finally { globalThis.setTimeout = savedSet; globalThis.clearTimeout = savedClear }
+  }
+})
+console.log(`VERIFIER PASS wallet-activity: existing classification regressions and ${blockscoutChecks} Blockscout checks; mocks only`)
