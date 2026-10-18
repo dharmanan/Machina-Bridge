@@ -3437,25 +3437,46 @@ await test('Public Beta 5 the Mainnet Dashboard heading owns the only Dashboard 
   }
 });
 
-await test('Public Beta 6 README documents current capabilities commands and public contract identities without upgrading evidence', async () => {
+await test('Public Beta 6 README documents current capabilities, validation, public links and risk boundaries', async () => {
   const readme = readFileSync(sourcePath('README.md'), 'utf8');
-  for (const title of ['# Machina Bridge — Public Beta', '## Product Overview', '## Current Features and Availability', '## Arc Intelligence',
-    '## Data Integrity and Limitations', '## Borrow Preview', '## Bridge and Earn', '## Architecture', '## Development and Validation',
-    '## Security, Disclaimer and Links']) assert.ok(readme.includes(`${title}\n`), title);
-  for (const phrase of ['independent Arc DeFi platform', 'Testnet-only', 'Read-only Preview', 'MAINNET_BORROW_WRITES_ENABLED=false',
-    'Not verified', 'unavailable/null', 'Galaxy USDC', 'Gauntlet USDC Prime', 'Node.js 24.x']) assert.ok(readme.includes(phrase), phrase);
-  assert.match(readme, /share one verified checkpoint/);
+
+  // Check the actual public documentation structure. Do not require headings from an older README.
+  for (const title of ['# Machina Bridge', '## Features', '## Arc Intelligence', '## Bridge', '## Earn',
+    '## Borrow Preview', '## Fees and data transparency', '## Technology and architecture',
+    '## Run locally', '## Independence, security, and license'])
+    assert.ok(readme.includes(title + '\n'), title);
+
+  // Product availability, missing-data honesty and wallet-write safety must remain explicit.
+  for (const phrase of ['independent, community-built interface', '**Public Beta**', '**Testnet only**',
+    '**Read-only Preview**', '**Borrow transactions are not enabled.**',
+    'Galaxy USDC', 'Gauntlet USDC Prime', 'Node.js 24.x'])
+    assert.ok(readme.includes(phrase), phrase);
+  assert.match(readme, /a missing or incomplete value is not presented as a confirmed zero/);
+  assert.match(readme, /Select \*\*24H\*\*, \*\*7D\*\*, or \*\*30D\*\*/);
+  assert.match(readme, /The tab never asks a wallet to sign, approve a token, or send a transaction/);
+  assert.match(readme, /Transactions involving real assets are irreversible and carry financial risks/);
+  assert.match(readme, /never share a seed phrase or private key/);
+  assert.match(readme, /does not provide investment recommendations/);
+  assert.match(readme, /not an official Arc, Circle, Uniswap, or Morpho product/);
+  assert.ok(readme.includes('src/config/mainnetBorrow.ts'));
+
+  // Every documented runnable command and script must exist.
   const pkg = JSON.parse(readFileSync(sourcePath('package.json'), 'utf8'));
-  for (const [, command] of readme.matchAll(/npm run ([\w:-]+)/g)) assert.ok(pkg.scripts[command], `documented npm script ${command} exists`);
-  for (const [, file] of readme.matchAll(/node (scripts\/[\w.-]+\.mjs)/g)) assert.ok(readFileSync(sourcePath(file)).length, file);
-  const configs = ['src/config/mainnet.ts', 'src/config/mainnetNetworks.ts', 'src/config/mainnetSolana.ts'].map(file =>
-    readFileSync(sourcePath(file), 'utf8').toLowerCase()).join('\n');
-  for (const address of new Set(readme.match(/0x[0-9a-fA-F]{40}/g))) assert.ok(configs.includes(address.toLowerCase()), `documented contract ${address} matches current config`);
-  for (const address of ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
-    'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe']) assert.ok(readme.includes(address) && configs.includes(address.toLowerCase()), 'public Solana contract identity');
+  for (const [, command] of readme.matchAll(/npm run ([\w:-]+)/g))
+    assert.ok(pkg.scripts[command], 'documented npm script ' + command + ' exists');
+  for (const [, file] of readme.matchAll(/node (scripts\/[\w.-]+\.mjs)/g))
+    assert.ok(readFileSync(sourcePath(file), 'utf8').length, file);
+
+  // Only verify contract addresses that the current README actually publishes.
+  // Do not force undocumented Solana contract addresses into a product overview.
+  const configs = ['src/config/mainnet.ts', 'src/config/mainnetNetworks.ts', 'src/config/mainnetSolana.ts',
+    'src/config/mainnetBorrow.ts'].map(file => readFileSync(sourcePath(file), 'utf8').toLowerCase()).join('\n');
+  for (const address of new Set(readme.match(/0x[0-9a-fA-F]{40}/g) ?? []))
+    assert.ok(configs.includes(address.toLowerCase()), 'documented contract ' + address + ' matches current config');
+
+  assert.ok(readme.includes('[Launch Machina Bridge](https://www.machinabridge.xyz/)'));
+  assert.ok(readme.includes('[Security contact](https://www.machinabridge.xyz/.well-known/security.txt)'));
   assert.doesNotMatch(readme, /Node\.js 18\+|pending as of 2026-09-28|machinabridge\.vercel\.app|-----BEGIN .*PRIVATE KEY/);
-  assert.match(readme, /does not provide automated investment advice/);
-  assert.match(readme, /not an official Arc or Circle product/);
   assert.equal(borrowConfig.MAINNET_BORROW_WRITES_ENABLED, false);
 });
 
