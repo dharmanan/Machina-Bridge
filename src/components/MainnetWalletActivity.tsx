@@ -191,7 +191,7 @@ export default function MainnetWalletActivity() {
         )}
 
         <p className="mt-4 border-t border-slate-100 pt-3 text-[10px] text-slate-400">
-          Activity data provided by Etherscan.
+          Activity data provided by Blockscout.
         </p>
       </Card>
     </Container>

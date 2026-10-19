@@ -22,6 +22,7 @@
     "@circle-fin/borrow-kit": "1.0.0",
     "@circle-fin/bridge-kit": "^1.8.3",
     "@circle-fin/earn-kit": "^1.7.0",
+    "@circle-fin/swap-kit": "1.7.0",
     "@mysten/dapp-kit": "^1.0.4",
     "@mysten/sui": "^2.16.0",
     "@rainbow-me/rainbowkit": "^2.2.10",

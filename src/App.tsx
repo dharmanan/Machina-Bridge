@@ -21,6 +21,7 @@ import './index.css'
 
 // Loaded on first visit so the Borrow Kit SDK stays out of the main bundle.
 const MainnetBorrow = lazy(() => import('./components/MainnetBorrow'))
+const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapPreview'))
 
 type Tab = 'swap' | 'bridge' | 'earn' | 'borrow' | 'dashboard' | 'activity'
 
@@ -47,7 +48,7 @@ export default function App() {
     isConnecting: isConnectingSuiWallet,
     isWalletAvailable: isSuiWalletAvailable,
   } = useSuiWallet()
-  const [activeTab, setActiveTab] = useState<Tab>('swap')
+  const [activeTab, setActiveTab] = useState<Tab>(() => readStoredAppNetwork() === 'mainnet' ? 'bridge' : 'swap')
   const [appNetwork, setAppNetwork] = useState<AppNetwork>(() => readStoredAppNetwork())
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
@@ -518,6 +519,7 @@ export default function App() {
             <nav className="flex flex-wrap gap-2 py-4">
               {[
                 { id: 'bridge' as const, label: 'Bridge', icon: <GitBranch size={20} /> },
+                { id: 'swap' as const, label: 'Swap', icon: <Zap size={20} /> },
                 { id: 'earn' as const, label: 'Earn', icon: <TrendingUp size={20} /> },
                 { id: 'borrow' as const, label: 'Borrow', icon: <Banknote size={20} /> },
                 { id: 'dashboard' as const, label: 'Dashboard', icon: <BarChart3 size={20} /> },
@@ -527,7 +529,7 @@ export default function App() {
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
                   className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors ${
-                    (activeTab === tab.id || (activeTab === 'swap' && tab.id === 'bridge'))
+                    activeTab === tab.id
                       ? 'border border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C] shadow-sm'
                       : 'border border-transparent text-slate-500 hover:border-slate-200 hover:bg-white hover:text-slate-900'
                   }`}
@@ -553,7 +555,9 @@ export default function App() {
                     <MainnetBorrow />
                   </Suspense>
                 )
-                : activeTab === 'activity'
+                : activeTab === 'swap'
+                  ? <Suspense fallback={<Container className="py-8"><p className="text-sm text-slate-500">Loading Swap Preview...</p></Container>}><MainnetSwapPreview /></Suspense>
+                  : activeTab === 'activity'
                   ? <MainnetWalletActivity />
                   : <MainnetPreviewGate />
         ) : (
