@@ -130,7 +130,7 @@ export default function MainnetSwapPreview() {
               {MAINNET_SWAP_SLIPPAGE_BPS.map((bps) => <option key={bps} value={bps}>{bps / 100}%</option>)}
             </select>
           </label>
-          <p className="text-sm text-slate-500">Route availability is confirmed only by a successful quote, including reverse directions. WETH is not enabled.</p>
+          <p className="text-sm text-slate-500">Route availability is confirmed only by a successful quote, including reverse directions.</p>
           {walletState === 'disconnected' && <p role="status" className="text-sm text-slate-600">Connect your wallet using the header to request a quote. No signature is requested.</p>}
           {walletState === 'wrong_network' && <p role="status" className="text-sm text-amber-700">Select Arc Mainnet (chain ID 5042) in your wallet. Quotes are disabled on other networks.</p>}
           {insufficientBalance && <p role="status" className="text-sm text-amber-700">Insufficient token balance for this amount.</p>}

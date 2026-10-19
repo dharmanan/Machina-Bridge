@@ -11,5 +11,6 @@ export const MAINNET_SWAP_TOKENS = {
   USDC: { symbol: 'USDC', address: '0x3600000000000000000000000000000000000000', decimals: 6 },
   EURC: { symbol: 'EURC', address: '0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1', decimals: 6 },
   cirBTC: { symbol: 'cirBTC', address: '0x171A4217b86A807A64eB94757Db6849fb4bDbAA0', decimals: 8 },
+  WETH: { symbol: 'WETH', address: '0x128cC466B61f542da60c70e3aA11c10e19B84EDB', decimals: 18 },
 } as const
 export type MainnetSwapToken = keyof typeof MAINNET_SWAP_TOKENS

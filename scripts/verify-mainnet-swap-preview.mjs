@@ -33,12 +33,13 @@ await test('Preview enabled and writes unconditionally disabled', () => {
   assert.equal(getChainByEnum('Arc').chainId, 5042)
   assert.equal(getChainByEnum('Arc').isTestnet, false)
 })
-await test('only the three officially pinned contracts and decimals are offered', () => {
-  assert.deepEqual(Object.keys(tokens), ['USDC', 'EURC', 'cirBTC'])
+await test('all four pinned Arc contracts and decimals are offered', () => {
+  assert.deepEqual(Object.keys(tokens), ['USDC', 'EURC', 'cirBTC', 'WETH'])
   assert.deepEqual(Object.values(tokens).map(({ address, decimals }) => [address.toLowerCase(), decimals]), [
     ['0x3600000000000000000000000000000000000000', 6],
     ['0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1', 6],
     ['0x171a4217b86a807a64eb94757db6849fb4bdbaa0', 8],
+    ['0x128cc466b61f542da60c70e3aa11c10e19b84edb', 18],
   ])
 })
 await test('amount math preserves values above Number precision and cirBTC base units', () => {
@@ -53,7 +54,7 @@ await test('wallet, network, pair and slippage gates fail closed', () => {
   assert.equal(swap.swapWalletState(false), 'disconnected')
   assert.equal(swap.swapWalletState(true, 1), 'wrong_network')
   assert.equal(swap.swapWalletState(true, 5042), 'ready')
-  for (const change of [{ address: '' }, { address: `0x${'0'.repeat(40)}` }, { chainId: 1 }, { chainId: 5042002 }, { tokenOut: 'WETH' }, { tokenIn: 'constructor' }, { tokenOut: 'USDC' }, { tokenIn: 'cirBTC' }, { slippageBps: 0 }, { slippageBps: 301 }]) {
+  for (const change of [{ address: '' }, { address: `0x${'0'.repeat(40)}` }, { chainId: 1 }, { chainId: 5042002 }, { tokenOut: 'DAI' }, { tokenIn: 'constructor' }, { tokenOut: 'USDC' }, { tokenIn: 'cirBTC' }, { slippageBps: 0 }, { slippageBps: 301 }]) {
     assert.throws(() => swap.validateSwapRequest({ ...request, ...change }))
   }
 })
@@ -70,6 +71,42 @@ await test('successful quote preserves exact output, minimum and distinct native
   assert.equal(quote.fees[1].amount, '0.02070858705783893')
   assert.equal(quote.expiresAt, 31000)
 })
+
+await test('WETH output, minimum, slippage and fee amounts retain all 18 decimals', () => {
+  const input = { ...request, tokenOut: 'WETH' }
+  const data = raw(input)
+  data.estimatedOutput = { token: tokens.WETH.address, amount: '0.004123456789012345' }
+  data.stopLimit = { token: tokens.WETH.address, amount: '0.004082222221122221' }
+  data.fees = [
+    { type: 'provider', token: 'USDC', amount: '0.0014' },
+    { type: 'gas', token: 'USDC', amount: '0.022822750974000829' },
+    { type: 'swap', token: tokens.WETH.address, amount: '0.000000000000000001' },
+  ]
+  const quote = swap.normalizeSwapQuote(data, input, 1000)
+  assert.equal(quote.estimatedOutput, '0.004123456789012345')
+  assert.equal(quote.minimumOutput, '0.004082222221122221')
+  assert.equal(quote.fees[1].amount, '0.022822750974000829')
+  assert.equal(quote.fees[2].amount, '0.000000000000000001')
+  assert.equal(swap.decimalUnits(quote.estimatedOutput, 18), 4123456789012345n)
+  const belowTolerance = { ...data, stopLimit: { token: 'WETH', amount: '0.004082222221122220' } }
+  assert.throws(() => swap.normalizeSwapQuote(belowTolerance, input, 1000), /invalid_quote/)
+  assert.throws(() => swap.normalizeSwapQuote({ ...data, fees: [{ type: 'gas', token: 'WETH', amount: '0.01' }] }, input, 1000), /invalid_quote/)
+  assert.throws(() => swap.normalizeSwapQuote({ ...data, estimatedOutput: { token: 'ETH', amount: '0.004123456789012345' } }, input, 1000), /invalid_quote/)
+  for (const field of ['estimatedOutput', 'stopLimit']) {
+    assert.throws(() => swap.normalizeSwapQuote({ ...data, [field]: { token: 'WETH', amount: '0.0041234567890123451' } }, input, 1000))
+  }
+})
+await test('WETH input and balances use exact 18-decimal units and still require Arc USDC pairs', () => {
+  const input = { ...request, tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004123456789012345' }
+  assert.doesNotThrow(() => swap.validateSwapRequest(input))
+  assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', 4123456789012344n), true)
+  assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', 4123456789012345n), false)
+  assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', undefined), false)
+  assert.throws(() => swap.validateSwapRequest({ ...input, amount: '0.0041234567890123451' }))
+  assert.throws(() => swap.validateSwapRequest({ ...input, tokenOut: 'EURC' }), /unsupported_route/)
+  assert.throws(() => swap.validateSwapRequest({ ...input, chainId: 1 }), /wrong_network/)
+})
+
 await test('contract-address echoes and reversed quotes validate without assuming route availability', () => {
   const input = { ...request, tokenIn: 'cirBTC', tokenOut: 'USDC', amount: '0.0001' }
   const data = raw(input)
@@ -145,6 +182,7 @@ await test('error messages are bounded and do not expose raw provider payloads',
 const originalFetch = globalThis.fetch
 let rpcCalls = [], serviceBodies = []
 let incorrectDecimals = false
+let rejectReverse = false
 // Exercise the actual installed SDK and real Viem adapter with local mock responses.
 globalThis.fetch = async (url, init) => {
   const endpoint = String(url)
@@ -159,7 +197,7 @@ globalThis.fetch = async (url, init) => {
       else if (entry.method === 'eth_call') {
         const token = Object.values(tokens).find((token) => token.address.toLowerCase() === entry.params[0].to.toLowerCase())
         assert.ok(token)
-        result = `0x${BigInt(incorrectDecimals ? 18 : token.decimals).toString(16).padStart(64, '0')}`
+        result = `0x${BigInt(incorrectDecimals ? 17 : token.decimals).toString(16).padStart(64, '0')}`
       } else throw new Error(`Unexpected RPC ${entry.method}`)
       return { jsonrpc: '2.0', id: entry.id, result }
     })
@@ -169,7 +207,13 @@ globalThis.fetch = async (url, init) => {
   assert.equal(init.method, 'POST') // quote preparation, never broadcast
   assert.equal(new Headers(init.headers).get('Authorization'), null)
   serviceBodies.push(body)
-  const output = body.tokenOutAddress.toLowerCase() === tokens.cirBTC.address.toLowerCase() ? ['12345', '12221'] : ['6200000', '6138000']
+  const outputs = { EURC: ['6200000', '6138000'], cirBTC: ['12345', '12221'], WETH: ['4123456789012345', '4082222221122221'], USDC: ['6200000', '6138000'] }
+  const outputToken = Object.values(tokens).find(token => token.address.toLowerCase() === body.tokenOutAddress.toLowerCase())
+  assert.ok(outputToken, 'SDK must send a pinned contract address, never an unverified alias')
+  const output = outputs[outputToken.symbol]
+  if (rejectReverse && body.tokenInAddress.toLowerCase() === tokens.WETH.address.toLowerCase()) {
+    return Response.json({ message: 'No liquidity route available' }, { status: 400 })
+  }
   return Response.json({
     ...body, tokenOutChain: 'Arc', estimatedAmount: output[0], stopLimit: output[1],
     fees: { provider: [{ amount: '1400', token: tokens.USDC.address, symbol: 'USDC', decimals: 6 }] },
@@ -177,22 +221,38 @@ globalThis.fetch = async (url, init) => {
   })
 }
 try {
-  await test('real SDK estimate completes for both USDC routes using only public reads and no credential', async () => {
-    for (const tokenOut of ['EURC', 'cirBTC']) {
+  await test('real SDK estimate preserves existing USDC routes and adds WETH by contract address', async () => {
+    for (const tokenOut of ['EURC', 'cirBTC', 'WETH']) {
       const result = await swap.readMainnetSwapQuote({ ...request, tokenOut }, new AbortController().signal)
-      assert.equal(result.estimatedOutput, tokenOut === 'EURC' ? '6.2' : '0.00012345')
-      assert.equal(result.minimumOutput, tokenOut === 'EURC' ? '6.138' : '0.00012221')
+      const expected = { EURC: ['6.2', '6.138'], cirBTC: ['0.00012345', '0.00012221'], WETH: ['0.004123456789012345', '0.004082222221122221'] }[tokenOut]
+      assert.equal(result.estimatedOutput, expected[0])
+      assert.equal(result.minimumOutput, expected[1])
       assert.equal(result.fees.find((fee) => fee.type === 'provider').amount, '0.0014')
       assert.ok(result.fees.find((fee) => fee.type === 'gas').amount)
     }
-    assert.equal(serviceBodies.length, 2)
+    assert.equal(serviceBodies.length, 3)
+    const wethBody = serviceBodies.find(body => body.tokenOutAddress.toLowerCase() === tokens.WETH.address.toLowerCase())
+    assert.ok(wethBody)
+    assert.equal(wethBody.amount, '7000000')
+    assert.equal(wethBody.tokenInAddress.toLowerCase(), tokens.USDC.address.toLowerCase())
     assert.ok(rpcCalls.includes('eth_call') && rpcCalls.includes('eth_gasPrice'))
     assert.ok(serviceBodies.every((body) => body.tokenInChain === 'Arc' && body.tokenOutChain === 'Arc' && body.slippageBps === 100))
+  })
+  await test('WETH reverse direction requires a successful SDK quote and preserves 18-decimal input', async () => {
+    const input = { ...request, tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004123456789012345' }
+    const result = await swap.readMainnetSwapQuote(input, new AbortController().signal)
+    assert.equal(result.estimatedOutput, '6.2')
+    assert.equal(serviceBodies.at(-1).tokenInAddress.toLowerCase(), tokens.WETH.address.toLowerCase())
+    assert.equal(serviceBodies.at(-1).amount, '4123456789012345')
+    rejectReverse = true
+    await assert.rejects(swap.readMainnetSwapQuote(input, new AbortController().signal))
+    rejectReverse = false
   })
   await test('wrong on-chain decimals is rejected by the adapter', async () => {
     incorrectDecimals = true
     const adapter = swap.createSwapReadAdapter()
     await assert.rejects(adapter.getTokenDecimals(tokens.cirBTC.address, getChainByEnum('Arc')), /token_decimals_mismatch/)
+    await assert.rejects(adapter.getTokenDecimals(tokens.WETH.address, getChainByEnum('Arc')), /token_decimals_mismatch/)
     await assert.rejects(adapter.getTokenDecimals(tokens.EURC.address, getChainByEnum('Ethereum')), /unsupported_chain/)
     await assert.rejects(adapter.getTokenDecimals(`0x${'9'.repeat(40)}`, getChainByEnum('Arc')), /unsupported_token/)
   })
@@ -258,5 +318,20 @@ await test('Arc wallet DOM reads token balance without claiming execution capaci
   const errorHtml = renderToStaticMarkup(React.createElement(Component))
   assert.match(errorHtml, /Balance unavailable/)
   assert.doesNotMatch(errorHtml, /ERC-20 balance: 0/)
+})
+await test('WETH is selectable in both directions and renders its full ERC-20 balance', () => {
+  wallet = { isConnected: true, chainId: 5042, address }
+  const initialHtml = renderToStaticMarkup(React.createElement(Component))
+  assert.equal((initialHtml.match(/<option>WETH<\/option>/g) ?? []).length, 2)
+  assert.doesNotMatch(initialHtml, /WETH is not enabled/)
+  const originalUseState = React.useState
+  mockBalance = { isSuccess: true, isError: false, data: 4123456789012345n }
+  React.useState = (initial) => originalUseState(initial === 'USDC' ? 'WETH' : initial === 'EURC' ? 'USDC' : initial)
+  try {
+    const html = renderToStaticMarkup(React.createElement(Component))
+    assert.match(html, /ERC-20 balance: 0\.004123456789012345 WETH/)
+    assert.match(html, /Swap disabled in Preview/)
+    assert.match(html, /Route availability is confirmed only by a successful quote, including reverse directions/)
+  } finally { React.useState = originalUseState }
 })
 console.log(`${passed} total Mainnet Swap checks passed, including DOM states.`)
