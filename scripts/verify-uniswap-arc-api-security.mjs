@@ -1,4 +1,4 @@
-// No paid API, RPC, real wallet, signature or transaction. Exercise the actual handler boundaries.
+// No live API, RPC, real wallet, signature or transaction. Exercise the actual handler boundaries.
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
@@ -19,6 +19,7 @@ const input = { chainId: 5042, tokenIn: 'USDC', tokenOut: 'EURC', amount: '1', o
 const origin = 'https://swap.example.test', key = 'synthetic-server-key-never-returned'
 const nonce = crypto.randomUUID()
 const headers = { origin, 'content-type': 'application/json', 'x-preview-request-id': nonce }
+const production = { NODE_ENV: 'production', VERCEL: '1', VERCEL_ENV: 'production', UNISWAP_ARC_PREVIEW_ENABLED: 'true' }
 const envKeys = ['NODE_ENV','VERCEL','VERCEL_ENV','CODESPACES','CODESPACE_NAME','GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN','UNISWAP_ARC_ALLOWED_ORIGIN','UNISWAP_TRADING_API_KEY','UNISWAP_ARC_PREVIEW_ENABLED']
 const saved = Object.fromEntries(envKeys.map(k => [k, process.env[k]]))
 const oldPrepare = service.prepareArcPreview
@@ -54,8 +55,9 @@ async function invoke(handler, changes = {}) {
 }
 async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`) }
 try {
-  await test('public entry point is closed with zero preparations in production, preview, development and unknown runtimes', async () => {
+  await test('public entry point defaults closed in production, preview, development and unknown runtimes', async () => {
     for (const env of [{}, { NODE_ENV: 'production' }, { NODE_ENV: 'development' }, { VERCEL: '1', VERCEL_ENV: 'preview' },
+      { NODE_ENV: 'production', VERCEL: '1', VERCEL_ENV: 'production' },
       { NODE_ENV: 'development', CODESPACES: 'true', UNISWAP_ARC_PREVIEW_ENABLED: 'true' }]) {
       runtime(env); const before = preparations
       const result = await invoke(load().default)
@@ -65,6 +67,67 @@ try {
       assert.equal(result.headers['Cache-Control'], 'no-store')
       assert.equal(preparations, before)
     }
+  })
+  await test('only exact true in a verified Vercel production runtime opts in', async () => {
+    for (const env of [{ ...production, UNISWAP_ARC_PREVIEW_ENABLED: '' }, { ...production, UNISWAP_ARC_PREVIEW_ENABLED: 'false' },
+      { ...production, UNISWAP_ARC_PREVIEW_ENABLED: '1' }, { ...production, UNISWAP_ARC_PREVIEW_ENABLED: 'TRUE' },
+      { ...production, UNISWAP_ARC_PREVIEW_ENABLED: 'true ' }, { ...production, VERCEL_ENV: 'preview' },
+      { ...production, VERCEL_ENV: 'development' }, { ...production, VERCEL: '' },
+      { ...production, NODE_ENV: 'development' }, { UNISWAP_ARC_PREVIEW_ENABLED: 'true' }]) {
+      runtime(env); const before = preparations
+      assert.equal((await invoke(load().default)).status, 503)
+      assert.equal(preparations, before)
+    }
+  })
+  await test('production opt-in returns the same verified read-only review and freshness protocol', async () => {
+    runtime(production)
+    const result = await invoke(load().default)
+    assert.equal(result.status, 200); assert.equal(result.headers['X-Uniswap-Preview-Status'], undefined)
+    assert.equal(result.body.simulation, 'passed'); assert.equal(result.body.writesEnabled, false); assert.equal(result.body.executionBound, false)
+    assert.equal(result.headers['X-Preview-Request-Id'], nonce)
+    p.validateArcReview(result.body, { owner: input.owner, chainId: 5042, connected: true }, Number(result.headers['X-Preview-Server-Time']))
+  })
+  await test('turning off the server opt-in immediately stops further preparations', async () => {
+    runtime(production); const api = load()
+    assert.equal((await invoke(api.default)).status, 200)
+    delete process.env.UNISWAP_ARC_PREVIEW_ENABLED
+    const before = preparations
+    assert.equal((await invoke(api.default)).status, 503); assert.equal(preparations, before)
+  })
+  await test('enabled production rejects wrong Origin, non-JSON and non-HTTPS configuration without upstream work', async () => {
+    runtime(production); const api = load(), before = preparations
+    for (const change of [{ origin: 'https://other.test' }, { origin: undefined }, { origin: [origin] }, { 'content-type': 'text/plain' }])
+      assert.equal((await invoke(api.default, { headers: { ...headers, ...change } })).status, 403)
+    for (const allowed of ['*', 'http://swap.example.test', origin + '/', origin + '/path']) {
+      process.env.UNISWAP_ARC_ALLOWED_ORIGIN = allowed
+      assert.equal((await invoke(api.default, { headers: { ...headers, origin: allowed } })).status, 403)
+    }
+    delete process.env.UNISWAP_ARC_ALLOWED_ORIGIN
+    assert.equal((await invoke(api.default)).status, 403)
+    assert.equal(preparations, before)
+  })
+  await test('enabled production enforces size, nonce and instance budget before preparation', async () => {
+    runtime(production); const api = load(), before = preparations
+    assert.equal((await invoke(api.default, { body: 'x'.repeat(8193) })).status, 413)
+    assert.equal((await invoke(api.default, { headers: { ...headers, 'x-preview-request-id': 'malformed' } })).status, 400)
+    for (let i = 0; i < 25; i++) assert.equal((await invoke(api.default, { body: { ...input, chainId: 1 } })).status, 503)
+    assert.equal(preparations, before)
+    for (let i = 0; i < 20; i++) assert.equal((await invoke(api.default)).status, 200)
+    const rejected = await invoke(api.default)
+    assert.equal(rejected.status, 429); assert.equal(rejected.headers['Retry-After'], '60'); assert.equal(preparations, before + 20)
+  })
+  await test('enabled production sanitizes service errors and preserves economic/write validation', async () => {
+    runtime(production); const api = load(), original = service.prepareArcPreview
+    try {
+      for (const prepare of [async () => { throw new Error(key + ' private-upstream-payload') },
+        async request => ({ ...makeReview(request), executionBound: true }),
+        async request => ({ ...makeReview(request), requiredMinimum: '0' })]) {
+        service.prepareArcPreview = prepare
+        const result = await invoke(api.default)
+        assert.equal(result.status, 503); assert.equal(JSON.stringify(result).includes('private-upstream-payload'), false)
+        assert.equal(result.body.writesEnabled, false)
+      }
+    } finally { service.prepareArcPreview = original }
   })
   await test('spoofed Origin/Referer/Fetch Metadata/forwarded/auth/development headers never unlock the public API', async () => {
     runtime({ NODE_ENV: 'development', CODESPACES: 'true' })
@@ -96,7 +159,7 @@ try {
   })
   await test('private Vite handler refuses production/unknown NODE_ENV and all Vercel runtime markers', async () => {
     for (const env of [{}, { NODE_ENV: 'production' }, { NODE_ENV: 'development', VERCEL: '0' },
-      { NODE_ENV: 'development', VERCEL: '1' }, { NODE_ENV: 'development', VERCEL_ENV: 'development' }]) {
+      { NODE_ENV: 'development', VERCEL: '1' }, { NODE_ENV: 'development', VERCEL_ENV: 'development' }, production]) {
       runtime(env); const before = preparations
       assert.equal((await invoke(load().handleDevelopmentArcPreview)).status, 503)
       assert.equal(preparations, before)
@@ -114,6 +177,11 @@ try {
     UNISWAP_ARC_ALLOWED_ORIGIN: 'https://specific-workspace-4173.app.github.dev' }
   const proxyHeaders = { ...headers, origin: 'https://localhost:4173', 'x-forwarded-host': 'specific-workspace-4173.app.github.dev',
     referer: 'https://specific-workspace-4173.app.github.dev/swap', 'sec-fetch-site': 'same-origin' }
+  await test('production opt-in cannot inherit the Codespaces rewritten-Origin exception', async () => {
+    runtime({ ...codespace, ...production }); const before = preparations
+    assert.equal((await invoke(load().default, { headers: proxyHeaders })).status, 403)
+    assert.equal(preparations, before)
+  })
   await test('existing Codespaces rewrite works only in Vite development and for the exact runtime Codespace/port/domain', async () => {
     runtime(codespace)
     assert.equal((await invoke(load().handleDevelopmentArcPreview, { headers: proxyHeaders })).status, 200)
@@ -183,7 +251,7 @@ try {
     await assert.rejects(p.submitUniswapArcSwap(), /writes_disabled/)
   })
   assert.equal(external, 0)
-  console.log(`${count} API security groups PASS. Public requests made zero paid preparations; development preparations are test doubles only.`)
+  console.log(`${count} API security groups PASS. Disabled paths made zero preparations; enabled/development preparations are test doubles only. Zero live API/RPC calls.`)
 } finally {
   service.prepareArcPreview = oldPrepare
   for (const [k, value] of Object.entries(saved)) if (value === undefined) delete process.env[k]; else process.env[k] = value

@@ -1,76 +1,81 @@
-# Uniswap API access and quota boundary
+# Uniswap production preview access
 
-Public Uniswap preview is **not ready to enable in production**. The default
-`/api/uniswap-arc-preview` serverless handler returns HTTP 503 with
-`uniswap_arc_public_preview_disabled` before reading the API key, parsing the
-body, or calling the preparation service. There is no environment/header switch
-that opens this entry point. This is an intentional safety closure, not a claim
-that an unauthenticated public API has been protected by Origin checking.
+`/api/uniswap-arc-preview` is **disabled by default**. An absent or non-exact
+`UNISWAP_ARC_PREVIEW_ENABLED=true` returns HTTP 503 with
+`uniswap_arc_public_preview_disabled` before body parsing, API-key use or upstream
+work. Only Vercel production (`VERCEL=1`, `VERCEL_ENV=production`,
+`NODE_ENV=production`) can opt in. Preview/development/unknown serverless runtimes
+stay closed even if the flag is set. Request headers cannot select this mode.
 
-## Findings and changes
+## Production configuration (owner action, not performed by this change)
 
-- Origin, Referer, Fetch Metadata and forwarded headers are browser consistency
-  checks. A non-browser caller can supply them. Neither an arbitrary wallet
-  address nor the freshness UUID authenticates or authorizes a paid API user.
-- The old Codespaces rewrite exception was present in the public handler. It is
-  now reachable only through Vite's development adapter, with `NODE_ENV=development`
-  and no Vercel runtime markers. It additionally requires the actual server-side
-  `CODESPACES=true`, Codespace name, forwarding domain and exact matching port,
-  allowed Origin, forwarded host, Referer and same-origin metadata. Headers alone
-  cannot select development mode. No wildcard Origin or production exception.
-- The default handler remains closed in production, preview, development and
-  unknown environments. Even an accidentally exported development handler refuses
-  production/unknown NODE_ENV or any Vercel runtime marker.
-- Vite development still supports existing read-only previews and freshness
-  headers. **The Vite port must remain private/authenticated by its host.** Its
-  header checks do not make a publicly forwarded Codespaces port quota-safe.
-  Port visibility/access settings were not inspected or changed by this commit.
-- The retained 20/minute counter and two-preparation concurrency limit are
-  process-local backpressure, not a global quota or billing guarantee. Instances,
-  regions and cold starts have independent state. Invalid/oversized/unsupported
-  input is now rejected before consuming the development preparation budget.
-- The frontend reports intentional public closure explicitly and continues to
-  offer the existing Circle source. It does not fabricate a quote or silently
-  change provider. No Circle code or economic decoder was changed.
+- Leave `UNISWAP_ARC_PREVIEW_ENABLED` unset or `false` until the release is approved.
+  To allow read-only quotes, set it to the exact string `true` in **Production**.
+  Setting it back to `false` disables quotes in deployments using that environment.
+  Vercel environment changes must be applied to the deployment; they do not mutate
+  an already-running deployment's environment.
+- `UNISWAP_ARC_ALLOWED_ORIGIN=https://machinabridge.xyz` must exactly match the
+  browser Origin: HTTPS, no trailing slash, path or wildcard. Other site origins
+  are rejected. Codespaces rewritten-Origin exceptions never apply in production.
+- Keep `UNISWAP_TRADING_API_KEY` server-only. None of these variables use a `VITE_`
+  prefix. Never place the key in the repository, browser, response or logs.
+- The owner reports a Vercel Hobby production Firewall rule for this endpoint:
+  **30 requests per IP per 60 seconds**, over-limit action **HTTP 429**. This
+  account configuration was not independently inspected or changed here. Ensure
+  the rule covers the deployed endpoint, including any routing aliases.
 
-## Options without a new service
+No environment variable enables Swap, approval, Permit2 or transaction signing.
+`UNISWAP_ARC_WRITES_ENABLED=false`, `MAINNET_SWAP_WRITES_ENABLED=false`,
+`writesEnabled=false`, and `executionBound=false` remain unchanged.
 
-Existing Vercel DDoS protection and custom deny/IP rules can reduce exposure;
-they do not authenticate public preview users or impose a global Uniswap budget.
-Vercel documents a Hobby WAF rate-limit allowance, but plan/usage conditions must
-be verified for this project. Its counters are per-region and source-based: an
-IP rule alone does not bound a distributed attack's total paid API use. No WAF
-rule, billing setting, subscription or production deployment was changed here.
+## Preserved protections and limits
 
-Before reopening, implement and verify a non-spoofable authorization boundary
-with enforceable aggregate paid-call limits, or a verified provider/platform
-hard quota meeting the required threat model. Anonymous token issuance, a secret
-embedded in frontend code, header allowlists and per-instance counters do not
-meet that requirement. Existing upstream key restrictions/hard caps were not
-accessible or verified. No new authentication/signing flow, Redis or database
-was introduced.
+- POST-only, exact Origin/JSON checks, an 8 KiB request limit, strict route/amount
+  validation before preparation, and sanitized errors with no upstream payload.
+- Existing CLASSIC Arc 5042 forward-route policy, pinned router/runtime hash,
+  independent calldata/economic validation, balance/fee checks, read-only RPC
+  simulation and quote freshness binding remain unchanged.
+- The retained **20 preparations/minute per instance** and **two concurrent
+  preparations per service instance** provide backpressure. HTTP 429 from the
+  local preparation counter includes `Retry-After: 60`. Invalid input does not
+  consume that counter. Existing upstream/RPC timeouts and no-retry policy remain.
+- The unified Swap UI, Circle source and wallet connection experience are
+  unchanged. Disabled production access still has an explicit UI message.
+- Private Vite development remains available without the production flag. Its
+  exact Codespace/runtime/port-bound proxy exception stays development-only;
+  publicly forwarding the Vite port does not provide production Firewall coverage.
 
-Sources reviewed:
+These are **abuse-reduction controls, not authentication or a global quota**.
+Origin headers and wallet addresses can be forged outside a browser. Distributed
+IPs, multiple instances/regions and cold starts can exceed per-IP/per-instance
+limits. Vercel documents regional Firewall counters. No daily 200-call guarantee,
+single-person guarantee or total infrastructure-cost cap is claimed.
 
-- [Origin header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Origin)
-- [Vercel WAF rate limits and regional scope](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting)
-- [Vercel WAF free and priced features](https://vercel.com/docs/vercel-firewall/vercel-waf/usage-and-pricing)
-- [GitHub Codespaces environment variables](https://docs.github.com/en/codespaces/developing-in-a-codespace/default-environment-variables-for-your-codespace)
+The Uniswap Trading API is currently free with a default 6 requests/second per
+key. Vercel function execution, bandwidth and RPC usage remain resource/plan
+risks; Hobby allowances and upstream limits are not a universal zero-cost or
+availability guarantee. A distributed attacker can exhaust capacity or quotas.
+No Redis, Upstash, database, SIWE, BotID, dependency, subscription or new service
+is introduced. No billable operation or deployment was initiated.
 
-## Validation and scope
+## Verification
 
-Run the focused API security suite, existing 37 decoder/security and 8 timing
-groups, Chromium UI suite, API TypeScript, production build and lint. All API/RPC
-responses and wallet connectors in these tests are controlled test doubles;
-they prove handler/control behavior, not live Vercel WAF deployment or new live
-Uniswap quotes. Economic calldata fixtures remain the original uploaded bytes.
+Run `node scripts/verify-uniswap-arc-api-security.mjs`,
+`node scripts/verify-uniswap-arc-preview.mjs`,
+`node scripts/verify-uniswap-arc-timing.mjs`,
+`node scripts/verify-uniswap-arc-ui.mjs`, API TypeScript, production build and lint.
+HTTP/RPC responses and wallet connectors in these tests are controlled test
+doubles. They verify the enabled handler and security/UI behavior; they do not
+prove live Vercel Firewall enforcement or new live Uniswap quotes. Original
+economic calldata evidence remains unchanged. No actual wallet signature or
+blockchain transaction is performed.
 
-API keys remain server-only, bounded errors are sanitized, and no raw upstream
-error payload is logged. `UNISWAP_ARC_WRITES_ENABLED=false`,
-`MAINNET_SWAP_WRITES_ENABLED=false`, `writesEnabled=false`, `executionBound=false`.
-No actual wallet signature, approval, Swap or transfer is enabled. Package/lock
-files, Circle Bridge, Earn, Borrow, Intelligence and Railway are unchanged.
+Only the existing feature branch is updated. Main, Intelligence, Circle Bridge,
+Earn, Borrow and Railway are unchanged. The production opt-in is not set by this
+commit, and no production deployment is performed.
 
-This commit targets only `feature/uniswap-swap-preview`. Until this code is
-deployed through a separately authorized release, it does not alter or secure an
-already-running production deployment. No production deployment was performed.
+Sources:
+
+- [Uniswap API limits and pricing](https://developers.uniswap.org/docs/trading/swapping-api/faqs)
+- [Vercel WAF regional rate limits](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting)
+- [Vercel environment variables](https://vercel.com/docs/environment-variables)
