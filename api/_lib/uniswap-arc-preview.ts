@@ -1,6 +1,6 @@
 // SERVER ONLY. Never import this module from src. Secrets and upstream JSON stay here.
 import { createPublicClient, defineChain, erc20Abi, http, keccak256, type Transport } from 'viem'
-import { ARC_NATIVE, ARC_USDC, ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, fail, minimumAtSlippage, nativeAmount, usdcAmount, sameAddress, uint, validateArcRequest, validateArcReview, verifyNativeCalldata, type ArcRequest, type ArcReview, type ArcTransaction } from '../../src/lib/uniswapArcPolicy'
+import { ARC_NATIVE, ARC_USDC, ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, fail, minimumAtSlippage, nativeAmount, usdcAmount, sameAddress, uint, validateArcRequest, validateArcReview, verifyNativeCalldata, type ArcRequest, type ArcReview, type ArcTransaction } from '../../src/lib/uniswapArcPolicy.ts'
 
 const API = 'https://trade-api.gateway.uniswap.org/v1/quote'
 const RPC = 'https://rpc.mainnet.arc.io'

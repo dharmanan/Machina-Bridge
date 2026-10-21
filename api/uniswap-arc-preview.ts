@@ -1,5 +1,6 @@
-import { prepareArcPreview } from './_lib/uniswap-arc-preview'
-import { validateArcRequest, validateArcReview } from '../src/lib/uniswapArcPolicy'
+// api/tsconfig.json rewrites explicit .ts imports to .js in the Vercel ESM artifact.
+import { prepareArcPreview } from './_lib/uniswap-arc-preview.ts'
+import { validateArcRequest, validateArcReview } from '../src/lib/uniswapArcPolicy.ts'
 
 interface Request { method?: string; headers: Record<string, string | string[] | undefined>; body?: unknown }
 interface Response { setHeader(name: string, value: string): void; status(code: number): Response; json(body: unknown): void }

@@ -1,0 +1,10 @@
+{
+  "extends": "../tsconfig.uniswap-arc.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["uniswap-arc-preview.ts", "_lib/uniswap-arc-preview.ts", "../src/lib/uniswapArcPolicy.ts"]
+}

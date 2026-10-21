@@ -74,6 +74,24 @@ Only the existing feature branch is updated. Main, Intelligence, Circle Bridge,
 Earn, Borrow and Railway are unchanged. The production opt-in is not set by this
 commit, and no production deployment is performed.
 
+## Serverless module loading
+
+The server entry point and service use explicit `.ts` local imports.
+`api/tsconfig.json` selects NodeNext and `rewriteRelativeImportExtensions`, so
+Vercel's TypeScript compiler emits fully specified `.js` imports. Both service
+and shared policy must be traced into the Lambda. The frontend Vite configuration
+and the root package's ESM mode remain unchanged. This requires TypeScript 5.7+;
+the existing lockfile installs 5.9.3, without a dependency update.
+
+`scripts/verify-uniswap-arc-serverless.mjs` invokes the actual `@vercel/node`
+builder, materializes its standalone Lambda and cold-loads it in native Node ESM
+without a TypeScript loader. Supply an independently installed builder through
+`VERCEL_NODE_BUILDER_PATH=/path/to/@vercel/node/dist/index.js`; the application
+does not gain a dependency or service. Tested with builder 26.0.0 and Node
+24.19.0. Preview returns the expected disabled 503, production guards still
+apply, and both archived routes decode from the packaged modules offline.
+This is local serverless-artifact verification, not a live deployment test.
+
 Sources:
 
 - [Uniswap API limits and pricing](https://developers.uniswap.org/docs/trading/swapping-api/faqs)
