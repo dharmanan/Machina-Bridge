@@ -4,7 +4,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { formatUnits } from 'viem'
 import { ARC_OUTPUTS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, nativeAmount, requestKey, sameAddress, type ArcRequest } from '../lib/uniswapArcPolicy'
 import { createUniswapArcPreviewReader } from '../lib/uniswapArcPreview'
-import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, type ExecutionContext, type ExecutionProvider, type ExecutionView } from '../lib/uniswapArcExecution'
+import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionProvider, type ExecutionView } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
 
 // Uses the already connected wagmi connector. No new wallet, signing SDK, service or login.
@@ -118,8 +118,9 @@ export function UniswapArcExecutionPanel({ execution, canReview }: { execution: 
             <ReviewLine label="Recipient" value={review.request.recipient} />
             <ReviewLine label="Router" value={ARC_ROUTER} />
             <ReviewLine label="Review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />
+            <ReviewLine label="Transaction deadline" value={`${new Date(executionDeadlineMs(review)).toISOString().slice(11, 19)} UTC`} />
           </dl>
-          <p className="text-xs text-slate-600">Native USDC only. No token approval or Permit2 signature. Confirming opens one wallet transaction request. A delayed approval may revert at the contract deadline and still charge gas.</p>
+          <p className="text-xs text-slate-600">Native USDC only. No token approval or Permit2 signature. Confirm before this review expires. The transaction deadline is capped at two minutes from quote creation and never exceeds Uniswap’s original deadline. The wallet approval window ends 15 seconds earlier to allow inclusion; this buffer is not a guarantee. Cancel an expired wallet request. A late approval or delayed inclusion may revert and still charge gas.</p>
         </>}
         <div className="flex gap-3">
           <button type="button" onClick={execution.cancel} className="flex-1 rounded-xl border border-slate-300 px-4 py-3">Cancel</button>
@@ -130,12 +131,13 @@ export function UniswapArcExecutionPanel({ execution, canReview }: { execution: 
     </dialog>
     {view.attempt && status && <section aria-label="Uniswap transaction status" className="space-y-2 rounded-xl border border-slate-200 p-3 text-sm">
       <p role="status" className="font-semibold">{status}</p>
+      {view.phase === 'awaiting_wallet' && view.walletWindowMs !== undefined && <p>Approve within at most {Math.floor(view.walletWindowMs / 1000)} seconds of the wallet request opening. If the window ends, cancel the request in your wallet. The app cannot cancel it.</p>}
       <p className="break-all text-xs text-slate-600">Wallet: {view.attempt.review.request.owner}</p>
       {view.attempt.hash && <a href={ARC_EXECUTION_EXPLORER + view.attempt.hash} target="_blank" rel="noopener noreferrer" className="block break-all text-[#2F6E0C] underline">View on Arc Explorer · {view.attempt.hash}</a>}
       {view.phase === 'confirmed' && view.attempt.output && <p>Received {formatUnits(BigInt(view.attempt.output), ARC_OUTPUTS[view.attempt.review.request.tokenOut].decimals)} {view.attempt.review.request.tokenOut}</p>}
       {['confirmed', 'failed'].includes(view.phase) && view.attempt.fee && <p>Network fee: {formatUnits(BigInt(view.attempt.fee), 18)} USDC</p>}
-      {['pending', 'unknown'].includes(view.phase) && <button type="button" onClick={() => { void execution.check() }} className="underline">Check transaction status</button>}
-      {view.phase === 'unknown' && !view.attempt.hash && <div className="space-y-2">
+      {['pending', 'unknown'].includes(view.phase) && !view.walletRequestOpen && <button type="button" onClick={() => { void execution.check() }} className="underline">Check transaction status</button>}
+      {view.phase === 'unknown' && !view.attempt.hash && !view.walletRequestOpen && <div className="space-y-2">
         <label className="block">Transaction hash from your wallet<input aria-label="Recover transaction hash" value={recovery} onChange={event => setRecovery(event.target.value)} maxLength={66} className="mt-1 w-full rounded-lg border border-slate-300 p-2" /></label>
         <button type="button" onClick={() => { void execution.recover(recovery) }} className="underline">Verify and track hash</button>
       </div>}

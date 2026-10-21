@@ -1,5 +1,6 @@
 // Controlled EIP-1193, RPC, clock, storage and lock ports. No real signatures, sends or network.
 import assert from 'node:assert/strict'
+import { mock } from 'node:test'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -9,7 +10,7 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
 const root = fileURLToPath(new URL('..', import.meta.url)), p = require(`${root}src/lib/uniswapArcPolicy.ts`)
 const e = require(`${root}src/lib/uniswapArcExecution.ts`), { createArcExecutionRpc, assertExecutionReadMethod } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
-const { decodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
+const { decodeFunctionData, encodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 let external = 0, count = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
@@ -47,6 +48,12 @@ function setup(options = {}) {
 }
 async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`) }
 const waitFor = async predicate => { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 1)) } assert.fail('Expected asynchronous state') }
+function withDeadline(review, seconds) {
+  const args = decodeFunctionData({ abi: p.EXECUTE_ABI, data: review.transaction.data }).args
+  const canonical = encodeFunctionData({ abi: p.EXECUTE_ABI, functionName: 'execute', args })
+  review.transaction.data = encodeFunctionData({ abi: p.EXECUTE_ABI, functionName: 'execute', args: [args[0], args[1], BigInt(Math.floor(review.requestStartedAt / 1000) + seconds)] }) + review.transaction.data.slice(canonical.length)
+  return review
+}
 await test('production source gate defaults false and blocks preparation, wallet and RPC', async () => {
   assert.equal(p.UNISWAP_ARC_WRITES_ENABLED, false)
   const f = setup({ ports: { enabled: undefined } }); await f.controller.prepare(); await f.controller.confirm('forged')
@@ -68,12 +75,94 @@ await test('deadline only tightens; real V4/V3 economics, refund and exact unix 
     const reviewed = f.controller.current().review
     const before = decodeFunctionData({ abi: p.EXECUTE_ABI, data: original.transaction.data }).args
     const after = decodeFunctionData({ abi: p.EXECUTE_ABI, data: reviewed.transaction.data }).args
-    assert.equal(before[0], after[0]); assert.deepEqual(before[1], after[1]); assert.ok(after[2] < before[2])
-    assert.ok(Number(after[2]) * 1000 < original.expiresAt)
+    assert.equal(before[0], after[0]); assert.deepEqual(before[1], after[1]); assert.ok(after[2] <= before[2])
+    assert.ok(Number(after[2]) * 1000 > original.expiresAt)
+    assert.ok(Number(after[2]) * 1000 <= original.requestStartedAt + e.EXECUTION_DEADLINE_WINDOW_MS)
+    assert.equal(reviewed.expiresAt, original.expiresAt)
+    assert.equal(reviewed.requiredMinimum, original.requiredMinimum); assert.deepEqual(reviewed.request, original.request)
     assert.equal(original.transaction.data.slice(-44), reviewed.transaction.data.slice(-44))
     assert.equal(reviewed.transaction.value, original.transaction.value)
     p.validateArcReview(reviewed, f.context, f.clock.now)
   }
+})
+await test('deadline cap never extends Uniswap original deadline or changes the 30-second quote freshness', () => {
+  const f = setup()
+  for (const seconds of [20, 45, 60, 120, 600]) {
+    const original = withDeadline(fresh(f.ports.input(), f.clock.now), seconds)
+    const reviewed = e.tightenExecutionReview(original, f.context, f.clock.now)
+    assert.equal(e.executionDeadlineMs(reviewed), Math.floor(f.clock.now / 1000) * 1000 + Math.min(seconds, 120) * 1000)
+    assert.equal(reviewed.expiresAt, f.clock.now + 30000)
+    assert.equal(reviewed.requiredMinimum, original.requiredMinimum)
+  }
+})
+await test('an original deadline without at least 30 seconds for approval plus 15 for inclusion blocks wallet access', async () => {
+  const f = setup({ ports: { fresh: async input => withDeadline(fresh(input, f.clock.now), 44) } })
+  await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle'); assert.match(f.controller.current().error, /expired/)
+  assert.equal(f.wallet.length, 0)
+})
+await test('quote expiry during final simulation still prevents opening a wallet request', async () => {
+  const f = setup({ preflight: async (_review, n) => { if (n === 2) f.clock.now += 31000; return { nonce: 7 } } })
+  await f.controller.confirm(await f.review()); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /expired/)
+})
+await test('45-second wallet approval outlives the quote TTL while preserving the exact approved transaction on both routes', async () => {
+  for (const symbol of ['EURC', 'cirBTC']) {
+    let release
+    const f = setup({ symbol }), original = f.provider.request, id = await f.review()
+    f.provider.request = args => args.method === 'eth_sendTransaction' ? (f.wallet.push(args), new Promise(resolve => { release = resolve })) : original(args)
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const pending = f.controller.confirm(id)
+      for (let i = 0; i < 100 && !release; i++) await Promise.resolve()
+      assert.ok(release); const transaction = structuredClone(f.sent()[0].params[0])
+      f.clock.now += 45000; mock.timers.tick(45000)
+      assert.equal(f.controller.current().phase, 'awaiting_wallet')
+      assert.ok(e.executionDeadlineMs(f.controller.current().attempt.review) > f.clock.now)
+      release(hash); await pending
+      assert.equal(f.controller.current().phase, 'pending'); assert.equal(f.controller.current().attempt.hash, hash)
+      assert.deepEqual(f.sent()[0].params[0], transaction); assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 1)
+    } finally { mock.timers.reset() }
+  }
+})
+await test('bounded approval timeout persists Unknown, keeps the lock, blocks retries and captures even a post-deadline hash', async () => {
+  let release
+  const data = new Map(), locks = new Set(), f = setup({ data, locks }), original = f.provider.request, id = await f.review()
+  f.provider.request = args => args.method === 'eth_sendTransaction' ? (f.wallet.push(args), new Promise(resolve => { release = resolve })) : original(args)
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const pending = f.controller.confirm(id)
+    for (let i = 0; i < 100 && !release; i++) await Promise.resolve()
+    assert.ok(release); const window = f.controller.current().walletWindowMs
+    assert.ok(window >= 30000 && window <= 105000)
+    mock.timers.tick(window - 1); assert.equal(f.controller.current().phase, 'awaiting_wallet')
+    mock.timers.tick(1); assert.equal(f.controller.current().phase, 'unknown')
+    assert.match(f.controller.current().error, /Cancel the open request.*cannot cancel.*charge gas/)
+    assert.equal(e.createExecutionJournal(f.ports.storage).read(owner)[0].status, 'unknown')
+    assert.equal(locks.has(owner.toLowerCase()), true)
+    f.controller.invalidate(); await f.controller.prepare(); await f.controller.confirm(id)
+    const second = setup({ data, locks }); await second.controller.prepare()
+    assert.equal(f.sent().length, 1); assert.equal(second.stats.quotes, 0); assert.equal(second.sent().length, 0)
+    f.clock.now += 130000; mock.timers.tick(130000)
+    release(hash); await pending
+    assert.equal(f.controller.current().phase, 'pending'); assert.equal(f.controller.current().attempt.hash, hash)
+    assert.equal(e.createExecutionJournal(f.ports.storage).read(owner)[0].hash, hash)
+    assert.equal(locks.size, 0); assert.equal(f.sent().length, 1)
+  } finally { mock.timers.reset() }
+})
+await test('a wallet rejection after the approval cutoff is recorded as Rejected without retry', async () => {
+  let reject
+  const f = setup(), original = f.provider.request, id = await f.review()
+  f.provider.request = args => args.method === 'eth_sendTransaction' ? (f.wallet.push(args), new Promise((_resolve, fail) => { reject = fail })) : original(args)
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const pending = f.controller.confirm(id)
+    for (let i = 0; i < 100 && !reject; i++) await Promise.resolve()
+    assert.ok(reject); mock.timers.tick(120000)
+    assert.equal(f.controller.current().phase, 'unknown')
+    reject({ code: 4001 }); await pending
+    assert.equal(f.controller.current().phase, 'rejected'); assert.equal(f.sent().length, 1)
+    assert.equal(e.createExecutionJournal(f.ports.storage).read(owner)[0].status, 'rejected')
+    mock.timers.tick(120000); assert.equal(f.controller.current().phase, 'rejected')
+  } finally { mock.timers.reset() }
 })
 await test('review, cancel and forged approval IDs never request a wallet transaction', async () => {
   const f = setup(); await f.review(); await f.controller.confirm('forged-id'); assert.equal(f.wallet.length, 0)

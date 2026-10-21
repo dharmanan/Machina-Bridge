@@ -22,10 +22,17 @@ No deployment, environment change, real signature or mainnet transaction was mad
    Existing 10 USDC input, 0.1 USDC maximum network fee, 100 bps slippage, router
    runtime hash, command/action/refund/suffix/recipient and minimum-output policies
    remain unchanged.
-2. The only calldata change is a **shorter execute deadline**, bounded by the
-   original quote TTL. Commands, input bytes, native value and the exact 22-byte
+2. Quote freshness remains **30 seconds**, checked again immediately before the
+   wallet request (with at least 5 seconds remaining). It authorizes opening that
+   request, not extending or reusing an expired quote for a new request. The only
+   calldata change is an execute deadline capped at **120 seconds from quote
+   request start**, never later than Uniswap's original deadline. Commands, input bytes, native value and the exact 22-byte
    `unix` attribution suffix are retained and independently decoded again.
    The altered transaction is separately simulated. No deadline is extended.
+   At least 30 seconds for wallet approval plus a 15-second inclusion buffer must
+   remain before opening the wallet. An earlier original deadline is never extended
+   to meet that budget: insufficient time requires a fresh review. The UI shows
+   separate review expiry and transaction deadline, plus the approval budget.
 3. Fixed, read-only Arc RPC independently rechecks chain, router/output contracts,
    output decimals, EOA code, current and pending USDC balances, current/base gas
    prices, exact calldata simulation, gas estimate and pending nonce. Contract and
@@ -85,8 +92,18 @@ production deployment or first funded transaction is authorized by this change.
   broadcast by a compromised wallet/provider, or protect users who edit wallet fees
   beyond the reviewed ceiling. Such results remain unverified and are not retried.
 - Once a wallet request is open it cannot be forcibly cancelled by changing the
-  page/network. A delayed approval may hit the stricter on-chain deadline and
-  revert, consuming gas. The minimum-output and refund constraints stay on-chain.
+  page/network. The supported approval window ends 15 seconds before the transaction
+  deadline (at most 105 seconds from quote start, shorter when time was spent
+  reviewing/checking). The timer changes Awaiting Wallet to Unknown and tells the
+  user to cancel the request, not approve it or resubmit. It durably retains the
+  unresolved intent and keeps the browser lock and response observer until the
+  provider settles; an outstanding provider promise is not forcibly cancellable.
+  Hash recovery/status controls become available once that request settles, or
+  after a reload; a late hash is still recorded and verified even after deadline.
+  A timeout never means Rejected or Failed. Browser suspension can delay the UI
+  timer. The inclusion buffer is not an inclusion guarantee: delayed approval,
+  mining or a price move can still cause a revert consuming gas. The reviewed
+  minimum-output, slippage and refund constraints stay unchanged and on-chain.
 - Dropped/replaced/cancelled transactions without an independently verified matching
   hash stay unresolved. No timeout is treated as permission to retry; replacement
   fee/payload changes are not silently accepted. Manual wallet/chain review may be
@@ -100,6 +117,9 @@ production deployment or first funded transaction is authorized by this change.
 `verify-uniswap-arc-execution.mjs` covers both actual calldata profiles, preparation,
 explicit wallet requests, rejection/ambiguity, duplicate prevention, storage faults,
 reload/recovery, economic/fee/nonce/receipt/output/reorg failures and gate closure.
+The deadline revision additionally covers unchanged economic bytes for both routes,
+original deadline caps, insufficient approval budget, quote expiry during final
+simulation, 45-second approval, cutoff/late hash, and rejection after cutoff.
 `verify-uniswap-arc-execution-ui.mjs` runs the real React/wagmi UI/controller/RPC
 adapter, native Web Locks and localStorage in Chromium. Only an in-memory test
 transform opens the release gate; HTTP/RPC and wallet responses are synthetic.
@@ -117,19 +137,21 @@ Vercel Lambda ESM packaging suites, API/client TypeScript, build and lint are al
 required. These tests do not call live Uniswap, request a real signature or send
 any blockchain transaction.
 
-Verification results for this candidate:
+Verification results for the deadline revision (all controlled, no live calls):
 
 | Check | Result |
 | --- | --- |
-| Execution/security | 34/34 PASS |
-| Chromium execution flow, persistence and mobile dialog | 14/14 PASS |
-| Existing API security | 22/22 PASS |
+| Execution/security | 40/40 PASS |
+| Chromium execution flow, persistence and mobile dialog | 15/15 PASS |
 | Existing independent decoder/economics | 37/37 PASS |
 | Existing freshness/error protocol | 8/8 PASS |
-| Default unified Preview UI | 17/17 PASS |
-| Circle Preview/SDK/DOM regressions | 25/25 PASS |
-| Actual Vercel Lambda/native ESM packaging | 8/8 PASS |
 | Client/API TypeScript, production build, lint | PASS |
+
+Unchanged suites previously passed on parent `ad6f57c`: API security 22/22,
+default unified Preview UI 17/17, Circle Preview/SDK/DOM regressions 25/25 and
+actual Vercel Lambda/native ESM packaging 8/8. They were not rerun for this narrow
+deadline revision. No live wallet, Uniswap request, RPC simulation or deployment
+was performed for this revision. The read-only RPC observation above is historical.
 
 References:
 

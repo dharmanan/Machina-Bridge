@@ -7,7 +7,7 @@ export type AttemptStatus = 'awaiting_wallet' | 'pending' | 'confirmed' | 'faile
 export interface SwapAttempt { id: string; review: ArcReview; nonce: number; status: AttemptStatus; createdAt: number; hash?: Hex; output?: string; fee?: string }
 export interface ExecutionView {
   phase: 'idle' | 'preparing' | 'review' | 'checking' | AttemptStatus
-  approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string
+  approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
 }
 export type ChainResult = { status: 'pending' } | { status: 'confirmed' | 'failed'; output: string; fee: string }
 export interface ExecutionPorts {
@@ -23,6 +23,11 @@ export interface ExecutionPorts {
   enabled?(): boolean
 }
 export const ARC_EXECUTION_EXPLORER = 'https://explorer.arc.io/tx/'
+// Quote freshness authorizes opening a wallet request; it is not the on-chain deadline.
+export const EXECUTION_DEADLINE_WINDOW_MS = 120000
+export const EXECUTION_MINING_BUFFER_MS = 15000
+const MIN_WALLET_WINDOW_MS = 30000
+export const executionDeadlineMs = (review: ArcReview) => Number(decodeFunctionData({ abi: EXECUTE_ABI, data: review.transaction.data }).args[2]) * 1000
 export const isTransactionHash = (hash: unknown): hash is Hex => typeof hash === 'string' && /^0x[a-fA-F0-9]{64}$/.test(hash)
 const isNonce = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
 const unresolved = (a: SwapAttempt) => ['awaiting_wallet', 'pending', 'unknown'].includes(a.status)
@@ -39,6 +44,7 @@ export function executionMessage(code: string): string {
     nonce: 'The wallet transaction nonce changed. Review a fresh swap.',
     rejected: 'You rejected the wallet request. No automatic retry will occur.',
     unknown: 'The wallet request may have been submitted. Check your wallet and recover its hash; do not submit again.',
+    wallet_timeout: 'The wallet approval window ended. Cancel the open request in your wallet; do not approve or submit again. The app cannot cancel it. A late approval or delayed inclusion may revert and still charge gas. Any returned hash will still be tracked.',
     verification: 'The transaction or its result could not be independently verified. Do not resubmit.',
     smart_wallet: 'This execution flow supports EOAs only. Contract and delegated wallets remain blocked.',
     preflight: 'The current balance, fees, contract identity or simulation could not be verified. No wallet request was started.',
@@ -53,10 +59,9 @@ export function tightenExecutionReview(source: ArcReview, context: ExecutionCont
   const review = structuredClone(source)
   const outer = decodeFunctionData({ abi: EXECUTE_ABI, data: review.transaction.data })
   const canonical = encodeFunctionData({ abi: EXECUTE_ABI, functionName: 'execute', args: outer.args })
-  const deadline = BigInt(Math.floor(review.expiresAt / 1000) - 1)
+  const deadline = BigInt(Math.floor((review.requestStartedAt + EXECUTION_DEADLINE_WINDOW_MS) / 1000))
   const shorter = deadline < outer.args[2] ? deadline : outer.args[2]
   review.transaction.data = (encodeFunctionData({ abi: EXECUTE_ABI, functionName: 'execute', args: [outer.args[0], outer.args[1], shorter] }) + review.transaction.data.slice(canonical.length)) as Hex
-  review.expiresAt = Math.min(review.expiresAt, Number(shorter) * 1000)
   validateArcReview(review, context, now)
   return review
 }
@@ -138,6 +143,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     if (selected.version !== version || contextKey() !== selected.context || !input || requestKey(input) !== requestKey(selected.review.request)) stop('context')
     validateArcReview(selected.review, context, ports.quoteNow(selected.review.request))
     if (selected.review.expiresAt - ports.quoteNow(selected.review.request) < 5000) stop('expired')
+    if (executionDeadlineMs(selected.review) - ports.quoteNow(selected.review.request) < MIN_WALLET_WINDOW_MS + EXECUTION_MINING_BUFFER_MS) stop('expired')
   }
   function errorCode(error: unknown) {
     const code = error instanceof Error ? error.message : ''
@@ -195,8 +201,17 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
         attempt = record
         journal.save(record) // Must succeed BEFORE the only wallet write method can run.
         ready(selected)
+        const walletWindowMs = executionDeadlineMs(selected.review) - ports.quoteNow(selected.review.request) - EXECUTION_MINING_BUFFER_MS
         intent = null; requested = true; sending = true
-        emit({ phase: 'awaiting_wallet', attempt: record })
+        emit({ phase: 'awaiting_wallet', attempt: record, walletWindowMs, walletRequestOpen: true })
+        // EIP-1193 cannot cancel an open request. Stop presenting it as approvable at
+        // the cutoff, but retain the lock/observer until it settles to record a late
+        // hash. Never race it into rejection or make a timeout authorize another send.
+        const walletTimer = setTimeout(() => {
+          record = { ...record, status: 'unknown' }; attempt = record
+          emit({ phase: 'unknown', attempt: record, error: executionMessage('wallet_timeout'), walletRequestOpen: true })
+          try { journal.save(record) } catch { /* Original durable unresolved intent still blocks retry. */ }
+        }, walletWindowMs)
         try {
           const hash = await provider.request({ method: 'eth_sendTransaction', params: [transaction] })
           if (!isTransactionHash(hash)) throw new Error('unknown')
@@ -208,7 +223,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
           record = { ...record, status: rejected ? 'rejected' : 'unknown' }; attempt = record
           emit({ phase: record.status, attempt: record, error: executionMessage(rejected ? 'rejected' : 'unknown') })
           try { journal.save(record) } catch { emit({ phase: 'unknown', attempt: record, error: executionMessage('storage') }) }
-        } finally { sending = false }
+        } finally { clearTimeout(walletTimer); sending = false }
       })
     } catch (error) {
       intent = null
