@@ -1,5 +1,5 @@
 // Real Chromium, React, wagmi connector, Web Locks and localStorage. API/RPC/wallet sends are test doubles.
-// Only Vite's in-memory test transform enables execution. The source release gate stays false.
+// Test-only pilot build configuration; controlled API/RPC/wallet responses, no real signatures or sends.
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
@@ -14,12 +14,9 @@ const root = fileURLToPath(new URL('..', import.meta.url)), p = require(`${root}
 const { toHex, decodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters } = require('viem')
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
-const owner = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', blockHash = '0x' + 'b'.repeat(64)
+const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', blockHash = '0x' + 'b'.repeat(64)
 const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) }, cacheDir: `${root}.verification/vite-execution-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
-  name: 'test-release-gate-only', enforce: 'pre', transform(code, id) {
-    if (id.split('?')[0] === `${root}src/lib/uniswapArcPolicy.ts`) return code.replace('export const UNISWAP_ARC_WRITES_ENABLED = false', 'export const UNISWAP_ARC_WRITES_ENABLED = true')
-  },
-}, { name: 'execution-fixture-route', configureServer(server) {
+  name: 'execution-fixture-route', configureServer(server) {
   server.middlewares.use('/__execution_ui_test', async (_req, res) => {
     res.setHeader('Content-Type', 'text/html')
     res.end(await server.transformIndexHtml('/__execution_ui_test', '<!doctype html><html><body><div id="root"></div><script type="module" src="/scripts/fixtures/uniswap-arc/execution-ui-harness.tsx"></script></body></html>'))
@@ -111,7 +108,7 @@ try {
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); assert.equal(await sends(), 0)
   })
   await test('native browser Web Lock blocks a competing submission without a wallet write', async () => {
-    await page.evaluate(() => { navigator.locks.request('machina-uniswap-5042:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266', () => new Promise(resolve => { window.releaseExecutionLock = resolve })); })
+    await page.evaluate(() => { navigator.locks.request('machina-uniswap-5042:0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321', () => new Promise(resolve => { window.releaseExecutionLock = resolve })); })
     await prepare(); await confirm.click(); await page.getByRole('alert').filter({ hasText: 'Another tab' }).waitFor()
     assert.equal(await sends(), 0); await page.evaluate(() => window.releaseExecutionLock())
   })
@@ -217,7 +214,7 @@ try {
   await test('no unapproved RPC methods, external traffic, uncaught errors or source gate changes', async () => {
     assert.equal(external, 0); assert.deepEqual(errors, [])
     assert.equal(methods.some(m => /send|sign|approve|wallet_/i.test(m)), false)
-    assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = false/)
+    assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = true/)
   })
-  console.log(`${count} Chromium execution UI groups PASS. In-memory test release flag; synthetic API/RPC/wallet only. Production source gate remains false.`)
+  console.log(`${count} Chromium execution UI groups PASS. Explicit test pilot configuration; synthetic API/RPC/wallet only. No real wallet request or broadcast.`)
 } finally { await browser?.close(); await server.close() }

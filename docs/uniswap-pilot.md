@@ -1,4 +1,4 @@
-# Arc Uniswap pilot: closed until separately approved
+# Arc Uniswap pilot: source prepared, deployment and activation separately approved
 
 Only native USDC → EURC on Arc Mainnet 5042, input **at most 0.1 USDC**,
 with the configured wallet as both sender and recipient. cirBTC remains preview
@@ -9,19 +9,26 @@ Confirm Swap → the wallet's explicit transaction confirmation → tracked stat
 
 ## Opening procedure — owner action after independent review
 
-1. Obtain the owner's **public Arc EVM EOA address** (`0x` plus 40 hex digits),
-   controlled by the existing connected wallet. Never request a key, seed phrase
-   or signature for configuration. No test wallet is a production default.
-2. Following independent review and explicit owner approval, make a separately
-   reviewed release change setting `UNISWAP_ARC_WRITES_ENABLED` to `true`.
-   **This commit leaves it false.** Configure the intended production build with
+1. The approved public wallet is
+   **`0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321`** (EIP-55 checksum).
+   It is pinned in the pilot policy; a different environment wallet fails closed.
+   Never request a key, seed phrase or signature for configuration. No test wallet
+   is a production default. On 2026-10-21, read-only Arc RPC confirmed chain 5042,
+   block **27185148**, hash
+   `0x61e3a424433c66dbc5f8afd9266916dfed1b3f5660c771555f83c89581d09e31`,
+   and `eth_getCode=0x` for this address. This satisfies the current EOA/no-delegation
+   code check; it does not prove ownership, balance or transaction readiness.
+   The actual pre-send checks must revalidate all of these applicable conditions.
+2. This release prepares `UNISWAP_ARC_WRITES_ENABLED=true`; mandatory pilot
+   authorization still defaults closed. After explicit deployment/activation
+   approval, configure the intended production build with
    `VITE_UNISWAP_ARC_PILOT_ENABLED=true` and
-   `VITE_UNISWAP_ARC_PILOT_WALLET=<approved public address>`. These public Vite
+   `VITE_UNISWAP_ARC_PILOT_WALLET=0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321`. These public Vite
    values are embedded at build time. Missing/invalid address, non-exact `true`,
    wrong wallet/network/direction or input above 0.1 fails closed. These settings
    do not change the separate live quote API gate or its server-only API key.
 3. The owner separately authorizes a build/deployment. No deployment, gate
-   activation, real signature or transaction is performed by this change.
+   environment activation, real signature or transaction is performed by this change.
    Using the approved wallet on Arc, enter **0.1 USDC → EURC**. Check the fresh
    minimum output, slippage, fees, recipient, router and deadline in Review Swap.
    Confirm Swap opens exactly one wallet request. Independently inspect the
@@ -68,9 +75,13 @@ unchanged and is not authenticated by this allowlist.
 
 ## Controlled verification
 
-47 execution/security groups (the previous 40 plus 7 pilot groups), 16 Chromium
+48 execution/security groups, 16 Chromium
 execution/pilot UI groups, 17 default Preview UI regression groups and 37 decoder
 security groups pass. TypeScript, production build and lint pass. Browser tests
-use public test wallet configuration and an in-memory release-gate transform;
-the production source gate remains false. API/RPC/wallet responses are controlled
-test doubles. No live quote, real signature, deployment or transaction is claimed.
+use the approved public address as a mock wallet and explicit test pilot build
+configuration. API/RPC/wallet responses are controlled test doubles. The address
+code check above is the only live RPC evidence in this revision. No live quote,
+real signature, deployment or transaction is claimed.
+API security (22), local serverless/native ESM packaging (8), and Circle
+Preview/SDK/DOM regressions (25) also pass. The Circle CommonJS DOM harness
+substitutes unset pilot Vite variables; browser suites use actual Vite handling.

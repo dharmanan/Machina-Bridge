@@ -15,7 +15,7 @@ const { decodeFunctionData, encodeFunctionData, encodeEventTopics, encodeAbiPara
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 let external = 0, count = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
-const owner = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', other = '0x2222222222222222222222222222222222222222'
+const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', other = '0x2222222222222222222222222222222222222222'
 const hash = '0x' + 'a'.repeat(64), blockHash = '0x' + 'b'.repeat(64)
 function setup(options = {}) {
   const data = options.data ?? new Map(), locks = options.locks ?? new Set(), seen = [], wallet = [], settled = []
@@ -57,15 +57,15 @@ function withDeadline(review, seconds) {
   review.transaction.data = encodeFunctionData({ abi: p.EXECUTE_ABI, functionName: 'execute', args: [args[0], args[1], BigInt(Math.floor(review.requestStartedAt / 1000) + seconds)] }) + review.transaction.data.slice(canonical.length)
   return review
 }
-await test('production source gate defaults false and blocks preparation, wallet and RPC', async () => {
-  assert.equal(p.UNISWAP_ARC_WRITES_ENABLED, false)
-  const f = setup({ ports: { enabled: undefined } }); await f.controller.prepare(); await f.controller.confirm('forged')
+await test('approved source gate still blocks preparation without pilot authorization', async () => {
+  assert.equal(p.UNISWAP_ARC_WRITES_ENABLED, true)
+  const f = setup({ ports: { enabled: undefined, authorize: undefined } }); await f.controller.prepare(); await f.controller.confirm('forged')
   assert.equal(f.stats.quotes, 0); assert.equal(f.stats.preflight, 0); assert.equal(f.sent().length, 0)
-  assert.match(f.controller.current().error, /disabled/)
+  assert.match(f.controller.current().error, /pilot/)
   await assert.rejects(p.submitUniswapArcSwap(), /writes_disabled/)
 })
 await test('pilot config is default off; missing, malformed, zero, router or non-exact enabled flags fail closed', () => {
-  for (const [flag, wallet] of [[undefined, undefined], ['true', undefined], ['true', 'bad'], ['true', '0x' + '0'.repeat(40)], ['true', p.ARC_ROUTER], ['TRUE', owner], ['false', owner], [' true ', owner]]) {
+  for (const [flag, wallet] of [[undefined, undefined], ['true', undefined], ['true', 'bad'], ['true', '0x' + '0'.repeat(40)], ['true', p.ARC_ROUTER], ['true', '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'], ['TRUE', owner], ['false', owner], [' true ', owner]]) {
     assert.equal(pilot.arcPilotConfig(flag, wallet).enabled, false)
   }
   assert.equal(pilot.arcPilotConfig('true', owner).enabled, true)
@@ -95,10 +95,20 @@ await test('no authorization callback or disabled pilot blocks execution even wi
     await f.controller.prepare(); assert.equal(f.stats.quotes, 0); assert.equal(f.sent().length, 0)
   }
 })
-await test('configured pilot cannot bypass the unchanged production false source gate', async () => {
+await test('configured pilot cannot bypass an explicitly closed source gate', async () => {
   const config = pilot.arcPilotConfig('true', owner)
-  const f = setup({ amount: '0.1', ports: { enabled: undefined, authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+  const f = setup({ amount: '0.1', ports: { enabled: () => false, authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
   await f.controller.prepare(); assert.equal(f.stats.quotes, 0); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /disabled/)
+})
+await test('production source gate permits only approved-wallet pilot configuration; forged configuration fails closed', async () => {
+  assert.equal(pilot.ARC_PILOT_APPROVED_WALLET, owner)
+  const config = pilot.arcPilotConfig('true', owner.toLowerCase())
+  assert.equal(config.wallet, owner)
+  const f = setup({ amount: '0.1', ports: { enabled: undefined, authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+  await f.controller.confirm(await f.review()); assert.equal(f.sent().length, 1)
+  assert.equal(pilot.arcPilotAllows({ enabled: true, wallet: other }, { ...f.ports.input(), owner: other, recipient: other }, { ...f.context, owner: other }), false)
+  const closed = setup({ amount: '0.1', ports: { enabled: undefined, authorize: (input, context) => pilot.arcPilotAllows(pilot.arcPilotConfig(), input, context) } })
+  await closed.controller.prepare(); assert.equal(closed.stats.quotes, 0); assert.equal(closed.sent().length, 0)
 })
 await test('being inside the pilot amount limit never overrides an unrepresentable economic output floor', async () => {
   const config = pilot.arcPilotConfig('true', owner)

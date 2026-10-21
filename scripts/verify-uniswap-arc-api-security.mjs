@@ -247,7 +247,7 @@ try {
       Response.json({ error: 'uniswap_arc_public_preview_disabled' }, { status: 503, headers: { 'X-Uniswap-Preview-Status': 'public-disabled' } }))
     await assert.rejects(reader.read(input), error => error.code === 'public_disabled' && uniswapArcPreviewErrorMessage(error).includes('Circle previews remain available'))
     assert.equal(reader.current(input), null)
-    assert.equal(p.UNISWAP_ARC_WRITES_ENABLED, false)
+    assert.equal(p.UNISWAP_ARC_WRITES_ENABLED, true)
     await assert.rejects(p.submitUniswapArcSwap(), /writes_disabled/)
   })
   assert.equal(external, 0)

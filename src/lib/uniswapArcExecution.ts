@@ -21,7 +21,7 @@ export interface ExecutionPorts {
   changed?(view: ExecutionView): void; settled?(attempt: SwapAttempt): void
   // Production supplies the pilot restriction. Missing authorization fails closed.
   authorize?(input: ArcRequest | null, context: ExecutionContext): boolean
-  // Trusted test seam only. Production omits it and uses the source-level false release gate.
+  // Trusted test seam only. Production uses the source gate AND mandatory pilot authorization.
   enabled?(): boolean
 }
 export const ARC_EXECUTION_EXPLORER = 'https://explorer.arc.io/tx/'

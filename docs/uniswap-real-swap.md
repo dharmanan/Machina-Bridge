@@ -1,4 +1,4 @@
-# Uniswap Arc execution candidate — disabled pending independent review
+# Uniswap Arc execution — restricted pilot, activation pending approval
 
 This implements native USDC -> EURC (CLASSIC V4) and native USDC -> cirBTC
 (CLASSIC V3) for Arc Mainnet 5042. Circle remains preview-only. No reverse route,
@@ -11,10 +11,11 @@ must permit execution. See [pilot opening/closing procedure](uniswap-pilot.md).
 
 ## Release boundary
 
-`UNISWAP_ARC_WRITES_ENABLED` in `src/lib/uniswapArcPolicy.ts` remains **false**.
-Both execution preparation and confirmation enforce it. There is no environment,
-URL, localStorage or DOM switch that enables the production application. A future
-reviewed release must explicitly change this source gate after owner approval.
+`UNISWAP_ARC_WRITES_ENABLED` in `src/lib/uniswapArcPolicy.ts` is **true** for the
+restricted pilot release. Preparation and confirmation additionally enforce the
+default-off pilot configuration, pinned approved wallet, EURC direction and
+0.1-USDC input ceiling. Missing or incorrect configuration fails closed. URL,
+localStorage, DOM state and preview objects cannot bypass those application checks.
 The server's existing `UNISWAP_ARC_PREVIEW_ENABLED` controls quotes only.
 `MAINNET_SWAP_WRITES_ENABLED` remains false. API/preview reviews still report
 `writesEnabled=false` and `executionBound=false`; these are never send authority.
@@ -128,7 +129,8 @@ simulation, 45-second approval, cutoff/late hash, and rejection after cutoff.
 `verify-uniswap-arc-execution-ui.mjs` runs the real React/wagmi UI/controller/RPC
 adapter, native Web Locks and localStorage in Chromium. Only an in-memory test
 transform opens the release gate; HTTP/RPC and wallet responses are synthetic.
-Original evidence bytes and the production source gate are unchanged.
+Original evidence bytes are unchanged. The earlier verification results below are
+historical; see the pilot procedure for current release configuration and results.
 
 A separate live **read-only** Arc RPC batch observed chain 5042, block 27180521,
 base fee 20000000000 native base units, and router runtime hash

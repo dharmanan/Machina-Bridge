@@ -73,7 +73,7 @@ if (mode === 'archive') {
     assert.equal(result.headers['X-Uniswap-Preview-Status'], 'public-disabled'); assert.equal(result.body.executionBound, false);
   }
 }
-assert.equal(policy.UNISWAP_ARC_WRITES_ENABLED, false);
+assert.equal(policy.UNISWAP_ARC_WRITES_ENABLED, true);
 await assert.rejects(policy.submitUniswapArcSwap(), /writes_disabled/);
 assert.equal(external, 0);
 console.log('PASS native ESM cold start: ' + mode + '; zero external calls');

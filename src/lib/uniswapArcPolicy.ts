@@ -1,8 +1,9 @@
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getAddress, getCreate2Address, keccak256, parseAbi, parseAbiParameters, type Hex } from 'viem'
 
-// Source-level release gate. Keep false until independent review and explicit owner approval.
-// Preview server environment flags, URL parameters and stored records cannot enable execution.
-export const UNISWAP_ARC_WRITES_ENABLED = false
+// Source release approved for the restricted pilot only. Execution additionally requires
+// the default-off pilot configuration, pinned wallet authorization and explicit confirmation.
+// Preview server flags, URL parameters and stored records cannot enable execution.
+export const UNISWAP_ARC_WRITES_ENABLED = true
 export const ARC_ROUTER = '0x8702463e73f74d0b6765aBceb314Ef07aCb92650'
 // Observed at user fork block 27114546 and block 27119997; official nonproxy deployment 802fe4c.
 export const ARC_ROUTER_HASH = '0x2e80a35dc8a1da121611acc5c31be03c2e63669135461e63947901ecf8a1654d'

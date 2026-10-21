@@ -7,7 +7,7 @@ import { custom, defineChain, toHex } from 'viem'
 import MainnetSwapScreen from '../../../src/components/MainnetSwapScreen'
 import '../../../src/index.css'
 
-const owner = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266' as const
+const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321' as const
 const other = '0x2222222222222222222222222222222222222222' as const
 const state = { walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], tx: null as unknown, hash: '', balanceReads: 0 }
 let release: ((value: string) => void) | undefined

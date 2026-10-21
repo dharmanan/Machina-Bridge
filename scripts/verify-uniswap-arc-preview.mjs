@@ -157,7 +157,7 @@ await test('expired or mutated review, wallet disconnect/change/chain change and
   for(const delta of [{expiresAt:now},{expiresAt:now+31000},{networkFee:'0'},{routerHash:'0x00'},{executionBound:true},{writesEnabled:true},{estimatedOutput:undefined},{estimatedOutput:'0'},{estimatedOutput:'989999'},{estimatedOutput:'99999999999999999'}]) assert.throws(()=>p.validateArcReview({...goodReview,...delta},ctx,now))
 })
 await test('submission hard stop prevents repeated sends before any dependency', async () => {
-  assert.equal(p.UNISWAP_ARC_WRITES_ENABLED,false)
+  assert.equal(p.UNISWAP_ARC_WRITES_ENABLED,true)
   for(let i=0;i<3;i++)await assert.rejects(p.submitUniswapArcSwap(),/writes_disabled/)
   for(const method of ['eth_sendTransaction','eth_sendRawTransaction','personal_sign','eth_signTypedData_v4','wallet_sendCalls'])assert.throws(()=>s.assertArcReadMethod(method),/read_only_rpc/)
 })

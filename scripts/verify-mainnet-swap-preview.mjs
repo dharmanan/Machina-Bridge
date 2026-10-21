@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url'
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 for (const extension of ['.ts', '.tsx']) require.extensions[extension] = (module, filename) => {
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
+  // Match an unconfigured Vite build in this CommonJS-only DOM harness.
+  const source = readFileSync(filename, 'utf8').replace(/import\.meta\.env\.VITE_UNISWAP_ARC_PILOT_(ENABLED|WALLET)/g, 'undefined')
+  const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true }, fileName: filename,
   })
   module._compile(outputText, filename)
@@ -280,7 +282,7 @@ await test('Circle preview remains read-only; unified UI delegates Uniswap to a 
   assert.match(component, /sm:grid-cols-2/)
   assert.match(component, /break-all/)
   assert.match(component, /UniswapArcExecutionPanel/)
-  assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = false/)
+  assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = true/)
 })
 
 const Module = require('node:module')
