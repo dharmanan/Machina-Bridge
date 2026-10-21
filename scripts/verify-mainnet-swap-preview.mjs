@@ -268,7 +268,7 @@ await test('only mainnet receives the new lazy Swap tab; legacy routes and defau
   const activity = readFileSync(`${root}src/components/MainnetWalletActivity.tsx`, 'utf8')
   assert.match(activity, /Activity data provided by Blockscout\./)
 })
-await test('UI cannot import execution helpers, and all requests are contextual and abortable', () => {
+await test('Circle preview remains read-only; unified UI delegates Uniswap to a separately gated controller', () => {
   const component = readFileSync(`${root}src/components/MainnetSwapPreview.tsx`, 'utf8') + readFileSync(`${root}src/components/MainnetSwapScreen.tsx`, 'utf8')
   const library = readFileSync(`${root}src/lib/mainnetSwap.ts`, 'utf8')
   for (const source of [component, library]) assert.doesNotMatch(source, /\.swap\(|\.approve\(|sendTransaction\(|writeContract\(|signTypedData\(|personal_sign|useWalletClient|window\.ethereum|privateKeyToAccount/)
@@ -279,13 +279,16 @@ await test('UI cannot import execution helpers, and all requests are contextual 
   assert.match(component, /controller\.current\?\.abort\(\)/)
   assert.match(component, /sm:grid-cols-2/)
   assert.match(component, /break-all/)
+  assert.match(component, /UniswapArcExecutionPanel/)
+  assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = false/)
 })
-console.log(`\n${passed} Mainnet Swap Preview checks passed. No live RPC, wallet or Circle request was sent.`)
 
 const Module = require('node:module')
 const originalRequire = Module.prototype.require
 const React = require('react')
 const { renderToStaticMarkup } = require('react-dom/server')
+const { QueryClient, QueryClientProvider } = require('@tanstack/react-query')
+const renderSwap = () => renderToStaticMarkup(React.createElement(QueryClientProvider, { client: new QueryClient() }, React.createElement(Component)))
 let wallet = { isConnected: false, chainId: undefined, address: undefined }
 let mockBalance = { isSuccess: false, isError: false, data: undefined }
 let mockNative = { data: undefined, isError: false }
@@ -297,7 +300,7 @@ let Component
 try { Component = require(`${root}src/components/MainnetSwapScreen.tsx`).default }
 finally { Module.prototype.require = originalRequire }
 await test('disconnected DOM keeps quote and execution controls disabled', () => {
-  const html = renderToStaticMarkup(React.createElement(Component))
+  const html = renderSwap()
   assert.match(html, /Connect your wallet using the header/)
   assert.match(html, /disabled=""[^>]*>Get quote/)
   assert.match(html, /disabled=""[^>]*>Swap disabled in Preview/)
@@ -307,31 +310,31 @@ await test('disconnected DOM keeps quote and execution controls disabled', () =>
 })
 await test('wrong-network DOM is explicit and cannot request a quote', () => {
   wallet = { isConnected: true, chainId: 1, address }
-  const html = renderToStaticMarkup(React.createElement(Component))
+  const html = renderSwap()
   assert.match(html, /Select Arc Mainnet \(chain ID 5042\)/)
   assert.match(html, /disabled=""[^>]*>Get quote/)
 })
 await test('Arc wallet DOM shows independent native USDC balance without claiming execution capacity', () => {
   wallet = { isConnected: true, chainId: 5042, address }
   mockNative = { data: { value: 192154955500000000n }, isError: false }
-  const html = renderToStaticMarkup(React.createElement(Component))
+  const html = renderSwap()
   assert.match(html, /Balance: (<!-- -->)?0\.192154 USDC/)
   assert.match(html, /disabled=""[^>]*>Swap disabled in Preview/)
   mockNative = { data: undefined, isError: true }
-  const errorHtml = renderToStaticMarkup(React.createElement(Component))
+  const errorHtml = renderSwap()
   assert.match(errorHtml, /Balance: (<!-- -->)?unavailable/)
   assert.doesNotMatch(errorHtml, /Balance: (<!-- -->)?0/)
 })
 await test('WETH is selectable in both directions and renders its full ERC-20 balance', () => {
   wallet = { isConnected: true, chainId: 5042, address }
-  const initialHtml = renderToStaticMarkup(React.createElement(Component))
+  const initialHtml = renderSwap()
   assert.equal((initialHtml.match(/<option>WETH<\/option>/g) ?? []).length, 2)
   assert.doesNotMatch(initialHtml, /WETH is not enabled/)
   const originalUseState = React.useState
   mockBalance = { isSuccess: true, isError: false, data: 4123456789012345n }
   React.useState = (initial) => originalUseState(initial === 'USDC' ? 'WETH' : initial === 'EURC' ? 'USDC' : initial)
   try {
-    const html = renderToStaticMarkup(React.createElement(Component))
+    const html = renderSwap()
     assert.match(html, /Balance: (<!-- -->)?0\.004123456789012345 WETH/)
     assert.doesNotMatch(html, /Quote source/)
     assert.match(html, /Circle Swap Kit/)

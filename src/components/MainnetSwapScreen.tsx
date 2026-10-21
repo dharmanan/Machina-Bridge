@@ -4,6 +4,7 @@ import { formatUnits } from 'viem'
 import { ArrowDown } from 'lucide-react'
 import { Container } from './ui'
 import { isUniswapArcRoute, useUniswapArcPreview } from './UniswapArcPreview'
+import { UniswapArcExecutionPanel, useUniswapArcExecution } from './UniswapArcExecution'
 import { useCircleSwapPreview } from './MainnetSwapPreview'
 import { MAINNET_SWAP_SLIPPAGE_BPS, MAINNET_SWAP_TOKENS, type MainnetSwapToken } from '../config/mainnetSwap'
 import { ARC_OUTPUTS, ARC_ROUTER, usdcAmount } from '../lib/uniswapArcPolicy'
@@ -28,6 +29,7 @@ export default function MainnetSwapScreen() {
   const slippageOptions: readonly number[] = provider === 'uniswap' ? UNISWAP_SLIPPAGE_BPS : MAINNET_SWAP_SLIPPAGE_BPS
   const slippageBps = slippageOptions.includes(slippageChoice) ? slippageChoice : DEFAULT_SLIPPAGE_BPS
   const uniswap = useUniswapArcPreview(tokenIn, tokenOut, amount, slippageBps)
+  const execution = useUniswapArcExecution(provider === 'uniswap' ? uniswap.request : null)
   const circle = useCircleSwapPreview(tokenIn, tokenOut, amount, slippageBps)
   // Native USDC is read directly from Arc RPC; other tokens use the Circle hook's ERC-20 read.
   const nativeBalance = useBalance({ address, chainId: 5042, query: { enabled: isConnected && !!address && tokenIn === 'USDC', refetchInterval: 30000 } })
@@ -93,9 +95,9 @@ export default function MainnetSwapScreen() {
     <section aria-labelledby="swap-title" className="mx-auto max-w-lg space-y-4">
       <header className="flex flex-wrap items-center gap-3">
         <h1 id="swap-title" className="text-3xl font-bold text-slate-900">Swap</h1>
-        <span className="rounded-full border border-[#66D121]/40 bg-[#eef7e8] px-3 py-1 text-sm font-medium text-[#2F6E0C]">Preview only</span>
+        <span className="rounded-full border border-[#66D121]/40 bg-[#eef7e8] px-3 py-1 text-sm font-medium text-[#2F6E0C]">{provider === 'uniswap' && execution.enabled ? 'Uniswap Swap' : 'Preview only'}</span>
       </header>
-      <p className="text-sm text-slate-600">Arc Mainnet · live quotes. Swaps, approvals and signatures are disabled.</p>
+      <p className="text-sm text-slate-600">{provider === 'uniswap' && execution.enabled ? 'Arc Mainnet · Review and confirm before a wallet transaction is requested. No token approval is needed.' : 'Arc Mainnet · live quotes. Swaps, approvals and signatures are disabled.'}</p>
       <div className="space-y-2 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6">
         <div className="space-y-2 rounded-2xl bg-slate-50 p-4">
           <div className="flex items-baseline justify-between gap-3 text-sm text-slate-500">
@@ -160,10 +162,11 @@ export default function MainnetSwapScreen() {
           {loading ? 'Getting quote…' : summary || expired ? 'Refresh quote' : 'Get quote'}
         </button>
         <div aria-live="polite" aria-atomic="true">
-          {summary ? <p role="status" className="text-xs text-slate-500">{provider === 'uniswap' ? 'Read-only simulation passed · Execution disabled. A simulation is not a completed transaction; the fee shown is a conservative budget, not a charged fee.' : 'Quote available. Local freshness is limited to 30 seconds, not a provider guarantee. Fees and output may change.'}</p>
+          {summary ? <p role="status" className="text-xs text-slate-500">{provider === 'uniswap' ? `Read-only simulation passed · ${execution.enabled ? 'Use Review Swap for a separately checked transaction.' : 'Execution disabled.'} A simulation is not a completed transaction; the fee shown is a conservative budget, not a charged fee.` : 'Quote available. Local freshness is limited to 30 seconds, not a provider guarantee. Fees and output may change.'}</p>
             : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : expired ? 'Quote expired or invalidated. Refresh to see current amounts.' : 'No current verified quote. No output or fee is assumed.'}</p>}
         </div>
-        <button type="button" disabled className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-100 px-5 py-3 font-semibold text-slate-500">Swap disabled in Preview</button>
+        {provider === 'uniswap' ? <UniswapArcExecutionPanel execution={execution} canReview={Boolean(uniswap.request)} />
+          : <button type="button" disabled className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-100 px-5 py-3 font-semibold text-slate-500">Swap disabled in Preview</button>}
       </div>
 
       {summary && summary.extra.length > 0 && <details className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">

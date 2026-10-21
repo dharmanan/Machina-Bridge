@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useAccount } from 'wagmi'
-import { ARC_OUTPUTS, UNISWAP_ARC_WRITES_ENABLED, requestKey, validateArcRequest, type ArcRequest, type ArcReview } from '../lib/uniswapArcPolicy'
+import { ARC_OUTPUTS, requestKey, validateArcRequest, type ArcRequest, type ArcReview } from '../lib/uniswapArcPolicy'
 import { ArcPreviewError, createUniswapArcPreviewReader, uniswapArcPreviewErrorMessage, type ArcWalletContext } from '../lib/uniswapArcPreview'
 
 // Uniswap exists only for native USDC -> a verified Arc output token; every other route is Circle-only.
@@ -49,7 +49,7 @@ export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: 
   }, [reader])
 
   async function load() {
-    if (!request || loading || UNISWAP_ARC_WRITES_ENABLED) return
+    if (!request || loading) return
     const input = request
     invalidate()
     const expected = generation.current

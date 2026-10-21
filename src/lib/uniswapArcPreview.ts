@@ -55,6 +55,10 @@ export function createUniswapArcPreviewReader(getContext: () => ArcWalletContext
   return {
     invalidate,
     current: checked,
+    validationTime(expectedRequest: ArcRequest): number {
+      if (!checked(expectedRequest)) throw new ArcPreviewError('expired')
+      return serverNow()
+    },
     remainingMs(expectedRequest: ArcRequest): number {
       const review = checked(expectedRequest)
       return review ? Math.max(0, Math.floor(review.expiresAt - serverNow())) : 0

@@ -1,5 +1,7 @@
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getAddress, getCreate2Address, keccak256, parseAbi, parseAbiParameters, type Hex } from 'viem'
 
+// Source-level release gate. Keep false until independent review and explicit owner approval.
+// Preview server environment flags, URL parameters and stored records cannot enable execution.
 export const UNISWAP_ARC_WRITES_ENABLED = false
 export const ARC_ROUTER = '0x8702463e73f74d0b6765aBceb314Ef07aCb92650'
 // Observed at user fork block 27114546 and block 27119997; official nonproxy deployment 802fe4c.
@@ -168,5 +170,6 @@ export function validateArcReview(review: ArcReview, context: { owner: string; c
   const fee = gas * price
   if (fee !== uint(review.networkFee) || fee > uint(r.maxNetworkFee) || uint(review.nativeBalance) < nativeAmount(r.amount) + fee) fail('balance_or_fee')
 }
-// Every invocation remains a hard stop, even if caller edits a review or DOM.
+// Legacy preview entry point stays a hard stop. Real execution requires the separately prepared,
+// privately retained intent and explicit confirmation in createUniswapArcExecution.
 export async function submitUniswapArcSwap(): Promise<never> { return fail('uniswap_arc_writes_disabled') }
