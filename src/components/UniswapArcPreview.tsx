@@ -8,7 +8,7 @@ export function isUniswapArcRoute(tokenIn: string, tokenOut: string): tokenOut i
   return tokenIn === 'USDC' && Object.prototype.hasOwnProperty.call(ARC_OUTPUTS, tokenOut)
 }
 
-export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: string, slippageBps: number) {
+export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: string, slippageBps: number, active = true) {
   const { address, isConnected, chainId } = useAccount()
   const [review, setReview] = useState<ArcReview | null>(null)
   const [loading, setLoading] = useState(false)
@@ -26,8 +26,8 @@ export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: 
         amount, slippageBps, minimumOutput: '1', maxNetworkFee: '100000000000000000' })
     } catch { /* Incomplete or out-of-policy input never starts a request. */ }
   }
-  const contextKey = JSON.stringify([address, isConnected, chainId, tokenIn, tokenOut, amount, slippageBps])
-  const current = review && request ? reader.current(request) : null
+  const contextKey = JSON.stringify([address, isConnected, chainId, tokenIn, tokenOut, amount, slippageBps, active])
+  const current = active && review && request ? reader.current(request) : null
   const remainingMs = current && request ? reader.remainingMs(request) : 0
 
   function invalidate() {
@@ -49,7 +49,7 @@ export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: 
   }, [reader])
 
   async function load() {
-    if (!request || loading) return
+    if (!active || document.hidden || !request || loading) return
     const input = request
     invalidate()
     const expected = generation.current
@@ -66,6 +66,6 @@ export function useUniswapArcPreview(tokenIn: string, tokenOut: string, amount: 
       if (generation.current === expected) setLoading(false)
     }
   }
-  return { supported, request, current, remainingMs, expired: Boolean(review && !current), loading, error, load,
+  return { supported, request, current, remainingMs, expired: Boolean(review && !current), loading, error, load, cancel: invalidate,
     invalidAmount: Boolean(supported && isConnected && chainId === 5042 && amount && !request) }
 }

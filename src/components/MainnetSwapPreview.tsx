@@ -10,7 +10,7 @@ import {
   swapWalletState, validateSwapRequest, type PreviewQuote, type SwapQuoteRequest,
 } from '../lib/mainnetSwap'
 
-export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: MainnetSwapToken, amount: string, slippageBps: number) {
+export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: MainnetSwapToken, amount: string, slippageBps: number, active = true) {
   const { address, isConnected, chainId } = useAccount()
   const [quote, setQuote] = useState<PreviewQuote | null>(null)
   const [error, setError] = useState<{ key: string; message: string } | null>(null)
@@ -21,7 +21,7 @@ export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: Mainne
   const walletState = swapWalletState(isConnected, chainId)
   const request: SwapQuoteRequest | null = address && walletState === 'ready'
     ? { address, chainId: MAINNET_SWAP_CHAIN_ID, tokenIn, tokenOut, amount, slippageBps } : null
-  const contextKey = request ? swapRequestKey(request) : `${walletState}:${tokenIn}:${tokenOut}:${amount}:${slippageBps}`
+  const contextKey = `${active}:${request ? swapRequestKey(request) : `${walletState}:${tokenIn}:${tokenOut}:${amount}:${slippageBps}`}`
   const balance = useReadContract({
     address: MAINNET_SWAP_TOKENS[tokenIn].address, abi: erc20Abi,
     functionName: 'balanceOf', args: address ? [address] : undefined,
@@ -37,7 +37,15 @@ export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: Mainne
       insufficientBalance = balance.isSuccess && hasInsufficientSwapBalance(amount, tokenIn, balance.data)
     } catch { /* Incomplete input is not a quote request. */ }
   }
-  const current = isCurrentSwapQuote(quote, request, now) && !insufficientBalance ? quote : null
+  const current = active && isCurrentSwapQuote(quote, request, now) && !insufficientBalance ? quote : null
+
+  function invalidate() {
+    generation.current += 1
+    controller.current?.abort()
+    setLoading(false)
+    setQuote(null)
+    setError(null)
+  }
 
   useEffect(() => {
     generation.current += 1
@@ -53,7 +61,7 @@ export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: Mainne
   }, [])
 
   async function loadQuote() {
-    if (!MAINNET_SWAP_READ_ONLY_ENABLED || MAINNET_SWAP_WRITES_ENABLED || !request || !validAmount || insufficientBalance || loading) return
+    if (!active || document.hidden || !MAINNET_SWAP_READ_ONLY_ENABLED || MAINNET_SWAP_WRITES_ENABLED || !request || !validAmount || insufficientBalance || loading) return
     const expectedGeneration = ++generation.current
     controller.current?.abort()
     const nextController = new AbortController()
@@ -74,5 +82,5 @@ export function useCircleSwapPreview(tokenIn: MainnetSwapToken, tokenOut: Mainne
     }
   }
   return { walletState, request, validAmount, insufficientBalance, balance, quote: current, expired: Boolean(quote && !current && request && quote.requestKey === swapRequestKey(request)), loading,
-    error: error?.key === contextKey ? error.message : null, load: loadQuote, now }
+    error: error?.key === contextKey ? error.message : null, load: loadQuote, cancel: invalidate, now }
 }

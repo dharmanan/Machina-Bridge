@@ -304,7 +304,7 @@ finally { Module.prototype.require = originalRequire }
 await test('disconnected DOM keeps quote and execution controls disabled', () => {
   const html = renderSwap()
   assert.match(html, /Connect your wallet using the header/)
-  assert.match(html, /disabled=""[^>]*>Get quote/)
+  assert.doesNotMatch(html, />Get quote|>Refresh quote/)
   assert.match(html, /disabled=""[^>]*>Swap disabled in Preview/)
   assert.doesNotMatch(html, /Estimated from a live quote/)
   assert.match(html, /Preview only/)
@@ -314,7 +314,7 @@ await test('wrong-network DOM is explicit and cannot request a quote', () => {
   wallet = { isConnected: true, chainId: 1, address }
   const html = renderSwap()
   assert.match(html, /Select Arc Mainnet \(chain ID 5042\)/)
-  assert.match(html, /disabled=""[^>]*>Get quote/)
+  assert.doesNotMatch(html, />Get quote|>Refresh quote/)
 })
 await test('Arc wallet DOM shows independent native USDC balance without claiming execution capacity', () => {
   wallet = { isConnected: true, chainId: 5042, address }

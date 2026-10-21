@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useAccount, useBalance } from 'wagmi'
 import { formatUnits } from 'viem'
-import { ArrowDown } from 'lucide-react'
+import { ArrowDown, Loader2 } from 'lucide-react'
 import { Container } from './ui'
 import { isUniswapArcRoute, useUniswapArcPreview } from './UniswapArcPreview'
 import { UniswapArcExecutionPanel, useUniswapArcExecution } from './UniswapArcExecution'
@@ -10,6 +10,7 @@ import { MAINNET_SWAP_SLIPPAGE_BPS, MAINNET_SWAP_TOKENS, type MainnetSwapToken }
 import { ARC_OUTPUTS, ARC_ROUTER, usdcAmount } from '../lib/uniswapArcPolicy'
 import { CIRCLE_NO_ROUTE_MESSAGE, decimalUnits } from '../lib/mainnetSwap'
 import { shortenAmount, unitPriceInUsdc } from '../lib/swapDisplay'
+import { useSwapAutoQuote } from './useSwapAutoQuote'
 
 type Provider = 'uniswap' | 'circle'
 const PROVIDER_NAME: Record<Provider, string> = { uniswap: 'Uniswap (Arc router)', circle: 'Circle Swap Kit' }
@@ -28,9 +29,9 @@ export default function MainnetSwapScreen() {
   const provider: Provider = uniswapRoute && preferred === 'uniswap' ? 'uniswap' : 'circle'
   const slippageOptions: readonly number[] = provider === 'uniswap' ? UNISWAP_SLIPPAGE_BPS : MAINNET_SWAP_SLIPPAGE_BPS
   const slippageBps = slippageOptions.includes(slippageChoice) ? slippageChoice : DEFAULT_SLIPPAGE_BPS
-  const uniswap = useUniswapArcPreview(tokenIn, tokenOut, amount, slippageBps)
+  const uniswap = useUniswapArcPreview(tokenIn, tokenOut, amount, slippageBps, provider === 'uniswap')
   const execution = useUniswapArcExecution(provider === 'uniswap' ? uniswap.request : null)
-  const circle = useCircleSwapPreview(tokenIn, tokenOut, amount, slippageBps)
+  const circle = useCircleSwapPreview(tokenIn, tokenOut, amount, slippageBps, provider === 'circle')
   // Native USDC is read directly from Arc RPC; other tokens use the Circle hook's ERC-20 read.
   const nativeBalance = useBalance({ address, chainId: 5042, query: { enabled: isConnected && !!address && tokenIn === 'USDC', refetchInterval: 30000 } })
 
@@ -76,6 +77,9 @@ export default function MainnetSwapScreen() {
     ? 'Circle cannot provide a quote for this amount. Choose Uniswap as the quote source.' : active.error
   const expired = active.expired
   const canQuote = provider === 'uniswap' ? Boolean(uniswap.request) : Boolean(circle.request && circle.validAmount && !circle.insufficientBalance)
+  const executionBusy = !['idle', 'confirmed', 'failed', 'rejected'].includes(execution.view.phase)
+  useSwapAutoQuote(JSON.stringify([address, isConnected, chainId, provider, tokenIn, tokenOut, amount, slippageBps]),
+    canQuote && !executionBusy, active.load, active.cancel)
 
   function selectToken(side: 'in' | 'out', token: MainnetSwapToken) {
     // Only USDC pairs have a verified route; other combinations fall back to a USDC pair.
@@ -158,14 +162,12 @@ export default function MainnetSwapScreen() {
         {provider === 'circle' && circle.insufficientBalance && <p role="status" className="text-sm text-amber-700">Insufficient token balance for this amount.</p>}
         {error && <p role="alert" className="break-words text-sm text-red-700">{error}</p>}
 
-        <button type="button" className="w-full rounded-xl bg-[#2F6E0C] px-5 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={!canQuote || loading} onClick={() => { void active.load() }}>
-          {loading ? 'Getting quote…' : summary || expired ? 'Refresh quote' : 'Get quote'}
-        </button>
+        {loading && <p role="status" className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" aria-hidden="true" />Updating price…</p>}
         <div aria-live="polite" aria-atomic="true">
           {summary ? <p role="status" className="text-xs text-slate-500">{provider === 'uniswap' ? `Read-only simulation passed · ${execution.enabled ? 'Use Review Swap for a separately checked transaction.' : 'Execution disabled.'} A simulation is not a completed transaction; the fee shown is a conservative budget, not a charged fee.` : 'Quote available. Local freshness is limited to 30 seconds, not a provider guarantee. Fees and output may change.'}</p>
-            : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : expired ? 'Quote expired or invalidated. Refresh to see current amounts.' : 'No current verified quote. No output or fee is assumed.'}</p>}
+            : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : expired ? 'Quote expired. Change the amount or settings for a new price.' : 'Enter an amount for an automatic quote. No output or fee is assumed.'}</p>}
         </div>
-        {provider === 'uniswap' ? <UniswapArcExecutionPanel execution={execution} canReview={Boolean(uniswap.request)} />
+        {provider === 'uniswap' ? <UniswapArcExecutionPanel execution={execution} canReview={Boolean(uniswap.request) && !uniswap.loading} />
           : <button type="button" disabled className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-100 px-5 py-3 font-semibold text-slate-500">Swap disabled in Preview</button>}
       </div>
 

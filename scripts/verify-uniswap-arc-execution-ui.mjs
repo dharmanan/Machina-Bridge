@@ -102,7 +102,9 @@ try {
     assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
   })
   await test('Review fetches fresh data, runs actual read-only client and shows independent approval summary', async () => {
-    await prepare(); assert.equal(apiCalls, 1); assert.equal(await sends(), 0)
+    await page.getByText(/Read-only simulation passed/).waitFor()
+    const before = apiCalls
+    await prepare(); assert.equal(apiCalls, before + 1); assert.equal(await sends(), 0)
     const dialog = page.getByRole('dialog'); await dialog.getByText('0.088565 EURC', { exact: true }).waitFor()
     await dialog.getByText('0.00026 USDC', { exact: true }).waitFor(); assert.ok(methods.includes('eth_estimateGas'))
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); assert.equal(await sends(), 0)
