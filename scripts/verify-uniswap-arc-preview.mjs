@@ -13,7 +13,7 @@ globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
 const p = require(`${root}src/lib/uniswapArcPolicy.ts`)
 const s = require(`${root}api/_lib/uniswap-arc-preview.ts`)
 const { createUniswapArcPreviewReader } = require(`${root}src/lib/uniswapArcPreview.ts`)
-const handler = require(`${root}api/uniswap-arc-preview.ts`).default
+const handler = require(`${root}api/uniswap-arc-preview.ts`).handleDevelopmentArcPreview
 const { encodeAbiParameters: abi, encodeFunctionData: fn, keccak256 } = require('viem')
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 const owner = '0x1111111111111111111111111111111111111111'
@@ -176,8 +176,10 @@ await test('browser cancellation and concurrent duplicate readers cannot publish
   await assert.rejects(createUniswapArcPreviewReader(()=>ctx).read(request),error=>error.code==='busy')
   reader.invalidate();release(Response.json(goodReview));await assert.rejects(pending,error=>error.code==='cancelled');assert.equal(reader.current(request),null)
 })
-await test('server handler requires configured origin, rejects methods/body and sanitizes failures', async () => {
+await test('private development handler requires configured origin, rejects methods/body and sanitizes failures', async () => {
   const previousOrigin=process.env.UNISWAP_ARC_ALLOWED_ORIGIN, previousKey=process.env.UNISWAP_TRADING_API_KEY
+  const runtime = Object.fromEntries(['NODE_ENV','VERCEL','VERCEL_ENV'].map(key=>[key,process.env[key]]))
+  process.env.NODE_ENV='development';delete process.env.VERCEL;delete process.env.VERCEL_ENV
   process.env.UNISWAP_ARC_ALLOWED_ORIGIN='https://example.test';delete process.env.UNISWAP_TRADING_API_KEY
   async function run(req){let status=0,body;const headers={};const res={setHeader:(k,v)=>{headers[k]=v},status:n=>{status=n;return res},json:v=>{body=v}};await handler(req,res);return {status,body,headers}}
   try {
@@ -189,6 +191,7 @@ await test('server handler requires configured origin, rejects methods/body and 
   } finally {
     if(previousOrigin===undefined)delete process.env.UNISWAP_ARC_ALLOWED_ORIGIN;else process.env.UNISWAP_ARC_ALLOWED_ORIGIN=previousOrigin
     if(previousKey===undefined)delete process.env.UNISWAP_TRADING_API_KEY;else process.env.UNISWAP_TRADING_API_KEY=previousKey
+    for(const [key,value] of Object.entries(runtime))if(value===undefined)delete process.env[key];else process.env[key]=value
   }
 })
 const originalGroups = count

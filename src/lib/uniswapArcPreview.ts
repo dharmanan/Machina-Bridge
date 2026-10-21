@@ -1,7 +1,7 @@
 import { requestKey, validateArcRequest, validateArcReview, type ArcRequest, type ArcReview } from './uniswapArcPolicy'
 
 export interface ArcWalletContext { owner: string; chainId: number; connected: boolean }
-export type ArcPreviewErrorCode = 'http_origin' | 'http_rate' | 'http_unavailable' | 'http_route' | 'http_request' | 'transport' | 'timeout' | 'response' | 'timing' | 'expired' | 'context' | 'policy' | 'busy' | 'cancelled'
+export type ArcPreviewErrorCode = 'public_disabled' | 'http_origin' | 'http_rate' | 'http_unavailable' | 'http_route' | 'http_request' | 'transport' | 'timeout' | 'response' | 'timing' | 'expired' | 'context' | 'policy' | 'busy' | 'cancelled'
 export class ArcPreviewError extends Error {
   constructor(readonly code: ArcPreviewErrorCode, readonly status?: number) { super(code); this.name = 'ArcPreviewError' }
 }
@@ -9,6 +9,7 @@ export function uniswapArcPreviewErrorMessage(error: unknown): string {
   const code = error instanceof ArcPreviewError ? error.code : 'response'
   const status = error instanceof ArcPreviewError && error.status ? ` (HTTP ${error.status})` : ''
   const messages: Record<ArcPreviewErrorCode, string> = {
+    public_disabled: 'Public Uniswap previews are disabled until server-side access and quota protection are verified. Circle previews remain available.',
     http_origin: `This site address is not allowed by the preview server${status}. The server origin configuration must match the address in your browser.`,
     http_rate: `Too many preview requests${status}. Wait a minute before requesting another quote.`,
     http_unavailable: `The server could not verify a current quote${status}. No transaction is authorized.`,
@@ -81,6 +82,7 @@ export function createUniswapArcPreviewReader(getContext: () => ArcWalletContext
         } catch { throw new ArcPreviewError(timedOut ? 'timeout' : version !== generation ? 'cancelled' : 'transport') }
         if (!response.ok) {
           const status = response.status
+          if (status === 503 && response.headers.get('X-Uniswap-Preview-Status') === 'public-disabled') throw new ArcPreviewError('public_disabled', status)
           throw new ArcPreviewError(status === 403 ? 'http_origin' : status === 429 ? 'http_rate' : status === 404 || status === 405 ? 'http_route' : status >= 500 ? 'http_unavailable' : 'http_request', status)
         }
         if (!response.body || response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new ArcPreviewError('response')

@@ -1,7 +1,7 @@
 import type { Plugin } from 'vite'
-import handler from '../uniswap-arc-preview'
+import { handleDevelopmentArcPreview } from '../uniswap-arc-preview'
 
-// Local Vite adapter for the same server-only handler used by /api on Vercel.
+// Vite development adapter. Keep its port private; the default Vercel entry point remains closed.
 // Requires the same server environment variables and origin policy; no fallback keys.
 export function uniswapArcDevPreview(): Plugin {
   return {
@@ -27,7 +27,7 @@ export function uniswapArcDevPreview(): Plugin {
             }
             body = Buffer.concat(chunks).toString('utf8')
           }
-          await handler({ method: req.method, headers: req.headers, body }, response)
+          await handleDevelopmentArcPreview({ method: req.method, headers: req.headers, body }, response)
         } catch { response.status(503).json({ error: 'uniswap_arc_review_blocked', writesEnabled: false }) }
       })
     },

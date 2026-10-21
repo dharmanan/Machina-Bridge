@@ -11,7 +11,7 @@ let network = 0
 globalThis.fetch = async () => { network++; throw new Error('external_network_forbidden') }
 const p = require(`${root}src/lib/uniswapArcPolicy.ts`)
 const server = require(`${root}api/_lib/uniswap-arc-preview.ts`)
-const handler = require(`${root}api/uniswap-arc-preview.ts`).default
+const handler = require(`${root}api/uniswap-arc-preview.ts`).handleDevelopmentArcPreview
 const { createUniswapArcPreviewReader, ArcPreviewError, uniswapArcPreviewErrorMessage } = require(`${root}src/lib/uniswapArcPreview.ts`)
 const { decodeFunctionData, encodeFunctionData } = require('viem')
 const raw = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/USDC-EURC.json`, 'utf8'))
@@ -88,8 +88,10 @@ await test('HTTP/transport/JSON failures expose only allowlisted stage messages 
   assert.equal(uniswapArcPreviewErrorMessage(new Error('private-key-secret')).includes('private-key-secret'), false)
   assert.ok(uniswapArcPreviewErrorMessage(new ArcPreviewError('policy')).includes('safety'))
 })
-await test('actual API handler binds successful response to request nonce and stamps checked server time; origin remains strict', async () => {
+await test('actual private development handler binds successful response to request nonce and stamps checked server time; origin remains strict', async () => {
   const oldPrepare = server.prepareArcPreview, oldOrigin = process.env.UNISWAP_ARC_ALLOWED_ORIGIN
+  const runtime = Object.fromEntries(['NODE_ENV','VERCEL','VERCEL_ENV'].map(key=>[key,process.env[key]]))
+  process.env.NODE_ENV='development';delete process.env.VERCEL;delete process.env.VERCEL_ENV
   server.prepareArcPreview = async () => review()
   process.env.UNISWAP_ARC_ALLOWED_ORIGIN = 'https://allowed.test'
   async function invoke(headers) {
@@ -111,6 +113,7 @@ await test('actual API handler binds successful response to request nonce and st
   } finally {
     server.prepareArcPreview = oldPrepare
     if (oldOrigin === undefined) delete process.env.UNISWAP_ARC_ALLOWED_ORIGIN; else process.env.UNISWAP_ARC_ALLOWED_ORIGIN = oldOrigin
+    for(const [key,value] of Object.entries(runtime))if(value===undefined)delete process.env[key];else process.env[key]=value
   }
 })
 assert.equal(network, 0)

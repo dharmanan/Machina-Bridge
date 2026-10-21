@@ -102,6 +102,7 @@ try {
     if (new URL(req.url()).pathname !== '/api/uniswap-arc-preview') return route.continue()
     apiCalls++; const input = req.postDataJSON(); requests.push({ input, headers: req.headers() })
     if (mode === 'held') await new Promise(resolve => { held = resolve })
+    if (mode === 'public-disabled') return route.fulfill({ status: 503, headers: { 'X-Uniswap-Preview-Status': 'public-disabled' }, json: { error: 'uniswap_arc_public_preview_disabled', writesEnabled: false, executionBound: false } })
     if (mode === 'error' || mode === 'origin' || mode === 'rate') return route.fulfill({ status: mode === 'origin' ? 403 : mode === 'rate' ? 429 : 503, json: { error: 'blocked', secret: 'never-display-upstream' } })
     try {
       const review = await prepare(input, 'synthetic-server-only-test-key')
@@ -207,6 +208,15 @@ try {
       assert.equal(await receiveText(), '0.00')
     }
   })
+  await test('disabled public Uniswap API is explicit, shows no fabricated output and preserves Circle selection', async () => {
+    mode = 'public-disabled'; await preview.click()
+    await page.getByRole('alert').filter({ hasText: 'Public Uniswap previews are disabled' }).waitFor()
+    assert.equal(await receiveText(), '0.00')
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
+    assert.equal(await page.getByRole('combobox', { name: 'Quote source' }).inputValue(), 'circle')
+    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true)
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap')
+  })
   await test('missing freshness envelope or mismatched request nonce is a precise timing failure', async () => {
     for (const value of ['missing-timing', 'wrong-nonce']) {
       mode = value; await preview.click(); await page.getByRole('alert').filter({ hasText: 'Preview freshness could not be verified' }).waitFor()
@@ -233,7 +243,7 @@ try {
   })
   await test('Circle-only routes switch provider and hide Uniswap; Uniswap routes offer both sources', async () => {
     await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
-    await page.getByText('Circle Swap Kit', { exact: true }).first().waitFor()
+    await page.locator('dt').filter({ hasText: /^Provider$/ }).locator('..').locator('dd').filter({ hasText: /^Circle Swap Kit$/ }).waitFor()
     await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap')
     await page.getByRole('combobox', { name: 'From token' }).selectOption('WETH')
     assert.equal(await page.getByRole('combobox', { name: 'Quote source' }).count(), 0)
