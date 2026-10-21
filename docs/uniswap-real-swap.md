@@ -4,6 +4,11 @@ This implements native USDC -> EURC (CLASSIC V4) and native USDC -> cirBTC
 (CLASSIC V3) for Arc Mainnet 5042. Circle remains preview-only. No reverse route,
 approval, Permit2 signature, arbitrary token/router or additional provider exists.
 
+The initial pilot additionally restricts execution to one configured wallet and
+USDC → EURC at most 0.1 USDC. cirBTC remains preview-only in the application.
+Both the existing source release gate and the new default-off pilot configuration
+must permit execution. See [pilot opening/closing procedure](uniswap-pilot.md).
+
 ## Release boundary
 
 `UNISWAP_ARC_WRITES_ENABLED` in `src/lib/uniswapArcPolicy.ts` remains **false**.

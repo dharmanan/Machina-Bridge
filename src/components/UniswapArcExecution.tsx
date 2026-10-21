@@ -6,6 +6,9 @@ import { ARC_OUTPUTS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, nativeAm
 import { createUniswapArcPreviewReader } from '../lib/uniswapArcPreview'
 import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionProvider, type ExecutionView } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
+import { arcPilotAllows, arcPilotConfig } from '../lib/uniswapArcPilot'
+
+const pilot = arcPilotConfig(import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED, import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET)
 
 // Uses the already connected wagmi connector. No new wallet, signing SDK, service or login.
 export function useUniswapArcExecution(input: ArcRequest | null) {
@@ -21,6 +24,7 @@ export function useUniswapArcExecution(input: ArcRequest | null) {
   const [reader] = useState(() => createUniswapArcPreviewReader(() => alive.current ? context.current : { ...context.current, connected: false }))
   const [controller] = useState(() => createUniswapArcExecution({
     context: () => alive.current ? context.current : { ...context.current, connected: false }, input: () => alive.current ? currentInput.current : null,
+    authorize: (request, current) => arcPilotAllows(pilot, request, current),
     fresh: request => reader.read(request), quoteNow: request => reader.validationTime(request),
     preflight: arcExecutionRpc.preflight, result: arcExecutionRpc.result,
     provider: async () => {
@@ -74,7 +78,7 @@ export function useUniswapArcExecution(input: ArcRequest | null) {
   }, [view.phase, view.attempt?.hash, controller])
   let remainingMs = 0
   if (view.review) { try { remainingMs = Math.max(0, view.review.expiresAt - reader.validationTime(view.review.request)) } catch { /* expired */ } }
-  return { view, remainingMs, enabled: UNISWAP_ARC_WRITES_ENABLED,
+  return { view, remainingMs, enabled: UNISWAP_ARC_WRITES_ENABLED && arcPilotAllows(pilot, input, context.current),
     prepare: () => controller.prepare(), confirm: () => view.approvalId ? controller.confirm(view.approvalId) : Promise.resolve(),
     cancel: () => { controller.invalidate(); reader.invalidate() },
     recover: (hash: string) => controller.reconcile(view.attempt?.review.request.owner, hash),
@@ -107,6 +111,7 @@ export function UniswapArcExecutionPanel({ execution, canReview }: { execution: 
     <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="uniswap-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
       <div className="space-y-4">
         <h2 id="uniswap-review-title" className="text-xl font-semibold">Review Uniswap Swap</h2>
+        <p className="text-xs text-slate-600">Controlled pilot · USDC → EURC · maximum 0.1 USDC input.</p>
         {review && <>
           <p>{review.request.amount} USDC → estimated {formatUnits(BigInt(review.estimatedOutput), ARC_OUTPUTS[review.request.tokenOut].decimals)} {review.request.tokenOut}</p>
           <dl className="space-y-2 text-sm">

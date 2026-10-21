@@ -15,7 +15,7 @@ const { toHex, decodeFunctionData, encodeEventTopics, encodeAbiParameters, parse
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 const owner = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', blockHash = '0x' + 'b'.repeat(64)
-const server = await createServer({ configFile: false, root, cacheDir: `${root}.verification/vite-execution-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
+const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) }, cacheDir: `${root}.verification/vite-execution-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
   name: 'test-release-gate-only', enforce: 'pre', transform(code, id) {
     if (id.split('?')[0] === `${root}src/lib/uniswapArcPolicy.ts`) return code.replace('export const UNISWAP_ARC_WRITES_ENABLED = false', 'export const UNISWAP_ARC_WRITES_ENABLED = true')
   },
@@ -85,17 +85,28 @@ try {
   const transactionStatus = page.getByRole('region', { name: 'Uniswap transaction status' })
   const sends = () => page.evaluate(() => window.executionUiTest.state.requests.filter(r => r.method === 'eth_sendTransaction').length)
   async function prepare(symbol = 'EURC') {
-    await page.getByRole('combobox', { name: 'To token' }).selectOption(symbol); await amount.fill('1'); await review.click()
+    await page.getByRole('combobox', { name: 'To token' }).selectOption(symbol); await amount.fill('0.1'); await review.click()
     await page.getByRole('dialog').waitFor(); await confirm.waitFor()
   }
   await test('existing wallet connection and explicit Review are required; no automatic quote/send on mount', async () => {
-    assert.equal(await review.isDisabled(), true); assert.equal(apiCalls, 0)
-    await page.evaluate(() => window.executionUiTest.connect(5042)); await amount.fill('1')
+    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true); assert.equal(apiCalls, 0)
+    await page.evaluate(() => window.executionUiTest.connect(5042)); await amount.fill('0.1')
     assert.equal(await review.isEnabled(), true); assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
+  })
+  await test('pilot UI blocks cirBTC execution, other wallets and more than 0.1 USDC without any send', async () => {
+    await page.getByRole('combobox', { name: 'To token' }).selectOption('cirBTC')
+    assert.equal(await review.count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true)
+    await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')
+    await amount.fill('0.100001'); assert.equal(await review.count(), 0)
+    await amount.fill('0.1'); await page.evaluate(() => window.executionUiTest.account(true))
+    await page.getByRole('button', { name: 'Swap disabled in Preview' }).waitFor(); assert.equal(await review.count(), 0)
+    await page.evaluate(() => window.executionUiTest.account(false)); await review.waitFor()
+    assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
   })
   await test('Review fetches fresh data, runs actual read-only client and shows independent approval summary', async () => {
     await prepare(); assert.equal(apiCalls, 1); assert.equal(await sends(), 0)
-    const dialog = page.getByRole('dialog'); await dialog.getByText('0.885661 EURC', { exact: true }).waitFor()
+    const dialog = page.getByRole('dialog'); await dialog.getByText('0.088565 EURC', { exact: true }).waitFor()
     await dialog.getByText('0.00026 USDC', { exact: true }).waitFor(); assert.ok(methods.includes('eth_estimateGas'))
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); assert.equal(await sends(), 0)
   })
@@ -127,12 +138,12 @@ try {
   await test('verified successful receipt shows Confirmed and actual output, then refreshes native balance', async () => {
     const before = await page.evaluate(() => window.executionUiTest.state.balanceReads)
     receiptMode = 'confirmed'
-    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor(); await transactionStatus.getByText('Received 0.885661 EURC', { exact: true }).waitFor()
+    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor(); await transactionStatus.getByText('Received 0.088565 EURC', { exact: true }).waitFor()
     await page.waitForFunction(n => window.executionUiTest.state.balanceReads > n, before)
     assert.equal(await sends(), 0)
   })
-  await test('cirBTC uses the same real UI/controller path and a reverted receipt is Failed', async () => {
-    receiptMode = 'pending'; await prepare('cirBTC'); await confirm.click()
+  await test('pilot EURC repeated review uses the same controller and a reverted receipt is Failed', async () => {
+    receiptMode = 'pending'; await prepare('EURC'); await confirm.click()
     await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); await cacheWallet()
     receiptMode = 'reverted'
     await transactionStatus.getByText('Failed — transaction reverted', { exact: true }).waitFor(); assert.equal(await sends(), 1)
@@ -162,7 +173,7 @@ try {
   })
   await test('failed router/balance preflight cannot open wallet approval', async () => {
     for (const mode of ['router', 'balance']) {
-      rpcMode = mode; await amount.fill('1'); await review.click(); await page.getByRole('alert').filter({ hasText: 'could not be verified' }).waitFor()
+      rpcMode = mode; await amount.fill('0.1'); await review.click(); await page.getByRole('alert').filter({ hasText: 'could not be verified' }).waitFor()
       assert.equal(await sends(), 0)
     }
     rpcMode = 'normal'
@@ -178,7 +189,7 @@ try {
   await test('wallet approval cutoff warns to cancel, blocks another request and tracks a late hash', async () => {
     receiptMode = 'pending'
     await page.evaluate(() => { window.executionUiTest.state.walletMode = 'held' })
-    await prepare('cirBTC'); const before = await sends(); await confirm.click()
+    await prepare('EURC'); const before = await sends(); await confirm.click()
     await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
     await page.clock.fastForward(121000)
     await transactionStatus.getByText('Submission or result unverified', { exact: true }).waitFor()

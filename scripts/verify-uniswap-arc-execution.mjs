@@ -9,6 +9,7 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, file)
 const root = fileURLToPath(new URL('..', import.meta.url)), p = require(`${root}src/lib/uniswapArcPolicy.ts`)
 const e = require(`${root}src/lib/uniswapArcExecution.ts`), { createArcExecutionRpc, assertExecutionReadMethod } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
+const pilot = require(`${root}src/lib/uniswapArcPilot.ts`)
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
 const { decodeFunctionData, encodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
@@ -37,6 +38,8 @@ function setup(options = {}) {
     result: async attempt => { stats.results++; return options.result ? options.result(attempt) : { status: 'pending' } },
     storage: { getItem: key => data.get(key) ?? null, setItem: (key, value) => { stats.writes++; if (options.write) options.write(stats.writes); data.set(key, value) } },
     lock: async (account, run) => { const key = account.toLowerCase(); if (locks.has(key)) throw Error('lock'); locks.add(key); try { return await run() } finally { locks.delete(key) } },
+    // Generic engine scenarios retain both route profiles. Pilot authorization is tested separately below.
+    authorize: () => true,
     enabled: options.enabled ?? (() => true), changed: view => seen.push(view), settled: attempt => settled.push(attempt),
     ...options.ports,
   }
@@ -60,6 +63,58 @@ await test('production source gate defaults false and blocks preparation, wallet
   assert.equal(f.stats.quotes, 0); assert.equal(f.stats.preflight, 0); assert.equal(f.sent().length, 0)
   assert.match(f.controller.current().error, /disabled/)
   await assert.rejects(p.submitUniswapArcSwap(), /writes_disabled/)
+})
+await test('pilot config is default off; missing, malformed, zero, router or non-exact enabled flags fail closed', () => {
+  for (const [flag, wallet] of [[undefined, undefined], ['true', undefined], ['true', 'bad'], ['true', '0x' + '0'.repeat(40)], ['true', p.ARC_ROUTER], ['TRUE', owner], ['false', owner], [' true ', owner]]) {
+    assert.equal(pilot.arcPilotConfig(flag, wallet).enabled, false)
+  }
+  assert.equal(pilot.arcPilotConfig('true', owner).enabled, true)
+})
+await test('pilot permits only configured-wallet native USDC to EURC at or below 0.1 USDC', async () => {
+  const config = pilot.arcPilotConfig('true', owner)
+  for (const amount of ['0.1', '0.100000', '0.01']) {
+    const f = setup({ amount, ports: { authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+    await f.controller.confirm(await f.review()); assert.equal(f.sent().length, 1)
+    assert.ok(BigInt(f.sent()[0].params[0].value) <= pilot.ARC_PILOT_MAX_INPUT)
+  }
+})
+await test('wrong wallet, chain, direction, recipient and over-limit input cannot request even a fresh execution quote', async () => {
+  const config = pilot.arcPilotConfig('true', owner)
+  for (const mutate of [f => f.setInput({ ...f.ports.input(), amount: '0.100001' }), f => f.setInput({ ...f.ports.input(), tokenOut: 'cirBTC' }),
+    f => { f.context.owner = other }, f => { f.context.chainId = 1 }, f => { f.context.connected = false },
+    f => f.setInput({ ...f.ports.input(), recipient: other }), f => f.setInput({ ...f.ports.input(), owner: other, recipient: other }),
+    f => f.setInput({ ...f.ports.input(), tokenIn: 'EURC' }), f => f.setInput(null)]) {
+    const f = setup({ amount: '0.1', ports: { authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+    mutate(f); await f.controller.prepare()
+    assert.equal(f.stats.quotes, 0); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /pilot/)
+  }
+})
+await test('no authorization callback or disabled pilot blocks execution even with a test-open release gate', async () => {
+  for (const authorize of [undefined, (input, context) => pilot.arcPilotAllows(pilot.arcPilotConfig('false', owner), input, context)]) {
+    const f = setup({ amount: '0.1', ports: { authorize } })
+    await f.controller.prepare(); assert.equal(f.stats.quotes, 0); assert.equal(f.sent().length, 0)
+  }
+})
+await test('configured pilot cannot bypass the unchanged production false source gate', async () => {
+  const config = pilot.arcPilotConfig('true', owner)
+  const f = setup({ amount: '0.1', ports: { enabled: undefined, authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+  await f.controller.prepare(); assert.equal(f.stats.quotes, 0); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /disabled/)
+})
+await test('being inside the pilot amount limit never overrides an unrepresentable economic output floor', async () => {
+  const config = pilot.arcPilotConfig('true', owner)
+  const f = setup({ amount: '0.000001', ports: { authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+  assert.equal(pilot.arcPilotAllows(config, f.ports.input(), f.context), true)
+  await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle'); assert.equal(f.sent().length, 0)
+})
+await test('pilot authorization is rechecked after review and during final simulation; closing it never sends', async () => {
+  for (const stage of ['after_review', 'during_preflight']) {
+    let config = pilot.arcPilotConfig('true', owner)
+    const f = setup({ amount: '0.1', preflight: async (_review, n) => { if (stage === 'during_preflight' && n === 2) config = pilot.arcPilotConfig('false', owner); return { nonce: 7 } },
+      ports: { authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
+    const id = await f.review()
+    if (stage === 'after_review') config = pilot.arcPilotConfig('true', other)
+    await f.controller.confirm(id); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /pilot/)
+  }
 })
 await test('both routes prepare from fresh API data, never an existing preview authorization', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {

@@ -19,6 +19,8 @@ export interface ExecutionPorts {
   storage: Pick<Storage, 'getItem' | 'setItem'>
   lock<T>(owner: string, run: () => Promise<T>): Promise<T>
   changed?(view: ExecutionView): void; settled?(attempt: SwapAttempt): void
+  // Production supplies the pilot restriction. Missing authorization fails closed.
+  authorize?(input: ArcRequest | null, context: ExecutionContext): boolean
   // Trusted test seam only. Production omits it and uses the source-level false release gate.
   enabled?(): boolean
 }
@@ -36,6 +38,7 @@ const stop = (code: string): never => { throw new Error(code) }
 export function executionMessage(code: string): string {
   const messages: Record<string, string> = {
     writes_disabled: 'Real Uniswap swaps are disabled pending independent review and release approval.',
+    pilot_restricted: 'Execution is restricted to the configured pilot wallet on Arc Mainnet: USDC to EURC, at most 0.1 USDC. Live previews remain available.',
     context: 'The wallet, network, provider or swap inputs changed. Review a fresh swap.',
     expired: 'This swap review expired. Review a fresh swap before confirming.',
     busy: 'An earlier wallet request or transaction is unresolved. Check its status before retrying.',
@@ -136,7 +139,10 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
   let intent: { id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
   const contextKey = () => { const c = ports.context(); return JSON.stringify([c.owner.toLowerCase(), c.connected, c.chainId, c.connectorId]) }
   function emit(next: ExecutionView) { view = structuredClone(next); try { ports.changed?.(structuredClone(view)) } catch { /* Observer cannot interrupt recording. */ } }
-  function requireEnabled() { if (!enabled()) stop('writes_disabled') }
+  function requireEnabled() {
+    if (!enabled()) stop('writes_disabled')
+    if (!ports.authorize?.(ports.input(), ports.context())) stop('pilot_restricted')
+  }
   function ready(selected: NonNullable<typeof intent>) {
     requireEnabled()
     const input = ports.input(), context = ports.context()
@@ -147,7 +153,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
   }
   function errorCode(error: unknown) {
     const code = error instanceof Error ? error.message : ''
-    return ['writes_disabled', 'context', 'nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired'].includes(code) ? code
+    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired'].includes(code) ? code
       : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
   }
   async function prepare() {
