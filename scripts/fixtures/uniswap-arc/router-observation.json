@@ -1,0 +1,12 @@
+{
+  "observedAt": "2026-10-21T13:24:59.175Z",
+  "chainId": 5042,
+  "address": "0x8702463e73f74d0b6765aBceb314Ef07aCb92650",
+  "historicalBlock": "27114546",
+  "latestBlock": "27119997",
+  "historicalBytes": 24380,
+  "latestBytes": 24380,
+  "historicalHash": "0x2e80a35dc8a1da121611acc5c31be03c2e63669135461e63947901ecf8a1654d",
+  "latestHash": "0x2e80a35dc8a1da121611acc5c31be03c2e63669135461e63947901ecf8a1654d",
+  "sameCode": true
+}

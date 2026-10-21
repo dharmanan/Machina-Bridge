@@ -1,0 +1,134 @@
+{
+  "request": {
+    "type": "EXACT_INPUT",
+    "amount": "1000000",
+    "tokenInChainId": 5042,
+    "tokenOutChainId": 5042,
+    "tokenIn": "0x3600000000000000000000000000000000000000",
+    "tokenOut": "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0",
+    "swapper": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "slippageTolerance": 0.5,
+    "protocols": [
+      "V2",
+      "V3",
+      "V4"
+    ],
+    "permitAmount": "EXACT"
+  },
+  "routing": "CLASSIC",
+  "quote": {
+    "chainId": 5042,
+    "swapper": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "tradeType": "EXACT_INPUT",
+    "route": [
+      [
+        {
+          "type": "v3-pool",
+          "address": "0x82916bee18fCEF517B26C72d7Cb5F13694E1dB41",
+          "tokenIn": {
+            "address": "0x3600000000000000000000000000000000000000",
+            "chainId": 5042,
+            "symbol": "USDC",
+            "decimals": "6"
+          },
+          "tokenOut": {
+            "address": "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0",
+            "chainId": 5042,
+            "symbol": "cirBTC",
+            "decimals": "8"
+          },
+          "sqrtRatioX96": "2292820295302771333527981851187",
+          "liquidity": "416837603323",
+          "tickCurrent": "67307",
+          "fee": "100",
+          "amountIn": "1000000",
+          "amountOut": "1193"
+        }
+      ]
+    ],
+    "input": {
+      "amount": "1000000",
+      "token": "0x3600000000000000000000000000000000000000",
+      "maximumAmount": "1000000"
+    },
+    "output": {
+      "amount": "1193",
+      "token": "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0",
+      "recipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "minimumAmount": "1187"
+    },
+    "slippage": 0.5,
+    "priceImpact": 0.09,
+    "priceDifference": 0.09,
+    "gasFee": "2910111550000000",
+    "gasFeeUSD": "0.00194",
+    "gasFeeQuote": "2",
+    "gasUseEstimate": "97000",
+    "routeString": "[v3] 100.00% = [0.01%] 0x82916bee18fCEF517B26C72d7Cb5F13694E1dB41",
+    "blockNumber": "27123145",
+    "quoteId": "01a15ebb-4a43-8000-9b26-a7c424b10100",
+    "maxFeePerGas": "30001150000",
+    "maxPriorityFeePerGas": "1150000",
+    "txFailureReasons": [],
+    "gasEstimates": [
+      {
+        "type": "eip1559",
+        "strategy": {
+          "limitInflationFactor": 1.15,
+          "priceInflationFactor": 1,
+          "percentileThresholdFor1559Fee": 25,
+          "minPriorityFeeGwei": 1,
+          "maxPriorityFeeGwei": 1.8,
+          "baseFeeMultiplier": 1.05,
+          "baseFeeHistoryWindow": 100,
+          "minPriorityFeeRatioOfBaseFee": 0.2,
+          "thresholdToInflateLastBlockBaseFee": 0
+        },
+        "gasLimit": "145015",
+        "gasFee": "4350616767250000",
+        "maxPriorityFeePerGas": "1150000",
+        "maxFeePerGas": "30001150000"
+      }
+    ],
+    "aggregatedOutputs": [
+      {
+        "amount": "1193",
+        "token": "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0",
+        "recipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "bps": 10000,
+        "minAmount": "1187"
+      }
+    ],
+    "routeGraph": {
+      "pools": [
+        {
+          "protocol": "V3",
+          "address": "0x82916bee18fCEF517B26C72d7Cb5F13694E1dB41",
+          "fee": "100",
+          "tokenIn": {
+            "address": "0x3600000000000000000000000000000000000000",
+            "chainId": 5042,
+            "symbol": "USDC",
+            "decimals": "6"
+          },
+          "tokenOut": {
+            "address": "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0",
+            "chainId": 5042,
+            "symbol": "cirBTC"
+          },
+          "shareOfInputBps": 10000
+        }
+      ]
+    }
+  },
+  "swapTransaction": {
+    "to": "0x8702463e73f74d0b6765aBceb314Ef07aCb92650",
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "chainId": 5042,
+    "data": "0x3593564c000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000006ad8ca6f000000000000000000000000000000000000000000000000000000000000000200040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000001a00000000000000000000000000000000000000000000000000000000000000140000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb9226600000000000000000000000000000000000000000000000000000000000f424000000000000000000000000000000000000000000000000000000000000004a300000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000002b3600000000000000000000000000000000000000000064171a4217b86a807a64eb94757db6849fb4bdbaa0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000000756e6978000001a15ebb4a4380009b26a7c424b10100",
+    "value": "0x0de0b6b3a7640000",
+    "gasLimit": "126100",
+    "maxFeePerGas": "30001150000",
+    "maxPriorityFeePerGas": "1150000"
+  }
+}
