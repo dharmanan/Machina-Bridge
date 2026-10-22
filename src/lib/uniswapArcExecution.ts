@@ -1,3 +1,4 @@
+import { WalletRpcFailure, walletRpcRead, walletRpcQuantity, walletRpcMessage } from './uniswapArcWalletRpc'
 import { decodeFunctionData, encodeFunctionData, toHex, type Hex } from 'viem'
 import { ARC_ROUTER, EXECUTE_ABI, UNISWAP_ARC_WRITES_ENABLED, nativeAmount, requestKey, sameAddress, uint, validateArcRequest, validateArcReview, type ArcRequest, type ArcReview } from './uniswapArcPolicy'
 
@@ -12,7 +13,7 @@ export interface ExecutionView {
 export type ChainResult = { status: 'pending' } | { status: 'confirmed' | 'failed'; output: string; fee: string }
 export interface ExecutionNonceState { nonce: number; latestNonce: number }
 export class ExecutionNonceObservationError extends Error {
-  constructor(source: 'public' | 'wallet', readonly highestObserved: number) { super(`${source}_nonce`) }
+  constructor(source: 'public' | 'wallet', readonly highestObserved: number, readonly reason?: 'latest-changed' | 'pending-behind-latest') { super(`${source}_nonce`) }
 }
 class NonceRpcConflict extends Error {
   constructor(readonly publicState: ExecutionNonceState, readonly walletState: ExecutionNonceState) { super('nonce_rpc') }
@@ -135,25 +136,20 @@ export async function browserExecutionLock<T>(owner: string, run: () => Promise<
   return navigator.locks.request(`machina-uniswap-5042:${owner.toLowerCase()}`, { mode: 'exclusive', ifAvailable: true }, lock => lock ? run() : stop('lock'))
 }
 async function walletIdentity(provider: ExecutionProvider, owner: string): Promise<ExecutionNonceState> {
-  async function identity() {
-    const chain = await provider.request({ method: 'eth_chainId' })
-    if (typeof chain !== 'string' || !/^0x[0-9a-f]+$/i.test(chain) || BigInt(chain) !== 5042n) return stop('context')
-    const accounts = await provider.request({ method: 'eth_accounts' })
-    if (!Array.isArray(accounts) || !sameAddress(accounts[0], owner)) return stop('context')
+  async function identity(after: boolean) {
+    const chainStage = after ? 'chain-after' : 'chain-before', accountStage = after ? 'accounts-after' : 'accounts-before'
+    const chain = walletRpcQuantity(await walletRpcRead(provider, chainStage, owner), chainStage)
+    if (chain !== 5042) throw new WalletRpcFailure(chainStage, 'network-mismatch')
+    const accounts = await walletRpcRead(provider, accountStage, owner)
+    if (!Array.isArray(accounts) || !accounts.every(a => typeof a === 'string' && /^0x[0-9a-f]{40}$/i.test(a))) throw new WalletRpcFailure(accountStage, 'invalid-response')
+    if (!sameAddress(accounts[0], owner)) throw new WalletRpcFailure(accountStage, 'account-mismatch')
   }
-  await identity()
-  let state: ExecutionNonceState
-  try {
-    const read = async (tag: 'latest' | 'pending') => {
-      const raw = await provider.request({ method: 'eth_getTransactionCount', params: [owner, tag] })
-      if (typeof raw !== 'string' || !/^0x[0-9a-f]+$/i.test(raw) || BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER)) return stop('wallet_nonce')
-      return Number(BigInt(raw))
-    }
-    const before = await read('latest'), nonce = await read('pending'), latestNonce = await read('latest')
-    if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce))
-    state = { nonce, latestNonce }
-  } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; return stop('wallet_nonce') }
-  await identity() // The connector must still identify the same network/account after the reads.
+  await identity(false)
+  const read = async (stage: 'latest-before' | 'pending' | 'latest-after') => walletRpcQuantity(await walletRpcRead(provider, stage, owner), stage)
+  const before = await read('latest-before'), nonce = await read('pending'), latestNonce = await read('latest-after')
+  if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce), before !== latestNonce ? 'latest-changed' : 'pending-behind-latest')
+  const state = { nonce, latestNonce }
+  await identity(true) // No wallet, chain or account mutation during the reads.
   return state
 }
 
@@ -195,6 +191,8 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
   }
   function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
+    if (error instanceof WalletRpcFailure) return `${stage} nonce check: ${walletRpcMessage(error)}`
+    if (error instanceof ExecutionNonceObservationError && error.message === 'wallet_nonce') return `${stage} nonce check: The wallet RPC returned inconsistent eth_getTransactionCount(latest/pending/latest) observations: ${error.reason === 'latest-changed' ? 'latest changed during the reads' : 'pending was below latest'}. No transaction was requested.`
     const code = errorCode(error), message = executionMessage(code)
     if (!['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(code)) return message
     // Only validated public integers are included, never a raw wallet/RPC error.

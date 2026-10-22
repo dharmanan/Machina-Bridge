@@ -138,6 +138,16 @@ try {
     laggedNonceReads = 3; await prepare(); assert.equal(laggedNonceReads, 0); assert.equal(await sends(), 0)
     await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
   })
+  await test('wallet RPC unsupported, unauthorized and malformed responses render safe pending-stage diagnostics', async () => {
+    for (const [mode, label] of [['unsupported', 'method unsupported (code -32601)'], ['unauthorized', 'wallet authorization unavailable (code 4100)'], ['malformed', 'invalid EIP-1193 response']]) {
+      await page.evaluate(mode => { window.executionUiTest.state.walletReadFailure = mode }, mode)
+      await review.click()
+      const alert = page.getByRole('alert').filter({ hasText: 'eth_getTransactionCount(pending)' })
+      await alert.waitFor(); assert.ok((await alert.innerText()).includes(label)); assert.ok(!(await page.locator('body').innerText()).includes('SECRET-PROVIDER-DETAILS'))
+      assert.equal(await page.getByRole('dialog').count(), 0); assert.equal(await sends(), 0)
+    }
+    await page.evaluate(() => { window.executionUiTest.state.walletReadFailure = '' })
+  })
   await test('native browser Web Lock blocks a competing submission without a wallet write', async () => {
     await page.evaluate(() => { navigator.locks.request('machina-uniswap-5042:0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321', () => new Promise(resolve => { window.releaseExecutionLock = resolve })); })
     await prepare(); await confirm.click(); await page.getByRole('alert').filter({ hasText: 'Another tab' }).waitFor()

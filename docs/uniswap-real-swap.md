@@ -95,6 +95,49 @@ pending activity on either/both nodes, transient convergence, persistent conflic
 backwards observations, malformed responses and expiry during reconciliation.
 TypeScript, production build and lint pass.
 
+## Wallet provider compatibility and safe diagnostics
+
+The execution hook now calls the connected connector's `getProvider()` **without
+`chainId`**. In the installed `@wagmi/connectors` WalletConnect implementation
+(`src/walletConnect.ts:316–346`), supplying `chainId` invokes `switchChain` before
+returning the provider. Injected and MetaMask implementations use a different
+provider acquisition path. Review must inspect the already connected provider,
+not trigger a network-switch request. Its `request` receiver is preserved.
+The installed WalletConnect EthereumProvider's actual request implementation is
+also exercised against a controlled signer to verify active `eip155:5042`
+routing. This test does not establish a live WalletConnect session's availability.
+
+`uniswapArcWalletRpc.ts` reports fixed stages for provider acquisition, the
+before/after chain and account checks, and latest-before/pending/latest-after
+nonce reads. EIP-1193 and JSON-RPC numeric codes are recognized from a bounded,
+cycle-safe error chain; arbitrary provider messages, names, stacks, URLs and
+payloads are neither logged nor surfaced. Rejection (4001), unauthorized (4100),
+unsupported methods (4200/-32601), disconnection (4900/4901), invalid requests,
+RPC errors, unknown errors, invalid responses and timeouts remain distinct.
+Provider acquisition is bounded at five seconds and each read at three seconds.
+A late read cannot authorize execution. These timeouts never apply to the actual
+wallet transaction approval window.
+
+Only valid hexadecimal EIP-1193 quantities within the safe integer range are
+accepted. Numbers, JSON-RPC envelopes, padded/unsafe quantities and unavailable
+pending data fail closed. Network/account changes, unstable observations, real
+nonce changes, pending activity and disagreement between sources remain blocked.
+No alternate endpoint, latest-only fallback, automatic chain switch, permission
+request or signing call is introduced. WalletConnect may internally route reads
+through its configured HTTP provider; these observations are not proof of a
+wallet's private mempool or globally complete pending-transaction visibility.
+
+**Live root cause remains unconfirmed.** The earlier broad `wallet_nonce` catch
+was proven to erase the failing RPC stage and code. The connector's network-switch
+side effect is proven in installed source, but is not established as the cause of
+the reported live nonce failure. No connected production wallet/session was
+available here. A real unsupported or unavailable pending-nonce RPC remains
+BLOCKED; passing controlled tests is not a live resolution claim. This revision
+passes 71 execution/security groups, 21 Chromium execution UI groups, 18 automatic
+quote UI groups, 37 decoder groups and 22 API security groups, plus TypeScript,
+production build and lint. Pilot settings,
+0.1 USDC maximum and all economic/preflight/submission guards are unchanged.
+
 ## Recording and chain results
 
 - Records are bounded, versioned, wallet-scoped localStorage data (20 attempts,

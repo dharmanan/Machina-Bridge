@@ -380,6 +380,102 @@ await test('quote expiry during bounded nonce reconciliation cannot be bypassed 
   f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x6') : original(args)
   await f.controller.confirm(id); assert.match(f.controller.current().error, /expired/); assert.equal(f.sent().length, 0)
 })
+const walletRpc = require(`${root}src/lib/uniswapArcWalletRpc.ts`)
+await test('connected provider acquisition never requests a chain switch and preserves provider this', async () => {
+  const provider = { value: '0x7', async request(args) { assert.equal(this, provider); assert.deepEqual(args, { method: 'eth_getTransactionCount', params: [owner, 'pending'] }); return this.value } }
+  const connector = { async getProvider(...args) { assert.equal(this, connector); assert.equal(args.length, 0); return provider } }
+  const connected = await walletRpc.connectedExecutionProvider(connector)
+  assert.equal(await walletRpc.walletRpcRead(connected, 'pending', owner), '0x7')
+})
+await test('provider acquisition failures expose only stage, recognized numeric code and category', async () => {
+  for (const code of [4001, 4100, 4200, 4900, 4901, -32601, -32602, -32000]) {
+    const f = setup({ ports: { provider: () => walletRpc.connectedExecutionProvider({ getProvider: async () => { throw { code, message: 'SECRET', data: 'SECRET' } } }) } })
+    await f.controller.prepare(); const message = f.controller.current().error
+    assert.match(message, /connector.getProvider/); assert.ok(message.includes(`code ${code}`)); assert.ok(!message.includes('SECRET')); assert.equal(f.sent().length, 0)
+  }
+  for (const provider of [undefined, {}, { request: 123 }]) await assert.rejects(walletRpc.connectedExecutionProvider({ getProvider: async () => provider }), error => error.stage === 'provider' && error.kind === 'invalid-response')
+})
+await test('every identity/nonce RPC failure has a precise stage in both Review and Confirm', async () => {
+  const labels = ['eth_chainId before nonce', 'eth_accounts before nonce', 'eth_getTransactionCount(latest) before pending', 'eth_getTransactionCount(pending)', 'eth_getTransactionCount(latest) after pending', 'eth_chainId after nonce', 'eth_accounts after nonce']
+  for (const confirm of [false, true]) for (let fail = 0; fail < labels.length; fail++) {
+    const f = setup(), id = confirm ? await f.review() : undefined, original = f.provider.request; let call = 0
+    f.provider.request = args => { if (call++ === fail) return Promise.reject({ code: -32601, message: 'SECRET URL TOKEN', stack: 'SECRET' }); return original(args) }
+    if (confirm) await f.controller.confirm(id); else await f.controller.prepare()
+    const message = f.controller.current().error
+    assert.ok(message.includes(labels[fail]), message); assert.match(message, /method unsupported.*code -32601/)
+    assert.ok(message.startsWith(confirm ? 'Confirm' : 'Review')); assert.ok(!message.includes('SECRET')); assert.equal(f.sent().length, 0)
+  }
+})
+await test('EIP-1193 rejection, permissions, unsupported methods and connectivity remain distinct from nonce disagreement', async () => {
+  for (const [code, label] of [[4001, 'request rejected'], [4100, 'authorization unavailable'], [4200, 'method unsupported'], [-32601, 'method unsupported'], [4900, 'provider disconnected'], [4901, 'requested chain'], [-32602, 'invalid RPC request'], [-32000, 'RPC error']]) {
+    const f = setup(), original = f.provider.request
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.reject({ cause: { data: { originalError: { code, message: 'SECRET' } } } }) : original(args)
+    await f.controller.prepare(); const message = f.controller.current().error
+    assert.ok(message.includes(label), message); assert.ok(message.includes(`code ${code}`), message)
+    assert.ok(!message.includes('disagree')); assert.ok(!message.includes('SECRET')); assert.equal(f.stats.preflight, 1); assert.equal(f.sent().length, 0)
+  }
+})
+await test('unrecognized or hostile error objects cannot leak arbitrary fields, names or codes', async () => {
+  const cycle = {}; cycle.cause = cycle
+  const hostile = { get code() { throw Error('SECRET') }, cause: cycle, name: 'SECRET', message: 'SECRET' }
+  for (const raw of [hostile, cycle, { code: '4200', message: 'SECRET' }, { code: 999999, data: 'SECRET' }, 'SECRET']) {
+    const f = setup(), original = f.provider.request
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.reject(raw) : original(args)
+    await f.controller.prepare(); const message = f.controller.current().error
+    assert.match(message, /unclassified provider failure/); assert.ok(!message.includes('SECRET')); assert.ok(!message.includes('999999')); assert.equal(f.sent().length, 0)
+  }
+})
+await test('strict quantity decoding rejects JSON-RPC envelopes, numbers and unsafe or malformed quantities', async () => {
+  for (const value of [null, true, 7, 7n, '7', '0x', '0x00', '0x-1', '0x20000000000000', { result: '0x7' }, '0x' + 'f'.repeat(10000)])
+    assert.throws(() => walletRpc.walletRpcQuantity(value, 'pending'), error => error.kind === 'invalid-response' && error.stage === 'pending')
+  for (const n of [0, 7, 12, Number.MAX_SAFE_INTEGER]) assert.equal(walletRpc.walletRpcQuantity('0x' + n.toString(16), 'pending'), n)
+})
+await test('unstable wallet snapshots are diagnosed separately without losing bounded retry or high-water protection', async () => {
+  for (const values of [[7, 7, 8], [7, 6, 7]]) {
+    const f = setup(), original = f.provider.request; let i = 0
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x' + values[i++ % 3].toString(16)) : original(args)
+    await f.controller.prepare(); assert.match(f.controller.current().error, /inconsistent eth_getTransactionCount/)
+    assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 0)
+  }
+})
+await test('nonce read timeout is bounded and a late result cannot authorize a transaction', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    let release
+    const f = setup(), original = f.provider.request
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? new Promise(resolve => { release = resolve }) : original(args)
+    const pending = f.controller.prepare()
+    for (let i = 0; i < 100 && !release; i++) await Promise.resolve()
+    assert.ok(release); mock.timers.tick(3000); await pending
+    assert.match(f.controller.current().error, /latest.*RPC read timed out/); release('0x7'); await Promise.resolve()
+    assert.equal(f.controller.current().phase, 'idle'); assert.equal(f.sent().length, 0)
+  } finally { mock.timers.reset() }
+})
+await test('provider acquisition timeout and malformed identity data never produce a prepared intent', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const f = setup({ ports: { provider: () => walletRpc.connectedExecutionProvider({ getProvider: () => new Promise(() => {}) }) } })
+    const pending = f.controller.prepare()
+    for (let i = 0; i < 60; i++) await Promise.resolve()
+    mock.timers.tick(5000); await pending
+    assert.match(f.controller.current().error, /connector.getProvider.*timed out/); assert.equal(f.sent().length, 0)
+  } finally { mock.timers.reset() }
+  for (const [method, raw] of [['eth_chainId', 5042], ['eth_accounts', { result: [owner] }], ['eth_accounts', ['SECRET']]]) {
+    const f = setup(), original = f.provider.request
+    f.provider.request = args => args.method === method ? Promise.resolve(raw) : original(args)
+    await f.controller.prepare(); assert.match(f.controller.current().error, /invalid EIP-1193 response/); assert.equal(f.sent().length, 0)
+  }
+})
+await test('installed WalletConnect provider routes controlled EIP-1193 reads to its active CAIP chain', async () => {
+  const { EthereumProvider } = await import('@walletconnect/ethereum-provider')
+  const calls = []
+  const receiver = { chainId: 5042, formatChainId: n => `eip155:${n}`, signer: { request: async (args, chain) => { calls.push({ args, chain }); return '0x7' } } }
+  const connected = await walletRpc.connectedExecutionProvider({ getProvider: async () => ({ request: args => EthereumProvider.prototype.request.call(receiver, args) }) })
+  for (const stage of ['latest-before', 'pending', 'latest-after']) assert.equal(await walletRpc.walletRpcRead(connected, stage, owner), '0x7')
+  assert.deepEqual(calls, ['latest', 'pending', 'latest'].map(tag => ({ args: { method: 'eth_getTransactionCount', params: [owner, tag] }, chain: 'eip155:5042' })))
+  receiver.signer.request = async () => { throw { code: -32601, message: 'SECRET' } }
+  await assert.rejects(walletRpc.walletRpcRead(connected, 'pending', owner), error => error.kind === 'unsupported' && error.rpcCode === -32601)
+})
 await test('double Confirm, repeated Prepare and a stale approval ID cannot submit twice', async () => {
   let release
   const f = setup(), original = f.provider.request

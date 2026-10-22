@@ -1,10 +1,11 @@
+import { connectedExecutionProvider } from '../lib/uniswapArcWalletRpc'
 import { useEffect, useRef, useState } from 'react'
 import { useAccount } from 'wagmi'
 import { useQueryClient } from '@tanstack/react-query'
 import { formatUnits } from 'viem'
 import { ARC_OUTPUTS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, nativeAmount, requestKey, sameAddress, type ArcRequest } from '../lib/uniswapArcPolicy'
 import { createUniswapArcPreviewReader } from '../lib/uniswapArcPreview'
-import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionProvider, type ExecutionView } from '../lib/uniswapArcExecution'
+import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionView } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
 import { arcPilotAllows, arcPilotConfig } from '../lib/uniswapArcPilot'
 
@@ -27,11 +28,7 @@ export function useUniswapArcExecution(input: ArcRequest | null) {
     authorize: (request, current) => arcPilotAllows(pilot, request, current),
     fresh: request => reader.read(request), quoteNow: request => reader.validationTime(request),
     preflight: arcExecutionRpc.preflight, result: arcExecutionRpc.result,
-    provider: async () => {
-      const provider = await currentConnector.current?.getProvider({ chainId: 5042 })
-      if (!provider || typeof (provider as ExecutionProvider).request !== 'function') throw new Error('context')
-      return { request: args => (provider as ExecutionProvider).request(args) }
-    },
+    provider: () => connectedExecutionProvider(currentConnector.current),
     storage: { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
     lock: browserExecutionLock,
     changed: next => { if (alive.current) setView(next) },
