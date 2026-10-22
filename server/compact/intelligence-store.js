@@ -7,6 +7,20 @@ import { storedWindow } from './windows.js';
 import { retainLiveDiscoveryEvidence } from './discovery-evidence.js';
 import { createPackedShards } from './packed-shards.js';
 
+const RETRY_DISCOVERY = `(status='unverified' OR (status='verified_erc20_like'
+  AND json_extract(candidate_json,'$.kind')='source' AND json_extract(result_json,'$.launch.status')='unknown_source'))`;
+const RETRY_INDEX = 'compact_token_discovery_retry_due';
+// Keep the predicate identical in the partial index and its readers. Only retry-eligible rows enter this index.
+// Explicit maintenance DDL only. Never include this in INTELLIGENCE_SQL or writer startup.
+export const DISCOVERY_RETRY_INDEX_SQL = `CREATE INDEX IF NOT EXISTS ${RETRY_INDEX}
+  ON compact_token_discoveries(not_before,block_number,candidate_key) WHERE ${RETRY_DISCOVERY};`;
+// Compare the full known DDL conservatively. Preserve quoted values and token boundaries;
+// SQLite omits the leading IF NOT EXISTS and final semicolon in sqlite_master.sql.
+const retryIndexDefinition = sql => sql.replace(/^CREATE INDEX IF NOT EXISTS /, 'CREATE INDEX ')
+  .replace(/;\s*$/, '').replace(/'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|\s+/g,
+    token => /^\s+$/.test(token) ? ' ' : token).trim();
+const EXPECTED_RETRY_INDEX_DEFINITION = retryIndexDefinition(DISCOVERY_RETRY_INDEX_SQL);
+
 export const INTELLIGENCE_SQL = `
 CREATE TABLE IF NOT EXISTS compact_intelligence_hours (
   hour_start INTEGER NOT NULL REFERENCES compact_hours(hour_start), definition_version TEXT NOT NULL,
@@ -40,15 +54,28 @@ const unavailable = (reason) => ({ status: 'unavailable', reason });
 const parse = (row) => row && JSON.parse(row.payload_json);
 // Never attempted or retryable. rejected_not_erc20_like is resolved (terminal), verified_erc20_like is a token.
 const UNRESOLVED_STATUSES = ['pending', 'unverified'];
-const RETRY_DISCOVERY = `(status='unverified' OR (status='verified_erc20_like'
-  AND json_extract(candidate_json,'$.kind')='source' AND json_extract(result_json,'$.launch.status')='unknown_source'))`;
+
+function retryTable(db) {
+  // Read-only processes may open a file before separately approved maintenance installs this index.
+  // Do not cache this decision: migration or rollback can change the schema on an open connection.
+  const indexed = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='compact_token_discoveries' AND name=?").get(RETRY_INDEX);
+  // The OR predicate otherwise favors the old status index and sorts/scans resolved source JSONs.
+  // A same-name index with another predicate can make INDEXED BY fail with 'no query solution'.
+  return typeof indexed?.sql === 'string' && retryIndexDefinition(indexed.sql) === EXPECTED_RETRY_INDEX_DEFINITION
+    ? `compact_token_discoveries INDEXED BY ${RETRY_INDEX}` : null;
+}
 
 // Read-only scheduler predicate. Missing additive tables mean no durable work, not complete coverage.
 export function discoveryWorkDue(db, now) {
   if (!Number.isSafeInteger(now) || now < 0) throw new Error('invalid_discovery_time');
   if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='compact_token_discoveries'").get()) return false;
-  return Boolean(db.prepare(`SELECT 1 FROM compact_token_discoveries WHERE not_before<=?
+  const retries = retryTable(db);
+  if (!retries) return Boolean(db.prepare(`SELECT 1 FROM compact_token_discoveries WHERE not_before<=?
     AND (status='pending' OR ${RETRY_DISCOVERY}) LIMIT 1`).get(BigInt(now)));
+  // One SQLite snapshot, two bounded existence checks; no UNION/sort or JSON scan of resolved sources.
+  return Boolean(db.prepare(`SELECT EXISTS(SELECT 1 FROM compact_token_discoveries
+    WHERE status='pending' AND not_before<=?1) OR EXISTS(SELECT 1 FROM ${retries}
+    WHERE ${RETRY_DISCOVERY} AND not_before<=?1) AS due`).get(BigInt(now)).due);
 }
 
 export function createIntelligenceRepository(db, { archive } = {}) {
@@ -139,7 +166,7 @@ export function createIntelligenceRepository(db, { archive } = {}) {
       const fresh = (order) => db.prepare(`SELECT candidate_key,candidate_json FROM compact_token_discoveries WHERE status='pending'
         AND not_before<=? ORDER BY not_before ${order},block_number ${order},candidate_key ASC LIMIT ?`).all(BigInt(now), BigInt(limit));
       const newest = fresh('DESC'), oldest = fresh('ASC');
-      const retries = db.prepare(`SELECT candidate_key,candidate_json FROM compact_token_discoveries WHERE ${RETRY_DISCOVERY} AND not_before<=?
+      const retries = db.prepare(`SELECT candidate_key,candidate_json FROM ${retryTable(db) ?? 'compact_token_discoveries'} WHERE ${RETRY_DISCOVERY} AND not_before<=?
         ORDER BY not_before ASC,block_number ASC,candidate_key ASC LIMIT ?`).all(BigInt(now), BigInt(limit));
       const selected = new Map();
       const take = (rows, places) => {
