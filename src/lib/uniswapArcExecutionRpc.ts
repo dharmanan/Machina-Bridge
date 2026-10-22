@@ -1,6 +1,6 @@
 import { createPublicClient, defineChain, erc20Abi, http, keccak256, type Hex, type Transport } from 'viem'
 import { ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, nativeAmount, sameAddress, uint, type ArcReview } from './uniswapArcPolicy'
-import { executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
+import { ExecutionNonceObservationError, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
 
 const RPC = 'https://rpc.mainnet.arc.io'
 const chain = defineChain({ id: 5042, name: 'Arc Mainnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [RPC] } } })
@@ -39,9 +39,14 @@ export function createArcExecutionRpc(rpc = client) {
     await rpc.call(call) // Exact tightened calldata, no state overrides or fake balances.
     const estimated = await rpc.estimateGas(call)
     if (estimated <= 0n || estimated > uint(review.gasLimit)) reject()
-    const nonce = await rpc.getTransactionCount({ address: account, blockTag: 'pending' })
-    if (!Number.isSafeInteger(nonce) || nonce < 0) reject()
-    return { nonce }
+    try {
+      const before = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
+      const nonce = await rpc.getTransactionCount({ address: account, blockTag: 'pending' })
+      const latestNonce = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
+      if (![before, nonce, latestNonce].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('public_nonce')
+      if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('public', Math.max(before, nonce, latestNonce))
+      return { nonce, latestNonce }
+    } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new Error('public_nonce') }
   }
   async function result(attempt: SwapAttempt): Promise<ChainResult> {
     if (!hash(attempt.hash) || await rpc.getChainId() !== 5042) reject()

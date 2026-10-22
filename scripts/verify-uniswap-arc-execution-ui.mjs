@@ -24,7 +24,7 @@ const server = await createServer({ configFile: false, root, define: { 'import.m
 } }] })
 await server.listen()
 const base = `http://127.0.0.1:${server.httpServer.address().port}`
-let browser, page, count = 0, apiCalls = 0, external = 0, latestReview, receiptMode = 'pending', rpcMode = 'normal'
+let browser, page, count = 0, apiCalls = 0, external = 0, latestReview, receiptMode = 'pending', rpcMode = 'normal', publicLatestNonce = 7, publicPendingNonce = 7, laggedNonceReads = 0
 const transactions = new Map(), methods = [], errors = []
 async function test(name, fn) {
   try { await fn(); count++; console.log(`PASS ${name}`) }
@@ -59,7 +59,7 @@ try {
     else if (method === 'eth_getCode') result = p.sameAddress(params[0], owner) ? '0x' : p.sameAddress(params[0], p.ARC_ROUTER) ? rpcMode === 'router' ? '0x6000' : runtime : '0x6000'
     else if (method === 'eth_getBalance') result = rpcMode === 'balance' ? '0x1' : toHex(100n * 10n ** 18n)
     else if (method === 'eth_gasPrice') result = '0x3b9aca00'
-    else if (method === 'eth_getTransactionCount') result = '0x7'
+    else if (method === 'eth_getTransactionCount') result = toHex(laggedNonceReads > 0 ? (laggedNonceReads--, 6) : params[1] === 'pending' ? publicPendingNonce : publicLatestNonce)
     else if (method === 'eth_estimateGas') result = '0x186a0'
     else if (method === 'eth_call') result = params[0].data === '0x313ce567' ? toHex(p.sameAddress(params[0].to, p.ARC_OUTPUTS.EURC.address) ? 6 : 8, { size: 32 }) : '0x'
     else if (method === 'eth_getTransactionByHash' || method === 'eth_getTransactionReceipt') {
@@ -108,6 +108,35 @@ try {
     const dialog = page.getByRole('dialog'); await dialog.getByText('0.088565 EURC', { exact: true }).waitFor()
     await dialog.getByText('0.00026 USDC', { exact: true }).waitFor(); assert.ok(methods.includes('eth_estimateGas'))
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); assert.equal(await sends(), 0)
+  })
+  await test('Review reports RPC nonce disagreement before offering confirmation and exposes only safe counts', async () => {
+    await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 6; window.executionUiTest.state.walletPendingNonce = 6 })
+    await review.click()
+    await page.getByRole('alert').filter({ hasText: 'Review nonce check: Public latest/pending 7/7; wallet latest/pending 6/6' }).waitFor()
+    assert.equal(await page.getByRole('dialog').count(), 0); assert.equal(await sends(), 0)
+    await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 7; window.executionUiTest.state.walletPendingNonce = 7 })
+  })
+  await test('Confirm distinguishes wallet RPC disagreement without opening a wallet transaction request', async () => {
+    await prepare()
+    await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 6; window.executionUiTest.state.walletPendingNonce = 6 })
+    await confirm.click()
+    await page.getByRole('alert').filter({ hasText: 'Confirm nonce check: Public latest/pending 7/7; wallet latest/pending 6/6' }).waitFor()
+    assert.equal(await sends(), 0)
+    await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 7; window.executionUiTest.state.walletPendingNonce = 7 })
+  })
+  await test('pending transactions and real confirmed nonce changes have distinct blocking messages', async () => {
+    for (const latest of [7, 8]) {
+      await prepare(); publicLatestNonce = latest; publicPendingNonce = 8
+      await page.evaluate(latest => { window.executionUiTest.state.walletLatestNonce = latest; window.executionUiTest.state.walletPendingNonce = 8 }, latest)
+      await confirm.click()
+      await page.getByRole('alert').filter({ hasText: latest === 7 ? 'another pending transaction' : 'The account nonce changed since Review' }).waitFor()
+      assert.equal(await sends(), 0); publicLatestNonce = 7; publicPendingNonce = 7
+      await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 7; window.executionUiTest.state.walletPendingNonce = 7 })
+    }
+  })
+  await test('one transient stale public nonce is reconciled forward with the real preflight adapter', async () => {
+    laggedNonceReads = 3; await prepare(); assert.equal(laggedNonceReads, 0); assert.equal(await sends(), 0)
+    await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
   })
   await test('native browser Web Lock blocks a competing submission without a wallet write', async () => {
     await page.evaluate(() => { navigator.locks.request('machina-uniswap-5042:0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321', () => new Promise(resolve => { window.releaseExecutionLock = resolve })); })

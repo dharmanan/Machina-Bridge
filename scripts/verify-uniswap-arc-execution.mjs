@@ -33,7 +33,7 @@ function setup(options = {}) {
   } }
   const ports = {
     context: () => context, input: () => input, fresh: async request => { stats.quotes++; return fresh(request, clock.now) }, quoteNow: () => clock.now,
-    preflight: async review => { stats.preflight++; return options.preflight ? options.preflight(review, stats.preflight) : { nonce: 7 } },
+    preflight: async review => { stats.preflight++; return options.preflight ? options.preflight(review, stats.preflight) : { nonce: 7, latestNonce: 7 } },
     provider: async () => provider,
     result: async attempt => { stats.results++; return options.result ? options.result(attempt) : { status: 'pending' } },
     storage: { getItem: key => data.get(key) ?? null, setItem: (key, value) => { stats.writes++; if (options.write) options.write(stats.writes); data.set(key, value) } },
@@ -119,7 +119,7 @@ await test('being inside the pilot amount limit never overrides an unrepresentab
 await test('pilot authorization is rechecked after review and during final simulation; closing it never sends', async () => {
   for (const stage of ['after_review', 'during_preflight']) {
     let config = pilot.arcPilotConfig('true', owner)
-    const f = setup({ amount: '0.1', preflight: async (_review, n) => { if (stage === 'during_preflight' && n === 2) config = pilot.arcPilotConfig('false', owner); return { nonce: 7 } },
+    const f = setup({ amount: '0.1', preflight: async (_review, n) => { if (stage === 'during_preflight' && n === 2) config = pilot.arcPilotConfig('false', owner); return { nonce: 7, latestNonce: 7 } },
       ports: { authorize: (input, context) => pilot.arcPilotAllows(config, input, context) } })
     const id = await f.review()
     if (stage === 'after_review') config = pilot.arcPilotConfig('true', other)
@@ -129,7 +129,7 @@ await test('pilot authorization is rechecked after review and during final simul
 await test('both routes prepare from fresh API data, never an existing preview authorization', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {
     const f = setup({ symbol, amount: '0.1' }); await f.review()
-    assert.equal(f.stats.quotes, 1); assert.equal(f.stats.preflight, 1); assert.equal(f.wallet.length, 0)
+    assert.equal(f.stats.quotes, 1); assert.equal(f.stats.preflight, 1); assert.equal(f.sent().length, 0)
     const view = f.controller.current(); assert.equal(view.review.request.tokenOut, symbol)
     assert.equal(view.review.executionBound, false); assert.equal(view.review.writesEnabled, false)
   }
@@ -163,10 +163,10 @@ await test('deadline cap never extends Uniswap original deadline or changes the 
 await test('an original deadline without at least 30 seconds for approval plus 15 for inclusion blocks wallet access', async () => {
   const f = setup({ ports: { fresh: async input => withDeadline(fresh(input, f.clock.now), 44) } })
   await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle'); assert.match(f.controller.current().error, /expired/)
-  assert.equal(f.wallet.length, 0)
+  assert.equal(f.sent().length, 0)
 })
 await test('quote expiry during final simulation still prevents opening a wallet request', async () => {
-  const f = setup({ preflight: async (_review, n) => { if (n === 2) f.clock.now += 31000; return { nonce: 7 } } })
+  const f = setup({ preflight: async (_review, n) => { if (n === 2) f.clock.now += 31000; return { nonce: 7, latestNonce: 7 } } })
   await f.controller.confirm(await f.review()); assert.equal(f.sent().length, 0); assert.match(f.controller.current().error, /expired/)
 })
 await test('45-second wallet approval outlives the quote TTL while preserving the exact approved transaction on both routes', async () => {
@@ -230,7 +230,7 @@ await test('a wallet rejection after the approval cutoff is recorded as Rejected
   } finally { mock.timers.reset() }
 })
 await test('review, cancel and forged approval IDs never request a wallet transaction', async () => {
-  const f = setup(); await f.review(); await f.controller.confirm('forged-id'); assert.equal(f.wallet.length, 0)
+  const f = setup(); await f.review(); await f.controller.confirm('forged-id'); assert.equal(f.sent().length, 0)
   f.controller.invalidate(); await f.controller.confirm(f.controller.current().approvalId); assert.equal(f.sent().length, 0)
 })
 await test('untrusted fresh quotes fail the existing economic policy before execution preflight', async () => {
@@ -246,7 +246,7 @@ await test('Confirm resimulates then sends one exact native EIP-1559 transaction
     await f.controller.confirm(id)
     assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 1)
     assert.deepEqual(f.sent()[0].params, [e.executionTransaction(reviewed, 7)])
-    assert.deepEqual(f.wallet.map(x => x.method), ['eth_chainId', 'eth_accounts', 'eth_getTransactionCount', 'eth_sendTransaction'])
+    assert.deepEqual(f.wallet.map(x => x.method), [...Array(2).fill(['eth_chainId', 'eth_accounts', 'eth_getTransactionCount', 'eth_getTransactionCount', 'eth_getTransactionCount', 'eth_chainId', 'eth_accounts']).flat(), 'eth_sendTransaction'])
     assert.equal(f.controller.current().phase, 'pending')
   }
 })
@@ -264,7 +264,7 @@ await test('wallet, chain, connector and amount changes invalidate prepared auth
 })
 await test('context change during final simulation cannot open a later wallet request', async () => {
   let release
-  const f = setup({ preflight: async (_review, n) => { if (n === 2) await new Promise(resolve => { release = resolve }); return { nonce: 7 } } })
+  const f = setup({ preflight: async (_review, n) => { if (n === 2) await new Promise(resolve => { release = resolve }); return { nonce: 7, latestNonce: 7 } } })
   const id = await f.review(), pending = f.controller.confirm(id)
   await waitFor(() => Boolean(release)); f.context.chainId = 1; f.controller.invalidate(); release(); await pending
   assert.equal(f.sent().length, 0)
@@ -272,7 +272,7 @@ await test('context change during final simulation cannot open a later wallet re
 await test('expired review, disabled gate and changed pending nonce stop before wallet write', async () => {
   let enabled = true
   for (const kind of ['expiry', 'gate', 'nonce']) {
-    const f = setup({ enabled: () => enabled, preflight: async (_review, n) => ({ nonce: kind === 'nonce' && n === 2 ? 8 : 7 }) })
+    const f = setup({ enabled: () => enabled, preflight: async (_review, n) => ({ nonce: kind === 'nonce' && n === 2 ? 8 : 7, latestNonce: kind === 'nonce' && n === 2 ? 8 : 7 }) })
     const id = await f.review()
     if (kind === 'expiry') f.clock.now += 31000
     if (kind === 'gate') enabled = false
@@ -282,10 +282,103 @@ await test('expired review, disabled gate and changed pending nonce stop before 
 })
 await test('wallet RPC chain, account and nonce are rechecked independently of React context', async () => {
   for (const [method, result] of [['eth_chainId', '0x1'], ['eth_accounts', [other]], ['eth_getTransactionCount', '0x8']]) {
-    const f = setup(), original = f.provider.request
+    const f = setup(), original = f.provider.request, id = await f.review()
     f.provider.request = args => args.method === method ? Promise.resolve(result) : original(args)
-    await f.controller.confirm(await f.review()); assert.equal(f.sent().length, 0)
+    await f.controller.confirm(id); assert.equal(f.sent().length, 0)
   }
+})
+await test('nonce reconciliation requires exact latest/pending agreement and rejects occupied nonces', () => {
+  for (const nonce of [0, 7, 12, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(e.reconcileExecutionNonce({ nonce, latestNonce: nonce }, { nonce, latestNonce: nonce }, nonce), nonce)
+  }
+  assert.throws(() => e.reconcileExecutionNonce({ nonce: 8, latestNonce: 7 }, { nonce: 8, latestNonce: 7 }), /^Error: nonce_pending$/)
+  assert.throws(() => e.reconcileExecutionNonce({ nonce: 7, latestNonce: 7 }, { nonce: 8, latestNonce: 7 }), /^Error: nonce_rpc$/)
+  assert.throws(() => e.reconcileExecutionNonce({ nonce: 8, latestNonce: 8 }, { nonce: 8, latestNonce: 8 }, 7), /^Error: nonce$/)
+})
+await test('persistent RPC disagreement is rejected during Review, with safe nonce diagnostics and no review loop', async () => {
+  const f = setup(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x6') : original(args)
+  await f.controller.prepare()
+  assert.equal(f.controller.current().phase, 'idle'); assert.equal(f.stats.preflight, 2); assert.equal(f.stats.quotes, 1)
+  assert.match(f.controller.current().error, /Review nonce check: Public latest\/pending 7\/7; wallet latest\/pending 6\/6/)
+  assert.match(f.controller.current().error, /repeating Review alone will not resolve/)
+  assert.equal(f.sent().length, 0); assert.equal(e.createExecutionJournal(f.ports.storage).read(owner).length, 0)
+})
+await test('transient stale RPC can converge forward once, only after repeating the entire preflight', async () => {
+  const f = setup({ preflight: async (_review, n) => ({ nonce: n === 1 ? 6 : 7, latestNonce: n === 1 ? 6 : 7 }) })
+  const id = await f.review(); assert.equal(f.stats.preflight, 2); assert.equal(f.stats.quotes, 1)
+  await f.controller.confirm(id); assert.equal(f.sent().length, 1); assert.equal(f.stats.preflight, 3)
+  assert.equal(f.sent()[0].params[0].nonce, '0x7')
+})
+await test('Confirm disagreement is distinct from a real agreed nonce change and never opens the wallet', async () => {
+  const f = setup(), id = await f.review(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x6') : original(args)
+  await f.controller.confirm(id)
+  assert.match(f.controller.current().error, /Confirm nonce check: Public latest\/pending 7\/7; wallet latest\/pending 6\/6/)
+  assert.equal(f.stats.preflight, 3); assert.equal(f.sent().length, 0)
+})
+await test('a real nonce change agreed by both sources after Review requires a new explicitly reviewed intent', async () => {
+  const f = setup({ preflight: async (_review, n) => ({ nonce: n === 1 ? 7 : 8, latestNonce: n === 1 ? 7 : 8 }) })
+  const id = await f.review(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x8') : original(args)
+  await f.controller.confirm(id)
+  assert.match(f.controller.current().error, /Confirm nonce check: The account nonce changed since Review/)
+  assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 0)
+})
+await test('pending transactions visible to both or just one RPC never permit reusing a nonce', async () => {
+  for (const [publicPending, walletPending] of [[8, 8], [8, 7], [7, 8]]) {
+    const f = setup({ preflight: async () => ({ nonce: publicPending, latestNonce: 7 }) }), original = f.provider.request
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve(args.params[1] === 'pending' ? '0x' + walletPending.toString(16) : '0x7') : original(args)
+    await f.controller.prepare(); assert.equal(f.sent().length, 0)
+    assert.match(f.controller.current().error, publicPending === walletPending ? /another pending transaction/ : /RPC and wallet RPC disagree/)
+  }
+})
+await test('pending activity appearing after Review blocks Confirm instead of sending a replacement', async () => {
+  const f = setup({ preflight: async (_review, n) => ({ nonce: n === 1 ? 7 : 8, latestNonce: 7 }) }), id = await f.review(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve(args.params[1] === 'pending' ? '0x8' : '0x7') : original(args)
+  await f.controller.confirm(id); assert.match(f.controller.current().error, /Confirm nonce check: RPC reports another pending/)
+  assert.equal(f.sent().length, 0); assert.equal(f.stats.preflight, 2)
+})
+await test('bounded reconciliation never discards a higher observed nonce to accept a lower RPC result', async () => {
+  const f = setup({ preflight: async (_review, n) => ({ nonce: n === 1 ? 8 : 7, latestNonce: n === 1 ? 8 : 7 }) })
+  await f.controller.prepare(); assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 0)
+  assert.match(f.controller.current().error, /nonce observations moved backwards/)
+})
+await test('higher nonces in unstable public or wallet snapshots survive the bounded retry', async () => {
+  for (const source of ['public', 'wallet']) {
+    let reads = 0
+    const f = setup({ preflight: async () => {
+      if (source === 'public' && reads++ === 0) throw new e.ExecutionNonceObservationError('public', 8)
+      return { nonce: 7, latestNonce: 7 }
+    } }), original = f.provider.request
+    if (source === 'wallet') f.provider.request = args => args.method === 'eth_getTransactionCount'
+      ? Promise.resolve(['0x7', '0x8', '0x8'][reads++] ?? '0x7') : original(args)
+    await f.controller.prepare(); assert.match(f.controller.current().error, /moved backwards/)
+    assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 0)
+  }
+})
+await test('malformed or unavailable wallet nonce fails at the wallet stage without leaking provider payloads', async () => {
+  for (const value of [undefined, 7, '7', '0x-1', '0x20000000000000', new Error('sensitive-provider-payload')]) {
+    const f = setup(), original = f.provider.request
+    f.provider.request = args => args.method === 'eth_getTransactionCount' ? (value instanceof Error ? Promise.reject(value) : Promise.resolve(value)) : original(args)
+    await f.controller.prepare(); assert.match(f.controller.current().error, /Review nonce check: The wallet RPC/)
+    assert.equal(f.stats.preflight, 1); assert.equal(f.sent().length, 0); assert.equal(JSON.stringify(f.controller.current()).includes('sensitive-provider-payload'), false)
+  }
+})
+await test('wallet identity must remain unchanged through all nonce reads', async () => {
+  let reads = 0
+  const f = setup(), original = f.provider.request
+  f.provider.request = args => {
+    if (args.method === 'eth_getTransactionCount') reads++
+    return args.method === 'eth_chainId' && reads >= 3 ? Promise.resolve('0x1') : original(args)
+  }
+  await f.controller.prepare(); assert.match(f.controller.current().error, /wallet, network, provider/); assert.equal(f.sent().length, 0)
+})
+await test('quote expiry during bounded nonce reconciliation cannot be bypassed by a retry', async () => {
+  const f = setup({ preflight: async (_review, n) => { if (n === 3) f.clock.now += 26000; return { nonce: 7, latestNonce: 7 } } })
+  const id = await f.review(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve('0x6') : original(args)
+  await f.controller.confirm(id); assert.match(f.controller.current().error, /expired/); assert.equal(f.sent().length, 0)
 })
 await test('double Confirm, repeated Prepare and a stale approval ID cannot submit twice', async () => {
   let release
@@ -418,7 +511,7 @@ function rpcFixture(symbol = 'EURC', changes = {}) {
 }
 await test('actual preflight adapter rechecks both routes, runtime, decimals, balances, fees, gas and exact simulation', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {
-    const f = rpcFixture(symbol); assert.deepEqual(await f.adapter.preflight(f.review), { nonce: 7 })
+    const f = rpcFixture(symbol); assert.deepEqual(await f.adapter.preflight(f.review), { nonce: 7, latestNonce: 7 })
     assert.equal(f.calls[0][1].data, f.review.transaction.data); assert.equal(f.calls[0][1].value, 10n ** 18n)
     assert.equal(f.calls[0][1].stateOverride, undefined); assert.equal(f.calls[0][1].gas, 130000n)
   }
@@ -433,6 +526,20 @@ await test('wrong RPC chain, router/token/decimals, EOA code, balance, fee, gas 
   for (const delta of failures) { const f = rpcFixture('EURC', delta); await assert.rejects(f.adapter.preflight(f.review)) }
   const contract = rpcFixture(); contract.rpc.getCode = async ({ address }) => p.sameAddress(address, p.ARC_ROUTER) ? runtime : '0x6000'
   await assert.rejects(contract.adapter.preflight(contract.review), /smart_wallet/)
+})
+await test('actual public adapter brackets pending with latest reads and rejects moving or malformed state', async () => {
+  const f = rpcFixture(), tags = []
+  f.rpc.getTransactionCount = async args => { tags.push(args.blockTag); return 7 }
+  assert.deepEqual(await f.adapter.preflight(f.review), { nonce: 7, latestNonce: 7 })
+  assert.deepEqual(tags, ['latest', 'pending', 'latest'])
+  for (const values of [[7, 8, 8], [7, 6, 7], [7, NaN, 7]]) {
+    const bad = rpcFixture(); let index = 0
+    bad.rpc.getTransactionCount = async () => values[index++]
+    await assert.rejects(bad.adapter.preflight(bad.review), /public_nonce/)
+  }
+  const pending = rpcFixture()
+  pending.rpc.getTransactionCount = async args => args.blockTag === 'pending' ? 8 : 7
+  assert.deepEqual(await pending.adapter.preflight(pending.review), { nonce: 8, latestNonce: 7 })
 })
 await test('receipt success requires exact transaction binding, two observed blocks and actual output Transfer logs', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {

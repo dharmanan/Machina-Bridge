@@ -10,10 +10,17 @@ export interface ExecutionView {
   approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
 }
 export type ChainResult = { status: 'pending' } | { status: 'confirmed' | 'failed'; output: string; fee: string }
+export interface ExecutionNonceState { nonce: number; latestNonce: number }
+export class ExecutionNonceObservationError extends Error {
+  constructor(source: 'public' | 'wallet', readonly highestObserved: number) { super(`${source}_nonce`) }
+}
+class NonceRpcConflict extends Error {
+  constructor(readonly publicState: ExecutionNonceState, readonly walletState: ExecutionNonceState) { super('nonce_rpc') }
+}
 export interface ExecutionPorts {
   context(): ExecutionContext; input(): ArcRequest | null
   fresh(input: ArcRequest): Promise<ArcReview>; quoteNow(input: ArcRequest): number
-  preflight(review: ArcReview): Promise<{ nonce: number }>
+  preflight(review: ArcReview): Promise<ExecutionNonceState>
   provider(): Promise<ExecutionProvider>
   result(attempt: SwapAttempt): Promise<ChainResult>
   storage: Pick<Storage, 'getItem' | 'setItem'>
@@ -44,7 +51,12 @@ export function executionMessage(code: string): string {
     busy: 'An earlier wallet request or transaction is unresolved. Check its status before retrying.',
     lock: 'Another tab is handling this wallet, or safe browser locking is unavailable.',
     storage: 'Safe transaction recording is unavailable. No new transaction can be requested.',
-    nonce: 'The wallet transaction nonce changed. Review a fresh swap.',
+    nonce: 'The account nonce changed since Review. Check recent transactions before creating a fresh review. No transaction was requested.',
+    nonce_rpc: 'Public Arc RPC and wallet RPC disagree about the account nonce. A pending transaction or stale RPC may be involved. No transaction was requested. Check the wallet’s Arc RPC and transaction activity; repeating Review alone will not resolve this.',
+    nonce_pending: 'RPC reports another pending transaction for this account. Wait for it to resolve and check its status before trying again. No replacement or new transaction was requested.',
+    nonce_regression: 'RPC nonce observations moved backwards during verification. Account state cannot be safely reconciled. No transaction was requested. Wait for consistent RPC state before retrying.',
+    public_nonce: 'Public Arc RPC could not provide a valid, stable latest/pending nonce. No transaction was requested. Check RPC availability and recent account activity.',
+    wallet_nonce: 'The wallet RPC could not provide a valid, stable latest/pending nonce. No transaction was requested. Check the wallet’s Arc network and RPC connection.',
     rejected: 'You rejected the wallet request. No automatic retry will occur.',
     unknown: 'The wallet request may have been submitted. Check your wallet and recover its hash; do not submit again.',
     wallet_timeout: 'The wallet approval window ended. Cancel the open request in your wallet; do not approve or submit again. The app cannot cancel it. A late approval or delayed inclusion may revert and still charge gas. Any returned hash will still be tracked.',
@@ -122,13 +134,39 @@ export async function browserExecutionLock<T>(owner: string, run: () => Promise<
   if (!globalThis.navigator?.locks) return stop('lock')
   return navigator.locks.request(`machina-uniswap-5042:${owner.toLowerCase()}`, { mode: 'exclusive', ifAvailable: true }, lock => lock ? run() : stop('lock'))
 }
-async function walletIdentity(provider: ExecutionProvider, owner: string, nonce: number) {
-  const chain = await provider.request({ method: 'eth_chainId' })
-  if (typeof chain !== 'string' || !/^0x[0-9a-f]+$/i.test(chain) || BigInt(chain) !== 5042n) return stop('context')
-  const accounts = await provider.request({ method: 'eth_accounts' })
-  if (!Array.isArray(accounts) || !sameAddress(accounts[0], owner)) return stop('context')
-  const currentNonce = await provider.request({ method: 'eth_getTransactionCount', params: [owner, 'pending'] })
-  if (typeof currentNonce !== 'string' || !/^0x[0-9a-f]+$/i.test(currentNonce) || BigInt(currentNonce) !== BigInt(nonce)) return stop('nonce')
+async function walletIdentity(provider: ExecutionProvider, owner: string): Promise<ExecutionNonceState> {
+  async function identity() {
+    const chain = await provider.request({ method: 'eth_chainId' })
+    if (typeof chain !== 'string' || !/^0x[0-9a-f]+$/i.test(chain) || BigInt(chain) !== 5042n) return stop('context')
+    const accounts = await provider.request({ method: 'eth_accounts' })
+    if (!Array.isArray(accounts) || !sameAddress(accounts[0], owner)) return stop('context')
+  }
+  await identity()
+  let state: ExecutionNonceState
+  try {
+    const read = async (tag: 'latest' | 'pending') => {
+      const raw = await provider.request({ method: 'eth_getTransactionCount', params: [owner, tag] })
+      if (typeof raw !== 'string' || !/^0x[0-9a-f]+$/i.test(raw) || BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER)) return stop('wallet_nonce')
+      return Number(BigInt(raw))
+    }
+    const before = await read('latest'), nonce = await read('pending'), latestNonce = await read('latest')
+    if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce))
+    state = { nonce, latestNonce }
+  } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; return stop('wallet_nonce') }
+  await identity() // The connector must still identify the same network/account after the reads.
+  return state
+}
+
+// Never select the higher/lower of disagreeing mempool views, silently rebase a
+// reviewed nonce, or send a replacement. Both sources must agree and be clear.
+export function reconcileExecutionNonce(publicState: ExecutionNonceState, walletState: ExecutionNonceState, expected?: number): number {
+  for (const [state, code] of [[publicState, 'public_nonce'], [walletState, 'wallet_nonce']] as const) {
+    if (!isNonce(state.nonce) || !isNonce(state.latestNonce) || state.nonce < state.latestNonce) stop(code)
+  }
+  if (publicState.nonce !== walletState.nonce || publicState.latestNonce !== walletState.latestNonce) throw new NonceRpcConflict(publicState, walletState)
+  if (walletState.nonce > walletState.latestNonce) stop('nonce_pending')
+  if (expected !== undefined && walletState.nonce !== expected) stop('nonce')
+  return walletState.nonce
 }
 
 // No preview object, DOM state or localStorage value can be passed to confirm as transaction authority.
@@ -153,8 +191,41 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
   }
   function errorCode(error: unknown) {
     const code = error instanceof Error ? error.message : ''
-    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired'].includes(code) ? code
+    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired'].includes(code) ? code
       : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
+  }
+  function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
+    const code = errorCode(error), message = executionMessage(code)
+    if (!['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(code)) return message
+    // Only validated public integers are included, never a raw wallet/RPC error.
+    const detail = error instanceof NonceRpcConflict
+      ? `Public latest/pending ${error.publicState.latestNonce}/${error.publicState.nonce}; wallet latest/pending ${error.walletState.latestNonce}/${error.walletState.nonce}. ` : ''
+    return `${stage} nonce check: ${detail}${message}`
+  }
+  async function checkedNonce(selected: NonNullable<typeof intent>, provider: ExecutionProvider, expected?: number) {
+    // One bounded recheck can reconcile a moving head or transient stale result.
+    // Repeat the full balance/gas/router/simulation preflight, not just the nonce.
+    let highestObserved = -1
+    for (let pass = 0; pass < 2; pass++) {
+      try {
+        ready(selected)
+        const publicState = await ports.preflight(structuredClone(selected.review))
+        if (!isNonce(publicState.nonce) || !isNonce(publicState.latestNonce) || publicState.nonce < publicState.latestNonce) stop('public_nonce')
+        highestObserved = Math.max(highestObserved, publicState.nonce)
+        ready(selected)
+        const walletState = await walletIdentity(provider, selected.review.request.owner)
+        highestObserved = Math.max(highestObserved, walletState.nonce)
+        ready(selected)
+        if (publicState.nonce === walletState.nonce && walletState.nonce < highestObserved) stop('nonce_regression')
+        return reconcileExecutionNonce(publicState, walletState, expected)
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        if (error instanceof ExecutionNonceObservationError && isNonce(error.highestObserved)) highestObserved = Math.max(highestObserved, error.highestObserved)
+        if (pass === 0 && (code === 'nonce_rpc' || error instanceof ExecutionNonceObservationError)) continue
+        throw error
+      }
+    }
+    return stop('nonce_rpc')
   }
   async function prepare() {
     if (busy || tracking) return
@@ -176,13 +247,13 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       if (currentVersion !== version || contextKey() !== expectedContext || !ports.input() || requestKey(ports.input()!) !== requestKey(input) || requestKey(fresh.request) !== requestKey(input)) stop('context')
       const review = tightenExecutionReview(fresh, ports.context(), ports.quoteNow(input))
       const selected = { id: crypto.randomUUID(), review, nonce: 0, context: expectedContext, version: currentVersion }
-      const checked = await ports.preflight(structuredClone(review))
-      selected.nonce = checked.nonce
+      const provider = await ports.provider()
+      selected.nonce = await checkedNonce(selected, provider)
       executionTransaction(review, selected.nonce)
       ready(selected)
       intent = selected
       emit({ phase: 'review', approvalId: selected.id, review })
-    } catch (error) { if (currentVersion === version) emit({ phase: 'idle', error: executionMessage(errorCode(error)) }) }
+    } catch (error) { if (currentVersion === version) emit({ phase: 'idle', error: failureMessage(error, 'Review') }) }
     finally { busy = false }
   }
   async function confirm(approvalId: string) {
@@ -196,11 +267,8 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       await ports.lock(selected.review.request.owner, async () => {
         ready(selected)
         if (journal.read(selected.review.request.owner).some(unresolved)) stop('busy')
-        const checked = await ports.preflight(structuredClone(selected.review))
-        if (checked.nonce !== selected.nonce) stop('nonce')
-        ready(selected)
         const provider = await ports.provider()
-        await walletIdentity(provider, selected.review.request.owner, selected.nonce)
+        await checkedNonce(selected, provider, selected.nonce)
         ready(selected)
         const transaction = executionTransaction(selected.review, selected.nonce)
         let record: SwapAttempt = { id: selected.id, review: structuredClone(selected.review), nonce: selected.nonce, createdAt: Date.now(), status: 'awaiting_wallet' }
@@ -234,7 +302,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     } catch (error) {
       intent = null
       if (!requested && attempt) { attempt = { ...attempt, status: 'rejected' }; try { journal.save(attempt) } catch { /* Original durable record blocks retry. */ } }
-      if (!requested) emit({ phase: 'idle', error: executionMessage(errorCode(error)) })
+      if (!requested) emit({ phase: 'idle', error: failureMessage(error, 'Confirm') })
     } finally { busy = false }
     if (attempt?.hash) await reconcile(attempt.review.request.owner)
   }

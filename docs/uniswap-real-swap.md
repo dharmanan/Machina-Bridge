@@ -41,23 +41,59 @@ No deployment, environment change, real signature or mainnet transaction was mad
    separate review expiry and transaction deadline, plus the approval budget.
 3. Fixed, read-only Arc RPC independently rechecks chain, router/output contracts,
    output decimals, EOA code, current and pending USDC balances, current/base gas
-   prices, exact calldata simulation, gas estimate and pending nonce. Contract and
+   prices, exact calldata simulation, gas estimate and nonce state. Contract and
    EIP-7702 delegated wallets fail closed; their execution semantics are unsupported.
 4. The review dialog shows pay/estimated/minimum output, slippage, network and total
    spend ceiling, recipient/router and validity. Cancel or a changed wallet,
    connector, network, amount, provider, slippage or hidden page invalidates it.
 5. **Confirm Swap** refers only to an opaque ID for a private in-memory intent.
    Rendered objects and stored reviews cannot supply a transaction to this method.
-   The same intent is resimulated and rechecked; changed nonce/fees or expiry require
-   a new review. No silent re-quote or economic mutation occurs after confirmation.
+   The same intent is resimulated and rechecked. A mutually confirmed nonce change,
+   changed fees or expiry invalidate the review. No silent re-quote, nonce rebase
+   or economic mutation occurs after confirmation.
 6. A per-wallet Web Lock is acquired, unresolved attempts are checked, wallet
-   `eth_chainId`/`eth_accounts`/pending nonce are independently checked, and a durable
+   `eth_chainId`/`eth_accounts`/nonce state are independently checked, and a durable
    intent is written and read back **before** the wallet request. There must be at
    least five seconds of verified validity left immediately before that request.
 7. Exactly one `eth_sendTransaction` contains the verified native value, calldata,
    sender, router, chain, nonce, gas and EIP-1559 fee caps. No signing-message,
    typed-data, raw-send, batched-call, approval or account-request action is used by
    the execution path. The existing connected wagmi connector supplies the provider.
+
+## Nonce agreement before any wallet transaction request
+
+Review and Confirm both use the full public-RPC preflight and independently read
+the connected wallet RPC. Each source brackets its `pending` nonce with two
+`latest` reads. Both snapshots must be valid, stable, mutually identical and
+`pending == latest`; otherwise no nonce is available for this pilot. A pending
+transaction reported by either source blocks sending, including replacements.
+
+One bounded recheck may repeat the **entire** preflight after a valid but moving
+or conflicting snapshot. It cannot discard a higher observed nonce, silently
+change the reviewed nonce, re-quote, extend quote freshness, or bypass simulation,
+balance/gas/router/identity checks. Malformed or unavailable nonce responses fail
+at their source stage. Confirm must still match the nonce retained during Review.
+Wallet network/account identity is checked before and after its nonce reads.
+
+Review/Confirm errors distinguish a real agreed nonce change, pending activity,
+public/wallet disagreement, backwards observations, and unavailable public/wallet
+nonce state. Validated integer counts can be shown; raw provider errors cannot.
+An RPC mismatch is not resolved by endlessly repeating Review. No public RPC can
+prove absence of transactions invisible to both nodes, and external activity may
+occur after the final check; this is not global mempool visibility or atomic nonce
+reservation. Existing local lock/journal and exact nonce/hash binding remain.
+
+For this revision, a live read-only query returned Arc chain 5042 and public
+`latest=12`, `pending=12` for the pilot address. The connected production wallet
+RPC was unavailable in this environment, so its actual response and the live
+production failure were not reproduced. Browser/RPC/wallet regression cases use
+controlled responses; no real transaction or wallet signature was requested.
+
+Nonce revision verification: 61 execution/security groups and 20 Chromium
+execution/UI groups pass, including normal consensus, confirmed nonce changes,
+pending activity on either/both nodes, transient convergence, persistent conflicts,
+backwards observations, malformed responses and expiry during reconciliation.
+TypeScript, production build and lint pass.
 
 ## Recording and chain results
 
