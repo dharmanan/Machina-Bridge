@@ -144,6 +144,10 @@ try {
       await review.click()
       const alert = page.getByRole('alert').filter({ hasText: 'eth_getTransactionCount(pending)' })
       await alert.waitFor(); assert.ok((await alert.innerText()).includes(label)); assert.ok(!(await page.locator('body').innerText()).includes('SECRET-PROVIDER-DETAILS'))
+      if (mode === 'malformed') {
+        assert.ok((await alert.innerText()).endsWith('Response shape: type=object; stringLength=n/a; canonicalHexQuantity=n/a.'))
+        assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('machina.uniswap.arc.execution.v1:')).length), 0)
+      } else assert.ok(!(await alert.innerText()).includes('Response shape'))
       assert.equal(await page.getByRole('dialog').count(), 0); assert.equal(await sends(), 0)
     }
     await page.evaluate(() => { window.executionUiTest.state.walletReadFailure = '' })

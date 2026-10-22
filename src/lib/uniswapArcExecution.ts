@@ -145,7 +145,8 @@ async function walletIdentity(provider: ExecutionProvider, owner: string): Promi
     if (!sameAddress(accounts[0], owner)) throw new WalletRpcFailure(accountStage, 'account-mismatch')
   }
   await identity(false)
-  const read = async (stage: 'latest-before' | 'pending' | 'latest-after') => walletRpcQuantity(await walletRpcRead(provider, stage, owner), stage)
+  // Only this already-authorized execution path opts into pending failure shape diagnostics.
+  const read = async (stage: 'latest-before' | 'pending' | 'latest-after') => walletRpcQuantity(await walletRpcRead(provider, stage, owner), stage, stage === 'pending')
   const before = await read('latest-before'), nonce = await read('pending'), latestNonce = await read('latest-after')
   if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce), before !== latestNonce ? 'latest-changed' : 'pending-behind-latest')
   const state = { nonce, latestNonce }

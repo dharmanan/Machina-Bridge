@@ -5,7 +5,7 @@ import type { ExecutionProvider } from './uniswapArcExecution'
 export type WalletRpcStage = 'provider' | 'chain-before' | 'accounts-before' | 'latest-before' | 'pending' | 'latest-after' | 'chain-after' | 'accounts-after'
 type FailureKind = 'rejected' | 'unauthorized' | 'unsupported' | 'disconnected' | 'wrong-chain' | 'invalid-request' | 'rpc-error' | 'unknown' | 'invalid-response' | 'timeout' | 'network-mismatch' | 'account-mismatch'
 export class WalletRpcFailure extends Error {
-  constructor(readonly stage: WalletRpcStage, readonly kind: FailureKind, readonly rpcCode?: number) { super('wallet_rpc') }
+  constructor(readonly stage: WalletRpcStage, readonly kind: FailureKind, readonly rpcCode?: number, readonly responseShape?: string) { super('wallet_rpc') }
 }
 function field(value: unknown, key: string): unknown {
   try { return value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined } catch { return undefined }
@@ -48,9 +48,20 @@ export async function walletRpcRead(provider: ExecutionProvider, stage: WalletRp
   const params = method === 'eth_getTransactionCount' ? [owner, stage === 'pending' ? 'pending' : 'latest'] : undefined
   return bounded(() => provider.request(params ? { method, params } : { method }), stage, 3000)
 }
-export function walletRpcQuantity(raw: unknown, stage: WalletRpcStage): number {
-  if (typeof raw !== 'string' || raw.length > 16 || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(raw) || BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER))
-    throw new WalletRpcFailure(stage, 'invalid-response')
+function rejectedQuantityShape(raw: unknown): string {
+  // No coercion, property traversal, value retention or additional RPC. Bound
+  // syntax inspection so an oversized response cannot create diagnostic work.
+  const type = raw === null ? 'null' : typeof raw
+  const length = typeof raw === 'string' ? raw.length : 'n/a'
+  const canonical = typeof raw !== 'string' ? 'n/a' : raw.length > 128 ? 'not-checked-length'
+    : /^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(raw) ? 'yes' : 'no'
+  return `Response shape: type=${type}; stringLength=${length}; canonicalHexQuantity=${canonical}.`
+}
+export function walletRpcQuantity(raw: unknown, stage: WalletRpcStage, diagnosePending = false): number {
+  if (typeof raw !== 'string' || raw.length > 16 || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(raw) || BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER)) {
+    const shape = diagnosePending && stage === 'pending' ? rejectedQuantityShape(raw) : undefined
+    throw new WalletRpcFailure(stage, 'invalid-response', undefined, shape)
+  }
   return Number(BigInt(raw))
 }
 export function walletRpcMessage(error: WalletRpcFailure): string {
@@ -61,5 +72,5 @@ export function walletRpcMessage(error: WalletRpcFailure): string {
     disconnected: 'provider disconnected', 'wrong-chain': 'provider disconnected from the requested chain', 'invalid-request': 'invalid RPC request',
     'network-mismatch': 'wallet, network, provider or swap inputs changed: wallet is not on Arc 5042', 'account-mismatch': 'wallet, network, provider or swap inputs changed: connected account differs from the reviewed account',
     'rpc-error': 'RPC error', unknown: 'unclassified provider failure', 'invalid-response': 'invalid EIP-1193 response', timeout: 'RPC read timed out' }
-  return `The wallet RPC check failed at ${labels[error.stage]}: ${reasons[error.kind]}${error.rpcCode === undefined ? '' : ` (code ${error.rpcCode})`}. No transaction was requested. Required wallet nonce verification remains blocked; no alternative RPC fallback was used.`
+  return `The wallet RPC check failed at ${labels[error.stage]}: ${reasons[error.kind]}${error.rpcCode === undefined ? '' : ` (code ${error.rpcCode})`}. No transaction was requested. Required wallet nonce verification remains blocked; no alternative RPC fallback was used.${error.responseShape ? ` ${error.responseShape}` : ''}`
 }

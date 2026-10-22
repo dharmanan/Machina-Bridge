@@ -430,6 +430,52 @@ await test('strict quantity decoding rejects JSON-RPC envelopes, numbers and uns
     assert.throws(() => walletRpc.walletRpcQuantity(value, 'pending'), error => error.kind === 'invalid-response' && error.stage === 'pending')
   for (const n of [0, 7, 12, Number.MAX_SAFE_INTEGER]) assert.equal(walletRpc.walletRpcQuantity('0x' + n.toString(16), 'pending'), n)
 })
+await test('pending failure diagnostics use only allowlisted shape fields from the original response', async () => {
+  const samples = [
+    [undefined, 'undefined', 'n/a', 'n/a'], [null, 'null', 'n/a', 'n/a'], [12, 'number', 'n/a', 'n/a'], [12n, 'bigint', 'n/a', 'n/a'],
+    ['0x0c', 'string', 4, 'no'], ['0x' + '0'.repeat(63) + 'c', 'string', 66, 'no'], ['0x20000000000000', 'string', 16, 'yes'],
+    [{ result: 'SECRET-NONCE', url: 'SECRET-URL', session: 'SECRET-SESSION' }, 'object', 'n/a', 'n/a'],
+    ['SECRET-RESPONSE', 'string', 15, 'no'], ['0x' + 'f'.repeat(10000), 'string', 10002, 'not-checked-length'],
+  ]
+  for (const [raw, type, length, canonical] of samples) for (const confirm of [false, true]) {
+    const f = setup(), id = confirm ? await f.review() : undefined, original = f.provider.request, calls = []
+    f.provider.request = args => { calls.push([args.method, args.params?.[1]]); return args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.resolve(raw) : original(args) }
+    if (confirm) await f.controller.confirm(id); else await f.controller.prepare()
+    const view = f.controller.current(), expected = `Response shape: type=${type}; stringLength=${length}; canonicalHexQuantity=${canonical}.`
+    assert.ok(view.error.endsWith(expected), view.error)
+    assert.deepEqual(calls, [['eth_chainId', undefined], ['eth_accounts', undefined], ['eth_getTransactionCount', 'latest'], ['eth_getTransactionCount', 'pending']])
+    assert.equal(f.sent().length, 0); assert.equal(f.stats.preflight, confirm ? 2 : 1)
+    assert.deepEqual([...f.data], []); assert.equal(view.approvalId, undefined)
+    for (const sensitive of ['SECRET', owner, '0x20000000000000', '0x0c']) assert.ok(!JSON.stringify(view).includes(sensitive))
+  }
+})
+await test('shape classification never traverses objects, calls getters or coerces response values', () => {
+  const hostile = new Proxy({}, { get() { throw Error('SECRET') }, ownKeys() { throw Error('SECRET') } })
+  const revoked = Proxy.revocable({}, {}); revoked.revoke()
+  for (const raw of [hostile, revoked.proxy, { get result() { throw Error('SECRET') }, toString() { throw Error('SECRET') } }]) {
+    assert.throws(() => walletRpc.walletRpcQuantity(raw, 'pending', true), error => error.responseShape === 'Response shape: type=object; stringLength=n/a; canonicalHexQuantity=n/a.')
+  }
+})
+await test('diagnostics are opt-in, pending-only and cannot alter quantity acceptance or rejection', () => {
+  for (const raw of [null, '0x00', { result: '0xc' }, 12]) {
+    for (const stage of ['chain-before', 'latest-before', 'latest-after'])
+      assert.throws(() => walletRpc.walletRpcQuantity(raw, stage, true), error => error.kind === 'invalid-response' && error.responseShape === undefined)
+    assert.throws(() => walletRpc.walletRpcQuantity(raw, 'pending'), error => error.kind === 'invalid-response' && error.responseShape === undefined)
+  }
+  for (const n of [0, 12, Number.MAX_SAFE_INTEGER]) {
+    const raw = '0x' + n.toString(16)
+    assert.equal(walletRpc.walletRpcQuantity(raw, 'pending', true), walletRpc.walletRpcQuantity(raw, 'pending'))
+  }
+})
+await test('unauthorized pilot paths and rejected RPC requests never produce response-shape diagnostics', async () => {
+  for (const ports of [{ authorize: () => false }, { enabled: () => false }]) {
+    const f = setup({ ports }); await f.controller.prepare()
+    assert.equal(f.wallet.length, 0); assert.ok(!f.controller.current().error.includes('Response shape'))
+  }
+  const f = setup(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.reject({ code: -32601, message: 'SECRET' }) : original(args)
+  await f.controller.prepare(); assert.ok(!f.controller.current().error.includes('Response shape')); assert.equal(f.sent().length, 0)
+})
 await test('unstable wallet snapshots are diagnosed separately without losing bounded retry or high-water protection', async () => {
   for (const values of [[7, 7, 8], [7, 6, 7]]) {
     const f = setup(), original = f.provider.request; let i = 0
