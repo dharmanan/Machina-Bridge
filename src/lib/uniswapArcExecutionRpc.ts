@@ -1,6 +1,6 @@
 import { createPublicClient, defineChain, erc20Abi, http, keccak256, type Hex, type Transport } from 'viem'
 import { ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, nativeAmount, sameAddress, uint, type ArcReview } from './uniswapArcPolicy'
-import { ExecutionNonceObservationError, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
+import { ExecutionNonceObservationError, ExecutionResultVerificationError, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
 
 const RPC = 'https://rpc.mainnet.arc.io'
 const chain = defineChain({ id: 5042, name: 'Arc Mainnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [RPC] } } })
@@ -54,8 +54,9 @@ export function createArcExecutionRpc(rpc = client) {
     const tx = await rpc.getTransaction({ hash: attempt.hash! })
     // Wallets can alter requests. Never report success for a hash that fails exact transaction binding.
     if (!sameAddress(tx.from, expected.from) || !sameAddress(tx.to, expected.to) || tx.chainId !== 5042 || tx.nonce !== attempt.nonce || tx.type !== 'eip1559' ||
-      tx.input.toLowerCase() !== expected.data.toLowerCase() || tx.value !== BigInt(expected.value) || tx.gas !== BigInt(expected.gas) ||
-      tx.maxFeePerGas !== BigInt(expected.maxFeePerGas) || tx.maxPriorityFeePerGas !== BigInt(expected.maxPriorityFeePerGas) || tx.hash.toLowerCase() !== attempt.hash!.toLowerCase()) reject()
+      tx.input.toLowerCase() !== expected.data.toLowerCase() || tx.value !== BigInt(expected.value) || tx.hash.toLowerCase() !== attempt.hash!.toLowerCase()) reject()
+    if (tx.gas !== BigInt(expected.gas) || tx.maxFeePerGas !== BigInt(expected.maxFeePerGas) ||
+      tx.maxPriorityFeePerGas !== BigInt(expected.maxPriorityFeePerGas)) throw new ExecutionResultVerificationError()
     let receipt
     try { receipt = await rpc.getTransactionReceipt({ hash: attempt.hash! }) }
     catch (error) {

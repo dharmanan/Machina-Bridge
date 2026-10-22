@@ -5,7 +5,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { formatUnits } from 'viem'
 import { ARC_OUTPUTS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, nativeAmount, requestKey, sameAddress, type ArcRequest } from '../lib/uniswapArcPolicy'
 import { createUniswapArcPreviewReader } from '../lib/uniswapArcPreview'
-import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionView } from '../lib/uniswapArcExecution'
+import { ARC_EXECUTION_EXPLORER, browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, type ExecutionContext, type ExecutionView, type SwapAttempt } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
 import { arcPilotAllows, arcPilotConfig } from '../lib/uniswapArcPilot'
 
@@ -15,6 +15,8 @@ const pilot = arcPilotConfig(import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED, imp
 export function useUniswapArcExecution(input: ArcRequest | null) {
   const { address, chainId, isConnected, connector } = useAccount()
   const queryClient = useQueryClient()
+  const [history, setHistory] = useState<SwapAttempt[]>([])
+  const [historyError, setHistoryError] = useState(false)
   const [view, setView] = useState<ExecutionView>({ phase: 'idle' })
   const [, tick] = useState(0)
   const alive = useRef(true)
@@ -43,6 +45,10 @@ export function useUniswapArcExecution(input: ArcRequest | null) {
       } })
     },
   }))
+  useEffect(() => {
+    if (!address || !isConnected) { setHistory([]); setHistoryError(false); return }
+    try { setHistory(controller.history(address)); setHistoryError(false) } catch { setHistory([]); setHistoryError(true) }
+  }, [address, isConnected, controller, view])
   const binding = JSON.stringify([address, chainId, isConnected, connector?.uid, input ? requestKey(input) : null])
   useEffect(() => {
     controller.invalidate(); reader.invalidate()
@@ -68,18 +74,20 @@ export function useUniswapArcExecution(input: ArcRequest | null) {
     return () => clearInterval(timer)
   }, [Boolean(view.review)])
   useEffect(() => {
-    if (!view.attempt?.hash || !['pending', 'unknown'].includes(view.phase)) return
+    if (!isConnected || !sameAddress(address, view.attempt?.review.request.owner ?? '') || !view.attempt?.hash || !['pending', 'unknown'].includes(view.phase)) return
     const owner = view.attempt.review.request.owner
     const timer = setInterval(() => { if (!document.hidden) void controller.reconcile(owner) }, 5000)
     return () => clearInterval(timer)
-  }, [view.phase, view.attempt?.hash, controller])
+  }, [view.phase, view.attempt?.hash, controller, address, isConnected])
   let remainingMs = 0
   if (view.review) { try { remainingMs = Math.max(0, view.review.expiresAt - reader.validationTime(view.review.request)) } catch { /* expired */ } }
-  return { view, remainingMs, enabled: UNISWAP_ARC_WRITES_ENABLED && arcPilotAllows(pilot, input, context.current),
+  const visibleView: ExecutionView = !isConnected || !sameAddress(address, view.attempt?.review.request.owner ?? view.review?.request.owner ?? address ?? '') ? { phase: 'idle' } : view
+  return { view: visibleView, history: isConnected ? history.filter(a => sameAddress(a.review.request.owner, address ?? '')) : [], historyError, remainingMs, enabled: UNISWAP_ARC_WRITES_ENABLED && arcPilotAllows(pilot, input, context.current),
     prepare: () => controller.prepare(), confirm: () => view.approvalId ? controller.confirm(view.approvalId) : Promise.resolve(),
     cancel: () => { controller.invalidate(); reader.invalidate() },
     recover: (hash: string) => controller.reconcile(view.attempt?.review.request.owner, hash),
     check: () => controller.reconcile(view.attempt?.review.request.owner),
+    checkAttempt: (id: string) => controller.reconcile(address, undefined, id),
   }
 }
 
@@ -96,7 +104,7 @@ export function UniswapArcExecutionPanel({ execution, canReview }: { execution: 
   const busy = ['preparing', 'checking', 'awaiting_wallet', 'pending', 'unknown'].includes(view.phase)
   const labels: Partial<Record<ExecutionView['phase'], string>> = {
     awaiting_wallet: 'Awaiting wallet confirmation', pending: 'Pending — checking Arc', confirmed: 'Confirmed',
-    failed: 'Failed — transaction reverted', rejected: 'Wallet request rejected', unknown: 'Submission or result unverified',
+    failed: 'Failed — transaction reverted', rejected: 'Wallet request rejected', unknown: 'Verification incomplete — check transaction status',
   }
   const status = labels[view.phase]
   return <div className="space-y-3">
@@ -143,6 +151,18 @@ export function UniswapArcExecutionPanel({ execution, canReview }: { execution: 
         <label className="block">Transaction hash from your wallet<input aria-label="Recover transaction hash" value={recovery} onChange={event => setRecovery(event.target.value)} maxLength={66} className="mt-1 w-full rounded-lg border border-slate-300 p-2" /></label>
         <button type="button" onClick={() => { void execution.recover(recovery) }} className="underline">Verify and track hash</button>
       </div>}
+    </section>}
+    {(execution.history.length > 0 || execution.historyError) && <section aria-label="Swap history" className="space-y-3 rounded-xl border border-slate-200 p-3 text-sm">
+      <h2 className="font-semibold">Swap history · Arc Mainnet</h2>
+      <p className="text-xs text-slate-500">Stored locally for this wallet. Recheck for current chain verification.</p>
+      {execution.historyError && <p>Local history could not be read safely. New submissions remain protected by the transaction journal.</p>}
+      {[...execution.history].reverse().map(attempt => <article key={attempt.id} className="space-y-1 border-t border-slate-100 pt-2">
+        <p>{attempt.review.request.amount} USDC → {attempt.review.request.tokenOut} · Saved status: {attempt.status === 'unknown' ? 'Verification incomplete' : attempt.status}</p>
+        {attempt.hash && <><p className="break-all text-xs">{attempt.hash}</p><a href={ARC_EXECUTION_EXPLORER + attempt.hash} target="_blank" rel="noopener noreferrer" className="block underline">Open swap on Arc Explorer</a></>}
+        {attempt.output && attempt.status === 'confirmed' && <p>Recorded received {formatUnits(BigInt(attempt.output), ARC_OUTPUTS[attempt.review.request.tokenOut].decimals)} {attempt.review.request.tokenOut}</p>}
+        {attempt.fee && ['confirmed', 'failed'].includes(attempt.status) && <p>Recorded network fee: {formatUnits(BigInt(attempt.fee), 18)} USDC</p>}
+        <button type="button" disabled={view.walletRequestOpen || ['preparing', 'review', 'checking', 'awaiting_wallet'].includes(view.phase)} onClick={() => { void execution.checkAttempt(attempt.id) }} className="underline disabled:opacity-50">Recheck swap {attempt.id.slice(0, 8)}</button>
+      </article>)}
     </section>}
   </div>
 }

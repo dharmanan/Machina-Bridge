@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useAccount, useBalance } from 'wagmi'
 import { formatUnits } from 'viem'
 import { ArrowDown, Loader2 } from 'lucide-react'
@@ -11,6 +11,9 @@ import { ARC_OUTPUTS, ARC_ROUTER, usdcAmount } from '../lib/uniswapArcPolicy'
 import { CIRCLE_NO_ROUTE_MESSAGE, decimalUnits } from '../lib/mainnetSwap'
 import { shortenAmount, unitPriceInUsdc } from '../lib/swapDisplay'
 import { useSwapAutoQuote } from './useSwapAutoQuote'
+
+import { NATIVE_SWAP_FEE_RESERVE, swapShortcutAmount } from '../lib/swapAmountShortcuts'
+import { ARC_PILOT_MAX_INPUT } from '../lib/uniswapArcPilot'
 
 type Provider = 'uniswap' | 'circle'
 const PROVIDER_NAME: Record<Provider, string> = { uniswap: 'Uniswap (Arc router)', circle: 'Circle Swap Kit' }
@@ -33,12 +36,44 @@ export default function MainnetSwapScreen() {
   const execution = useUniswapArcExecution(provider === 'uniswap' ? uniswap.request : null)
   const circle = useCircleSwapPreview(tokenIn, tokenOut, amount, slippageBps, provider === 'circle')
   // Native USDC is read directly from Arc RPC; other tokens use the Circle hook's ERC-20 read.
-  const nativeBalance = useBalance({ address, chainId: 5042, query: { enabled: isConnected && !!address && tokenIn === 'USDC', refetchInterval: 30000 } })
-
   const arcReady = isConnected && chainId === 5042
+  const nativeBalance = useBalance({ address, chainId: 5042, query: { enabled: arcReady && !!address && tokenIn === 'USDC', refetchInterval: 30000 } })
+
+  const shortcutKey = JSON.stringify([address, isConnected, chainId, tokenIn, tokenOut, provider, amount])
+  const selection = useRef({ key: shortcutKey })
+  if (selection.current.key !== shortcutKey) selection.current = { key: shortcutKey }
+  const shortcutLock = useRef(false)
+  const [shortcutBusy, setShortcutBusy] = useState(false)
+  const [shortcutError, setShortcutError] = useState<{ context: { key: string }; message: string } | null>(null)
+  const maxBlocked = tokenIn === 'USDC' && provider !== 'uniswap'
+  async function selectBalance(percent: number) {
+    if (!arcReady || !address || shortcutLock.current || (percent === 100 && maxBlocked)) return
+    const selected = selection.current
+    shortcutLock.current = true; setShortcutBusy(true); setShortcutError(null)
+    try {
+      let balance: bigint
+      if (tokenIn === 'USDC') {
+        const fresh = await nativeBalance.refetch()
+        if (fresh.isError || !fresh.data || fresh.data.decimals !== 18) throw Error('balance')
+        balance = fresh.data.value
+      } else {
+        const fresh = await circle.balance.refetch()
+        if (fresh.isError || typeof fresh.data !== 'bigint') throw Error('balance')
+        balance = fresh.data
+      }
+      if (selection.current !== selected) return
+      const cap = provider === 'uniswap' && tokenOut === 'EURC' ? ARC_PILOT_MAX_INPUT / 10n ** 12n : undefined
+      setAmount(swapShortcutAmount(balance, MAINNET_SWAP_TOKENS[tokenIn].decimals, percent, tokenIn === 'USDC', provider === 'uniswap' ? NATIVE_SWAP_FEE_RESERVE : undefined, cap))
+    } catch (error) {
+      if (selection.current === selected) setShortcutError({ context: selected, message: error instanceof Error && error.message === 'gas'
+        ? 'MAX unavailable: the current native USDC balance cannot cover the reserved network fee.'
+        : error instanceof Error && error.message === 'zero' ? 'The selected share is below the smallest supported token amount.'
+          : 'The current input-token balance could not be verified. Amount unchanged.' })
+    } finally { shortcutLock.current = false; setShortcutBusy(false) }
+  }
   let balanceText: string | null = null
   if (isConnected && address) {
-    if (tokenIn === 'USDC') balanceText = nativeBalance.data ? `${formatUnits(nativeBalance.data.value / 10n ** 12n, 6)} USDC` : nativeBalance.isError ? 'unavailable' : 'loading…'
+    if (tokenIn === 'USDC') balanceText = nativeBalance.isError ? 'unavailable' : nativeBalance.data ? `${formatUnits(nativeBalance.data.value / 10n ** 12n, 6)} USDC` : 'loading…'
     else if (arcReady) balanceText = circle.balance.isSuccess && typeof circle.balance.data === 'bigint' ? `${formatUnits(circle.balance.data, MAINNET_SWAP_TOKENS[tokenIn].decimals)} ${tokenIn}`
       : circle.balance.isError ? 'unavailable' : 'loading…'
   }
@@ -77,7 +112,7 @@ export default function MainnetSwapScreen() {
     ? 'Circle cannot provide a quote for this amount. Choose Uniswap as the quote source.' : active.error
   const expired = active.expired
   const canQuote = provider === 'uniswap' ? Boolean(uniswap.request) : Boolean(circle.request && circle.validAmount && !circle.insufficientBalance)
-  const executionBusy = !['idle', 'confirmed', 'failed', 'rejected'].includes(execution.view.phase)
+  const executionBusy = ['preparing', 'review', 'checking', 'awaiting_wallet'].includes(execution.view.phase) || execution.view.walletRequestOpen === true
   useSwapAutoQuote(JSON.stringify([address, isConnected, chainId, provider, tokenIn, tokenOut, amount, slippageBps]),
     canQuote && !executionBusy, active.load, active.cancel)
 
@@ -115,6 +150,16 @@ export default function MainnetSwapScreen() {
               {tokens.map(symbol => <option key={symbol}>{symbol}</option>)}
             </select>
           </div>
+          <div className="flex gap-2" aria-label="Input balance shortcuts">
+            {[25, 50, 75, 100].map(percent => <button key={percent} type="button" onClick={() => { void selectBalance(percent) }}
+              disabled={!arcReady || shortcutBusy || (percent === 100 && maxBlocked)}
+              className="flex-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-medium disabled:opacity-40">{percent === 100 ? 'MAX' : `${percent}%`}</button>)}
+          </div>
+          {shortcutBusy && <p role="status" className="text-xs text-slate-500">Checking current token balance…</p>}
+          {shortcutError?.context === selection.current && <p role="status" className="text-xs text-amber-800">{shortcutError.message}</p>}
+          {maxBlocked && <p className="text-xs text-slate-500">Native USDC MAX is unavailable: Circle has no verified network fee ceiling. Circle is preview only.</p>}
+          {tokenIn === 'USDC' && provider === 'uniswap' && <p className="text-xs text-slate-500">MAX reserves 0.1 USDC for the existing worst-case network fee ceiling. This is a budget, not the charged fee.</p>}
+          {provider === 'uniswap' && tokenOut === 'EURC' && <p className="text-xs text-slate-500">Balance shortcuts are capped at the pilot maximum of 0.1 USDC. Manual entry remains available for previews.</p>}
         </div>
         <div className="flex justify-center">
           <button type="button" aria-label="Reverse direction" className="-my-4 relative z-10 rounded-xl border border-slate-200 bg-white p-2 text-slate-600 shadow-sm hover:bg-slate-50"
@@ -167,8 +212,7 @@ export default function MainnetSwapScreen() {
           {summary ? <p role="status" className="text-xs text-slate-500">{provider === 'uniswap' ? `Read-only simulation passed · ${execution.enabled ? 'Use Review Swap for a separately checked transaction.' : 'Execution disabled.'} A simulation is not a completed transaction; the fee shown is a conservative budget, not a charged fee.` : 'Quote available. Local freshness is limited to 30 seconds, not a provider guarantee. Fees and output may change.'}</p>
             : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : expired ? 'Quote expired. Change the amount or settings for a new price.' : 'Enter an amount for an automatic quote. No output or fee is assumed.'}</p>}
         </div>
-        {provider === 'uniswap' ? <UniswapArcExecutionPanel execution={execution} canReview={Boolean(uniswap.request) && !uniswap.loading} />
-          : <button type="button" disabled className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-100 px-5 py-3 font-semibold text-slate-500">Swap disabled in Preview</button>}
+        <UniswapArcExecutionPanel execution={execution} canReview={provider === 'uniswap' && Boolean(uniswap.request) && !uniswap.loading} />
       </div>
 
       {summary && summary.extra.length > 0 && <details className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">

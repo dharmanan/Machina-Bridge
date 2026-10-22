@@ -109,6 +109,46 @@ try {
     await dialog.getByText('0.00026 USDC', { exact: true }).waitFor(); assert.ok(methods.includes('eth_estimateGas'))
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); assert.equal(await sends(), 0)
   })
+  await test('native balance shortcuts refetch, respect the pilot cap and block unsafe or failed MAX reads', async () => {
+    for (const name of ['25%', '50%', '75%', 'MAX']) {
+      await amount.fill(''); const before = await page.evaluate(() => window.executionUiTest.state.balanceReads)
+      await page.getByRole('button', { name, exact: true }).click()
+      await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.1')
+      assert.ok(await page.evaluate(() => window.executionUiTest.state.balanceReads) > before); assert.equal(await sends(), 0)
+    }
+    await page.evaluate(() => { window.executionUiTest.state.balanceMode = 'low' })
+    await amount.fill('0.07'); await page.getByRole('button', { name: 'MAX', exact: true }).click()
+    await page.getByText(/cannot cover the reserved network fee/).waitFor(); assert.equal(await amount.inputValue(), '0.07')
+    await page.evaluate(() => { window.executionUiTest.state.balanceMode = 'error' })
+    await page.getByRole('button', { name: '25%', exact: true }).click()
+    await page.getByText(/current input-token balance could not be verified/).waitFor(); assert.equal(await amount.inputValue(), '0.07')
+    await page.evaluate(() => { window.executionUiTest.state.balanceMode = '' }); await amount.fill('0.1')
+  })
+  await test('delayed shortcut responses cannot overwrite manual edits or changed wallets/tokens, including switching back', async () => {
+    for (const change of ['manual', 'wallet', 'token']) {
+      await page.evaluate(() => { window.executionUiTest.state.balanceMode = 'held' })
+      await page.getByRole('button', { name: '25%', exact: true }).click()
+      await page.getByText('Checking current token balance…').waitFor()
+      if (change === 'manual') await amount.fill('0.03')
+      if (change === 'wallet') { await page.evaluate(() => window.executionUiTest.account(true)); await page.evaluate(() => window.executionUiTest.account(false)) }
+      if (change === 'token') { await page.getByRole('combobox', { name: 'From token' }).selectOption('EURC'); await page.getByRole('combobox', { name: 'From token' }).selectOption('USDC') }
+      await page.evaluate(() => { window.executionUiTest.state.balanceMode = ''; window.executionUiTest.releaseBalance() })
+      await page.getByText('Checking current token balance…').waitFor({ state: 'hidden' })
+      assert.equal(await amount.inputValue(), change === 'manual' ? '0.03' : '0.1'); assert.equal(await sends(), 0)
+      await amount.fill('0.1')
+    }
+  })
+  await test('ERC-20 percentages use the selected token decimals; Circle MAX never enables execution', async () => {
+    await page.getByRole('combobox', { name: 'From token' }).selectOption('cirBTC')
+    await page.getByRole('button', { name: '75%', exact: true }).click()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.75')
+    assert.equal(await review.count(), 0)
+    await page.getByRole('combobox', { name: 'From token' }).selectOption('USDC'); await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
+    assert.equal(await page.getByRole('button', { name: 'MAX', exact: true }).isDisabled(), true)
+    await page.getByText(/Circle has no verified network fee ceiling/).waitFor(); assert.equal(await review.count(), 0)
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap'); await amount.fill('0.1')
+  })
   await test('Review reports RPC nonce disagreement before offering confirmation and exposes only safe counts', async () => {
     await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 6; window.executionUiTest.state.walletPendingNonce = 6 })
     await review.click()
@@ -190,6 +230,20 @@ try {
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
     await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
   })
+  await test('pending history survives direction/provider changes and remains wallet-scoped with read-only rechecks', async () => {
+    const history = page.getByRole('region', { name: 'Swap history' }), before = await sends()
+    await history.waitFor(); await page.getByRole('button', { name: 'Reverse direction' }).click()
+    await history.getByRole('link', { name: 'Open swap on Arc Explorer' }).first().waitFor()
+    assert.equal(await review.count(), 0)
+    await page.getByRole('button', { name: 'Reverse direction' }).click()
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
+    await history.getByRole('button', { name: /Recheck swap/ }).first().click()
+    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor()
+    assert.equal(await sends(), before)
+    await page.evaluate(() => window.executionUiTest.account(true)); await history.waitFor({ state: 'hidden' }); assert.equal(await transactionStatus.count(), 0)
+    await page.evaluate(() => window.executionUiTest.account(false)); await history.waitFor()
+    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap'); await amount.fill('0.1')
+  })
   await test('verified successful receipt shows Confirmed and actual output, then refreshes native balance', async () => {
     const before = await page.evaluate(() => window.executionUiTest.state.balanceReads)
     receiptMode = 'confirmed'
@@ -198,7 +252,9 @@ try {
     assert.equal(await sends(), 0)
   })
   await test('pilot EURC repeated review uses the same controller and a reverted receipt is Failed', async () => {
-    receiptMode = 'pending'; await prepare('EURC'); await confirm.click()
+    receiptMode = 'pending'; await prepare('EURC')
+    assert.equal(await page.getByRole('region', { name: 'Swap history' }).getByRole('button', { name: /Recheck swap/ }).first().isDisabled(), true)
+    await confirm.click()
     await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); await cacheWallet()
     receiptMode = 'reverted'
     await transactionStatus.getByText('Failed — transaction reverted', { exact: true }).waitFor(); assert.equal(await sends(), 1)
@@ -210,7 +266,7 @@ try {
   })
   await test('ambiguous wallet result stays blocked and supports read-only hash recovery after reload', async () => {
     receiptMode = 'pending'; await page.evaluate(() => { window.executionUiTest.state.walletMode = 'unknown' }); await prepare(); await confirm.click()
-    await transactionStatus.getByText('Submission or result unverified', { exact: true }).waitFor(); const state = await cacheWallet()
+    await transactionStatus.getByText('Verification incomplete — check transaction status', { exact: true }).waitFor(); const state = await cacheWallet()
     assert.equal(await review.isDisabled(), true)
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
     await page.getByRole('textbox', { name: 'Recover transaction hash' }).fill(state.hash)
@@ -247,7 +303,7 @@ try {
     await prepare('EURC'); const before = await sends(); await confirm.click()
     await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
     await page.clock.fastForward(121000)
-    await transactionStatus.getByText('Submission or result unverified', { exact: true }).waitFor()
+    await transactionStatus.getByText('Verification incomplete — check transaction status', { exact: true }).waitFor()
     await page.getByRole('alert').filter({ hasText: 'The wallet approval window ended. Cancel the open request' }).waitFor()
     assert.equal(await review.isDisabled(), true); assert.equal(await sends(), before + 1)
     const records = await page.evaluate(() => Object.entries(localStorage).filter(([k]) => k.startsWith('machina.uniswap.arc.execution.v1:')).map(([,v]) => JSON.parse(v)).flat())

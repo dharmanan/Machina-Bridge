@@ -9,15 +9,21 @@ import '../../../src/index.css'
 
 const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321' as const
 const other = '0x2222222222222222222222222222222222222222' as const
-const state = { walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], tx: null as unknown, hash: '', balanceReads: 0, walletLatestNonce: 7, walletPendingNonce: 7, walletReadFailure: '', numericPending: false }
+const state = { walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], tx: null as unknown, hash: '', balanceReads: 0, walletLatestNonce: 7, walletPendingNonce: 7, walletReadFailure: '', numericPending: false, balanceMode: '', tokenBalance: 100000000n }
 let release: ((value: string) => void) | undefined
+const pendingBalances: ((value: string) => void)[] = []
 let selectedAccount: string = owner
 const arc = defineChain({ id: 5042, name: 'Arc test double', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: ['http://127.0.0.1/never-rpc'] } } })
 const wrong = defineChain({ ...arc, id: 1, name: 'Wrong network test double' })
 const transport = custom({ request: async args => {
-  if (args.method === 'eth_getBalance') { state.balanceReads++; return toHex(100n * 10n ** 18n) }
+  if (args.method === 'eth_getBalance') {
+    state.balanceReads++
+    if (state.balanceMode === 'error') throw Error('controlled-balance-error')
+    if (state.balanceMode === 'held') return new Promise<string>(resolve => { pendingBalances.push(resolve) })
+    return toHex(state.balanceMode === 'low' ? 50000000000000000n : 100n * 10n ** 18n)
+  }
   if (args.method === 'eth_chainId') return '0x13b2'
-  if (args.method === 'eth_call') return toHex(100000000n, { size: 32 })
+  if (args.method === 'eth_call') return toHex(state.tokenBalance, { size: 32 })
   throw new Error('unexpected_wagmi_read')
 } })
 const config = createConfig({ chains: [arc, wrong], connectors: [mock({ accounts: [owner, other] })], transports: { 5042: transport, 1: transport }, storage: null })
@@ -47,6 +53,7 @@ const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false 
 Object.assign(window, { executionUiTest: { state,
   connect: (chainId = 5042) => connect(config, { connector, chainId }), disconnect: () => disconnect(config),
   chain: (chainId: number) => switchChain(config, { chainId }), account: (change: boolean) => { selectedAccount = change ? other : owner; connector.onAccountsChanged([selectedAccount]) },
+  releaseBalance: () => { for (const resolve of pendingBalances.splice(0)) resolve(toHex(100n * 10n ** 18n)) },
   release: () => { release?.(state.hash); release = undefined },
 } })
 createRoot(document.getElementById('root')!).render(<WagmiProvider config={config}><QueryClientProvider client={queryClient}><MainnetSwapScreen /></QueryClientProvider></WagmiProvider>)

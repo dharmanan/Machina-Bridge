@@ -10,6 +10,9 @@ export interface ExecutionView {
   phase: 'idle' | 'preparing' | 'review' | 'checking' | AttemptStatus
   approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
 }
+export class ExecutionResultVerificationError extends Error {
+  constructor() { super('review_fee_mismatch') }
+}
 export type ChainResult = { status: 'pending' } | { status: 'confirmed' | 'failed'; output: string; fee: string }
 export interface ExecutionNonceState { nonce: number; latestNonce: number }
 export class ExecutionNonceObservationError extends Error {
@@ -59,9 +62,9 @@ export function executionMessage(code: string): string {
     public_nonce: 'Public Arc RPC could not provide a valid, stable latest/pending nonce. No transaction was requested. Check RPC availability and recent account activity.',
     wallet_nonce: 'The wallet RPC could not provide a valid, stable latest/pending nonce. No transaction was requested. Check the wallet’s Arc network and RPC connection.',
     rejected: 'You rejected the wallet request. No automatic retry will occur.',
-    unknown: 'The wallet request may have been submitted. Check your wallet and recover its hash; do not submit again.',
+    unknown: 'Submission or confirmation is not yet verified. This does not mean failure. Check your wallet or Arc Explorer; do not submit again.',
     wallet_timeout: 'The wallet approval window ended. Cancel the open request in your wallet; do not approve or submit again. The app cannot cancel it. A late approval or delayed inclusion may revert and still charge gas. Any returned hash will still be tracked.',
-    verification: 'The transaction or its result could not be independently verified. Do not resubmit.',
+    verification: 'Verification is incomplete; this does not mean the transaction failed. Check its hash on Arc Explorer and recheck its status. Do not submit another swap.',
     smart_wallet: 'This execution flow supports EOAs only. Contract and delegated wallets remain blocked.',
     preflight: 'The current balance, fees, contract identity or simulation could not be verified. No wallet request was started.',
     confirmation: 'The transaction is still being checked. RPC errors and timeouts do not mean it failed.',
@@ -305,13 +308,13 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     } finally { busy = false }
     if (attempt?.hash) await reconcile(attempt.review.request.owner)
   }
-  async function reconcile(owner = ports.context().owner, recoveredHash?: string) {
+  async function reconcile(owner = ports.context().owner, recoveredHash?: string, attemptId?: string) {
     if (busy || tracking || !/^0x[a-fA-F0-9]{40}$/.test(owner)) return
     tracking = true
     try {
       await ports.lock(owner, async () => {
         const records = journal.read(owner)
-        const stored = [...records].reverse().find(unresolved) ?? records[records.length - 1]
+        const stored = attemptId ? records.find(a => a.id === attemptId) : [...records].reverse().find(unresolved) ?? records[records.length - 1]
         if (!stored || stored.status === 'rejected') return
         let attempt = stored
         if (!attempt.hash && view.attempt?.id === stored.id && view.attempt.hash) attempt = { ...attempt, hash: view.attempt.hash }
@@ -335,11 +338,11 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
           journal.save(attempt)
           emit({ phase: result.status, attempt })
           try { ports.settled?.(structuredClone(attempt)) } catch { /* Balance refresh cannot change chain truth. */ }
-        } catch {
+        } catch (error) {
           attempt = { ...attempt, status: 'unknown' }
           // Do not persist an unverified recovery hash; keep the original record recoverable.
           if (recoveredHash === undefined) { try { journal.save(attempt) } catch { /* Previous unresolved record remains. */ } }
-          emit({ phase: 'unknown', attempt, error: executionMessage('verification') })
+          emit({ phase: 'unknown', attempt, error: executionMessage('verification') + (error instanceof ExecutionResultVerificationError ? ' The on-chain gas or fee parameters differ from the reviewed transaction; the app cannot mark it Confirmed under the approved limits.' : '') })
         }
       })
     } catch (error) {
@@ -351,5 +354,5 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     version++; intent = null
     if (!sending && !['pending', 'unknown', 'confirmed', 'failed', 'rejected'].includes(view.phase)) emit({ phase: 'idle' })
   }
-  return { prepare, confirm, reconcile, invalidate, current: () => structuredClone(view) }
+  return { prepare, confirm, reconcile, invalidate, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view) }
 }

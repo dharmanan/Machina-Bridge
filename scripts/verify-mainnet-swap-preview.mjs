@@ -271,7 +271,7 @@ await test('only mainnet receives the new lazy Swap tab; legacy routes and defau
   assert.match(activity, /Activity data provided by Blockscout\./)
 })
 await test('Circle preview remains read-only; unified UI delegates Uniswap to a separately gated controller', () => {
-  const component = readFileSync(`${root}src/components/MainnetSwapPreview.tsx`, 'utf8') + readFileSync(`${root}src/components/MainnetSwapScreen.tsx`, 'utf8')
+  const component = readFileSync(`${root}src/components/MainnetSwapPreview.tsx`, 'utf8') + readFileSync(`${root}src/components/MainnetSwapScreen.tsx`, 'utf8') + readFileSync(`${root}src/components/UniswapArcExecution.tsx`, 'utf8')
   const library = readFileSync(`${root}src/lib/mainnetSwap.ts`, 'utf8')
   for (const source of [component, library]) assert.doesNotMatch(source, /\.swap\(|\.approve\(|sendTransaction\(|writeContract\(|signTypedData\(|personal_sign|useWalletClient|window\.ethereum|privateKeyToAccount/)
   assert.match(component, /Swap disabled in Preview/)

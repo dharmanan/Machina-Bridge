@@ -11,7 +11,7 @@ const root = fileURLToPath(new URL('..', import.meta.url)), p = require(`${root}
 const e = require(`${root}src/lib/uniswapArcExecution.ts`), { createArcExecutionRpc, assertExecutionReadMethod } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
 const pilot = require(`${root}src/lib/uniswapArcPilot.ts`)
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
-const { decodeFunctionData, encodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
+const { decodeFunctionData, decodeAbiParameters, encodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 let external = 0, count = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
@@ -735,6 +735,53 @@ await test('receipt success requires exact transaction binding, two observed blo
     const f = rpcFixture(symbol), result = await f.adapter.result(f.attempt)
     assert.equal(result.status, 'confirmed'); assert.equal(result.output, f.review.requiredMinimum); assert.equal(result.fee, '100000000000000')
   }
+})
+await test('real first pilot RPC evidence proves the reviewed zero-tip invariant is violated without bypassing it', async () => {
+  const raw = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/first-pilot-result.json`, 'utf8'))
+  const { formatTransaction, formatTransactionReceipt } = require('viem')
+  const tx = formatTransaction(raw.eth_getTransactionByHash), receipt = formatTransactionReceipt(raw.eth_getTransactionReceipt)
+  assert.equal(tx.chainId, 5042); assert.equal(tx.value, 100000000000000000n); assert.equal(receipt.status, 'success')
+  assert.equal(receipt.blockNumber, 27278158n); assert.equal(raw.eth_getBlockByNumber.hash, receipt.blockHash)
+  assert.equal(receipt.gasUsed * receipt.effectiveGasPrice, 3800899000000000n)
+  const incoming = receipt.logs.filter(log => p.sameAddress(log.address, p.ARC_OUTPUTS.EURC.address) && log.topics[2].endsWith(owner.slice(2).toLowerCase()))
+  assert.equal(incoming.reduce((sum, log) => sum + BigInt(log.data), 0n), 87854n)
+  assert.equal(tx.maxPriorityFeePerGas, 1500000000n)
+  assert.match(readFileSync(`${root}api/_lib/uniswap-arc-preview.ts`, 'utf8'), /maxPriorityFeePerGas: '0'/)
+  // Only the invariant under test is reconstructed; this is NOT the original saved review.
+  const f = rpcFixture(); f.attempt.hash = tx.hash; f.attempt.nonce = tx.nonce
+  f.review.request.amount = '0.1'; f.review.transaction.data = tx.input; f.review.gasLimit = tx.gas.toString()
+  f.review.maxFeePerGas = tx.maxFeePerGas.toString(); f.review.maxPriorityFeePerGas = '0'
+  f.rpc.getTransaction = async () => tx
+  await assert.rejects(f.adapter.result(f.attempt), e.ExecutionResultVerificationError)
+})
+await test('real first pilot actions are unsupported by this HEAD and never silently accepted as an approved review', () => {
+  const raw = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/first-pilot-result.json`, 'utf8'))
+  const tx = raw.eth_getTransactionByHash, outer = decodeFunctionData({ abi: p.EXECUTE_ABI, data: tx.input })
+  const [actions, params] = decodeAbiParameters(p.V4_ENVELOPE, outer.args[1][0])
+  assert.equal(outer.args[0], '0x1004'); assert.equal(actions, '0x070b100e'); assert.equal(params.length, 4)
+  const suffixId = tx.input.slice(-32), quoteId = [suffixId.slice(0, 8), suffixId.slice(8, 12), suffixId.slice(12, 16), suffixId.slice(16, 20), suffixId.slice(20)].join('-')
+  const request = { ...setup().ports.input(), amount: '0.1' }
+  assert.throws(() => p.decodeNativeEconomics({ chainId: 5042, from: tx.from, to: tx.to, data: tx.input, value: tx.value }, request, 1n, quoteId), /unsupported_actions/)
+})
+await test('review fee mismatch remains unknown with clear non-failure guidance and blocks another send', async () => {
+  const f = setup({ result: async () => { throw new e.ExecutionResultVerificationError() } })
+  await f.controller.confirm(await f.review())
+  assert.equal(f.controller.current().phase, 'unknown'); assert.match(f.controller.current().error, /does not mean.*failed/)
+  assert.match(f.controller.current().error, /gas or fee parameters differ/)
+  await f.controller.prepare(); assert.equal(f.sent().length, 1)
+})
+await test('wallet-scoped history and targeted old-record checks cannot bypass unresolved attempts or restore send authority', async () => {
+  const f = setup({ result: async () => ({ status: 'confirmed', output: '1000000', fee: '1' }) })
+  await f.controller.confirm(await f.review()); const first = f.controller.history()[0]
+  await f.controller.confirm(await f.review()); const records = f.controller.history()
+  assert.equal(records.length, 2); assert.deepEqual(f.controller.history(other), [])
+  const snapshot = f.controller.history(); snapshot[0].status = 'unknown'; assert.equal(f.controller.history()[0].status, 'confirmed')
+  f.ports.result = async () => { throw Error('rpc-down') }
+  await f.controller.reconcile(owner, undefined, first.id); assert.equal(f.controller.current().phase, 'unknown')
+  assert.equal(f.controller.current().attempt.id, first.id)
+  await f.controller.prepare(); assert.equal(f.sent().length, 2)
+  const reload = setup({ data: f.data }); assert.equal(reload.controller.history().length, 2)
+  await reload.controller.confirm(first.id); assert.equal(reload.sent().length, 0)
 })
 await test('wrong hash/from/router/value/calldata/nonce/chain/gas/fees/type cannot report success', async () => {
   for (const delta of [{ hash: '0x' + 'c'.repeat(64) }, { from: other }, { to: other }, { value: 1n }, { input: '0x' }, { nonce: 8 }, { chainId: 1 }, { gas: 130001n }, { maxFeePerGas: 3000000000n }, { maxPriorityFeePerGas: 1n }, { type: 'legacy' }]) {
