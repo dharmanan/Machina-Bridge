@@ -425,14 +425,61 @@ await test('unrecognized or hostile error objects cannot leak arbitrary fields, 
     assert.match(message, /unclassified provider failure/); assert.ok(!message.includes('SECRET')); assert.ok(!message.includes('999999')); assert.equal(f.sent().length, 0)
   }
 })
-await test('strict quantity decoding rejects JSON-RPC envelopes, numbers and unsafe or malformed quantities', async () => {
-  for (const value of [null, true, 7, 7n, '7', '0x', '0x00', '0x-1', '0x20000000000000', { result: '0x7' }, '0x' + 'f'.repeat(10000)])
+await test('strict quantity decoding rejects JSON-RPC envelopes, bigint and unsafe or malformed hex quantities', async () => {
+  for (const value of [null, true, 7n, '7', '0x', '0x00', '0x-1', '0x20000000000000', { result: '0x7' }, '0x' + 'f'.repeat(10000)])
     assert.throws(() => walletRpc.walletRpcQuantity(value, 'pending'), error => error.kind === 'invalid-response' && error.stage === 'pending')
   for (const n of [0, 7, 12, Number.MAX_SAFE_INTEGER]) assert.equal(walletRpc.walletRpcQuantity('0x' + n.toString(16), 'pending'), n)
 })
+await test('only wallet pending accepts nonnegative safe integer numbers; other RPC stages remain hex-only', () => {
+  for (const value of [0, 7, 12, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(walletRpc.walletRpcQuantity(value, 'pending'), value)
+    assert.equal(walletRpc.walletRpcQuantity(value, 'pending', true), value)
+    assert.equal(walletRpc.walletRpcQuantity('0x' + value.toString(16), 'pending'), value)
+    for (const stage of ['chain-before', 'chain-after', 'latest-before', 'latest-after'])
+      assert.throws(() => walletRpc.walletRpcQuantity(value, stage, true), error => error.kind === 'invalid-response' && error.responseShape === undefined)
+  }
+})
+await test('numeric pending compatibility never coerces invalid numbers or other response types', () => {
+  for (const value of [-1, -0.5, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, '7', '0', '7.0', 7n, null, undefined, true, { result: 7 }, Object(7)])
+    assert.throws(() => walletRpc.walletRpcQuantity(value, 'pending', true), error => error.kind === 'invalid-response' && error.responseShape !== undefined)
+})
+await test('numeric pending can prepare with matching public nonce and never sends merely by reviewing', async () => {
+  const f = setup(), original = f.provider.request, tags = []
+  f.provider.request = args => {
+    if (args.method === 'eth_getTransactionCount') tags.push(args.params[1])
+    return args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.resolve(7) : original(args)
+  }
+  const id = await f.review(); assert.ok(id); assert.equal(f.sent().length, 0)
+  assert.deepEqual(tags, ['latest', 'pending', 'latest']); assert.deepEqual([...f.data], [])
+  f.controller.invalidate(); assert.equal(f.sent().length, 0)
+})
+await test('numeric pending preserves public-wallet disagreement and occupied nonce blocking in Review and Confirm', async () => {
+  for (const confirm of [false, true]) for (const publicPending of [7, 8]) {
+    const f = setup(), id = confirm ? await f.review() : undefined, original = f.provider.request
+    f.ports.preflight = async () => ({ nonce: publicPending, latestNonce: 7 })
+    f.provider.request = args => args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.resolve(8) : original(args)
+    if (confirm) await f.controller.confirm(id); else await f.controller.prepare()
+    assert.match(f.controller.current().error, publicPending === 7 ? /RPC and wallet RPC disagree/ : /another pending transaction/)
+    assert.equal(f.sent().length, 0); assert.deepEqual([...f.data], [])
+  }
+})
+await test('numeric pending still binds Confirm to reviewed nonce and rejects a real account nonce change', async () => {
+  const f = setup(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.resolve(7) : original(args)
+  const id = await f.review()
+  f.ports.preflight = async () => ({ nonce: 8, latestNonce: 8 })
+  f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.resolve(args.params[1] === 'pending' ? 8 : '0x8') : original(args)
+  await f.controller.confirm(id); assert.match(f.controller.current().error, /account nonce changed/); assert.equal(f.sent().length, 0)
+})
+await test('synthetic Confirm serializes numeric pending once into the verified transaction without changing nonce', async () => {
+  const f = setup(), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' ? Promise.resolve(7) : original(args)
+  const id = await f.review(); await f.controller.confirm(id); await f.controller.confirm(id)
+  assert.equal(f.sent().length, 1); assert.equal(f.sent()[0].params[0].nonce, '0x7')
+})
 await test('pending failure diagnostics use only allowlisted shape fields from the original response', async () => {
   const samples = [
-    [undefined, 'undefined', 'n/a', 'n/a'], [null, 'null', 'n/a', 'n/a'], [12, 'number', 'n/a', 'n/a'], [12n, 'bigint', 'n/a', 'n/a'],
+    [undefined, 'undefined', 'n/a', 'n/a'], [null, 'null', 'n/a', 'n/a'], [12.5, 'number', 'n/a', 'n/a'], [12n, 'bigint', 'n/a', 'n/a'],
     ['0x0c', 'string', 4, 'no'], ['0x' + '0'.repeat(63) + 'c', 'string', 66, 'no'], ['0x20000000000000', 'string', 16, 'yes'],
     [{ result: 'SECRET-NONCE', url: 'SECRET-URL', session: 'SECRET-SESSION' }, 'object', 'n/a', 'n/a'],
     ['SECRET-RESPONSE', 'string', 15, 'no'], ['0x' + 'f'.repeat(10000), 'string', 10002, 'not-checked-length'],
@@ -457,7 +504,7 @@ await test('shape classification never traverses objects, calls getters or coerc
   }
 })
 await test('diagnostics are opt-in, pending-only and cannot alter quantity acceptance or rejection', () => {
-  for (const raw of [null, '0x00', { result: '0xc' }, 12]) {
+  for (const raw of [null, '0x00', { result: '0xc' }, -1]) {
     for (const stage of ['chain-before', 'latest-before', 'latest-after'])
       assert.throws(() => walletRpc.walletRpcQuantity(raw, stage, true), error => error.kind === 'invalid-response' && error.responseShape === undefined)
     assert.throws(() => walletRpc.walletRpcQuantity(raw, 'pending'), error => error.kind === 'invalid-response' && error.responseShape === undefined)

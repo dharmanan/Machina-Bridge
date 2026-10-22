@@ -9,7 +9,7 @@ import '../../../src/index.css'
 
 const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321' as const
 const other = '0x2222222222222222222222222222222222222222' as const
-const state = { walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], tx: null as unknown, hash: '', balanceReads: 0, walletLatestNonce: 7, walletPendingNonce: 7, walletReadFailure: '' }
+const state = { walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], tx: null as unknown, hash: '', balanceReads: 0, walletLatestNonce: 7, walletPendingNonce: 7, walletReadFailure: '', numericPending: false }
 let release: ((value: string) => void) | undefined
 let selectedAccount: string = owner
 const arc = defineChain({ id: 5042, name: 'Arc test double', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: ['http://127.0.0.1/never-rpc'] } } })
@@ -32,6 +32,7 @@ connector.getProvider = async args => {
     if (state.walletReadFailure === 'malformed') return { result: '0x7' }
     throw { code: state.walletReadFailure === 'unsupported' ? -32601 : 4100, message: 'SECRET-PROVIDER-DETAILS' }
   }
+  if (args.method === 'eth_getTransactionCount' && args.params?.[1] === 'pending' && state.numericPending) return state.walletPendingNonce
   if (args.method === 'eth_getTransactionCount') return toHex(args.params?.[1] === 'pending' ? state.walletPendingNonce : state.walletLatestNonce)
   if (args.method !== 'eth_sendTransaction') return original.request(args as never)
   state.tx = structuredClone(args.params![0])

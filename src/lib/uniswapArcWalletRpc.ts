@@ -58,6 +58,7 @@ function rejectedQuantityShape(raw: unknown): string {
   return `Response shape: type=${type}; stringLength=${length}; canonicalHexQuantity=${canonical}.`
 }
 export function walletRpcQuantity(raw: unknown, stage: WalletRpcStage, diagnosePending = false): number {
+  if (stage === 'pending' && typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0) return raw
   if (typeof raw !== 'string' || raw.length > 16 || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(raw) || BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER)) {
     const shape = diagnosePending && stage === 'pending' ? rejectedQuantityShape(raw) : undefined
     throw new WalletRpcFailure(stage, 'invalid-response', undefined, shape)

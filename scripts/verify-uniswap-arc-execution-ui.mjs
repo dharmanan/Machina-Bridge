@@ -152,6 +152,19 @@ try {
     }
     await page.evaluate(() => { window.executionUiTest.state.walletReadFailure = '' })
   })
+  await test('numeric wallet pending opens Review without sending and retains mismatch/invalid-response blocks', async () => {
+    await page.evaluate(() => { window.executionUiTest.state.numericPending = true })
+    await prepare(); assert.equal(await sends(), 0)
+    await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
+    await page.evaluate(() => { window.executionUiTest.state.walletPendingNonce = 8 })
+    await review.click(); await page.getByRole('alert').filter({ hasText: 'RPC and wallet RPC disagree' }).waitFor()
+    assert.equal(await sends(), 0); assert.equal(await page.getByRole('dialog').count(), 0)
+    await page.evaluate(() => { window.executionUiTest.state.walletPendingNonce = -1 })
+    await review.click()
+    await page.getByRole('alert').filter({ hasText: 'Response shape: type=number; stringLength=n/a; canonicalHexQuantity=n/a.' }).waitFor()
+    assert.equal(await sends(), 0)
+    await page.evaluate(() => { window.executionUiTest.state.walletPendingNonce = 7; window.executionUiTest.state.numericPending = false })
+  })
   await test('native browser Web Lock blocks a competing submission without a wallet write', async () => {
     await page.evaluate(() => { navigator.locks.request('machina-uniswap-5042:0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321', () => new Promise(resolve => { window.releaseExecutionLock = resolve })); })
     await prepare(); await confirm.click(); await page.getByRole('alert').filter({ hasText: 'Another tab' }).waitFor()
