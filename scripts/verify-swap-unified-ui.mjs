@@ -20,7 +20,7 @@ const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 const real = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/first-pilot-result.json`, 'utf8'))
 const FIRST_HASH = '0x1a5e6d2db765c80787cc428163e6fc0defe2f329b594d775715371a1e5efa921'
-const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321'
+const owner = require('viem/accounts').privateKeyToAccount('0x' + '00'.repeat(31) + '01').address
 const V3_INPUT = parseAbiParameters('address recipient,uint256 amountIn,uint256 amountOutMinimum,bytes path,bool payerIsUser,uint256[] minHopPriceX36')
 const dec = { USDC: 6, EURC: 6, cirBTC: 8, WETH: 18 }
 const AMOUNT = { USDC: '1', EURC: '1', cirBTC: '0.00001', WETH: '0.0003' }
@@ -63,6 +63,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_ALLOWANCE_ONLY === '1' && !/^(the mode chip|existing excessive token allowances)/.test(name)) return
   try { await fn(); count++; console.log(`PASS ${name}`) }
   catch (error) { console.error('Diagnostics:', (await page.locator('body').innerText()).slice(0, 1800), '\nRPC errors:', world.errors.slice(-6), '\nRecent reads:', world.reads.slice(-4).map(r => r.method)); throw error }
 }
@@ -80,7 +81,7 @@ function receiptLogs(tx, hash, blockHash, blockNumber) {
     return [transfer(input.token, owner, adapterAddress, input.amount, 0), transfer(swap.tokenOut, adapterAddress, owner, out, 1)]
   }
   if (!router) return []
-  const outer = decodeFunctionData({ abi: p.EXECUTE_ABI, data: tx.data }), swap = decodeAbiParameters(V3_INPUT, outer.args[1][0]), path = swap[3], hops = (path.length - 2 - 40) / 46
+  const outer = decodeFunctionData({ abi: p.EXECUTE_ABI, data: tx.data }), swap = decodeAbiParameters(V3_INPUT, outer.args[1][outer.args[0] === '0x0a00' ? 1 : 0]), path = swap[3], hops = (path.length - 2 - 40) / 46
   const symbolOf = a => rpc.symbolOf(a), fees = []
   for (let i = 0; i < hops; i++) fees.push(parseInt(path.slice(2 + 40 + i * 46, 2 + 40 + i * 46 + 6), 16))
   const symbolIn = symbolOf(`0x${path.slice(2, 42)}`), symbolOut = symbolOf(`0x${path.slice(path.length - 40)}`), out = rpc.quoteOut(symbolIn, symbolOut, swap[1], fees)
@@ -185,6 +186,27 @@ try {
     assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0)
   })
 
+  await test('existing excessive token allowances are visible on the Swap screen and in fresh Review for EURC, WETH and cirBTC, without any extra wallet request', async () => {
+    for (const [symbol, input, unlimited] of [['EURC', '1', true], ['WETH', '0.0003', false], ['cirBTC', '0.00001', true]]) {
+      const need = parseUnits(input, dec[symbol])
+      rpc.state.tokenAllowance[symbol] = unlimited ? 2n ** 256n - 1n : need + 1n
+      await pick(symbol, 'USDC'); await amount.fill(''); await amount.fill(input); await quoted()
+      const notice = page.getByRole('note', { name: 'Existing Permit2 token allowance', exact: true })
+      await notice.waitFor(); await notice.getByText(unlimited ? /unlimited/ : /above this swap amount/).waitFor()
+      assert.ok((await notice.textContent()).includes(`${symbol} → Permit2`))
+      const before = await sends(), signatures = await page.evaluate(() => window.swapUiTest.state.signs.length)
+      await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByRole('note', { name: 'Existing Permit2 token allowance', exact: true }).waitFor()
+      const text = await dialog.innerText(); assert.match(text, /not be automatically increased or revoked/); assert.ok(text.includes(`only ${input} ${symbol}`))
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+      assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signatures)
+      assert.equal(rpc.state.tokenAllowance[symbol], unlimited ? 2n ** 256n - 1n : need + 1n)
+      rpc.state.tokenAllowance[symbol] = 0n
+    }
+    await page.evaluate(() => window.swapUiTest.chain(1))
+    assert.equal(await page.getByRole('note', { name: 'Existing Permit2 token allowance', exact: true }).count(), 0)
+    await page.evaluate(() => window.swapUiTest.chain(5042)); await pick('USDC', 'EURC'); await amount.fill('')
+  })
+
   await test('all 12 directions quote in both providers; the better price is tagged, the other stays selectable, and no provider is switched silently', async () => {
     const seen = new Set()
     for (const { tokenIn, tokenOut } of tokens.SWAP_DIRECTIONS) {
@@ -194,12 +216,12 @@ try {
       const best = routes.map(r => rpc.quoteOut(tokenIn, tokenOut, units, r.hops.map(h => h.fee))).reduce((m, x) => (x > m ? x : m))
       const shown = await page.getByLabel('Estimated receive').getAttribute('title'); assert.equal(shown, `${formatUnits(best, dec[tokenOut])} ${tokenOut}`, `${tokenIn}>${tokenOut}`)
       assert.equal(await uniCard.getAttribute('aria-checked'), 'true') // still the provider the user chose
-      assert.equal(await page.getByText('Best price', { exact: true }).count(), 1)
+      assert.equal(await page.getByText('Higher output · before gas', { exact: true }).count(), 1)
       seen.add(`${tokenIn}>${tokenOut}`)
     }
     assert.equal(seen.size, 12)
     world.circleBias = 105n; await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted()
-    assert.ok(await circleCard.getByText('Best price', { exact: true }).count()); assert.equal(await uniCard.getByText('Best price', { exact: true }).count(), 0)
+    assert.ok(await circleCard.getByText('Higher output · before gas', { exact: true }).count()); assert.equal(await uniCard.getByText('Higher output · before gas', { exact: true }).count(), 0)
     assert.equal(await uniCard.getAttribute('aria-checked'), 'true'); world.circleBias = 99n
     await shot('quotes-desktop')
     await page.setViewportSize({ width: 390, height: 844 }); await shot('quotes-mobile')
@@ -225,7 +247,7 @@ try {
     await pick('EURC', 'cirBTC'); const details = page.getByLabel('Route support'); await details.locator(':scope > summary').click()
     const uni = details.getByRole('region', { name: 'Uniswap support' }), circ = details.getByRole('region', { name: 'Circle Swap Kit support' })
     const opened = async () => { await page.evaluate(() => document.querySelectorAll('[aria-label="Route support"] details').forEach(node => { node.open = true })) }
-    await uni.getByText(/EURC → USDC \(0\.05%\) → cirBTC \(0\.01%\)/).waitFor(); await uni.getByText(/Two one-time permissions for exactly the amount you swap/).waitFor(); await uni.getByText('Yes', { exact: true }).waitFor()
+    await uni.getByText(/EURC → USDC \(0\.05%\) → cirBTC \(0\.01%\)/).waitFor(); await uni.getByText(/An exact token approval if needed, one free short-lived Permit2 signature/).waitFor(); await uni.getByText('Yes', { exact: true }).waitFor()
     await circ.getByText(/One approval for exactly the amount you swap, then the swap\./).waitFor(); await circ.getByText('Yes', { exact: true }).waitFor()
     await opened(); await uni.getByText(/None yet by this application\. The route was only simulated/).waitFor(); await circ.getByText(/Real swaps on this direction by other wallets are on chain/).waitFor()
     await uni.getByText(/Available \(any wallet, up to the per-swap ceiling\)/).waitFor(); await circ.getByText(/Available \(any wallet, up to the per-swap ceiling\)/).waitFor()
@@ -287,10 +309,10 @@ try {
     await latest.getByText(/wallet adjusted the network fee slightly; it stayed within the maximum you approved/).waitFor(); assert.equal(await latest.getByRole('note').count(), 0); world.walletAdjusts = false; await bumpNonce(); await syncNonce()
   })
 
-  await test('ERC-20 input: both exact approvals are reviewed and confirmed separately, then the swap runs; nothing is unlimited and nothing else is signed', async () => {
+  await test('ERC-20 input: one exact approval continues to a fresh Review, then one PermitSingle signature and the atomic swap', async () => {
     await pick('EURC', 'USDC'); await amount.fill('1'); await quoted()
     const panel = page.getByRole('region', { name: 'Token approvals' });
-    await page.getByRole('button', { name: 'Approve EURC · 2 steps' }).waitFor(); const before = await sends()
+    await page.getByRole('button', { name: 'Approve EURC · 1 step' }).waitFor(); const before = await sends()
     assert.equal(await panel.count(), 0, 'no separate approval panel on the form')
     await review.click(); await panel.getByText('Let Uniswap use exactly 1 EURC').first().waitFor()
     await panel.getByText('1 EURC (exact)').waitFor(); assert.ok((await panel.textContent()).includes(`Allowed spender: ${p.ARC_PERMIT2}`)); assert.equal(await sends(), before) // the spender is in the closed Technical details
@@ -300,20 +322,27 @@ try {
     assert.equal(await review.isDisabled(), true) // an unresolved approval blocks a new swap
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Approval completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
-    await page.getByRole('button', { name: 'Approve EURC · 1 step' }).waitFor(); await review.click()
-    await panel.getByText(/Let the Uniswap router use exactly 1 EURC for 15 minutes/).first().waitFor(); await panel.getByRole('button', { name: 'Confirm approval' }).click()
-    await latest.getByText('Verifying approval', { exact: false }).waitFor(); sent = await lastSent(); assert.ok(p.sameAddress(sent.tx.to, p.ARC_PERMIT2))
-    const approval2 = decodeFunctionData({ abi: viem.parseAbi(['function approve(address token, address spender, uint160 amount, uint48 expiration)']), data: sent.tx.data })
-    assert.ok(p.sameAddress(approval2.args[1], p.ARC_ROUTER)); assert.equal(approval2.args[2], 1_000_000n); await syncWalletSends(); setReceipt(sent.hash, 'success')
-    await recheck(); await page.getByRole('button', { name: 'Review Swap', exact: true }).waitFor(); await bumpNonce(); await syncNonce()
-    assert.equal(await becomesEnabled(), true); await review.click(); await page.getByRole('dialog').getByText(/Your exact approvals are already in place/).waitFor()
+    await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor()
     await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); sent = await lastSent(); assert.equal(sent.tx.value, '0x0')
-    assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[0], '0x00')
+    assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[0], '0x0a00')
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(/Paid 1 EURC · Received 1\.1192 USDC|Paid 1 EURC · Received 1\.119/).waitFor()
     const history = page.getByLabel('Swap history'); await history.getByText(/earlier swaps?/).first().waitFor(); assert.equal(await history.locator('article').filter({ visible: true }).count(), 0) // earlier swaps are a closed list of short summaries; await bumpNonce(); await syncNonce()
     const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method))
-    assert.equal(wallet.some(m => /sign|typedData|wallet_|permit/i.test(m)), false)
+    assert.equal(wallet.filter(m => m === 'eth_signTypedData_v4').length, 1); assert.equal(await sends(), before + 2)
+  })
+
+  await test('MetaMask-style hide and return during an explicitly confirmed PermitSingle request preserves context; no approval or send happens before signature release', async () => {
+    await bumpNonce(); await syncNonce(); await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted()
+    await page.evaluate(() => { window.swapUiTest.state.permitMode = 'held' })
+    const before = await sends(); await review.click(); await confirm.click()
+    await page.getByRole('dialog').getByText('Confirm the free, exact-amount Permit2 signature in your wallet. No swap has been sent.', { exact: true }).waitFor()
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
+    assert.equal(await sends(), before)
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')); window.swapUiTest.state.permitMode = 'sign'; window.swapUiTest.releasePermit() })
+    await latest.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), before + 1)
+    const sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
+    await latest.getByText('Swap completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
   })
 
   await test('all 12 directions can be reviewed, sent and shown as Swap completed with the exact received and paid amounts (approvals already in place for ERC-20 inputs)', async () => {
@@ -415,6 +444,7 @@ try {
   })
 
   await test('the first real swap (0x1a5e…a921): completed on the chain with a plain warning that it differs from the stored Review (the 1.6% fee, the amounts); no program jargon on the screen; shown the same with or without a connected wallet', async () => {
+    const owner = real.eth_getTransactionByHash.from
     // The user's original Review record lives only in their browser and is not available here. This test stores a SYNTHETIC Review of the same
     // request (clearly not the original) and checks how the screen presents the real on-chain transaction against it.
     const request = p.validateArcRequest({ chainId: 5042, tokenIn: 'USDC', tokenOut: 'EURC', owner, recipient: owner, amount: '0.1', minimumOutput: '1', slippageBps: 100, maxNetworkFee: '100000000000000000' })
@@ -556,10 +586,10 @@ try {
     await page.setViewportSize({ width: 1280, height: 900 })
   })
 
-  await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only eth_sendTransaction was ever asked of the wallet', async () => {
+  await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only approved read, exact PermitSingle/Circle signature and transaction methods are allowed', async () => {
     assert.equal(world.external, 0); assert.deepEqual(errors, [])
     assert.equal(methods.some(m => /send|sign|wallet_|personal/i.test(m)), false)
-    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction)$/.test(m)).length, 0, wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction)$/.test(m)).join())
+    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)$/.test(m)).length, 0, wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)$/.test(m)).join())
   })
   console.log(`${count} Chromium unified Swap UI groups PASS. Controlled Arc RPC, Circle estimator and wallet; no real signature, approval or transaction.`)
 } finally { await browser?.close(); await server.close() }

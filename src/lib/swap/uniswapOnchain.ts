@@ -101,7 +101,7 @@ export async function createOnchainReview(request: ArcRequest, ports: OnchainPor
     request: r, transaction: { chainId: 5042, from: r.owner, to: ARC_ROUTER, data, value: `0x${value.toString(16)}` },
     estimatedOutput: estimated.toString(), requiredMinimum: minimum.toString(), requestStartedAt: startedAt, expiresAt,
     routerHash: ARC_ROUTER_HASH, blockNumber: chain.blockNumber.toString(), gasLimit: gas.toString(), maxFeePerGas: maxFee.toString(), maxPriorityFeePerGas: '0',
-    networkFee: fee.toString(), nativeBalance: chain.nativeBalance.toString(), simulation: 'passed', executionBound: false, writesEnabled: false,
+    networkFee: fee.toString(), ...(r.tokenIn === 'USDC' ? { estimatedNetworkFee: (((proof.gas > best.gas ? proof.gas : best.gas) + GAS_OVERHEAD) * chain.gasPrice).toString() } : {}), nativeBalance: chain.nativeBalance.toString(), simulation: 'passed', executionBound: false, writesEnabled: false,
   }
   validateOnchainReview(review, context, startedAt)
   // Defensive: the decoder must reproduce exactly the route that was simulated.

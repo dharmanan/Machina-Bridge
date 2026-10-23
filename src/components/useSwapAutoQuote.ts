@@ -29,7 +29,11 @@ export function useSwapAutoQuote(key: string, enabled: boolean, load: () => Prom
     }
     function visibility() {
       if (document.hidden) { clearTimeout(timer); action.cancel() }
-      else schedule() // Resume an unattempted edit, never retry a failed/expired request.
+      else {
+        // One fresh attempt per return, through the same debounce/pacing. No background polling or error retry loop.
+        attempted = false
+        schedule()
+      }
     }
     document.addEventListener('visibilitychange', visibility)
     schedule()

@@ -1,3 +1,4 @@
+import { existingAllowanceNotice } from './permitSingle'
 import { decodeFunctionData, encodeFunctionData, getAddress, parseAbi, toHex, type Hex } from 'viem'
 import { ARC_PERMIT2, ARC_ROUTER, ARC_TOKENS, sameAddress, tokenUnits, validateArcRequest, type ArcRequest, type ArcSymbol } from '../uniswapArcPolicy'
 import { WalletRpcFailure, walletRpcMessage } from '../uniswapArcWalletRpc'
@@ -72,22 +73,23 @@ export type ApprovalPlan =
   | { state: 'blocked'; reason: 'insufficient_balance' }
   | { state: 'complete' }
   | { state: 'needed'; steps: ApprovalStep[] }
-// What is still missing, from fresh chain reads. Existing approvals that already cover the exact amount are reused; nothing is
+// What token approval is still missing, from fresh chain reads. Existing approvals that already cover the exact amount are reused; nothing is
 // approved "just in case", and an allowance larger than needed is left as it is (the app never raises or revokes without being asked).
 export function planApprovals(requestInput: ArcRequest, reads: ApprovalReads): ApprovalPlan {
   const request = validateArcRequest(requestInput)
   if (request.tokenIn === 'USDC') return { state: 'native_input' }
   const need = tokenUnits(request.amount, ARC_TOKENS[request.tokenIn].decimals)
   if (reads.balance < need) return { state: 'blocked', reason: 'insufficient_balance' }
-  const now = Number(reads.timestamp), steps: ApprovalStep[] = []
+  const steps: ApprovalStep[] = []
   if (reads.tokenAllowance < need) steps.push({ kind: 'token', token: request.tokenIn, spender: ARC_PERMIT2 as Hex, amount: need.toString(), expiration: 0 })
-  if (reads.permitAmount < need || reads.permitExpiration <= reads.timestamp + 180n) steps.push({ kind: 'permit2', token: request.tokenIn, spender: ARC_ROUTER as Hex, amount: need.toString(), expiration: now + PERMIT_VALIDITY_SECONDS })
+  // Router authorisation is now a short-lived PermitSingle signature inside the swap, never a second on-chain approval.
   return steps.length === 0 ? { state: 'complete' } : { state: 'needed', steps }
 }
 
 export interface ApprovalReview {
   id: string; step: ApprovalStep; request: ArcRequest; transaction: ApprovalTransaction; nonce: number
   gas: string; maxFeePerGas: string; maxPriorityFeePerGas: string; networkFee: string; nativeBalance: string; expiresAt: number
+  estimatedNetworkFee: string
   remaining: number // how many approvals this swap still needs, this one included
 }
 export interface ApprovalAttempt {
@@ -255,10 +257,11 @@ export function createUniswapApprovals(ports: ApprovalPorts) {
     const step = validateApprovalStep(plan.steps[0], request, Number(reads.timestamp) * 1000)
     return { step, remaining: plan.steps.length, reads }
   }
-  async function plan(requestInput: ArcRequest): Promise<ApprovalPlan> {
-    const request = validateArcRequest(requestInput)
-    return planApprovals(request, await ports.reads(request.owner as Hex, request.tokenIn))
+  async function inspect(requestInput: ArcRequest) {
+    const request = validateArcRequest(requestInput), reads = await ports.reads(request.owner as Hex, request.tokenIn)
+    return { plan: planApprovals(request, reads), allowanceNotice: existingAllowanceNotice(request, reads.tokenAllowance) }
   }
+  async function plan(requestInput: ArcRequest): Promise<ApprovalPlan> { return (await inspect(requestInput)).plan }
   async function prepare(requestInput: ArcRequest) {
     if (busy || tracking) return
     busy = true
@@ -283,7 +286,7 @@ export function createUniswapApprovals(ports: ApprovalPorts) {
       const nonce = reconcileExecutionNonce(publicState, walletState)
       if (current !== version || contextKey() !== expected) stop('context')
       const review: ApprovalReview = { id: crypto.randomUUID(), step, request, transaction, nonce, gas: gas.toString(), maxFeePerGas: maxFee.toString(), maxPriorityFeePerGas: '0',
-        networkFee: fee.toString(), nativeBalance: reads.nativeBalance.toString(), expiresAt: ports.now() + APPROVAL_REVIEW_TTL_MS, remaining }
+        networkFee: fee.toString(), estimatedNetworkFee: (estimate * reads.gasPrice).toString(), nativeBalance: reads.nativeBalance.toString(), expiresAt: ports.now() + APPROVAL_REVIEW_TTL_MS, remaining }
       intent = { review, context: expected, version: current }
       emit({ phase: 'review', review })
     } catch (error) { if (current === version) emit({ phase: 'idle', error: failureMessage(error) }) }
@@ -296,6 +299,7 @@ export function createUniswapApprovals(ports: ApprovalPorts) {
     let record: ApprovalAttempt | undefined, requested = false
     try {
       const { review } = selected, request = review.request, owner = request.owner as Hex
+      if (review.step.kind !== 'token') stop('changed')
       const ready = () => {
         authorized(request)
         if (selected.version !== version || contextKey() !== selected.context) stop('context')
@@ -393,7 +397,7 @@ export function createUniswapApprovals(ports: ApprovalPorts) {
     await reconcile(owner)
   }
   return {
-    view: () => structuredClone(view), plan, prepare, confirm, reconcile, recover,
+    view: () => structuredClone(view), plan, inspect, prepare, confirm, reconcile, recover,
     history: (owner: string) => journal.read(owner),
     blocking: (owner: string) => { try { return journal.read(owner).some(blocking) } catch { return true } },
     invalidate() { version++; intent = null; if (['review', 'checking', 'preparing'].includes(view.phase)) emit({ phase: 'idle' }) },

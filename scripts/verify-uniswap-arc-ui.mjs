@@ -293,7 +293,11 @@ try {
     await advance(); await page.getByText(/Estimate only\./).waitFor(); assert.equal(apiCalls, before + 1)
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')) })
-    await advance(10000); assert.equal(apiCalls, before + 1); await noReceive()
+    await advance(10000); assert.equal(apiCalls, before + 2); await page.getByText(/Estimate only\./).waitFor()
+    const resumed = apiCalls, circleResumed = circleCalls
+    await page.evaluate(() => { for (let i = 0; i < 3; i++) document.dispatchEvent(new Event('visibilitychange')) })
+    await advance(); assert.equal(apiCalls, resumed + 1); assert.equal(circleCalls, circleResumed + 1)
+    assert.equal(await amount.inputValue(), '0.1')
   })
   await test('both providers are quoted for comparison; selecting Circle only changes the selected provider, and amount/slippage changes refresh both', async () => {
     const before = apiCalls; await page.getByRole('radio', { name: 'Circle Swap Kit quote' }).click(); await advance()

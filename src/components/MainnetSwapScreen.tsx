@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAccount, useBalance } from 'wagmi'
 import { formatUnits } from 'viem'
 import { ArrowDown, Loader2 } from 'lucide-react'
@@ -36,7 +36,7 @@ const CHIP_CLASS = { live: 'border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C]', pi
 
 interface ProviderQuote {
   provider: Provider; state: 'idle' | 'loading' | 'quoted' | 'error' | 'unsupported'
-  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; otherFees?: string; route?: string; expiresIn?: number; message?: string
+  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; otherFees?: string; steps?: string; gasEstimate?: bigint | null; route?: string; expiresIn?: number; message?: string
 }
 
 export default function MainnetSwapScreen() {
@@ -53,6 +53,13 @@ export default function MainnetSwapScreen() {
   const [selectionEpoch, setSelectionEpoch] = useState<Record<Provider, number>>({ uniswap: 0, circle: 0 })
   // A fresh start of a swap that certainly did not happen: the same pair, amount and provider are set up again. Nothing is sent; the user
   // reviews the swap anew (fresh quote, fresh checks) and confirms it again.
+  const continuingApproval = useRef<string | null>(null)
+  const [resumeEpoch, setResumeEpoch] = useState(0)
+  useEffect(() => {
+    const resume = () => { if (!document.hidden) setResumeEpoch(value => value + 1) }
+    document.addEventListener('visibilitychange', resume)
+    return () => document.removeEventListener('visibilitychange', resume)
+  }, [])
   const [retried, setRetried] = useState<string | null>(null)
   const choose = (id: Provider) => { if (id !== provider) {
     setProvider(id)
@@ -123,8 +130,8 @@ export default function MainnetSwapScreen() {
   const walletReady = isConnected && chainId === 5042
   const uniswapQuote: ProviderQuote = !uniswapOffers ? { provider: 'uniswap', state: 'unsupported', message: `Uniswap does not offer ${slippageBps / 100}% slippage. Choose 0.1%, 0.5% or 1%.` }
     : uniswap.current ? { provider: 'uniswap', state: 'quoted', estimatedUnits: BigInt(uniswap.current.estimatedOutput), estimated: formatUnits(BigInt(uniswap.current.estimatedOutput), outDecimals), minimum: formatUnits(BigInt(uniswap.current.requiredMinimum), outDecimals),
-      fee: `${formatUnits(BigInt(uniswap.current.networkFee) + (tokenIn === 'USDC' ? 0n : APPROVAL_FEE_CEILING * BigInt(approvals.plan.state === 'needed' ? approvals.plan.steps.length : approvals.plan.state === 'complete' ? 0 : 2)), 18)} USDC`,
-      otherFees: 'Pool fees included in price', route: uniswap.current.route ?? `${tokenIn} → ${tokenOut}`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
+      fee: `${formatUnits(BigInt(uniswap.current.networkFee) + (tokenIn === 'USDC' ? 0n : APPROVAL_FEE_CEILING * BigInt(approvals.plan.state === 'needed' ? approvals.plan.steps.length : approvals.plan.state === 'complete' ? 0 : 1)), 18)} USDC`,
+      gasEstimate: uniswap.current.source === 'onchain' && uniswap.current.estimatedNetworkFee !== undefined ? BigInt(uniswap.current.estimatedNetworkFee) : null, otherFees: 'Pool fees included in price', steps: tokenIn === 'USDC' ? '1 blockchain transaction' : `${approvals.plan.state === 'needed' ? '3 interactions · 1 free signature + 2 blockchain transactions' : approvals.plan.state === 'complete' ? '2 interactions · 1 free signature + 1 blockchain transaction' : 'Permission check pending; step count unavailable'}`, route: uniswap.current.route ?? `${tokenIn} → ${tokenOut}`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
       : uniswap.loading ? { provider: 'uniswap', state: 'loading' } : uniswap.error ? { provider: 'uniswap', state: 'error', message: uniswap.error }
         : uniswap.expired ? { provider: 'uniswap', state: 'error', message: 'Quote expired. Check the price again before continuing.' } : { provider: 'uniswap', state: 'idle' }
   let circleQuote: ProviderQuote
@@ -134,10 +141,10 @@ export default function MainnetSwapScreen() {
     const text = (fee: { amount: string | null; token: string }) => (fee.amount === null ? 'not estimated' : `${fee.amount} ${fee.token}`)
     let units: bigint | undefined
     try { units = decimalUnits(quote.estimatedOutput, outDecimals) } catch { units = undefined }
-    const gasEstimate = gas.length > 0 && gas.every(fee => fee.amount !== null) ? gas.reduce((sum, fee) => sum + decimalUnits(fee.amount, 18), 0n) : null
+    const gasEstimate = gas.length > 0 && gas.every(fee => fee.amount !== null && fee.token === 'USDC') ? gas.reduce((sum, fee) => sum + decimalUnits(fee.amount, 18), 0n) : null
     circleQuote = { provider: 'circle', state: 'quoted', estimated: quote.estimatedOutput, estimatedUnits: units, minimum: quote.minimumOutput,
       fee: `${formatUnits(circleFeeCeiling(gasEstimate), 18)} USDC`, otherFees: other.map(fee => text(fee)).join(' · ') || 'Not reported',
-      route: 'Circle Swap Kit router', expiresIn: Math.max(0, Math.ceil((quote.expiresAt - circle.now) / 1000)) }
+      gasEstimate: tokenIn === 'USDC' ? gasEstimate : null, steps: tokenIn === 'USDC' ? '1 free signature + 1 blockchain transaction' : '1 approval + 1 swap · 2 blockchain transactions', route: 'Circle Swap Kit router', expiresIn: Math.max(0, Math.ceil((quote.expiresAt - circle.now) / 1000)) }
   } else if (circle.loading) circleQuote = { provider: 'circle', state: 'loading' }
   else if (circle.error) circleQuote = { provider: 'circle', state: 'error', message: circle.error }
   else if (circle.expired) circleQuote = { provider: 'circle', state: 'error', message: 'Quote expired. Check the price again before continuing.' }
@@ -203,8 +210,19 @@ export default function MainnetSwapScreen() {
     if (!canContinue) return
     if (canRetryPrice) { setSelectionEpoch(epoch => ({ ...epoch, [provider]: epoch[provider] + 1 })); return }
     setShowActivity(true)
+    if (needsApproval) continuingApproval.current = quoteKey
     void (needsApproval ? approvals.prepare() : active_.prepare())
   }
+
+  useEffect(() => {
+    if (continuingApproval.current !== quoteKey || provider !== 'uniswap') { continuingApproval.current = null; return }
+    if (['failed', 'rejected', 'mismatch', 'unknown'].includes(approvals.view.phase)) { continuingApproval.current = null; return }
+    if (approvals.view.phase !== 'confirmed' || approvals.plan.state !== 'complete' || executionBusy || document.hidden) return
+    continuingApproval.current = null
+    // Read-only continuation: a fresh independent Review opens. Confirm Swap is still mandatory before any signature/send.
+    setSelectionEpoch(epoch => ({ uniswap: epoch.uniswap + 1, circle: epoch.circle + 1 }))
+    void execution.prepare()
+  }, [quoteKey, provider, approvals.view.phase, approvals.plan.state, executionBusy, resumeEpoch])
 
   // --- transactions: one panel for swaps and approvals, built from this browser's records ---------------------------------------
   // The wording of a mismatch lives in the card's own headline and Review lines, so its generic error text is not repeated.
@@ -304,6 +322,9 @@ export default function MainnetSwapScreen() {
 
         <dl className="space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
           <SummaryLine label="Minimum receive" value={summary ? `${shortenAmount(summary.minimum ?? '0')} ${tokenOut}` : '—'} title={summary ? `${summary.minimum} ${tokenOut}` : undefined} />
+          <SummaryLine label="Remaining wallet steps" value={summary?.steps ?? '—'} />
+          <SummaryLine label="Network fee estimate · remaining" value={summary?.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : summary ? 'Not yet estimated for every remaining step' : '—'} />
+          {tokenOut === 'USDC' && <SummaryLine label="Net estimate after network fee" value={summary?.estimatedUnits !== undefined && summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.estimatedUnits * 10n ** 12n - summary.gasEstimate, 18)} USDC` : summary ? 'Unavailable until all remaining network costs are verified' : '—'} />}
           <SummaryLine label="Network fee cap · all steps" value={summary ? `≤ ${summary.fee}` : '—'} />
           <SummaryLine label={provider === 'circle' ? 'Circle fees' : 'Trading fees'} value={summary?.otherFees ?? '—'} />
           <SummaryLine label="Quote expires in" value={summary ? `${summary.expiresIn} seconds` : '—'} />
@@ -322,6 +343,7 @@ export default function MainnetSwapScreen() {
             : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : 'Enter an amount to see a price.'}</p>}
         </div>
 
+        {provider === 'uniswap' && approvals.allowanceNotice && <p role="note" aria-label="Existing Permit2 token allowance" className="break-words rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">{approvals.allowanceNotice}</p>}
         <ApprovalsPanel dialogOnly approvals={approvals} request={provider === 'uniswap' && uniswapAllowed ? uniswap.request : null} />
         <div className="space-y-2">
           <button id="review-swap" type="button" onClick={continueSwap} disabled={!canContinue}
@@ -358,7 +380,7 @@ export default function MainnetSwapScreen() {
           if (!entry) return <p key={id}>{PROVIDER_NAME[id]}: this pair is not supported.</p>
           const build = executionInBuild(entry, SWAP_EXECUTION, CIRCLE_SWAP_WRITES_ENABLED)
           const approval = entry.approval.kind === 'none' ? 'No approval needed: USDC is sent directly with the swap.'
-            : entry.approval.kind === 'permit2_exact' ? `Two one-time permissions for exactly the amount you swap (never unlimited), each confirmed in your wallet before the swap.`
+            : entry.approval.kind === 'permit2_exact' ? `An exact token approval if needed, one free short-lived Permit2 signature, then the swap. Up to three wallet interactions; never unlimited.`
             : entry.approval.kind === 'adapter_permit' ? 'One signature (no fee) that allows exactly the amount you swap, then the swap.' : 'One approval for exactly the amount you swap, then the swap.'
           return <section key={id} aria-label={`${PROVIDER_NAME[id]} support`} className="space-y-1">
             <h3 className="font-semibold text-slate-900">{PROVIDER_NAME[id]}</h3>
@@ -383,13 +405,15 @@ export default function MainnetSwapScreen() {
 
 function ProviderCard({ id, quote, selected, best, tokenOut, onSelect, onlyOne, quotesOnly }: { id: Provider; quote: ProviderQuote; selected: boolean; best: boolean; tokenOut: string; onSelect(): void; onlyOne: boolean; quotesOnly: boolean }) {
   return <button type="button" role="radio" aria-checked={selected} aria-label={`${PROVIDER_NAME[id]} quote`} onClick={onSelect}
-    className={`min-h-[5.5rem] w-full rounded-2xl border p-3 text-left text-sm transition-colors ${selected ? 'border-[#2F6E0C] bg-[#f4faef]' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
+    className={`min-h-[12rem] w-full rounded-2xl border p-3 text-left text-sm transition-colors ${selected ? 'border-[#2F6E0C] bg-[#f4faef]' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
     <span className="flex items-center justify-between gap-2">
       <span className="font-semibold text-slate-900">{id === 'circle' ? 'Circle' : 'Uniswap'}</span>
-      <span className="flex flex-wrap items-center justify-end gap-1 text-xs">{best && <span className="rounded-full bg-[#2F6E0C] px-2 py-0.5 font-medium text-white">Best price</span>}{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span aria-hidden="true" className="text-[#2F6E0C]">✓</span>}</span>
+      <span className="flex flex-wrap items-center justify-end gap-1 text-xs">{best && <span className="rounded-full bg-[#2F6E0C] px-2 py-0.5 font-medium text-white">Higher output · before gas</span>}{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span aria-hidden="true" className="text-[#2F6E0C]">✓</span>}</span>
     </span>
     {quote.state === 'quoted' && <span className="mt-1 block space-y-0.5">
       <span className="block text-base font-semibold text-slate-900" title={`${quote.estimated} ${tokenOut}`}>{shortenAmount(quote.estimated ?? '0')} {tokenOut}</span>
+      <span className="block text-xs text-slate-500">{quote.steps}</span>
+      <span className="block text-xs text-slate-500">Network estimate: {quote.gasEstimate !== undefined && quote.gasEstimate !== null ? `${formatUnits(quote.gasEstimate, 18)} USDC` : 'all steps not yet estimated'}</span>
       <span className="block text-xs text-slate-600">Minimum {shortenAmount(quote.minimum ?? '0')} {tokenOut}{onlyOne ? ' · only available quote' : ''}</span>
     </span>}
     {quote.state === 'loading' && <span className="mt-1 flex items-center gap-2 text-xs text-slate-500"><Loader2 size={12} className="animate-spin" aria-hidden="true" />Updating price…</span>}

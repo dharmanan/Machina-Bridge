@@ -18,25 +18,34 @@ const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', other = '0x222222222
 const HASH1 = `0x${'a1'.repeat(32)}`, HASH2 = `0x${'b2'.repeat(32)}`
 const request = (tokenIn = 'EURC', amount = '1', extra = {}) => p.validateArcRequest({ chainId: 5042, tokenIn, tokenOut: tokenIn === 'USDC' ? 'EURC' : 'USDC', owner, recipient: owner, amount, minimumOutput: '1', slippageBps: 50, maxNetworkFee: '100000000000000000', ...extra })
 const NEED = 1_000_000n, TS = 1_800_000_000n
+const historicalPermitStep = { kind: 'permit2', token: 'EURC', spender: p.ARC_ROUTER, amount: NEED.toString(), expiration: Number(TS) + 900 }
 const reads = (changes = {}) => ({ timestamp: TS, balance: 5n * NEED, tokenAllowance: 0n, permitAmount: 0n, permitExpiration: 0n, nativeBalance: 5n * 10n ** 18n, gasPrice: 20_000_000_000n, ...changes })
 
 await test('the plan asks only for what is missing, for the exact amount, and reuses approvals that already cover it', () => {
   assert.deepEqual(a.planApprovals(request('USDC'), reads()), { state: 'native_input' })
   assert.deepEqual(a.planApprovals(request(), reads({ balance: NEED - 1n })), { state: 'blocked', reason: 'insufficient_balance' })
   const both = a.planApprovals(request(), reads())
-  assert.equal(both.state, 'needed'); assert.deepEqual(both.steps.map(s => s.kind), ['token', 'permit2'])
-  assert.ok(both.steps.every(s => s.amount === NEED.toString())); assert.ok(p.sameAddress(both.steps[0].spender, p.ARC_PERMIT2)); assert.ok(p.sameAddress(both.steps[1].spender, p.ARC_ROUTER))
-  assert.equal(both.steps[0].expiration, 0); assert.equal(both.steps[1].expiration, Number(TS) + a.PERMIT_VALIDITY_SECONDS)
-  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED })).steps.map(s => s.kind), ['permit2'])
+  assert.equal(both.state, 'needed'); assert.deepEqual(both.steps.map(s => s.kind), ['token'])
+  assert.ok(both.steps.every(s => s.amount === NEED.toString())); assert.ok(p.sameAddress(both.steps[0].spender, p.ARC_PERMIT2))
+  assert.equal(both.steps[0].expiration, 0)
+  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED })), { state: 'complete' })
   assert.deepEqual(a.planApprovals(request(), reads({ permitAmount: NEED, permitExpiration: TS + 900n })).steps.map(s => s.kind), ['token'])
   assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED, permitAmount: NEED, permitExpiration: TS + 900n })), { state: 'complete' })
   assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: 10n * NEED, permitAmount: 10n * NEED, permitExpiration: TS + 900n })), { state: 'complete' }) // larger existing allowances are left alone
-  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED, permitAmount: NEED, permitExpiration: TS + 179n })).steps.map(s => s.kind), ['permit2']) // about to expire
-  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED, permitAmount: NEED - 1n, permitExpiration: TS + 900n })).steps.map(s => s.kind), ['permit2'])
+  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED, permitAmount: NEED, permitExpiration: TS + 179n })), { state: 'complete' }) // about to expire
+  assert.deepEqual(a.planApprovals(request(), reads({ tokenAllowance: NEED, permitAmount: NEED - 1n, permitExpiration: TS + 900n })), { state: 'complete' })
   for (const [symbol, amount, units] of [['cirBTC', '0.00001', 1000n], ['WETH', '0.0003', 300_000_000_000_000n], ['EURC', '1.234567', 1_234_567n]]) assert.equal(a.planApprovals(request(symbol, amount), reads({ balance: 10n ** 21n })).steps[0].amount, units.toString())
 })
+await test('EURC, WETH and cirBTC existing unlimited allowances are reused without a new approval; a missing allowance always asks for the exact amount', () => {
+  for (const [symbol, amount] of [['EURC', '1'], ['WETH', '0.0003'], ['cirBTC', '0.00001']]) {
+    const r = request(symbol, amount), need = p.tokenUnits(amount, p.ARC_TOKENS[symbol].decimals)
+    assert.deepEqual(a.planApprovals(r, reads({ balance: need, tokenAllowance: 2n ** 256n - 1n })), { state: 'complete' })
+    const missing = a.planApprovals(r, reads({ balance: need, tokenAllowance: need - 1n }))
+    assert.equal(missing.steps.length, 1); assert.equal(missing.steps[0].kind, 'token'); assert.equal(missing.steps[0].amount, need.toString())
+  }
+})
 await test('no step can be unlimited, to another spender, for another token or amount, or valid for long', () => {
-  const r = request(), now = Number(TS) * 1000, good = a.planApprovals(r, reads()).steps
+  const r = request(), now = Number(TS) * 1000, good = [...a.planApprovals(r, reads()).steps, historicalPermitStep]
   assert.doesNotThrow(() => a.validateApprovalStep(good[0], r, now)); assert.doesNotThrow(() => a.validateApprovalStep(good[1], r, now))
   const bad = (name, step) => assert.throws(() => a.validateApprovalStep(step, r, now), undefined, name)
   bad('unlimited token approval', { ...good[0], amount: (2n ** 256n - 1n).toString() }); bad('unlimited Permit2 approval', { ...good[1], amount: (2n ** 160n - 1n).toString() })
@@ -48,7 +57,7 @@ await test('no step can be unlimited, to another spender, for another token or a
   assert.throws(() => a.validateApprovalStep({ kind: 'token', token: 'USDC', spender: p.ARC_PERMIT2, amount: NEED.toString(), expiration: 0 }, request('USDC'), now)) // native USDC never needs an approval
 })
 await test('approval transactions are exactly the two approved shapes and decode back to the same step; anything else is not an approval', () => {
-  const r = request(), steps = a.planApprovals(r, reads()).steps
+  const r = request(), steps = [...a.planApprovals(r, reads()).steps, historicalPermitStep]
   for (const step of steps) {
     const tx = a.approvalTransaction(owner, step)
     assert.equal(tx.value, '0x0'); assert.equal(tx.chainId, 5042); assert.ok(p.sameAddress(tx.from, owner))
@@ -92,7 +101,7 @@ function setup(options = {}) {
 }
 await test('review: the first missing approval, its exact fee ceiling and nonce are shown; nothing is requested from the wallet', async () => {
   const f = setup(), id = await f.review(), v = f.controller.view().review
-  assert.ok(id); assert.equal(v.remaining, 2); assert.equal(v.step.kind, 'token'); assert.equal(v.step.amount, NEED.toString()); assert.equal(v.nonce, 4)
+  assert.ok(id); assert.equal(v.remaining, 1); assert.equal(v.step.kind, 'token'); assert.equal(v.step.amount, NEED.toString()); assert.equal(v.nonce, 4)
   assert.equal(BigInt(v.networkFee), BigInt(v.gas) * BigInt(v.maxFeePerGas)); assert.equal(v.gas, '69000'); assert.equal(v.maxFeePerGas, '40000000000'); assert.ok(BigInt(v.networkFee) <= a.APPROVAL_FEE_CEILING)
   assert.equal(v.maxPriorityFeePerGas, '0'); assert.equal(f.sent.length, 0); assert.equal(f.data.size, 0) // review writes nothing
   assert.equal(JSON.stringify(v.transaction).includes('ffffffff'), false)
@@ -121,17 +130,13 @@ await test('a confirmed approval is only "Confirmed" when the sent transaction i
     assert.equal(f.controller.blocking(owner), expected === 'pending')
   }
 })
-await test('after the token approval, the Permit2 approval is the next step; once both exist nothing more is offered', async () => {
+await test('after the exact token approval, no on-chain Permit2 approval is ever offered; historical decoding remains available', async () => {
   const f = setup({ result: async () => ({ status: 'settled', state: 'success', fee: '5', blockNumber: '9', bound: true, allowanceOk: true }) })
   await f.controller.confirm(await f.review()); await f.controller.reconcile(owner)
   f.world.reads.tokenAllowance = NEED; f.world.nonce = 5
-  const id = await f.review(); assert.equal(f.controller.view().review.step.kind, 'permit2'); assert.equal(f.controller.view().review.remaining, 1); assert.equal(f.controller.view().review.nonce, 5)
-  await f.controller.confirm(id); assert.equal(f.sent.length, 2); assert.ok(p.sameAddress(f.sent[1].to, p.ARC_PERMIT2))
-  const decoded = a.decodeApprovalTransaction({ to: f.sent[1].to, data: f.sent[1].data, value: f.sent[1].value }); assert.equal(decoded.kind, 'permit2'); assert.ok(p.sameAddress(decoded.spender, p.ARC_ROUTER)); assert.equal(decoded.amount, NEED.toString())
-  await f.controller.reconcile(owner)
-  Object.assign(f.world.reads, { permitAmount: NEED, permitExpiration: TS + 900n }); f.world.nonce = 6
+  assert.deepEqual(await f.controller.plan(request()), { state: 'complete' })
   await f.controller.prepare(request()); assert.equal(f.controller.view().phase, 'idle'); assert.match(f.controller.view().error, /already in place/)
-  assert.deepEqual(a.createApprovalJournal(f.storage).read(owner).map(x => x.step.kind), ['token', 'permit2'])
+  assert.equal(f.sent.length, 1); assert.deepEqual(a.createApprovalJournal(f.storage).read(owner).map(x => x.step.kind), ['token'])
 })
 await test('nothing is requested when: execution is not authorized, the wallet or network differs, another transaction is unresolved, or the amount is not covered', async () => {
   const gated = setup({ world: { authorized: false } }); await gated.controller.prepare(request()); assert.equal(gated.controller.view().phase, 'idle'); assert.match(gated.controller.view().error, /controlled pilot/); assert.equal(gated.sent.length, 0)
@@ -153,7 +158,7 @@ await test('double confirm, a stale id, an expired review, a changed wallet or c
   const expired = setup(), expiredId = await expired.review(); expired.clock.now += a.APPROVAL_REVIEW_TTL_MS + 1; await expired.controller.confirm(expiredId); assert.equal(expired.sent.length, 0); assert.match(expired.controller.view().error, /expired/)
   const wallet = setup(), walletId = await wallet.review(); wallet.world.ctx = { ...wallet.world.ctx, owner: other }; await wallet.controller.confirm(walletId); assert.equal(wallet.sent.length, 0)
   const connector = setup(), connectorId = await connector.review(); connector.world.ctx = { ...connector.world.ctx, connectorId: 'c2' }; await connector.controller.confirm(connectorId); assert.equal(connector.sent.length, 0)
-  const changed = setup(), changedId = await changed.review(); changed.world.reads.tokenAllowance = NEED; await changed.controller.confirm(changedId); assert.equal(changed.sent.length, 0); assert.match(changed.controller.view().error, /changed|Review/)
+  const changed = setup(), changedId = await changed.review(); changed.world.reads.tokenAllowance = NEED; await changed.controller.confirm(changedId); assert.equal(changed.sent.length, 0); assert.match(changed.controller.view().error, /changed|Review|already in place/)
   const nonce = setup(), nonceId = await nonce.review(); nonce.world.nonce = 9; await nonce.controller.confirm(nonceId); assert.equal(nonce.sent.length, 0); assert.match(nonce.controller.view().error, /nonce/i)
   const gate = setup(), gateId = await gate.review(); gate.world.authorized = false; await gate.controller.confirm(gateId); assert.equal(gate.sent.length, 0)
   const cancelled = setup(), cancelledId = await cancelled.review(); cancelled.controller.invalidate(); await cancelled.controller.confirm(cancelledId); assert.equal(cancelled.sent.length, 0); assert.equal(cancelled.controller.view().phase, 'idle')
@@ -227,7 +232,7 @@ function rpcFixture(changes = {}) {
 await test('the adapter verifies hash, sender, nonce, target, calldata, value and the fee ceiling, then re-reads the allowance at the receipt block', async () => {
   const ok = rpcFixture(); const r = await ok.adapter.result(ok.attempt)
   assert.deepEqual(r, { status: 'settled', state: 'success', fee: (46_000n * 21_000_000_000n).toString(), blockNumber: '100', bound: true, allowanceOk: true }); assert.equal(ok.calls[0].blockNumber, 100n)
-  const permitStep = a.planApprovals(request(), reads({ tokenAllowance: NEED })).steps[0], permitTx = a.approvalTransaction(owner, permitStep)
+  const permitStep = historicalPermitStep, permitTx = a.approvalTransaction(owner, permitStep)
   const permit = rpcFixture({ allowance: [NEED, permitStep.expiration, 0] }); Object.assign(permit.attempt, { step: permitStep, transaction: permitTx }); permit.rpc.getTransaction = async () => ({ hash: HASH1, from: owner, to: permitTx.to, chainId: 5042, nonce: 4, input: permitTx.data, value: 0n, gas: 69000n, maxFeePerGas: 40_000_000_000n })
   assert.equal((await permit.adapter.result(permit.attempt)).allowanceOk, true)
   const wrongExpiry = rpcFixture({ allowance: [NEED, permitStep.expiration + 1, 0] }); Object.assign(wrongExpiry.attempt, { step: permitStep, transaction: permitTx }); wrongExpiry.rpc.getTransaction = permit.rpc.getTransaction

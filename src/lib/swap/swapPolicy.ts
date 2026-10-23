@@ -22,6 +22,7 @@ export function validateOnchainReview(review: ArcReview, context: ReviewContext,
   if (typeof review.route !== 'string' || review.route !== economics.routeText) fail('unverified_review')
   const gas = uint(review.gasLimit), price = uint(review.maxFeePerGas), tip = uint(review.maxPriorityFeePerGas)
   if (gas < 21000n || gas > 2000000n || price <= 0n || price > 100000000000n || tip > price) fail('gas_limit')
+  if (review.estimatedNetworkFee !== undefined && uint(review.estimatedNetworkFee) > uint(review.networkFee)) fail('balance_or_fee')
   const fee = gas * price
   if (fee !== uint(review.networkFee) || fee > uint(r.maxNetworkFee) || uint(review.nativeBalance) < routeTransactionValue(r) + fee) fail('balance_or_fee')
 }

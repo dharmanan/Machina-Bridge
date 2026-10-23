@@ -40,7 +40,7 @@ export interface IntentReport { verdict: IntentVerdict; checks: IntentCheck[]; d
 
 export interface ReviewedIntent {
   owner: Hex; recipient: Hex; router: Hex; chainId: number; nonce: number
-  value: bigint; calldata: Hex
+  value: bigint; calldata: Hex; calldataHash?: Hex
   gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; feeCeiling: bigint
   outputToken: Hex; requiredMinimum: bigint
   // Token symbols/decimals only for readable messages.
@@ -133,7 +133,7 @@ export function compareToReview(input: ComparisonInput): IntentReport {
   if (tx.value !== reviewed.value) differences.push('The native value sent differs from the reviewed value.')
 
   // Calldata: exact bytes, or an explained difference.
-  if (lc(tx.input) === lc(reviewed.calldata)) checks.push(check('calldata', 'Calldata', 'match', 'The calldata is byte-for-byte the reviewed calldata.'))
+  if (reviewed.calldataHash ? lc(keccak256(tx.input)) === lc(reviewed.calldataHash) : lc(tx.input) === lc(reviewed.calldata)) checks.push(check('calldata', 'Calldata', 'match', reviewed.calldataHash ? 'The calldata matches the signed transaction commitment saved before submission.' : 'The calldata is byte-for-byte the reviewed calldata.'))
   else {
     const explained = describeProgramDifferences(decodeUniversalRouterCalldata(reviewed.calldata), decodeUniversalRouterCalldata(tx.input))
     differences.push(...explained)

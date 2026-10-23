@@ -31,7 +31,7 @@ export function useUniswapArcExecution(input: ArcRequest | null, blocked: (owner
     context: () => alive.current ? context.current : { ...context.current, connected: false }, input: () => alive.current ? currentInput.current : null,
     authorize: (request, current) => swapExecutionRestriction(SWAP_EXECUTION, request, current) === null && !currentBlocked.current(current.owner),
     fresh: request => source.read(request), quoteNow: request => source.now(request),
-    preflight: arcExecutionRpc.preflight, result: arcExecutionRpc.result,
+    preflight: arcExecutionRpc.preflight, signPermit: arcExecutionRpc.signPermit, result: arcExecutionRpc.result,
     provider: () => connectedExecutionProvider(currentConnector.current),
     storage: { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
     lock: browserExecutionLock,
@@ -64,7 +64,7 @@ export function useUniswapArcExecution(input: ArcRequest | null, blocked: (owner
     const changed = (event: StorageEvent) => {
       if (event.key?.startsWith('machina.uniswap.arc.execution.v1:')) { controller.invalidate(); void controller.reconcile() }
     }
-    const hidden = () => { if (document.hidden) { controller.invalidate(); source.invalidate() } }
+    const hidden = () => { if (document.hidden && !controller.current().walletRequestOpen) { controller.invalidate(); source.invalidate() } }
     window.addEventListener('storage', changed); document.addEventListener('visibilitychange', hidden)
     return () => {
       alive.current = false; controller.invalidate(); source.invalidate()
@@ -140,6 +140,7 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
         <p className="font-medium">Wallet security</p>
         <p>Browser extensions may modify swap transactions before signing. Check the final amount, additional fees and recipient in your wallet. If anything differs from this review, reject the transaction.</p>
       </div>
+      {view.allowanceNotice && <p role="note" aria-label="Existing Permit2 token allowance" className="break-words rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{view.allowanceNotice}</p>}
       {review && inp && out && <>
         <p>You pay {review.request.amount} {review.request.tokenIn} and receive about {formatUnits(BigInt(review.estimatedOutput), out.decimals)} {review.request.tokenOut}.</p>
         <dl className="space-y-2 text-sm">
@@ -150,6 +151,8 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
           {feeToOthers && netMinimum !== null && <ReviewLine label="Minimum after that fee" value={`${formatUnits(netMinimum, out.decimals)} ${review.request.tokenOut}`} />}
           <ReviewLine label="Slippage allowed" value={`${review.request.slippageBps / 100}%`} />
           {poolFees.length > 0 && <ReviewLine label="Pool fee (already in the estimate)" value={poolFees.join(' + ')} />}
+          {!nativeIn && <ReviewLine label="Remaining wallet interactions" value="2 · 1 free signature + 1 blockchain transaction" />}
+          {!nativeIn && <ReviewLine label="Permit2 spending permission" value={`${review.request.amount} ${review.request.tokenIn} · expires with transaction deadline`} />}
           <ReviewLine label="Network fee (maximum)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
           {nativeIn && <ReviewLine label="Most USDC you could spend" value={`${formatUnits(reviewValue(review) + BigInt(review.networkFee), 18)} USDC`} />}
           <ReviewLine label="Route" value={review.route ?? `${review.request.tokenIn} → ${review.request.tokenOut}`} />
@@ -157,7 +160,7 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
         </dl>
         {feeToOthers && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">This swap sends part of what you receive to another address, as shown above. Confirm only if you accept this fee.</p>}
         {portions === null && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">We couldn’t read every detail of this swap. Don’t confirm it; review a fresh swap.</p>}
-        <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked in the transaction prepared by this app: all swap output goes to your wallet, with no additional recipient fee. Your wallet or browser extensions may change the transaction before signing.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Your exact approvals are already in place.'} Confirm before this review expires.</p>
+        <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked in the transaction prepared by this app: all swap output goes to your wallet, with no additional recipient fee. Your wallet or browser extensions may change the transaction before signing.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Your token approval is in place. Confirming requests one free, exact-amount Permit2 signature, followed by one gas-paying swap transaction. Reject either wallet request to stop.'} Confirm before this review expires.</p>
         <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
           <dl className="mt-2 space-y-1">
             <ReviewLine label="Contract" value={`Uniswap Universal Router · ${ARC_ROUTER}`} />
@@ -169,10 +172,11 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
             <ReviewLine label="Network" value="Arc Mainnet · 5042" />
           </dl></details>
       </>}
+      {view.phase === 'checking' && view.walletRequestOpen && <p role="status" className="text-sm text-slate-600">{remainingMs <= 0 ? 'This review expired while the permission request was open. Reject the outstanding wallet request; no swap will be sent from this review.' : 'Confirm the free, exact-amount Permit2 signature in your wallet. No swap has been sent.'}</p>}
       <div className="flex gap-3">
         <button type="button" onClick={execution.cancel} className="flex-1 rounded-xl border border-slate-300 px-4 py-3">Cancel</button>
         <button type="button" onClick={() => { void execution.confirm() }} disabled={view.phase !== 'review' || remainingMs < 5000 || portions === null}
-          className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? 'Rechecking…' : remainingMs <= 0 ? 'Review expired' : remainingMs < 5000 ? 'Review expiring' : 'Confirm Swap'}</button>
+          className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? (view.walletRequestOpen ? 'Sign permission in wallet…' : 'Rechecking…') : remainingMs <= 0 ? 'Review expired' : remainingMs < 5000 ? 'Review expiring' : 'Confirm Swap'}</button>
       </div>
     </div>
   </dialog>

@@ -21,6 +21,7 @@ export function useUniswapApprovals(input: ArcRequest | null, blockedBy: (owner:
   const queryClient = useQueryClient()
   const [view, setView] = useState<ApprovalView>({ phase: 'idle' })
   const [plan, setPlan] = useState<PlanState>({ state: 'idle' })
+  const [notice, setNotice] = useState<{ binding: string; text: string | null } | null>(null)
   const [history, setHistory] = useState<ApprovalAttempt[]>([])
   const [stored, setStored] = useState<StoredApprovals[]>([])
   const alive = useRef(true)
@@ -55,8 +56,8 @@ export function useUniswapApprovals(input: ArcRequest | null, blockedBy: (owner:
     if (!request || !needsApproval) { setPlan({ state: 'idle' }); return }
     setPlan(previous => (previous.state === 'needed' || previous.state === 'complete' ? previous : { state: 'loading' }))
     try {
-      const next = await controller.plan(request)
-      if (version === planVersion.current && alive.current) setPlan(next)
+      const next = await controller.inspect(request)
+      if (version === planVersion.current && alive.current) { setPlan(next.plan); setNotice({ binding, text: next.allowanceNotice }) }
     } catch { if (version === planVersion.current && alive.current) setPlan({ state: 'error' }) }
   }
   useEffect(() => {
@@ -98,7 +99,7 @@ export function useUniswapApprovals(input: ArcRequest | null, blockedBy: (owner:
 
   const visibleView: ApprovalView = !isConnected || !sameAddress(address, view.attempt?.owner ?? view.review?.request.owner ?? address ?? '') ? { phase: 'idle' } : view
   return {
-    view: visibleView, plan, history, stored, needsApproval, remainingMs: view.review ? Math.max(0, view.review.expiresAt - Date.now()) : 0,
+    view: visibleView, plan, allowanceNotice: needsApproval && notice?.binding === binding && ['needed', 'complete'].includes(plan.state) ? notice.text : null, history, stored, needsApproval, remainingMs: view.review ? Math.max(0, view.review.expiresAt - Date.now()) : 0,
     blocking: (owner: string) => controller.blocking(owner),
     prepare: () => (currentInput.current ? controller.prepare(currentInput.current) : Promise.resolve()),
     confirm: () => (view.review ? controller.confirm(view.review.id) : Promise.resolve()),
@@ -129,7 +130,7 @@ export function ApprovalsPanel({ approvals, request, dialogOnly = false }: { app
     {plan.state === 'loading' || plan.state === 'idle' ? <p role="status" className="text-slate-500">Checking your current approvals…</p> : null}
     {plan.state === 'error' && <p role="status" className="text-amber-800">We couldn’t read your current approvals just now. Nothing was requested; please try again.</p>}
     {plan.state === 'blocked' && <p role="status" className="text-amber-800">Your wallet does not hold {amountText}.</p>}
-    {plan.state === 'complete' && <p role="status" className="text-[#2F6E0C]">Approvals for exactly {amountText} are in place. You can review the swap.</p>}
+    {plan.state === 'complete' && <p role="status" className="text-[#2F6E0C]">Your token allowance covers {amountText}. The swap still requires a free, short-lived Permit2 signature and your wallet transaction confirmation.</p>}
     {plan.state === 'needed' && !review && !dialogOnly && <>
       <p className="text-slate-700">This swap needs {plan.steps.length === 1 ? '1 approval' : `${plan.steps.length} approvals`} for exactly {amountText}, never more. Each one is confirmed separately in your wallet and has a small network fee.</p>
       <ol className="list-decimal space-y-1 pl-5 text-slate-700">{plan.steps.map(step => <li key={step.kind}>{kindText(step)}</li>)}</ol>
@@ -138,9 +139,11 @@ export function ApprovalsPanel({ approvals, request, dialogOnly = false }: { app
     </>}
     {review && <div className="space-y-2 rounded-xl bg-slate-50 p-3">
       <p className="font-medium">{kindText(review.step)}</p>
+      <p className="text-xs text-slate-600">Full flow: this gas-paying token approval, a fresh swap Review, one free exact Permit2 signature, then one gas-paying swap. Three wallet interactions in total. Each wallet request requires your confirmation. The token approval has no automatic expiry; the subsequent Permit2 signature is short-lived.</p>
       <dl className="space-y-1">
         <Row label="Amount" value={`${formatUnits(BigInt(review.step.amount), token.decimals)} ${review.step.token} (exact)`} />
         {review.step.expiration > 0 && <Row label="Valid until" value={`${new Date(review.step.expiration * 1000).toISOString().slice(11, 19)} UTC`} />}
+        <Row label="Network fee (estimate · this approval)" value={`${formatUnits(BigInt(review.estimatedNetworkFee), 18)} USDC`} />
         <Row label="Network fee (maximum)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
         <Row label="This review expires in" value={`${Math.ceil(approvals.remainingMs / 1000)} seconds`} />
       </dl>

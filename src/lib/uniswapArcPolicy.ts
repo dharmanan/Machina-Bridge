@@ -184,7 +184,7 @@ export interface ArcReview {
   route?: string
   request: ArcRequest; transaction: ArcTransaction; estimatedOutput: string; requiredMinimum: string; requestStartedAt: number; expiresAt: number
   routerHash: string; blockNumber: string; gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string
-  networkFee: string; nativeBalance: string; simulation: 'passed'; executionBound: false; writesEnabled: false
+  networkFee: string; estimatedNetworkFee?: string; nativeBalance: string; simulation: 'passed'; executionBound: false; writesEnabled: false
   quoteId?: string
 }
 export function validateArcReview(review: ArcReview, context: { owner: string; chainId: number; connected: boolean }, now = Date.now()): void {

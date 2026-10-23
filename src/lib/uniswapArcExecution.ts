@@ -1,5 +1,5 @@
 import { WalletRpcFailure, walletRpcRead, walletRpcQuantity, walletRpcMessage } from './uniswapArcWalletRpc'
-import { decodeFunctionData, encodeFunctionData, toHex, type Hex } from 'viem'
+import { decodeFunctionData, encodeFunctionData, keccak256, toHex, type Hex } from 'viem'
 import { ARC_ROUTER, EXECUTE_ABI, UNISWAP_ARC_WRITES_ENABLED, requestKey, sameAddress, uint, validateArcRequest, type ArcRequest, type ArcReview } from './uniswapArcPolicy'
 import { reviewValue, validateReview } from './swap/swapPolicy'
 import type { ChainSummary, IntentSummary, IntentVerdict } from './swap/transactionEvidence'
@@ -17,10 +17,13 @@ export interface StatusLogEntry { at: number; status: AttemptStatus; note: strin
 export interface SwapAttempt {
   id: string; review: ArcReview; nonce: number; status: AttemptStatus; createdAt: number; hash?: Hex; output?: string; fee?: string
   // Chain facts and the Review comparison are stored separately: a chain success never implies Review verification.
+  // Signed calldata commitment only; the PermitSingle signature itself is never persisted.
+  submittedCalldataHash?: Hex
   chain?: ChainSummary; intent?: IntentSummary; log?: StatusLogEntry[]
 }
 export interface ExecutionView {
   phase: 'idle' | 'preparing' | 'review' | 'checking' | AttemptStatus
+  allowanceNotice?: string
   approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
   // A status lookup in progress. The status already known stays visible; only this flag changes.
   checking?: boolean
@@ -54,7 +57,8 @@ class NonceRpcConflict extends Error {
 export interface ExecutionPorts {
   context(): ExecutionContext; input(): ArcRequest | null
   fresh(input: ArcRequest): Promise<ArcReview>; quoteNow(input: ArcRequest): number
-  preflight(review: ArcReview): Promise<ExecutionNonceState>
+  preflight(review: ArcReview, signedData?: Hex): Promise<ExecutionNonceState & { allowanceNotice?: string }>
+  signPermit?(review: ArcReview, provider: ExecutionProvider): Promise<Hex>
   provider(): Promise<ExecutionProvider>
   result(attempt: SwapAttempt, submitted?: (intent: IntentSummary) => void): Promise<ChainResult>
   storage: Pick<Storage, 'getItem' | 'setItem'>
@@ -160,10 +164,11 @@ function validateLog(l: unknown) {
 function validateAttempt(value: unknown, owner: string): SwapAttempt {
   if (!value || typeof value !== 'object') return stop('storage')
   const a = value as SwapAttempt
-  if (Object.keys(a).some(k => !['id', 'review', 'nonce', 'status', 'createdAt', 'hash', 'output', 'fee', 'chain', 'intent', 'log'].includes(k)) ||
+  if (Object.keys(a).some(k => !['id', 'review', 'nonce', 'status', 'createdAt', 'hash', 'output', 'fee', 'chain', 'intent', 'log', 'submittedCalldataHash'].includes(k)) ||
     !/^[a-f0-9-]{36}$/i.test(a.id) || !isNonce(a.nonce) || !Number.isSafeInteger(a.createdAt) ||
     !ATTEMPT_STATUSES.includes(a.status) ||
     !a.review || !sameAddress(a.review.request?.owner, owner) || (a.hash !== undefined && !isTransactionHash(a.hash))) return stop('storage')
+  if (a.submittedCalldataHash !== undefined && (!isTransactionHash(a.submittedCalldataHash) || a.review?.request?.tokenIn === 'USDC')) stop('storage')
   // Historical reviews are checked at their original timestamp, solely for tracking. Never restored as send authority.
   validateReview(a.review, { owner, chainId: 5042, connected: true }, a.review.requestStartedAt)
   if (['pending', 'confirmed', 'failed', 'mismatch'].includes(a.status) && !a.hash) return stop('storage')
@@ -285,7 +290,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     if (a.status === status && a.log && a.log.length > 0) return { ...a, status }
     return { ...a, status, log: [...(a.log ?? []), { at, status, note }].slice(-40) }
   }
-  let intent: { id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
+  let intent: { allowanceNotice?: string; id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
   const contextKey = () => { const c = ports.context(); return JSON.stringify([c.owner.toLowerCase(), c.connected, c.chainId, c.connectorId]) }
   function emit(next: ExecutionView) { view = structuredClone(next); try { ports.changed?.(structuredClone(view)) } catch { /* Observer cannot interrupt recording. */ } }
   function requireEnabled() {
@@ -302,12 +307,15 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
   }
   function errorCode(error: unknown) {
     const code = error instanceof Error ? error.message : ''
-    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired', 'allowance_missing', 'insufficient_input_balance'].includes(code) ? code
+    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired', 'allowance_missing', 'insufficient_input_balance', 'permit_invalid'].includes(code) ? code
       : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
   }
   function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
     if (error instanceof WalletRpcFailure) return `${stage} nonce check: ${walletRpcMessage(error)}`
     if (error instanceof ExecutionNonceObservationError && error.message === 'wallet_nonce') return `${stage} nonce check: The wallet RPC returned inconsistent eth_getTransactionCount(latest/pending/latest) observations: ${error.reason === 'latest-changed' ? 'latest changed during the reads' : 'pending was below latest'}. No transaction was requested.`
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 4001) return 'The wallet permission was rejected. No swap transaction was requested.'
+    if (error instanceof Error && error.message === 'allowance_changed') return 'The existing token allowance changed since Review. Review a fresh swap to see the current permission; no swap transaction was requested.'
+    if (error instanceof Error && error.message === 'permit_invalid') return 'The Permit2 signature, nonce or deadline could not be verified. No swap transaction was requested.'
     const code = errorCode(error), message = executionMessage(code)
     if (!['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(code)) return message
     // Only validated public integers are included, never a raw wallet/RPC error.
@@ -315,14 +323,16 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       ? `Public latest/pending ${error.publicState.latestNonce}/${error.publicState.nonce}; wallet latest/pending ${error.walletState.latestNonce}/${error.walletState.nonce}. ` : ''
     return `${stage} nonce check: ${detail}${message}`
   }
-  async function checkedNonce(selected: NonNullable<typeof intent>, provider: ExecutionProvider, expected?: number) {
+  async function checkedNonce(selected: NonNullable<typeof intent>, provider: ExecutionProvider, expected?: number, signedData?: Hex) {
     // One bounded recheck can reconcile a moving head or transient stale result.
     // Repeat the full balance/gas/router/simulation preflight, not just the nonce.
     let highestObserved = -1
     for (let pass = 0; pass < 2; pass++) {
       try {
         ready(selected)
-        const publicState = await ports.preflight(structuredClone(selected.review))
+        const publicState = await ports.preflight(structuredClone(selected.review), signedData)
+        if (expected !== undefined && publicState.allowanceNotice !== selected.allowanceNotice) stop('allowance_changed')
+        selected.allowanceNotice = publicState.allowanceNotice
         if (!isNonce(publicState.nonce) || !isNonce(publicState.latestNonce) || publicState.nonce < publicState.latestNonce) stop('public_nonce')
         highestObserved = Math.max(highestObserved, publicState.nonce)
         ready(selected)
@@ -359,13 +369,14 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       const fresh = await ports.fresh(input)
       if (currentVersion !== version || contextKey() !== expectedContext || !ports.input() || requestKey(ports.input()!) !== requestKey(input) || requestKey(fresh.request) !== requestKey(input)) stop('context')
       const review = tightenExecutionReview(fresh, ports.context(), ports.quoteNow(input))
-      const selected = { id: crypto.randomUUID(), review, nonce: 0, context: expectedContext, version: currentVersion }
+      if (input.tokenIn !== 'USDC' && !ports.signPermit) stop('permit_invalid')
+      const selected = { allowanceNotice: undefined as string | undefined, id: crypto.randomUUID(), review, nonce: 0, context: expectedContext, version: currentVersion }
       const provider = await ports.provider()
       selected.nonce = await checkedNonce(selected, provider)
       executionTransaction(review, selected.nonce)
       ready(selected)
       intent = selected
-      emit({ phase: 'review', approvalId: selected.id, review })
+      emit({ phase: 'review', approvalId: selected.id, review, allowanceNotice: selected.allowanceNotice })
     } catch (error) { if (currentVersion === version) emit({ phase: 'idle', error: failureMessage(error, 'Review') }) }
     finally { busy = false }
   }
@@ -376,15 +387,28 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     let attempt: SwapAttempt | undefined, requested = false
     try {
       ready(selected)
-      emit({ phase: 'checking', approvalId, review: selected.review })
+      emit({ phase: 'checking', approvalId, allowanceNotice: selected.allowanceNotice, review: selected.review })
       await ports.lock(selected.review.request.owner, async () => {
         ready(selected)
         if (journal.read(selected.review.request.owner).some(blocking)) stop('busy')
         const provider = await ports.provider()
         await checkedNonce(selected, provider, selected.nonce)
         ready(selected)
-        const transaction = executionTransaction(selected.review, selected.nonce)
-        let record: SwapAttempt = { id: selected.id, review: structuredClone(selected.review), nonce: selected.nonce, createdAt: Date.now(), status: 'awaiting_wallet' }
+        // Confirm Swap explicitly authorizes the shown free PermitSingle signature and subsequent wallet transaction.
+        let signedData: Hex | undefined
+        if (selected.review.request.tokenIn !== 'USDC') {
+          if (!ports.signPermit) stop('permit_invalid')
+          emit({ phase: 'checking', approvalId, allowanceNotice: selected.allowanceNotice, review: selected.review, walletRequestOpen: true })
+          signedData = await ports.signPermit!(structuredClone(selected.review), provider)
+          if (!signedData) stop('permit_invalid')
+          emit({ phase: 'checking', approvalId, allowanceNotice: selected.allowanceNotice, review: selected.review, walletRequestOpen: false })
+          ready(selected)
+          // Mandatory exact signed transaction simulation, current Permit2 nonce, gas and wallet/public nonce checks after signing.
+          await checkedNonce(selected, provider, selected.nonce, signedData)
+          ready(selected)
+        }
+        const transaction = { ...executionTransaction(selected.review, selected.nonce), ...(signedData ? { data: signedData } : {}) }
+        let record: SwapAttempt = { id: selected.id, review: structuredClone(selected.review), nonce: selected.nonce, createdAt: Date.now(), status: 'awaiting_wallet', ...(signedData ? { submittedCalldataHash: keccak256(signedData) } : {}) }
         attempt = record
         journal.save(record) // Must succeed BEFORE the only wallet write method can run.
         ready(selected)

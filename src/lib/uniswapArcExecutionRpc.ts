@@ -1,7 +1,8 @@
+import { existingAllowanceNotice, attachPermit, permitMessage, PERMIT_DOMAIN, PERMIT_SINGLE_TYPES, validatePermitCalldata } from './swap/permitSingle'
 import { createPublicClient, defineChain, erc20Abi, http, keccak256, parseAbi, type Hex, type Transport } from 'viem'
 import { ARC_PERMIT2, ARC_ROUTER, ARC_ROUTER_HASH, ARC_TOKENS, sameAddress, tokenUnits, uint, type ArcReview } from './uniswapArcPolicy'
 import { reviewValue } from './swap/swapPolicy'
-import { ExecutionNonceObservationError, ExecutionVerificationError, executionDeadlineMs, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
+import { ExecutionNonceObservationError, ExecutionVerificationError, executionDeadlineMs, executionTransaction, type ExecutionProvider, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
 import { compareToReview, ownerFlows, summarizeIntent, type IntentSummary, type ChainLog, type ChainReceipt, type ChainTx, type ReviewedIntent } from './swap/transactionEvidence'
 
 const RPC = 'https://rpc.mainnet.arc.io'
@@ -27,7 +28,7 @@ const transferTopic = keccak256(new TextEncoder().encode('Transfer(address,addre
 
 // The injectable client is a test seam; production uses only the pinned, read-only Arc RPC.
 export function createArcExecutionRpc(rpc = client) {
-  async function preflight(review: ArcReview) {
+  async function preflight(review: ArcReview, signedData?: Hex) {
     const r = review.request, account = r.owner as Hex, output = ARC_TOKENS[r.tokenOut], input = ARC_TOKENS[r.tokenIn], value = reviewValue(review), erc20Input = r.tokenIn !== 'USDC'
     const needed = tokenUnits(r.amount, input.decimals), fee = uint(review.networkFee)
     if (await rpc.getChainId() !== 5042) reject()
@@ -43,29 +44,34 @@ export function createArcExecutionRpc(rpc = client) {
     if (block.timestamp >= BigInt(deadline)) throw new Error('expired')
     if (balance < value + fee || pendingBalance < value + fee ||
       price <= 0n || price > uint(review.maxFeePerGas) || typeof block.baseFeePerGas !== 'bigint' || block.baseFeePerGas > uint(review.maxFeePerGas)) reject()
+    let allowanceNotice: string | null = null
     if (erc20Input) {
-      // An ERC-20 input is pulled through Permit2: the wallet must hold it and have approved exactly what this swap needs, twice
-      // (token -> Permit2, then Permit2 -> router, unexpired). A missing approval is its own, actionable answer.
+      // An ERC-20 input needs a sufficient token -> Permit2 allowance. The second layer is the signed PermitSingle,
+      // consumed atomically by the exact signed call below. No on-chain Permit2 approval fallback.
       const [held, toPermit2, permit] = await Promise.all([
         rpc.readContract({ address: input.address, abi: erc20Abi, functionName: 'balanceOf', args: [account], blockNumber }),
         rpc.readContract({ address: input.address, abi: erc20Abi, functionName: 'allowance', args: [account, ARC_PERMIT2], blockNumber }),
         rpc.readContract({ address: ARC_PERMIT2, abi: PERMIT2_ABI, functionName: 'allowance', args: [account, input.address, ARC_ROUTER], blockNumber }),
       ])
       if (held < needed) throw new Error('insufficient_input_balance')
-      if (toPermit2 < needed || permit[0] < needed || BigInt(permit[1]) <= block.timestamp + 120n) throw new Error('allowance_missing')
+      if (toPermit2 < needed) throw new Error('allowance_missing')
+      allowanceNotice = existingAllowanceNotice(r, toPermit2)
+      if (signedData) await validatePermitCalldata(review, signedData, permit[2], block.timestamp)
     }
-    const call = { account, to: ARC_ROUTER, data: review.transaction.data, value, gas: uint(review.gasLimit),
+    const call = { account, to: ARC_ROUTER, data: signedData ?? review.transaction.data, value, gas: uint(review.gasLimit),
       maxFeePerGas: uint(review.maxFeePerGas), maxPriorityFeePerGas: uint(review.maxPriorityFeePerGas), blockNumber } as const
-    await rpc.call(call) // Exact tightened calldata, no state overrides or fake balances.
-    const estimated = await rpc.estimateGas(call)
-    if (estimated <= 0n || estimated > uint(review.gasLimit)) reject()
+    if (!erc20Input || signedData) {
+      await rpc.call(call) // Exact tightened calldata, no state overrides or fake balances.
+      const estimated = await rpc.estimateGas(call)
+      if (estimated <= 0n || estimated > uint(review.gasLimit)) reject()
+    } // An unsigned ERC-20 Review is preparation only; signing must be followed by the exact, non-overridden simulation above.
     try {
       const before = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
       const nonce = await rpc.getTransactionCount({ address: account, blockTag: 'pending' })
       const latestNonce = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
       if (![before, nonce, latestNonce].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('public_nonce')
       if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('public', Math.max(before, nonce, latestNonce))
-      return { nonce, latestNonce }
+      return { nonce, latestNonce, ...(allowanceNotice ? { allowanceNotice } : {}) }
     } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new Error('public_nonce') }
   }
   // The transaction and receipt are read from the public RPC only. The result keeps two separate answers:
@@ -95,7 +101,7 @@ export function createArcExecutionRpc(rpc = client) {
     const outputToken = ARC_TOKENS[request.tokenOut]
     const reviewed: ReviewedIntent = {
       owner: request.owner as Hex, recipient: request.recipient as Hex, router: ARC_ROUTER as Hex, chainId: 5042, nonce: attempt.nonce,
-      value: BigInt(expected.value), calldata: attempt.review.transaction.data, gasLimit: BigInt(expected.gas), maxFeePerGas: BigInt(expected.maxFeePerGas),
+      value: BigInt(expected.value), calldata: attempt.review.transaction.data, calldataHash: attempt.submittedCalldataHash, gasLimit: BigInt(expected.gas), maxFeePerGas: BigInt(expected.maxFeePerGas),
       maxPriorityFeePerGas: BigInt(expected.maxPriorityFeePerGas), feeCeiling: uint(attempt.review.networkFee), outputToken: outputToken.address as Hex,
       requiredMinimum: uint(attempt.review.requiredMinimum), outputSymbol: request.tokenOut, outputDecimals: outputToken.decimals,
     }
@@ -144,6 +150,14 @@ export function createArcExecutionRpc(rpc = client) {
         effectiveGasPrice: receipt.effectiveGasPrice.toString(), fee: fee.toString(), received: received === null ? null : (received < 0n ? '0' : received.toString()), sent: sent === null ? null : sent.toString(), checkedAt },
     }
   }
-  return { preflight, result }
+  async function signPermit(review: ArcReview, provider: ExecutionProvider): Promise<Hex> {
+    const blockNumber = await rpc.getBlockNumber({ cacheTime: 0 })
+    const [block, allowance] = await Promise.all([rpc.getBlock({ blockNumber }), rpc.readContract({ address: ARC_PERMIT2, abi: PERMIT2_ABI, functionName: 'allowance', args: [review.request.owner as Hex, ARC_TOKENS[review.request.tokenIn].address, ARC_ROUTER], blockNumber })])
+    const message = permitMessage(review, allowance[2], block.timestamp)
+    const payload = { domain: PERMIT_DOMAIN, types: { ...PERMIT_SINGLE_TYPES, EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }] }, primaryType: 'PermitSingle', message }
+    const signature = await provider.request({ method: 'eth_signTypedData_v4', params: [review.request.owner, JSON.stringify(payload, (_, value) => typeof value === 'bigint' ? value.toString() : value)] })
+    return attachPermit(review, allowance[2], block.timestamp, signature)
+  }
+  return { preflight, result, signPermit }
 }
 export const arcExecutionRpc = createArcExecutionRpc()

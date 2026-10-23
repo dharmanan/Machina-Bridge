@@ -269,12 +269,11 @@ function preflightFixture(tokenIn = 'EURC', tokenOut = 'USDC', changes = {}) {
     return { review, request, calls, rpc, adapter: createArcExecutionRpc(rpc) }
   })()
 }
-await test('preflight for an ERC-20 input checks the token balance and BOTH allowances, simulates the exact calldata with no state override, and sends no value', async () => {
+await test('unsigned ERC-20 preparation checks balance and token allowance, but cannot authorize a send or simulate an absent signature', async () => {
   for (const [tokenIn, tokenOut] of [['EURC', 'USDC'], ['cirBTC', 'EURC'], ['WETH', 'USDC']]) {
     const f = await preflightFixture(tokenIn, tokenOut)
     assert.deepEqual(await f.adapter.preflight(f.review), { nonce: 3, latestNonce: 3 })
-    const call = f.calls.find(c => Array.isArray(c) && c[0] === 'call')[1]
-    assert.equal(call.data, f.review.transaction.data); assert.equal(call.value, 0n); assert.equal(call.stateOverride, undefined); assert.ok(p.sameAddress(call.account, owner))
+    assert.equal(f.calls.some(c => Array.isArray(c) && c[0] === 'call'), false)
     assert.ok(f.calls.includes('balanceOf') && f.calls.includes('allowance'))
   }
 })
@@ -283,17 +282,13 @@ await test('ERC-20 preflight: a missing, short or expiring approval is "allowanc
   const cases = [
     ['token approval missing', { state: { toPermit2: 0n } }, 'allowance_missing'],
     ['token approval below the amount', { state: { toPermit2: need - 1n } }, 'allowance_missing'],
-    ['Permit2 approval missing', { state: { permit: [0n, 0, 0] } }, 'allowance_missing'],
-    ['Permit2 approval below the amount', { state: { permit: [need - 1n, Number(CHAIN_TS) + 900, 0] } }, 'allowance_missing'],
-    ['Permit2 approval about to expire', { state: { permit: [need, Number(CHAIN_TS) + 100, 0] } }, 'allowance_missing'],
-    ['Permit2 approval expired', { state: { permit: [need, Number(CHAIN_TS), 0] } }, 'allowance_missing'],
     ['not enough of the input token', { state: { held: need - 1n } }, 'insufficient_input_balance'],
   ]
   for (const [name, changes, code] of cases) { const f = await preflightFixture('EURC', 'USDC', changes); await assert.rejects(f.adapter.preflight(f.review), e => e.message === code, name); assert.equal(f.calls.some(c => Array.isArray(c) && c[0] === 'call'), false) }
   const poor = await preflightFixture('EURC', 'USDC', { state: { balance: 1n } }); await assert.rejects(poor.adapter.preflight(poor.review), /verification/) // cannot pay the network fee
   const expired = await preflightFixture('EURC', 'USDC', { rpc: { getBlock: async () => ({ hash: `0x${'aa'.repeat(32)}`, timestamp: CHAIN_TS + 121n, baseFeePerGas: 1n }) } }); await assert.rejects(expired.adapter.preflight(expired.review), /expired/)
-  const reverts = await preflightFixture('EURC', 'USDC', { rpc: { call: async () => { throw Error('execution reverted') } } }); await assert.rejects(reverts.adapter.preflight(reverts.review))
-  const hungry = await preflightFixture('EURC', 'USDC', { rpc: { estimateGas: async () => 10n ** 9n } }); await assert.rejects(hungry.adapter.preflight(hungry.review), /verification/)
+  const reverts = await preflightFixture('USDC', 'EURC', { rpc: { call: async () => { throw Error('execution reverted') } } }); await assert.rejects(reverts.adapter.preflight(reverts.review))
+  const hungry = await preflightFixture('USDC', 'EURC', { rpc: { estimateGas: async () => 10n ** 9n } }); await assert.rejects(hungry.adapter.preflight(hungry.review), /verification/)
 })
 await test('native USDC input needs no allowance and is checked for the amount plus the fee ceiling', async () => {
   const f = await preflightFixture('USDC', 'EURC', { state: { toPermit2: 0n, permit: [0n, 0, 0] } })
