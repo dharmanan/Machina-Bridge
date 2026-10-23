@@ -1,6 +1,6 @@
 // SERVER ONLY. Never import this module from src. Secrets and upstream JSON stay here.
 import { createPublicClient, defineChain, erc20Abi, http, keccak256, type Transport } from 'viem'
-import { ARC_NATIVE, ARC_USDC, ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, fail, minimumAtSlippage, nativeAmount, usdcAmount, sameAddress, uint, validateArcRequest, validateArcReview, verifyNativeCalldata, type ArcRequest, type ArcReview, type ArcTransaction } from '../../src/lib/uniswapArcPolicy.ts'
+import { ARC_NATIVE, ARC_USDC, ARC_ROUTER, legacyApiOutput, ARC_ROUTER_HASH, decodeNativeEconomics, fail, minimumAtSlippage, nativeAmount, usdcAmount, sameAddress, uint, validateArcRequest, validateArcReview, verifyNativeCalldata, type ArcRequest, type ArcReview, type ArcTransaction } from '../../src/lib/uniswapArcPolicy.ts'
 
 const API = 'https://trade-api.gateway.uniswap.org/v1/quote'
 const RPC = 'https://rpc.mainnet.arc.io'
@@ -40,7 +40,7 @@ function hasFailure(value: unknown): boolean {
 export function quoteBody(request: ArcRequest) {
   const r = validateArcRequest(request)
   return { type: 'EXACT_INPUT', amount: usdcAmount(r.amount).toString(), tokenInChainId: 5042, tokenOutChainId: 5042,
-    tokenIn: ARC_USDC, tokenOut: ARC_OUTPUTS[r.tokenOut].address, swapper: r.owner, recipient: r.recipient,
+    tokenIn: ARC_USDC, tokenOut: legacyApiOutput(r).address, swapper: r.owner, recipient: r.recipient,
     protocols: r.tokenOut === 'EURC' ? ['V4'] : ['V3'], ...(r.tokenOut === 'EURC' ? { hooksOptions: 'V4_NO_HOOKS' } : {}), routingPreference: 'BEST_PRICE', slippageTolerance: r.slippageBps / 100,
     permitAmount: 'EXACT', generatePermitAsTransaction: false }
 }
@@ -54,7 +54,7 @@ function inspectQuoteEconomics(raw: unknown, request: ArcRequest) {
   for (const value of [response.txFailureReason,response.txFailureReasons,q.txFailureReason,q.txFailureReasons]) if (hasFailure(value)) fail('simulation_failed')
   const erc20 = sameAddress(q.input?.token, ARC_USDC)
   const expectedInput = erc20 ? usdcAmount(r.amount) : nativeAmount(r.amount)
-  if (q.chainId !== 5042 || !sameAddress(q.swapper, r.owner) || (!erc20 && !sameAddress(q.input?.token, ARC_NATIVE)) || uint(q.input?.amount) !== expectedInput || !sameAddress(q.output?.token, ARC_OUTPUTS[r.tokenOut].address)) fail('quote_context')
+  if (q.chainId !== 5042 || !sameAddress(q.swapper, r.owner) || (!erc20 && !sameAddress(q.input?.token, ARC_NATIVE)) || uint(q.input?.amount) !== expectedInput || !sameAddress(q.output?.token, legacyApiOutput(r).address)) fail('quote_context')
   if ((q.tradeType !== undefined && q.tradeType !== 'EXACT_INPUT') || (erc20 && (q.tradeType !== 'EXACT_INPUT' || uint(q.input.maximumAmount) !== expectedInput))) fail('quote_trade_type')
   if (q.output.recipient !== undefined && !sameAddress(q.output.recipient, r.recipient)) fail('quote_recipient')
   if ((q.portionBips !== undefined && uint(String(q.portionBips)) !== 0n) || (q.portionAmount !== undefined && uint(q.portionAmount) !== 0n)) fail('unsupported_fee_or_split')
@@ -77,7 +77,7 @@ function inspectQuoteEconomics(raw: unknown, request: ArcRequest) {
   if (erc20 || q.aggregatedOutputs !== undefined) {
     if (!Array.isArray(q.aggregatedOutputs) || q.aggregatedOutputs.length !== 1) fail('unsupported_fee_or_split')
     const aggregated = q.aggregatedOutputs[0]
-    if (!aggregated || !sameAddress(aggregated.token, ARC_OUTPUTS[r.tokenOut].address) || !sameAddress(aggregated.recipient, r.recipient) || aggregated.bps !== 10000 || uint(aggregated.amount) !== estimated || uint(aggregated.minAmount) !== uint(q.output.minimumAmount) || (aggregated.fee !== undefined && uint(String(aggregated.fee)) !== 0n)) fail('aggregated_output_mismatch')
+    if (!aggregated || !sameAddress(aggregated.token, legacyApiOutput(r).address) || !sameAddress(aggregated.recipient, r.recipient) || aggregated.bps !== 10000 || uint(aggregated.amount) !== estimated || uint(aggregated.minAmount) !== uint(q.output.minimumAmount) || (aggregated.fee !== undefined && uint(String(aggregated.fee)) !== 0n)) fail('aggregated_output_mismatch')
     if (Object.keys(aggregated).some(k => !['token','recipient','bps','amount','minAmount','fee'].includes(k))) fail('unsupported_aggregated_field')
   }
   const rawTx = response.swapTransaction
@@ -92,7 +92,7 @@ function inspectQuoteEconomics(raw: unknown, request: ArcRequest) {
     const pool = q.route[0][0]
     const expectedType = economics.profile === 'arc-usdc-v4-single-hop' ? 'v4-pool' : 'v3-pool'
     if (typeof pool.address !== 'string' || pool.address.toLowerCase() !== economics.poolIdentity?.toLowerCase()) fail('pool_identity_mismatch')
-    if (pool.type !== expectedType || !sameAddress(pool.tokenIn?.address, ARC_USDC) || !sameAddress(pool.tokenOut?.address, ARC_OUTPUTS[r.tokenOut].address) || pool.tokenIn.chainId !== 5042 || pool.tokenOut.chainId !== 5042 || String(pool.tokenIn.decimals) !== '6' || String(pool.tokenOut.decimals) !== String(ARC_OUTPUTS[r.tokenOut].decimals) || uint(pool.amountIn) !== expectedInput || uint(pool.amountOut) !== estimated || uint(pool.fee) !== BigInt(economics.fee)) fail('route_metadata_mismatch')
+    if (pool.type !== expectedType || !sameAddress(pool.tokenIn?.address, ARC_USDC) || !sameAddress(pool.tokenOut?.address, legacyApiOutput(r).address) || pool.tokenIn.chainId !== 5042 || pool.tokenOut.chainId !== 5042 || String(pool.tokenIn.decimals) !== '6' || String(pool.tokenOut.decimals) !== String(legacyApiOutput(r).decimals) || uint(pool.amountIn) !== expectedInput || uint(pool.amountOut) !== estimated || uint(pool.fee) !== BigInt(economics.fee)) fail('route_metadata_mismatch')
     if (expectedType === 'v4-pool' && (!sameAddress(pool.hooks, ARC_NATIVE) || uint(pool.tickSpacing) !== BigInt(economics.tickSpacing!))) fail('route_hook_or_tick')
   }
   return { transaction: tx, estimatedOutput: estimated.toString(), requiredMinimum: minimum.toString(), economics, quoteId }
@@ -126,7 +126,7 @@ export function createArcPreviewService(ports = { fetch: globalThis.fetch, clien
     try {
       if (await ports.client.getChainId() !== 5042) fail('wrong_rpc_chain')
       const blockNumber = await ports.client.getBlockNumber({ cacheTime: 0 })
-      const output = ARC_OUTPUTS[request.tokenOut]
+      const output = legacyApiOutput(request)
       const [code, tokenCode, decimals, nativeBalance, gasPrice] = await Promise.all([
         ports.client.getCode({ address: ARC_ROUTER, blockNumber }),
         ports.client.getCode({ address: output.address, blockNumber }),

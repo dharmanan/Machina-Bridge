@@ -79,27 +79,26 @@ try {
   const amount = page.getByRole('textbox', { name: 'Swap amount' })
   const review = page.getByRole('button', { name: 'Review Swap', exact: true })
   const confirm = page.getByRole('button', { name: 'Confirm Swap', exact: true })
-  const transactionStatus = page.getByRole('region', { name: 'Uniswap transaction status' })
+  const transactionStatus = page.getByRole('article', { name: 'Latest transaction' }) // the latest transaction only; the history is a separate, collapsed list
   const sends = () => page.evaluate(() => window.executionUiTest.state.requests.filter(r => r.method === 'eth_sendTransaction').length)
   async function prepare(symbol = 'EURC') {
     await page.getByRole('combobox', { name: 'To token' }).selectOption(symbol); await amount.fill('0.1'); await review.click()
     await page.getByRole('dialog').waitFor(); await confirm.waitFor()
   }
   await test('existing wallet connection and explicit Review are required; no automatic quote/send on mount', async () => {
-    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true); assert.equal(apiCalls, 0)
+    assert.equal(await review.isDisabled(), true); assert.equal(apiCalls, 0)
     await page.evaluate(() => window.executionUiTest.connect(5042)); await amount.fill('0.1')
     assert.equal(await review.isEnabled(), true); assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
   })
-  await test('pilot UI blocks cirBTC execution, other wallets and more than 0.1 USDC without any send', async () => {
+  await test('pilot UI blocks other directions, other wallets and more than 0.1 USDC with a stated reason, and without any send', async () => {
     await page.getByRole('combobox', { name: 'To token' }).selectOption('cirBTC')
-    assert.equal(await review.count(), 0)
-    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true)
+    assert.equal(await review.isDisabled(), true); await page.getByText(/Execution is limited to the controlled pilot \(USDC → EURC\)/).waitFor()
     await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')
-    await amount.fill('0.100001'); assert.equal(await review.count(), 0)
+    await amount.fill('0.100001'); assert.equal(await review.isDisabled(), true); await page.getByText(/controlled pilot allows at most 0\.1 USDC/).waitFor()
     await amount.fill('0.1'); await page.evaluate(() => window.executionUiTest.account(true))
-    await page.getByRole('button', { name: 'Swap disabled in Preview' }).waitFor(); assert.equal(await review.count(), 0)
-    await page.evaluate(() => window.executionUiTest.account(false)); await review.waitFor()
-    assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
+    await page.getByText(/limited to the approved pilot wallet|Connect the wallet that will pay/).waitFor(); assert.equal(await review.isDisabled(), true)
+    await page.evaluate(() => window.executionUiTest.account(false)); await page.waitForFunction(() => !document.evaluate("//button[normalize-space()='Review Swap']", document, null, 9, null).singleNodeValue?.disabled)
+    assert.equal(await review.isEnabled(), true); assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
   })
   await test('Review fetches fresh data, runs actual read-only client and shows independent approval summary', async () => {
     await page.getByText(/Read-only simulation passed/).waitFor()
@@ -134,20 +133,21 @@ try {
       if (change === 'token') { await page.getByRole('combobox', { name: 'From token' }).selectOption('EURC'); await page.getByRole('combobox', { name: 'From token' }).selectOption('USDC') }
       await page.evaluate(() => { window.executionUiTest.state.balanceMode = ''; window.executionUiTest.releaseBalance() })
       await page.getByText('Checking current token balance…').waitFor({ state: 'hidden' })
-      assert.equal(await amount.inputValue(), change === 'manual' ? '0.03' : '0.1'); assert.equal(await sends(), 0)
+      assert.equal(await amount.inputValue(), change === 'manual' ? '0.03' : change === 'token' ? '' : '0.1') // changing the input token clears the amount (its units change); a late balance never refills it
+      assert.equal(await sends(), 0)
       await amount.fill('0.1')
     }
   })
-  await test('ERC-20 percentages use the selected token decimals; Circle MAX never enables execution', async () => {
+  await test('ERC-20 percentages use the selected token decimals and the per-swap ceiling; Circle never enables execution', async () => {
     await page.getByRole('combobox', { name: 'From token' }).selectOption('cirBTC')
     await page.getByRole('button', { name: '75%', exact: true }).click()
-    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.75')
-    assert.equal(await review.count(), 0)
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.00012') // 0.75 cirBTC held, limited to 0.00012 cirBTC per swap
+    assert.equal(await review.isDisabled(), true)
+    assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0) // the pilot build never offers an approval for a route it cannot send
     await page.getByRole('combobox', { name: 'From token' }).selectOption('USDC'); await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')
-    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
-    assert.equal(await page.getByRole('button', { name: 'MAX', exact: true }).isDisabled(), true)
-    await page.getByText(/Circle has no verified network fee ceiling/).waitFor(); assert.equal(await review.count(), 0)
-    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap'); await amount.fill('0.1')
+    await amount.fill('0.1'); await page.getByRole('radio', { name: 'Circle Swap Kit quote' }).click()
+    await page.getByText(/Circle Swap Kit swaps are not part of the controlled pilot/).waitFor(); assert.equal(await review.isDisabled(), true)
+    await page.getByRole('radio', { name: 'Uniswap quote' }).click(); await amount.fill('0.1')
   })
   await test('Review reports RPC nonce disagreement before offering confirmation and exposes only safe counts', async () => {
     await page.evaluate(() => { window.executionUiTest.state.walletLatestNonce = 6; window.executionUiTest.state.walletPendingNonce = 6 })
@@ -223,39 +223,39 @@ try {
     assert.ok(Number(decodeFunctionData({ abi: p.EXECUTE_ABI, data: records[0].review.transaction.data }).args[2]) * 1000 > records[0].review.expiresAt)
     await page.clock.fastForward(45000)
     await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
-    await page.evaluate(() => window.executionUiTest.release()); await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor()
+    await page.evaluate(() => window.executionUiTest.release()); await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor()
     const state = await cacheWallet(); await page.getByRole('link', { name: /View on Arc Explorer/ }).filter({ hasText: state.hash }).waitFor()
   })
   await test('reload resumes pending transaction from localStorage without signing or resending', async () => {
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
-    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
+    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
   })
-  await test('pending history survives direction/provider changes and remains wallet-scoped with read-only rechecks', async () => {
-    const history = page.getByRole('region', { name: 'Swap history' }), before = await sends()
-    await history.waitFor(); await page.getByRole('button', { name: 'Reverse direction' }).click()
-    await history.getByRole('link', { name: 'Open swap on Arc Explorer' }).first().waitFor()
-    assert.equal(await review.count(), 0)
+  await test('the pending transaction survives direction and provider changes; rechecks are read-only; other wallets keep their records visible', async () => {
+    const before = await sends(), latest = transactionStatus
+    await latest.waitFor(); await page.getByRole('button', { name: 'Reverse direction' }).click()
+    await latest.getByRole('link', { name: /View on Arc Explorer/ }).waitFor(); assert.equal(await review.isDisabled(), true)
     await page.getByRole('button', { name: 'Reverse direction' }).click()
-    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('circle')
-    await history.getByRole('button', { name: /Recheck swap/ }).first().click()
-    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor()
-    assert.equal(await sends(), before)
-    await page.evaluate(() => window.executionUiTest.account(true)); await history.waitFor({ state: 'hidden' }); assert.equal(await transactionStatus.count(), 0)
-    await page.evaluate(() => window.executionUiTest.account(false)); await history.waitFor()
-    await page.getByRole('combobox', { name: 'Quote source' }).selectOption('uniswap'); await amount.fill('0.1')
+    await page.getByRole('radio', { name: 'Circle Swap Kit quote' }).click()
+    await latest.getByRole('button', { name: 'Check transaction status' }).click()
+    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), before)
+    await page.evaluate(() => window.executionUiTest.account(true))
+    // The other wallet is connected: the records of the first wallet stay readable (history is not tied to the connected wallet).
+    await transactionStatus.getByText(/Wallet: 0xafbB6Cc5/).first().waitFor(); assert.equal(await review.isDisabled(), true)
+    await page.evaluate(() => window.executionUiTest.account(false)); await latest.waitFor()
+    await page.getByRole('radio', { name: 'Uniswap quote' }).click(); await amount.fill('0.1')
   })
   await test('verified successful receipt shows Confirmed and actual output, then refreshes native balance', async () => {
     const before = await page.evaluate(() => window.executionUiTest.state.balanceReads)
     receiptMode = 'confirmed'
-    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor(); await transactionStatus.getByText('Received 0.088565 EURC', { exact: true }).waitFor()
+    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor(); await transactionStatus.getByText(/Received 0\.088565 EURC/).waitFor()
     await page.waitForFunction(n => window.executionUiTest.state.balanceReads > n, before)
     assert.equal(await sends(), 0)
   })
   await test('pilot EURC repeated review uses the same controller and a reverted receipt is Failed', async () => {
     receiptMode = 'pending'; await prepare('EURC')
-    assert.equal(await page.getByRole('region', { name: 'Swap history' }).getByRole('button', { name: /Recheck swap/ }).first().isDisabled(), true)
+    assert.equal(await review.isDisabled(), true) // the earlier confirmed swap never blocks a new review; an in-progress review blocks another
     await confirm.click()
-    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); await cacheWallet()
+    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); await cacheWallet()
     receiptMode = 'reverted'
     await transactionStatus.getByText('Failed — transaction reverted', { exact: true }).waitFor(); assert.equal(await sends(), 1)
   })
@@ -266,12 +266,12 @@ try {
   })
   await test('ambiguous wallet result stays blocked and supports read-only hash recovery after reload', async () => {
     receiptMode = 'pending'; await page.evaluate(() => { window.executionUiTest.state.walletMode = 'unknown' }); await prepare(); await confirm.click()
-    await transactionStatus.getByText('Verification incomplete — check transaction status', { exact: true }).waitFor(); const state = await cacheWallet()
+    await transactionStatus.getByText('Status not yet verified', { exact: true }).waitFor(); const state = await cacheWallet()
     assert.equal(await review.isDisabled(), true)
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
     await page.getByRole('textbox', { name: 'Recover transaction hash' }).fill(state.hash)
     await page.getByRole('button', { name: 'Verify and track hash' }).click()
-    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
+    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
     receiptMode = 'confirmed'
     await transactionStatus.getByText('Confirmed', { exact: true }).waitFor()
   })
@@ -303,13 +303,13 @@ try {
     await prepare('EURC'); const before = await sends(); await confirm.click()
     await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
     await page.clock.fastForward(121000)
-    await transactionStatus.getByText('Verification incomplete — check transaction status', { exact: true }).waitFor()
+    await transactionStatus.getByText('Status not yet verified', { exact: true }).waitFor()
     await page.getByRole('alert').filter({ hasText: 'The wallet approval window ended. Cancel the open request' }).waitFor()
     assert.equal(await review.isDisabled(), true); assert.equal(await sends(), before + 1)
     const records = await page.evaluate(() => Object.entries(localStorage).filter(([k]) => k.startsWith('machina.uniswap.arc.execution.v1:')).map(([,v]) => JSON.parse(v)).flat())
     assert.equal(records.at(-1).status, 'unknown')
     await page.evaluate(() => window.executionUiTest.release())
-    await transactionStatus.getByText('Pending — checking Arc', { exact: true }).waitFor()
+    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor()
     const state = await cacheWallet()
     await page.getByRole('link', { name: /View on Arc Explorer/ }).filter({ hasText: state.hash }).waitFor()
     assert.equal(await sends(), before + 1)
@@ -322,8 +322,7 @@ try {
     assert.equal(await page.getByRole('button', { name: 'Review expired', exact: true }).isDisabled(), true)
     await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
     await page.getByRole('combobox', { name: 'From token' }).selectOption('WETH')
-    await page.getByText('Preview only', { exact: true }).waitFor(); assert.equal(await review.count(), 0)
-    assert.equal(await page.getByRole('button', { name: 'Swap disabled in Preview' }).isDisabled(), true)
+    await page.getByText('Quotes only', { exact: true }).first().waitFor(); assert.equal(await review.isDisabled(), true)
   })
   await test('no unapproved RPC methods, external traffic, uncaught errors or source gate changes', async () => {
     assert.equal(external, 0); assert.deepEqual(errors, [])

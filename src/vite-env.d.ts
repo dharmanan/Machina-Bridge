@@ -6,6 +6,7 @@ declare module 'vite/client' {
     readonly VITE_ENABLE_MAINNET_PREVIEW?: string
     readonly VITE_UNISWAP_ARC_PILOT_ENABLED?: string
     readonly VITE_UNISWAP_ARC_PILOT_WALLET?: string
+    readonly VITE_SWAP_EXECUTION_MODE?: string
     readonly VITE_MAINNET_APP_URL?: string
     readonly VITE_SEPOLIA_RPC: string
     readonly VITE_ARC_TESTNET_RPC: string

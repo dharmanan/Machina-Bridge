@@ -8,11 +8,35 @@ export const ARC_ROUTER = '0x8702463e73f74d0b6765aBceb314Ef07aCb92650'
 // Observed at user fork block 27114546 and block 27119997; official nonproxy deployment 802fe4c.
 export const ARC_ROUTER_HASH = '0x2e80a35dc8a1da121611acc5c31be03c2e63669135461e63947901ecf8a1654d'
 export const ARC_NATIVE = '0x0000000000000000000000000000000000000000'
+// Canonical Permit2 (code present on Arc Mainnet; the Universal Router pulls ERC-20 inputs through it).
+export const ARC_PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
 export const ARC_USDC = '0x3600000000000000000000000000000000000000'
+// The API-sourced pilot profiles (Trading API calldata) only exist for USDC to these two outputs.
 export const ARC_OUTPUTS = {
   EURC: { address: '0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1', decimals: 6 },
   cirBTC: { address: '0x171A4217b86A807A64eB94757Db6849fb4bDbAA0', decimals: 8 },
 } as const
+// All four Swap tokens (official Arc registry; kept equal to config/mainnetSwap.ts by the verification suite). This module has no
+// relative imports on purpose: the serverless build compiles it standalone.
+export const ARC_TOKENS = {
+  USDC: { address: ARC_USDC, decimals: 6 },
+  EURC: ARC_OUTPUTS.EURC,
+  cirBTC: ARC_OUTPUTS.cirBTC,
+  WETH: { address: '0x128cC466B61f542da60c70e3aA11c10e19B84EDB', decimals: 18 },
+} as const
+export type ArcSymbol = keyof typeof ARC_TOKENS
+export const isArcSymbol = (value: unknown): value is ArcSymbol => typeof value === 'string' && Object.prototype.hasOwnProperty.call(ARC_TOKENS, value)
+// Largest input per transaction in base units of the input token (about 10 USD each). Raising one is a release decision, not a setting.
+export const ARC_INPUT_CAPS: Record<ArcSymbol, bigint> = { USDC: 10_000_000n, EURC: 9_000_000n, cirBTC: 12_000n, WETH: 4_000_000_000_000_000n }
+// The API-sourced profiles exist only for native USDC to EURC or cirBTC.
+export function legacyApiOutput(request: { tokenIn: ArcSymbol; tokenOut: ArcSymbol }): (typeof ARC_OUTPUTS)[keyof typeof ARC_OUTPUTS] {
+  if (request.tokenIn !== 'USDC' || !Object.prototype.hasOwnProperty.call(ARC_OUTPUTS, request.tokenOut)) return fail('unsupported_direction')
+  return ARC_OUTPUTS[request.tokenOut as keyof typeof ARC_OUTPUTS]
+}
+export function tokenUnits(amount: string, decimals: number): bigint {
+  const [whole, fraction = ''] = amount.split('.')
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, '0'))
+}
 export const EXECUTE_ABI = parseAbi(['function execute(bytes commands, bytes[] inputs, uint256 deadline) payable'])
 export const V4_ENVELOPE = parseAbiParameters('bytes actions, bytes[] params')
 // Pinned periphery 3779387e5d296f39df543d23524b050f89a62917, not current main ABI.
@@ -48,17 +72,18 @@ export function minimumAtSlippage(output: bigint, bps: number): bigint {
   // Quantize once to the output token's indivisible base unit. Never subtract a tolerance unit.
   return output * BigInt(10000 - bps) / 10000n
 }
-export interface ArcRequest { chainId: 5042; tokenIn: 'USDC'; tokenOut: keyof typeof ARC_OUTPUTS; owner: string; recipient: string; amount: string; minimumOutput: string; slippageBps: number; maxNetworkFee: string }
+export interface ArcRequest { chainId: 5042; tokenIn: ArcSymbol; tokenOut: ArcSymbol; owner: string; recipient: string; amount: string; minimumOutput: string; slippageBps: number; maxNetworkFee: string }
 export function validateArcRequest(input: unknown): ArcRequest {
   if (!input || typeof input !== 'object') throw new Error('invalid_request')
   const r = input as ArcRequest
   const keys = ['chainId','tokenIn','tokenOut','owner','recipient','amount','minimumOutput','slippageBps','maxNetworkFee']
   if (Object.keys(r).some(k => !keys.includes(k)) || keys.some(k => !Object.prototype.hasOwnProperty.call(r, k))) fail('invalid_request')
-  if (r.chainId !== 5042 || r.tokenIn !== 'USDC' || !Object.prototype.hasOwnProperty.call(ARC_OUTPUTS, r.tokenOut)) fail('unsupported_direction')
+  if (r.chainId !== 5042 || !isArcSymbol(r.tokenIn) || !isArcSymbol(r.tokenOut) || r.tokenIn === r.tokenOut) fail('unsupported_direction')
   if (!sameAddress(r.owner, r.recipient) || !sameAddress(r.owner, getAddress(r.owner)) || BigInt(r.owner) <= 2n || sameAddress(r.owner, ARC_ROUTER)) fail('invalid_recipient')
-  if (typeof r.amount !== 'string' || !/^(0|[1-9]\d{0,2})(\.\d{1,6})?$/.test(r.amount)) fail('invalid_amount')
-  const amount = nativeAmount(r.amount)
-  if (amount <= 0n || amount > 10n ** 19n) fail('input_limit') // conservative 10 USDC ceiling
+  const decimals = ARC_TOKENS[r.tokenIn].decimals
+  if (typeof r.amount !== 'string' || !new RegExp(`^(0|[1-9]\\d{0,${r.tokenIn === 'USDC' ? 2 : 11}})(\\.\\d{1,${decimals}})?$`).test(r.amount)) fail('invalid_amount')
+  const amount = tokenUnits(r.amount, decimals)
+  if (amount <= 0n || amount > ARC_INPUT_CAPS[r.tokenIn]) fail('input_limit') // conservative per-token ceiling (USDC: 10)
   if (uint(r.minimumOutput) <= 0n || !Number.isInteger(r.slippageBps) || r.slippageBps < 1 || r.slippageBps > 100) fail('invalid_minimum_or_slippage')
   if (uint(r.maxNetworkFee) <= 0n || uint(r.maxNetworkFee) > 10n ** 17n) fail('fee_limit') // <=0.1 USDC
   return Object.freeze({ chainId: r.chainId, tokenIn: r.tokenIn, tokenOut: r.tokenOut, owner: getAddress(r.owner), recipient: getAddress(r.recipient), amount: r.amount, minimumOutput: r.minimumOutput, slippageBps: r.slippageBps, maxNetworkFee: r.maxNetworkFee })
@@ -92,7 +117,7 @@ export function decodeNativeEconomics(transaction: ArcTransaction, request: ArcR
   const [refundToken, refundRecipient, refundMinimum] = decodeAbiParameters(NATIVE_REFUND, inputs[1])
   if (encodeAbiParameters(NATIVE_REFUND, [refundToken, refundRecipient, refundMinimum]).toLowerCase() !== inputs[1].toLowerCase()) fail('noncanonical_refund')
   if (!sameAddress(refundToken, ARC_NATIVE) || !sameAddress(refundRecipient, r.recipient) || refundMinimum !== 0n) fail('refund_recipient')
-  const output = ARC_OUTPUTS[r.tokenOut].address
+  const output = legacyApiOutput(r).address
   const result = (minimum: bigint, profile: string, fee: number, tickSpacing?: number) => {
     if (minimum < requiredMinimum) fail('economic_mismatch')
     const [token0,token1] = [getAddress(ARC_USDC),getAddress(output)].sort((a,b)=>BigInt(a)<BigInt(b)?-1:1)
@@ -153,6 +178,10 @@ export function verifyNativeCalldata(transaction: ArcTransaction, request: ArcRe
   return result
 }
 export interface ArcReview {
+  // `source` absent or 'api': calldata from the Uniswap Trading API, decoded by the legacy profiles in this module.
+  // 'onchain': calldata built locally from the pinned pool registry and quoted by an eth_call simulation (swap/swapPolicy.ts).
+  source?: 'api' | 'onchain'
+  route?: string
   request: ArcRequest; transaction: ArcTransaction; estimatedOutput: string; requiredMinimum: string; requestStartedAt: number; expiresAt: number
   routerHash: string; blockNumber: string; gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string
   networkFee: string; nativeBalance: string; simulation: 'passed'; executionBound: false; writesEnabled: false

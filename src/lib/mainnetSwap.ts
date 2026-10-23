@@ -37,7 +37,8 @@ export function validateSwapRequest(request: SwapQuoteRequest): void {
   if (!addressPattern.test(request.address) || /^0x0{40}$/i.test(request.address)) fail('wallet_required')
   if (request.chainId !== MAINNET_SWAP_CHAIN_ID) fail('wrong_network')
   if (!Object.prototype.hasOwnProperty.call(MAINNET_SWAP_TOKENS, request.tokenIn) || !Object.prototype.hasOwnProperty.call(MAINNET_SWAP_TOKENS, request.tokenOut)) fail('unsupported_token')
-  if (request.tokenIn === request.tokenOut || (request.tokenIn !== 'USDC' && request.tokenOut !== 'USDC')) fail('unsupported_route')
+  // Circle's service quotes every ordered pair of the four Arc tokens (verified live for all 12 directions); an identical pair is not a swap.
+  if (request.tokenIn === request.tokenOut) fail('unsupported_route')
   if (!(MAINNET_SWAP_SLIPPAGE_BPS as readonly number[]).includes(request.slippageBps)) fail('invalid_slippage')
   if (decimalUnits(request.amount, MAINNET_SWAP_TOKENS[request.tokenIn].decimals) <= 0n) fail('invalid_amount')
 }

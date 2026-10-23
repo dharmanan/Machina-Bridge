@@ -30,3 +30,17 @@ export function unitPriceInUsdc(usdcUnits: bigint, tokenUnits: bigint, tokenDeci
   const rounded = (price + 10n ** BigInt(17 - decimals) * 5n) / 10n ** BigInt(18 - decimals)
   return formatUnits(rounded, decimals).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')
 }
+
+// How many output tokens one input token buys, from the exact quoted amounts (fees are not part of either amount). Display only:
+// five decimals below 1, four decimals from 1, two decimals from 100 up; never shows a value for a non-positive amount.
+export function exchangeRate(inUnits: bigint, inDecimals: number, outUnits: bigint, outDecimals: number): string | null {
+  if (inUnits <= 0n || outUnits <= 0n) return null
+  const scale = 10n ** 24n
+  const rate = outUnits * 10n ** BigInt(inDecimals) * scale / (inUnits * 10n ** BigInt(outDecimals))
+  if (rate <= 0n) return null
+  const digits = rate.toString().length - 24 // digits before the decimal point (<= 0 means below 1)
+  const decimals = digits >= 3 ? 2 : digits >= 1 ? 4 : Math.min(24, 3 + (1 - digits) + 1)
+  const quantum = 10n ** BigInt(24 - decimals), rounded = (rate + quantum / 2n) / quantum
+  const [whole, fraction = ''] = formatUnits(rounded, decimals).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '').split('.')
+  return fraction ? `${group(whole)}.${fraction}` : group(whole)
+}

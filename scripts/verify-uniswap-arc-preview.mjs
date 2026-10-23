@@ -53,9 +53,19 @@ function service(options = {}) {
   })
   return { calls, run: s.createArcPreviewService({ client: rpc, fetch: fetcher, now: options.now ?? (() => now) }) }
 }
-await test('only native USDC to EURC/cirBTC; reverse/WETH/wrong chain and unknown request fields blocked', () => {
+await test('the request validator accepts any ordered pair of the four tokens but still blocks wrong chain, unknown fields, recipients, limits and identical pairs', () => {
   for (const tokenOut of ['EURC','cirBTC']) p.validateArcRequest({ ...request, tokenOut })
-  for (const delta of [{ chainId: 1 }, { tokenIn: 'EURC' }, { tokenIn: 'cirBTC' }, { tokenOut: 'USDC' }, { tokenOut: 'WETH' }, { apiKey: 'forbidden' }, { recipient: wrong }, { amount: '11' }, { amount: '0' }, { amount: '1e18' }, { slippageBps: 101 }, { minimumOutput: '0' }, { maxNetworkFee: '100000000000000001' }]) assert.throws(() => p.validateArcRequest({ ...request, ...delta }))
+  // Generalised (every direction is a valid request shape); what each route may do is decided by the policy layers, not by this validator.
+  p.validateArcRequest({ ...request, tokenIn: 'EURC', tokenOut: 'USDC', amount: '1' }); p.validateArcRequest({ ...request, tokenOut: 'WETH' })
+  p.validateArcRequest({ ...request, tokenIn: 'cirBTC', tokenOut: 'WETH', amount: '0.0001', minimumOutput: '1' }); p.validateArcRequest({ ...request, tokenIn: 'WETH', tokenOut: 'EURC', amount: '0.004', minimumOutput: '1' })
+  for (const delta of [{ chainId: 1 }, { tokenOut: 'USDC' }, { tokenIn: 'DAI' }, { tokenOut: 'DAI' }, { apiKey: 'forbidden' }, { recipient: wrong }, { amount: '11' }, { amount: '0' }, { amount: '1e18' }, { slippageBps: 101 }, { minimumOutput: '0' }, { maxNetworkFee: '100000000000000001' },
+    { tokenIn: 'EURC', amount: '9.000001' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.00012001' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.000000001' }, { tokenIn: 'WETH', tokenOut: 'EURC', amount: '0.0040001' }]) assert.throws(() => p.validateArcRequest({ ...request, ...delta }))
+})
+await test('the Trading API profiles stay native USDC to EURC/cirBTC only: every other direction is refused before any API request', async () => {
+  for (const delta of [{ tokenIn: 'EURC', tokenOut: 'USDC' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.0001' }, { tokenOut: 'WETH' }, { tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004' }]) {
+    assert.throws(() => s.quoteBody({ ...request, ...delta }), /unsupported_direction/)
+    const f = service(); await assert.rejects(f.run({ ...request, ...delta }, 'server-test-key'), /unsupported_direction/); assert.equal(f.calls.filter(c => c[0] === 'fetch').length, 0)
+  }
 })
 await test('official router runtime fixture matches pinned hash', () => assert.equal(keccak256(runtime), p.ARC_ROUTER_HASH))
 await test('both outputs decode exact native value, token path, minimum and implicit locker recipient', () => {
@@ -195,7 +205,7 @@ await test('private development handler requires configured origin, rejects meth
   }
 })
 const originalGroups = count
-assert.equal(originalGroups,23,'retain every original safety group')
+assert.equal(originalGroups,24,'retain every original safety group (23 original + the API direction guard)')
 const evidence = Object.fromEntries(['EURC','cirBTC'].map(symbol => [symbol, JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/USDC-${symbol}.json`,'utf8'))]))
 const provenance = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/quote-evidence-provenance.json`,'utf8'))
 function evidenceRequest(symbol) {

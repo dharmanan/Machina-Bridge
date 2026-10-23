@@ -1,5 +1,8 @@
 # Arc Uniswap pilot: source prepared, deployment and activation separately approved
 
+> The Swap screen now covers all four Arc tokens and both providers (see `docs/swap-unified.md`). That does not change this pilot: the default build mode is
+> still `pilot`, and everything below remains the only execution the production build allows.
+
 Only native USDC → EURC on Arc Mainnet 5042, input **at most 0.1 USDC**,
 with the configured wallet as both sender and recipient. cirBTC remains preview
 only; Circle execution is unchanged and disabled. Existing router/runtime,

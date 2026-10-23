@@ -645,8 +645,10 @@ await test('late hash after wallet/network change is still recorded under the or
 })
 await test('pending receipt and RPC errors never become Failed or Confirmed', async () => {
   const f = setup({ result: async () => { throw Error('timeout-sensitive-detail') } })
-  await f.controller.confirm(await f.review()); assert.equal(f.controller.current().phase, 'unknown')
-  assert.equal(f.controller.current().attempt.hash, hash)
+  await f.controller.confirm(await f.review())
+  // A read failure teaches nothing: the transaction stays Pending (with the reason), never Failed, Confirmed or silently Unknown.
+  assert.equal(f.controller.current().phase, 'pending'); assert.match(f.controller.current().error, /could not be read just now/)
+  assert.equal(f.controller.current().attempt.hash, hash); assert.equal(f.controller.current().nextCheckMs, 5000)
   const reload = setup({ data: f.data }); await reload.controller.reconcile(); assert.equal(reload.controller.current().phase, 'pending')
 })
 await test('confirmed and reverted results persist, refresh balances and survive a read-only reload', async () => {
@@ -658,11 +660,18 @@ await test('confirmed and reverted results persist, refresh balances and survive
     assert.equal(reload.controller.current().phase, status); assert.equal(reload.sent().length, 0)
   }
 })
-await test('a persisted Confirmed status is rechecked rather than trusted after reload', async () => {
+await test('a persisted Confirmed status is rechecked after reload; an RPC failure keeps the recorded status visible but blocks a new send until re-verified', async () => {
   const f = setup({ result: async attempt => ({ status: 'confirmed', output: attempt.review.requiredMinimum, fee: '0' }) })
   await f.controller.confirm(await f.review())
   const reload = setup({ data: f.data, result: async () => { throw Error('rpc-down') } }); await reload.controller.reconcile()
-  assert.equal(reload.controller.current().phase, 'unknown')
+  // The recorded result is not lost or downgraded by a read failure; the lookup indicator is separate and the failure is explained.
+  assert.equal(reload.controller.current().phase, 'confirmed'); assert.equal(reload.controller.current().checking, false)
+  assert.match(reload.controller.current().error, /could not be read just now/)
+  assert.equal(e.createExecutionJournal(reload.ports.storage).read(owner)[0].status, 'confirmed')
+  await reload.controller.prepare(); assert.equal(reload.stats.quotes, 0); assert.match(reload.controller.current().error, /unresolved/)
+  // Once the chain is read again the block is lifted by evidence, not by waiting.
+  reload.ports.result = async attempt => ({ status: 'confirmed', output: attempt.review.requiredMinimum, fee: '0' })
+  await reload.controller.reconcile(); await reload.controller.prepare(); assert.equal(reload.stats.quotes, 1)
 })
 await test('a formerly confirmed transaction becoming Pending again is durably unresolved', async () => {
   const f = setup({ result: async attempt => ({ status: 'confirmed', output: attempt.review.requiredMinimum, fee: '0' }) })
@@ -675,7 +684,7 @@ await test('hash recovery is read-only and cannot restore a serialized send auth
   const f = setup(), original = f.provider.request
   f.provider.request = args => args.method === 'eth_sendTransaction' ? Promise.reject(Error('disconnected')) : original(args)
   await f.controller.confirm(await f.review())
-  const reload = setup({ data: f.data }); await reload.controller.reconcile(owner, hash)
+  const reload = setup({ data: f.data, result: async () => ({ status: 'pending', identified: true }) }); await reload.controller.reconcile(owner, hash)
   assert.equal(reload.controller.current().attempt.hash, hash); assert.equal(reload.sent().length, 0)
   await reload.controller.confirm(e.createExecutionJournal(reload.ports.storage).read(owner)[0].id); assert.equal(reload.sent().length, 0)
 })
@@ -697,6 +706,10 @@ function rpcFixture(symbol = 'EURC', changes = {}) {
     getTransactionCount: async () => 7, getTransaction: async () => tx, getTransactionReceipt: async () => receipt, ...changes,
   }
   return { attempt, review, tx, receipt, rpc, calls, adapter: createArcExecutionRpc(rpc) }
+}
+// A transaction is "not verified" when the adapter refuses to bind it (reject) or reports a settled result whose Review comparison is not verified.
+async function notVerified(f) {
+  try { const r = await f.adapter.result(f.attempt); return r.status === 'settled' ? ['verified', 'verified_with_notes'].includes(r.intent.verdict) === false : false } catch { return true }
 }
 await test('actual preflight adapter rechecks both routes, runtime, decimals, balances, fees, gas and exact simulation', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {
@@ -733,26 +746,9 @@ await test('actual public adapter brackets pending with latest reads and rejects
 await test('receipt success requires exact transaction binding, two observed blocks and actual output Transfer logs', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {
     const f = rpcFixture(symbol), result = await f.adapter.result(f.attempt)
-    assert.equal(result.status, 'confirmed'); assert.equal(result.output, f.review.requiredMinimum); assert.equal(result.fee, '100000000000000')
+    assert.equal(result.status, 'settled'); assert.equal(result.chain.state, 'success'); assert.equal(result.intent.verdict, 'verified')
+    assert.equal(result.output, f.review.requiredMinimum); assert.equal(result.fee, '100000000000000'); assert.equal(result.chain.received, f.review.requiredMinimum)
   }
-})
-await test('real first pilot RPC evidence proves the reviewed zero-tip invariant is violated without bypassing it', async () => {
-  const raw = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/first-pilot-result.json`, 'utf8'))
-  const { formatTransaction, formatTransactionReceipt } = require('viem')
-  const tx = formatTransaction(raw.eth_getTransactionByHash), receipt = formatTransactionReceipt(raw.eth_getTransactionReceipt)
-  assert.equal(tx.chainId, 5042); assert.equal(tx.value, 100000000000000000n); assert.equal(receipt.status, 'success')
-  assert.equal(receipt.blockNumber, 27278158n); assert.equal(raw.eth_getBlockByNumber.hash, receipt.blockHash)
-  assert.equal(receipt.gasUsed * receipt.effectiveGasPrice, 3800899000000000n)
-  const incoming = receipt.logs.filter(log => p.sameAddress(log.address, p.ARC_OUTPUTS.EURC.address) && log.topics[2].endsWith(owner.slice(2).toLowerCase()))
-  assert.equal(incoming.reduce((sum, log) => sum + BigInt(log.data), 0n), 87854n)
-  assert.equal(tx.maxPriorityFeePerGas, 1500000000n)
-  assert.match(readFileSync(`${root}api/_lib/uniswap-arc-preview.ts`, 'utf8'), /maxPriorityFeePerGas: '0'/)
-  // Only the invariant under test is reconstructed; this is NOT the original saved review.
-  const f = rpcFixture(); f.attempt.hash = tx.hash; f.attempt.nonce = tx.nonce
-  f.review.request.amount = '0.1'; f.review.transaction.data = tx.input; f.review.gasLimit = tx.gas.toString()
-  f.review.maxFeePerGas = tx.maxFeePerGas.toString(); f.review.maxPriorityFeePerGas = '0'
-  f.rpc.getTransaction = async () => tx
-  await assert.rejects(f.adapter.result(f.attempt), e.ExecutionResultVerificationError)
 })
 await test('real first pilot actions are unsupported by this HEAD and never silently accepted as an approved review', () => {
   const raw = JSON.parse(readFileSync(`${root}scripts/fixtures/uniswap-arc/first-pilot-result.json`, 'utf8'))
@@ -763,11 +759,11 @@ await test('real first pilot actions are unsupported by this HEAD and never sile
   const request = { ...setup().ports.input(), amount: '0.1' }
   assert.throws(() => p.decodeNativeEconomics({ chainId: 5042, from: tx.from, to: tx.to, data: tx.input, value: tx.value }, request, 1n, quoteId), /unsupported_actions/)
 })
-await test('review fee mismatch remains unknown with clear non-failure guidance and blocks another send', async () => {
-  const f = setup({ result: async () => { throw new e.ExecutionResultVerificationError() } })
+await test('a deterministic binding failure stays unknown, stops automatic checks, explains itself and blocks another send', async () => {
+  const f = setup({ result: async () => { throw new e.ExecutionVerificationError('binding', false) } })
   await f.controller.confirm(await f.review())
-  assert.equal(f.controller.current().phase, 'unknown'); assert.match(f.controller.current().error, /does not mean.*failed/)
-  assert.match(f.controller.current().error, /gas or fee parameters differ/)
+  assert.equal(f.controller.current().phase, 'unknown'); assert.match(f.controller.current().error, /does not identify the reviewed swap/)
+  assert.equal(f.controller.current().nextCheckMs, null); assert.equal(f.stats.results, 1)
   await f.controller.prepare(); assert.equal(f.sent().length, 1)
 })
 await test('wallet-scoped history and targeted old-record checks cannot bypass unresolved attempts or restore send authority', async () => {
@@ -777,18 +773,30 @@ await test('wallet-scoped history and targeted old-record checks cannot bypass u
   assert.equal(records.length, 2); assert.deepEqual(f.controller.history(other), [])
   const snapshot = f.controller.history(); snapshot[0].status = 'unknown'; assert.equal(f.controller.history()[0].status, 'confirmed')
   f.ports.result = async () => { throw Error('rpc-down') }
-  await f.controller.reconcile(owner, undefined, first.id); assert.equal(f.controller.current().phase, 'unknown')
+  await f.controller.reconcile(owner, undefined, first.id)
+  // A failed re-check keeps the recorded Confirmed visible (nothing is downgraded or lost) but still blocks a new send until re-verified.
+  assert.equal(f.controller.current().phase, 'confirmed'); assert.match(f.controller.current().error, /could not be read just now/)
   assert.equal(f.controller.current().attempt.id, first.id)
   await f.controller.prepare(); assert.equal(f.sent().length, 2)
   const reload = setup({ data: f.data }); assert.equal(reload.controller.history().length, 2)
   await reload.controller.confirm(first.id); assert.equal(reload.sent().length, 0)
 })
-await test('wrong hash/from/router/value/calldata/nonce/chain/gas/fees/type cannot report success', async () => {
-  for (const delta of [{ hash: '0x' + 'c'.repeat(64) }, { from: other }, { to: other }, { value: 1n }, { input: '0x' }, { nonce: 8 }, { chainId: 1 }, { gas: 130001n }, { maxFeePerGas: 3000000000n }, { maxPriorityFeePerGas: 1n }, { type: 'legacy' }]) {
-    const f = rpcFixture(); Object.assign(f.tx, delta); await assert.rejects(f.adapter.result(f.attempt))
+await test('wrong hash/from/router/value/calldata/nonce/chain/gas ceiling/fee ceiling/type can never be verified', async () => {
+  // Identity fields (hash, sender, nonce, network) make the hash unrelated to the attempt: refused outright.
+  for (const delta of [{ hash: '0x' + 'c'.repeat(64) }, { from: other }, { nonce: 8 }, { chainId: 1 }]) {
+    const f = rpcFixture(); Object.assign(f.tx, delta); await assert.rejects(f.adapter.result(f.attempt), error => error instanceof e.ExecutionVerificationError && error.retryable === false)
+  }
+  // Everything else is a real chain result that is NOT the reviewed transaction: reported, never Confirmed.
+  for (const delta of [{ to: other }, { value: 1n }, { input: '0x' + '00'.repeat(4) }, { gas: 130001n }, { maxFeePerGas: 3000000000n }, { type: 'legacy' }]) {
+    const f = rpcFixture(); Object.assign(f.tx, delta); assert.equal(await notVerified(f), true, JSON.stringify(delta, (k, v) => typeof v === 'bigint' ? v.toString() : v))
+  }
+  // A wallet that only raises the priority fee, or lowers the gas limit, stays inside the approved ceiling: verified with notes.
+  for (const delta of [{ maxPriorityFeePerGas: 1n }, { maxPriorityFeePerGas: 1500000000n, maxFeePerGas: 2000000000n }, { gas: 120000n }]) {
+    const f = rpcFixture(); Object.assign(f.tx, delta); const r = await f.adapter.result(f.attempt)
+    assert.equal(r.intent.verdict, 'verified_with_notes'); assert.equal(r.chain.state, 'success')
   }
 })
-await test('success status without enough output to the correct recipient/token is not a successful swap', async () => {
+await test('success status without enough output to the correct recipient/token is a chain success that does not match the Review', async () => {
   for (const change of ['none', 'low', 'recipient', 'token', 'outgoing']) {
     const f = rpcFixture(), log = f.receipt.logs[0]
     if (change === 'none') f.receipt.logs = []
@@ -796,34 +804,115 @@ await test('success status without enough output to the correct recipient/token 
     if (change === 'recipient') log.topics[2] = '0x' + other.slice(2).padStart(64, '0')
     if (change === 'token') log.address = p.ARC_OUTPUTS.cirBTC.address
     if (change === 'outgoing') log.topics = [log.topics[0], log.topics[2], log.topics[1]]
-    await assert.rejects(f.adapter.result(f.attempt))
+    const r = await f.adapter.result(f.attempt)
+    assert.equal(r.status, 'settled'); assert.equal(r.chain.state, 'success'); assert.equal(r.intent.verdict, 'mismatch', change)
+    assert.ok(r.intent.checks.some(c => c.id === 'minimum' && c.status === 'mismatch'))
   }
 })
-await test('duplicated or cross-transaction Transfer logs cannot inflate verified output', async () => {
+await test('duplicated or cross-transaction Transfer logs cannot inflate verified output: the amount is unavailable and nothing is confirmed', async () => {
   for (const kind of ['duplicate', 'hash', 'block', 'index']) {
     const f = rpcFixture(), log = f.receipt.logs[0]
     if (kind === 'duplicate') f.receipt.logs.push(structuredClone(log))
     if (kind === 'hash') log.transactionHash = '0x' + 'c'.repeat(64)
     if (kind === 'block') log.blockHash = '0x' + 'c'.repeat(64)
     if (kind === 'index') log.transactionIndex = 1
-    await assert.rejects(f.adapter.result(f.attempt))
+    const r = await f.adapter.result(f.attempt)
+    assert.equal(r.intent.verdict, 'incomplete', kind); assert.equal(r.chain.received, null)
   }
+  // The controller treats incomplete evidence as unknown (retried with backoff), never Confirmed.
+  const f = setup({ result: async attempt => { const r = rpcFixture(); r.receipt.logs = [structuredClone(r.receipt.logs[0]), structuredClone(r.receipt.logs[0])]; return r.adapter.result({ ...r.attempt, review: attempt.review, nonce: attempt.nonce }) } })
+  await f.controller.confirm(await f.review()); assert.notEqual(f.controller.current().phase, 'confirmed')
 })
 await test('reverts are Failed; missing receipt, insufficient confirmations and reorg remain Pending', async () => {
-  const reverted = rpcFixture(); reverted.receipt.status = 'reverted'; assert.equal((await reverted.adapter.result(reverted.attempt)).status, 'failed')
+  const reverted = rpcFixture(); reverted.receipt.status = 'reverted'; const revertedResult = await reverted.adapter.result(reverted.attempt)
+  assert.equal(revertedResult.status, 'settled'); assert.equal(revertedResult.chain.state, 'reverted'); assert.equal(revertedResult.output, '0')
   for (const changes of [{ getTransactionReceipt: async () => { throw Object.assign(Error('not found'), { name: 'TransactionReceiptNotFoundError' }) } },
     { getBlockNumber: async () => 100n }, { getBlock: async () => ({ hash: '0x' + 'c'.repeat(64) }) }]) {
     const f = rpcFixture('EURC', changes); assert.equal((await f.adapter.result(f.attempt)).status, 'pending')
   }
 })
 await test('receipt block identity and spent gas cannot exceed the approved transaction budget', async () => {
-  for (const delta of [{ transactionHash: '0x' + 'c'.repeat(64) }, { from: other }, { to: other }, { gasUsed: 130001n }, { effectiveGasPrice: 3000000000n }]) {
+  for (const delta of [{ transactionHash: '0x' + 'c'.repeat(64) }, { from: other }]) {
     const f = rpcFixture(); Object.assign(f.receipt, delta); await assert.rejects(f.adapter.result(f.attempt))
+  }
+  for (const delta of [{ to: other }, { gasUsed: 130001n }, { effectiveGasPrice: 3000000000n }]) {
+    const f = rpcFixture(); Object.assign(f.receipt, delta); assert.equal(await notVerified(f), true, JSON.stringify(delta, (k, v) => typeof v === 'bigint' ? v.toString() : v))
   }
 })
 await test('read-only RPC allowlist never permits signing, sends, approvals or arbitrary wallet calls', () => {
   for (const method of ['eth_sendTransaction', 'eth_sendRawTransaction', 'personal_sign', 'eth_signTypedData_v4', 'wallet_sendCalls', 'eth_requestAccounts', 'debug_traceCall', 'evm_mine']) assert.throws(() => assertExecutionReadMethod(method), /read_only_rpc/)
   for (const method of ['eth_chainId', 'eth_getTransactionCount', 'eth_getTransactionReceipt']) assertExecutionReadMethod(method)
+})
+// --- Findings of the adversarial review ----------------------------------------------------------------------------------------
+const settledFor = attempt => ({ status: 'settled', output: attempt.review.requiredMinimum, fee: '100000', chain: { state: 'success', blockNumber: '100', blockHash, gasUsed: '100000', effectiveGasPrice: '1000000000', fee: '100000', received: attempt.review.requiredMinimum, sent: null, checkedAt: Date.now() },
+  intent: { verdict: 'verified', checks: [], differences: [], checkedAt: Date.now() } })
+async function lostHash(options = {}) {
+  const f = setup(options), original = f.provider.request
+  f.provider.request = args => args.method === 'eth_sendTransaction' ? Promise.reject(Object.assign(Error('internal'), { code: -32603 })) : original(args)
+  await f.controller.confirm(await f.review()); assert.equal(f.controller.current().phase, 'unknown'); return f
+}
+await test('recovery: a hash the network has never shown is not saved, so the real hash can still be supplied afterwards', async () => {
+  const wrong = '0x' + 'c'.repeat(64), real = '0x' + 'd'.repeat(64)
+  const lost = await lostHash(), result = async attempt => (attempt.hash === real ? { status: 'pending', identified: true } : { status: 'pending', identified: false })
+  const reload = setup({ data: lost.data, result }); const journal = () => e.createExecutionJournal(reload.ports.storage).read(owner)[0]
+  await reload.controller.reconcile(owner, wrong); assert.match(reload.controller.current().error, /does not know that hash/); assert.equal(journal().hash, undefined); assert.equal(reload.controller.current().phase, 'unknown')
+  await reload.controller.prepare(); assert.match(reload.controller.current().error, /unresolved/); assert.equal(reload.sent().length, 0)
+  await reload.controller.reconcile(owner, real); assert.equal(journal().hash, real); assert.equal(reload.controller.current().phase, 'pending')
+  assert.equal(e.createExecutionJournal(reload.ports.storage).read(owner).length, 1) // the original record, not a second one
+})
+await test('replaced transaction: a different hash takes over only when the recorded one is unknown AND its nonce was used by something else; the new hash is then verified like any other', async () => {
+  const second = '0x' + 'd'.repeat(64)
+  const make = async nonceUsed => { const f = setup({ result: async attempt => (attempt.hash === second ? settledFor(attempt) : { status: 'pending', identified: false, ...(nonceUsed === undefined ? {} : { nonceUsed }) }) }); await f.controller.confirm(await f.review()); return f }
+  const unproven = await make(false); await unproven.controller.reconcile(owner); assert.equal(unproven.controller.current().replaced, undefined); assert.equal(unproven.controller.current().phase, 'pending')
+  await unproven.controller.reconcile(owner, second); assert.match(unproven.controller.current().error, /does not identify/); assert.equal(e.createExecutionJournal(unproven.ports.storage).read(owner)[0].hash, hash)
+  const unread = await make(undefined); await unread.controller.reconcile(owner, second); assert.match(unread.controller.current().error, /does not identify/)
+  const replaced = await make(true); await replaced.controller.reconcile(owner)
+  assert.equal(replaced.controller.current().replaced, true); assert.match(replaced.controller.current().error, /nonce was used by another transaction/); assert.equal(replaced.controller.current().phase, 'pending')
+  assert.equal((await replaced.controller.prepare(), replaced.sent().length), 1) // still blocks a new swap
+  await replaced.controller.reconcile(owner, second)
+  const record = e.createExecutionJournal(replaced.ports.storage).read(owner)[0]; assert.equal(record.hash, second); assert.equal(record.status, 'confirmed')
+  assert.ok(record.log.some(entry => entry.note.includes(hash) && entry.note.includes('nonce was used by another transaction'))); assert.equal(replaced.controller.blocking(owner), false)
+  // a replacement the network does not show yet is not saved
+  const early = await make(true); early.ports.result = async () => ({ status: 'pending', identified: false, nonceUsed: true }); await early.controller.reconcile(owner, second)
+  assert.match(early.controller.current().error, /does not know that hash/); assert.equal(e.createExecutionJournal(early.ports.storage).read(owner)[0].hash, hash)
+})
+await test('incomplete evidence is stored with its chain facts, claims nothing, keeps blocking, and its re-reads back off and stop', async () => {
+  const f = setup({ result: async attempt => ({ ...settledFor(attempt), chain: { ...settledFor(attempt).chain, received: null }, intent: { verdict: 'incomplete', checks: [], differences: [], checkedAt: 1 } }) })
+  await f.controller.confirm(await f.review()); const delays = [f.controller.current().nextCheckMs] // the check that follows the send is the first
+  for (let i = 0; i < 8; i++) { await f.controller.reconcile(owner); delays.push(f.controller.current().nextCheckMs) }
+  assert.deepEqual(delays, [5000, 10000, 20000, 40000, 60000, 60000, 60000, null, null]); const record = e.createExecutionJournal(f.ports.storage).read(owner)[0]
+  assert.equal(record.status, 'unknown'); assert.equal(record.chain.state, 'success'); assert.equal(f.controller.blocking(owner), true); assert.match(f.controller.current().error, /Automatic checks stopped/)
+})
+await test('the adapter reports whether the node knows the hash and whether its nonce was used; a read problem leaves the nonce question open', async () => {
+  const notFound = Object.assign(Error('x'), { name: 'TransactionNotFoundError' })
+  const gone = rpcFixture('EURC', { getTransaction: async () => { throw notFound }, getTransactionCount: async () => 8 }); assert.deepEqual(await gone.adapter.result(gone.attempt), { status: 'pending', identified: false, nonceUsed: true })
+  const free = rpcFixture('EURC', { getTransaction: async () => { throw notFound }, getTransactionCount: async () => 7 }); assert.deepEqual(await free.adapter.result(free.attempt), { status: 'pending', identified: false, nonceUsed: false })
+  const blind = rpcFixture('EURC', { getTransaction: async () => { throw notFound }, getTransactionCount: async () => { throw Error('down') } }); assert.deepEqual(await blind.adapter.result(blind.attempt), { status: 'pending', identified: false })
+  const unmined = rpcFixture('EURC', { getTransactionReceipt: async () => { throw Object.assign(Error('x'), { name: 'TransactionReceiptNotFoundError' }) } }); assert.deepEqual(await unmined.adapter.result(unmined.attempt), { status: 'pending', identified: true })
+})
+await test('eviction never moves a record this session could not re-verify, and an archive entry today\'s rules reject is kept, counted and never fatal', async () => {
+  const f = setup(); await f.controller.confirm(await f.review()); const base = e.createExecutionJournal(f.ports.storage).read(owner)[0]
+  const store = new Map(), pinned = new Set(), journal = e.createExecutionJournal({ getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) }, id => pinned.has(id))
+  const record = n => { const copy = structuredClone(base); for (const key of ['hash', 'output', 'fee', 'chain', 'intent', 'log']) delete copy[key]; return { ...copy, id: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`, status: 'rejected' } }
+  for (let n = 1; n <= 20; n++) journal.save(record(n)); pinned.add(record(1).id); journal.save(record(21))
+  assert.ok(journal.read(owner).some(a => a.id === record(1).id)); assert.ok(!journal.read(owner).some(a => a.id === record(2).id)); assert.deepEqual(journal.archived(owner).map(a => a.id), [record(2).id])
+  const archiveKey = `machina.uniswap.arc.execution.archive.v1:${owner.toLowerCase()}`, activeKey = `machina.uniswap.arc.execution.v1:${owner.toLowerCase()}`
+  const stored = JSON.parse(store.get(archiveKey)); stored.push({ id: 'legacy', note: 'old' }); store.set(archiveKey, JSON.stringify(stored))
+  assert.equal(journal.archiveUnreadable(owner), 1); journal.save(record(22)); assert.equal(journal.read(owner).length, 20)
+  assert.ok(JSON.parse(store.get(archiveKey)).some(entry => entry.id === 'legacy')); assert.equal(journal.archived(owner).length, 2)
+  const view = key => ({ length: 2, key: i => [activeKey, archiveKey][i], getItem: k => (k === archiveKey && key === 'broken' ? '{' : store.get(k) ?? null) })
+  const listed = e.listStoredAttempts(view('fine')); assert.equal(listed[0].attempts.length, 20); assert.equal(listed[0].archived.length, 2); assert.equal(listed[0].archiveUnreadable, 1); assert.equal(listed[0].unreadable, false)
+  const broken = e.listStoredAttempts(view('broken')); assert.equal(broken[0].attempts.length, 20); assert.deepEqual(broken[0].archived, []); assert.equal(broken[0].unreadable, true) // the active records stay visible
+  const noActive = e.listStoredAttempts({ length: 1, key: () => activeKey, getItem: () => '{' }); assert.equal(noActive[0].unreadable, true); assert.deepEqual(noActive[0].attempts, [])
+})
+await test('the controller reports whether a wallet is held by an unresolved record, and unreadable storage counts as held', async () => {
+  const f = setup(); assert.equal(f.controller.blocking(owner), false); await f.controller.confirm(await f.review()); assert.equal(f.controller.blocking(owner), true)
+  const broken = setup({ data: new Map([[`machina.uniswap.arc.execution.v1:${owner.toLowerCase()}`, '{']]) }); assert.equal(broken.controller.blocking(owner), true)
+})
+await test('the read-only client refuses every non-read method on both of its request paths and never reaches the network', async () => {
+  const { arcReadClient } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
+  for (const request of [arcReadClient.request, arcReadClient.transport.request]) for (const method of ['eth_sendRawTransaction', 'eth_sendTransaction', 'personal_sign', 'eth_signTypedData_v4', 'wallet_switchEthereumChain'])
+    await assert.rejects(Promise.resolve().then(() => request({ method, params: [] })), /read_only_rpc/, method)
 })
 assert.equal(external, 0)
 console.log(`${count} Uniswap execution/security groups PASS. Synthetic wallet requests and RPC only; zero live signatures, sends, approvals or transfers.`)

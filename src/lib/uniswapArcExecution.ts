@@ -1,19 +1,49 @@
 import { WalletRpcFailure, walletRpcRead, walletRpcQuantity, walletRpcMessage } from './uniswapArcWalletRpc'
 import { decodeFunctionData, encodeFunctionData, toHex, type Hex } from 'viem'
-import { ARC_ROUTER, EXECUTE_ABI, UNISWAP_ARC_WRITES_ENABLED, nativeAmount, requestKey, sameAddress, uint, validateArcRequest, validateArcReview, type ArcRequest, type ArcReview } from './uniswapArcPolicy'
+import { ARC_ROUTER, EXECUTE_ABI, UNISWAP_ARC_WRITES_ENABLED, requestKey, sameAddress, uint, validateArcRequest, type ArcRequest, type ArcReview } from './uniswapArcPolicy'
+import { reviewValue, validateReview } from './swap/swapPolicy'
+import type { ChainSummary, IntentSummary, IntentVerdict } from './swap/transactionEvidence'
+import { archiveRecord, archiveUnreadable, readArchive } from './swap/journalArchive'
 
 export interface ExecutionContext { owner: string; connected: boolean; chainId: number; connectorId: string }
 export interface ExecutionProvider { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
-export type AttemptStatus = 'awaiting_wallet' | 'pending' | 'confirmed' | 'failed' | 'rejected' | 'unknown'
-export interface SwapAttempt { id: string; review: ArcReview; nonce: number; status: AttemptStatus; createdAt: number; hash?: Hex; output?: string; fee?: string }
+// confirmed : the chain says success AND the transaction matches the Review the user approved
+// mismatch  : the chain says success but the transaction is not what was reviewed (never shown as Confirmed)
+// failed    : the chain says the transaction reverted
+// unknown   : the outcome could not be determined (RPC trouble, or a hash that does not identify the attempt)
+export type AttemptStatus = 'awaiting_wallet' | 'pending' | 'confirmed' | 'failed' | 'rejected' | 'unknown' | 'mismatch'
+// Append-only record of how an attempt's status changed. Original Review data is never rewritten.
+export interface StatusLogEntry { at: number; status: AttemptStatus; note: string }
+export interface SwapAttempt {
+  id: string; review: ArcReview; nonce: number; status: AttemptStatus; createdAt: number; hash?: Hex; output?: string; fee?: string
+  // Chain facts and the Review comparison are stored separately: a chain success never implies Review verification.
+  chain?: ChainSummary; intent?: IntentSummary; log?: StatusLogEntry[]
+}
 export interface ExecutionView {
   phase: 'idle' | 'preparing' | 'review' | 'checking' | AttemptStatus
   approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
+  // A status lookup in progress. The status already known stays visible; only this flag changes.
+  checking?: boolean
+  // When the next automatic lookup is due, or null when none will run (terminal or deterministic result).
+  nextCheckMs?: number | null
+  // The last time the chain was actually read for this attempt (not a stored value).
+  observedAt?: number
+  // The recorded hash is unknown to the network and its nonce was used by another transaction: the replacement's hash can be supplied.
+  replaced?: boolean
 }
-export class ExecutionResultVerificationError extends Error {
-  constructor() { super('review_fee_mismatch') }
+// Raised when the evidence cannot be trusted or does not identify the attempt. `retryable` false = repeating cannot change it.
+export class ExecutionVerificationError extends Error {
+  constructor(readonly reason: 'binding' | 'malformed' | 'rpc', readonly retryable: boolean) { super('verification') }
 }
-export type ChainResult = { status: 'pending' } | { status: 'confirmed' | 'failed'; output: string; fee: string }
+export type ChainResult =
+  // identified: the node knows this exact transaction and it is bound to the attempt (sender, nonce, chain). A hash the node has never
+  // seen is not identified. nonceUsed: that hash is unknown AND the account's nonce was already used by another transaction, so the
+  // recorded transaction can never execute any more (a wallet speed-up or cancel replaced it, or it was dropped and the nonce reused).
+  | { status: 'pending'; identified?: boolean; nonceUsed?: boolean }
+  | { status: 'confirmed' | 'failed'; output: string; fee: string }
+  // Full verification: chain facts plus the Review comparison.
+  | { status: 'settled'; chain: ChainSummary; intent: IntentSummary; output: string; fee: string }
+export const isIntentVerified = (verdict: IntentVerdict) => verdict === 'verified' || verdict === 'verified_with_notes'
 export interface ExecutionNonceState { nonce: number; latestNonce: number }
 export class ExecutionNonceObservationError extends Error {
   constructor(source: 'public' | 'wallet', readonly highestObserved: number, readonly reason?: 'latest-changed' | 'pending-behind-latest') { super(`${source}_nonce`) }
@@ -45,7 +75,14 @@ export const isTransactionHash = (hash: unknown): hash is Hex => typeof hash ===
 const isNonce = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
 const unresolved = (a: SwapAttempt) => ['awaiting_wallet', 'pending', 'unknown'].includes(a.status)
 const storageKey = (owner: string) => `machina.uniswap.arc.execution.v1:${owner.toLowerCase()}`
+const archiveKey = (owner: string) => `machina.uniswap.arc.execution.archive.v1:${owner.toLowerCase()}`
 const stop = (code: string): never => { throw new Error(code) }
+// Automatic status lookups: a pending transaction is polled at a steady pace; a transient read failure backs off and eventually
+// stops. A deterministic result (terminal chain state, or a hash that cannot identify the attempt) is never retried automatically.
+export const PENDING_CHECK_MS = 5000
+export const TRANSIENT_CHECK_DELAYS_MS = [5000, 10000, 20000, 40000, 60000]
+export const MAX_AUTOMATIC_CHECK_FAILURES = 8
+const TERMINAL: AttemptStatus[] = ['confirmed', 'failed', 'mismatch']
 export function executionMessage(code: string): string {
   const messages: Record<string, string> = {
     writes_disabled: 'Real Uniswap swaps are disabled pending independent review and release approval.',
@@ -64,8 +101,15 @@ export function executionMessage(code: string): string {
     rejected: 'You rejected the wallet request. No automatic retry will occur.',
     unknown: 'Submission or confirmation is not yet verified. This does not mean failure. Check your wallet or Arc Explorer; do not submit again.',
     wallet_timeout: 'The wallet approval window ended. Cancel the open request in your wallet; do not approve or submit again. The app cannot cancel it. A late approval or delayed inclusion may revert and still charge gas. Any returned hash will still be tracked.',
-    verification: 'Verification is incomplete; this does not mean the transaction failed. Check its hash on Arc Explorer and recheck its status. Do not submit another swap.',
+    verification: 'The chain could not be read just now (network or RPC trouble). This does not mean the transaction failed or succeeded. The app checks again automatically with growing pauses; you can also check manually. Do not submit another swap.',
+    verification_binding: 'This transaction hash does not identify the reviewed swap (its sender, nonce, network or hash differ), so it is not counted as this swap. Check it on Arc Explorer. No further automatic checks will run, and no new swap can start while this attempt is unresolved.',
+    verification_stopped: 'Automatic checks stopped after repeated read failures. This does not mean the transaction failed. Use Check transaction status to try again; do not submit another swap.',
+    recovery_unknown: 'The network does not know that hash (yet), so it was not saved and nothing was changed. Check the hash in your wallet or on Arc Explorer, then paste it again.',
+    replaced: 'The recorded transaction is not known to the network, and its nonce was used by another transaction (for example a wallet speed-up or cancel). Paste the hash your wallet shows for the replacement; it is accepted only if it is the swap you reviewed.',
+    mismatch: 'The blockchain transaction succeeded, but it is not the transaction you reviewed, so it is not marked Confirmed. The differences are listed below.',
     smart_wallet: 'This execution flow supports EOAs only. Contract and delegated wallets remain blocked.',
+    allowance_missing: 'The exact approvals this swap needs are not in place (or have expired). Approve the exact amount first; each approval is its own wallet confirmation. No swap was requested.',
+    insufficient_input_balance: 'The wallet does not hold enough of the input token for this swap. No wallet request was started.',
     preflight: 'The current balance, fees, contract identity or simulation could not be verified. No wallet request was started.',
     confirmation: 'The transaction is still being checked. RPC errors and timeouts do not mean it failed.',
   }
@@ -74,37 +118,65 @@ export function executionMessage(code: string): string {
 
 // Only the deadline is tightened. Commands, inputs, attribution suffix, value and economic floors are unchanged.
 export function tightenExecutionReview(source: ArcReview, context: ExecutionContext, now: number): ArcReview {
-  validateArcReview(source, context, now)
+  validateReview(source, context, now)
   const review = structuredClone(source)
   const outer = decodeFunctionData({ abi: EXECUTE_ABI, data: review.transaction.data })
   const canonical = encodeFunctionData({ abi: EXECUTE_ABI, functionName: 'execute', args: outer.args })
   const deadline = BigInt(Math.floor((review.requestStartedAt + EXECUTION_DEADLINE_WINDOW_MS) / 1000))
   const shorter = deadline < outer.args[2] ? deadline : outer.args[2]
   review.transaction.data = (encodeFunctionData({ abi: EXECUTE_ABI, functionName: 'execute', args: [outer.args[0], outer.args[1], shorter] }) + review.transaction.data.slice(canonical.length)) as Hex
-  validateArcReview(review, context, now)
+  validateReview(review, context, now)
   return review
 }
 export function executionTransaction(review: ArcReview, nonce: number) {
   if (!isNonce(nonce)) return stop('nonce')
   return Object.freeze({ chainId: toHex(5042), from: review.request.owner, to: ARC_ROUTER, data: review.transaction.data,
-    value: toHex(nativeAmount(review.request.amount)), gas: toHex(uint(review.gasLimit)), nonce: toHex(nonce),
+    value: toHex(reviewValue(review)), gas: toHex(uint(review.gasLimit)), nonce: toHex(nonce),
     type: '0x2', maxFeePerGas: toHex(uint(review.maxFeePerGas)), maxPriorityFeePerGas: toHex(uint(review.maxPriorityFeePerGas)) })
+}
+const ATTEMPT_STATUSES = ['awaiting_wallet', 'pending', 'confirmed', 'failed', 'rejected', 'unknown', 'mismatch']
+const INTENT_VERDICTS = ['verified', 'verified_with_notes', 'mismatch', 'incomplete', 'unbound', 'no_review']
+const INTENT_STATUSES = ['match', 'allowed', 'mismatch', 'unavailable']
+const decimalText = (v: unknown): v is string => typeof v === 'string' && /^\d{1,78}$/.test(v)
+const boundedText = (v: unknown, max: number): v is string => typeof v === 'string' && v.length <= max
+function validateChain(c: unknown) {
+  const v = c as Record<string, unknown> | null
+  if (!v || typeof v !== 'object' || Object.keys(v).some(k => !['state', 'blockNumber', 'blockHash', 'gasUsed', 'effectiveGasPrice', 'fee', 'received', 'sent', 'checkedAt'].includes(k)) ||
+    !['success', 'reverted'].includes(v.state as string) || !decimalText(v.blockNumber) || typeof v.blockHash !== 'string' || !/^0x[a-fA-F0-9]{64}$/.test(v.blockHash) ||
+    !decimalText(v.gasUsed) || !decimalText(v.effectiveGasPrice) || !decimalText(v.fee) || (v.received !== null && !decimalText(v.received)) || (v.sent !== null && v.sent !== undefined && !decimalText(v.sent)) ||
+    !Number.isSafeInteger(v.checkedAt)) stop('storage')
+}
+function validateIntent(i: unknown) {
+  const v = i as Record<string, unknown> | null
+  if (!v || typeof v !== 'object' || Object.keys(v).some(k => !['verdict', 'checks', 'differences', 'checkedAt'].includes(k)) || !INTENT_VERDICTS.includes(v.verdict as string) ||
+    !Array.isArray(v.checks) || v.checks.length > 24 || !Array.isArray(v.differences) || v.differences.length > 8 || !Number.isSafeInteger(v.checkedAt)) return stop('storage')
+  for (const item of v.checks as Record<string, unknown>[]) if (!item || typeof item !== 'object' || !boundedText(item.id, 40) || !INTENT_STATUSES.includes(item.status as string) || !boundedText(item.detail, 500)) stop('storage')
+  for (const text of v.differences as unknown[]) if (!boundedText(text, 500)) stop('storage')
+}
+function validateLog(l: unknown) {
+  if (!Array.isArray(l) || l.length > 40) return stop('storage')
+  for (const item of l as Record<string, unknown>[]) if (!item || typeof item !== 'object' || !Number.isSafeInteger(item.at) || !ATTEMPT_STATUSES.includes(item.status as string) || !boundedText(item.note, 300)) stop('storage')
 }
 function validateAttempt(value: unknown, owner: string): SwapAttempt {
   if (!value || typeof value !== 'object') return stop('storage')
   const a = value as SwapAttempt
-  if (Object.keys(a).some(k => !['id', 'review', 'nonce', 'status', 'createdAt', 'hash', 'output', 'fee'].includes(k)) ||
+  if (Object.keys(a).some(k => !['id', 'review', 'nonce', 'status', 'createdAt', 'hash', 'output', 'fee', 'chain', 'intent', 'log'].includes(k)) ||
     !/^[a-f0-9-]{36}$/i.test(a.id) || !isNonce(a.nonce) || !Number.isSafeInteger(a.createdAt) ||
-    !['awaiting_wallet', 'pending', 'confirmed', 'failed', 'rejected', 'unknown'].includes(a.status) ||
+    !ATTEMPT_STATUSES.includes(a.status) ||
     !a.review || !sameAddress(a.review.request?.owner, owner) || (a.hash !== undefined && !isTransactionHash(a.hash))) return stop('storage')
   // Historical reviews are checked at their original timestamp, solely for tracking. Never restored as send authority.
-  validateArcReview(a.review, { owner, chainId: 5042, connected: true }, a.review.requestStartedAt)
-  if (['pending', 'confirmed', 'failed'].includes(a.status) && !a.hash) return stop('storage')
+  validateReview(a.review, { owner, chainId: 5042, connected: true }, a.review.requestStartedAt)
+  if (['pending', 'confirmed', 'failed', 'mismatch'].includes(a.status) && !a.hash) return stop('storage')
   if (a.output !== undefined) uint(a.output)
-  if (a.fee !== undefined && uint(a.fee) > uint(a.review.networkFee)) return stop('storage')
+  // Only a Confirmed result must stay inside the approved fee ceiling; a mismatch records what the chain actually charged.
+  if (a.fee !== undefined && (uint(a.fee) > uint(a.review.networkFee) && a.status === 'confirmed')) return stop('storage')
+  if (a.fee !== undefined) uint(a.fee)
+  if (a.chain !== undefined) validateChain(a.chain)
+  if (a.intent !== undefined) validateIntent(a.intent)
+  if (a.log !== undefined) validateLog(a.log)
   return structuredClone(a)
 }
-export function createExecutionJournal(storage: ExecutionPorts['storage']) {
+export function createExecutionJournal(storage: ExecutionPorts['storage'], pinned: (id: string) => boolean = () => false) {
   function read(owner: string): SwapAttempt[] {
     try {
       const raw = storage.getItem(storageKey(owner))
@@ -122,8 +194,13 @@ export function createExecutionJournal(storage: ExecutionPorts['storage']) {
       const owner = attempt.review.request.owner, checked = validateAttempt(attempt, owner)
       const records = read(owner).filter(a => a.id !== checked.id)
       if (records.length >= 20) {
-        const removable = records.findIndex(a => !unresolved(a))
+        // Oldest settled record first; a record that recorded a mismatch is the last one removed. Unresolved ones never are.
+        // A settled record that this session could not re-verify (`pinned`) still blocks new sends, so it is not moved out either.
+        const movable = (a: SwapAttempt) => !unresolved(a) && !pinned(a.id)
+        const removable = (() => { const index = records.findIndex(a => movable(a) && a.status !== 'mismatch'); return index >= 0 ? index : records.findIndex(movable) })()
         if (removable < 0) return stop('storage')
+        // Moved, never deleted: the archive must hold the record before it leaves the active journal.
+        archiveRecord(storage, archiveKey(owner), records[removable], value => validateAttempt(value, owner))
         records.splice(removable, 1)
       }
       records.push(checked)
@@ -132,13 +209,38 @@ export function createExecutionJournal(storage: ExecutionPorts['storage']) {
       storage.setItem(storageKey(owner), text)
       if (storage.getItem(storageKey(owner)) !== text) return stop('storage')
     } catch { return stop('storage') }
+  }, archived(owner: string): SwapAttempt[] {
+    try { const active = new Set(read(owner).map(a => a.id)); return readArchive(storage, archiveKey(owner), value => validateAttempt(value, owner)).filter(a => !active.has(a.id)) } catch { return stop('storage') }
+  }, archiveUnreadable(owner: string): number {
+    try { return archiveUnreadable(storage, archiveKey(owner), value => validateAttempt(value, owner)) } catch { return stop('storage') }
   } }
+}
+// Read-only enumeration of every wallet's records stored in this browser, so the history stays reachable without a connected wallet,
+// on another network, or while a different token pair or provider is selected. Unreadable records are reported, never repaired or removed.
+export interface StoredHistory { owner: string; attempts: SwapAttempt[]; archived: SwapAttempt[]; unreadable: boolean; archiveUnreadable?: number }
+export function listStoredAttempts(storage: Pick<Storage, 'getItem' | 'key' | 'length'>): StoredHistory[] {
+  const prefix = 'machina.uniswap.arc.execution.v1:'
+  const owners: string[] = []
+  try {
+    for (let index = 0; index < Math.min(storage.length, 512); index++) {
+      const key = storage.key(index)
+      if (key?.startsWith(prefix) && /^0x[a-f0-9]{40}$/.test(key.slice(prefix.length))) owners.push(key.slice(prefix.length))
+    }
+  } catch { return [] }
+  return owners.slice(0, 16).map(owner => {
+    // The active records and the archive are read separately: a problem in one never hides the other.
+    const journal = createExecutionJournal({ getItem: key => storage.getItem(key), setItem: () => stop('storage') })
+    let attempts: SwapAttempt[], archived: SwapAttempt[] = [], archiveUnreadable = 0, unreadable = false
+    try { attempts = journal.read(owner) } catch { return { owner, attempts: [], archived: [], unreadable: true } }
+    try { archived = journal.archived(owner); archiveUnreadable = journal.archiveUnreadable(owner) } catch { unreadable = true }
+    return { owner, attempts, archived, unreadable, archiveUnreadable }
+  })
 }
 export async function browserExecutionLock<T>(owner: string, run: () => Promise<T>): Promise<T> {
   if (!globalThis.navigator?.locks) return stop('lock')
   return navigator.locks.request(`machina-uniswap-5042:${owner.toLowerCase()}`, { mode: 'exclusive', ifAvailable: true }, lock => lock ? run() : stop('lock'))
 }
-async function walletIdentity(provider: ExecutionProvider, owner: string): Promise<ExecutionNonceState> {
+export async function walletIdentity(provider: ExecutionProvider, owner: string): Promise<ExecutionNonceState> {
   async function identity(after: boolean) {
     const chainStage = after ? 'chain-after' : 'chain-before', accountStage = after ? 'accounts-after' : 'accounts-before'
     const chain = walletRpcQuantity(await walletRpcRead(provider, chainStage, owner), chainStage)
@@ -171,9 +273,18 @@ export function reconcileExecutionNonce(publicState: ExecutionNonceState, wallet
 
 // No preview object, DOM state or localStorage value can be passed to confirm as transaction authority.
 export function createUniswapArcExecution(ports: ExecutionPorts) {
-  const journal = createExecutionJournal(ports.storage)
+  const journal = createExecutionJournal(ports.storage, id => unverified.has(id))
   const enabled = ports.enabled ?? (() => UNISWAP_ARC_WRITES_ENABLED)
   let view: ExecutionView = { phase: 'idle' }, version = 0, busy = false, tracking = false, sending = false
+  // A settled record whose chain re-check failed in this session keeps its recorded status, but still blocks a new send until it is
+  // re-verified: a stored status is a record, not a fresh observation.
+  const unverified = new Set<string>()
+  const failures = new Map<string, number>()
+  const blocking = (a: SwapAttempt) => unresolved(a) || unverified.has(a.id)
+  const withLog = (a: SwapAttempt, status: AttemptStatus, note: string, at = Date.now()): SwapAttempt => {
+    if (a.status === status && a.log && a.log.length > 0) return { ...a, status }
+    return { ...a, status, log: [...(a.log ?? []), { at, status, note }].slice(-40) }
+  }
   let intent: { id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
   const contextKey = () => { const c = ports.context(); return JSON.stringify([c.owner.toLowerCase(), c.connected, c.chainId, c.connectorId]) }
   function emit(next: ExecutionView) { view = structuredClone(next); try { ports.changed?.(structuredClone(view)) } catch { /* Observer cannot interrupt recording. */ } }
@@ -185,13 +296,13 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     requireEnabled()
     const input = ports.input(), context = ports.context()
     if (selected.version !== version || contextKey() !== selected.context || !input || requestKey(input) !== requestKey(selected.review.request)) stop('context')
-    validateArcReview(selected.review, context, ports.quoteNow(selected.review.request))
+    validateReview(selected.review, context, ports.quoteNow(selected.review.request))
     if (selected.review.expiresAt - ports.quoteNow(selected.review.request) < 5000) stop('expired')
     if (executionDeadlineMs(selected.review) - ports.quoteNow(selected.review.request) < MIN_WALLET_WINDOW_MS + EXECUTION_MINING_BUFFER_MS) stop('expired')
   }
   function errorCode(error: unknown) {
     const code = error instanceof Error ? error.message : ''
-    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired'].includes(code) ? code
+    return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'smart_wallet', 'expired', 'allowance_missing', 'insufficient_input_balance'].includes(code) ? code
       : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
   }
   function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
@@ -237,7 +348,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     try {
       requireEnabled()
       const input = validateArcRequest(ports.input()), expectedContext = contextKey()
-      const persisted = journal.read(input.owner).find(unresolved)
+      const persisted = journal.read(input.owner).find(blocking)
       const memory = view.attempt && sameAddress(view.attempt.review.request.owner, input.owner) && unresolved(view.attempt) ? view.attempt : undefined
       const outstanding = memory ?? persisted
       if (outstanding) {
@@ -268,7 +379,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       emit({ phase: 'checking', approvalId, review: selected.review })
       await ports.lock(selected.review.request.owner, async () => {
         ready(selected)
-        if (journal.read(selected.review.request.owner).some(unresolved)) stop('busy')
+        if (journal.read(selected.review.request.owner).some(blocking)) stop('busy')
         const provider = await ports.provider()
         await checkedNonce(selected, provider, selected.nonce)
         ready(selected)
@@ -314,45 +425,114 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     try {
       await ports.lock(owner, async () => {
         const records = journal.read(owner)
-        const stored = attemptId ? records.find(a => a.id === attemptId) : [...records].reverse().find(unresolved) ?? records[records.length - 1]
+        const stored = attemptId ? records.find(a => a.id === attemptId) : [...records].reverse().find(blocking) ?? records[records.length - 1]
         if (!stored || stored.status === 'rejected') return
         let attempt = stored
         if (!attempt.hash && view.attempt?.id === stored.id && view.attempt.hash) attempt = { ...attempt, hash: view.attempt.hash }
+        // `base` is what is recorded (plus a hash the wallet itself returned). A hash the user typed is `unrecorded` until the network has
+        // shown that exact transaction: a mistyped or foreign hash must never replace the means of finding the real one.
+        const base = attempt
+        let unrecorded = false, replaced: Hex | undefined
         if (recoveredHash !== undefined) {
-          if (!isTransactionHash(recoveredHash) || (attempt.hash && attempt.hash.toLowerCase() !== recoveredHash.toLowerCase())) throw new Error('verification')
+          if (!isTransactionHash(recoveredHash)) throw new ExecutionVerificationError('binding', false)
+          if (attempt.hash && attempt.hash.toLowerCase() !== recoveredHash.toLowerCase()) {
+            // A different hash can take over only when the recorded one provably cannot execute any more: the node does not know it AND
+            // its nonce was already used by another transaction. The new hash is then verified like any other (sender, nonce, calldata, fee).
+            const probe = await ports.result(structuredClone(attempt))
+            if (!(probe.status === 'pending' && probe.identified === false && probe.nonceUsed === true)) throw new ExecutionVerificationError('binding', false)
+            replaced = attempt.hash
+          }
+          unrecorded = !attempt.hash || replaced !== undefined
           attempt = { ...attempt, hash: recoveredHash }
         }
-        if (!attempt.hash) { emit({ phase: 'unknown', attempt, error: executionMessage('unknown') }); return }
-        // Persisted terminal status is not trusted as a fresh chain observation after reload.
-        emit({ phase: 'pending', attempt: { ...attempt, status: 'pending' } })
+        if (!attempt.hash) { emit({ phase: 'unknown', attempt, error: executionMessage('unknown'), nextCheckMs: null }); return }
+        // The status already known stays on screen; only the checking indicator is added. A stored settled status is shown as
+        // recorded until the chain has been read again.
+        emit({ phase: attempt.status === 'awaiting_wallet' ? 'unknown' : attempt.status, attempt, checking: true, nextCheckMs: null, observedAt: view.attempt?.id === attempt.id ? view.observedAt : undefined })
+        // The record of a replacement keeps the earlier hash in its log, so nothing about the first attempt is lost.
+        const withReplacement = (a: SwapAttempt, at: number): SwapAttempt => replaced === undefined ? a
+          : { ...a, log: [...(a.log ?? []), { at, status: a.status, note: `Tracked under the hash you supplied. The previously recorded hash ${replaced} is unknown to the network and its nonce was used by another transaction.`.slice(0, 290) }].slice(-40) }
         try {
           const result = await ports.result(structuredClone(attempt))
+          const observedAt = Date.now()
           if (result.status === 'pending') {
-            // A recovery hash is saved only after exact transaction verification. A reorg of a
-            // formerly terminal record must become durable Pending again, blocking another send.
-            journal.save({ ...attempt, status: 'pending' })
+            failures.delete(attempt.id)
+            if (unrecorded && result.identified !== true) {
+              // Nothing is saved: the recorded state (and the means to find the real transaction) stays exactly as it was.
+              emit({ phase: base.status === 'awaiting_wallet' ? 'unknown' : base.status, attempt: base, checking: false, nextCheckMs: null, error: executionMessage('recovery_unknown'), observedAt: view.observedAt, ...(replaced ? { replaced: true } : {}) })
+              return
+            }
+            // A reorg of a formerly settled record must become durable Pending again, blocking another send.
+            unverified.delete(attempt.id)
+            const pending = withReplacement(withLog({ ...attempt, status: attempt.status }, 'pending', 'Waiting for inclusion and two observed blocks.', observedAt), observedAt)
+            journal.save(pending)
+            const gone = result.identified === false && result.nonceUsed === true
+            emit({ phase: 'pending', attempt: pending, checking: false, nextCheckMs: PENDING_CHECK_MS, observedAt, ...(gone ? { replaced: true, error: executionMessage('replaced') } : {}) })
             return
           }
-          if (uint(result.fee) > uint(attempt.review.networkFee) || (result.status === 'confirmed' && uint(result.output) < uint(attempt.review.requiredMinimum))) stop('verification')
-          attempt = { ...attempt, status: result.status, output: result.output, fee: result.fee }
-          journal.save(attempt)
-          emit({ phase: result.status, attempt })
-          try { ports.settled?.(structuredClone(attempt)) } catch { /* Balance refresh cannot change chain truth. */ }
+          let next: SwapAttempt, status: AttemptStatus
+          if (result.status === 'settled') {
+            const verified = isIntentVerified(result.intent.verdict)
+            status = result.chain.state === 'reverted' ? 'failed' : verified ? 'confirmed' : result.intent.verdict === 'mismatch' ? 'mismatch' : 'unknown'
+            if (status === 'unknown') {
+              // The chain answered (success) but the evidence needed to compare it with the Review is incomplete. The chain facts are kept and
+              // shown; nothing about the Review is claimed. It stays unresolved (blocks a new send) and is re-read with growing pauses that
+              // end: the same incomplete answer must not be fetched every five seconds forever.
+              const count = (failures.get(attempt.id) ?? 0) + 1
+              failures.set(attempt.id, count)
+              const wait = count < MAX_AUTOMATIC_CHECK_FAILURES ? TRANSIENT_CHECK_DELAYS_MS[Math.min(count - 1, TRANSIENT_CHECK_DELAYS_MS.length - 1)] : null
+              const incomplete = withReplacement(withLog({ ...attempt, output: result.output, fee: result.fee, chain: result.chain, intent: result.intent }, 'unknown', 'Chain success; evidence to compare with the Review is incomplete. Nothing is claimed.', observedAt), observedAt)
+              journal.save(incomplete)
+              unverified.delete(attempt.id)
+              emit({ phase: 'unknown', attempt: incomplete, checking: false, nextCheckMs: wait, observedAt, error: executionMessage(wait === null ? 'verification_stopped' : 'verification') })
+              return
+            }
+            if (status === 'confirmed' && (uint(result.fee) > uint(attempt.review.networkFee) || uint(result.output) < uint(attempt.review.requiredMinimum))) throw new ExecutionVerificationError('malformed', false)
+            const note = status === 'confirmed' ? (result.intent.verdict === 'verified_with_notes' ? 'Chain success; matches the Review (wallet adjusted gas fields within the approved ceiling).' : 'Chain success; matches the Review.')
+              : status === 'failed' ? 'Chain: the transaction reverted.' : `Chain success; not the reviewed transaction: ${result.intent.differences[0] ?? 'see the intent checks'}`
+            next = withLog({ ...attempt, output: result.output, fee: result.fee, chain: result.chain, intent: result.intent }, status, note.slice(0, 290), observedAt)
+          } else {
+            if (uint(result.fee) > uint(attempt.review.networkFee) || (result.status === 'confirmed' && uint(result.output) < uint(attempt.review.requiredMinimum))) throw new ExecutionVerificationError('malformed', false)
+            status = result.status
+            next = withLog({ ...attempt, output: result.output, fee: result.fee }, status, status === 'confirmed' ? 'Chain success; matches the Review.' : 'Chain: the transaction reverted.', observedAt)
+          }
+          next = withReplacement(next, observedAt)
+          failures.delete(attempt.id)
+          journal.save(next)
+          unverified.delete(attempt.id)
+          emit({ phase: status, attempt: next, checking: false, nextCheckMs: null, observedAt, ...(status === 'mismatch' ? { error: executionMessage('mismatch') } : {}) })
+          try { ports.settled?.(structuredClone(next)) } catch { /* Balance refresh cannot change chain truth. */ }
         } catch (error) {
-          attempt = { ...attempt, status: 'unknown' }
-          // Do not persist an unverified recovery hash; keep the original record recoverable.
-          if (recoveredHash === undefined) { try { journal.save(attempt) } catch { /* Previous unresolved record remains. */ } }
-          emit({ phase: 'unknown', attempt, error: executionMessage('verification') + (error instanceof ExecutionResultVerificationError ? ' The on-chain gas or fee parameters differ from the reviewed transaction; the app cannot mark it Confirmed under the approved limits.' : '') })
+          const deterministic = error instanceof ExecutionVerificationError && !error.retryable
+          const count = (failures.get(attempt.id) ?? 0) + 1
+          failures.set(attempt.id, count)
+          const automatic = !deterministic && count < MAX_AUTOMATIC_CHECK_FAILURES
+          const delay = automatic ? TRANSIENT_CHECK_DELAYS_MS[Math.min(count - 1, TRANSIENT_CHECK_DELAYS_MS.length - 1)] : null
+          const message = executionMessage(deterministic ? 'verification_binding' : automatic ? 'verification' : 'verification_stopped')
+          if ((TERMINAL.includes(attempt.status) || attempt.status === 'pending') && !deterministic) {
+            // A read failure teaches nothing about the chain. A settled record is not downgraded, and a Pending transaction stays Pending:
+            // the last known status remains on screen (with the reason it could not be refreshed), it keeps blocking new sends until
+            // the chain is read again, and the lookup is retried with growing pauses.
+            unverified.add(attempt.id)
+            emit({ phase: attempt.status, attempt: base, checking: false, nextCheckMs: delay, error: message, observedAt: view.observedAt })
+          } else {
+            const unknown = withLog({ ...attempt }, 'unknown', deterministic ? 'The hash does not identify the reviewed transaction.' : 'The chain could not be read; outcome not yet verified.')
+            // Do not persist an unverified recovery hash; keep the original record recoverable.
+            if (!unrecorded) { try { journal.save(unknown) } catch { /* Previous unresolved record remains. */ } }
+            emit({ phase: 'unknown', attempt: unrecorded ? { ...unknown, hash: base.hash } : unknown, checking: false, nextCheckMs: delay, error: message, observedAt: view.observedAt })
+          }
         }
       })
     } catch (error) {
       // A temporarily held cross-tab lock does not turn a transaction into a failure.
-      if (!(error instanceof Error && error.message === 'lock')) emit({ ...view, error: executionMessage(error instanceof Error && error.message === 'verification' ? 'verification' : 'storage') })
+      if (!(error instanceof Error && error.message === 'lock')) emit({ ...view, checking: false, error: executionMessage(error instanceof ExecutionVerificationError ? (error.retryable ? 'verification' : 'verification_binding') : error instanceof Error && error.message === 'verification' ? 'verification' : 'storage') })
     } finally { tracking = false }
   }
   function invalidate() {
     version++; intent = null
     if (!sending && !['pending', 'unknown', 'confirmed', 'failed', 'rejected'].includes(view.phase)) emit({ phase: 'idle' })
   }
-  return { prepare, confirm, reconcile, invalidate, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view) }
+  return { prepare, confirm, reconcile, invalidate, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view),
+    // True while a record of this wallet is unresolved (or could not be re-verified). Unreadable storage counts as blocking.
+    blocking: (owner: string) => { try { return journal.read(owner).some(blocking) } catch { return true } } }
 }

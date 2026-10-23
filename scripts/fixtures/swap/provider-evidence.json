@@ -1,0 +1,605 @@
+{
+ "collectedAt": "2026-10-22T17:29:42.418Z",
+ "chainId": 5042,
+ "block": "27318774",
+ "note": "Read-only: eth_call, eth_getCode, eth_getBlock, eth_getBalance and Circle Swap Kit estimate. No signature, approval or transaction.",
+ "uniswap": {
+  "router": {
+   "address": "0x8702463e73f74d0b6765aBceb314Ef07aCb92650",
+   "present": true,
+   "hash": "0x2e80a35dc8a1da121611acc5c31be03c2e63669135461e63947901ecf8a1654d"
+  },
+  "permit2": {
+   "address": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+   "present": true,
+   "hash": "0x05a793d6bdba8b8715c8f4cef0725ec3a961f567d33ebb2d360f541f19f70c8f"
+  },
+  "factory": {
+   "address": "0xf0db7b58379503491d857db50ac9ece64c653918",
+   "present": true,
+   "hash": "0x621c4819f7b62d7ddb153206bc30950bcc3f5cc9d24c45661f8c2f31dcbd166d"
+  },
+  "pools": [
+   {
+    "pair": "USDC/EURC",
+    "fee": 500,
+    "address": "0x6fd5F2fb831940DcD61A98c5B3aCB7D8C6f3bFc1",
+    "factoryAgrees": true,
+    "liquidity": "28274715587571"
+   },
+   {
+    "pair": "USDC/EURC",
+    "fee": 3000,
+    "address": "0x88f97E21c423261244d6D661fBd569b2bd69539f",
+    "factoryAgrees": true,
+    "liquidity": "58619505"
+   },
+   {
+    "pair": "USDC/cirBTC",
+    "fee": 100,
+    "address": "0x82916bee18fCEF517B26C72d7Cb5F13694E1dB41",
+    "factoryAgrees": true,
+    "liquidity": "413104864407"
+   },
+   {
+    "pair": "USDC/WETH",
+    "fee": 3000,
+    "address": "0x964cFF2cCCB9059e83D507df348f070e5257A2e0",
+    "factoryAgrees": true,
+    "liquidity": "158840469360331"
+   },
+   {
+    "pair": "USDC/WETH",
+    "fee": 10000,
+    "address": "0xCC1437eD1200316193Ab09dB22e501D7e5907632",
+    "factoryAgrees": true,
+    "liquidity": "56090516186210"
+   },
+   {
+    "pair": "cirBTC/WETH",
+    "fee": 3000,
+    "address": "0xBb505c923D0CE6364b6d1769Fd85Bd62B0C0E9C9",
+    "factoryAgrees": true,
+    "liquidity": "954045230356"
+   }
+  ],
+  "directions": {
+   "USDC>EURC": {
+    "amountIn": "1",
+    "candidates": [
+     "USDC>500>EURC",
+     "USDC>3000>EURC"
+    ],
+    "best": {
+     "route": "USDC → EURC (0.05%)",
+     "estimatedOut": "0.890492",
+     "simulatedGas": "111681"
+    },
+    "alternatives": [
+     {
+      "route": "USDC → EURC (0.3%)",
+      "estimatedOut": "0.883942"
+     }
+    ],
+    "failures": [],
+    "block": "27318778",
+    "review": {
+     "built": true,
+     "gasLimit": "209521",
+     "networkFeeCeiling": "9701801989605934",
+     "minimum": "886039"
+    }
+   },
+   "USDC>cirBTC": {
+    "amountIn": "1",
+    "candidates": [
+     "USDC>100>cirBTC",
+     "USDC>3000>WETH|WETH>3000>cirBTC"
+    ],
+    "best": {
+     "route": "USDC → cirBTC (0.01%)",
+     "estimatedOut": "0.00001229",
+     "simulatedGas": "110690"
+    },
+    "alternatives": [
+     {
+      "route": "USDC → WETH (0.3%) → cirBTC (0.3%)",
+      "estimatedOut": "0.00001223"
+     }
+    ],
+    "failures": [],
+    "block": "27318781",
+    "review": {
+     "built": true,
+     "gasLimit": "208035",
+     "networkFeeCeiling": "9628048872609750",
+     "minimum": "1222"
+    }
+   },
+   "USDC>WETH": {
+    "amountIn": "1",
+    "candidates": [
+     "USDC>3000>WETH",
+     "USDC>10000>WETH",
+     "USDC>100>cirBTC|cirBTC>3000>WETH"
+    ],
+    "best": {
+     "route": "USDC → WETH (0.3%)",
+     "estimatedOut": "0.000419585181607169",
+     "simulatedGas": "131328"
+    },
+    "alternatives": [
+     {
+      "route": "USDC → cirBTC (0.01%) → WETH (0.3%)",
+      "estimatedOut": "0.000418271468630565"
+     },
+     {
+      "route": "USDC → WETH (1%)",
+      "estimatedOut": "0.000414389661321703"
+     }
+    ],
+    "failures": [],
+    "block": "27318782",
+    "review": {
+     "built": true,
+     "gasLimit": "238992",
+     "networkFeeCeiling": "11060766967879200",
+     "minimum": "417487255699133"
+    }
+   },
+   "EURC>USDC": {
+    "amountIn": "1",
+    "candidates": [
+     "EURC>500>USDC",
+     "EURC>3000>USDC"
+    ],
+    "best": {
+     "route": "EURC → USDC (0.05%)",
+     "estimatedOut": "1.121851",
+     "simulatedGas": "91459"
+    },
+    "alternatives": [
+     {
+      "route": "EURC → USDC (0.3%)",
+      "estimatedOut": "1.092663"
+     }
+    ],
+    "failures": [],
+    "block": "27318784",
+    "review": {
+     "built": true,
+     "gasLimit": "179188",
+     "networkFeeCeiling": "8421119248000000",
+     "minimum": "1116241"
+    }
+   },
+   "EURC>cirBTC": {
+    "amountIn": "1",
+    "candidates": [
+     "EURC>500>USDC|USDC>100>cirBTC"
+    ],
+    "best": {
+     "route": "EURC → USDC (0.05%) → cirBTC (0.01%)",
+     "estimatedOut": "0.00001379",
+     "simulatedGas": "194017"
+    },
+    "alternatives": [],
+    "failures": [],
+    "block": "27318785",
+    "review": {
+     "built": true,
+     "gasLimit": "333025",
+     "networkFeeCeiling": "15650842900000000",
+     "minimum": "1372"
+    }
+   },
+   "EURC>WETH": {
+    "amountIn": "1",
+    "candidates": [
+     "EURC>500>USDC|USDC>3000>WETH"
+    ],
+    "best": {
+     "route": "EURC → USDC (0.05%) → WETH (0.3%)",
+     "estimatedOut": "0.000470704482556629",
+     "simulatedGas": "216655"
+    },
+    "alternatives": [],
+    "failures": [],
+    "block": "27318787",
+    "review": {
+     "built": true,
+     "gasLimit": "366982",
+     "networkFeeCeiling": "17246686072000000",
+     "minimum": "468350960143845"
+    }
+   },
+   "cirBTC>USDC": {
+    "amountIn": "0.00001",
+    "candidates": [
+     "cirBTC>100>USDC",
+     "cirBTC>3000>WETH|WETH>3000>USDC"
+    ],
+    "best": {
+     "route": "cirBTC → USDC (0.01%)",
+     "estimatedOut": "0.812501",
+     "simulatedGas": "85552"
+    },
+    "alternatives": [
+     {
+      "route": "cirBTC → WETH (0.3%) → USDC (0.3%)",
+      "estimatedOut": "0.806393"
+     }
+    ],
+    "failures": [],
+    "block": "27318788",
+    "review": {
+     "built": true,
+     "gasLimit": "170328",
+     "networkFeeCeiling": "8004734688000000",
+     "minimum": "808438"
+    }
+   },
+   "cirBTC>EURC": {
+    "amountIn": "0.00001",
+    "candidates": [
+     "cirBTC>100>USDC|USDC>500>EURC"
+    ],
+    "best": {
+     "route": "cirBTC → USDC (0.01%) → EURC (0.05%)",
+     "estimatedOut": "0.723525",
+     "simulatedGas": "189101"
+    },
+    "alternatives": [],
+    "failures": [],
+    "block": "27318789",
+    "review": {
+     "built": true,
+     "gasLimit": "325651",
+     "networkFeeCeiling": "15378231884609576",
+     "minimum": "719907"
+    }
+   },
+   "cirBTC>WETH": {
+    "amountIn": "0.00001",
+    "candidates": [
+     "cirBTC>3000>WETH",
+     "cirBTC>100>USDC|USDC>3000>WETH"
+    ],
+    "best": {
+     "route": "cirBTC → USDC (0.01%) → WETH (0.3%)",
+     "estimatedOut": "0.000340921400916828",
+     "simulatedGas": "210722"
+    },
+    "alternatives": [
+     {
+      "route": "cirBTC → WETH (0.3%)",
+      "estimatedOut": "0.000340469285722957"
+     }
+    ],
+    "failures": [],
+    "block": "27318790",
+    "review": {
+     "built": true,
+     "gasLimit": "358083",
+     "networkFeeCeiling": "16909769685757608",
+     "minimum": "339216793912243"
+    }
+   },
+   "WETH>USDC": {
+    "amountIn": "0.0003",
+    "candidates": [
+     "WETH>3000>USDC",
+     "WETH>10000>USDC",
+     "WETH>3000>cirBTC|cirBTC>100>USDC"
+    ],
+    "best": {
+     "route": "WETH → USDC (0.3%)",
+     "estimatedOut": "0.710551",
+     "simulatedGas": "117121"
+    },
+    "alternatives": [
+     {
+      "route": "WETH → cirBTC (0.3%) → USDC (0.01%)",
+      "estimatedOut": "0.710023"
+     },
+     {
+      "route": "WETH → USDC (1%)",
+      "estimatedOut": "0.709109"
+     }
+    ],
+    "failures": [],
+    "block": "27318791",
+    "review": {
+     "built": true,
+     "gasLimit": "217681",
+     "networkFeeCeiling": "10279559696956856",
+     "minimum": "706998"
+    }
+   },
+   "WETH>EURC": {
+    "amountIn": "0.0003",
+    "candidates": [
+     "WETH>3000>USDC|USDC>500>EURC"
+    ],
+    "best": {
+     "route": "WETH → USDC (0.3%) → EURC (0.05%)",
+     "estimatedOut": "0.632739",
+     "simulatedGas": "222670"
+    },
+    "alternatives": [],
+    "failures": [],
+    "block": "27318793",
+    "review": {
+     "built": true,
+     "gasLimit": "376005",
+     "networkFeeCeiling": "17670730980000000",
+     "minimum": "629575"
+    }
+   },
+   "WETH>cirBTC": {
+    "amountIn": "0.0003",
+    "candidates": [
+     "WETH>3000>cirBTC",
+     "WETH>3000>USDC|USDC>100>cirBTC"
+    ],
+    "best": {
+     "route": "WETH → cirBTC (0.3%)",
+     "estimatedOut": "0.00000874",
+     "simulatedGas": "139910"
+    },
+    "alternatives": [
+     {
+      "route": "WETH → USDC (0.3%) → cirBTC (0.01%)",
+      "estimatedOut": "0.00000873"
+     }
+    ],
+    "failures": [],
+    "block": "27318794",
+    "review": {
+     "built": true,
+     "gasLimit": "251865",
+     "networkFeeCeiling": "11836647540000000",
+     "minimum": "869"
+    }
+   }
+  }
+ },
+ "circle": {
+  "sdk": "1.7.0",
+  "adapterContract": {
+   "address": "0x7FB8c7260b63934d8da38aF902f87ae6e284a845",
+   "present": true,
+   "hash": "0xa7bf56ff347a9755b51029c5e0e36b7e751ee85f595d121cf09ce24b3d4b11f8"
+  },
+  "directions": {
+   "USDC>EURC": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "0.890581",
+     "minimum": "0.881675",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "USDC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.024452149459787011",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "USDC>cirBTC": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "0.00001234",
+     "minimum": "0.00001222",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "USDC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.037104301198237753",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "USDC>WETH": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "0.000419739205967046",
+     "minimum": "0.000415541813907376",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "USDC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.028003196135376365",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "EURC>USDC": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "1.122231",
+     "minimum": "1.111009",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "EURC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.021491179525770494",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "EURC>cirBTC": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "0.0000138",
+     "minimum": "0.00001366",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "EURC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0281660652",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "EURC>WETH": {
+    "amountIn": "1",
+    "estimate": {
+     "out": "0.000471138361767392",
+     "minimum": "0.000466426978149718",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.0002",
+       "token": "EURC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0338844744",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "cirBTC>USDC": {
+    "amountIn": "0.00001",
+    "estimate": {
+     "out": "0.813918",
+     "minimum": "0.805779",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000001",
+       "token": "cirBTC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0243664872549",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "cirBTC>EURC": {
+    "amountIn": "0.00001",
+    "estimate": {
+     "out": "0.723721",
+     "minimum": "0.716484",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000001",
+       "token": "cirBTC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0211088556",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "cirBTC>WETH": {
+    "amountIn": "0.00001",
+    "estimate": {
+     "out": "0.000340765241812381",
+     "minimum": "0.000337357589394257",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000001",
+       "token": "cirBTC"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0318975804",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "WETH>USDC": {
+    "amountIn": "0.0003",
+    "estimate": {
+     "out": "0.7139",
+     "minimum": "0.706761",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000006",
+       "token": "0x128cC466B61f542da60c70e3aA11c10e19B84EDB"
+      },
+      {
+       "type": "gas",
+       "amount": "0.026965512",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "WETH>EURC": {
+    "amountIn": "0.0003",
+    "estimate": {
+     "out": "0.635914",
+     "minimum": "0.629555",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000006",
+       "token": "0x128cC466B61f542da60c70e3aA11c10e19B84EDB"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0353942064",
+       "token": "USDC"
+      }
+     ]
+    }
+   },
+   "WETH>cirBTC": {
+    "amountIn": "0.0003",
+    "estimate": {
+     "out": "0.00000878",
+     "minimum": "0.00000869",
+     "fees": [
+      {
+       "type": "provider",
+       "amount": "0.00000006",
+       "token": "0x128cC466B61f542da60c70e3aA11c10e19B84EDB"
+      },
+      {
+       "type": "gas",
+       "amount": "0.0286736354079",
+       "token": "USDC"
+      }
+     ]
+    }
+   }
+  }
+ }
+}

@@ -1,6 +1,8 @@
-import { createPublicClient, defineChain, erc20Abi, http, keccak256, type Hex, type Transport } from 'viem'
-import { ARC_OUTPUTS, ARC_ROUTER, ARC_ROUTER_HASH, decodeNativeEconomics, nativeAmount, sameAddress, uint, type ArcReview } from './uniswapArcPolicy'
-import { ExecutionNonceObservationError, ExecutionResultVerificationError, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
+import { createPublicClient, defineChain, erc20Abi, http, keccak256, parseAbi, type Hex, type Transport } from 'viem'
+import { ARC_PERMIT2, ARC_ROUTER, ARC_ROUTER_HASH, ARC_TOKENS, sameAddress, tokenUnits, uint, type ArcReview } from './uniswapArcPolicy'
+import { reviewValue } from './swap/swapPolicy'
+import { ExecutionNonceObservationError, ExecutionVerificationError, executionDeadlineMs, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
+import { compareToReview, ownerFlows, summarizeIntent, type ChainLog, type ChainReceipt, type ChainTx, type ReviewedIntent } from './swap/transactionEvidence'
 
 const RPC = 'https://rpc.mainnet.arc.io'
 const chain = defineChain({ id: 5042, name: 'Arc Mainnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [RPC] } } })
@@ -10,17 +12,24 @@ export function assertExecutionReadMethod(method: string) {
 }
 const transport: Transport = options => {
   const underlying = http(RPC, { timeout: 8000, retryCount: 0 })(options)
-  return { ...underlying, request(args, requestOptions) { assertExecutionReadMethod(args.method); return underlying.request(args, requestOptions) } }
+  // Both the client's request and the transport's own request are guarded; nothing reaches the network layer without the read-only check.
+  const guarded: typeof underlying.request = (args, requestOptions) => { assertExecutionReadMethod(args.method); return underlying.request(args, requestOptions) }
+  const rawGuarded = (args: { method: string; params?: unknown }) => { assertExecutionReadMethod(args.method); return underlying.config.request(args as never) }
+  return { ...underlying, config: { ...underlying.config, request: rawGuarded as never }, request: guarded }
 }
 const client = createPublicClient({ chain, transport, ccipRead: false, cacheTime: 0 })
+// The one read-only Arc client (guarded to read methods only), shared with the keyless Uniswap quote adapter.
+export const arcReadClient = client
 const hash = (value: unknown): value is Hex => typeof value === 'string' && /^0x[a-f0-9]{64}$/i.test(value)
 const reject = (): never => { throw new Error('verification') }
+const PERMIT2_ABI = parseAbi(['function allowance(address owner, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)'])
 const transferTopic = keccak256(new TextEncoder().encode('Transfer(address,address,uint256)'))
 
 // The injectable client is a test seam; production uses only the pinned, read-only Arc RPC.
 export function createArcExecutionRpc(rpc = client) {
   async function preflight(review: ArcReview) {
-    const r = review.request, account = r.owner as Hex, output = ARC_OUTPUTS[r.tokenOut]
+    const r = review.request, account = r.owner as Hex, output = ARC_TOKENS[r.tokenOut], input = ARC_TOKENS[r.tokenIn], value = reviewValue(review), erc20Input = r.tokenIn !== 'USDC'
+    const needed = tokenUnits(r.amount, input.decimals), fee = uint(review.networkFee)
     if (await rpc.getChainId() !== 5042) reject()
     const blockNumber = await rpc.getBlockNumber({ cacheTime: 0 })
     const [block, code, tokenCode, walletCode, decimals, balance, pendingBalance, price] = await Promise.all([
@@ -30,11 +39,22 @@ export function createArcExecutionRpc(rpc = client) {
     ])
     if (walletCode && walletCode !== '0x') throw new Error('smart_wallet')
     if (!code || keccak256(code) !== ARC_ROUTER_HASH || !tokenCode || tokenCode === '0x' || decimals !== output.decimals) reject()
-    const deadline = decodeNativeEconomics(review.transaction, r, uint(review.requiredMinimum), review.quoteId).deadline
+    const deadline = executionDeadlineMs(review) / 1000
     if (block.timestamp >= BigInt(deadline)) throw new Error('expired')
-    if (balance < nativeAmount(r.amount) + uint(review.networkFee) || pendingBalance < nativeAmount(r.amount) + uint(review.networkFee) ||
+    if (balance < value + fee || pendingBalance < value + fee ||
       price <= 0n || price > uint(review.maxFeePerGas) || typeof block.baseFeePerGas !== 'bigint' || block.baseFeePerGas > uint(review.maxFeePerGas)) reject()
-    const call = { account, to: ARC_ROUTER, data: review.transaction.data, value: nativeAmount(r.amount), gas: uint(review.gasLimit),
+    if (erc20Input) {
+      // An ERC-20 input is pulled through Permit2: the wallet must hold it and have approved exactly what this swap needs, twice
+      // (token -> Permit2, then Permit2 -> router, unexpired). A missing approval is its own, actionable answer.
+      const [held, toPermit2, permit] = await Promise.all([
+        rpc.readContract({ address: input.address, abi: erc20Abi, functionName: 'balanceOf', args: [account], blockNumber }),
+        rpc.readContract({ address: input.address, abi: erc20Abi, functionName: 'allowance', args: [account, ARC_PERMIT2], blockNumber }),
+        rpc.readContract({ address: ARC_PERMIT2, abi: PERMIT2_ABI, functionName: 'allowance', args: [account, input.address, ARC_ROUTER], blockNumber }),
+      ])
+      if (held < needed) throw new Error('insufficient_input_balance')
+      if (toPermit2 < needed || permit[0] < needed || BigInt(permit[1]) <= block.timestamp + 120n) throw new Error('allowance_missing')
+    }
+    const call = { account, to: ARC_ROUTER, data: review.transaction.data, value, gas: uint(review.gasLimit),
       maxFeePerGas: uint(review.maxFeePerGas), maxPriorityFeePerGas: uint(review.maxPriorityFeePerGas), blockNumber } as const
     await rpc.call(call) // Exact tightened calldata, no state overrides or fake balances.
     const estimated = await rpc.estimateGas(call)
@@ -48,47 +68,79 @@ export function createArcExecutionRpc(rpc = client) {
       return { nonce, latestNonce }
     } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new Error('public_nonce') }
   }
+  // The transaction and receipt are read from the public RPC only. The result keeps two separate answers:
+  //   chain  : what the network says (success/reverted, block, fee, what the wallet received)
+  //   intent : whether that transaction is the one that was reviewed (see swap/transactionEvidence)
+  // Wallet-adjusted gas fields are judged by the approved fee ceiling; calldata, value, target, sender and nonce are never adjustable.
   async function result(attempt: SwapAttempt): Promise<ChainResult> {
-    if (!hash(attempt.hash) || await rpc.getChainId() !== 5042) reject()
+    // A transient read problem is a retryable error; a hash that cannot identify the attempt is not.
+    if (!hash(attempt.hash)) throw new ExecutionVerificationError('binding', false)
+    let chainId: number
+    try { chainId = await rpc.getChainId() } catch { throw new ExecutionVerificationError('rpc', true) }
+    if (chainId !== 5042) throw new ExecutionVerificationError('rpc', true)
     const expected = executionTransaction(attempt.review, attempt.nonce)
-    const tx = await rpc.getTransaction({ hash: attempt.hash! })
-    // Wallets can alter requests. Never report success for a hash that fails exact transaction binding.
-    if (!sameAddress(tx.from, expected.from) || !sameAddress(tx.to, expected.to) || tx.chainId !== 5042 || tx.nonce !== attempt.nonce || tx.type !== 'eip1559' ||
-      tx.input.toLowerCase() !== expected.data.toLowerCase() || tx.value !== BigInt(expected.value) || tx.hash.toLowerCase() !== attempt.hash!.toLowerCase()) reject()
-    if (tx.gas !== BigInt(expected.gas) || tx.maxFeePerGas !== BigInt(expected.maxFeePerGas) ||
-      tx.maxPriorityFeePerGas !== BigInt(expected.maxPriorityFeePerGas)) throw new ExecutionResultVerificationError()
+    let tx
+    try { tx = await rpc.getTransaction({ hash: attempt.hash! }) }
+    catch (error) {
+      // A hash that the public node does not know yet is still pending, not failed. Whether its nonce has meanwhile been used by another
+      // transaction is read as well: then this hash can never be mined, and only a replacement hash can identify the swap.
+      if (error instanceof Error && error.name === 'TransactionNotFoundError') {
+        let nonceUsed: boolean | undefined
+        try { nonceUsed = (await rpc.getTransactionCount({ address: attempt.review.request.owner as Hex, blockTag: 'latest' })) > attempt.nonce } catch { nonceUsed = undefined }
+        return { status: 'pending', identified: false, ...(nonceUsed === undefined ? {} : { nonceUsed }) }
+      }
+      throw new ExecutionVerificationError('rpc', true)
+    }
+    const identityOk = tx.hash.toLowerCase() === attempt.hash!.toLowerCase() && sameAddress(tx.from, expected.from) && tx.chainId === 5042 && tx.nonce === attempt.nonce
+    if (!identityOk) throw new ExecutionVerificationError('binding', false)
     let receipt
     try { receipt = await rpc.getTransactionReceipt({ hash: attempt.hash! }) }
     catch (error) {
-      // A missing receipt is pending, not failure. Other RPC errors remain unverified.
-      if (error instanceof Error && error.name === 'TransactionReceiptNotFoundError') return { status: 'pending' }
-      throw error
+      // A missing receipt is pending, not failure. Other RPC errors remain unverified (and are retried with backoff).
+      if (error instanceof Error && error.name === 'TransactionReceiptNotFoundError') return { status: 'pending', identified: true }
+      throw new ExecutionVerificationError('rpc', true)
     }
-    if (receipt.transactionHash.toLowerCase() !== attempt.hash!.toLowerCase() || !sameAddress(receipt.from, expected.from) || !sameAddress(receipt.to, expected.to) ||
-      receipt.blockNumber === null || !hash(receipt.blockHash) || receipt.gasUsed <= 0n || receipt.gasUsed > BigInt(expected.gas) || receipt.effectiveGasPrice > BigInt(expected.maxFeePerGas)) reject()
-    const block = await rpc.getBlock({ blockNumber: receipt.blockNumber })
-    if (block.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) return { status: 'pending' }
-    if (await rpc.getBlockNumber({ cacheTime: 0 }) < receipt.blockNumber + 1n) return { status: 'pending' } // Two observed blocks; not a promise against all reorgs.
+    if (receipt.blockNumber === null || !hash(receipt.blockHash) || receipt.gasUsed <= 0n) throw new ExecutionVerificationError('malformed', true)
+    let block, latest
+    try { block = await rpc.getBlock({ blockNumber: receipt.blockNumber }); latest = await rpc.getBlockNumber({ cacheTime: 0 }) }
+    catch { throw new ExecutionVerificationError('rpc', true) }
+    if (block.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) return { status: 'pending', identified: true }
+    if (latest < receipt.blockNumber + 1n) return { status: 'pending', identified: true } // Two observed blocks; not a promise against all reorgs.
+    const request = attempt.review.request
+    const outputToken = ARC_TOKENS[request.tokenOut]
+    const reviewed: ReviewedIntent = {
+      owner: request.owner as Hex, recipient: request.recipient as Hex, router: ARC_ROUTER as Hex, chainId: 5042, nonce: attempt.nonce,
+      value: BigInt(expected.value), calldata: attempt.review.transaction.data, gasLimit: BigInt(expected.gas), maxFeePerGas: BigInt(expected.maxFeePerGas),
+      maxPriorityFeePerGas: BigInt(expected.maxPriorityFeePerGas), feeCeiling: uint(attempt.review.networkFee), outputToken: outputToken.address as Hex,
+      requiredMinimum: uint(attempt.review.requiredMinimum), outputSymbol: request.tokenOut, outputDecimals: outputToken.decimals,
+    }
+    const chainTx: ChainTx = { hash: tx.hash, from: tx.from, to: tx.to ?? null, chainId: tx.chainId ?? 0, nonce: tx.nonce, type: tx.type, value: tx.value, gas: tx.gas,
+      maxFeePerGas: tx.maxFeePerGas ?? 0n, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 0n, input: tx.input }
+    const chainReceipt: ChainReceipt = { transactionHash: receipt.transactionHash, from: receipt.from, to: receipt.to ?? null, status: receipt.status === 'success' ? 'success' : 'reverted',
+      blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, transactionIndex: receipt.transactionIndex, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice,
+      logs: receipt.logs as unknown as readonly ChainLog[] }
+    if (receipt.status !== 'success' && receipt.status !== 'reverted') throw new ExecutionVerificationError('malformed', true)
     const fee = receipt.gasUsed * receipt.effectiveGasPrice
-    if (fee > uint(attempt.review.networkFee)) reject()
-    if (receipt.status === 'reverted') return { status: 'failed', fee: fee.toString(), output: '0' }
-    if (receipt.status !== 'success') reject()
-    let received = 0n
-    const logIndexes = new Set<number>()
-    const output = ARC_OUTPUTS[attempt.review.request.tokenOut].address, owner = attempt.review.request.recipient
-    for (const log of receipt.logs) {
-      if (!sameAddress(log.address, output) || log.topics[0]?.toLowerCase() !== transferTopic) continue
-      if (log.removed || log.transactionHash?.toLowerCase() !== attempt.hash!.toLowerCase() || log.blockHash?.toLowerCase() !== receipt.blockHash.toLowerCase() ||
-        log.blockNumber !== receipt.blockNumber || log.logIndex === null || !Number.isSafeInteger(log.logIndex) || log.logIndex < 0 || logIndexes.has(log.logIndex) ||
-        log.transactionIndex !== receipt.transactionIndex || log.topics.length !== 3 || !/^0x[0-9a-fA-F]{64}$/.test(log.data) ||
-        !log.topics.slice(1).every(topic => /^0x0{24}[0-9a-fA-F]{40}$/.test(topic ?? ''))) reject()
-      logIndexes.add(log.logIndex!)
-      const from = `0x${log.topics[1]!.slice(-40)}`, to = `0x${log.topics[2]!.slice(-40)}`, amount = BigInt(log.data)
-      if (sameAddress(to, owner)) received += amount
-      if (sameAddress(from, owner)) received -= amount
+    let received: bigint | null = null, sent: bigint | null = null
+    if (receipt.status === 'success') {
+      const inputToken = ARC_TOKENS[request.tokenIn]
+      const flows = ownerFlows(chainReceipt, request.recipient, [outputToken.address, inputToken.address])
+      if (flows.ok) {
+        received = flows.flows.get(outputToken.address.toLowerCase())?.net ?? 0n
+        // What the wallet actually paid: the native value minus any refund for USDC, the token flow for an ERC-20 input.
+        const paid = request.tokenIn === 'USDC' ? tx.value - flows.nativeRefund : -(flows.flows.get(inputToken.address.toLowerCase())?.net ?? 0n)
+        sent = paid > 0n ? (request.tokenIn === 'USDC' ? paid / 10n ** 12n : paid) : null
+      }
     }
-    if (received < uint(attempt.review.requiredMinimum)) reject()
-    return { status: 'confirmed', fee: fee.toString(), output: received.toString() }
+    const report = compareToReview({ attemptHash: attempt.hash!, tx: chainTx, receipt: chainReceipt, observation: { canonical: true, latestBlock: latest, blockTimestamp: typeof block.timestamp === 'bigint' ? block.timestamp : null }, reviewed, received })
+    if (report.verdict === 'unbound') throw new ExecutionVerificationError('binding', false)
+    const checkedAt = Date.now()
+    const net = received !== null && received > 0n ? received : 0n
+    return {
+      status: 'settled', output: net.toString(), fee: fee.toString(), intent: summarizeIntent(report, checkedAt),
+      chain: { state: receipt.status === 'success' ? 'success' : 'reverted', blockNumber: receipt.blockNumber.toString(), blockHash: receipt.blockHash, gasUsed: receipt.gasUsed.toString(),
+        effectiveGasPrice: receipt.effectiveGasPrice.toString(), fee: fee.toString(), received: received === null ? null : (received < 0n ? '0' : received.toString()), sent: sent === null ? null : sent.toString(), checkedAt },
+    }
   }
   return { preflight, result }
 }

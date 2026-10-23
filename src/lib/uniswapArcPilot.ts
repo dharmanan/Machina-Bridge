@@ -17,7 +17,7 @@ export function arcPilotAllows(config: ArcPilotConfig, input: ArcRequest | null,
   if (!config.enabled || !sameAddress(config.wallet, ARC_PILOT_APPROVED_WALLET) || !context.connected || context.chainId !== 5042 || !sameAddress(context.owner, config.wallet)) return false
   try {
     const request = validateArcRequest(input)
-    return request.tokenOut === 'EURC' && sameAddress(request.owner, config.wallet) &&
+    return request.tokenIn === 'USDC' && request.tokenOut === 'EURC' && sameAddress(request.owner, config.wallet) &&
       sameAddress(request.recipient, config.wallet) && nativeAmount(request.amount) <= ARC_PILOT_MAX_INPUT
   } catch { return false }
 }
