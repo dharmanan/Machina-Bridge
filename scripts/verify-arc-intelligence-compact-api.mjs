@@ -522,7 +522,7 @@ if (!sqlite) {
     for (const [section, family] of Object.entries(names)) {
       const spec = FAMILY_WINDOWS[family];
       const allowed = new Set([...(spec.counts ?? []), ...(spec.amounts ?? []), ...(spec.constants ?? []), ...Object.keys(spec.tallies ?? {}),
-        ...Object.keys(spec.lists ?? {}), 'units']);
+        ...Object.keys(spec.lists ?? {}), 'units', ...(family === 'gateway' ? ['tokenMetrics'] : [])]);
       for (const key of Object.keys(families[section].metrics)) assert.ok(allowed.has(key), `${section}.${key} is not a persisted window field`);
     }
     const text = JSON.stringify(summary);

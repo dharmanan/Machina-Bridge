@@ -2218,6 +2218,13 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
   const cctp = ctx.summary?.crossChain.cctp ?? null
   const gateway = ctx.summary?.crossChain.gateway ?? null
   const across = ctx.summary?.crossChain.across ?? null
+  const gatewayTokens = familyMetrics(gateway)?.tokenMetrics as { byToken?: unknown } | undefined
+  const gatewayFlows = tokenFlows(objectEntries(gatewayTokens?.byToken).filter(([token]) => token !== '0x3600000000000000000000000000000000000000')
+    .map(([token, entry]) => {
+      const units = entry.units as { symbol?: unknown; decimals?: unknown } | undefined
+      return { token, symbol: units?.symbol, decimals: units?.decimals,
+        amounts: [entry.depositAmountRaw, entry.outboundBurnAmountRaw, entry.inboundMintAmountRaw, entry.withdrawalAmountRaw] }
+    }))
   const cctpCell = numberCell(ctx, cctp, metricSum(cctp, ['outboundTransferCount', 'inboundMintCount']), formatCount)
   const gatewayCell = numberCell(ctx, gateway, metricSum(gateway, ['depositCount', 'outboundBurnCount', 'inboundMintCount', 'withdrawalCompletedCount']), formatCount)
   const acrossCell = numberCell(ctx, across, metricSum(across, ['depositCount', 'fillCount']), formatCount)
@@ -2245,7 +2252,8 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
         <UsdValues ctx={ctx} item="cross-chain.cctp-usd" name="cctp" />
         <FamilyCoverage family={cctp} />
       </ProtocolCard>
-      <ProtocolCard item="cross-chain.gateway" cell={gatewayCell} title="Gateway" subtitle={`Unified USDC balance activity on Arc, last ${ctx.windowLabel}`} category="Unified balance">
+      <ProtocolCard item="cross-chain.gateway" cell={gatewayCell} title="Gateway" subtitle={`Per-token Gateway activity on Arc, last ${ctx.windowLabel}`} category="Unified balance">
+        <p className="mt-2 text-[11px] text-slate-500">USDC · ERC-20 units (6 decimals)</p>
         <div className="mt-3 grid grid-cols-2 gap-2">
           <LegCell label="Deposit" leg={usdcLeg(ctx, gateway, 'depositCount', 'depositAmountRaw')} />
           <LegCell label="Sent" direction="out" leg={usdcLeg(ctx, gateway, 'outboundBurnCount', 'outboundBurnAmountRaw')} />
@@ -2253,8 +2261,9 @@ function CrossChainSection({ ctx }: { ctx: ViewContext }) {
           <LegCell label="Withdraw" leg={usdcLeg(ctx, gateway, 'withdrawalCompletedCount', 'withdrawalAmountRaw')} />
         </div>
         <UsdValues ctx={ctx} item="cross-chain.gateway-usd" name="gateway" />
+        {gatewayCell.status === 'available' && <TokenFlows flows={gatewayFlows} labels={['Deposited', 'Sent', 'Received', 'Withdrawn']} title="Other Gateway assets · separate token units" />}
         <FamilyCoverage family={gateway} />
-        {gatewayCell.status === 'available' && <p className="mt-2 text-[10px] text-slate-500">USDC interface only (6 decimals). Unexpected tokens fail verification; their amounts are never included.</p>}
+        {gatewayCell.status === 'available' && <p className="mt-2 text-[10px] text-slate-500">USD values above cover USDC only. EURC and cirBTC remain in their own units; legacy hours store USDC only. Legs and protocols are never added together. Unknown tokens fail verification.</p>}
 
       </ProtocolCard>
       <ProtocolCard item="cross-chain.across" cell={acrossCell} title="Across" subtitle={`Bridge deposits and fills on Arc, last ${ctx.windowLabel}`} category="Bridge">

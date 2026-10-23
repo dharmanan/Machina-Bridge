@@ -39,6 +39,7 @@ import { metadataExempt, TOKEN_METADATA_VERSION } from './token-metadata.js';
 import { TVL_POOLS_PER_PROTOCOL, TVL_REASONS, TVL_VERSION } from './tvl.js';
 import { hourFeesOf, hourVolumeOf, tokenPricesOf, VALUATION_REASONS, VALUATION_VERSIONS, VALUATIONS } from './valuation.js';
 import { sumWindow } from './windows.js';
+import { gatewayStoredMetrics } from './gateway-metrics.js';
 
 import { INTELLIGENCE_SQL, createIntelligenceRepository } from './intelligence-store.js';
 import { DAILY_ACTIVE_ADDRESSES_SQL, createDailyActiveAddressesStore } from './daily-active-addresses.js';
@@ -277,7 +278,7 @@ function hourRows(result) {
     const family = result.families?.[name];
     const fields = FAMILY_FIELDS[name];
     if (family?.status === 'available' && fields.every((field) => family[field] !== undefined && family[field] !== null)) {
-      const json = canonical(Object.fromEntries(fields.map((field) => [field, family[field]])));
+      const json = canonical(name === 'gateway' ? gatewayStoredMetrics(family) : Object.fromEntries(fields.map((field) => [field, family[field]])));
       return { name, status: 'available', reason: null, json, sha: sha256(json) };
     }
     if (family?.status === 'unavailable' && typeof family.reason === 'string' && fields.every((field) => family[field] === null)) {
@@ -1282,7 +1283,7 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
         if (!family || family.reason !== input.reason) throw new StoreError('gateway_repair_state_changed');
         const evidence = { originalReason: input.reason, hourStart: input.hourStart, firstBlock: input.firstBlock, lastBlock: input.lastBlock,
           firstHash: input.firstHash, lastHash: input.lastHash, networkSha: input.networkSha };
-        const json = canonical(Object.fromEntries(FAMILY_FIELDS.gateway.map((field) => [field, metrics[field]])));
+        const json = canonical(gatewayStoredMetrics(metrics));
         sql.upgradeFamily.run(json, sha256(json), int(input.hourStart), 'gateway');
         // An append-only metadata key preserves the original failure without changing any family definition,
         // metrics JSON/hash, existing table or successful projection. Older readers ignore this namespace.

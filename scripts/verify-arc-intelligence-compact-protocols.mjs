@@ -323,7 +323,8 @@ await test('unexpected tokens and non-EVM addresses fail closed instead of mixin
   const eurcTopic = `0x${'0'.repeat(24)}${'bef5f6d51cb62b58e6a8f77868681825c6fe21c1'}`;
   assertOnly(await run({ faults: corruptFirst('cctp', (log) => ({ ...log, topics: [log.topics[0], eurcTopic, ...log.topics.slice(2)] }),
     (log) => log.synthetic.event === 'depositForBurn') }), 'cctp', 'cctp_unexpected_token');
-  assertOnly(await run({ faults: corruptFirst('gateway', (log) => ({ ...log, topics: [log.topics[0], eurcTopic, ...log.topics.slice(2)] })) }), 'gateway',
+  const unknownTopic = `0x${'0'.repeat(24)}${'ab'.repeat(20)}`;
+  assertOnly(await run({ faults: corruptFirst('gateway', (log) => ({ ...log, topics: [log.topics[0], unknownTopic, ...log.topics.slice(2)] })) }), 'gateway',
     'gateway_unexpected_token');
   assertOnly(await run({ faults: corruptFirst('across', (log) => ({ ...log, data: `0x${'ff'.repeat(32)}${log.data.slice(66)}` }),
     (log) => log.synthetic.event === 'fundsDeposited') }), 'across', 'across_non_evm_address');
@@ -347,7 +348,9 @@ await test('windows: counts, raw amounts and keyed tallies add up across hours; 
   };
   for (const name of NAMES) {
     const summed = sumWindow(FAMILY_WINDOWS[name], [clean.families[name], next.families[name]]);
-    assert.deepEqual(summed, pick(combined[name], FAMILY_WINDOWS[name]), name);
+    const { tokenMetrics, ...legacy } = summed;
+    assert.deepEqual(legacy, pick(combined[name], FAMILY_WINDOWS[name]), name);
+    if (name === 'gateway') assert.deepEqual(tokenMetrics.byToken[CIRCLE_ARC.usdc], legacy);
     for (const field of FAMILY_FIELDS[name].filter((key) => /^unique/.test(key))) assert.equal(field in summed, false, `${name}.${field} is not additive`);
   }
   // The Stage 1/2 families too, against plain arithmetic on the two hours.

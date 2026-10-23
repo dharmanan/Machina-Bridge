@@ -4,6 +4,8 @@
 // foreign-emitter counts are left out: an actor or pool active in two hours would be counted twice. Constant metadata of a
 // key (its token, decimals, market params) must agree across hours; a disagreement fails the window rather than guessing.
 
+import { gatewayTokenMetrics, GATEWAY_TOKEN_FORMAT } from './gateway-metrics.js';
+
 export class WindowError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
@@ -55,6 +57,22 @@ export function sumWindow(spec, hours) {
   }
   for (const field of Object.keys(spec.lists ?? {})) {
     out[field] = Object.keys(out[field] ?? {}).sort().map((key) => out[field][key]);
+  }
+  if (spec.gatewayTokens) {
+    const byToken = new Map();
+    let legacyUsdcOnlyHours = 0;
+    for (const hour of hours) {
+      let tokens;
+      try { tokens = gatewayTokenMetrics(hour); } catch { throw new WindowError('gateway_token_metrics_invalid'); }
+      if (tokens.legacy) legacyUsdcOnlyHours += 1;
+      for (const [token, metrics] of Object.entries(tokens.byToken)) {
+        if (!byToken.has(token)) byToken.set(token, []);
+        byToken.get(token).push(metrics);
+      }
+    }
+    out.tokenMetrics = { version: GATEWAY_TOKEN_FORMAT, coverage: { legacyUsdcOnlyHours, multiTokenHours: hours.length - legacyUsdcOnlyHours },
+      byToken: Object.fromEntries([...byToken].sort(([a], [b]) => a.localeCompare(b))
+        .map(([token, entries]) => [token, sumWindow({ ...spec, gatewayTokens: false }, entries)])) };
   }
   return out;
 }

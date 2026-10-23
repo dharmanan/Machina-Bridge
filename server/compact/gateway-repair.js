@@ -1,6 +1,7 @@
 // One already-verified stored hour, one Gateway stream, no full block spine/transactions, metadata or projections.
 // Log-bearing headers still verify transaction hashes/positions. Stored canonical boundaries are checked twice.
-import { GATEWAY_FAMILY, GATEWAY_EVENTS, CIRCLE_ARC } from './protocols/circle.js';
+import { GATEWAY_FAMILY, GATEWAY_EVENTS } from './protocols/circle.js';
+import { GATEWAY_ASSETS } from './gateway-metrics.js';
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
 import { streamLogs, validateLogs, LogError } from './logs.js';
 import { headerOf } from './spine.js';
@@ -46,7 +47,7 @@ export async function repairStoredGatewayHour({ store, provider, hourStart, mode
         const log = normalizeLog(item);
         const definition = Object.values(GATEWAY_EVENTS).find((event) => event.topic === log.topics[0]);
         const event = definition?.decode(log);
-        return event && event.token !== CIRCLE_ARC.usdc;
+        return event && !GATEWAY_ASSETS.some((asset) => asset.address === event.token);
       });
       if (!candidate) continue;
       selected = [candidate];

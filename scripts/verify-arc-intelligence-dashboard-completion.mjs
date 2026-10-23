@@ -25,6 +25,9 @@ import { inspectGatewayEvidence } from './inspect-compact-gateway-evidence.mjs';
 import { repairStoredGatewayHour, GATEWAY_REPAIR_LIMITS } from '../server/compact/gateway-repair.js';
 import { familyRetryPolicy } from '../server/compact/repair-policy.js';
 import { GATEWAY_EVENTS, GATEWAY_FAMILY, CIRCLE_ARC } from '../server/compact/protocols/circle.js';
+import { GATEWAY_ASSETS, GATEWAY_USDC, gatewayStoredMetrics, gatewayTokenMetrics } from '../server/compact/gateway-metrics.js';
+import { sumWindow } from '../server/compact/windows.js';
+import { DISCOVERY_RETRY_INDEX_SQL } from '../server/compact/intelligence-store.js';
 import { encodeEventLog } from '../server/compact/offline.js';
 import { createScheduler } from '../server/compact/scheduler.js';
 import { createProvider, ProviderError } from '../server/compact/provider.js';
@@ -114,6 +117,9 @@ function fixture(name, count, options) {
 }
 const facts = (db) => Object.fromEntries(['compact_hours', 'compact_family_hours', 'compact_checkpoint', 'compact_hour_addresses',
   'compact_pool_hours', 'compact_dex_activity'].map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()]));
+const gatewayUnchangedFacts = (db) => Object.fromEntries(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()
+  .map(({ name }) => [name, db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all().filter(row => name === 'compact_family_hours'
+    ? row.family !== 'gateway' : name !== 'compact_meta' || !row.key.startsWith('family_repair_evidence:gateway:'))]));
 
 try {
   await test('V3 actual balance calls preserve historical blockTag and >2^53 raw precision; missing sides fail closed', async () => {
@@ -515,16 +521,20 @@ try {
     } finally { model.close(); data.db.close(); }
   });
 
-  function gatewayFixture(name, { fork = false, malformed = false, rateLimit = false, foreign = false, dense = false } = {}) {
+  function gatewayFixture(name, { fork = false, malformed = false, rateLimit = false, foreign = false, dense = false, multiToken = false, duplicate = false } = {}) {
     const data = fixture(name, 1);
     data.db.prepare("UPDATE compact_family_hours SET status='unavailable',reason='gateway_unexpected_token',metrics_json=NULL,metrics_sha256=NULL WHERE family='gateway'").run();
     const log = (token, index, value) => ({ address: CIRCLE_ARC.gatewayWallet, blockNumber: '0x3e9', blockHash: hash(1001),
       transactionHash: hash(9001), transactionIndex: '0x0', logIndex: `0x${index.toString(16)}`, removed: false,
       ...encodeEventLog(GATEWAY_EVENTS.deposited, { token, depositor: address(42), sender: address(43), value }) });
     const logs = [log(USDC, 0, 1234567n)];
+    if (multiToken) for (const [i, asset] of GATEWAY_ASSETS.filter((asset) => asset.address !== USDC).entries()) {
+      logs.push(log(asset.address, i + 1, 10n ** BigInt(asset.decimals) + 1n));
+    }
     if (foreign || malformed) logs.push(log(UNKNOWN, 1, 10n ** 30n));
     if (dense) for (let i = 0; i < 65; i++) logs.push({ ...log(USDC, 2 + i, 1n), blockNumber: `0x${(1000 + i).toString(16)}`, blockHash: hash(1000 + i) });
     if (malformed) logs[1].topics[1] = `0x${'f'.repeat(64)}`;
+    if (duplicate) logs.push({ ...logs[0] });
     const requests = [];
     const request = async (method, params) => {
       requests.push([method, params]);
@@ -539,6 +549,139 @@ try {
     };
     return { ...data, requests, provider: { request, batch: async (calls) => Promise.all(calls.map(([method, params]) => request(method, params))) } };
   }
+  await test('Gateway multi-token all event types preserve USDC and isolate exact EURC/cirBTC units and domains', async () => {
+    const accumulator = GATEWAY_FAMILY.create();
+    for (const asset of GATEWAY_ASSETS) {
+      const value = 10n ** BigInt(asset.decimals) + 1n;
+      const base = { token: asset.address, depositor: address(42), sender: address(43), recipient: address(44), value,
+        transferSpecHash: hash(55), destinationDomain: 26, destinationRecipient: hash(44), signer: address(43), fee: 2n,
+        fromAvailable: value, fromWithdrawing: 0n, sourceDomain: 0, sourceDepositor: hash(42), sourceSigner: hash(43),
+        remainingAvailable: 0n, totalWithdrawing: value, withdrawalBlock: 1100n };
+      for (const [name, event] of Object.entries(GATEWAY_EVENTS)) accumulator.add('gateway', [{
+        address: name === 'attestationUsed' ? CIRCLE_ARC.gatewayMinter : CIRCLE_ARC.gatewayWallet, ...encodeEventLog(event, base) }]);
+    }
+    const metrics = await accumulator.finish({ codePresent: () => true });
+    assert.equal(metrics.depositAmountRaw, '1000001');
+    assert.equal(metrics.depositCount, 1, 'legacy counts remain USDC only');
+    const stored = gatewayStoredMetrics(metrics);
+    for (const asset of GATEWAY_ASSETS) {
+      const token = stored.tokenMetrics.byToken[asset.address], expected = (10n ** BigInt(asset.decimals) + 1n).toString();
+      assert.equal(token.depositCount, 1); assert.equal(token.outboundBurnCount, 1); assert.equal(token.inboundMintCount, 1);
+      assert.equal(token.depositAmountRaw, expected); assert.equal(token.outboundBurnAmountRaw, expected);
+      assert.equal(token.inboundMintAmountRaw, expected); assert.equal(token.withdrawalAmountRaw, expected);
+      assert.equal(token.outboundBurnFeeRaw, '2'); assert.equal(token.withdrawalInitiatedCount, 1); assert.equal(token.withdrawalCompletedCount, 1);
+      assert.equal(token.outboundByDestinationDomain['26'].amountRaw, expected);
+      assert.equal(token.inboundBySourceDomain['0'].amountRaw, expected);
+      assert.equal(token.uniqueDepositors, 1); assert.equal(token.uniqueInboundRecipients, 1);
+    }
+    const window = sumWindow(FAMILY_WINDOWS.gateway, [stored, stored]);
+    assert.equal(window.depositAmountRaw, '2000002');
+    assert.equal(window.tokenMetrics.byToken[GATEWAY_ASSETS[2].address].depositAmountRaw, '200000002');
+    assert.equal('uniqueDepositors' in window.tokenMetrics.byToken[USDC], false);
+  });
+
+  await test('Gateway EURC-only and cirBTC-only hours keep zero USDC; raw amounts above safe Number precision stay exact', async () => {
+    for (const asset of GATEWAY_ASSETS.filter(asset => asset.address !== USDC)) {
+      const acc = GATEWAY_FAMILY.create(), value = 10n ** 30n + 7n;
+      acc.add('gateway', [{ address: CIRCLE_ARC.gatewayWallet, ...encodeEventLog(GATEWAY_EVENTS.deposited,
+        { token: asset.address, depositor: address(42), sender: address(43), value }) }]);
+      const result = await acc.finish({ codePresent: () => true });
+      assert.equal(result.depositCount, 0); assert.equal(result.depositAmountRaw, '0');
+      assert.equal(result.tokenMetrics.byToken[asset.address].depositAmountRaw, value.toString());
+      assert.equal(sumWindow(FAMILY_WINDOWS.gateway, [result, result]).tokenMetrics.byToken[asset.address].depositAmountRaw, (value * 2n).toString());
+    }
+  });
+
+  await test('Gateway legacy JSON remains byte-equivalent; mixed legacy/new windows expose coverage and reject invalid extensions', async () => {
+    const legacy = hourResult(0).families.gateway;
+    assert.deepEqual(gatewayStoredMetrics(legacy), Object.fromEntries(FAMILY_FIELDS.gateway.map((field) => [field, legacy[field]])));
+    const accumulator = GATEWAY_FAMILY.create();
+    const metrics = await accumulator.finish({ codePresent: () => true });
+    assert.equal('tokenMetrics' in gatewayStoredMetrics(metrics), false, 'USDC-only replay keeps its original JSON/hash');
+    accumulator.add('gateway', [{ address: CIRCLE_ARC.gatewayWallet, ...encodeEventLog(GATEWAY_EVENTS.deposited,
+      { token: GATEWAY_ASSETS[1].address, depositor: address(42), sender: address(43), value: 1n }) }]);
+    const multi = await accumulator.finish({ codePresent: () => true });
+    const mixed = sumWindow(FAMILY_WINDOWS.gateway, [legacy, multi]);
+    assert.deepEqual(mixed.tokenMetrics.coverage, { legacyUsdcOnlyHours: 1, multiTokenHours: 1 });
+    assert.equal(mixed.tokenMetrics.byToken[GATEWAY_USDC].depositAmountRaw, legacy.depositAmountRaw);
+    for (const mutate of [m => { m.tokenMetrics.version = 'future'; }, m => { m.tokenMetrics.byToken[UNKNOWN] = m.tokenMetrics.byToken[USDC]; },
+      m => { m.tokenMetrics.byToken[USDC].depositAmountRaw = '9'; }, m => { m.tokenMetrics.byToken[GATEWAY_ASSETS[1].address].depositAmountRaw = '-1'; },
+      m => { m.tokenMetrics.byToken[GATEWAY_ASSETS[1].address].depositCount = 0; },
+      m => { delete m.tokenMetrics.byToken[GATEWAY_ASSETS[2].address]; }]) {
+      const bad = structuredClone(multi); mutate(bad);
+      assert.throws(() => gatewayStoredMetrics(bad), /gateway_token_metrics_invalid/);
+      assert.throws(() => sumWindow(FAMILY_WINDOWS.gateway, [bad]), /gateway_token_metrics_invalid/);
+    }
+    assert.equal(gatewayTokenMetrics(legacy).legacy, true);
+  });
+
+  await test('Gateway supported tokens still reject malformed events, wrong emitters, unknown tokens and missing code', async () => {
+    for (const token of GATEWAY_ASSETS.map(asset => asset.address)) {
+      const log = { address: CIRCLE_ARC.gatewayWallet, ...encodeEventLog(GATEWAY_EVENTS.deposited, { token, depositor: address(42), sender: address(43), value: 1n }) };
+      assert.throws(() => GATEWAY_FAMILY.create().add('gateway', [{ ...log, address: CIRCLE_ARC.gatewayMinter }]), /unexpected_gateway_emitter/);
+      assert.throws(() => GATEWAY_FAMILY.create().add('gateway', [{ ...log, data: '0x' }]), /malformed_gateway_event/);
+      assert.throws(() => GATEWAY_FAMILY.create().add('gateway', [{ ...log, topics: [hash(1), ...log.topics.slice(1)] }]), /malformed_gateway_event/);
+    }
+    const acc = GATEWAY_FAMILY.create();
+    assert.throws(() => acc.add('gateway', [{ address: CIRCLE_ARC.gatewayWallet, ...encodeEventLog(GATEWAY_EVENTS.deposited,
+      { token: UNKNOWN, depositor: address(42), sender: address(43), value: 1n }) }]), /gateway_unexpected_token/);
+    await assert.rejects(GATEWAY_FAMILY.create().finish({ codePresent: () => false }), /gateway_code_unverified/);
+    assert.equal(familyRetryPolicy('gateway_unexpected_token').eligible, false);
+  });
+
+  await test('Gateway mixed-token repair changes only its family and evidence; old/new readers and replay remain compatible', async () => {
+    const data = gatewayFixture('gateway-mixed', { multiToken: true });
+    data.db.exec(DISCOVERY_RETRY_INDEX_SQL); // Synthetic fixture only: prove preservation of an already installed index.
+    const allOtherRows = gatewayUnchangedFacts(data.db);
+    const before = facts(data.db), checkpoint = data.store.checkpoint();
+    const indexes = data.db.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' ORDER BY name").all();
+    const schema = data.db.prepare('PRAGMA user_version').get();
+    try {
+      assert.equal((await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE })).outcome, 'upgraded');
+      const record = data.store.familyRows(BASE).find(row => row.family === 'gateway').metrics;
+      assert.equal(record.depositAmountRaw, '1234567');
+      assert.equal(record.tokenMetrics.byToken[GATEWAY_ASSETS[1].address].depositAmountRaw, '1000001');
+      assert.equal(record.tokenMetrics.byToken[GATEWAY_ASSETS[2].address].depositAmountRaw, '100000001');
+      assert.deepEqual(data.store.checkpoint(), checkpoint);
+      assert.deepEqual(data.db.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' ORDER BY name").all(), indexes);
+      assert.deepEqual(data.db.prepare('PRAGMA user_version').get(), schema);
+      assert.equal(data.db.prepare("SELECT value FROM compact_meta WHERE key='schema_version'").get().value, '2');
+      if (process.env.COMPACT_GATEWAY_LEGACY_ROOT) {
+        const { pathToFileURL } = await import('node:url');
+        const legacyRoot = process.env.COMPACT_GATEWAY_LEGACY_ROOT;
+        const { createCompactReadModel: legacyReadModel } = await import(pathToFileURL(join(legacyRoot, 'server/compact/read-model.js')).href);
+        const { createCompactStore: legacyStore } = await import(pathToFileURL(join(legacyRoot, 'server/compact/store.js')).href);
+        const oldReader = legacyReadModel({ path: data.path, DatabaseSync, now: () => (BASE + HOUR) * 1000 });
+        try { assert.equal(oldReader.summary('30d').crossChain.gateway.metrics.depositAmountRaw, '1234567'); } finally { oldReader.close(); }
+        assert.equal(legacyStore(data.db).familyWindow('gateway', BASE, 1).metrics.depositAmountRaw, '1234567');
+        console.log('BASELINE_COMPATIBILITY PASS: actual c6352e reader and writer open new multi-token data without mutation');
+      }
+      assert.deepEqual(gatewayUnchangedFacts(data.db), allOtherRows, 'every other table/metadata row and installed discovery index remain unchanged');
+      const after = facts(data.db);
+      for (const table of Object.keys(before).filter(name => name !== 'compact_family_hours')) assert.deepEqual(after[table], before[table], table);
+      assert.deepEqual(after.compact_family_hours.filter(row => row.family !== 'gateway'), before.compact_family_hours.filter(row => row.family !== 'gateway'));
+      const model = data.model();
+      try {
+        const summary = model.summary('30d'), gateway = summary.crossChain.gateway;
+        assert.equal(gateway.metrics.depositAmountRaw, '1234567');
+        assert.equal(gateway.metrics.tokenMetrics.byToken[GATEWAY_ASSETS[2].address].units.decimals, 8);
+        assert.equal(summary.protocolUsd.gateway.values.depositUsdMicros, '1234567', 'EURC/cirBTC are never valued as USDC');
+        assert.equal(summary.protocolUsd.gateway.tokenScope, 'legacy_usdc_only');
+        assert.equal(gateway.repairEvidence[0].originalReason, 'gateway_unexpected_token');
+      } finally { model.close(); }
+      assert.equal((await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE })).outcome, 'unchanged');
+    } finally { data.db.close(); }
+  });
+
+  await test('Gateway multi-token repair rolls back family and evidence atomically on a SQLite write failure', async () => {
+    const data = gatewayFixture('gateway-rollback', { multiToken: true });
+    data.db.exec("CREATE TEMP TRIGGER reject_evidence BEFORE INSERT ON compact_meta WHEN NEW.key LIKE 'family_repair_evidence:gateway:%' BEGIN SELECT RAISE(ABORT,'injected_evidence_failure'); END");
+    const before = facts(data.db);
+    try {
+      await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }), /injected_evidence_failure/);
+      assert.deepEqual(facts(data.db), before);
+    } finally { data.db.close(); }
+  });
   await test('narrow Gateway repair of verified USDC preserves original reason and all other projections', async () => {
     const data = gatewayFixture('gateway-narrow');
     const before = facts(data.db);
@@ -559,7 +702,7 @@ try {
     } finally { data.db.close(); }
   });
   await test('forks, malformed foreign events and provider limits cannot alter any stored repair evidence', async () => {
-    for (const fault of ['fork', 'malformed', 'rateLimit', 'foreign', 'dense']) {
+    for (const fault of ['fork', 'malformed', 'rateLimit', 'foreign', 'dense', 'duplicate']) {
       const data = gatewayFixture(`gateway-${fault}`, { [fault]: true });
       const before = facts(data.db);
       try {

@@ -2,11 +2,11 @@
 // (https://docs.arc.io/arc/references/contract-addresses); event signatures are Circle's (evm-cctp-contracts src/v2, Gateway
 // wallet/minter), the same ones the A2 modules api/_lib/arc-intelligence/cctp.js and gateway.js decode with viem. Arc logs
 // prove the Arc leg only: a burn here is an outbound leg, a mint here an inbound leg; the other chain's leg is never
-// claimed. Amounts are in the Arc USDC ERC-20 interface units (6 decimals). Any other token makes the family unavailable
-// rather than being mixed into USDC totals.
+// claimed. CCTP remains USDC-only. Gateway preserves legacy USDC totals and separates supported tokens by address.
 import { defineEvent } from '../abi.js';
 import { FamilyError } from '../family-error.js';
 import { createTally, requireCode, senderOf } from './common.js';
+import { GATEWAY_ASSETS, GATEWAY_TOKEN_FORMAT, gatewayStoredMetrics } from '../gateway-metrics.js';
 
 export const CIRCLE_ARC = Object.freeze({
   usdc: '0x3600000000000000000000000000000000000000',
@@ -88,49 +88,39 @@ function createCctpAccumulator() {
 // balance is on Arc (destination domain 26 means a same-chain transfer); AttestationUsed mints an inbound transfer on
 // Arc. A withdrawal is two events of one lifecycle: only WithdrawalCompleted carries the amount that left; initiations
 // are counted, never summed again. Unified balances themselves are off-chain state and are not claimed.
-function createGatewayAccumulator() {
+function createGatewayTokenAccumulator() {
   let depositCount = 0, depositAmount = 0n, outboundBurnCount = 0, outboundBurnAmount = 0n, outboundBurnFee = 0n;
   let inboundMintCount = 0, inboundMintAmount = 0n, withdrawalInitiatedCount = 0, withdrawalCompletedCount = 0, withdrawalAmount = 0n;
   const byDestination = createTally({ limit: DOMAIN_LIMIT, code: 'gateway_domain_limit', counts: ['transferCount'], amounts: ['amountRaw'] });
   const bySource = createTally({ limit: DOMAIN_LIMIT, code: 'gateway_domain_limit', counts: ['transferCount'], amounts: ['amountRaw'] });
   const depositors = new Set();
   const inboundRecipients = new Set();
-  // Preserve the strict USDC guard until the actual unexpected event has been independently explained.
-  // Attach exactly one bounded raw event to the error for the read-only evidence command; never value it as USDC.
-  const usdcOnly = (event, log) => {
-    if (event.token !== CIRCLE_ARC.usdc) throw new FamilyError('gateway_unexpected_token', {
-      decodedToken: event.token, expectedToken: CIRCLE_ARC.usdc, emitter: log.address,
-      blockNumber: log.blockNumber, blockHash: log.blockHash, transactionHash: log.transactionHash,
-      transactionIndex: log.transactionIndex, logIndex: log.logIndex, topics: log.topics, data: log.data,
-    });
-    return event;
-  };
   return {
     add(_stream, logs) {
       for (const log of logs) {
         const topic = log.topics[0];
         if (topic === GATEWAY_EVENTS.deposited.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.deposited, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
+          const event = decoded(GATEWAY_EVENTS.deposited, log, 'gateway', CIRCLE_ARC.gatewayWallet);
           depositCount += 1;
           depositAmount += event.value;
           depositors.add(event.depositor);
         } else if (topic === GATEWAY_EVENTS.gatewayBurned.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.gatewayBurned, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
+          const event = decoded(GATEWAY_EVENTS.gatewayBurned, log, 'gateway', CIRCLE_ARC.gatewayWallet);
           outboundBurnCount += 1;
           outboundBurnAmount += event.value;
           outboundBurnFee += event.fee;
           byDestination.add(String(event.destinationDomain), { transferCount: 1, amountRaw: event.value });
         } else if (topic === GATEWAY_EVENTS.attestationUsed.topic) {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.attestationUsed, log, 'gateway', CIRCLE_ARC.gatewayMinter), log);
+          const event = decoded(GATEWAY_EVENTS.attestationUsed, log, 'gateway', CIRCLE_ARC.gatewayMinter);
           inboundMintCount += 1;
           inboundMintAmount += event.value;
           bySource.add(String(event.sourceDomain), { transferCount: 1, amountRaw: event.value });
           inboundRecipients.add(event.recipient);
         } else if (topic === GATEWAY_EVENTS.withdrawalInitiated.topic) {
-          usdcOnly(decoded(GATEWAY_EVENTS.withdrawalInitiated, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
+          decoded(GATEWAY_EVENTS.withdrawalInitiated, log, 'gateway', CIRCLE_ARC.gatewayWallet);
           withdrawalInitiatedCount += 1;
         } else {
-          const event = usdcOnly(decoded(GATEWAY_EVENTS.withdrawalCompleted, log, 'gateway', CIRCLE_ARC.gatewayWallet), log);
+          const event = decoded(GATEWAY_EVENTS.withdrawalCompleted, log, 'gateway', CIRCLE_ARC.gatewayWallet);
           withdrawalCompletedCount += 1;
           withdrawalAmount += event.value;
         }
@@ -143,6 +133,31 @@ function createGatewayAccumulator() {
         outboundByDestinationDomain: byDestination.toObject(), inboundMintCount, inboundMintAmountRaw: inboundMintAmount.toString(10),
         inboundBySourceDomain: bySource.toObject(), uniqueInboundRecipients: inboundRecipients.size, withdrawalInitiatedCount,
         withdrawalCompletedCount, withdrawalAmountRaw: withdrawalAmount.toString(10) };
+    },
+  };
+}
+
+function createGatewayAccumulator() {
+  const tokens = new Map(GATEWAY_ASSETS.map((asset) => [asset.address, createGatewayTokenAccumulator()]));
+  return {
+    add(stream, logs) {
+      for (const log of logs) {
+        const definition = Object.entries(GATEWAY_EVENTS).find(([, event]) => event.topic === log.topics[0]);
+        if (!definition) throw new FamilyError('malformed_gateway_event');
+        const [name, event] = definition;
+        const values = decoded(event, log, 'gateway', name === 'attestationUsed' ? CIRCLE_ARC.gatewayMinter : CIRCLE_ARC.gatewayWallet);
+        const accumulator = tokens.get(values.token);
+        if (!accumulator) throw new FamilyError('gateway_unexpected_token', {
+          decodedToken: values.token, expectedTokens: [...tokens.keys()], emitter: log.address,
+          blockNumber: log.blockNumber, blockHash: log.blockHash, transactionHash: log.transactionHash,
+          transactionIndex: log.transactionIndex, logIndex: log.logIndex, topics: log.topics, data: log.data,
+        });
+        accumulator.add(stream, [log]);
+      }
+    },
+    async finish(context) {
+      const byToken = Object.fromEntries(await Promise.all([...tokens].map(async ([token, accumulator]) => [token, await accumulator.finish(context)])));
+      return gatewayStoredMetrics({ ...byToken[CIRCLE_ARC.usdc], tokenMetrics: { version: GATEWAY_TOKEN_FORMAT, byToken } });
     },
   };
 }
@@ -175,6 +190,7 @@ export const GATEWAY_FAMILY = Object.freeze({
     'outboundByDestinationDomain', 'inboundMintCount', 'inboundMintAmountRaw', 'inboundBySourceDomain', 'uniqueInboundRecipients',
     'withdrawalInitiatedCount', 'withdrawalCompletedCount', 'withdrawalAmountRaw'],
   window: {
+    gatewayTokens: true,
     counts: ['depositCount', 'outboundBurnCount', 'inboundMintCount', 'withdrawalInitiatedCount', 'withdrawalCompletedCount'],
     amounts: ['depositAmountRaw', 'outboundBurnAmountRaw', 'outboundBurnFeeRaw', 'inboundMintAmountRaw', 'withdrawalAmountRaw'],
     tallies: { outboundByDestinationDomain: transferTally, inboundBySourceDomain: transferTally },

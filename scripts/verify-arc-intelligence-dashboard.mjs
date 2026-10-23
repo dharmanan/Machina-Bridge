@@ -857,6 +857,21 @@ await test('UI 3 header, window selector, refresh, KPI cards, chart tabs, activi
   assert.deepEqual(order, SECTION_IDS, 'sections render in the locked order');
 });
 
+await test('Gateway multi-token UI shows separate token units and explicit USDC-only USD scope', async () => {
+  const eurc = ARC_VERIFIED_ASSETS.find(asset => asset.symbol === 'EURC');
+  const btc = ARC_VERIFIED_ASSETS.find(asset => asset.symbol === 'cirBTC');
+  const payload = structuredClone(READY_DATA.summary);
+  payload.crossChain.gateway.metrics.tokenMetrics = { version: 'circle-gateway-token-metrics-v1', byToken: Object.fromEntries([eurc, btc].map(asset => [asset.address,
+    { depositAmountRaw: asset.symbol === 'EURC' ? '1234567' : '123456789', outboundBurnAmountRaw: '0', inboundMintAmountRaw: '0', withdrawalAmountRaw: '0',
+      units: { symbol: asset.symbol, decimals: asset.decimals } }])) };
+  const tree = render({ ...STATES.ready, data: { ...READY_DATA, summary: payload } }).tree;
+  const text = textOf(item(tree, 'cross-chain.gateway'));
+  assert.match(text, /EURC/); assert.match(text, /cirBTC/);
+  assert.match(text, /1\.23/); assert.match(text, /1\.2345/);
+  assert.match(text, /USD values above cover USDC only/);
+  assert.match(text, /Unknown tokens fail verification/);
+});
+
 await test('UI 4 verified values come from the summary and timeseries exactly, with explicit units', async () => {
   assert.equal(valueIn('ready', 'network.transactions'), '1234567');
   assert.match(textOf(item(rendered.ready.tree, 'network.transactions')), /1,234,567 Total transactions, last 24H/);

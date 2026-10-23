@@ -187,6 +187,10 @@ function withUnits(name, metrics) {
     out.units = { amountRaw: { token: ARC_USDC.address, symbol: 'USDC', decimals: metrics.rawDecimals, source: 'persisted_raw_decimals' } };
   } else if (Object.hasOwn(FAMILY_UNITS, name)) {
     out.units = FAMILY_UNITS[name];
+    if (name === 'gateway' && metrics.tokenMetrics) {
+      out.tokenMetrics = { ...metrics.tokenMetrics, byToken: mapEntries(metrics.tokenMetrics.byToken,
+        (token, entry) => ({ ...entry, units: tokenUnit(token) })) };
+    }
   } else if (name === 'across') {
     for (const field of ['depositByToken', 'fillByToken']) {
       if (metrics[field]) out[field] = mapEntries(metrics[field], (token, entry) => ({ ...entry, units: tokenUnit(token) }));
@@ -775,7 +779,8 @@ export function createCompactReadModel({ path, DatabaseSync, now = () => Date.no
             unvaluedAmountRaw: asset.unvaluedAmount.toString(10), usdMicros: asset.hasValue ? asset.usd.toString(10) : null,
             blockers: [...asset.blockers.values()] })) }];
       }));
-      const extra = { actions: scopedActions, ...(gaps.length ? { unavailableHours: gaps.map((row) => iso(row.hour_start)) } : {}) };
+      const extra = { actions: scopedActions, ...(name === 'gateway' ? { tokenScope: 'legacy_usdc_only', excludedTokensValued: false } : {}),
+        ...(gaps.length ? { unavailableHours: gaps.map((row) => iso(row.hour_start)) } : {}) };
       if (failure) return unavailable(failure, { ...extra, failedHour });
       return [name, { status: 'available', reason: null, ...range,
         values: Object.fromEntries(Object.entries(actions).map(([field, action]) => [field, action.total.toString(10)])), ...extra }];
