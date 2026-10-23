@@ -46,6 +46,7 @@ export default function MainnetSwapScreen() {
   const [amount, setAmount] = useState('')
   const [slippageChoice, setSlippageChoice] = useState(DEFAULT_SLIPPAGE_BPS)
   const [provider, setProvider] = useState<Provider>('uniswap')
+  const [inversePrice, setInversePrice] = useState(false)
   const [showActivity, setShowActivity] = useState(false)
   // Keep a still-current price when selecting a provider. Missing/expired prices may be requested again;
   // Review always obtains its own independent quote and never treats this comparison as transaction authority.
@@ -147,7 +148,9 @@ export default function MainnetSwapScreen() {
   const selected = quotes[provider]
   let rateText: string | null = null
   try {
-    if (selected.state === 'quoted' && selected.estimatedUnits !== undefined) rateText = exchangeRate(decimalUnits(amount, inDecimals), inDecimals, selected.estimatedUnits, outDecimals)
+    if (selected.state === 'quoted' && selected.estimatedUnits !== undefined) rateText = inversePrice
+      ? exchangeRate(selected.estimatedUnits, outDecimals, decimalUnits(amount, inDecimals), inDecimals)
+      : exchangeRate(decimalUnits(amount, inDecimals), inDecimals, selected.estimatedUnits, outDecimals)
   } catch { rateText = null }
   const active = provider === 'uniswap' ? uniswap : circle
   const loading = active.loading
@@ -229,7 +232,8 @@ export default function MainnetSwapScreen() {
   const checkItem = (item: ActivityItem) => { void (item.provider === 'circle' ? circleExecution.checkAttempt(item.id, item.owner) : item.kind === 'swap' ? execution.checkAttempt(item.id, item.owner) : approvals.check(item.owner, item.id)) }
 
   const summary = selected.state === 'quoted' ? selected : null
-  const priceToken = tokenIn
+  const priceToken = inversePrice ? tokenOut : tokenIn
+  const priceQuoteToken = inversePrice ? tokenIn : tokenOut
   return <Container className="py-8 sm:py-12">
     <section aria-labelledby="swap-title" className="mx-auto max-w-lg space-y-4">
       <header className="flex flex-wrap items-center gap-3">
@@ -275,7 +279,7 @@ export default function MainnetSwapScreen() {
               {tokens.map(symbol => <option key={symbol}>{symbol}</option>)}
             </select>
           </div>
-          <p className="min-h-[1rem] text-xs text-slate-500">{summary ? (rateText ? <span aria-label="Unit price">1 {priceToken} ≈ {rateText} {tokenOut}</span> : 'Estimated from a live quote.') : 'Enter an amount to see what you would receive.'}</p>
+          <p className="min-h-[1rem] text-xs text-slate-500">{summary ? (rateText ? <button type="button" aria-label="Unit price" aria-pressed={inversePrice} title="Switch price direction" onClick={() => setInversePrice(value => !value)} className="rounded hover:text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#66D121]">1 {priceToken} ≈ {rateText} {priceQuoteToken}</button> : 'Estimated from a live quote.') : 'Enter an amount to see what you would receive.'}</p>
         </div>
 
         <fieldset className="space-y-2 pt-2">

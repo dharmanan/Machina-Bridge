@@ -20,6 +20,9 @@ await test('exchange rates are computed from exact amounts and formatted without
   assert.equal(r(1000000n, 6, 892564n, 6), '0.89256'); assert.equal(r(1000000n, 6, 1119247n, 6), '1.1192'); assert.equal(r(1000000n, 6, 1225n, 8), '0.00001225')
   assert.equal(r(1000n, 8, 61481396n, 6), '6,148,139.6'); assert.equal(r(10n ** 18n, 18, 2400n * 10n ** 6n, 6), '2,400'); assert.equal(r(1000000n, 6, 123456789000n, 6), '123,456.79')
   assert.equal(r(1n, 6, 0n, 6), null); assert.equal(r(0n, 6, 1n, 6), null)
+  // The same exact USDC/WETH quote supplies either display direction; no reciprocal of a rounded label.
+  assert.equal(r(1000000n, 6, 400000000000000n, 18), '0.0004')
+  assert.equal(r(400000000000000n, 18, 1000000n, 6), '2,500')
 })
 await test('the mode chip describes the route and the build, never whether an amount was typed', () => {
   const pilot = mode.swapExecutionConfig('true', owner, 'pilot'), open = mode.swapExecutionConfig('true', undefined, 'open'), off = mode.swapExecutionConfig('false', owner, 'pilot')

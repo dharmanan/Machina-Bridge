@@ -191,6 +191,27 @@ try {
     const ttl = await page.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
     assert.ok(parseInt(ttl) > 0 && parseInt(ttl) <= 30)
   })
+  await test('unit price toggles both directions from the current provider quote without edits, requests or wallet actions', async () => {
+    const price = page.getByRole('button', { name: 'Unit price', exact: true })
+    const originalAmount = await amount.inputValue()
+    for (const [provider, forward, reverse] of [
+      ['Uniswap quote', '1 USDC ≈ 0.89011 EURC', '1 EURC ≈ 1.1235 USDC'],
+      ['Circle Swap Kit quote', '1 USDC ≈ 2 EURC', '1 EURC ≈ 0.5 USDC'],
+    ]) {
+      await page.getByRole('radio', { name: provider, exact: true }).click()
+      const before = apiCalls + circleCalls
+      assert.equal(await price.innerText(), forward)
+      await price.click(); assert.equal(await price.innerText(), reverse)
+      assert.equal(await price.getAttribute('aria-pressed'), 'true')
+      await price.focus(); await page.keyboard.press('Enter'); assert.equal(await price.innerText(), forward)
+      assert.equal(await amount.inputValue(), originalAmount)
+      assert.equal(await page.getByRole('combobox', { name: 'From token' }).inputValue(), 'USDC')
+      assert.equal(await page.getByRole('combobox', { name: 'To token' }).inputValue(), 'EURC')
+      assert.equal(await page.getByRole('radio', { name: provider, exact: true }).isChecked(), true)
+      assert.equal(apiCalls + circleCalls, before)
+    }
+    await page.getByRole('radio', { name: 'Uniswap quote', exact: true }).click()
+  })
   await test('shared refresh requests both providers once through existing pacing, preserving amount, tokens, slippage and provider', async () => {
     for (const provider of ['Uniswap quote', 'Circle Swap Kit quote']) {
       await page.getByRole('radio', { name: provider, exact: true }).click()
@@ -244,6 +265,7 @@ try {
   })
   await test('expired automatic quotes disappear without polling or automatic resubmission', async () => {
     await success(); const before = apiCalls, circleBefore = circleCalls; await advance(31000); await noReceive()
+    assert.equal(await page.getByRole('button', { name: 'Unit price', exact: true }).count(), 0)
     assert.equal(apiCalls, before); await page.getByText(/Quote expired. Check the price again/).first().waitFor()
     await advance(60000); assert.equal(apiCalls, before)
     assert.equal(await page.getByRole('button', { name: 'Review Swap', exact: true }).count(), 0)
