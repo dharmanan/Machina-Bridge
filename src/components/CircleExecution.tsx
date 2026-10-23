@@ -131,6 +131,7 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
           <Line label="Network fee (maximum, all steps)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
           {view.phase !== 'awaiting_step' && <Line label="This review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />}
         </dl>
+        <p className="text-xs text-slate-600">The estimate covers the swap transaction. {request.tokenIn === 'USDC' ? 'Signing the permission has no network fee; using it on chain is part of the swap.' : 'An approval transaction also uses gas.'} The maximum is a safety budget for all steps, not an extra charge. Actual network fees depend on gas used and the network price.</p>
         <div className="space-y-1 rounded-xl bg-slate-50 p-3 text-sm">
           <p className="font-medium">What you will be asked, one step at a time</p>
           <ol className="list-decimal space-y-1 pl-5 text-slate-700">

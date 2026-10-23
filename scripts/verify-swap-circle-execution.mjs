@@ -1169,6 +1169,28 @@ await test('review building: the reference is read independently, a failing refe
   const failing = await sdk.buildCircleReview(request, deps({ reference: async () => { throw Error('rpc down') } })); assert.equal(failing.reference, undefined)
   assert.equal((await sdk.buildCircleReview(request, deps({ reference: async () => null }))).reference, undefined)
 })
+await test('the production example preserves 18-decimal gas math, separate 6-decimal provider fees and the existing safety margins', async () => {
+  // Controlled reproduction: the exact estimate is inferred from the reported ceiling; the historical raw quote was not supplied.
+  const sdk = require(`${root}src/lib/swap/circleSdk.ts`)
+  const request = { chainId: 5042, tokenIn: 'USDC', tokenOut: 'EURC', owner, amount: '0.1', slippageBps: 50, allowanceStrategy: 'permit' }
+  const review = await sdk.buildCircleReview(request, {
+    now: () => NOW_MS,
+    quote: async () => ({ estimatedOutput: '0.089297', minimumOutput: '0.08885', expiresAt: NOW_MS + 30_000,
+      fees: [{ type: 'provider', token: 'USDC', amount: '0.00002' }, { type: 'gas', token: 'USDC', amount: '0.02357122150215' }] }),
+    facts: async () => ({ nativeBalance: 10n ** 18n, tokenBalance: 1_000_000n, allowance: 0n, gasPrice: gwei(20), baseFee: gwei(21) }),
+  })
+  assert.equal(review.networkFee, '90713664506450000')
+  assert.equal(review.maxFeePerGas, gwei(42).toString()); assert.equal(review.maxPriorityFeePerGas, '0')
+  assert.equal(review.amountIn, '100000'); assert.equal(review.estimatedOutput, '89297')
+  assert.equal(c.providerFeeUnits(review), 20n)
+  assert.equal(Number(review.fees.find(f => f.type === 'gas').amount).toPrecision(2), '0.024')
+  assert.equal(g.bufferedGas(100001n), 130002n)
+  assert.equal(c.circleFeeCeiling(10n ** 18n), c.CIRCLE_FEE_CEILING_CAP)
+  const { ViemAdapter } = require('@circle-fin/adapter-viem-v2'), { getChainByEnum } = require('@circle-fin/swap-kit')
+  const adapter = new ViemAdapter({ getPublicClient: () => ({ getGasPrice: async () => gwei(20) }), getWalletClient: () => { throw Error('wallet_forbidden') } }, { addressContext: 'user-controlled', supportedChains: [getChainByEnum('Arc')] })
+  const estimated = await adapter.calculateTransactionFee(1_000_000n, undefined, getChainByEnum('Arc'))
+  assert.equal(estimated.fee, '21000000000000000') // 1M gas x 20 gwei plus the adapter's existing 5% buffer
+})
 await test('Review-bound fee: the provider fee in the transaction may not exceed the fee the Review showed (rounding aside); real swaps and the real service agree to the unit', () => {
   const real = realSwaps.find(r => r.tokenIn === 'EURC' && r.call.instructions.length === 2), nowSec = Number(real.call.deadline) - 590
   const fee = real.call.instructions.filter(i => i.tokenOut === ZERO).reduce((sum, i) => sum + i.amountToApprove, 0n)

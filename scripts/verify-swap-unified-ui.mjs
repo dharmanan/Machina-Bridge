@@ -263,7 +263,11 @@ try {
     await page.getByRole('dialog').getByText(/Browser extensions may modify swap transactions before signing/).waitFor()
     assert.equal(await page.getByRole('button', { name: '↻ Refresh quotes', exact: true }).isDisabled(), true)
     const dialog = page.getByRole('dialog'); await dialog.getByText('USDC → cirBTC (0.01%)', { exact: true }).waitFor(); await dialog.getByText('Most USDC you could spend', { exact: true }).waitFor(); await dialog.getByText('Minimum you receive', { exact: true }).waitFor(); await dialog.getByText('Network fee (maximum)', { exact: true }).waitFor()
-    await dialog.getByText(/no fee is taken by anyone else/).waitFor(); assert.equal(await dialog.getByText('Fee to another address').count(), 0); assert.doesNotMatch(await dialog.innerText(), /calldata|TAKE_PORTION|SWEEP|V4_SWAP|Universal Router|Permit2/i) // the plain Review shows every fee and the minimum, no jargon; assert.equal(await sends(), before)
+    await dialog.getByText(/Checked in the transaction prepared by this app/).waitFor()
+    await dialog.getByText(/Your wallet or browser extensions may change the transaction before signing/).waitFor()
+    assert.equal(await dialog.getByText(/no fee is taken by anyone else/).count(), 0)
+    assert.equal(await dialog.getByText('Fee to another address').count(), 0); assert.doesNotMatch(await dialog.innerText(), /calldata|TAKE_PORTION|SWEEP|V4_SWAP|Universal Router|Permit2/i) // the plain Review shows every fee and the minimum, no jargon
+    assert.equal(await sends(), before)
     await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
     const sent = await lastSent(); assert.equal(await sends(), before + 1)
     assert.ok(p.sameAddress(sent.tx.to, p.ARC_ROUTER)); assert.equal(sent.tx.value, toHex(10n ** 18n)); assert.equal(sent.tx.type, '0x2'); assert.equal(sent.tx.chainId, '0x13b2'); assert.equal(sent.tx.maxPriorityFeePerGas, '0x0')
@@ -336,6 +340,8 @@ try {
     const before = await sends(); await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
     await dialog.getByText('Wallet security', { exact: true }).waitFor()
     await dialog.getByText(/Browser extensions may modify swap transactions before signing/).waitFor()
+    await dialog.getByText(/An approval transaction also uses gas/).waitFor()
+    await dialog.getByText(/The maximum is a safety budget for all steps, not an extra charge/).waitFor()
     await dialog.getByText('Circle fee', { exact: true }).waitFor(); await dialog.getByText('Minimum you receive', { exact: true }).waitFor(); await dialog.getByText('Network fee (maximum, all steps)', { exact: true }).waitFor(); assert.doesNotMatch(await dialog.innerText(), /calldata|adapter|execute|ERC-1967/i)
     await dialog.getByText(/Approve exactly this EURC amount for Circle/).first().waitFor(); assert.equal(await sends(), before)
     await dialog.getByRole('button', { name: 'Confirm Swap' }).click(); await dialog.getByText(/Step 1 of 2: Approve exactly this EURC amount/).waitFor(); assert.equal(await sends(), before) // nothing reaches the wallet before the step is confirmed
@@ -357,6 +363,7 @@ try {
     await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     const before = await sends(), signs = () => page.evaluate(() => window.swapUiTest.state.signs.length), signsBefore = await signs()
     await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText(/Sign a one-time permission for exactly this USDC amount/).first().waitFor()
+    await dialog.getByText(/Signing the permission has no network fee; using it on chain is part of the swap/).waitFor()
     await dialog.getByRole('button', { name: 'Confirm Swap' }).click(); await dialog.getByText(/Step 1 of 2: Sign a one-time permission/).waitFor()
     await dialog.getByRole('button', { name: 'Cancel' }).click(); await page.waitForTimeout(400); assert.equal(await sends(), before); assert.equal(await signs(), signsBefore) // declined in the app: the wallet was never contacted
     await review.click(); await dialog.getByRole('button', { name: 'Confirm Swap' }).click(); await dialog.getByText(/Step 1 of 2: Sign a one-time permission/).waitFor(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
