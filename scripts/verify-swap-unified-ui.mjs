@@ -25,7 +25,7 @@ const V3_INPUT = parseAbiParameters('address recipient,uint256 amountIn,uint256 
 const dec = { USDC: 6, EURC: 6, cirBTC: 8, WETH: 18 }
 const AMOUNT = { USDC: '1', EURC: '1', cirBTC: '0.00001', WETH: '0.0003' }
 // Execution state the scenarios drive. clockOffset follows the page's fake clock so Arc's block time and the device clock stay consistent.
-const world = { receipts: new Map(), hidden: new Set(), walletAdjusts: false, rpcDown: new Set(), reads: [], errors: [], circleCalls: 0, circleBias: 99n, circleDelayMs: 0, external: 0, clockOffset: 0, blockSeq: 0 }
+const world = { receipts: new Map(), hidden: new Set(), walletAdjusts: false, rpcDown: new Set(), reads: [], errors: [], circleCalls: 0, circleBias: 99n, circleDelayMs: 0, external: 0, clockOffset: 0, blockSeq: 0, holdMethod: null, releases: [] }
 const rpc = createFakeArcRpc({ viem, policy: p, simulator, routerRuntime: runtime, now: () => Date.now() + world.clockOffset })
 rpc.state.owner = owner; rpc.state.block = 27_300_000n; rpc.state.gasPrice = 20_000_000_000n // about Arc's real gas price (21.5 gwei in the first swap)
 const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
@@ -48,7 +48,7 @@ export const readMainnetSwapQuote = testCircleReader;
     name: 'circle-execution-test-doubles', enforce: 'pre', transform(code, id) {
       const file = id.split('?')[0]
       if (file === `${root}src/lib/swap/circleSdk.ts`) return code.replace('export const circleChainRpc =', 'const realCircleChainRpc =').replace('export function circleSdk(', 'function realCircleSdk(') +
-        "\nimport { fakeCircleSdk, fakeCircleChainRpc } from '/scripts/fixtures/swap/circle-fake-sdk'\nexport const circleChainRpc = fakeCircleChainRpc(realCircleChainRpc)\nexport const circleSdk = fakeCircleSdk as never\nvoid realCircleSdk\n"
+        "\nimport { fakeCircleSdk, fakeCircleChainRpc } from '/scripts/fixtures/swap/circle-fake-sdk'\nexport const circleChainRpc = fakeCircleChainRpc(realCircleChainRpc)\nexport const circleSdk = ((wallet: never) => { const built = fakeCircleSdk(wallet); return { ...built, kit: { swap: async (params: never) => { await (window as unknown as { circleSdkHold?: Promise<void> }).circleSdkHold; return built.kit.swap(params) } } } }) as never\nvoid realCircleSdk\n"
     },
   }, {
     name: 'unified-ui-harness', configureServer(server) {
@@ -140,6 +140,7 @@ try {
     if (url.startsWith('https://fonts.googleapis.com/')) return route.fulfill({ contentType: 'text/css', body: '' })
     if (url !== 'https://rpc.mainnet.arc.io/') { world.external++; return route.abort() }
     const body = request.postDataJSON(), { method, params } = body; methods.push(method)
+    if (method === world.holdMethod) await new Promise(resolve => world.releases.push(resolve))
     if (world.rpcDown.has('everything')) return route.fulfill({ status: 503, body: 'down' })
     try {
       if (method === 'eth_getTransactionByHash' || method === 'eth_getTransactionReceipt') {
@@ -334,6 +335,31 @@ try {
     }
   })
 
+  await test('Circle progress labels follow held balance, nonce and SDK stages; timing details stay ephemeral and cancellation requests no signature', async () => {
+    await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
+    await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
+    const before = await sends(), signs = await page.evaluate(() => window.swapUiTest.state.signs.length)
+    await page.evaluate(() => { window.circleSdkHold = new Promise(resolve => { window.releaseCircleSdk = resolve }) })
+    world.holdMethod = 'eth_getBalance'
+    const held = async () => { for (let i = 0; i < 100 && world.releases.length === 0; i++) await page.waitForTimeout(10); assert.ok(world.releases.length > 0) }
+    await dialog.getByRole('button', { name: 'Confirm Swap', exact: true }).click()
+    await dialog.getByRole('button', { name: 'Checking balances and fees…', exact: true }).waitFor()
+    await held()
+    world.holdMethod = 'eth_getTransactionCount'; world.releases.splice(0).forEach(resolve => resolve())
+    await dialog.getByRole('button', { name: 'Checking wallet and network…', exact: true }).waitFor()
+    await held()
+    world.holdMethod = null; world.releases.splice(0).forEach(resolve => resolve())
+    await dialog.getByRole('button', { name: 'Preparing Circle transaction…', exact: true }).waitFor()
+    assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
+    await page.evaluate(() => { window.releaseCircleSdk(); delete window.circleSdkHold; delete window.releaseCircleSdk })
+    await dialog.getByText(/Step 1 of 2: Sign a one-time permission/).waitFor()
+    await dialog.getByText('Timing diagnostics · this tab only', { exact: true }).click()
+    await dialog.getByText(/first_wallet_preparation ·/).waitFor()
+    const text = await dialog.locator('details').filter({ hasText: 'Timing diagnostics' }).innerText()
+    assert.doesNotMatch(text, /0x[a-f0-9]{40}|https?:\/\//i)
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click(); await page.waitForTimeout(100)
+    assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
+  })
   await test('Circle Swap Kit (test doubles for the SDK only): an exact approval and the adapter swap, each confirmed in the app first and then in the wallet, verified from the chain', async () => {
     await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); assert.equal(await review.isEnabled(), true)

@@ -10,6 +10,7 @@ import { MAINNET_SWAP_QUOTE_TTL_MS } from '../../config/mainnetSwap'
 import { validateArcRequest } from '../uniswapArcPolicy'
 import { createOnchainReview } from './uniswapOnchain'
 import { createOnchainPorts } from './uniswapOnchainRpc'
+import type { CirclePerformance } from './circlePerformance'
 
 // The pinned, read-only Arc client for Circle execution: only the read methods in assertCircleExecutionReadMethod can pass, so neither the
 // SDK nor anything else can send, sign or approve through it. The only write path is the guarded wallet (circleGuard).
@@ -45,6 +46,7 @@ export async function readCircleReviewFacts(owner: string, tokenIn: ReturnType<t
 }
 
 export interface CircleReviewDeps {
+  performance?: CirclePerformance
   // An independent price for the same swap (the keyless Uniswap quote), or null when none could be read.
   reference?(request: CircleSwapRequest): Promise<string | null>
   quote(request: { address: Hex; chainId: number; tokenIn: CircleSwapRequest['tokenIn']; tokenOut: CircleSwapRequest['tokenOut']; amount: string; slippageBps: number }): Promise<PreviewQuote>
@@ -54,14 +56,22 @@ export interface CircleReviewDeps {
 export const MAX_FEE_MULTIPLIER = 2n
 // A read-only Circle quote and the chain facts, turned into a Review the controller validates again before anything reaches a wallet.
 export async function buildCircleReview(request: CircleSwapRequest, deps: CircleReviewDeps): Promise<CircleSwapReview> {
+  const run = () => buildCircleReviewData(request, deps)
+  return deps.performance ? deps.performance.measure('review', run) : run()
+}
+async function buildCircleReviewData(request: CircleSwapRequest, deps: CircleReviewDeps): Promise<CircleSwapReview> {
   const tokenIn = swapToken(request.tokenIn), tokenOut = swapToken(request.tokenOut), startedAt = deps.now()
-  const quote = await deps.quote({ address: request.owner as Hex, chainId: 5042, tokenIn: request.tokenIn, tokenOut: request.tokenOut, amount: request.amount, slippageBps: request.slippageBps })
-  const facts = await deps.facts(request.owner, request)
+  const measure = <T>(stage: 'quote' | 'review_facts' | 'reference', run: () => Promise<T>) => deps.performance ? deps.performance.measure(stage, run) : run()
+  const quote = await measure('quote', () => deps.quote({ address: request.owner as Hex, chainId: 5042, tokenIn: request.tokenIn, tokenOut: request.tokenOut, amount: request.amount, slippageBps: request.slippageBps }))
+  // Independent reads for the same request; neither uses the other's response. No cached/partial data is substituted.
+  const [facts, referenceOutput] = await Promise.all([
+    measure('review_facts', () => deps.facts(request.owner, request)),
+    deps.reference ? measure('reference', () => deps.reference!(request)).catch(() => null) : Promise.resolve(null),
+  ])
   const gas = quote.fees.filter(fee => fee.type === 'gas')
   // Circle quotes its gas estimate in USDC. When it gives none (or not for every item) the ceiling falls back to its fixed default.
   let estimatedGasFee: bigint | null = null
   if (gas.length > 0 && gas.every(fee => fee.amount !== null && fee.token === 'USDC')) estimatedGasFee = gas.reduce((sum, fee) => sum + parseUnits(fee.amount as string, 18), 0n)
-  const referenceOutput = deps.reference ? await deps.reference(request).catch(() => null) : null
   const price = (facts.baseFee !== null && facts.baseFee > facts.gasPrice ? facts.baseFee : facts.gasPrice) * MAX_FEE_MULTIPLIER
   return {
     request, amountIn: decimalUnits(request.amount, tokenIn.decimals).toString(), estimatedOutput: decimalUnits(quote.estimatedOutput, tokenOut.decimals).toString(),

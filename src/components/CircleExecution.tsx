@@ -13,6 +13,7 @@ import { buildCircleReview, circleChainRpc, circleReviewDeps, circleSdk } from '
 import { swapToken } from '../lib/swap/tokens'
 import { CIRCLE_ADAPTER } from '../lib/swap/circleAdapterDecode'
 import { SWAP_EXECUTION } from '../config/swapExecution'
+import { createCirclePerformance, type CircleTiming } from '../lib/swap/circlePerformance'
 
 // Circle Swap Kit execution through the connected wagmi wallet. The SDK only ever sees the guarded wallet; every step is confirmed in the
 // app first, then in the wallet. `blocked` lets the caller hold a swap while another provider's transaction of the same wallet is unresolved.
@@ -22,6 +23,7 @@ export function useCircleSwapExecution(input: CircleSwapRequest | null, blocked:
   const [history, setHistory] = useState<CircleSwapAttempt[]>([])
   const [historyError, setHistoryError] = useState(false)
   const [view, setView] = useState<CircleView>({ phase: 'idle' })
+  const [performance] = useState(() => createCirclePerformance())
   const [, tick] = useState(0)
   const alive = useRef(true)
   const context = useRef<CircleContext>({ owner: '', connected: false, chainId: 0, connectorId: '' })
@@ -29,8 +31,9 @@ export function useCircleSwapExecution(input: CircleSwapRequest | null, blocked:
   context.current = { owner: address ?? '', connected: isConnected, chainId: chainId ?? 0, connectorId: connector?.uid ?? '' }
   currentInput.current = input; currentConnector.current = connector; currentBlocked.current = blocked
   const [controller] = useState(() => createCircleSwapExecution({
+    performance,
     context: () => alive.current ? context.current : { ...context.current, connected: false }, input: () => alive.current ? currentInput.current : null, now: () => Date.now(),
-    fresh: request => buildCircleReview(request, circleReviewDeps()),
+    fresh: request => buildCircleReview(request, { ...circleReviewDeps(), performance }),
     preflight: circleChainRpc.preflight, publicNonce: circleChainRpc.publicNonce, estimateGas: circleChainRpc.estimateGas, simulate: circleChainRpc.simulate, approval: circleChainRpc.approval, result: circleChainRpc.result,
     provider: () => connectedExecutionProvider(currentConnector.current), sdk: circleSdk,
     storage: { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
@@ -82,7 +85,7 @@ export function useCircleSwapExecution(input: CircleSwapRequest | null, blocked:
   const visibleView: CircleView = !isConnected || !sameAddress(address, view.attempt?.review.request.owner ?? view.review?.request.owner ?? address ?? '') ? { phase: 'idle' } : view
   const restriction = circleExecutionRestriction(SWAP_EXECUTION, input, context.current, CIRCLE_SWAP_WRITES_ENABLED)
   return {
-    view: visibleView, stored, history: isConnected ? history.filter(a => sameAddress(a.review.request.owner, address ?? '')) : [], historyError,
+    view: visibleView, timings: controller.timings(), stored, history: isConnected ? history.filter(a => sameAddress(a.review.request.owner, address ?? '')) : [], historyError,
     remainingMs: view.review ? Math.max(0, view.review.expiresAt - Date.now()) : 0,
     restriction, restrictionMessage: restriction ? executionRestrictionMessage(restriction) : null, enabled: CIRCLE_SWAP_WRITES_ENABLED && restriction === null,
     blocking: (owner: string) => controller.blocking(owner),
@@ -111,8 +114,10 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
   const request = review?.request
   const tokenIn = request ? swapToken(request.tokenIn) : null, tokenOut = request ? swapToken(request.tokenOut) : null
   const step = view.step
+  const progress = view.stage === 'balances' ? 'Checking balances and fees…' : view.stage === 'wallet' ? 'Checking wallet and network…'
+    : view.stage === 'transaction' ? 'Checking transaction and fees…' : 'Preparing Circle transaction…'
   const providerFee = review?.fees.find(fee => fee.type === 'provider'), gasEstimate = review?.fees.find(fee => fee.type === 'gas')
-  return <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="circle-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
+  return <><dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="circle-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
       <h2 id="circle-review-title" className="text-xl font-semibold">Review Circle swap</h2>
       <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
@@ -129,7 +134,7 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
           {providerFee && <Line label="Circle fee" value={providerFee.amount === null ? 'not estimated' : `${providerFee.amount} ${providerFee.token}`} />}
           {gasEstimate?.amount != null && <Line label="Network fee (estimate)" value={`about ${Number(gasEstimate.amount).toPrecision(2)} USDC`} />}
           <Line label="Network fee (maximum, all steps)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
-          {view.phase !== 'awaiting_step' && <Line label="This review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />}
+          {view.approvalId && <Line label="This review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />}
         </dl>
         <p className="text-xs text-slate-600">The estimate covers the swap transaction. {request.tokenIn === 'USDC' ? 'Signing the permission has no network fee; using it on chain is part of the swap.' : 'An approval transaction also uses gas.'} The maximum is a safety budget for all steps, not an extra charge. Actual network fees depend on gas used and the network price.</p>
         <div className="space-y-1 rounded-xl bg-slate-50 p-3 text-sm">
@@ -148,6 +153,7 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
             {review.reference && <Line label="Independent price check" value={`Uniswap reference ${formatUnits(BigInt(review.reference.estimatedOutput), tokenOut.decimals)} ${request.tokenOut}`} />}
           </dl></details>
       </>}
+      {open && <CircleTimingDetails timings={execution.timings} />}
       {step && view.phase === 'awaiting_step' && <div role="status" className="space-y-2 rounded-xl border border-[#2F6E0C]/40 bg-[#f4faef] p-3 text-sm">
         <p className="font-semibold">Step {step.kind === 'swap' ? 2 : 1} of 2: {kindText(step.kind, request?.tokenIn ?? '')}</p>
         <dl className="space-y-1">
@@ -166,10 +172,18 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
         {view.phase === 'awaiting_step'
           ? <button type="button" onClick={execution.continueStep} className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white">Continue to wallet</button>
           : <button type="button" onClick={() => { void execution.confirm() }} disabled={view.phase !== 'review' || remainingMs < 5000}
-            className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? 'Rechecking…' : remainingMs <= 0 ? 'Review expired' : remainingMs < 5000 ? 'Review expiring' : 'Confirm Swap'}</button>}
+            className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? progress : remainingMs <= 0 ? 'Review expired' : remainingMs < 5000 ? 'Review expiring' : 'Confirm Swap'}</button>}
       </div>
     </div>
-  </dialog>
+  </dialog>{!open && <CircleTimingDetails timings={execution.timings} />}</>
+}
+function CircleTimingDetails({ timings }: { timings: CircleTiming[] }) {
+  if (timings.length === 0) return null
+  return <details className="text-xs text-slate-500">
+    <summary className="cursor-pointer">Timing diagnostics · this tab only</summary>
+    <p>Review and first-confirmation preparation exclude your confirmation wait. Step preparation excludes the wallet wait. HTTP timings are browser observations; concurrent requests and cross-origin restrictions can prevent attribution or hide status. They are not an SDK retry count.</p>
+    <ul>{timings.map((timing, index) => <li key={index}>{timing.stage} · {timing.ms} ms · {timing.outcome} · {timing.reason} · pass {timing.pass}</li>)}</ul>
+  </details>
 }
 function Line({ label, value }: { label: string; value: string }) {
   return <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3"><dt className="text-slate-500">{label}</dt><dd className="break-all text-right">{value}</dd></div>

@@ -15,6 +15,7 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
 const root = fileURLToPath(new URL('..', import.meta.url))
 const d = require(`${root}src/lib/swap/circleAdapterDecode.ts`), g = require(`${root}src/lib/swap/circleGuard.ts`), c = require(`${root}src/lib/swap/circleSwap.ts`)
 const tk = require(`${root}src/lib/swap/tokens.ts`), ev = require(`${root}src/lib/swap/transactionEvidence.ts`), x = require(`${root}src/lib/uniswapArcExecution.ts`)
+const perf = require(`${root}src/lib/swap/circlePerformance.ts`)
 const { encodeFunctionData, encodeAbiParameters, parseAbiParameters, keccak256, formatTransaction, formatTransactionReceipt, parseUnits } = require('viem')
 const swaps = JSON.parse(readFileSync(`${root}scripts/fixtures/swap/circle/arc-circle-swaps.json`, 'utf8'))
 const earn = JSON.parse(readFileSync(`${root}scripts/fixtures/swap/circle/arc-adapter-earn-txs.json`, 'utf8'))
@@ -359,7 +360,7 @@ function setup(options = {}) {
     authorize: () => true, enabled: options.enabled ?? (() => true), changed: view => seen.push(view), settled: attempt => settled.push(attempt), pause: async () => {},
     ...options.ports,
   }
-  const controller = c.createCircleSwapExecution(ports)
+  const controller = (options.engine ?? c.createCircleSwapExecution)(ports)
   return { controller, world, clock, context, data, seen, settled, ports, provider, records, setInput: next => { input = next }, input: () => input, storageKey,
     async review() { await controller.prepare(); assert.equal(controller.current().phase, 'review', controller.current().error); return controller.current().approvalId },
     // Runs a whole attempt: confirm, then the user continues each step as it appears (a step is identified by its kind and index).
@@ -656,6 +657,202 @@ await test('timers: an unanswered step confirmation expires without a wallet req
     release(hash); await waitFor(() => g2.world.sends.length === 1 && g2.controller.current().attempt?.steps[0]?.hash === hash)
     // the late hash is recorded; the flow goes on to the swap gate
     await waitFor(() => g2.controller.current().phase === 'awaiting_step'); g2.controller.cancelStep(); await run2
+  } finally { mock.timers.reset() }
+})
+await test('timing records are bounded, detached, monotonic and payload-free, and never retain hostile error objects', async () => {
+  let time = 10
+  const metrics = perf.createCirclePerformance(() => time); metrics.begin()
+  const end = metrics.start('review'); time = 25; end(); end()
+  assert.equal(metrics.snapshot()[0].ms, 15); assert.equal(metrics.snapshot().length, 1)
+  const copy = metrics.snapshot(); copy[0].ms = -1; assert.equal(metrics.snapshot()[0].ms, 15)
+  for (let i = 0; i < 70; i++) await assert.rejects(metrics.measure('public_nonce', async () => { throw Object.assign(Error('SECRET calldata address signature RPC_URL balance'), { data: 'SECRET' }) }))
+  assert.equal(metrics.snapshot().length, 64); assert.doesNotMatch(JSON.stringify(metrics.snapshot()), /SECRET|address|signature|calldata|balance|RPC_URL/)
+  const old = metrics.start('quote'); metrics.begin(); old(); assert.deepEqual(metrics.snapshot(), [])
+  assert.doesNotThrow(() => perf.circleTimingFailure(new Proxy({}, { get() { throw Error('SECRET') } })))
+  assert.deepEqual(perf.circleTimingFailure({ name: 'HttpRequestError', cause: { name: 'TimeoutError', message: 'SECRET' } }), { outcome: 'timeout', reason: 'rpc' })
+})
+await test('Circle HTTP resource timing records only numeric durations and allowlisted outcomes, never URLs or purported retry counts', () => {
+  const saved = globalThis.PerformanceObserver, metrics = perf.createCirclePerformance()
+  let callback, stopped = 0
+  class Observer {
+    static supportedEntryTypes = ['resource']
+    constructor(cb) { callback = cb }
+    observe() {}
+    takeRecords() { return [] }
+    disconnect() { stopped++ }
+  }
+  try {
+    globalThis.PerformanceObserver = Observer
+    const stop = perf.observeCircleHttp(metrics), startTime = performance.now() + 1
+    callback({ getEntries: () => [
+      { entryType: 'resource', startTime, name: 'https://api.circle.com/v1/stablecoinKits/swap?SECRET', duration: 250, responseStatus: 429 },
+      { entryType: 'resource', startTime, name: 'https://api.circle.com/v1/stablecoinKits/swap', duration: 150, responseStatus: 0 },
+      { entryType: 'resource', startTime, name: 'https://unrelated.invalid/SECRET', duration: 999, responseStatus: 200 },
+    ] })
+    stop(); assert.equal(stopped, 1)
+    assert.deepEqual(metrics.snapshot().map(t => [t.ms, t.outcome, t.reason]), [[250, 'error', 'rate_limit'], [150, 'unavailable', 'http_status_hidden']])
+    assert.doesNotMatch(JSON.stringify(metrics.snapshot()), /SECRET|https|retry/)
+    globalThis.PerformanceObserver = undefined
+    perf.observeCircleHttp(metrics)(); assert.equal(metrics.snapshot().at(-1).reason, 'resource_timing_unavailable')
+  } finally { globalThis.PerformanceObserver = saved }
+})
+await test('public and wallet nonce reads overlap after preflight while each wallet observation retains its order', async () => {
+  const f = setup(), original = f.provider.request, calls = []
+  let release, publicStarted = false
+  f.ports.publicNonce = () => { publicStarted = true; return new Promise(resolve => { release = () => resolve({ nonce: 7, latestNonce: 7 }) }) }
+  f.provider.request = async args => { assert.equal(publicStarted, true); calls.push(args.method === 'eth_getTransactionCount' ? args.params[1] : args.method); return original(args) }
+  const preparing = f.controller.prepare()
+  await waitFor(() => calls.length === 7)
+  assert.deepEqual(calls, ['eth_chainId', 'eth_accounts', 'latest', 'pending', 'latest', 'eth_chainId', 'eth_accounts'])
+  assert.equal(f.controller.current().stage, 'wallet'); assert.equal(f.world.sends.length, 0)
+  release(); await preparing; assert.equal(f.controller.current().phase, 'review')
+  assert.ok(f.controller.timings().some(t => t.stage === 'public_nonce' && t.outcome === 'ok'))
+  assert.ok(f.controller.timings().some(t => t.stage === 'wallet_nonce' && t.outcome === 'ok'))
+})
+// Optional comparison against the real previous implementation; not required by shallow-clone regression runs.
+if (process.env.CIRCLE_PERFORMANCE_BASELINE) await test('controlled virtual-time comparison against the selected git baseline (not a live RPC speed claim)', async () => {
+  const { execFileSync } = require('node:child_process'), { Module } = require('node:module'), { dirname } = require('node:path')
+  const revision = process.env.CIRCLE_PERFORMANCE_BASELINE
+  assert.match(revision, /^[a-f0-9]{40}$/)
+  function baseline(relative) {
+    const filename = root + relative, source = execFileSync('git', ['show', `${revision}:${relative}`], { cwd: root, encoding: 'utf8' })
+    const mod = new Module(filename); mod.filename = filename; mod.paths = Module._nodeModulePaths(dirname(filename))
+    mod._compile(ts.transpileModule(source, { fileName: filename, compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, filename)
+    return mod.exports
+  }
+  function schedule() {
+    let time = 0; const queue = []
+    return {
+      now: () => time,
+      after: (ms, value) => new Promise(resolve => queue.push({ at: time + ms, resolve: () => resolve(value) })),
+      async finish(promise, update = () => {}) {
+        let done = false, value, failure
+        promise.then(v => { value = v; done = true }, e => { failure = e; done = true })
+        for (let turn = 0; !done && turn < 10000; turn++) {
+          await new Promise(resolve => setImmediate(resolve))
+          if (done || queue.length === 0) continue
+          time = Math.min(...queue.map(event => event.at)); update(time)
+          for (const event of queue.filter(event => event.at === time)) { queue.splice(queue.indexOf(event), 1); event.resolve() }
+        }
+        assert.equal(done, true); if (failure) throw failure
+        return { value, ms: time }
+      },
+    }
+  }
+  const previousSdk = baseline('src/lib/swap/circleSdk.ts'), previousEngine = baseline('src/lib/swap/circleSwap.ts')
+  const sdk = require(`${root}src/lib/swap/circleSdk.ts`), request = setup().input()
+  const reviewResults = []
+  for (const build of [previousSdk.buildCircleReview, sdk.buildCircleReview]) {
+    const clock = schedule()
+    const result = await clock.finish(build(request, {
+      now: () => NOW_MS + clock.now(),
+      quote: () => clock.after(200, { estimatedOutput: '0.9', minimumOutput: '0.8955', fees: [], expiresAt: NOW_MS + 30_000 }),
+      facts: () => clock.after(400, { nativeBalance: 5n * 10n ** 18n, tokenBalance: 10n ** 20n, allowance: 0n, gasPrice: gwei(20), baseFee: gwei(20) }),
+      reference: () => clock.after(600, '0.905'),
+    }))
+    reviewResults.push(result)
+  }
+  assert.deepEqual(reviewResults.map(r => r.ms), [1200, 800]); assert.deepEqual(reviewResults[0].value, reviewResults[1].value)
+  const nonceResults = []
+  for (const engine of [previousEngine.createCircleSwapExecution, c.createCircleSwapExecution]) {
+    const clock = schedule(), f = setup({ engine, ports: { performance: perf.createCirclePerformance(clock.now) } })
+    const preflight = f.ports.preflight, publicNonce = f.ports.publicNonce, wallet = f.provider.request
+    f.ports.preflight = async review => { await clock.after(150); return preflight(review) }
+    f.ports.publicNonce = async who => { for (let read = 0; read < 3; read++) await clock.after(120); return publicNonce(who) }
+    f.provider.request = async args => { await clock.after(100); return wallet(args) }
+    const result = await clock.finish(f.controller.prepare(), ms => { f.clock.now = NOW_MS + ms })
+    assert.equal(f.controller.current().phase, 'review'); assert.equal(f.world.sends.length, 0)
+    nonceResults.push(result.ms)
+  }
+  assert.deepEqual(nonceResults, [1210, 850])
+  console.log('CONTROLLED TIMINGS: Review quote/facts/reference 1200 -> 800 ms; preflight + public/wallet nonce checks 1210 -> 850 ms. Same inputs and checks; virtual time only, no network.')
+})
+await test('a failed parallel source drains the other read before a bounded retry, and never uses a partial observation', async () => {
+  const f = setup(), original = f.provider.request
+  let publicCalls = 0, release, pendingCalls = 0
+  f.ports.publicNonce = async () => { if (++publicCalls === 1) throw new x.ExecutionNonceObservationError('public', 7); return { nonce: 7, latestNonce: 7 } }
+  f.provider.request = args => args.method === 'eth_getTransactionCount' && args.params[1] === 'pending' && ++pendingCalls === 1
+    ? new Promise(resolve => { release = () => resolve('0x7') }) : original(args)
+  const preparing = f.controller.prepare(); await waitFor(() => release !== undefined)
+  assert.equal(publicCalls, 1); assert.equal(f.world.preflights, 1); assert.equal(f.world.sends.length, 0)
+  release(); await preparing; assert.equal(publicCalls, 2); assert.equal(f.controller.current().phase, 'review')
+  assert.ok(f.controller.timings().some(t => t.outcome === 'retry' && t.reason === 'nonce_observation'))
+})
+await test('parallel wallet errors and quote expiry fail closed with safe stage diagnostics and no SDK call', async () => {
+  const f = setup()
+  f.provider.request = async () => { throw Object.assign(Error('SECRET session address payload'), { code: 4200 }) }
+  await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle')
+  assert.match(f.controller.current().error, /method unsupported/); assert.doesNotMatch(f.controller.current().error, /SECRET/)
+  assert.ok(f.controller.timings().some(t => t.stage === 'wallet_nonce' && t.reason === 'unsupported'))
+  assert.equal(f.world.sdkCalls.length, 0)
+  const g2 = setup(), preflight = g2.ports.preflight
+  g2.ports.preflight = async review => { const facts = await preflight(review); g2.clock.now += 26_000; return facts }
+  await g2.controller.prepare(); assert.match(g2.controller.current().error, /30-second quote expired/)
+  assert.ok(g2.controller.timings().some(t => t.reason === 'expired')); assert.equal(g2.world.sends.length, 0)
+})
+await test('parallel Review reads never reuse a previous balance or price when either fresh source fails', async () => {
+  const sdk = require(`${root}src/lib/swap/circleSdk.ts`)
+  for (const failed of ['facts', 'reference']) {
+    const f = setup()
+    f.ports.fresh = request => sdk.buildCircleReview(request, {
+      performance: perf.createCirclePerformance(), now: () => f.clock.now,
+      quote: async () => ({ estimatedOutput: '0.9', minimumOutput: '0.8955', fees: [], expiresAt: f.clock.now + 30_000 }),
+      facts: async () => { if (failed === 'facts') throw Error('SECRET balance'); return { nativeBalance: 5n * 10n ** 18n, tokenBalance: 10n ** 20n, allowance: 0n, gasPrice: gwei(20), baseFee: gwei(20) } },
+      reference: async () => { if (failed === 'reference') throw Error('SECRET quote'); return '0.905' },
+    })
+    await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle')
+    assert.equal(f.world.sdkCalls.length, 0); assert.equal(f.world.sends.length, 0); assert.equal(f.records().length, 0)
+    assert.doesNotMatch(f.controller.current().error, /SECRET/)
+  }
+})
+await test('SDK first-step latency and a stalled SDK are measured separately from nonce checks and user wait', async () => {
+  const f = setup({ tokenIn: 'USDC', tokenOut: 'EURC' })
+  let resolveSdk
+  const normalSdk = f.ports.sdk
+  f.ports.sdk = wallet => new Promise(resolve => { resolveSdk = () => resolve(normalSdk(wallet)) })
+  const id = await f.review(), running = f.controller.confirm(id)
+  await waitFor(() => resolveSdk !== undefined)
+  assert.equal(f.controller.current().stage, 'sdk'); assert.equal(f.world.signs.length, 0)
+  assert.equal(f.controller.timings().some(t => t.stage === 'first_wallet_preparation'), false)
+  resolveSdk(); await waitFor(() => f.controller.current().phase === 'awaiting_step')
+  assert.ok(f.controller.timings().some(t => t.stage === 'sdk_preparation' && t.outcome === 'ok'))
+  assert.ok(f.controller.timings().some(t => t.stage === 'first_wallet_preparation' && t.outcome === 'ok'))
+  f.controller.cancelStep(); await running
+  assert.equal(JSON.stringify(f.records()).includes('sdk_preparation'), false)
+  assert.equal(f.world.signs.length, 0); assert.equal(f.world.sends.length, 0)
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const g2 = setup(); let started = false
+    g2.world.kit = { swap: () => { started = true; return new Promise(() => {}) } }
+    const id2 = await g2.review(), stalled = g2.controller.confirm(id2)
+    await waitFor(() => started); mock.timers.tick(c.CIRCLE_STALL_BEFORE_STEP_MS); await stalled
+    assert.ok(g2.controller.timings().some(t => t.stage === 'sdk_preparation' && t.outcome === 'timeout'))
+    assert.equal(g2.world.sends.length, 0); assert.match(g2.controller.current().error, /did not answer in time/)
+  } finally { mock.timers.reset() }
+})
+await test('a stalled SDK factory cannot start a late swap or reopen a closed confirmation', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const f = setup(), sdk = f.ports.sdk; let release
+    f.ports.sdk = wallet => new Promise(resolve => { release = () => resolve(sdk(wallet)) })
+    const id = await f.review(), running = f.controller.confirm(id)
+    await waitFor(() => release !== undefined); mock.timers.tick(c.CIRCLE_STALL_BEFORE_STEP_MS); await running
+    assert.equal(f.controller.current().phase, 'rejected'); assert.equal(f.world.sdkCalls.length, 0)
+    assert.ok(f.controller.timings().some(t => t.stage === 'sdk_preparation' && t.outcome === 'timeout'))
+    release(); await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.world.sdkCalls.length, 0); assert.equal(f.world.sends.length, 0); assert.equal(f.controller.current().phase, 'rejected')
+  } finally { mock.timers.reset() }
+})
+await test('wallet timeout diagnostics identify the read stage without logging provider contents or retrying the request', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const f = setup(); let calls = 0
+    f.provider.request = () => { calls++; return new Promise(() => {}) }
+    const preparing = f.controller.prepare(); await waitFor(() => calls === 1)
+    mock.timers.tick(3000); await preparing
+    assert.match(f.controller.current().error, /eth_chainId before nonce: RPC read timed out/)
+    assert.equal(calls, 1); assert.equal(f.world.sdkCalls.length, 0)
+    assert.ok(f.controller.timings().some(t => t.stage === 'wallet_nonce' && t.outcome === 'timeout'))
   } finally { mock.timers.reset() }
 })
 await test('a wallet that never returns a hash is Unknown and blocks; a bad hash is not trusted; a late 4001 turns Unknown into Rejected', async () => {

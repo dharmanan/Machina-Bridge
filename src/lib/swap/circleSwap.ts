@@ -13,6 +13,8 @@ import {
 import { SWAP_INPUT_CAPS, isSwapSymbol, swapToken, type SwapSymbol } from './tokens'
 import { archiveRecord, archiveUnreadable, readArchive } from './journalArchive'
 import { viemInnerWallet } from './circleWallet'
+import { WalletRpcFailure, walletRpcRead, walletRpcMessage } from '../uniswapArcWalletRpc'
+import { createCirclePerformance, circleTimingFailure, observeCircleHttp, type CirclePerformance } from './circlePerformance'
 import { ownerFlows, summarizeIntent, type ChainLog, type ChainReceipt, type ChainSummary, type ChainTx, type IntentSummary } from './transactionEvidence'
 
 // Circle Swap Kit execution on Arc Mainnet. Mirrors the Uniswap controller (uniswapArcExecution.ts): the application, not the SDK or the
@@ -188,6 +190,7 @@ export interface CircleSwapAttempt {
   chain?: ChainSummary; intent?: IntentSummary; log?: StatusLogEntry[]
 }
 export interface CircleView {
+  stage?: 'balances' | 'wallet' | 'sdk' | 'transaction'
   phase: 'idle' | 'preparing' | 'review' | 'checking' | 'awaiting_step' | AttemptStatus
   approvalId?: string; review?: CircleSwapReview; attempt?: CircleSwapAttempt; error?: string
   // The step waiting for the user's in-app confirmation (phase awaiting_step). Nothing reaches the wallet before continueStep().
@@ -206,6 +209,7 @@ export type CircleApprovalState = { status: 'pending' } | { status: 'confirmed' 
 export interface CircleKitLike { swap(params: Record<string, unknown>): Promise<unknown> }
 
 export interface CirclePorts {
+  performance?: CirclePerformance
   context(): CircleContext; input(): CircleSwapRequest | null
   now(): number
   // Fresh read-only quote, balances and fee data. Re-validated by validateCircleReview.
@@ -436,13 +440,11 @@ export async function browserCircleLock<T>(owner: string, run: () => Promise<T>)
 }
 
 // --- Wallet side reads ------------------------------------------------------------------------------------------------------
-const WALLET_READ_MS = 3000
-async function walletRead(provider: CircleProvider, method: string, params?: unknown[]): Promise<unknown> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([Promise.resolve().then(() => provider.request(params ? { method, params } : { method })),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('wallet_nonce')), WALLET_READ_MS) })])
-  } catch { return stop('wallet_nonce') } finally { clearTimeout(timer) }
+class CircleWalletReadFailure extends WalletRpcFailure {
+  constructor(failure: WalletRpcFailure) { super(failure.stage, failure.kind, failure.rpcCode); this.message = 'wallet_nonce' }
+}
+class CirclePublicNonceFailure extends Error {
+  constructor(readonly kind: 'timeout' | 'rpc-error') { super('public_nonce') }
 }
 const walletQuantity = (raw: unknown): number => {
   if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0) return raw
@@ -452,17 +454,21 @@ const walletQuantity = (raw: unknown): number => {
 }
 // The wallet's own view of the account: network and first account before and after, and latest/pending/latest counts that must agree.
 export async function readWalletNonceState(provider: CircleProvider, owner: string): Promise<ExecutionNonceState> {
-  async function identity() {
-    if (walletQuantity(await walletRead(provider, 'eth_chainId')) !== CIRCLE_CHAIN_ID) stop('wallet_nonce')
-    const accounts = await walletRead(provider, 'eth_accounts')
+  async function read(stage: Parameters<typeof walletRpcRead>[1]) {
+    try { return await walletRpcRead(provider, stage, owner) }
+    catch (error) { if (error instanceof WalletRpcFailure) throw new CircleWalletReadFailure(error); throw error }
+  }
+  async function identity(after: boolean) {
+    if (walletQuantity(await read(after ? 'chain-after' : 'chain-before')) !== CIRCLE_CHAIN_ID) stop('wallet_nonce')
+    const accounts = await read(after ? 'accounts-after' : 'accounts-before')
     if (!Array.isArray(accounts) || !accounts.every(a => typeof a === 'string' && ADDRESS.test(a)) || !same(accounts[0], owner)) stop('wallet_nonce')
   }
-  await identity()
-  const before = walletQuantity(await walletRead(provider, 'eth_getTransactionCount', [owner, 'latest']))
-  const nonce = walletQuantity(await walletRead(provider, 'eth_getTransactionCount', [owner, 'pending']))
-  const latestNonce = walletQuantity(await walletRead(provider, 'eth_getTransactionCount', [owner, 'latest']))
+  await identity(false)
+  const before = walletQuantity(await read('latest-before'))
+  const nonce = walletQuantity(await read('pending'))
+  const latestNonce = walletQuantity(await read('latest-after'))
   if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce), before !== latestNonce ? 'latest-changed' : 'pending-behind-latest')
-  await identity()
+  await identity(true)
   return { nonce, latestNonce }
 }
 // Parameters for SwapKit.swap. batchTransactions is false and the guarded wallet has no EIP-5792 methods: approval and swap are separate
@@ -485,6 +491,7 @@ export const circleGuardPolicy = (review: CircleSwapReview, now: () => number, f
 export const circleStrategy = (request: Pick<CircleSwapRequest, 'tokenIn' | 'allowanceStrategy'>): CircleStrategy => request.allowanceStrategy ?? (request.tokenIn === 'USDC' ? 'permit' : 'approve')
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const guardCode = (error: unknown): string => {
+  if (error instanceof WalletRpcFailure) return 'wallet_nonce'
   if (error instanceof CircleGuardError) return error.code
   const code = error instanceof Error ? error.message : ''
   return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'busy_other', 'smart_wallet', 'expired',
@@ -498,6 +505,7 @@ const deferred = <T>(): Deferred<T> => { let resolve!: (value: T) => void; const
 
 // No preview object, DOM state or localStorage value can be passed to confirm as transaction authority.
 export function createCircleSwapExecution(ports: CirclePorts) {
+  const metrics = ports.performance ?? createCirclePerformance()
   const journal = createCircleJournal(ports.storage, id => unverified.has(id))
   const enabled = ports.enabled ?? (() => CIRCLE_SWAP_WRITES_ENABLED)
   const pause = ports.pause ?? sleep
@@ -517,6 +525,7 @@ export function createCircleSwapExecution(ports: CirclePorts) {
   let stepGate: { step: CircleStepInfo; resolve(): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; selected: Selected } | null = null
   const contextKey = () => { const c = ports.context(); return JSON.stringify([c.owner.toLowerCase(), c.connected, c.chainId, c.connectorId]) }
   function emit(next: CircleView) { view = structuredClone(next); try { ports.changed?.(structuredClone(view)) } catch { /* An observer cannot interrupt recording. */ } }
+  function stage(next: CircleView['stage']) { if (view.phase === 'preparing' || view.phase === 'checking') emit({ ...view, stage: next }) }
   function requireEnabled() {
     if (!enabled()) stop('writes_disabled')
     if (!ports.authorize?.(ports.input(), ports.context())) stop('pilot_restricted')
@@ -540,7 +549,9 @@ export function createCircleSwapExecution(ports: CirclePorts) {
     if (selected.review.expiresAt - ports.now() < 5000) stop('expired')
   }
   function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
+    if (error instanceof WalletRpcFailure) return `${stage} nonce check: ${walletRpcMessage(error)}`
     const code = guardCode(error), message = circleSwapMessage(code)
+    if (code === 'expired') return `${stage}: the 30-second quote expired before the checks finished. Request a fresh review. No wallet transaction was requested.`
     if (!['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(code)) return message
     const detail = error instanceof ExecutionNonceObservationError && error.message === 'wallet_nonce' ? ` The wallet RPC returned inconsistent latest/pending observations (${error.reason === 'latest-changed' ? 'latest changed during the reads' : 'pending was below latest'}).` : ''
     return `${stage} nonce check: ${message}${detail}`
@@ -554,13 +565,27 @@ export function createCircleSwapExecution(ports: CirclePorts) {
     for (let pass = 0; pass < 2; pass++) {
       try {
         still()
-        if (preflight) evaluatePreflight(selected.review, await ports.preflight(structuredClone(selected.review)), feeLeft)
+        if (preflight) {
+          stage('balances')
+          await metrics.measure('preflight', async () => evaluatePreflight(selected.review, await ports.preflight(structuredClone(selected.review)), feeLeft), pass + 1)
+        }
         const owner = selected.review.request.owner
-        const publicState = await ports.publicNonce(owner)
+        still(); stage('wallet')
+        // Each source retains its own ordered, bracketed observations. Drain BOTH reads before retrying or returning an error.
+        const reads = await Promise.allSettled([
+          metrics.measure('public_nonce', () => ports.publicNonce(owner), pass + 1),
+          metrics.measure('wallet_nonce', () => readWalletNonceState(provider, owner), pass + 1),
+        ])
+        for (const read of reads) {
+          if (read.status === 'fulfilled' && isNonce(read.value.nonce)) highestObserved = Math.max(highestObserved, read.value.nonce)
+          else if (read.status === 'rejected' && read.reason instanceof ExecutionNonceObservationError && isNonce(read.reason.highestObserved)) highestObserved = Math.max(highestObserved, read.reason.highestObserved)
+        }
+        if (reads[0].status === 'rejected') throw reads[0].reason
+        if (reads[1].status === 'rejected') throw reads[1].reason
+        const publicState = reads[0].value, walletState = reads[1].value
         if (!isNonce(publicState.nonce) || !isNonce(publicState.latestNonce) || publicState.nonce < publicState.latestNonce) stop('public_nonce')
         highestObserved = Math.max(highestObserved, publicState.nonce)
         still()
-        const walletState = await readWalletNonceState(provider, owner)
         highestObserved = Math.max(highestObserved, walletState.nonce)
         still()
         if (publicState.nonce === walletState.nonce && walletState.nonce < highestObserved) stop('nonce_regression')
@@ -568,7 +593,10 @@ export function createCircleSwapExecution(ports: CirclePorts) {
       } catch (error) {
         const code = error instanceof Error ? error.message : ''
         if (error instanceof ExecutionNonceObservationError && isNonce(error.highestObserved)) highestObserved = Math.max(highestObserved, error.highestObserved)
-        if (pass === 0 && (code === 'nonce_rpc' || error instanceof ExecutionNonceObservationError)) continue
+        if (pass === 0 && (code === 'nonce_rpc' || error instanceof ExecutionNonceObservationError)) {
+          metrics.start('public_nonce', pass + 1)('retry', code === 'nonce_rpc' ? 'nonce_conflict' : 'nonce_observation')
+          continue
+        }
         throw error
       }
     }
@@ -579,6 +607,8 @@ export function createCircleSwapExecution(ports: CirclePorts) {
     busy = true
     const currentVersion = ++version
     intent = null
+    metrics.begin()
+    const endReview = metrics.start('review_preparation')
     try {
       requireEnabled()
       const input = validateCircleRequest(ports.input()), expectedContext = contextKey()
@@ -593,17 +623,17 @@ export function createCircleSwapExecution(ports: CirclePorts) {
       validateCircleReview(fresh, ports.context(), ports.now())
       independentPriceCheck(fresh)
       const selected: Selected = { id: crypto.randomUUID(), review: structuredClone(fresh), nonce: 0, context: expectedContext, version: currentVersion }
-      const provider = await ports.provider()
+      const provider = await metrics.measure('provider', () => ports.provider())
       selected.nonce = await checkedNonce(selected, provider)
       ready(selected)
       intent = selected
       emit({ phase: 'review', approvalId: selected.id, review: selected.review })
-    } catch (error) { if (currentVersion === version) emit({ phase: 'idle', error: failureMessage(error, 'Review') }) }
-    finally { busy = false }
+    } catch (error) { const failure = circleTimingFailure(error); endReview(failure.outcome, failure.reason); if (currentVersion === version) emit({ phase: 'idle', error: failureMessage(error, 'Review') }) }
+    finally { endReview(); busy = false }
   }
 
   // One run of the SDK for one attempt. Everything the SDK asks of the wallet passes through the hooks below.
-  interface Run { attempt: CircleSwapAttempt; selected: Selected; provider: CircleProvider; swapSettled: Deferred<void>; stalled: Deferred<void>; lastCode?: string; walletTimer?: ReturnType<typeof setTimeout>; stallTimer?: ReturnType<typeof setTimeout> }
+  interface Run { attempt: CircleSwapAttempt; selected: Selected; provider: CircleProvider; swapSettled: Deferred<void>; stalled: Deferred<void>; lastCode?: string; closed?: boolean; walletTimer?: ReturnType<typeof setTimeout>; stallTimer?: ReturnType<typeof setTimeout>; endSdk?: ReturnType<CirclePerformance['start']>; endFirst?: ReturnType<CirclePerformance['start']>; stopHttp?: () => void }
   // The SDK cannot be cancelled, so a flow that is waiting for it (the quote service, a receipt) is ended after a while with nothing open:
   // not while the user is at a confirmation or a wallet request is open (those have their own windows). Whatever was already submitted
   // stays recorded and tracked; the guard is sealed, so the SDK can send nothing afterwards.
@@ -622,6 +652,9 @@ export function createCircleSwapExecution(ports: CirclePorts) {
   function hooksFor(run: Run): CircleGuardHooks {
     return {
       gate(step) {
+        if (run.closed) throw new CircleGuardError('sealed', 'This swap preparation has ended.')
+        sameContext(run.selected)
+        run.endSdk?.(); run.endFirst?.(); run.stopHttp?.()
         disarmStall(run)
         return new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => { if (stepGate?.timer === timer) stepGate = null; reject(new CircleGuardError('step_timeout')) }, STEP_CONFIRM_TIMEOUT_MS)
@@ -630,6 +663,9 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         })
       },
       async before(step, { gas, data }): Promise<CircleStepPlan> {
+        const end = metrics.start('step_preparation')
+        emit({ phase: 'checking', stage: 'transaction', attempt: run.attempt, step })
+        try {
         requireEnabled(); sameContext(run.selected)
         const review = run.selected.review, owner = review.request.owner as Hex
         const strategy = circleStrategy(review.request)
@@ -688,7 +724,10 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         }, windowMs)
         disarmStall(run)
         return plan
+        } catch (error) { const failure = circleTimingFailure(error); end(failure.outcome, failure.reason); throw error }
+        finally { end() }
       },
+      signed() { emit({ phase: 'checking', stage: 'sdk', attempt: run.attempt }); armStall(run, CIRCLE_STALL_AFTER_APPROVAL_MS) },
       sent(step, hash) {
         clearWalletTimer(run)
         setStep(run, step.index, { status: 'pending', hash })
@@ -699,6 +738,8 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         if (step.kind === 'swap') run.swapSettled.resolve(); else armStall(run, CIRCLE_STALL_AFTER_APPROVAL_MS)
       },
       failed(step, outcome: CircleStepOutcome, error) {
+        const failure = circleTimingFailure(error)
+        metrics.start('step_preparation')(failure.outcome, outcome === 'rejected' ? 'rejected' : failure.reason)
         // A request refused before it had a step of its own (misclassified, repeated, out of order) touches no record and no open wallet
         // request; it only explains why the SDK stopped.
         if (outcome === 'refused') { if (!run.lastCode) run.lastCode = guardCode(error); return }
@@ -721,21 +762,23 @@ export function createCircleSwapExecution(ports: CirclePorts) {
     if (busy || tracking || !intent || view.phase !== 'review' || approvalId !== intent.id) return
     busy = true
     const selected = intent
+    const endFirst = metrics.start('first_wallet_preparation')
     let run: Run | undefined, journaled = false
     try {
       ready(selected)
-      emit({ phase: 'checking', approvalId, review: selected.review })
+      emit({ phase: 'checking', stage: 'wallet', approvalId, review: selected.review })
       await ports.lock(selected.review.request.owner, async () => {
         ready(selected)
         const found = outstanding(selected.review.request.owner)
         if (found) stop(found === 'elsewhere' ? 'busy_other' : 'busy')
-        const provider = await ports.provider()
+        stage('wallet')
+        const provider = await metrics.measure('provider', () => ports.provider())
         await checkedNonce(selected, provider, { expected: selected.nonce })
         ready(selected)
         const record: CircleSwapAttempt = { id: selected.id, review: structuredClone(selected.review), createdAt: Date.now(), status: 'awaiting_wallet', steps: [] }
         journal.save(record) // The intent is durable BEFORE the SDK or the wallet are touched.
         journaled = true
-        const current: Run = { attempt: record, selected, provider, swapSettled: deferred<void>(), stalled: deferred<void>() }
+        const current: Run = { attempt: record, selected, provider, swapSettled: deferred<void>(), stalled: deferred<void>(), endFirst }
         run = current
         armStall(current, CIRCLE_STALL_BEFORE_STEP_MS)
         intent = null; sending = true
@@ -743,18 +786,30 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         const guarded = createGuardedWalletClient((ports.wallet ?? viemInnerWallet)(provider, selected.review.request.owner as Hex), circleGuardPolicy(selected.review, ports.now, feeBudget), hooksFor(current))
         let finished: 'done' | 'error' = 'done'
         try {
-          const { kit, adapter } = await ports.sdk(guarded)
+          emit({ phase: 'checking', stage: 'sdk', attempt: record })
+          current.endSdk = metrics.start('sdk_preparation')
+          current.stopHttp = observeCircleHttp(metrics)
+          const { kit, adapter } = await Promise.race([
+            Promise.resolve().then(() => ports.sdk(guarded)),
+            current.stalled.promise.then(() => { current.lastCode ??= 'sdk_stalled'; throw new Error('sdk_stalled') }),
+          ])
           // The SDK keeps polling Circle's own status service after the swap is sent. The application does not depend on it: once the swap
           // hash is journaled the chain is the only source, so the wait ends there and the SDK is left to finish (or fail) on its own.
           const sdkRun = Promise.resolve().then(() => kit.swap(buildCircleSwapParams(selected.review, adapter))).then(() => 'done' as const, () => 'error' as const)
           finished = await Promise.race([sdkRun, current.swapSettled.promise.then(() => 'done' as const), current.stalled.promise.then(() => { current.lastCode ??= 'sdk_stalled'; return 'error' as const })])
-        } catch { finished = 'error' } finally { guarded.seal(); disarmStall(current) }
+          if (finished === 'error') {
+            const timeout = current.lastCode === 'sdk_stalled'
+            current.endSdk(timeout ? 'timeout' : 'error', 'sdk'); endFirst(timeout ? 'timeout' : 'error', 'sdk')
+          }
+        } catch (error) { const failure = circleTimingFailure(error); current.endSdk?.(failure.outcome, failure.reason); endFirst(failure.outcome, failure.reason); finished = 'error' }
+        finally { current.closed = true; current.endSdk?.(); current.stopHttp?.(); guarded.seal(); disarmStall(current) }
         clearWalletTimer(current)
         sending = false
         finalizeUnsent(current, finished)
       })
     } catch (error) {
       intent = null
+      const failure = circleTimingFailure(error); endFirst(failure.outcome, failure.reason)
       sending = false
       if (!journaled) emit({ phase: 'idle', error: failureMessage(error, 'Confirm') })
       else if (run) finalizeUnsent(run, 'error', guardCode(error))
@@ -950,7 +1005,7 @@ export function createCircleSwapExecution(ports: CirclePorts) {
     cancelStep()
     if (!sending && !['pending', 'unknown', 'confirmed', 'failed', 'rejected', 'mismatch', 'awaiting_step', 'awaiting_wallet'].includes(view.phase)) emit({ phase: 'idle' })
   }
-  return { prepare, confirm, continueStep, cancelStep, reconcile, invalidate, hidden, stepKey, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view),
+  return { prepare, confirm, continueStep, cancelStep, reconcile, invalidate, hidden, stepKey, timings: () => metrics.snapshot(), history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view),
     // True while a record of this wallet is unresolved or could not be re-verified in this session. Unreadable storage counts as blocking.
     blocking: (owner: string) => { try { return journal.read(owner).some(blocking) } catch { return true } } }
 }
@@ -1003,7 +1058,7 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
       if (![before, nonce, latestNonce].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('public_nonce')
       if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('public', Math.max(before, nonce, latestNonce))
       return { nonce, latestNonce }
-    } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new Error('public_nonce') }
+    } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new CirclePublicNonceFailure(circleTimingFailure(error).outcome === 'timeout' ? 'timeout' : 'rpc-error') }
   }
   async function estimateGas(tx: { from: Hex; to: Hex; data: Hex; value: bigint }) {
     return rpc.estimateGas({ account: tx.from, to: tx.to, data: tx.data, value: tx.value })
