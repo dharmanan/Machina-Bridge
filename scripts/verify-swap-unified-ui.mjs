@@ -259,6 +259,7 @@ try {
   await test('native USDC to cirBTC: Review shows the route and limits, the wallet receives exactly the reviewed transaction, and the result reads Swap completed with real amounts', async () => {
     await pick('USDC', 'cirBTC'); await amount.fill('1'); await quoted()
     const before = await sends(); await review.click(); await page.getByRole('dialog').waitFor()
+    assert.equal(await page.getByRole('button', { name: '↻ Refresh quotes', exact: true }).isDisabled(), true)
     const dialog = page.getByRole('dialog'); await dialog.getByText('USDC → cirBTC (0.01%)', { exact: true }).waitFor(); await dialog.getByText('Most USDC you could spend', { exact: true }).waitFor(); await dialog.getByText('Minimum you receive', { exact: true }).waitFor(); await dialog.getByText('Network fee (maximum)', { exact: true }).waitFor()
     await dialog.getByText(/no fee is taken by anyone else/).waitFor(); assert.equal(await dialog.getByText('Fee to another address').count(), 0); assert.doesNotMatch(await dialog.innerText(), /calldata|TAKE_PORTION|SWEEP|V4_SWAP|Universal Router|Permit2/i) // the plain Review shows every fee and the minimum, no jargon; assert.equal(await sends(), before)
     await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()

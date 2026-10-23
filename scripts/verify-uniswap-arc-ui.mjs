@@ -144,6 +144,7 @@ try {
   await page.clock.install()
   await page.clock.pauseAt(new Date(Date.now() + 1000))
   const amount = page.getByRole('textbox', { name: 'Swap amount' })
+  const refresh = page.getByRole('button', { name: '↻ Refresh quotes', exact: true })
   const setSlippage = async value => {
     const field = page.getByRole('combobox', { name: 'Slippage tolerance', includeHidden: true })
     const details = page.locator('details').filter({ has: field }).first()
@@ -161,9 +162,10 @@ try {
     mode = 'normal'; await page.getByRole('combobox', { name: 'To token' }).selectOption(symbol)
     await change(); await page.getByText(/Estimate only\./).waitFor()
   }
-  await test('single Swap screen removes manual quote buttons and keeps default pilot disabled', async () => {
+  await test('single Swap screen offers one shared refresh button and keeps default pilot disabled', async () => {
     await page.getByRole('heading', { name: 'Swap', exact: true }).waitFor()
     assert.equal(await page.getByRole('button', { name: /^(Get|Refresh) quote$/ }).count(), 0)
+    assert.equal(await refresh.count(), 1); assert.equal(await refresh.isDisabled(), true)
     assert.equal(await page.getByRole('button', { name: 'Review Swap', exact: true }).isDisabled(), true)
   })
   await test('disconnected, wrong-chain and invalid input never start automatic API calls', async () => {
@@ -172,6 +174,7 @@ try {
     await amount.fill(''); await page.evaluate(() => window.uniswapUiTest.chain(5042))
     for (const value of ['0', '11', '1e6', '1.0000001', '-1']) { await amount.fill(value); await advance() }
     assert.equal(apiCalls, 0)
+    assert.equal(await refresh.isDisabled(), true)
   })
   await test('rapid typing debounces for 700ms and only the last amount is queried', async () => {
     const circleBefore = circleCalls
@@ -187,6 +190,25 @@ try {
     assert.equal(requests.at(-1).headers['x-api-key'], undefined)
     const ttl = await page.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
     assert.ok(parseInt(ttl) > 0 && parseInt(ttl) <= 30)
+  })
+  await test('shared refresh requests both providers once through existing pacing, preserving amount, tokens, slippage and provider', async () => {
+    for (const provider of ['Uniswap quote', 'Circle Swap Kit quote']) {
+      await page.getByRole('radio', { name: provider, exact: true }).click()
+      const before = { api: apiCalls, circle: circleCalls, amount: await amount.inputValue(),
+        from: await page.getByRole('combobox', { name: 'From token' }).inputValue(), to: await page.getByRole('combobox', { name: 'To token' }).inputValue(),
+        slippage: await page.getByRole('combobox', { name: 'Slippage tolerance', includeHidden: true }).inputValue() }
+      await refresh.click(); await refresh.click(); await noReceive()
+      assert.equal(await page.getByRole('button', { name: 'Review Swap', exact: true }).isDisabled(), true)
+      await advance(600); assert.equal(apiCalls, before.api); assert.equal(circleCalls, before.circle)
+      await advance(); await page.getByText(/Estimate only\./).waitFor()
+      assert.equal(apiCalls, before.api + 1); assert.equal(circleCalls, before.circle + 1)
+      assert.equal(await amount.inputValue(), before.amount)
+      assert.equal(await page.getByRole('combobox', { name: 'From token' }).inputValue(), before.from)
+      assert.equal(await page.getByRole('combobox', { name: 'To token' }).inputValue(), before.to)
+      assert.equal(await page.getByRole('combobox', { name: 'Slippage tolerance', includeHidden: true }).inputValue(), before.slippage)
+      assert.equal(await page.getByRole('radio', { name: provider, exact: true }).isChecked(), true)
+    }
+    await page.getByRole('radio', { name: 'Uniswap quote', exact: true }).click()
   })
   await test('slippage changes automatically fetch the selected quote; Uniswap slippage values Circle does not offer are said so, never replaced', async () => {
     await setSlippage('100'); await noReceive(); await advance()
@@ -221,11 +243,13 @@ try {
     await page.clock.setSystemTime(new Date())
   })
   await test('expired automatic quotes disappear without polling or automatic resubmission', async () => {
-    await success(); const before = apiCalls; await advance(31000); await noReceive()
+    await success(); const before = apiCalls, circleBefore = circleCalls; await advance(31000); await noReceive()
     assert.equal(apiCalls, before); await page.getByText(/Quote expired. Check the price again/).first().waitFor()
     await advance(60000); assert.equal(apiCalls, before)
-    await page.getByRole('button', { name: 'Check price again', exact: true }).click(); await advance()
+    assert.equal(await page.getByRole('button', { name: 'Review Swap', exact: true }).count(), 0)
+    await refresh.click(); await advance()
     await page.getByText(/Estimate only\./).waitFor(); assert.equal(apiCalls, before + 1)
+    assert.equal(circleCalls, circleBefore + 1)
   })
   await test('HTTP 429 and API errors stay bounded and never cause infinite retries', async () => {
     for (const [value, text] of [['rate', 'Too many preview requests'], ['error', 'The server could not verify a current quote'], ['origin', 'This site address is not allowed'], ['public-disabled', 'Public Uniswap previews are disabled']]) {

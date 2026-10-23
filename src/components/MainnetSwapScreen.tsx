@@ -157,6 +157,14 @@ export default function MainnetSwapScreen() {
   const quoteKey = JSON.stringify([address, isConnected, chainId, tokenIn, tokenOut, amount, slippageBps])
   useSwapAutoQuote(`${quoteKey}:uniswap:${selectionEpoch.uniswap}`, Boolean(uniswap.request) && uniswapOffers && !executionBusy, uniswap.load, uniswap.cancel)
   useSwapAutoQuote(`${quoteKey}:circle:${selectionEpoch.circle}`, Boolean(circle.request && circle.validAmount && !circle.insufficientBalance) && circleOffers && !executionBusy, circle.load, circle.cancel)
+  const canRefreshQuotes = walletReady && !executionBusy && !uniswap.loading && !circle.loading &&
+    ((Boolean(uniswap.request) && uniswapOffers) || (Boolean(circle.request && circle.validAmount && !circle.insufficientBalance) && circleOffers))
+  function refreshQuotes() {
+    if (!canRefreshQuotes || document.hidden) return
+    // Invalidate both prices immediately; the existing debounce and pacing still schedule every request.
+    uniswap.cancel(); circle.cancel()
+    setSelectionEpoch(epoch => ({ uniswap: epoch.uniswap + 1, circle: epoch.circle + 1 }))
+  }
 
   function selectToken(side: 'in' | 'out', token: MainnetSwapToken) {
     // Any token can be paired with any other supported token; choosing the other side's token exchanges the two sides.
@@ -272,6 +280,9 @@ export default function MainnetSwapScreen() {
 
         <fieldset className="space-y-2 pt-2">
           <legend className="text-sm font-medium text-slate-600">Choose your price <span className="text-xs font-normal text-slate-400">· before network fees</span></legend>
+          <div className="flex justify-end">
+            <button type="button" onClick={refreshQuotes} disabled={!canRefreshQuotes} className="text-sm font-medium text-slate-600 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50">↻ Refresh quotes</button>
+          </div>
           <div role="radiogroup" aria-label="Quote source" className="grid gap-2 sm:grid-cols-2">
             {(['uniswap', 'circle'] as Provider[]).map(id => <ProviderCard key={id} id={id} quote={quotes[id]} selected={provider === id} best={best === id} tokenOut={tokenOut} onSelect={() => choose(id)}
               quotesOnly={(() => { const entry = supportFor(id, tokenIn, tokenOut); return entry ? !executionInBuild(entry, SWAP_EXECUTION, CIRCLE_SWAP_WRITES_ENABLED).available : true })()}
