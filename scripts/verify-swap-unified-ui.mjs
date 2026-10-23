@@ -63,6 +63,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_UI_POLISH_ONLY === '1' && !/^(the mode chip|compact provider cards|existing excessive token allowances)/.test(name)) return
   if (process.env.MACHINA_ALLOWANCE_ONLY === '1' && !/^(the mode chip|existing excessive token allowances)/.test(name)) return
   try { await fn(); count++; console.log(`PASS ${name}`) }
   catch (error) { console.error('Diagnostics:', (await page.locator('body').innerText()).slice(0, 1800), '\nRPC errors:', world.errors.slice(-6), '\nRecent reads:', world.reads.slice(-4).map(r => r.method)); throw error }
@@ -184,6 +185,36 @@ try {
     assert.equal(await page.getByLabel('Swap activity', { exact: true }).evaluate(node => node.open), false)
     assert.equal(await page.getByLabel('Swap details', { exact: true }).evaluate(node => node.open), false)
     assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0)
+  })
+
+  await test('compact provider cards hide empty fee rows, disclose quoted costs on demand, and fit desktop and mobile without wallet requests', async () => {
+    const before = await sends(), signs = await page.evaluate(() => window.swapUiTest.state.signs.length)
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 900 }); await pick('USDC', 'EURC'); await amount.fill('')
+      await page.waitForTimeout(100)
+      assert.equal(await page.getByText('Minimum receive', { exact: true }).count(), 0)
+      assert.equal(await page.getByText('Remaining wallet steps', { exact: true }).count(), 0)
+      assert.equal(await page.getByText('Network fee cap · all steps', { exact: true }).count(), 0)
+      assert.equal(await page.getByLabel('Fees and wallet steps', { exact: true }).count(), 0)
+      for (const card of [uniCard, circleCard]) {
+        assert.ok(['auto', '0px'].includes(await card.evaluate(node => getComputedStyle(node).minHeight)))
+        assert.ok((await card.boundingBox()).height < 150, 'empty provider card is compact')
+      }
+      await amount.fill('1'); await quoted()
+      await page.getByText('Minimum receive', { exact: true }).waitFor()
+      await page.getByText('Network fee estimate · remaining', { exact: true }).waitFor()
+      const details = page.getByLabel('Fees and wallet steps', { exact: true })
+      assert.equal(await details.getByText('Remaining wallet steps', { exact: true }).isVisible(), false)
+      await details.locator(':scope > summary').click()
+      await details.getByText('Remaining wallet steps', { exact: true }).waitFor()
+      await details.getByText('Network fee cap · all steps', { exact: true }).waitFor()
+      await details.locator(':scope > summary').click()
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false)
+      for (const card of [uniCard, circleCard]) assert.ok((await card.boundingBox()).height < 180, 'quoted provider card has no artificial height')
+      await shot(`compact-quotes-${width}`)
+    }
+    assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
+    await page.setViewportSize({ width: 1280, height: 900 })
   })
 
   await test('existing excessive token allowances are visible on the Swap screen and in fresh Review for EURC, WETH and cirBTC, without any extra wallet request', async () => {

@@ -320,17 +320,24 @@ export default function MainnetSwapScreen() {
           </label>
         </details>
 
-        <dl className="space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
-          <SummaryLine label="Minimum receive" value={summary ? `${shortenAmount(summary.minimum ?? '0')} ${tokenOut}` : '—'} title={summary ? `${summary.minimum} ${tokenOut}` : undefined} />
-          <SummaryLine label="Remaining wallet steps" value={summary?.steps ?? '—'} />
-          <SummaryLine label="Network fee estimate · remaining" value={summary?.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : summary ? 'Not yet estimated for every remaining step' : '—'} />
-          {tokenOut === 'USDC' && <SummaryLine label="Net estimate after network fee" value={summary?.estimatedUnits !== undefined && summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.estimatedUnits * 10n ** 12n - summary.gasEstimate, 18)} USDC` : summary ? 'Unavailable until all remaining network costs are verified' : '—'} />}
-          <SummaryLine label="Network fee cap · all steps" value={summary ? `≤ ${summary.fee}` : '—'} />
-          <SummaryLine label={provider === 'circle' ? 'Circle fees' : 'Trading fees'} value={summary?.otherFees ?? '—'} />
-          <SummaryLine label="Quote expires in" value={summary ? `${summary.expiresIn} seconds` : '—'} />
-        </dl>
+        {summary && <div className="space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
+          <dl className="space-y-2">
+            <SummaryLine label="Minimum receive" value={`${shortenAmount(summary.minimum ?? '0')} ${tokenOut}`} title={`${summary.minimum} ${tokenOut}`} />
+            <SummaryLine label="Network fee estimate · remaining" value={summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : 'Not available yet'} />
+          </dl>
+          <details aria-label="Fees and wallet steps" className="text-xs text-slate-500">
+            <summary className="cursor-pointer">Fees & wallet steps</summary>
+            <dl className="mt-2 space-y-2">
+              <SummaryLine label="Remaining wallet steps" value={summary.steps ?? '—'} />
+              {tokenOut === 'USDC' && <SummaryLine label="Net estimate after network fee" value={summary.estimatedUnits !== undefined && summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.estimatedUnits * 10n ** 12n - summary.gasEstimate, 18)} USDC` : 'Unavailable until all remaining network costs are verified'} />}
+              <SummaryLine label="Network fee cap · all steps" value={`≤ ${summary.fee}`} />
+              <SummaryLine label={provider === 'circle' ? 'Circle fees' : 'Trading fees'} value={summary.otherFees ?? '—'} />
+              <SummaryLine label="Quote expires in" value={`${summary.expiresIn} seconds`} />
+            </dl>
+          </details>
+        </div>}
 
-        <div className="min-h-[2.5rem] space-y-1">
+        <div className="space-y-1 empty:hidden">
           {!isConnected && <p role="status" className="text-sm text-slate-600">Connect your wallet using the header to get a quote. Nothing is signed.</p>}
           {isConnected && chainId !== 5042 && <p role="status" className="text-sm text-amber-700">Switch your wallet to Arc Mainnet to get a quote.</p>}
           {walletReady && uniswap.invalidAmount && <p role="status" className="text-sm text-slate-600">Enter a positive amount of at most {formatUnits(ARC_INPUT_CAPS[tokenIn], inDecimals)} {tokenIn} with at most {inDecimals} decimal places.</p>}
@@ -338,17 +345,14 @@ export default function MainnetSwapScreen() {
           {selected.state === 'error' && <p role="alert" className="break-words text-sm text-red-700">{selected.message}</p>}
           {loading && <p role="status" className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" aria-hidden="true" />Updating price…</p>}
         </div>
-        <div aria-live="polite" aria-atomic="true" className="min-h-[2rem]">
-          {summary ? <p role="status" className="text-xs text-slate-500">Estimate only. Final amounts and fee limits are checked again before confirmation.</p>
-            : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : 'Enter an amount to see a price.'}</p>}
-        </div>
+        {summary && <p role="status" aria-live="polite" aria-atomic="true" className="text-xs text-slate-500">Estimate only. Final amounts and fee limits are checked again before confirmation.</p>}
 
         {provider === 'uniswap' && approvals.allowanceNotice && <p role="note" aria-label="Existing Permit2 token allowance" className="break-words rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">{approvals.allowanceNotice}</p>}
         <ApprovalsPanel dialogOnly approvals={approvals} request={provider === 'uniswap' && uniswapAllowed ? uniswap.request : null} />
         <div className="space-y-2">
           <button id="review-swap" type="button" onClick={continueSwap} disabled={!canContinue}
             className="w-full rounded-xl bg-[#2F6E0C] px-5 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">{primaryLabel}</button>
-          <div className="min-h-[1.25rem]">
+          <div className="space-y-1 empty:hidden">
             {reviewBlocked && <p role="status" className="text-xs text-slate-600">{reviewBlocked}</p>}
             {!reviewBlocked && retried === formKey && <p role="status" className="text-xs text-slate-600">The same swap is set up again. Review it to continue; nothing was sent.</p>}
             {/* A message about a transaction is shown once, inside that transaction's card; only Review-stage messages appear here. */}
@@ -405,16 +409,15 @@ export default function MainnetSwapScreen() {
 
 function ProviderCard({ id, quote, selected, best, tokenOut, onSelect, onlyOne, quotesOnly }: { id: Provider; quote: ProviderQuote; selected: boolean; best: boolean; tokenOut: string; onSelect(): void; onlyOne: boolean; quotesOnly: boolean }) {
   return <button type="button" role="radio" aria-checked={selected} aria-label={`${PROVIDER_NAME[id]} quote`} onClick={onSelect}
-    className={`min-h-[12rem] w-full rounded-2xl border p-3 text-left text-sm transition-colors ${selected ? 'border-[#2F6E0C] bg-[#f4faef]' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
+    className={`flex min-w-0 w-full flex-col items-stretch rounded-2xl border p-3 text-left text-sm transition-colors ${selected ? 'border-[#2F6E0C] bg-[#f4faef]' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
     <span className="flex items-center justify-between gap-2">
       <span className="font-semibold text-slate-900">{id === 'circle' ? 'Circle' : 'Uniswap'}</span>
-      <span className="flex flex-wrap items-center justify-end gap-1 text-xs">{best && <span className="rounded-full bg-[#2F6E0C] px-2 py-0.5 font-medium text-white">Higher output · before gas</span>}{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span aria-hidden="true" className="text-[#2F6E0C]">✓</span>}</span>
+      <span className="flex flex-wrap items-center justify-end gap-1 text-xs">{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span aria-hidden="true" className="text-[#2F6E0C]">✓</span>}</span>
     </span>
     {quote.state === 'quoted' && <span className="mt-1 block space-y-0.5">
       <span className="block text-base font-semibold text-slate-900" title={`${quote.estimated} ${tokenOut}`}>{shortenAmount(quote.estimated ?? '0')} {tokenOut}</span>
-      <span className="block text-xs text-slate-500">{quote.steps}</span>
-      <span className="block text-xs text-slate-500">Network estimate: {quote.gasEstimate !== undefined && quote.gasEstimate !== null ? `${formatUnits(quote.gasEstimate, 18)} USDC` : 'all steps not yet estimated'}</span>
       <span className="block text-xs text-slate-600">Minimum {shortenAmount(quote.minimum ?? '0')} {tokenOut}{onlyOne ? ' · only available quote' : ''}</span>
+      {best && <span className="inline-block rounded-full bg-[#2F6E0C] px-2 py-0.5 text-xs font-medium text-white">Higher output · before gas</span>}
     </span>}
     {quote.state === 'loading' && <span className="mt-1 flex items-center gap-2 text-xs text-slate-500"><Loader2 size={12} className="animate-spin" aria-hidden="true" />Updating price…</span>}
     {quote.state === 'idle' && <span className="mt-1 block text-xs text-slate-500">Enter an amount to see this provider’s price.</span>}

@@ -188,7 +188,9 @@ try {
     await success(); assert.equal(await receiveText(), '0.890112')
     for (const text of ['0.885661 EURC', '≤ 0.00026 USDC']) assert.ok(await page.getByText(text, { exact: true }).count(), text)
     assert.equal(requests.at(-1).headers['x-api-key'], undefined)
-    const ttl = await page.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
+    const feeDetails = page.getByLabel('Fees and wallet steps', { exact: true }); await feeDetails.locator(':scope > summary').click()
+    const ttl = await feeDetails.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
+    await feeDetails.locator(':scope > summary').click()
     assert.ok(parseInt(ttl) > 0 && parseInt(ttl) <= 30)
   })
   await test('unit price toggles both directions from the current provider quote without edits, requests or wallet actions', async () => {
@@ -258,7 +260,9 @@ try {
     for (const skew of [-60000, 60000, -3600000, 3600000]) {
       await page.clock.setSystemTime(new Date(Date.now() + skew)); await success()
       assert.equal(await receiveText(), '0.890112')
-      const ttl = await page.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
+      const feeDetails = page.getByLabel('Fees and wallet steps', { exact: true }); await feeDetails.locator(':scope > summary').click()
+    const ttl = await feeDetails.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
+    await feeDetails.locator(':scope > summary').click()
       assert.ok(parseInt(ttl) > 0 && parseInt(ttl) <= 30)
     }
     await page.clock.setSystemTime(new Date())
