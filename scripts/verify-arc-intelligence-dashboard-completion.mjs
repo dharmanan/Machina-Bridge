@@ -61,10 +61,10 @@ function emptyMetrics(name) {
     spec.amounts?.includes(field) ? '0' : spec.constants?.includes(field) ? constants[field]
       : spec.tallies?.[field] ? {} : spec.lists?.[field] ? [] : 0]));
 }
-function hourResult(i, { unknown = false, mismatchedDecimals = false } = {}) {
+function hourResult(i, { unknown = false, mismatchedDecimals = false, blockSpan = 100 } = {}) {
   const hourStart = BASE + i * HOUR;
-  const firstBlock = 1000 + i * 100;
-  const lastBlock = firstBlock + 99;
+  const firstBlock = 1000 + i * blockSpan;
+  const lastBlock = firstBlock + blockSpan - 1;
   const families = Object.fromEntries(Object.keys(FAMILY_FIELDS).map((name) => [name, { status: 'available', ...emptyMetrics(name) }]));
   Object.assign(families.uniswapV3, { swapCount: 3, poolsWithSwaps: 1 });
   Object.assign(families.uniswapV4, { swapCount: 3, poolsWithSwaps: 1 });
@@ -83,14 +83,14 @@ function hourResult(i, { unknown = false, mismatchedDecimals = false } = {}) {
     token0OutRaw: '0', token1InRaw: v3 ? '3000000' : '0', token1OutRaw: '0', addCount: 0, removeCount: 0, pokeCount: 0,
     addAmount0Raw: v3 ? '0' : null, addAmount1Raw: v3 ? '0' : null, removeAmount0Raw: v3 ? '0' : null, removeAmount1Raw: v3 ? '0' : null });
   const pricePath = (pool, sqrt, reserve0, reserve1) => ({ pool, swapCount: 3, firstSwapBlock: firstBlock, lastSwapBlock: lastBlock,
-    pricedBlocks: 100, closeSqrtPriceX96: sqrt.toString(), closeLiquidity: '1', sqrtPriceBlockSum: (sqrt * 100n).toString(),
-    reserve0BlockSum: (reserve0 * 100n).toString(), reserve1BlockSum: (reserve1 * 100n).toString() });
+    pricedBlocks: blockSpan, closeSqrtPriceX96: sqrt.toString(), closeLiquidity: '1', sqrtPriceBlockSum: (sqrt * BigInt(blockSpan)).toString(),
+    reserve0BlockSum: (reserve0 * BigInt(blockSpan)).toString(), reserve1BlockSum: (reserve1 * BigInt(blockSpan)).toString() });
   return { definitionVersion: COMPACT_DEFINITION_VERSION, chainId: ARC_CHAIN_ID,
     range: { kind: 'hour', hourStart, hourEnd: hourStart + HOUR, startUtc: iso(hourStart), endUtc: iso(hourStart + HOUR),
       firstBlock, lastBlock, parentHash: hash(firstBlock - 1), firstHash: hash(firstBlock), lastHash: hash(lastBlock),
       firstTimestamp: hourStart, lastTimestamp: hourStart + HOUR - 1 },
-    network: { status: 'available', blockCount: 100, transactionCount: 10, uniqueSenders: 1, uniqueRecipients: 1,
-      uniqueActiveAddresses: 1, gasUsedRaw: '1000', averageTransactionsPerBlock: 0.1, transactionsPerSecond: 10 / HOUR,
+    network: { status: 'available', blockCount: blockSpan, transactionCount: 10, uniqueSenders: 1, uniqueRecipients: 1,
+      uniqueActiveAddresses: 1, gasUsedRaw: '1000', averageTransactionsPerBlock: 10 / blockSpan, transactionsPerSecond: 10 / HOUR,
       internal: { deploymentAttempts: 0 } }, activeAddresses: [address(9)], complete: true, families,
     registry: { uniswapV3: { through: lastBlock, throughHash: hash(lastBlock), created: [] } },
     projections: {
@@ -549,6 +549,138 @@ try {
     };
     return { ...data, requests, provider: { request, batch: async (calls) => Promise.all(calls.map(([method, params]) => request(method, params))) } };
   }
+  function gatewayCapacityFixture(name, { blockSpan = 600, fault = null } = {}) {
+    const data = fixture(name, 1, { blockSpan });
+    data.db.prepare("UPDATE compact_family_hours SET status='unavailable',reason='gateway_unexpected_token',metrics_json=NULL,metrics_sha256=NULL WHERE family='gateway'").run();
+    const first = 1000, last = first + blockSpan - 1;
+    const stats = { calls: 0, logRequests: 0, headerReads: 0, maxBatch: 0, boundaryReads: 0, codeReads: 0, commits: 0 };
+    const reads = new Map();
+    const eventOf = (number, index = 0) => ({ address: CIRCLE_ARC.gatewayWallet, blockNumber: `0x${number.toString(16)}`, blockHash: hash(number),
+      transactionHash: hash(9001), transactionIndex: '0x0', logIndex: `0x${index.toString(16)}`, removed: false,
+      ...encodeEventLog(GATEWAY_EVENTS.deposited, { token: GATEWAY_ASSETS[(number - first) % 3].address,
+        depositor: address(42), sender: address(43), value: 1n }) });
+    const request = async (method, params) => {
+      stats.calls++;
+      if (method === 'eth_getCode') { stats.codeReads++; return '0x6001'; }
+      if (method === 'eth_getLogs') {
+        const page = stats.logRequests++;
+        const from = Number(BigInt(params[0].fromBlock)), to = Number(BigInt(params[0].toBlock));
+        assert.ok(to - from + 1 <= GATEWAY_REPAIR_LIMITS.logRangeBlocks);
+        if (fault === 'logBudget') return to > from ? Array(GATEWAY_REPAIR_LIMITS.logsPerResponse).fill({}) : [];
+        if (fault === 'eventBudget' && to > from) return Array(GATEWAY_REPAIR_LIMITS.logsPerResponse).fill({});
+        if (fault === 'eventBudget') return Array.from({ length: 700 }, (_, i) => eventOf(from, i));
+        if (fault === 'callBudget') return Array.from({ length: 600 }, (_, i) => eventOf(first + i, page));
+        const logs = Array.from({ length: to - from + 1 }, (_, i) => eventOf(from + i));
+        if (from > first && fault === 'duplicate') logs.push(eventOf(first + 1));
+        if (from > first && fault === 'reReadFork') logs.push({ ...eventOf(first + 1, 1), blockHash: hash(999998) });
+        if (from > first && fault === 'reReadTransactions') logs.push({ ...eventOf(first + 1, 1), transactionHash: hash(999997) });
+        const late = logs.find(log => Number(BigInt(log.blockNumber)) === last - 1);
+        if (late) {
+          if (fault === 'hash') late.blockHash = hash(999999);
+          if (fault === 'transaction') late.transactionHash = hash(999999);
+          if (fault === 'emitter') late.address = CIRCLE_ARC.gatewayMinter;
+          if (fault === 'event') late.data = '0x';
+        }
+        return logs.reverse(); // Order-independent grouping must not lose or duplicate events.
+      }
+      assert.equal(method, 'eth_getBlockByNumber'); assert.equal(params[1], false);
+      const number = Number(BigInt(params[0]));
+      const count = (reads.get(number) ?? 0) + 1; reads.set(number, count);
+      if (number === first - 1) stats.boundaryReads++;
+      if (number >= first && number <= last) stats.headerReads++;
+      if (fault === 'provider' && number === last - 1) throw new ProviderError('rpc_error');
+      return { number: params[0], hash: fault === 'reReadFork' && number === first + 1 && count > 1 ? hash(999998)
+        : fault === 'boundary' && number === last && stats.boundaryReads > 1 ? hash(999999) : hash(number), parentHash: hash(number - 1),
+        timestamp: `0x${(number === first - 1 ? BASE - 1 : number === last + 1 ? BASE + HOUR
+          : BASE + Math.floor((number - first) * 3599 / (blockSpan - 1))).toString(16)}`,
+        transactions: Array.from({ length: 128 }, (_, i) => fault === 'reReadTransactions' && number === first + 1 && count > 1 && i === 0
+          ? hash(999997) : hash(9001 + i)) };
+    };
+    const provider = { request, batch: async calls => {
+      stats.maxBatch = Math.max(stats.maxBatch, calls.length);
+      assert.ok(calls.length <= GATEWAY_REPAIR_LIMITS.headerBatchSize);
+      return Promise.all(calls.map(([method, params]) => request(method, params)));
+    } };
+    const store = { ...data.store, commitGatewayRepair(input, metrics) {
+      assert.equal(stats.boundaryReads, 2, 'all boundary checks precede the first write');
+      assert.equal(stats.codeReads, 2); assert.ok(stats.headerReads >= blockSpan);
+      stats.commits++;
+      return data.store.commitGatewayRepair(input, metrics);
+    } };
+    return { ...data, store, provider, stats };
+  }
+
+  await test('Gateway repair capacity: 600 event blocks exceed old limits while retaining at most 16 headers', async () => {
+    const data = gatewayCapacityFixture('gateway-capacity-success');
+    const before = gatewayUnchangedFacts(data.db);
+    try {
+      const result = await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE });
+      assert.equal(result.outcome, 'upgraded'); assert.equal(result.validatedEvents, 600);
+      assert.equal(result.peakHeaderBlocks, 16); assert.equal(data.stats.maxBatch, 16);
+      assert.ok(result.calls > 128 && result.calls <= GATEWAY_REPAIR_LIMITS.calls);
+      assert.equal(data.stats.commits, 1); assert.equal(data.stats.logRequests, 3);
+      const metrics = data.store.familyRows(BASE).find(row => row.family === 'gateway').metrics;
+      for (const asset of GATEWAY_ASSETS) {
+        assert.equal(metrics.tokenMetrics.byToken[asset.address].depositCount, 200);
+        assert.equal(metrics.tokenMetrics.byToken[asset.address].depositAmountRaw, '200');
+      }
+      assert.deepEqual(gatewayUnchangedFacts(data.db), before);
+      const calls = data.stats.calls;
+      assert.equal((await repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE })).outcome, 'unchanged');
+      assert.equal(data.stats.calls, calls);
+    } finally { data.db.close(); }
+  });
+
+  await test('Gateway repair capacity: late hash transaction emitter event provider and boundary failures never write', async () => {
+    for (const fault of ['hash', 'transaction', 'emitter', 'event', 'provider', 'boundary']) {
+      const data = gatewayCapacityFixture(`gateway-capacity-${fault}`, { fault });
+      const before = facts(data.db), other = gatewayUnchangedFacts(data.db);
+      try {
+        await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }));
+        assert.ok(data.stats.headerReads > 500, fault);
+        assert.equal(data.stats.commits, 0); assert.deepEqual(facts(data.db), before);
+        assert.deepEqual(gatewayUnchangedFacts(data.db), other);
+        assert.equal(data.db.prepare("SELECT COUNT(*) AS n FROM compact_meta WHERE key LIKE 'family_repair_evidence:gateway:%'").get().n, 0);
+      } finally { data.db.close(); }
+    }
+  });
+
+  await test('Gateway repair capacity: duplicate keys and fork fingerprints survive header eviction and log pages', async () => {
+    for (const [fault, code] of [['duplicate', 'duplicate_log'], ['reReadFork', 'log_block_hash_mismatch'], ['reReadTransactions', 'gateway_repair_block_changed']]) {
+      const data = gatewayCapacityFixture(`gateway-capacity-${fault}`, { fault });
+      const before = facts(data.db);
+      try {
+        await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }), error => error.code === code);
+        assert.ok(data.stats.logRequests >= 2); assert.equal(data.stats.commits, 0);
+        assert.deepEqual(facts(data.db), before);
+      } finally { data.db.close(); }
+    }
+  });
+
+  await test('Gateway repair capacity: event logical-RPC and adaptive-log budgets stop excessive work without writes', async () => {
+    for (const [fault, code, blockSpan] of [['eventBudget', 'gateway_repair_event_limit', 100],
+      ['callBudget', 'gateway_repair_call_limit', 10000], ['logBudget', 'log_split_exhausted', 10000]]) {
+      const data = gatewayCapacityFixture(`gateway-capacity-${fault}`, { fault, blockSpan });
+      const before = facts(data.db);
+      try {
+        await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }), error => error.code === code);
+        assert.equal(data.stats.commits, 0); assert.deepEqual(facts(data.db), before);
+        assert.ok(data.stats.calls <= GATEWAY_REPAIR_LIMITS.calls);
+        assert.ok(data.stats.logRequests <= GATEWAY_REPAIR_LIMITS.logRequests);
+        assert.ok(data.stats.maxBatch <= GATEWAY_REPAIR_LIMITS.headerBatchSize);
+      } finally { data.db.close(); }
+    }
+  });
+
+  await test('Gateway repair capacity: overlarge hour ranges remain blocked before any RPC', async () => {
+    const data = gatewayCapacityFixture('gateway-capacity-range', { blockSpan: GATEWAY_REPAIR_LIMITS.blocks + 1 });
+    const before = facts(data.db);
+    try {
+      await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }), error => error.code === 'gateway_repair_range_limit');
+      assert.equal(data.stats.calls, 0); assert.equal(data.stats.commits, 0); assert.deepEqual(facts(data.db), before);
+    } finally { data.db.close(); }
+  });
+
   await test('Gateway multi-token all event types preserve USDC and isolate exact EURC/cirBTC units and domains', async () => {
     const accumulator = GATEWAY_FAMILY.create();
     for (const asset of GATEWAY_ASSETS) {
@@ -702,13 +834,13 @@ try {
     } finally { data.db.close(); }
   });
   await test('forks, malformed foreign events and provider limits cannot alter any stored repair evidence', async () => {
-    for (const fault of ['fork', 'malformed', 'rateLimit', 'foreign', 'dense', 'duplicate']) {
+    for (const fault of ['fork', 'malformed', 'rateLimit', 'foreign', 'duplicate']) {
       const data = gatewayFixture(`gateway-${fault}`, { [fault]: true });
       const before = facts(data.db);
       try {
         await assert.rejects(repairStoredGatewayHour({ store: data.store, provider: data.provider, hourStart: BASE }));
         assert.deepEqual(facts(data.db), before);
-        assert.ok(data.requests.length <= (fault === 'dense' ? 70 : 12));
+        assert.ok(data.requests.length <= 12);
       } finally { data.db.close(); }
     }
   });

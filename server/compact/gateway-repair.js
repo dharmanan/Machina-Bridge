@@ -1,5 +1,6 @@
 // One already-verified stored hour, one Gateway stream, no full block spine/transactions, metadata or projections.
 // Log-bearing headers still verify transaction hashes/positions. Stored canonical boundaries are checked twice.
+import { createHash } from 'node:crypto';
 import { GATEWAY_FAMILY, GATEWAY_EVENTS } from './protocols/circle.js';
 import { GATEWAY_ASSETS } from './gateway-metrics.js';
 import { normalizeLog } from '../../api/_lib/arc-intelligence/normalize.js';
@@ -8,7 +9,12 @@ import { headerOf } from './spine.js';
 import { codeIsPresent } from './registry.js';
 
 const hex = (number) => `0x${number.toString(16)}`;
-export const GATEWAY_REPAIR_LIMITS = Object.freeze({ calls: 128, logRequests: 32, eventBlocks: 64, blocks: 10000 });
+const MAX_BLOCKS = 10000, MAX_LOG_REQUESTS = 256;
+export const GATEWAY_REPAIR_LIMITS = Object.freeze({ blocks: MAX_BLOCKS, logRequests: MAX_LOG_REQUESTS,
+  logRangeBlocks: 250, logsPerResponse: 1000, headerBatchSize: 16, events: 65536,
+  // At most one header read per block in an honest range scan, plus log requests, two boundary checks and code reads.
+  // Repeated/unexpected provider work still consumes this hard logical-RPC budget (batch items count individually).
+  calls: MAX_BLOCKS + MAX_LOG_REQUESTS + 8 + 2 });
 
 export async function repairStoredGatewayHour({ store, provider, hourStart, mode = 'repair' }) {
   if (mode !== 'repair' && mode !== 'inspect') throw new LogError('gateway_repair_mode_invalid');
@@ -19,7 +25,10 @@ export async function repairStoredGatewayHour({ store, provider, hourStart, mode
     throw new LogError('gateway_repair_range_limit');
   }
   let calls = 0;
-  const take = (count) => { calls += count; if (calls > GATEWAY_REPAIR_LIMITS.calls) throw new LogError('gateway_repair_call_limit'); };
+  const take = (count) => {
+    if (count > GATEWAY_REPAIR_LIMITS.calls - calls) throw new LogError('gateway_repair_call_limit');
+    calls += count;
+  };
   const bounded = {
     request(method, params) { take(1); return provider.request(method, params); },
     batch(items) { take(items.length); return provider.batch(items); },
@@ -35,10 +44,15 @@ export async function repairStoredGatewayHour({ store, provider, hourStart, mode
     }
   };
   await boundaries();
-  const stream = GATEWAY_FAMILY.streams[0];
+  const stream = { ...GATEWAY_FAMILY.streams[0], maxRange: GATEWAY_REPAIR_LIMITS.logRangeBlocks };
   const accumulator = GATEWAY_FAMILY.create();
-  const seen = new Set(), headers = new Map();
-  for await (const raw of streamLogs(bounded, stream, input.firstBlock, input.lastBlock, { maxRequests: GATEWAY_REPAIR_LIMITS.logRequests })) {
+  const seen = new Set();
+  // Retain only small fingerprints across pages, including the transaction list and header fields. Re-reading an
+  // evicted header may not change forks, timestamps or transaction positions, even if the RPC repeats the same hash.
+  const blockProofs = new Map();
+  let peakHeaderBlocks = 0;
+  for await (const raw of streamLogs(bounded, stream, input.firstBlock, input.lastBlock,
+    { maxRequests: GATEWAY_REPAIR_LIMITS.logRequests, suspectResultCount: GATEWAY_REPAIR_LIMITS.logsPerResponse })) {
     // Evidence extraction verifies only the first unexpected-token candidate, never all log-bearing blocks.
     // It does not derive counters or claim an hour is repaired. Even a dense hour remains a small diagnostic operation.
     let selected = raw;
@@ -54,25 +68,47 @@ export async function repairStoredGatewayHour({ store, provider, hourStart, mode
       const code = await bounded.batch(GATEWAY_FAMILY.codeAddresses.map((address) => ['eth_getCode', [address, hex(input.lastBlock)]]));
       await accumulator.finish({ codePresent: (address) => codeIsPresent(code[GATEWAY_FAMILY.codeAddresses.indexOf(address)]) });
     }
-    const numbers = [...new Set(selected.map((log) => Number(BigInt(log.blockNumber))))];
-    for (const number of numbers) {
+    if (selected.length > GATEWAY_REPAIR_LIMITS.events - seen.size) throw new LogError('gateway_repair_event_limit');
+    const byBlock = new Map();
+    for (const log of selected) {
+      let number;
+      try { number = Number(BigInt(log.blockNumber)); } catch { throw new LogError('malformed_log'); }
       if (!Number.isSafeInteger(number) || number < input.firstBlock || number > input.lastBlock) throw new LogError('log_outside_range');
-      if (headers.has(number)) continue;
-      if (headers.size >= GATEWAY_REPAIR_LIMITS.eventBlocks) throw new LogError('gateway_repair_event_block_limit');
-      const block = await bounded.request('eth_getBlockByNumber', [hex(number), false]);
-      const header = headerOf(block, number);
-      if (header.timestamp < hourStart || header.timestamp >= hourStart + 3600
-        || !Array.isArray(block.transactions) || !block.transactions.every((tx) => /^0x[0-9a-f]{64}$/i.test(tx))) {
-        throw new LogError('gateway_repair_block_invalid', number);
-      }
-      headers.set(number, { ...header, txHashes: block.transactions.map((tx) => tx.toLowerCase()) });
+      if (!byBlock.has(number)) byBlock.set(number, []);
+      byBlock.get(number).push(log);
     }
-    try {
-      accumulator.add(stream.key, validateLogs(selected, stream,
-        { fromBlock: input.firstBlock, toBlock: input.lastBlock, window: headers, seen }));
-    } catch (error) {
-      if (mode === 'inspect' && error.evidence) await boundaries();
-      throw error;
+    const numbers = [...byBlock.keys()].sort((a, b) => a - b);
+    for (let offset = 0; offset < numbers.length; offset += GATEWAY_REPAIR_LIMITS.headerBatchSize) {
+      const group = numbers.slice(offset, offset + GATEWAY_REPAIR_LIMITS.headerBatchSize);
+      const blocks = await bounded.batch(group.map((number) => ['eth_getBlockByNumber', [hex(number), false]]));
+      if (!Array.isArray(blocks) || blocks.length !== group.length) throw new LogError('gateway_repair_block_invalid');
+      const headers = new Map();
+      for (let index = 0; index < group.length; index++) {
+        const number = group[index], block = blocks[index], header = headerOf(block, number);
+        if (header.timestamp < hourStart || header.timestamp >= hourStart + 3600
+          || !Array.isArray(block.transactions) || !block.transactions.every((tx) => /^0x[0-9a-f]{64}$/i.test(tx))) {
+          throw new LogError('gateway_repair_block_invalid', number);
+        }
+        const previous = blockProofs.get(number);
+        if ((number === input.firstBlock && header.hash !== input.firstHash) || (number === input.lastBlock && header.hash !== input.lastHash)
+          || (previous && previous.hash !== header.hash)) throw new LogError('log_block_hash_mismatch', number);
+        const txHashes = block.transactions.map((tx) => tx.toLowerCase());
+        const digest = createHash('sha256').update(JSON.stringify([header.hash, header.parentHash, header.timestamp, txHashes])).digest('hex');
+        if (previous && previous.digest !== digest) throw new LogError('gateway_repair_block_changed', number);
+        blockProofs.set(number, { hash: header.hash, digest });
+        headers.set(number, { ...header, txHashes });
+      }
+      peakHeaderBlocks = Math.max(peakHeaderBlocks, headers.size);
+      try {
+        accumulator.add(stream.key, validateLogs(group.flatMap((number) => byBlock.get(number)), stream,
+          { fromBlock: input.firstBlock, toBlock: input.lastBlock, window: headers, seen }));
+      } catch (error) {
+        if (mode === 'inspect' && error.evidence) await boundaries();
+        throw error;
+      }
+      // Drop transaction arrays and processed logs before the next header batch. Only hashes and duplicate keys survive.
+      headers.clear(); blocks.length = 0;
+      for (const number of group) byBlock.delete(number);
     }
   }
   if (mode === 'inspect') return { outcome: 'no_unexpected_token_candidate_observed', calls, evidence: null,
@@ -81,5 +117,5 @@ export async function repairStoredGatewayHour({ store, provider, hourStart, mode
   const metrics = await accumulator.finish({ codePresent: (address) => codeIsPresent(code[GATEWAY_FAMILY.codeAddresses.indexOf(address)]) });
   await boundaries();
   const outcome = store.commitGatewayRepair(input, metrics);
-  return { outcome, calls, repairedFrom: input.reason };
+  return { outcome, calls, repairedFrom: input.reason, validatedEvents: seen.size, peakHeaderBlocks };
 }
