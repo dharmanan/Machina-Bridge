@@ -9,6 +9,7 @@ import { swapExecutionRestriction } from '../lib/swap/executionMode'
 import { APPROVAL_STORAGE_PREFIX, createUniswapApprovals, listStoredApprovals, type ApprovalAttempt, type ApprovalPlan, type ApprovalView, type StoredApprovals } from '../lib/swap/uniswapApprovals'
 import { createApprovalRpc } from '../lib/swap/uniswapApprovalsRpc'
 import { SWAP_EXECUTION } from '../config/swapExecution'
+import { PlainMessage } from './PlainMessage'
 
 const rpc = createApprovalRpc()
 
@@ -108,8 +109,10 @@ export function useUniswapApprovals(input: ArcRequest | null, blockedBy: (owner:
 }
 export type UniswapApprovals = ReturnType<typeof useUniswapApprovals>
 
-const kindText = (step: { kind: string; token: string }) => step.kind === 'token'
-  ? `Allow Permit2 to use ${step.token} (token approval)` : `Allow the Uniswap Router to use ${step.token} through Permit2 (valid 15 minutes)`
+const kindText = (step: { kind: string; token: string; amount: string }) => {
+  const amount = `${formatUnits(BigInt(step.amount), ARC_TOKENS[step.token as keyof typeof ARC_TOKENS].decimals)} ${step.token}`
+  return step.kind === 'token' ? `Let Uniswap use exactly ${amount}` : `Let the Uniswap router use exactly ${amount} for 15 minutes`
+}
 // Shown only for an ERC-20 input. Says exactly which approvals are missing, for which amount, and what each costs; each one is a
 // separate review and wallet confirmation. Nothing here is unlimited.
 export function ApprovalsPanel({ approvals, request }: { approvals: UniswapApprovals; request: ArcRequest | null }) {
@@ -121,11 +124,11 @@ export function ApprovalsPanel({ approvals, request }: { approvals: UniswapAppro
   return <section aria-label="Token approvals" className="min-h-[3.5rem] space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
     <h2 className="font-semibold text-slate-900">Approvals for {request.tokenIn}</h2>
     {plan.state === 'loading' || plan.state === 'idle' ? <p role="status" className="text-slate-500">Checking your current approvals…</p> : null}
-    {plan.state === 'error' && <p role="status" className="text-amber-800">Your current approvals could not be read from Arc. Nothing was requested; try again.</p>}
+    {plan.state === 'error' && <p role="status" className="text-amber-800">We couldn’t read your current approvals just now. Nothing was requested; please try again.</p>}
     {plan.state === 'blocked' && <p role="status" className="text-amber-800">Your wallet does not hold {amountText}.</p>}
-    {plan.state === 'complete' && <p role="status" className="text-[#2F6E0C]">Approvals for exactly {amountText} are in place. Review Swap is available.</p>}
+    {plan.state === 'complete' && <p role="status" className="text-[#2F6E0C]">Approvals for exactly {amountText} are in place. You can review the swap.</p>}
     {plan.state === 'needed' && !review && <>
-      <p className="text-slate-700">This swap needs {plan.steps.length === 1 ? '1 approval' : `${plan.steps.length} approvals`} for exactly {amountText}, never an unlimited amount. Each approval is its own wallet confirmation and has a small network fee.</p>
+      <p className="text-slate-700">This swap needs {plan.steps.length === 1 ? '1 approval' : `${plan.steps.length} approvals`} for exactly {amountText}, never more. Each one is confirmed separately in your wallet and has a small network fee.</p>
       <ol className="list-decimal space-y-1 pl-5 text-slate-700">{plan.steps.map(step => <li key={step.kind}>{kindText(step)}</li>)}</ol>
       <button type="button" onClick={() => { void approvals.prepare() }} disabled={busy}
         className="w-full rounded-xl border border-[#2F6E0C] px-4 py-2 font-semibold text-[#2F6E0C] disabled:opacity-50">{view.phase === 'preparing' ? 'Preparing approval…' : `Review approval 1 of ${plan.steps.length}`}</button>
@@ -134,11 +137,12 @@ export function ApprovalsPanel({ approvals, request }: { approvals: UniswapAppro
       <p className="font-medium">{kindText(review.step)}</p>
       <dl className="space-y-1">
         <Row label="Amount" value={`${formatUnits(BigInt(review.step.amount), token.decimals)} ${review.step.token} (exact)`} />
-        <Row label="Spender" value={review.step.spender} />
         {review.step.expiration > 0 && <Row label="Valid until" value={`${new Date(review.step.expiration * 1000).toISOString().slice(11, 19)} UTC`} />}
-        <Row label="Network fee ceiling" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
-        <Row label="Review expires in" value={`${Math.ceil(approvals.remainingMs / 1000)} seconds`} />
+        <Row label="Network fee (maximum)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
+        <Row label="This review expires in" value={`${Math.ceil(approvals.remainingMs / 1000)} seconds`} />
       </dl>
+      <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+        <ul className="mt-1 space-y-1 break-all"><li>Contract: {review.transaction.to}</li><li>Allowed spender: {review.step.spender}</li><li>Transaction number (nonce): {review.nonce}</li><li>Gas limit: {review.gas}</li></ul></details>
       <div className="flex gap-3">
         <button type="button" onClick={approvals.cancel} disabled={view.phase !== 'review'} className="flex-1 rounded-xl border border-slate-300 px-4 py-2 disabled:opacity-50">Cancel</button>
         <button type="button" onClick={() => { void approvals.confirm() }} disabled={view.phase !== 'review' || approvals.remainingMs < 5000}
@@ -146,8 +150,8 @@ export function ApprovalsPanel({ approvals, request }: { approvals: UniswapAppro
       </div>
     </div>}
     {['awaiting_wallet', 'pending', 'unknown'].includes(view.phase) && view.attempt && <p role="status" className="text-sky-800">
-      {view.phase === 'awaiting_wallet' ? 'Confirm the approval in your wallet…' : view.phase === 'pending' ? 'Approval submitted — waiting for Arc…' : 'Approval status not yet verified.'}</p>}
-    {view.error && !view.attempt && <p role="alert" className="break-words text-amber-800">{view.error}</p>}
+      {view.phase === 'awaiting_wallet' ? 'Confirm the approval in your wallet…' : view.phase === 'pending' ? 'Verifying approval…' : 'We haven’t confirmed this approval yet. Please don’t approve again until it is settled.'}</p>}
+    {view.error && !view.attempt && <PlainMessage raw={view.error} />}
   </section>
 }
 function Row({ label, value }: { label: string; value: string }) {

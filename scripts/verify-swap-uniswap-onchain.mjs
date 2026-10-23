@@ -401,14 +401,15 @@ await test('the read-only adapter separates reverts from outages, backs off on r
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // Execution mode
-await test('the execution mode defaults to pilot; "open" must be the exact string and never loosens a transaction check', () => {
-  for (const value of [undefined, '', 'OPEN', 'Open', 'true', 'open ', 'pilot', '1']) assert.equal(mode.swapExecutionConfig('true', owner, value).mode, 'pilot', String(value))
-  assert.equal(mode.swapExecutionConfig('true', owner, 'open').mode, 'open'); assert.equal(mode.swapExecutionConfig('true', undefined, undefined).enabled, false)
-  assert.equal(mode.swapExecutionConfig('false', owner, 'open').enabled, false); assert.equal(mode.swapExecutionConfig('TRUE', owner, 'open').enabled, false)
-  assert.equal(mode.swapExecutionConfig('true', other, undefined).enabled, false) // pilot still demands the approved wallet
+await test('the execution mode defaults to the full multi-direction swap; the earlier pilot is selected only by the exact string "pilot", and the execution switch stays the kill switch of both', () => {
+  for (const value of [undefined, '', 'OPEN', 'open', 'PILOT', 'Pilot', 'pilot ', 'true', '1']) assert.equal(mode.swapExecutionConfig('true', owner, value).mode, 'open', String(value))
+  assert.equal(mode.swapExecutionConfig('true', owner, 'pilot').mode, 'pilot'); assert.equal(mode.swapExecutionConfig('true', undefined, undefined).enabled, true) // the build switch alone enables the default mode
+  for (const value of [undefined, 'open', 'pilot']) { assert.equal(mode.swapExecutionConfig('false', owner, value).enabled, false, String(value)); assert.equal(mode.swapExecutionConfig('TRUE', owner, value).enabled, false, String(value)); assert.equal(mode.swapExecutionConfig(undefined, owner, value).enabled, false, String(value)) }
+  assert.equal(mode.swapExecutionConfig('true', other, 'pilot').enabled, false) // the pilot still demands the approved wallet
+  assert.equal(mode.swapExecutionConfig('true', other, undefined).mode, 'open'); assert.equal(mode.swapExecutionConfig('true', p.ARC_ROUTER, undefined).wallet, '') // a router address is never taken as a wallet
 })
 await test('pilot mode lets exactly one request through: the approved wallet, USDC to EURC, at most 0.1 USDC', () => {
-  const config = mode.swapExecutionConfig('true', owner), ctx = { connected: true, owner, chainId: 5042 }
+  const config = mode.swapExecutionConfig('true', owner, 'pilot'), ctx = { connected: true, owner, chainId: 5042 }
   const r = (tokenIn, tokenOut, amount) => p.validateArcRequest(requestFor(tokenIn, tokenOut, { amount }))
   assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '0.1'), ctx), null); assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '0.000001'), ctx), null)
   assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '0.100001'), ctx), 'pilot_amount'); assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '5'), ctx), 'pilot_amount')
@@ -417,7 +418,7 @@ await test('pilot mode lets exactly one request through: the approved wallet, US
   assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '0.1'), { ...ctx, connected: false }), 'wallet'); assert.equal(mode.swapExecutionRestriction(config, r('USDC', 'EURC', '0.1'), { ...ctx, owner: other }), 'wallet')
   const foreign = p.validateArcRequest(requestFor('USDC', 'EURC', { owner: other, recipient: other, amount: '0.1' }))
   assert.equal(mode.swapExecutionRestriction(config, foreign, { ...ctx, owner: other }), 'pilot_wallet')
-  assert.equal(mode.swapExecutionRestriction(mode.swapExecutionConfig('false', owner), r('USDC', 'EURC', '0.1'), ctx), 'disabled')
+  assert.equal(mode.swapExecutionRestriction(mode.swapExecutionConfig('false', owner, 'pilot'), r('USDC', 'EURC', '0.1'), ctx), 'disabled')
   assert.equal(pilot.arcPilotAllows(pilot.arcPilotConfig('true', owner), r('EURC', 'USDC', '1'), ctx), false); assert.equal(pilot.arcPilotAllows(pilot.arcPilotConfig('true', owner), r('USDC', 'cirBTC', '0.1'), ctx), false)
   for (const key of Object.keys(mode)) if (key.endsWith('Message')) assert.ok(mode[key]('pilot_direction').length > 20)
 })

@@ -93,8 +93,11 @@ export const encodeApprove = (spender: string, amount: bigint) => encodeFunction
 // one the controller uses) or an EIP-2612 permit that rides inside the swap transaction.
 export interface CircleSwapIntent {
   owner: Hex; adapter: Hex; inputToken: Hex; outputToken: Hex; amountIn: bigint; minimumOut: bigint; strategy: 'approve' | 'permit'; chainId: number
+  // The provider fee the Review showed, in input-token base units. The fee instructions of the transaction may not take more (a small rounding
+  // allowance aside): a fee that is not in the Review is refused, however small. Without it only the generic share cap applies.
+  maxFeeUnits?: bigint
 }
-export type SwapCheck = { ok: true; call: DecodedAdapterCall; instructions: number } | { ok: false; code: string; detail: string }
+export type SwapCheck = { ok: true; call: DecodedAdapterCall; instructions: number; feeUnits: bigint } | { ok: false; code: string; detail: string }
 const deny = (code: string, detail: string): SwapCheck => ({ ok: false, code, detail })
 const swapTokenAddresses = () => SWAP_SYMBOLS.map(symbol => swapToken(symbol).address as string)
 
@@ -140,6 +143,7 @@ export function checkSwapCalldata(data: unknown, intent: CircleSwapIntent, nowSe
   // instructions may not take a large share.
   if (approved !== intent.amountIn) return deny('approval_sum', 'The instructions do not approve exactly the reviewed amount of the input token.')
   if (fees * 10_000n > intent.amountIn * CIRCLE_MAX_FEE_BPS) return deny('fee_share', 'The fee instructions take a larger share of the input than Circle charges.')
+  if (intent.maxFeeUnits !== undefined && fees > intent.maxFeeUnits + intent.maxFeeUnits / 100n + 1n) return deny('fee_share', 'The transaction takes a larger fee than the fee shown in the Review.')
   if (outputFloor === 0n || outputFloor < intent.minimumOut) return deny('min_output', 'No instruction guarantees the reviewed minimum output.')
   // The adapter sweeps every listed token to its beneficiary after the instructions: always the wallet itself. Multi-hop routes list their
   // intermediate token too, so any of the four swap tokens is acceptable as a residual.
@@ -155,7 +159,7 @@ export function checkSwapCalldata(data: unknown, intent: CircleSwapIntent, nowSe
   const remaining = Number(call.deadline) - nowSeconds
   if (mode === 'send' ? remaining < MIN_DEADLINE_SECONDS : remaining < 0) return deny('deadline_passed', mode === 'send' ? 'The swap deadline has passed or is about to.' : 'The transaction was included after its deadline.')
   if (remaining > MAX_DEADLINE_SECONDS) return deny('deadline_far', 'The swap deadline is further away than the service issues.')
-  return { ok: true, call, instructions: call.instructions.length }
+  return { ok: true, call, instructions: call.instructions.length, feeUnits: fees }
 }
 
 // --- Comparison of an on-chain swap transaction with the Review ----------------------------------------------------------

@@ -1,4 +1,5 @@
-import { erc20Abi, formatUnits, keccak256, type Hex, type PublicClient } from 'viem'
+import { decodeFunctionResult, encodeFunctionData, erc20Abi, formatUnits, keccak256, type Hex, type PublicClient } from 'viem'
+import { SIMULATOR_ABI, SIMULATOR_RUNTIME } from './simulatorCode'
 import { MAINNET_SWAP_QUOTE_TTL_MS, MAINNET_SWAP_SLIPPAGE_BPS } from '../../config/mainnetSwap'
 import {
   ExecutionNonceObservationError, ExecutionVerificationError, MAX_AUTOMATIC_CHECK_FAILURES, PENDING_CHECK_MS, TRANSIENT_CHECK_DELAYS_MS, isIntentVerified, isTransactionHash, reconcileExecutionNonce,
@@ -18,9 +19,11 @@ import { ownerFlows, summarizeIntent, type ChainLog, type ChainReceipt, type Cha
 // wallet, decides what may be sent. The SDK runs unchanged but only ever sees the guarded wallet (circleGuard.ts); every wallet request is
 // journaled BEFORE the wallet is contacted, bound to the Review, and the result is verified from the chain, separately from the Review.
 
-// Source gate: real Circle swaps are closed until a release decision opens them. Production also supplies a mandatory pilot restriction
-// through ports.authorize; a missing authorisation fails closed.
-export const CIRCLE_SWAP_WRITES_ENABLED = false
+// Source gate of Circle execution. It is open: what the real SDK and the real Circle service do was exercised read-only for all 12 directions
+// (fresh service responses pass the calldata policy, the fee instructions equal the quoted provider fee, the exact calldata was simulated
+// against the live adapter), and every wallet request still passes the guarded wallet, the independent price check and the outcome simulation.
+// Execution additionally needs the build's execution switch and mode (ports.authorize); a missing authorisation fails closed.
+export const CIRCLE_SWAP_WRITES_ENABLED = true
 export const CIRCLE_CHAIN_ID = 5042
 export const CIRCLE_EXPLORER = 'https://explorer.arc.io/tx/'
 // Fee ceiling for ALL steps of one attempt (approval plus swap), in 18-decimal native units. Real Circle swaps on Arc cost 0.007-0.048 USDC
@@ -69,6 +72,9 @@ export interface CircleSwapReview {
   fees: { type: string; token: string; amount: string | null }[]   // provider/swap fees from the quote, display only
   requestStartedAt: number; expiresAt: number
   route?: string
+  // An independent price for the same swap (the keyless Uniswap quote), used to refuse a Circle quote that is far below the market.
+  // Required for a fresh Review to be executable (see independentPriceCheck); old stored records do not carry it.
+  reference?: { source: 'uniswap'; estimatedOutput: string }
 }
 export interface CircleContext { owner: string; connected: boolean; chainId: number; connectorId: string }
 export interface CircleProvider { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
@@ -122,6 +128,25 @@ export function validateCircleReview(review: CircleSwapReview, context: Pick<Cir
   if (!Array.isArray(review.fees) || review.fees.length > 16) stop('invalid_request')
   for (const item of review.fees) if (!item || !boundedText(item.type, 24) || !boundedText(item.token, 24) || (item.amount !== null && !boundedText(item.amount, 80))) stop('invalid_request')
   if (review.route !== undefined && !boundedText(review.route, 200)) stop('invalid_request')
+  if (review.reference !== undefined && (review.reference.source !== 'uniswap' || !decimalText(review.reference.estimatedOutput))) stop('invalid_request')
+}
+
+// The quote service decides the guaranteed minimum, so a quote that is wrong but self-consistent would otherwise be accepted. A fresh Review
+// must therefore carry an independent price, and its guaranteed minimum may not be further below that price than the slippage the user chose
+// plus a fixed tolerance for ordinary differences between venues (measured on the live service: well under 1%).
+export const CIRCLE_REFERENCE_TOLERANCE_BPS = 250
+export function independentPriceCheck(review: CircleSwapReview): void {
+  if (!review.reference || review.reference.source !== 'uniswap') return stop('price_check_unavailable')
+  const reference = uint(review.reference.estimatedOutput), minimum = uint(review.requiredMinimum)
+  if (reference <= 0n) return stop('price_check_unavailable')
+  if (minimum * 10_000n < reference * BigInt(10_000 - review.request.slippageBps - CIRCLE_REFERENCE_TOLERANCE_BPS)) stop('price_check')
+}
+// The provider fee the Review showed, in base units of the input token (undefined when the quote showed none).
+export function providerFeeUnits(review: CircleSwapReview): bigint | undefined {
+  const input = swapToken(review.request.tokenIn)
+  const fees = review.fees.filter(fee => fee.type === 'provider' && fee.token === review.request.tokenIn && fee.amount !== null)
+  if (fees.length === 0) return undefined
+  return fees.reduce((sum, fee) => sum + parseCircleAmount(fee.amount as string, input.decimals), 0n)
 }
 
 // Facts read from the chain, read-only, right before a wallet request.
@@ -195,6 +220,10 @@ export interface CirclePorts {
   sdk(wallet: GuardedWallet): Promise<{ kit: CircleKitLike; adapter: unknown }> | { kit: CircleKitLike; adapter: unknown }
   // eth_estimateGas on the exact transaction: a revert throws, so it doubles as the simulation before the wallet is asked.
   estimateGas(tx: { from: Hex; to: Hex; data: Hex; value: bigint }): Promise<bigint>
+  // A test run of the exact swap calldata against the live adapter and the wallet's real balances (read-only eth_call): what the wallet would
+  // receive and spend. Required before an approval-strategy swap is requested; a permit swap cannot be run this way (its signature belongs to the
+  // wallet, not to a test run) and is covered by estimateGas and the on-chain check.
+  simulate?(owner: Hex, data: Hex, tokenIn: Hex, tokenOut: Hex): Promise<{ received: bigint; spent: bigint }>
   approval(attempt: CircleSwapAttempt, step: CircleStepRecord): Promise<CircleApprovalState>
   result(attempt: CircleSwapAttempt): Promise<CircleChainResult>
   storage: Pick<Storage, 'getItem' | 'setItem'>
@@ -219,7 +248,7 @@ const INTENT_STATUSES = ['match', 'allowed', 'mismatch', 'unavailable']
 
 export function circleSwapMessage(code: string): string {
   const messages: Record<string, string> = {
-    writes_disabled: 'Real Circle Swap Kit swaps are disabled pending release approval.',
+    writes_disabled: 'Circle Swap Kit swaps are switched off in this build. Quotes are shown for comparison only.',
     pilot_restricted: 'Execution is restricted to the configured pilot on Arc Mainnet. Live previews remain available.',
     context: 'The wallet, network, provider or swap inputs changed. Review a fresh swap.',
     expired: 'This swap review expired. Review a fresh swap before confirming.',
@@ -276,6 +305,9 @@ export function circleSwapMessage(code: string): string {
     invalid_request: 'The swap request is not valid. Review a fresh swap.',
     invalid_strategy: 'USDC is swapped with a signed permit and every other token with an exact approval; this combination is not offered.',
     economic_mismatch: 'The quote does not satisfy the slippage you chose. Review a fresh swap.',
+    price_check: 'Circle’s price for this swap is well below the independent market price, so it was not prepared. Nothing was sent. Try again later or use the other provider.',
+    price_check_unavailable: 'An independent price check could not be completed, so a Circle swap was not prepared. Nothing was sent. Try again in a moment.',
+    simulation_outcome: 'A test run of this exact swap on Arc shows you would receive less than your minimum (or spend more than you approved), so it was not sent to your wallet. Nothing was sent. Review a fresh swap.',
     sdk_failed: 'The swap software stopped before any transaction was requested. Nothing was sent. Review a fresh swap.',
     sdk_stalled: 'The swap software did not answer in time, so the flow was ended. Nothing further will be requested. Anything that was already submitted is tracked below. Review a fresh swap.',
     permit_failed: 'The signature request did not complete (declined, not supported by the wallet, or timed out). A signature moves no funds and no transaction was requested. Review a fresh swap.',
@@ -447,7 +479,7 @@ export const circleGuardPolicy = (review: CircleSwapReview, now: () => number, f
   const request = validateCircleRequest(review.request)
   return { owner: request.owner as Hex, adapter: CIRCLE_ADAPTER, inputToken: swapToken(request.tokenIn).address as Hex, outputToken: swapToken(request.tokenOut).address as Hex,
     amountIn: uint(review.amountIn), minimumOut: uint(review.requiredMinimum), strategy: circleStrategy(request), chainId: CIRCLE_CHAIN_ID,
-    now, maxFeePerGas: uint(review.maxFeePerGas), maxPriorityFeePerGas: uint(review.maxPriorityFeePerGas), feeBudget }
+    now, maxFeePerGas: uint(review.maxFeePerGas), maxPriorityFeePerGas: uint(review.maxPriorityFeePerGas), feeBudget, maxFeeUnits: providerFeeUnits(review) }
 }
 // The strategy a request resolves to. Stored Reviews always carry it explicitly; this keeps any older record readable.
 export const circleStrategy = (request: Pick<CircleSwapRequest, 'tokenIn' | 'allowanceStrategy'>): CircleStrategy => request.allowanceStrategy ?? (request.tokenIn === 'USDC' ? 'permit' : 'approve')
@@ -456,7 +488,7 @@ const guardCode = (error: unknown): string => {
   if (error instanceof CircleGuardError) return error.code
   const code = error instanceof Error ? error.message : ''
   return ['writes_disabled', 'pilot_restricted', 'context', 'nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce', 'storage', 'lock', 'busy', 'busy_other', 'smart_wallet', 'expired',
-    'insufficient_input_balance', 'insufficient_gas', 'adapter_identity', 'approval_failed', 'approval_pending', 'approval_missing', 'simulation', 'fee_ceiling', 'step_declined', 'step_timeout'].includes(code) ? code
+    'insufficient_input_balance', 'insufficient_gas', 'adapter_identity', 'approval_failed', 'approval_pending', 'approval_missing', 'simulation', 'simulation_outcome', 'price_check', 'price_check_unavailable', 'fee_ceiling', 'step_declined', 'step_timeout'].includes(code) ? code
     : ['deadline', 'quote_expired'].includes(code) ? 'expired' : 'preflight'
 }
 
@@ -504,6 +536,7 @@ export function createCircleSwapExecution(ports: CirclePorts) {
   function ready(selected: Selected) {
     requireEnabled(); sameContext(selected)
     validateCircleReview(selected.review, ports.context(), ports.now())
+    independentPriceCheck(selected.review)
     if (selected.review.expiresAt - ports.now() < 5000) stop('expired')
   }
   function failureMessage(error: unknown, stage: 'Review' | 'Confirm') {
@@ -558,6 +591,7 @@ export function createCircleSwapExecution(ports: CirclePorts) {
       const fresh = await ports.fresh(input)
       if (currentVersion !== version || contextKey() !== expectedContext || !ports.input() || circleRequestKey(ports.input()!) !== circleRequestKey(input) || circleRequestKey(fresh.request) !== circleRequestKey(input)) stop('context')
       validateCircleReview(fresh, ports.context(), ports.now())
+      independentPriceCheck(fresh)
       const selected: Selected = { id: crypto.randomUUID(), review: structuredClone(fresh), nonce: 0, context: expectedContext, version: currentVersion }
       const provider = await ports.provider()
       selected.nonce = await checkedNonce(selected, provider)
@@ -620,6 +654,13 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         let estimate: bigint
         try { estimate = await ports.estimateGas({ from: owner, to: step.to, data, value: 0n }) } catch { return stop('simulation') }
         if (estimate <= 0n) stop('simulation')
+        // The exact swap, run against the live adapter with the wallet's real balances and the approval that is now on chain: what would be
+        // received and spent. The adapter's own minimum is thereby checked before the wallet is asked, not only afterwards.
+        if (step.kind === 'swap' && strategy === 'approve' && ports.simulate) {
+          let outcome: { received: bigint; spent: bigint }
+          try { outcome = await ports.simulate(owner, data, swapToken(review.request.tokenIn).address as Hex, swapToken(review.request.tokenOut).address as Hex) } catch { return stop('simulation_outcome') }
+          if (outcome.received < uint(review.requiredMinimum) || outcome.spent > uint(review.amountIn)) stop('simulation_outcome')
+        }
         // The last await is behind us: the flow must still be the reviewed one, enabled and unchanged, before anything is journaled for the wallet.
         requireEnabled(); sameContext(run.selected)
         const limit = gas !== null && gas >= estimate ? gas : bufferedGas(estimate)
@@ -913,6 +954,8 @@ export function assertCircleExecutionReadMethod(method: string) {
   if (!['eth_chainId', 'eth_blockNumber', 'eth_getCode', 'eth_getBalance', 'eth_call', 'eth_estimateGas', 'eth_gasPrice', 'eth_feeHistory', 'eth_maxPriorityFeePerGas',
     'eth_getTransactionCount', 'eth_getTransactionByHash', 'eth_getTransactionReceipt', 'eth_getBlockByNumber', 'eth_getBlockByHash', 'eth_getStorageAt'].includes(method)) throw new Error('read_only_rpc')
 }
+const SIMULATION_CALLER: Hex = '0x00000000000000000000000000000000000abc01'
+const SIMULATION_GAS = 0x4000000n
 const APPROVAL_TOPIC = keccak256(new TextEncoder().encode('Approval(address,address,uint256)'))
 const hash = (value: unknown): value is Hex => typeof value === 'string' && /^0x[a-f0-9]{64}$/i.test(value)
 const topicAddress = (topic: string | null | undefined) => (typeof topic === 'string' && /^0x0{24}[0-9a-fA-F]{40}$/.test(topic) ? `0x${topic.slice(-40)}` : null)
@@ -958,6 +1001,15 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
   }
   async function estimateGas(tx: { from: Hex; to: Hex; data: Hex; value: bigint }) {
     return rpc.estimateGas({ account: tx.from, to: tx.to, data: tx.data, value: tx.value })
+  }
+  // The read-only test run. The wallet's address temporarily carries the simulation helper's code inside this one eth_call, so the adapter sees
+  // the wallet as the caller with its real balance and allowance; the helper reports how the wallet's balances moved. Nothing is sent or signed.
+  async function simulate(owner: Hex, data: Hex, tokenIn: Hex, tokenOut: Hex): Promise<{ received: bigint; spent: bigint }> {
+    const call = encodeFunctionData({ abi: SIMULATOR_ABI, functionName: 'simulate', args: [CIRCLE_ADAPTER, data, 0n, tokenIn, tokenOut, '0x0000000000000000000000000000000000000000', 0n] })
+    const { data: returned } = await rpc.call({ account: SIMULATION_CALLER, to: owner, data: call, gas: SIMULATION_GAS, stateOverride: [{ address: owner, code: SIMULATOR_RUNTIME as Hex }] })
+    if (!returned) throw new ExecutionVerificationError('malformed', true)
+    const result = decodeFunctionResult({ abi: SIMULATOR_ABI, functionName: 'simulate', data: returned })
+    return { received: result.outAfter - result.outBefore, spent: result.inBefore - result.inAfter }
   }
   // One transaction, read by hash. A transaction or receipt the node does not have yet is `missing` / `unmined` (pending, not failed); any other
   // read problem is retryable; a hash that is not the recorded transaction (sender, nonce, network) is not retryable.
@@ -1034,7 +1086,7 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
     const reviewed: CircleReviewedIntent = {
       owner, adapter: CIRCLE_ADAPTER, inputToken: tokenIn.address as Hex, outputToken: tokenOut.address as Hex, amountIn: uint(attempt.review.amountIn), minimumOut: uint(attempt.review.requiredMinimum),
       strategy: circleStrategy(request), chainId: CIRCLE_CHAIN_ID, feeCeiling: uint(attempt.review.networkFee), inputSymbol: request.tokenIn, inputDecimals: tokenIn.decimals,
-      outputSymbol: request.tokenOut, outputDecimals: tokenOut.decimals, nonce: swap.nonce, sentDataHash: swap.dataHash, approvalFees,
+      outputSymbol: request.tokenOut, outputDecimals: tokenOut.decimals, nonce: swap.nonce, sentDataHash: swap.dataHash, approvalFees, maxFeeUnits: providerFeeUnits(attempt.review),
       planned: swap.gasLimit !== undefined && swap.maxFee !== undefined && swap.maxTip !== undefined ? { gas: uint(swap.gasLimit), maxFeePerGas: uint(swap.maxFee), maxPriorityFeePerGas: uint(swap.maxTip) } : undefined,
     }
     const report = compareCircleSwap({ attemptHash: attempt.hash, tx: chainTx, receipt: chainReceipt, observation: { canonical: true, latestBlock: latest, blockTimestamp: typeof block.timestamp === 'bigint' ? block.timestamp : null }, reviewed, received, sent })
@@ -1048,7 +1100,7 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
         effectiveGasPrice: receipt.effectiveGasPrice.toString(), fee: fee.toString(), received: received === null ? null : (received < 0n ? '0' : received.toString()), sent: sent === null ? null : (sent < 0n ? '0' : sent.toString()), checkedAt },
     }
   }
-  return { preflight, publicNonce, estimateGas, approval, result }
+  return { preflight, publicNonce, estimateGas, simulate, approval, result }
 }
 
 // One import surface for the hook: the guard's public types live next to the controller that uses them.

@@ -1,4 +1,4 @@
-import { createPublicClient, defineChain, erc20Abi, http, parseUnits, type Hex, type Transport } from 'viem'
+import { createPublicClient, defineChain, erc20Abi, formatUnits, http, parseUnits, type Hex, type Transport } from 'viem'
 import { ViemAdapter } from '@circle-fin/adapter-viem-v2'
 import { SwapKit, getChainByEnum } from '@circle-fin/swap-kit'
 import { assertCircleExecutionReadMethod, circleFeeCeiling, createCircleChainRpc, type CircleSwapRequest, type CircleSwapReview } from './circleSwap'
@@ -7,6 +7,9 @@ import { readMainnetSwapQuote, decimalUnits, type PreviewQuote } from '../mainne
 import { swapToken } from './tokens'
 import { CIRCLE_ADAPTER } from './circleAdapterDecode'
 import { MAINNET_SWAP_QUOTE_TTL_MS } from '../../config/mainnetSwap'
+import { validateArcRequest } from '../uniswapArcPolicy'
+import { createOnchainReview } from './uniswapOnchain'
+import { createOnchainPorts } from './uniswapOnchainRpc'
 
 // The pinned, read-only Arc client for Circle execution: only the read methods in assertCircleExecutionReadMethod can pass, so neither the
 // SDK nor anything else can send, sign or approve through it. The only write path is the guarded wallet (circleGuard).
@@ -42,6 +45,8 @@ export async function readCircleReviewFacts(owner: string, tokenIn: ReturnType<t
 }
 
 export interface CircleReviewDeps {
+  // An independent price for the same swap (the keyless Uniswap quote), or null when none could be read.
+  reference?(request: CircleSwapRequest): Promise<string | null>
   quote(request: { address: Hex; chainId: number; tokenIn: CircleSwapRequest['tokenIn']; tokenOut: CircleSwapRequest['tokenOut']; amount: string; slippageBps: number }): Promise<PreviewQuote>
   facts(owner: string, request: CircleSwapRequest): Promise<CircleReviewFacts>
   now(): number
@@ -56,14 +61,25 @@ export async function buildCircleReview(request: CircleSwapRequest, deps: Circle
   // Circle quotes its gas estimate in USDC. When it gives none (or not for every item) the ceiling falls back to its fixed default.
   let estimatedGasFee: bigint | null = null
   if (gas.length > 0 && gas.every(fee => fee.amount !== null && fee.token === 'USDC')) estimatedGasFee = gas.reduce((sum, fee) => sum + parseUnits(fee.amount as string, 18), 0n)
+  const referenceOutput = deps.reference ? await deps.reference(request).catch(() => null) : null
   const price = (facts.baseFee !== null && facts.baseFee > facts.gasPrice ? facts.baseFee : facts.gasPrice) * MAX_FEE_MULTIPLIER
   return {
     request, amountIn: decimalUnits(request.amount, tokenIn.decimals).toString(), estimatedOutput: decimalUnits(quote.estimatedOutput, tokenOut.decimals).toString(),
     requiredMinimum: decimalUnits(quote.minimumOutput, tokenOut.decimals).toString(), networkFee: circleFeeCeiling(estimatedGasFee).toString(), maxFeePerGas: price.toString(), maxPriorityFeePerGas: '0',
     nativeBalance: facts.nativeBalance.toString(), tokenBalance: facts.tokenBalance.toString(), allowance: facts.allowance.toString(),
     fees: quote.fees.map(fee => ({ type: fee.type, token: fee.token, amount: fee.amount })), requestStartedAt: startedAt, expiresAt: Math.min(quote.expiresAt, startedAt + MAINNET_SWAP_QUOTE_TTL_MS), route: 'Circle Swap Kit router',
+    ...(referenceOutput !== null ? { reference: { source: 'uniswap' as const, estimatedOutput: decimalUnits(referenceOutput, tokenOut.decimals).toString() } } : {}),
   }
 }
+// The independent price: what the keyless Uniswap route (the real Universal Router against the real pools, read-only) would pay for the same swap.
+// It is only a market reference for the sanity check on Circle's guaranteed minimum; nothing from it is ever sent.
+export async function uniswapReferenceOutput(request: CircleSwapRequest, ports = createOnchainPorts()): Promise<string> {
+  const arc = validateArcRequest({ chainId: 5042, tokenIn: request.tokenIn, tokenOut: request.tokenOut, owner: request.owner, recipient: request.owner, amount: request.amount,
+    minimumOutput: '1', slippageBps: request.slippageBps, maxNetworkFee: '100000000000000000' })
+  const review = await createOnchainReview(arc, ports, { owner: request.owner, chainId: 5042, connected: true })
+  return formatUnits(BigInt(review.estimatedOutput), swapToken(request.tokenOut).decimals)
+}
 export const circleReviewDeps = (): CircleReviewDeps => ({
+  reference: request => uniswapReferenceOutput(request),
   quote: request => readMainnetSwapQuote(request, new AbortController().signal), facts: (owner, request) => readCircleReviewFacts(owner, swapToken(request.tokenIn)), now: () => Date.now(),
 })

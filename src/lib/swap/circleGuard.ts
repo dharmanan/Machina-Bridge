@@ -25,6 +25,8 @@ export interface CircleStepInfo {
   index: number; kind: CircleStepKind; to: Hex; token: Hex; amount: string
   spender?: Hex; minimumOut?: string; deadline?: number; dataHash: Hex
   gasLimit?: string; maxFeePerGas?: string; worstCaseFee?: string
+  // Swap step: the provider fee taken from the input by this very transaction (input-token base units).
+  feeAmount?: string
 }
 // Fee and nonce plan for one wallet request, decided by the controller (never by the SDK or the wallet).
 export interface CircleStepPlan { nonce: number; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }
@@ -114,7 +116,7 @@ export function createGuardedWalletClient(inner: CircleInnerWallet, policy: Circ
       const nowSeconds = Math.floor(policy.now() / 1000)
       const result = checkSwapCalldata(data, policy, nowSeconds)
       if (!result.ok) throw new CircleGuardError('swap_calldata', `${result.detail} (${result.code})`)
-      return { kind: 'swap', data, info: { kind: 'swap', to: policy.adapter, token: policy.inputToken, amount: policy.amountIn.toString(), minimumOut: policy.minimumOut.toString(), deadline: Number(result.call.deadline), dataHash: keccak256(data) } }
+      return { kind: 'swap', data, info: { kind: 'swap', to: policy.adapter, token: policy.inputToken, amount: policy.amountIn.toString(), minimumOut: policy.minimumOut.toString(), deadline: Number(result.call.deadline), feeAmount: result.feeUnits.toString(), dataHash: keccak256(data) } }
     }
     throw new CircleGuardError('wrong_target', 'The transaction is not addressed to the reviewed token or the Circle adapter.')
   }

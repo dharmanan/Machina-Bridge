@@ -15,7 +15,7 @@ export interface SupportEntry {
   routes: string[]              // every route the app will consider (Uniswap) or the single provider route (Circle)
   approval: { kind: ApprovalKind; steps: number; text: string }
   verification: string
-  // Execution in each build mode. 'pilot' is the production build today; 'open' needs a separate release decision.
+  // Execution in each build mode. 'open' (the default) is the full multi-direction swap; 'pilot' is the earlier controlled pilot, kept as an explicit fallback.
   execution: { pilot: 'enabled' | 'quotes_only'; open: 'enabled' | 'gated'; text: string }
   liveTransaction: string       // evidence that this application itself has sent a real transaction on this route
 }
@@ -25,12 +25,12 @@ function uniswapEntry(tokenIn: SwapSymbol, tokenOut: SwapSymbol): SupportEntry {
   const routes = candidateRoutes(tokenIn, tokenOut).map(describeRoute), native = tokenIn === 'USDC', pilot = PILOT_ROUTE(tokenIn, tokenOut)
   return {
     id: `uniswap:${tokenIn}>${tokenOut}`, provider: 'uniswap', tokenIn, tokenOut,
-    quote: pilot ? 'Uniswap Trading API through the server preview route (pilot build); keyless pool simulation in open mode' : 'Read-only simulation of the real Universal Router against the real pools (keyless)',
-    routing: pilot ? 'Uniswap Universal Router, V4 pool (pilot) or V3 pools (open mode)' : 'Uniswap Universal Router, V3 pools from the pinned registry',
+    quote: pilot ? 'Keyless pool simulation of the real Universal Router (default); Uniswap Trading API only in the explicit pilot build' : 'Read-only simulation of the real Universal Router against the real pools (keyless)',
+    routing: pilot ? 'Uniswap Universal Router, V3 pools from the pinned registry (the pilot build uses the Trading API V4 route)' : 'Uniswap Universal Router, V3 pools from the pinned registry',
     routes, approval: native ? { kind: 'none', steps: 0, text: 'Native USDC is sent as transaction value; no approval.' } : { kind: 'permit2_exact', steps: 2, text: `Two exact approvals: ${tokenIn} to Permit2, then Permit2 to the Router (valid 15 minutes). Never unlimited.` },
     verification: 'Strict calldata decoder before the wallet; receipt, transfers and fee ceiling checked after, separately from the Review.',
-    execution: { pilot: pilot ? 'enabled' : 'quotes_only', open: 'gated', text: pilot ? 'Enabled in the controlled pilot (approved wallet, up to 0.1 USDC).' : 'Built and tested; quotes only in the pilot build. Opens with the execution mode, a separate release decision.' },
-    liveTransaction: pilot ? 'Yes: one real swap (0x1a5e…a921) through the Trading API path; its verification is reported separately.' : 'None yet. The keyless route was only simulated read-only against the live router.',
+    execution: { pilot: pilot ? 'enabled' : 'quotes_only', open: 'enabled', text: pilot ? 'Available in the default multi-direction mode; the explicit pilot build also allows it (approved wallet, up to 0.1 USDC).' : 'Available in the default multi-direction mode (any wallet, up to the per-swap ceiling). Quotes only in the explicit pilot build.' },
+    liveTransaction: pilot ? 'Yes: one real swap (0x1a5e…a921) through the earlier Trading API path; its verification is reported separately. The keyless route used by default has not yet been sent with a user\'s wallet.' : 'None yet by this application. The route was only simulated read-only against the live router.',
   }
 }
 function circleEntry(tokenIn: SwapSymbol, tokenOut: SwapSymbol, seenOnChain: boolean): SupportEntry {
@@ -40,7 +40,7 @@ function circleEntry(tokenIn: SwapSymbol, tokenOut: SwapSymbol, seenOnChain: boo
     quote: 'Circle Swap Kit estimate (service quote, read-only)', routing: `Circle Swap Kit adapter ${CIRCLE_ADAPTER}`, routes: ['Circle Swap Kit router'],
     approval: permit ? { kind: 'adapter_permit', steps: 1, text: 'One-time EIP-2612 permit signature for exactly the amount (a signature, not a transaction).' } : { kind: 'adapter_exact', steps: 1, text: `One exact ${tokenIn} approval for the Circle adapter, then the swap.` },
     verification: 'Pinned adapter-call decoder before the wallet (guarded wallet); receipt, transfers and fee ceiling checked after, separately from the Review.',
-    execution: { pilot: 'quotes_only', open: 'gated', text: 'Built and tested with the real SDK against controlled doubles; switched off by its own source gate until a live test is approved. Never part of the pilot.' },
+    execution: { pilot: 'quotes_only', open: 'enabled', text: 'Available in the default multi-direction mode, through the guarded wallet: each step is confirmed in the app and then in the wallet. Never part of the explicit pilot build.' },
     liveTransaction: seenOnChain ? 'None by this application. Real swaps on this direction by other wallets are on chain and were decoded as fixtures.' : 'None by this application, and no real swap of this direction was found among the decoded fixtures.',
   }
 }
@@ -52,6 +52,6 @@ export const supportFor = (provider: SwapProviderId, tokenIn: SwapSymbol, tokenO
 // What the selected build lets this provider do for a route right now (the screen shows this; it never claims more).
 export function executionInBuild(entry: SupportEntry, config: SwapExecutionConfig, circleOpen: boolean): { available: boolean; text: string } {
   if (!config.enabled) return { available: false, text: 'Execution is switched off in this build: quotes only.' }
-  if (config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off until a live test is approved: quotes only.' } : { available: true, text: 'Available.' }
+  if (config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off in this build: quotes only.' } : { available: true, text: 'Available (any wallet, up to the per-swap ceiling).' }
   return entry.execution.pilot === 'enabled' ? { available: true, text: 'Available in the controlled pilot (approved wallet, up to 0.1 USDC).' } : { available: false, text: 'Quotes only in the controlled pilot.' }
 }

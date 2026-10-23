@@ -15,7 +15,7 @@ const { toHex, decodeFunctionData, encodeEventTopics, encodeAbiParameters, parse
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', blockHash = '0x' + 'b'.repeat(64)
-const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) }, cacheDir: `${root}.verification/vite-execution-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
+const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_SWAP_EXECUTION_MODE': JSON.stringify('pilot'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) }, cacheDir: `${root}.verification/vite-execution-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
   name: 'execution-fixture-route', configureServer(server) {
   server.middlewares.use('/__execution_ui_test', async (_req, res) => {
     res.setHeader('Content-Type', 'text/html')
@@ -101,7 +101,7 @@ try {
     assert.equal(await review.isEnabled(), true); assert.equal(await sends(), 0); assert.equal(apiCalls, 0)
   })
   await test('Review fetches fresh data, runs actual read-only client and shows independent approval summary', async () => {
-    await page.getByText(/Read-only simulation passed/).waitFor()
+    await page.getByText(/Estimate only\. You’ll see the exact amounts and fees/).waitFor()
     const before = apiCalls
     await prepare(); assert.equal(apiCalls, before + 1); assert.equal(await sends(), 0)
     const dialog = page.getByRole('dialog'); await dialog.getByText('0.088565 EURC', { exact: true }).waitFor()
@@ -183,11 +183,13 @@ try {
       await page.evaluate(mode => { window.executionUiTest.state.walletReadFailure = mode }, mode)
       await review.click()
       const alert = page.getByRole('alert').filter({ hasText: 'eth_getTransactionCount(pending)' })
-      await alert.waitFor(); assert.ok((await alert.innerText()).includes(label)); assert.ok(!(await page.locator('body').innerText()).includes('SECRET-PROVIDER-DETAILS'))
+      await alert.waitFor(); await alert.getByText('We couldn’t confirm your wallet’s state just now, so nothing was sent.').waitFor() // the plain sentence is what a person sees
+      assert.ok((await alert.textContent()).includes(label)); assert.ok(!(await page.locator('body').textContent()).includes('SECRET-PROVIDER-DETAILS')) // the precise wording stays in the closed Technical details
+      assert.equal(await alert.locator('details').getAttribute('open'), null)
       if (mode === 'malformed') {
-        assert.ok((await alert.innerText()).endsWith('Response shape: type=object; stringLength=n/a; canonicalHexQuantity=n/a.'))
+        assert.ok((await alert.textContent()).endsWith('Response shape: type=object; stringLength=n/a; canonicalHexQuantity=n/a.'))
         assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('machina.uniswap.arc.execution.v1:')).length), 0)
-      } else assert.ok(!(await alert.innerText()).includes('Response shape'))
+      } else assert.ok(!(await alert.textContent()).includes('Response shape'))
       assert.equal(await page.getByRole('dialog').count(), 0); assert.equal(await sends(), 0)
     }
     await page.evaluate(() => { window.executionUiTest.state.walletReadFailure = '' })
@@ -212,23 +214,22 @@ try {
   })
   await test('EURC wallet approval may take 45 seconds without inheriting the 30-second quote deadline', async () => {
     await page.clock.install()
-    await prepare(); await page.getByRole('dialog').getByText('Transaction deadline', { exact: true }).waitFor()
-    await page.getByRole('dialog').getByText(/The transaction deadline is capped at two minutes/).waitFor()
+    await prepare(); await page.getByRole('dialog').locator('summary', { hasText: 'Technical details' }).click(); await page.getByRole('dialog').getByText('Transaction deadline', { exact: true }).waitFor() // the deadline lives in the closed Technical details
     await page.evaluate(() => { window.executionUiTest.state.walletMode = 'held' }); await confirm.click()
-    await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
+    await transactionStatus.getByText('Confirm in your wallet', { exact: true }).waitFor()
     assert.equal(await sends(), 1); assert.equal(await review.isDisabled(), true)
     const records = await page.evaluate(() => Object.entries(localStorage).filter(([k]) => k.startsWith('machina.uniswap.arc.execution.v1:')).map(([,v]) => JSON.parse(v)).flat())
     assert.equal(records[0].status, 'awaiting_wallet'); assert.equal(records[0].hash, undefined)
-    await transactionStatus.getByText(/Approve within at most/).waitFor()
+    await transactionStatus.getByText(/Approve within about/).waitFor()
     assert.ok(Number(decodeFunctionData({ abi: p.EXECUTE_ABI, data: records[0].review.transaction.data }).args[2]) * 1000 > records[0].review.expiresAt)
     await page.clock.fastForward(45000)
-    await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
-    await page.evaluate(() => window.executionUiTest.release()); await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor()
-    const state = await cacheWallet(); await page.getByRole('link', { name: /View on Arc Explorer/ }).filter({ hasText: state.hash }).waitFor()
+    await transactionStatus.getByText('Confirm in your wallet', { exact: true }).waitFor()
+    await page.evaluate(() => window.executionUiTest.release()); await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor()
+    const state = await cacheWallet(); await page.locator(`a[href$="${state.hash}"]`, { hasText: 'View on Arc Explorer' }).first().waitFor()
   })
   await test('reload resumes pending transaction from localStorage without signing or resending', async () => {
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
-    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
+    await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), 0)
   })
   await test('the pending transaction survives direction and provider changes; rechecks are read-only; other wallets keep their records visible', async () => {
     const before = await sends(), latest = transactionStatus
@@ -236,44 +237,44 @@ try {
     await latest.getByRole('link', { name: /View on Arc Explorer/ }).waitFor(); assert.equal(await review.isDisabled(), true)
     await page.getByRole('button', { name: 'Reverse direction' }).click()
     await page.getByRole('radio', { name: 'Circle Swap Kit quote' }).click()
-    await latest.getByRole('button', { name: 'Check transaction status' }).click()
-    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), before)
+    await latest.getByRole('button', { name: 'Check status' }).click()
+    await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), before)
     await page.evaluate(() => window.executionUiTest.account(true))
     // The other wallet is connected: the records of the first wallet stay readable (history is not tied to the connected wallet).
-    await transactionStatus.getByText(/Wallet: 0xafbB6Cc5/).first().waitFor(); assert.equal(await review.isDisabled(), true)
+    const technical = transactionStatus.locator('details', { hasText: 'Technical details' }).last(); await technical.locator('summary').click(); await technical.getByText(/Wallet: 0xafbB6Cc5/).first().waitFor(); assert.equal(await review.isDisabled(), true)
     await page.evaluate(() => window.executionUiTest.account(false)); await latest.waitFor()
     await page.getByRole('radio', { name: 'Uniswap quote' }).click(); await amount.fill('0.1')
   })
-  await test('verified successful receipt shows Confirmed and actual output, then refreshes native balance', async () => {
+  await test('verified successful receipt shows Swap completed with the actual output, then refreshes native balance', async () => {
     const before = await page.evaluate(() => window.executionUiTest.state.balanceReads)
     receiptMode = 'confirmed'
-    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor(); await transactionStatus.getByText(/Received 0\.088565 EURC/).waitFor()
+    await transactionStatus.getByText('Swap completed', { exact: true }).waitFor(); await transactionStatus.getByText(/Paid 0\.1 USDC · Received 0\.088565 EURC · Network fee/).waitFor()
     await page.waitForFunction(n => window.executionUiTest.state.balanceReads > n, before)
     assert.equal(await sends(), 0)
   })
-  await test('pilot EURC repeated review uses the same controller and a reverted receipt is Failed', async () => {
+  await test('pilot EURC repeated review uses the same controller and a reverted receipt reads Swap failed', async () => {
     receiptMode = 'pending'; await prepare('EURC')
     assert.equal(await review.isDisabled(), true) // the earlier confirmed swap never blocks a new review; an in-progress review blocks another
     await confirm.click()
-    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); await cacheWallet()
+    await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor(); await cacheWallet()
     receiptMode = 'reverted'
-    await transactionStatus.getByText('Failed — transaction reverted', { exact: true }).waitFor(); assert.equal(await sends(), 1)
+    await transactionStatus.getByText('Swap failed', { exact: true }).waitFor(); assert.equal(await sends(), 1)
   })
   await test('wallet rejection is understandable and does not retry or expose provider errors', async () => {
     await page.evaluate(() => { window.executionUiTest.state.walletMode = 'reject' }); await prepare(); await confirm.click()
-    await transactionStatus.getByText('Wallet request rejected', { exact: true }).waitFor()
+    await transactionStatus.getByText('Swap cancelled', { exact: true }).waitFor()
     assert.equal((await page.locator('body').innerText()).includes('synthetic-private-error'), false); assert.equal(await sends(), 2)
   })
   await test('ambiguous wallet result stays blocked and supports read-only hash recovery after reload', async () => {
     receiptMode = 'pending'; await page.evaluate(() => { window.executionUiTest.state.walletMode = 'unknown' }); await prepare(); await confirm.click()
-    await transactionStatus.getByText('Status not yet verified', { exact: true }).waitFor(); const state = await cacheWallet()
+    await transactionStatus.getByText('Waiting for confirmation', { exact: true }).waitFor(); const state = await cacheWallet()
     assert.equal(await review.isDisabled(), true)
     await page.reload(); await page.evaluate(() => window.executionUiTest.connect(5042))
     await page.getByRole('textbox', { name: 'Recover transaction hash' }).fill(state.hash)
     await page.getByRole('button', { name: 'Verify and track hash' }).click()
-    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor(); assert.equal(await sends(), 0)
+    await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), 0)
     receiptMode = 'confirmed'
-    await transactionStatus.getByText('Confirmed', { exact: true }).waitFor()
+    await transactionStatus.getByText('Swap completed', { exact: true }).waitFor()
   })
   await test('input and wallet network changes close an outstanding review without requesting a transaction', async () => {
     await prepare(); await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
@@ -301,20 +302,20 @@ try {
     receiptMode = 'pending'
     await page.evaluate(() => { window.executionUiTest.state.walletMode = 'held' })
     await prepare('EURC'); const before = await sends(); await confirm.click()
-    await transactionStatus.getByText('Awaiting wallet confirmation', { exact: true }).waitFor()
+    await transactionStatus.getByText('Confirm in your wallet', { exact: true }).waitFor()
     await page.clock.fastForward(121000)
-    await transactionStatus.getByText('Status not yet verified', { exact: true }).waitFor()
+    await transactionStatus.getByText('Waiting for confirmation', { exact: true }).waitFor()
     await page.getByRole('alert').filter({ hasText: 'The wallet approval window ended. Cancel the open request' }).waitFor()
     assert.equal(await review.isDisabled(), true); assert.equal(await sends(), before + 1)
     const records = await page.evaluate(() => Object.entries(localStorage).filter(([k]) => k.startsWith('machina.uniswap.arc.execution.v1:')).map(([,v]) => JSON.parse(v)).flat())
     assert.equal(records.at(-1).status, 'unknown')
     await page.evaluate(() => window.executionUiTest.release())
-    await transactionStatus.getByText('Pending — waiting for Arc', { exact: true }).waitFor()
+    await transactionStatus.getByText('Verifying transaction', { exact: true }).waitFor()
     const state = await cacheWallet()
-    await page.getByRole('link', { name: /View on Arc Explorer/ }).filter({ hasText: state.hash }).waitFor()
+    await page.locator(`a[href$="${state.hash}"]`, { hasText: 'View on Arc Explorer' }).first().waitFor()
     assert.equal(await sends(), before + 1)
     receiptMode = 'reverted'; await page.clock.fastForward(6000)
-    await transactionStatus.getByText('Failed — transaction reverted', { exact: true }).waitFor()
+    await transactionStatus.getByText('Swap failed', { exact: true }).waitFor()
     await page.evaluate(() => { window.executionUiTest.state.walletMode = 'hash' })
   })
   await test('expired review cannot confirm; Circle-only routes retain Preview and no execution button', async () => {

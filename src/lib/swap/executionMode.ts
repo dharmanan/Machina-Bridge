@@ -2,20 +2,18 @@ import { getAddress, isAddress } from 'viem'
 import { arcPilotAllows, arcPilotConfig, ARC_PILOT_APPROVED_WALLET, ARC_PILOT_MAX_INPUT } from '../uniswapArcPilot'
 import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '../uniswapArcPolicy'
 
-// Who may execute which swap. Two modes, one default:
-//   pilot (default, and the only mode a production build uses today)
-//         exactly the approved wallet, native USDC -> EURC, at most 0.1 USDC. Nothing else can ask a wallet for a signature.
-//   open  every supported direction up to the per-token ceilings of uniswapArcPolicy (ARC_INPUT_CAPS), any externally owned
-//         wallet. It exists so the full product can be built, tested and reviewed; it is enabled only by a separate, explicit
-//         release decision (VITE_SWAP_EXECUTION_MODE=open). Anything other than the exact string "open" means pilot.
-// In both modes the execution switch itself (VITE_UNISWAP_ARC_PILOT_ENABLED === "true") must be on. Neither mode weakens a
-// transaction check: they only decide whether a request may start.
+// Who may execute which swap. Two modes:
+//   open  (the default) every supported direction, both providers, any externally owned wallet, up to the per-token ceilings of
+//         uniswapArcPolicy (ARC_INPUT_CAPS: roughly 10 USD per swap while no route has been proven with a user's own wallet).
+//   pilot the earlier controlled pilot, kept only as an explicit fallback: exactly the approved wallet, native USDC -> EURC, at most
+//         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
+// In both modes the execution switch itself (VITE_UNISWAP_ARC_PILOT_ENABLED === "true") must be on: it remains the single kill switch of
+// the build. Neither mode weakens a transaction check; they only decide whether a request may start.
 export type SwapExecutionMode = 'pilot' | 'open'
 export interface SwapExecutionConfig { enabled: boolean; mode: SwapExecutionMode; wallet: string }
 
 export function swapExecutionConfig(enabled?: string, wallet?: string, mode?: string): SwapExecutionConfig {
-  const open = mode === 'open'
-  if (!open) { const pilot = arcPilotConfig(enabled, wallet); return Object.freeze({ enabled: pilot.enabled, mode: 'pilot', wallet: pilot.wallet }) }
+  if (mode === 'pilot') { const pilot = arcPilotConfig(enabled, wallet); return Object.freeze({ enabled: pilot.enabled, mode: 'pilot', wallet: pilot.wallet }) }
   const valid = typeof wallet === 'string' && isAddress(wallet) && BigInt(wallet) > 2n && !sameAddress(wallet, ARC_ROUTER)
   return Object.freeze({ enabled: enabled === 'true', mode: 'open', wallet: valid ? getAddress(wallet) : '' })
 }
@@ -57,7 +55,7 @@ export function executionRestrictionMessage(restriction: ExecutionRestriction): 
     pilot_amount: `The controlled pilot allows at most ${Number(ARC_PILOT_MAX_INPUT / 10n ** 12n) / 1e6} USDC per swap. Enter a smaller amount to execute.`,
     request: 'Enter a valid amount to review a swap.',
     pilot_provider: 'Circle Swap Kit swaps are not part of the controlled pilot. Quotes are shown for comparison only.',
-    provider_closed: 'Circle Swap Kit swaps are built and tested but switched off until a live test is approved. Quotes are shown for comparison only.',
+    provider_closed: 'Circle Swap Kit swaps are switched off in this build. Quotes are shown for comparison only.',
   }
   return messages[restriction]
 }

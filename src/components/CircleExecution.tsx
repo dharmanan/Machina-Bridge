@@ -11,6 +11,7 @@ import {
 } from '../lib/swap/circleSwap'
 import { buildCircleReview, circleChainRpc, circleReviewDeps, circleSdk } from '../lib/swap/circleSdk'
 import { swapToken } from '../lib/swap/tokens'
+import { CIRCLE_ADAPTER } from '../lib/swap/circleAdapterDecode'
 import { SWAP_EXECUTION } from '../config/swapExecution'
 
 // Circle Swap Kit execution through the connected wagmi wallet. The SDK only ever sees the guarded wallet; every step is confirmed in the
@@ -30,7 +31,7 @@ export function useCircleSwapExecution(input: CircleSwapRequest | null, blocked:
   const [controller] = useState(() => createCircleSwapExecution({
     context: () => alive.current ? context.current : { ...context.current, connected: false }, input: () => alive.current ? currentInput.current : null, now: () => Date.now(),
     fresh: request => buildCircleReview(request, circleReviewDeps()),
-    preflight: circleChainRpc.preflight, publicNonce: circleChainRpc.publicNonce, estimateGas: circleChainRpc.estimateGas, approval: circleChainRpc.approval, result: circleChainRpc.result,
+    preflight: circleChainRpc.preflight, publicNonce: circleChainRpc.publicNonce, estimateGas: circleChainRpc.estimateGas, simulate: circleChainRpc.simulate, approval: circleChainRpc.approval, result: circleChainRpc.result,
     provider: () => connectedExecutionProvider(currentConnector.current), sdk: circleSdk,
     storage: { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
     lock: browserCircleLock, enabled: () => CIRCLE_SWAP_WRITES_ENABLED,
@@ -93,7 +94,8 @@ export function useCircleSwapExecution(input: CircleSwapRequest | null, blocked:
 }
 export type CircleExecution = ReturnType<typeof useCircleSwapExecution>
 
-const kindText = (kind: string, token: string) => (kind === 'permit' ? `Sign a one-time permit for exactly this ${token} amount (a signature, not a transaction; no network fee)` : kind === 'approve' ? `Approve exactly this ${token} amount for the Circle adapter (a transaction with a small network fee)` : 'Send the swap transaction')
+const kindText = (kind: string, token: string) => (kind === 'permit' ? `Sign a one-time permission for exactly this ${token} amount (a signature: no network fee)` : kind === 'approve' ? `Approve exactly this ${token} amount for Circle (a transaction with a small network fee)` : 'Send the swap')
+const utc = (seconds: number) => `${new Date(seconds * 1000).toISOString().slice(11, 19)} UTC`
 
 // The Review dialog and the per-step confirmation. Nothing reaches the wallet until the user confirms the step shown here.
 export function CircleReviewDialog({ execution }: { execution: CircleExecution }) {
@@ -109,39 +111,50 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
   const request = review?.request
   const tokenIn = request ? swapToken(request.tokenIn) : null, tokenOut = request ? swapToken(request.tokenOut) : null
   const step = view.step
+  const providerFee = review?.fees.find(fee => fee.type === 'provider'), gasEstimate = review?.fees.find(fee => fee.type === 'gas')
   return <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="circle-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
-      <h2 id="circle-review-title" className="text-xl font-semibold">Review Circle Swap Kit swap</h2>
-      <p className="text-xs text-slate-600">Arc Mainnet · executed by Circle’s adapter contract. The app checks the exact calls before your wallet is asked.</p>
+      <h2 id="circle-review-title" className="text-xl font-semibold">Review Circle swap</h2>
       {review && request && tokenIn && tokenOut && <>
-        <p>{request.amount} {request.tokenIn} → estimated {formatUnits(BigInt(review.estimatedOutput), tokenOut.decimals)} {request.tokenOut}</p>
+        <p>You pay {request.amount} {request.tokenIn} and receive about {formatUnits(BigInt(review.estimatedOutput), tokenOut.decimals)} {request.tokenOut}.</p>
         <dl className="space-y-2 text-sm">
-          <Line label="Minimum receive" value={`${formatUnits(BigInt(review.requiredMinimum), tokenOut.decimals)} ${request.tokenOut}`} />
-          <Line label="Slippage" value={`${request.slippageBps / 100}%`} />
-          <Line label="Network fee ceiling (all steps)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
-          {review.fees.filter(fee => fee.type !== 'gas').map(fee => <Line key={fee.type} label={`${fee.type[0].toUpperCase()}${fee.type.slice(1)} fee`} value={fee.amount === null ? 'not estimated' : `${fee.amount} ${fee.token}`} />)}
-          <Line label="Network" value="Arc Mainnet · 5042" />
-          <Line label="Recipient" value={request.owner} />
-          {view.phase !== 'awaiting_step' && <Line label="Review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />}
+          <Line label="You pay" value={`${request.amount} ${request.tokenIn}`} />
+          <Line label="You receive (estimate)" value={`${formatUnits(BigInt(review.estimatedOutput), tokenOut.decimals)} ${request.tokenOut}`} />
+          <Line label="Minimum you receive" value={`${formatUnits(BigInt(review.requiredMinimum), tokenOut.decimals)} ${request.tokenOut}`} />
+          <Line label="Slippage allowed" value={`${request.slippageBps / 100}%`} />
+          {providerFee && <Line label="Circle fee" value={providerFee.amount === null ? 'not estimated' : `${providerFee.amount} ${providerFee.token}`} />}
+          {gasEstimate?.amount != null && <Line label="Network fee (estimate)" value={`about ${Number(gasEstimate.amount).toPrecision(2)} USDC`} />}
+          <Line label="Network fee (maximum, all steps)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
+          {view.phase !== 'awaiting_step' && <Line label="This review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />}
         </dl>
         <div className="space-y-1 rounded-xl bg-slate-50 p-3 text-sm">
           <p className="font-medium">What you will be asked, one step at a time</p>
           <ol className="list-decimal space-y-1 pl-5 text-slate-700">
-            <li>{request.tokenIn === 'USDC' ? 'Sign a one-time permit for exactly this USDC amount (a signature, not a transaction; no fee).' : `Approve exactly this ${request.tokenIn} amount for the Circle adapter (a transaction; small fee).`}</li>
-            <li>Send the swap transaction.</li>
+            <li>{request.tokenIn === 'USDC' ? 'Sign a one-time permission for exactly this USDC amount (a signature: no fee).' : `Approve exactly this ${request.tokenIn} amount for Circle (a transaction; small fee).`}</li>
+            <li>Send the swap.</li>
           </ol>
-          <p className="text-xs text-slate-600">Never unlimited. Each step is confirmed here first, then in your wallet. If a step fails, the later steps are not requested.</p>
+          <p className="text-xs text-slate-600">Never more than the amount above. Each step is confirmed here first, then in your wallet. If a step fails, the next ones are not requested. If the price moves so you would receive less than the minimum, the swap does not go through.</p>
         </div>
+        <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+          <dl className="mt-2 space-y-1">
+            <Line label="Contract" value={`Circle adapter · ${CIRCLE_ADAPTER}`} />
+            <Line label="Recipient" value={request.owner} />
+            <Line label="Network" value="Arc Mainnet · 5042" />
+            {review.reference && <Line label="Independent price check" value={`Uniswap reference ${formatUnits(BigInt(review.reference.estimatedOutput), tokenOut.decimals)} ${request.tokenOut}`} />}
+          </dl></details>
       </>}
       {step && view.phase === 'awaiting_step' && <div role="status" className="space-y-2 rounded-xl border border-[#2F6E0C]/40 bg-[#f4faef] p-3 text-sm">
         <p className="font-semibold">Step {step.kind === 'swap' ? 2 : 1} of 2: {kindText(step.kind, request?.tokenIn ?? '')}</p>
         <dl className="space-y-1">
           <Line label="Amount" value={tokenIn ? `${formatUnits(BigInt(step.amount), tokenIn.decimals)} ${request?.tokenIn}` : step.amount} />
-          {step.spender && <Line label="Spender" value={step.spender} />}
-          <Line label="Target" value={step.to} />
-          {step.worstCaseFee && <Line label="Worst-case fee for this step" value={`${formatUnits(BigInt(step.worstCaseFee), 18)} USDC`} />}
+          {step.kind === 'swap' && step.minimumOut && tokenOut && <Line label="Minimum you receive" value={`${formatUnits(BigInt(step.minimumOut), tokenOut.decimals)} ${request?.tokenOut}`} />}
+          {step.kind === 'swap' && step.feeAmount && tokenIn && <Line label="Circle fee in this transaction" value={`${formatUnits(BigInt(step.feeAmount), tokenIn.decimals)} ${request?.tokenIn}`} />}
+          {step.kind === 'swap' && step.deadline !== undefined && <Line label="Must complete by" value={utc(step.deadline)} />}
+          {step.worstCaseFee && <Line label="Network fee for this step (maximum)" value={`${formatUnits(BigInt(step.worstCaseFee), 18)} USDC`} />}
           {view.stepWindowMs !== undefined && <Line label="Confirm within" value={`${Math.floor(view.stepWindowMs / 1000)} seconds`} />}
         </dl>
+        <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+          <ul className="mt-1 space-y-1 break-all"><li>Contract: {step.to}</li>{step.spender && <li>Allowed spender: {step.spender}</li>}<li>Transaction fingerprint: {step.dataHash}</li></ul></details>
       </div>}
       <div className="flex gap-3">
         <button type="button" onClick={execution.cancel} className="flex-1 rounded-xl border border-slate-300 px-4 py-3">Cancel</button>

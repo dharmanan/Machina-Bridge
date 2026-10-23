@@ -3,13 +3,14 @@ import { useEffect, useRef, useState } from 'react'
 import { useAccount } from 'wagmi'
 import { useQueryClient } from '@tanstack/react-query'
 import { formatUnits } from 'viem'
-import { ARC_TOKENS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, requestKey, sameAddress, tokenUnits, type ArcRequest } from '../lib/uniswapArcPolicy'
+import { ARC_TOKENS, ARC_ROUTER, ARC_USDC, UNISWAP_ARC_WRITES_ENABLED, requestKey, sameAddress, type ArcRequest } from '../lib/uniswapArcPolicy'
 import { createReviewSource } from '../lib/swap/reviewSource'
 import { reviewValue } from '../lib/swap/swapPolicy'
 import { executionRestrictionMessage, swapExecutionRestriction } from '../lib/swap/executionMode'
 import { browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, listStoredAttempts, type ExecutionContext, type ExecutionView, type StoredHistory, type SwapAttempt } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
 import { SWAP_EXECUTION } from '../config/swapExecution'
+import { decodeUniversalRouterCalldata, guaranteedNetMinimum } from '../lib/swap/universalRouter'
 
 // Uses the already connected wagmi connector. No new wallet, signing SDK, service or login.
 // `blocked` lets the caller hold a new swap while another transaction of the same wallet (an approval) is unresolved.
@@ -122,31 +123,51 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
   const review = view.review
   const out = review ? ARC_TOKENS[review.request.tokenOut] : null, inp = review ? ARC_TOKENS[review.request.tokenIn] : null
   const nativeIn = review?.request.tokenIn === 'USDC'
+  const poolFees = review?.route ? [...review.route.matchAll(/\(([0-9.]+%)\)/g)].map(match => match[1]) : []
+  // What the reviewed transaction itself does with the output: the fee portions, read from the calldata that will be sent (never assumed).
+  let program = '', portions: { percent: string; recipient: string }[] | null = null, netMinimum: bigint | null = null
+  if (review) {
+    try {
+      const decoded = decodeUniversalRouterCalldata(review.transaction.data)
+      if (decoded.ok) { program = decoded.program.signature; portions = decoded.program.portions.map(portion => ({ percent: `${(Number(portion.bips) / 100).toFixed(2)}%`, recipient: portion.recipient })); netMinimum = guaranteedNetMinimum(decoded.program) }
+    } catch { program = ''; portions = null }
+  }
+  const feeToOthers = portions !== null && portions.length > 0
   return <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="uniswap-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
-      <h2 id="uniswap-review-title" className="text-xl font-semibold">Review Uniswap Swap</h2>
-      <p className="text-xs text-slate-600">{SWAP_EXECUTION.mode === 'pilot' ? 'Controlled pilot · USDC → EURC · maximum 0.1 USDC input.' : 'Arc Mainnet · exact-input swap through the Uniswap Universal Router.'}</p>
+      <h2 id="uniswap-review-title" className="text-xl font-semibold">Review Uniswap swap</h2>
       {review && inp && out && <>
-        <p>{review.request.amount} {review.request.tokenIn} → estimated {formatUnits(BigInt(review.estimatedOutput), out.decimals)} {review.request.tokenOut}</p>
+        <p>You pay {review.request.amount} {review.request.tokenIn} and receive about {formatUnits(BigInt(review.estimatedOutput), out.decimals)} {review.request.tokenOut}.</p>
         <dl className="space-y-2 text-sm">
-          <ReviewLine label="Route" value={review.route ?? `${review.request.tokenIn} → ${review.request.tokenOut} (Uniswap Trading API)`} />
-          <ReviewLine label="Minimum receive" value={`${formatUnits(BigInt(review.requiredMinimum), out.decimals)} ${review.request.tokenOut}`} />
-          <ReviewLine label="Slippage" value={`${review.request.slippageBps / 100}%`} />
-          <ReviewLine label="Network fee ceiling" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
-          {nativeIn
-            ? <ReviewLine label="Total USDC ceiling" value={formatUnits(reviewValue(review) + BigInt(review.networkFee), 18)} />
-            : <ReviewLine label={`${review.request.tokenIn} spent`} value={`${formatUnits(tokenUnits(review.request.amount, inp.decimals), inp.decimals)} ${review.request.tokenIn}`} />}
-          <ReviewLine label="Network" value="Arc Mainnet · 5042" />
-          <ReviewLine label="Recipient" value={review.request.recipient} />
-          <ReviewLine label="Router" value={ARC_ROUTER} />
-          <ReviewLine label="Review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />
-          <ReviewLine label="Transaction deadline" value={`${new Date(executionDeadlineMs(review)).toISOString().slice(11, 19)} UTC`} />
+          <ReviewLine label="You pay" value={`${review.request.amount} ${review.request.tokenIn}`} />
+          <ReviewLine label="You receive (estimate)" value={`${formatUnits(BigInt(review.estimatedOutput), out.decimals)} ${review.request.tokenOut}`} />
+          <ReviewLine label="Minimum you receive" value={`${formatUnits(BigInt(review.requiredMinimum), out.decimals)} ${review.request.tokenOut}`} />
+          {feeToOthers && (portions ?? []).map(portion => <ReviewLine key={portion.recipient} label="Fee to another address" value={`${portion.percent} of what you receive`} />)}
+          {feeToOthers && netMinimum !== null && <ReviewLine label="Minimum after that fee" value={`${formatUnits(netMinimum, out.decimals)} ${review.request.tokenOut}`} />}
+          <ReviewLine label="Slippage allowed" value={`${review.request.slippageBps / 100}%`} />
+          {poolFees.length > 0 && <ReviewLine label="Pool fee (already in the estimate)" value={poolFees.join(' + ')} />}
+          <ReviewLine label="Network fee (maximum)" value={`${formatUnits(BigInt(review.networkFee), 18)} USDC`} />
+          {nativeIn && <ReviewLine label="Most USDC you could spend" value={`${formatUnits(reviewValue(review) + BigInt(review.networkFee), 18)} USDC`} />}
+          <ReviewLine label="Route" value={review.route ?? `${review.request.tokenIn} → ${review.request.tokenOut}`} />
+          <ReviewLine label="This review expires in" value={`${Math.ceil(remainingMs / 1000)} seconds`} />
         </dl>
-        <p className="text-xs text-slate-600">{nativeIn ? 'Native USDC only. No token approval or Permit2 signature.' : `Your exact ${review.request.tokenIn} approvals are already in place (exact amount, not unlimited). The swap itself needs no further approval.`} Confirm before this review expires. The transaction deadline is capped at two minutes from the quote and never later. The wallet approval window ends 15 seconds earlier to allow inclusion; this buffer is not a guarantee. Cancel an expired wallet request. A late approval or delayed inclusion may revert and still charge gas.</p>
+        {feeToOthers && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">This swap sends part of what you receive to another address, as shown above. Confirm only if you accept this fee.</p>}
+        {portions === null && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">We couldn’t read every detail of this swap. Don’t confirm it; review a fresh swap.</p>}
+        <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked: everything you receive goes to your wallet, and no fee is taken by anyone else.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Your exact approvals are already in place.'} Confirm before this review expires.</p>
+        <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+          <dl className="mt-2 space-y-1">
+            <ReviewLine label="Contract" value={`Uniswap Universal Router · ${ARC_ROUTER}`} />
+            <ReviewLine label="Recipient" value={review.request.recipient} />
+            {program && <ReviewLine label="Program" value={program} />}
+            <ReviewLine label="Gas limit" value={review.gasLimit} />
+            <ReviewLine label="Max fee per gas" value={`${formatUnits(BigInt(review.maxFeePerGas), 9)} gwei`} />
+            <ReviewLine label="Transaction deadline" value={`${new Date(executionDeadlineMs(review)).toISOString().slice(11, 19)} UTC`} />
+            <ReviewLine label="Network" value="Arc Mainnet · 5042" />
+          </dl></details>
       </>}
       <div className="flex gap-3">
         <button type="button" onClick={execution.cancel} className="flex-1 rounded-xl border border-slate-300 px-4 py-3">Cancel</button>
-        <button type="button" onClick={() => { void execution.confirm() }} disabled={view.phase !== 'review' || remainingMs < 5000}
+        <button type="button" onClick={() => { void execution.confirm() }} disabled={view.phase !== 'review' || remainingMs < 5000 || portions === null}
           className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? 'Rechecking…' : remainingMs <= 0 ? 'Review expired' : remainingMs < 5000 ? 'Review expiring' : 'Confirm Swap'}</button>
       </div>
     </div>

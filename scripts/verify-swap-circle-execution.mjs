@@ -335,7 +335,8 @@ function setup(options = {}) {
     const estimated = amountIn * 10n ** BigInt(outT.decimals) / 10n ** BigInt(inT.decimals) * 90n / 100n, minimum = estimated * BigInt(10_000 - request.slippageBps) / 10_000n
     return { request: structuredClone(request), amountIn: amountIn.toString(), estimatedOutput: estimated.toString(), requiredMinimum: minimum.toString(), networkFee: (5n * 10n ** 16n).toString(),
       maxFeePerGas: gwei(30).toString(), maxPriorityFeePerGas: gwei(1).toString(), nativeBalance: (5n * 10n ** 18n).toString(), tokenBalance: (amountIn * 10n).toString(), allowance: '0',
-      fees: [{ type: 'provider', token: request.tokenIn, amount: '0.0002' }], requestStartedAt: now, expiresAt: now + 30_000, route: 'Circle Swap Kit' }
+      fees: [{ type: 'provider', token: request.tokenIn, amount: '0.0002' }], requestStartedAt: now, expiresAt: now + 30_000, route: 'Circle Swap Kit',
+      reference: { source: 'uniswap', estimatedOutput: estimated.toString() } }
   }
   const settleResult = attempt => ({ status: 'settled', output: attempt.review.requiredMinimum, fee: '12000000000000000', approvals: attempt.steps.filter(s => s.kind === 'approve' && s.hash).map(s => ({ index: s.index, status: 'confirmed', fee: '1000000000000000' })),
     chain: { state: 'success', blockNumber: '100', blockHash: '0x' + '11'.repeat(32), gasUsed: '500000', effectiveGasPrice: '21000000000', fee: '11000000000000000', received: attempt.review.requiredMinimum, sent: attempt.review.amountIn, checkedAt: Date.now() },
@@ -396,10 +397,10 @@ function fakeKit(world, clock) {
   } }
 }
 
-await test('source gate: Circle execution is closed by default and without the pilot authorisation; nothing is quoted or recorded', async () => {
-  assert.equal(c.CIRCLE_SWAP_WRITES_ENABLED, false)
-  const f = setup({ ports: { enabled: undefined, authorize: undefined } }); await f.controller.prepare()
-  assert.equal(f.world.quotes, 0); assert.match(f.controller.current().error, /disabled/)
+await test('source gate: Circle execution is open in the source but still needs the build switch and the mode authorisation; without them nothing is quoted or recorded', async () => {
+  assert.equal(c.CIRCLE_SWAP_WRITES_ENABLED, true)
+  const f = setup({ ports: { enabled: () => false } }); await f.controller.prepare()
+  assert.equal(f.world.quotes, 0); assert.match(f.controller.current().error, /switched off/)
   const g2 = setup({ ports: { authorize: undefined } }); await g2.controller.prepare(); assert.equal(g2.world.quotes, 0); assert.match(g2.controller.current().error, /pilot/)
   await g2.controller.confirm('forged'); assert.equal(g2.world.sends.length, 0); assert.equal(g2.data.size, 0)
   const g3 = setup({ ports: { authorize: () => false } }); await g3.controller.prepare(); assert.match(g3.controller.current().error, /pilot/)
@@ -1078,6 +1079,71 @@ await test('the read-only Arc client of the Circle flow refuses every non-read m
   for (const request of [sdk.circleReadClient.request, sdk.circleReadClient.transport.request]) for (const method of ['eth_sendRawTransaction', 'eth_sendTransaction', 'personal_sign', 'eth_signTypedData_v4', 'wallet_switchEthereumChain'])
     await assert.rejects(Promise.resolve().then(() => request({ method, params: [] })), /read_only_rpc/, method)
   assert.equal(external, before); for (const method of ['eth_getStorageAt', 'eth_getTransactionByHash']) c.assertCircleExecutionReadMethod(method)
+})
+// =============================================================================================================================
+// G. Execution completion: independent price, Review-bound fee, outcome simulation (all read-only)
+// =============================================================================================================================
+await test('independent price: a fresh Review without a reference price, or with a guaranteed minimum far below it, is never executable; ordinary venue differences are fine', async () => {
+  const reference = setup(), base = await reference.ports.fresh(reference.input())
+  const mutate = fn => async (request, now) => { const review = await reference.ports.fresh(request); review.requestStartedAt = now; review.expiresAt = now + 30_000; fn(review); return review }
+  const noReference = setup({ fresh: mutate(r => { delete r.reference }) }); await noReference.controller.prepare()
+  assert.equal(noReference.controller.current().phase, 'idle'); assert.match(noReference.controller.current().error, /independent price check could not be completed/); assert.equal(noReference.world.sends.length, 0)
+  const estimated = BigInt(base.estimatedOutput), minimum = BigInt(base.requiredMinimum)
+  const edge = c.CIRCLE_REFERENCE_TOLERANCE_BPS
+  // the reference must not be more than slippage + tolerance above the guaranteed minimum
+  const justOk = minimum * 10_000n / BigInt(10_000 - 50 - edge) // reference at which minimum is exactly at the floor
+  for (const [name, referenceOutput, ok] of [['equal to Circle', estimated, true], ['2% above Circle', estimated * 102n / 100n, true], ['at the floor', justOk, true], ['1 unit past the floor', justOk + 2n, false], ['10% above Circle', estimated * 110n / 100n, false], ['zero', 0n, false]]) {
+    const f = setup({ fresh: mutate(r => { r.reference = { source: 'uniswap', estimatedOutput: referenceOutput.toString() } }) }); await f.controller.prepare()
+    assert.equal(f.controller.current().phase, ok ? 'review' : 'idle', `${name}: ${f.controller.current().error}`)
+    if (!ok) assert.match(f.controller.current().error, name === 'zero' ? /independent price check/ : /well below the independent market price/)
+  }
+  assert.throws(() => c.independentPriceCheck({ ...base, reference: { source: 'other', estimatedOutput: '1' } }), /price_check/)
+  assert.doesNotThrow(() => c.validateCircleReview({ ...base, reference: undefined }, { owner, connected: true, chainId: 5042 }, base.requestStartedAt)) // stored records do not carry one
+  assert.throws(() => c.validateCircleReview({ ...base, reference: { source: 'other', estimatedOutput: '1' } }, { owner, connected: true, chainId: 5042 }, base.requestStartedAt), /invalid_request/)
+})
+await test('review building: the reference is read independently, a failing reference read leaves the Review without one, and the real Uniswap reference converts to base units', async () => {
+  const sdk = require(`${root}src/lib/swap/circleSdk.ts`)
+  const quote = { requestKey: 'k', estimatedOutput: '0.9', minimumOutput: '0.8955', fees: [{ type: 'provider', token: 'EURC', amount: '0.0002' }], receivedAt: NOW_MS, expiresAt: NOW_MS + 30_000 }
+  const deps = over => ({ quote: async () => quote, facts: async () => ({ nativeBalance: 5n * 10n ** 18n, tokenBalance: 10n ** 20n, allowance: 0n, gasPrice: gwei(20), baseFee: gwei(20) }), now: () => NOW_MS, ...over })
+  const request = { chainId: 5042, tokenIn: 'EURC', tokenOut: 'USDC', owner, amount: '1', slippageBps: 50, allowanceStrategy: 'approve' }
+  const withReference = await sdk.buildCircleReview(request, deps({ reference: async () => '0.905' })); assert.deepEqual(withReference.reference, { source: 'uniswap', estimatedOutput: '905000' })
+  const failing = await sdk.buildCircleReview(request, deps({ reference: async () => { throw Error('rpc down') } })); assert.equal(failing.reference, undefined)
+  assert.equal((await sdk.buildCircleReview(request, deps({ reference: async () => null }))).reference, undefined)
+})
+await test('Review-bound fee: the provider fee in the transaction may not exceed the fee the Review showed (rounding aside); real swaps and the real service agree to the unit', () => {
+  const real = realSwaps.find(r => r.tokenIn === 'EURC' && r.call.instructions.length === 2), nowSec = Number(real.call.deadline) - 590
+  const fee = real.call.instructions.filter(i => i.tokenOut === ZERO).reduce((sum, i) => sum + i.amountToApprove, 0n)
+  assert.equal(d.checkSwapCalldata(real.v.tx.input, { ...real.intent, maxFeeUnits: fee }, nowSec).feeUnits, fee)
+  assert.equal(d.checkSwapCalldata(real.v.tx.input, { ...real.intent, maxFeeUnits: fee }, nowSec).ok, true)
+  const tooSmall = d.checkSwapCalldata(real.v.tx.input, { ...real.intent, maxFeeUnits: fee / 2n }, nowSec); assert.equal(tooSmall.ok, false); assert.equal(tooSmall.code, 'fee_share'); assert.match(tooSmall.detail, /larger fee than the fee shown in the Review/)
+  assert.equal(d.checkSwapCalldata(real.v.tx.input, { ...real.intent, maxFeeUnits: fee - 1n }, nowSec).ok, true) // one unit of rounding is tolerated
+  assert.equal(c.providerFeeUnits({ request: { tokenIn: 'EURC' }, fees: [{ type: 'provider', token: 'EURC', amount: '0.0002' }, { type: 'gas', token: 'USDC', amount: '0.02' }] }), 200n)
+  assert.equal(c.providerFeeUnits({ request: { tokenIn: 'EURC' }, fees: [{ type: 'provider', token: 'USDC', amount: '0.0002' }] }), undefined) // a fee in another token is not a bound for this one
+  const f = guardFixture({ policy: { maxFeeUnits: 150n } }); // the synthetic service call carries amountIn / 5000 = 200 units of fee; 1% + 1 unit of rounding is tolerated
+  return (async () => { await f.wallet.sendTransaction(f.approve()); await refused(f.wallet.sendTransaction(f.swap()), 'swap_calldata'); const ok = guardFixture({ policy: { maxFeeUnits: 200n } }); await ok.wallet.sendTransaction(ok.approve()); await ok.wallet.sendTransaction(ok.swap()); assert.equal(ok.log.find(e => e[0] === 'gate' && e[1] === 'swap') !== undefined, true) })()
+})
+await test('outcome simulation: an approval-strategy swap is run against the live adapter first; a shortfall, an overspend or an unreadable run stops it before the wallet; the approval stays tracked', async () => {
+  const seen = []
+  const ok = setup({ ports: { simulate: async (who, data, tokenIn, tokenOut) => { seen.push({ who, tokenIn, tokenOut, data }); const review = ok.records()[0].review; return { received: BigInt(review.requiredMinimum), spent: BigInt(review.amountIn) } } } })
+  await ok.run(await ok.review()); assert.equal(ok.controller.current().phase, 'pending'); assert.equal(ok.world.sends.length, 2); assert.equal(seen.length, 1)
+  assert.equal(seen[0].who, owner); assert.equal(seen[0].tokenIn.toLowerCase(), T('EURC').address.toLowerCase()); assert.equal(seen[0].tokenOut.toLowerCase(), T('USDC').address.toLowerCase()); assert.equal(seen[0].data.slice(0, 10), d.ADAPTER_EXECUTE_SELECTOR)
+  for (const [name, simulate] of [['shortfall', async () => ({ received: 1n, spent: 1_000_000n })], ['overspend', async () => ({ received: 10n ** 12n, spent: 1_000_001n })], ['unreadable', async () => { throw Error('rpc') }]]) {
+    const f = setup({ ports: { simulate } }); await f.run(await f.review())
+    assert.equal(f.world.sends.length, 1, name) // the approval went out, the swap never reached the wallet
+    assert.match(f.controller.current().error ?? '', /test run of this exact swap|Approval confirmed|swap was not requested/i, name)
+    assert.ok(!f.world.sends.some(send => send.to.toLowerCase() === ADAPTER.toLowerCase()), name)
+  }
+  // a permit swap has no such run (its signature belongs to the wallet); it is covered by the estimate and the on-chain check
+  let called = 0; const permit = setup({ tokenIn: 'USDC', tokenOut: 'EURC', ports: { simulate: async () => { called++; return { received: 0n, spent: 0n } } } }); await permit.run(await permit.review())
+  assert.equal(called, 0); assert.equal(permit.world.sends.length, 1)
+})
+await test('outcome simulation, read side: the wallet address carries the helper only inside one eth_call and the helper reports how the balances moved', async () => {
+  const sim = require(`${root}src/lib/swap/simulatorCode.ts`), calls = []
+  const rpc = { call: async args => { calls.push(args); return { data: encodeAbiParameters(parseAbiParameters('(uint256 inBefore,uint256 inAfter,uint256 outBefore,uint256 outAfter,uint256 gasUsed) r'), [{ inBefore: 5_000_000n, inAfter: 4_000_000n, outBefore: 7n, outAfter: 1_119_610n, gasUsed: 566_804n }]) } } }
+  const outcome = await c.createCircleChainRpc(rpc, () => 1).simulate(owner, '0xaa3e079c', T('EURC').address, T('USDC').address)
+  assert.deepEqual(outcome, { received: 1_119_603n, spent: 1_000_000n }); const call = calls[0]
+  assert.equal(call.to, owner); assert.equal(call.stateOverride.length, 1); assert.equal(call.stateOverride[0].address, owner); assert.equal(call.stateOverride[0].code, sim.SIMULATOR_RUNTIME); assert.equal(call.value, undefined)
+  await assert.rejects(c.createCircleChainRpc({ call: async () => ({ data: undefined }) }, () => 1).simulate(owner, '0xaa3e079c', T('EURC').address, T('USDC').address))
 })
 await test('Circle messages for the new states exist and say what happened', () => {
   for (const code of ['sdk_stalled', 'permit_failed', 'closed_before_wallet', 'recovery_unknown', 'replaced']) assert.notEqual(c.circleSwapMessage(code), c.circleSwapMessage('preflight'), code)

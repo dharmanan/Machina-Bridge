@@ -2,7 +2,7 @@
 // for it: it asks the GUARDED wallet for the same steps the real SDK does (an exact approval or a permit signature, then the adapter swap),
 // so the controller, the guard and the screen are exercised for real. Nothing here is trusted by the application.
 import { encodeAbiParameters, encodeFunctionData, parseAbiParameters, parseUnits } from 'viem'
-import { ADAPTER_ABI, CIRCLE_ADAPTER, CIRCLE_ADAPTER_CODEHASH, CIRCLE_ADAPTER_IMPLEMENTATION, CIRCLE_ADAPTER_IMPLEMENTATION_CODEHASH, CIRCLE_FEE_TARGET, CIRCLE_SWAP_EXECUTOR, PERMIT_TYPES, encodeApprove } from '../../../src/lib/swap/circleAdapterDecode'
+import { ADAPTER_ABI, CIRCLE_ADAPTER, CIRCLE_ADAPTER_CODEHASH, CIRCLE_ADAPTER_IMPLEMENTATION, CIRCLE_ADAPTER_IMPLEMENTATION_CODEHASH, CIRCLE_FEE_TARGET, CIRCLE_SWAP_EXECUTOR, PERMIT_TYPES, decodeAdapterExecute, encodeApprove } from '../../../src/lib/swap/circleAdapterDecode'
 import { SWAP_SYMBOLS, swapToken } from '../../../src/lib/swap/tokens'
 
 const ZERO = '0x0000000000000000000000000000000000000000'
@@ -41,6 +41,14 @@ export function fakeCircleSdk(wallet: FakeWallet) {
   return { kit, adapter: { wallet } }
 }
 // The real chain reads against the controlled RPC, except that the adapter's code hash and implementation are reported as the pinned ones (there is no real adapter code in a test RPC).
+// The outcome simulation of the exact adapter calldata runs the real adapter, which a test RPC does not have (the hermetic Circle suite and the
+// read-only live probe cover that path). The double reports what the controlled receipts of this suite also show: the minimum plus 0.5% received, the exact input spent.
 export function fakeCircleChainRpc<T extends { preflight(review: never): Promise<Record<string, unknown>> }>(real: T): T {
-  return { ...real, async preflight(review: never) { return { ...(await real.preflight(review)), adapterCodeHash: CIRCLE_ADAPTER_CODEHASH, adapterImplementation: CIRCLE_ADAPTER_IMPLEMENTATION, implementationCodeHash: CIRCLE_ADAPTER_IMPLEMENTATION_CODEHASH } } } as T
+  return { ...real,
+    async preflight(review: never) { return { ...(await real.preflight(review)), adapterCodeHash: CIRCLE_ADAPTER_CODEHASH, adapterImplementation: CIRCLE_ADAPTER_IMPLEMENTATION, implementationCodeHash: CIRCLE_ADAPTER_IMPLEMENTATION_CODEHASH } },
+    async simulate(_owner: `0x${string}`, data: `0x${string}`) {
+      const decoded = decodeAdapterExecute(data); if (!decoded.ok) throw new Error('not an adapter swap')
+      const swap = decoded.call.instructions.find(item => item.tokenOut !== ZERO)!, input = decoded.call.tokenInputs[0]
+      return { received: (swap.minTokenOut * 1005n) / 1000n, spent: input.amount }
+    } } as T
 }

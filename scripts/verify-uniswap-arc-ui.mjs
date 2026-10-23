@@ -58,7 +58,8 @@ const prepare = service.createArcPreviewService({ now: Date.now, client: {
   raw.isTokenApprovalApplicable = false; raw.permitData = null
   return Response.json(raw)
 } })
-const server = await createServer({ configFile: false, root, cacheDir: `${root}.verification/vite-ui-cache`, server: { host: '127.0.0.1', port: 0 }, plugins: [uniswapArcDevPreview(), {
+// This suite covers the Trading-API preview route, which is the route of the explicit pilot build (the default build quotes on chain, keyless; see verify-swap-unified-ui.mjs).
+const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_SWAP_EXECUTION_MODE': JSON.stringify('pilot') }, cacheDir: `${root}.verification/vite-ui-cache`, server: { host: '127.0.0.1', port: 0 }, plugins: [uniswapArcDevPreview(), {
   name: 'controlled-circle-estimator', enforce: 'pre', transform(code, id) {
     if (id.split('?')[0] !== `${root}src/lib/mainnetSwap.ts`) return
     return code.replace('export function readMainnetSwapQuote(', 'function originalReadMainnetSwapQuote(') + `
@@ -151,7 +152,7 @@ try {
   async function change(value = '1') { await amount.fill(''); await amount.fill(value); await advance() }
   async function success(symbol = 'EURC') {
     mode = 'normal'; await page.getByRole('combobox', { name: 'To token' }).selectOption(symbol)
-    await change(); await page.getByText(/Read-only simulation passed/).waitFor()
+    await change(); await page.getByText(/Estimate only\./).waitFor()
   }
   await test('single Swap screen removes manual quote buttons and keeps default pilot disabled', async () => {
     await page.getByRole('heading', { name: 'Swap', exact: true }).waitFor()
@@ -169,7 +170,7 @@ try {
     const circleBefore = circleCalls
     await amount.fill('0.'); await advance(250); await amount.fill('0.1'); await advance(250); await amount.fill('0.12')
     await advance(600); assert.equal(apiCalls, 0)
-    await advance(150); await page.getByText(/Read-only simulation passed/).waitFor()
+    await advance(150); await page.getByText(/Estimate only\./).waitFor()
     assert.equal(apiCalls, 1); assert.equal(requests.at(-1).input.amount, '0.12')
     assert.equal(circleCalls - circleBefore, 1) // both providers are quoted for comparison, each once for the last amount
   })
@@ -182,9 +183,9 @@ try {
   })
   await test('slippage changes automatically fetch the selected quote; Uniswap slippage values Circle does not offer are said so, never replaced', async () => {
     await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('100'); await noReceive(); await advance()
-    await page.getByText(/Read-only simulation passed/).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 100)
+    await page.getByText(/Estimate only\./).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 100)
     await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('10'); await noReceive(); await advance()
-    await page.getByText(/Read-only simulation passed/).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 10)
+    await page.getByText(/Estimate only\./).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 10)
     await page.getByText(/Circle Swap Kit does not offer 0\.1% slippage/).waitFor()
     await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('300'); await noReceive()
     await page.getByText(/Uniswap does not offer 3% slippage/).waitFor()
@@ -195,13 +196,13 @@ try {
     for (let i = 0; i < 50 && !held; i++) await page.waitForTimeout(20)
     assert.ok(held); await page.getByText('Updating price…', { exact: true }).first().waitFor()
     const before = apiCalls; await amount.fill('0.2'); await noReceive(); held(); mode = 'normal'
-    await advance(); await page.getByText(/Read-only simulation passed/).waitFor()
+    await advance(); await page.getByText(/Estimate only\./).waitFor()
     assert.equal(requests.at(-1).input.amount, '0.2'); assert.equal(apiCalls, before + 1)
   })
   await test('automatic requests are paced at least 2.5 seconds apart', async () => {
     await success(); const before = apiCalls
     await amount.fill('0.3'); await advance(750); assert.equal(apiCalls, before)
-    await advance(1800); await page.getByText(/Read-only simulation passed/).waitFor(); assert.equal(apiCalls, before + 1)
+    await advance(1800); await page.getByText(/Estimate only\./).waitFor(); assert.equal(apiCalls, before + 1)
   })
   await test('automatic pricing preserves server-clock freshness with browser clocks ahead or behind', async () => {
     for (const skew of [-60000, 60000, -3600000, 3600000]) {
@@ -234,15 +235,15 @@ try {
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
     const before = apiCalls; await amount.fill('0.1'); await advance(10000); assert.equal(apiCalls, before)
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')) })
-    await advance(); await page.getByText(/Read-only simulation passed/).waitFor(); assert.equal(apiCalls, before + 1)
+    await advance(); await page.getByText(/Estimate only\./).waitFor(); assert.equal(apiCalls, before + 1)
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')) })
     await advance(10000); assert.equal(apiCalls, before + 1); await noReceive()
   })
   await test('both providers are quoted for comparison; selecting Circle only changes the selected provider, and amount/slippage changes refresh both', async () => {
     const before = apiCalls; await page.getByRole('radio', { name: 'Circle Swap Kit quote' }).click(); await advance()
-    await page.getByText(/Quote available. Local freshness/).waitFor(); assert.equal(await receiveText(), '0.2'); assert.equal(apiCalls, before)
-    const calls = circleCalls; await amount.fill('0.2'); await advance(); await page.getByText(/Quote available. Local freshness/).waitFor()
+    await page.getByText(/Estimate only\./).waitFor(); assert.equal(await receiveText(), '0.2'); assert.equal(apiCalls, before)
+    const calls = circleCalls; await amount.fill('0.2'); await advance(); await page.getByText(/Estimate only\./).waitFor()
     assert.equal(circleCalls, calls + 1); assert.equal(await receiveText(), '0.4'); assert.equal(apiCalls, before + 1) // both providers refresh for a new amount
     await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('100'); await advance()
     assert.equal(circleCalls, calls + 2); assert.equal(apiCalls, before + 2)
@@ -251,19 +252,19 @@ try {
     circleMode = 'held'; circleHeld = undefined; await change('0.1')
     for (let i = 0; i < 50 && !circleHeld; i++) await page.waitForTimeout(20)
     assert.ok(circleHeld); await amount.fill('0.3'); await noReceive(); circleMode = 'normal'; circleHeld()
-    await advance(); await page.getByText(/Quote available. Local freshness/).waitFor(); assert.equal(await receiveText(), '0.6')
+    await advance(); await page.getByText(/Estimate only\./).waitFor(); assert.equal(await receiveText(), '0.6')
     circleMode = 'error'; await change('0.1'); await page.getByText(/No quote from this provider/).first().waitFor()
     const before = circleCalls; await advance(60000); assert.equal(circleCalls, before)
     circleMode = 'normal'
   })
   await test('non-USDC pairs (WETH to EURC) are accepted as chosen, auto-quote, and execution stays disabled in the pilot build', async () => {
     await page.getByRole('combobox', { name: 'From token' }).selectOption('WETH'); await change('0.1')
-    await page.getByText(/Quote available. Local freshness/).waitFor(); assert.equal(await page.getByRole('combobox', { name: 'To token' }).inputValue(), 'EURC') // no silent fallback to a USDC leg
+    await page.getByText(/Estimate only\./).waitFor(); assert.equal(await page.getByRole('combobox', { name: 'To token' }).inputValue(), 'EURC') // no silent fallback to a USDC leg
     assert.equal(await page.getByRole('button', { name: 'Review Swap', exact: true }).isDisabled(), true)
   })
   await test('wallet changes invalidate amounts and disconnect never queries', async () => {
     await page.evaluate(() => window.uniswapUiTest.account(true)); await noReceive(); await advance()
-    await page.getByText(/Quote available. Local freshness/).waitFor()
+    await page.getByText(/Estimate only\./).waitFor()
     await page.evaluate(() => window.uniswapUiTest.disconnect()); await noReceive()
     const before = apiCalls + circleCalls; await amount.fill('0.2'); await advance(10000); assert.equal(apiCalls + circleCalls, before)
   })

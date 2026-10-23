@@ -316,7 +316,7 @@ await test('disconnected DOM keeps quote and execution controls disabled', () =>
 await test('wrong-network DOM is explicit and cannot request a quote', () => {
   wallet = { isConnected: true, chainId: 1, address }
   const html = renderSwap()
-  assert.match(html, /Select Arc Mainnet \(chain ID 5042\)/)
+  assert.match(html, /Switch your wallet to Arc Mainnet to get a quote/)
   assert.doesNotMatch(html, />Get quote|>Refresh quote/)
 })
 await test('Arc wallet DOM shows independent native USDC balance without claiming execution capacity', () => {
