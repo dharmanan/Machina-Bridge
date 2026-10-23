@@ -14,7 +14,7 @@ import { SWAP_EXECUTION } from '../config/swapExecution'
 import { plainMessage } from '../lib/swap/userMessages'
 import { PlainMessage } from './PlainMessage'
 import { ARC_ROUTER, ARC_INPUT_CAPS } from '../lib/uniswapArcPolicy'
-import { CIRCLE_NO_ROUTE_MESSAGE, decimalUnits } from '../lib/mainnetSwap'
+import { decimalUnits } from '../lib/mainnetSwap'
 import { exchangeRate, shortenAmount } from '../lib/swapDisplay'
 import { useSwapAutoQuote } from './useSwapAutoQuote'
 import { NATIVE_SWAP_FEE_RESERVE, swapShortcutAmount } from '../lib/swapAmountShortcuts'
@@ -23,6 +23,8 @@ import { executionChip, swapExecutionRestriction } from '../lib/swap/executionMo
 import { approvalActivity, circleActivity, splitActivity, storedApprovalActivity, storedCircleActivity, storedSwapActivity, swapActivity, type ActivityItem } from '../lib/swap/activity'
 import { CIRCLE_SWAP_WRITES_ENABLED, validateCircleRequest, type CircleSwapRequest } from '../lib/swap/circleSwap'
 import { executionInBuild, supportFor } from '../lib/swap/support'
+import { APPROVAL_FEE_CEILING } from '../lib/swap/uniswapApprovals'
+import { circleFeeCeiling } from '../lib/swap/circleSwap'
 
 type Provider = 'uniswap' | 'circle'
 const PROVIDER_NAME: Record<Provider, string> = { uniswap: 'Uniswap', circle: 'Circle Swap Kit' }
@@ -34,7 +36,7 @@ const CHIP_CLASS = { live: 'border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C]', pi
 
 interface ProviderQuote {
   provider: Provider; state: 'idle' | 'loading' | 'quoted' | 'error' | 'unsupported'
-  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; route?: string; expiresIn?: number; message?: string
+  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; otherFees?: string; route?: string; expiresIn?: number; message?: string
 }
 
 export default function MainnetSwapScreen() {
@@ -44,12 +46,17 @@ export default function MainnetSwapScreen() {
   const [amount, setAmount] = useState('')
   const [slippageChoice, setSlippageChoice] = useState(DEFAULT_SLIPPAGE_BPS)
   const [provider, setProvider] = useState<Provider>('uniswap')
-  // Choosing a provider asks that provider for a fresh price (its quote may have expired while the other was selected).
+  const [showActivity, setShowActivity] = useState(false)
+  // Keep a still-current price when selecting a provider. Missing/expired prices may be requested again;
+  // Review always obtains its own independent quote and never treats this comparison as transaction authority.
   const [selectionEpoch, setSelectionEpoch] = useState<Record<Provider, number>>({ uniswap: 0, circle: 0 })
   // A fresh start of a swap that certainly did not happen: the same pair, amount and provider are set up again. Nothing is sent; the user
   // reviews the swap anew (fresh quote, fresh checks) and confirms it again.
   const [retried, setRetried] = useState<string | null>(null)
-  const choose = (id: Provider) => { if (id !== provider) { setProvider(id); setSelectionEpoch(epoch => ({ ...epoch, [id]: epoch[id] + 1 })) } }
+  const choose = (id: Provider) => { if (id !== provider) {
+    setProvider(id)
+    if (!['quoted', 'loading'].includes(quotes[id].state)) setSelectionEpoch(epoch => ({ ...epoch, [id]: epoch[id] + 1 }))
+  } }
 
   const slippageBps = ALL_SLIPPAGE_BPS.includes(slippageChoice) ? slippageChoice : DEFAULT_SLIPPAGE_BPS
   const uniswapOffers = SLIPPAGE_BPS.uniswap.includes(slippageBps), circleOffers = SLIPPAGE_BPS.circle.includes(slippageBps)
@@ -115,9 +122,10 @@ export default function MainnetSwapScreen() {
   const walletReady = isConnected && chainId === 5042
   const uniswapQuote: ProviderQuote = !uniswapOffers ? { provider: 'uniswap', state: 'unsupported', message: `Uniswap does not offer ${slippageBps / 100}% slippage. Choose 0.1%, 0.5% or 1%.` }
     : uniswap.current ? { provider: 'uniswap', state: 'quoted', estimatedUnits: BigInt(uniswap.current.estimatedOutput), estimated: formatUnits(BigInt(uniswap.current.estimatedOutput), outDecimals), minimum: formatUnits(BigInt(uniswap.current.requiredMinimum), outDecimals),
-      fee: `${formatUnits(BigInt(uniswap.current.networkFee), 18)} USDC ceiling`, route: uniswap.current.route ?? `${tokenIn} → ${tokenOut} (Uniswap Trading API)`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
+      fee: `${formatUnits(BigInt(uniswap.current.networkFee) + (tokenIn === 'USDC' ? 0n : APPROVAL_FEE_CEILING * BigInt(approvals.plan.state === 'needed' ? approvals.plan.steps.length : approvals.plan.state === 'complete' ? 0 : 2)), 18)} USDC`,
+      otherFees: 'Pool fees included in price', route: uniswap.current.route ?? `${tokenIn} → ${tokenOut}`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
       : uniswap.loading ? { provider: 'uniswap', state: 'loading' } : uniswap.error ? { provider: 'uniswap', state: 'error', message: uniswap.error }
-        : uniswap.expired ? { provider: 'uniswap', state: 'error', message: 'Quote expired. Change the amount or settings for a new price.' } : { provider: 'uniswap', state: 'idle' }
+        : uniswap.expired ? { provider: 'uniswap', state: 'error', message: 'Quote expired. Check the price again before continuing.' } : { provider: 'uniswap', state: 'idle' }
   let circleQuote: ProviderQuote
   if (!circleOffers) circleQuote = { provider: 'circle', state: 'unsupported', message: `Circle Swap Kit does not offer ${slippageBps / 100}% slippage. Choose 0.5%, 1% or 3%.` }
   else if (circle.quote) {
@@ -125,12 +133,13 @@ export default function MainnetSwapScreen() {
     const text = (fee: { amount: string | null; token: string }) => (fee.amount === null ? 'not estimated' : `${fee.amount} ${fee.token}`)
     let units: bigint | undefined
     try { units = decimalUnits(quote.estimatedOutput, outDecimals) } catch { units = undefined }
+    const gasEstimate = gas.length > 0 && gas.every(fee => fee.amount !== null) ? gas.reduce((sum, fee) => sum + decimalUnits(fee.amount, 18), 0n) : null
     circleQuote = { provider: 'circle', state: 'quoted', estimated: quote.estimatedOutput, estimatedUnits: units, minimum: quote.minimumOutput,
-      fee: [...gas.map(fee => `gas ${text(fee)}`), ...other.map(fee => `${fee.type} ${text(fee)}`)].join(' · ') || 'not reported',
+      fee: `${formatUnits(circleFeeCeiling(gasEstimate), 18)} USDC`, otherFees: other.map(fee => text(fee)).join(' · ') || 'Not reported',
       route: 'Circle Swap Kit router', expiresIn: Math.max(0, Math.ceil((quote.expiresAt - circle.now) / 1000)) }
   } else if (circle.loading) circleQuote = { provider: 'circle', state: 'loading' }
-  else if (circle.error) circleQuote = { provider: 'circle', state: 'error', message: circle.error === CIRCLE_NO_ROUTE_MESSAGE ? 'Circle cannot provide a quote for this amount.' : circle.error }
-  else if (circle.expired) circleQuote = { provider: 'circle', state: 'error', message: 'Quote expired. Change the amount or settings for a new price.' }
+  else if (circle.error) circleQuote = { provider: 'circle', state: 'error', message: circle.error }
+  else if (circle.expired) circleQuote = { provider: 'circle', state: 'error', message: 'Quote expired. Check the price again before continuing.' }
   else circleQuote = { provider: 'circle', state: 'idle' }
   const quotes: Record<Provider, ProviderQuote> = { uniswap: uniswapQuote, circle: circleQuote }
   const best: Provider | null = uniswapQuote.estimatedUnits !== undefined && circleQuote.estimatedUnits !== undefined && uniswapQuote.estimatedUnits !== circleQuote.estimatedUnits
@@ -169,11 +178,22 @@ export default function MainnetSwapScreen() {
   // One wallet, one open transaction: an unresolved swap of the other provider (or an approval) holds a new Review.
   const heldByOther = Boolean(address) && (provider === 'uniswap' ? other.current.circle(address ?? '') : other.current.uniswap(address ?? ''))
   const reviewBlocked = active_.restrictionMessage ?? (heldByOther ? 'Another swap or approval from this wallet is still being verified. You can start a new swap once it is done.'
-    : provider === 'uniswap' && uniswap.request && erc20Input && !approvalsReady ? 'Approve this exact amount first, then review the swap.' : null)
+    : null)
   const hasRequest = provider === 'uniswap' ? Boolean(uniswap.request) : Boolean(circleRequest)
   const canReview = hasRequest && !(provider === 'uniswap' ? uniswap.loading : circle.loading) && active_.enabled && (provider === 'circle' || approvalsReady) && !executionBusy && !heldByOther &&
     !(provider === 'uniswap' ? approvals.blocking(address ?? '') : false)
   const busyPhase = ['preparing', 'checking', 'awaiting_step', 'awaiting_wallet', 'pending', 'unknown'].includes(active_.view.phase)
+  const needsApproval = provider === 'uniswap' && erc20Input && approvals.plan.state === 'needed'
+  const canApprove = needsApproval && execution.enabled && uniswapAllowed && hasRequest && !executionBusy && !heldByOther && !approvals.blocking(address ?? '')
+  const canRetryPrice = hasRequest && selected.state === 'error' && walletReady && !circle.insufficientBalance && !executionBusy && !busyPhase && !heldByOther
+  const canContinue = (selected.state === 'quoted' && (canReview || canApprove) && !busyPhase) || canRetryPrice
+  const primaryLabel = executionBusy ? 'Preparing…' : canRetryPrice ? 'Check price again' : needsApproval ? `Approve ${tokenIn} · ${approvals.plan.state === 'needed' ? approvals.plan.steps.length : ''} ${approvals.plan.state === 'needed' && approvals.plan.steps.length === 1 ? 'step' : 'steps'}` : 'Review Swap'
+  function continueSwap() {
+    if (!canContinue) return
+    if (canRetryPrice) { setSelectionEpoch(epoch => ({ ...epoch, [provider]: epoch[provider] + 1 })); return }
+    setShowActivity(true)
+    void (needsApproval ? approvals.prepare() : active_.prepare())
+  }
 
   // --- transactions: one panel for swaps and approvals, built from this browser's records ---------------------------------------
   // The wording of a mismatch lives in the card's own headline and Review lines, so its generic error text is not repeated.
@@ -190,6 +210,7 @@ export default function MainnetSwapScreen() {
     items.push(item); if (!activeKey || item.createdAt >= (items.find(x => x.key === activeKey)?.createdAt ?? 0)) activeKey = item.key
   }
   const { latest, earlier } = splitActivity(items, activeKey, address)
+  const activityUnreadable = execution.historyError || circleExecution.historyError || [...execution.stored, ...approvals.stored, ...circleExecution.stored].some(history => history.unreadable)
   const formKey = [provider, tokenIn, tokenOut, amount].join(':')
   const retryItem = (item: ActivityItem) => {
     if (!item.again) return
@@ -207,8 +228,7 @@ export default function MainnetSwapScreen() {
         <h1 id="swap-title" className="text-3xl font-bold text-slate-900">Swap</h1>
         <span aria-label="Swap mode" className={`rounded-full border px-3 py-1 text-sm font-medium ${CHIP_CLASS[chip.tone]}`}>{chip.label}</span>
       </header>
-      <p className="text-sm text-slate-600">{chip.tone === 'quotes' ? 'Arc Mainnet · live quotes from both providers. Swaps, approvals and signatures are not available for this route in this build.'
-        : 'Arc Mainnet · Review and confirm before a wallet transaction is requested. Approvals, when needed, are exact and confirmed one at a time.'}</p>
+      <p className="text-sm text-slate-500">Arc Mainnet{chip.tone === 'quotes' ? ' · Quotes only in this build' : ' · You confirm every wallet step'}</p>
       <div className="space-y-2 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6">
         <div className="space-y-2 rounded-2xl bg-slate-50 p-4">
           <div className="flex items-baseline justify-between gap-3 text-sm text-slate-500">
@@ -227,12 +247,10 @@ export default function MainnetSwapScreen() {
               disabled={!arcReady || shortcutBusy}
               className="flex-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-medium disabled:opacity-40">{percent === 100 ? 'MAX' : `${percent}%`}</button>)}
           </div>
-          <div className="min-h-[2.25rem] space-y-1 text-xs text-slate-500">
+          <div className="space-y-1 text-xs text-slate-500">
             {shortcutBusy && <p role="status">Checking current token balance…</p>}
             {shortcutError?.context === selection.current && <p role="status" className="text-amber-800">{shortcutError.message}</p>}
-            {tokenIn === 'USDC' && <p>MAX reserves 0.1 USDC for the worst-case network fee. This is a budget, not the charged fee.</p>}
-            {gasBalanceText && <p>Network fees are paid in USDC. Your USDC balance: {gasBalanceText}.</p>}
-            <p>Shortcuts and manual entry are limited to {formatUnits(inputCap, inDecimals)} {tokenIn} per swap{pilotRoute ? ' (controlled pilot)' : ''}.</p>
+            <p>Limit {formatUnits(inputCap, inDecimals)} {tokenIn}{pilotRoute ? ' · Pilot' : ''}{tokenIn === 'USDC' ? ' · MAX keeps 0.1 USDC for fees' : gasBalanceText ? ` · Gas balance ${gasBalanceText}` : ''}</p>
           </div>
         </div>
         <div className="flex justify-center">
@@ -253,27 +271,26 @@ export default function MainnetSwapScreen() {
         </div>
 
         <fieldset className="space-y-2 pt-2">
-          <legend className="text-sm font-medium text-slate-600">Compare providers</legend>
-          <div role="radiogroup" aria-label="Quote source" className="grid gap-2">
+          <legend className="text-sm font-medium text-slate-600">Choose your price <span className="text-xs font-normal text-slate-400">· before network fees</span></legend>
+          <div role="radiogroup" aria-label="Quote source" className="grid gap-2 sm:grid-cols-2">
             {(['uniswap', 'circle'] as Provider[]).map(id => <ProviderCard key={id} id={id} quote={quotes[id]} selected={provider === id} best={best === id} tokenOut={tokenOut} onSelect={() => choose(id)}
               quotesOnly={(() => { const entry = supportFor(id, tokenIn, tokenOut); return entry ? !executionInBuild(entry, SWAP_EXECUTION, CIRCLE_SWAP_WRITES_ENABLED).available : true })()}
-              onlyOne={quotes[id].state === 'quoted' && best === null} />)}
+              onlyOne={quotes[id].state === 'quoted' && quotes[id === 'uniswap' ? 'circle' : 'uniswap'].state !== 'quoted'} />)}
           </div>
         </fieldset>
-        <div className="grid min-w-0 gap-3 pt-2 sm:grid-cols-2">
+        <details className="pt-2 text-sm text-slate-600">
+          <summary className="cursor-pointer">Slippage · {slippageBps / 100}%</summary>
           <label className="min-w-0 space-y-1 text-sm font-medium text-slate-600">Slippage tolerance
             <select aria-label="Slippage tolerance" className={fieldClass} value={slippageBps} onChange={event => setSlippageChoice(Number(event.target.value))}>
               {ALL_SLIPPAGE_BPS.map(bps => <option key={bps} value={bps}>{bps / 100}%</option>)}
             </select>
           </label>
-        </div>
+        </details>
 
         <dl className="space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
-          <SummaryLine label="Provider" value={PROVIDER_NAME[provider]} />
-          <SummaryLine label="Route" value={summary?.route ?? '—'} />
           <SummaryLine label="Minimum receive" value={summary ? `${shortenAmount(summary.minimum ?? '0')} ${tokenOut}` : '—'} title={summary ? `${summary.minimum} ${tokenOut}` : undefined} />
-          <SummaryLine label="Slippage" value={`${slippageBps / 100}%`} />
-          <SummaryLine label="Network fee" value={summary?.fee ?? '—'} />
+          <SummaryLine label="Network fee cap · all steps" value={summary ? `≤ ${summary.fee}` : '—'} />
+          <SummaryLine label={provider === 'circle' ? 'Circle fees' : 'Trading fees'} value={summary?.otherFees ?? '—'} />
           <SummaryLine label="Quote expires in" value={summary ? `${summary.expiresIn} seconds` : '—'} />
         </dl>
 
@@ -282,33 +299,43 @@ export default function MainnetSwapScreen() {
           {isConnected && chainId !== 5042 && <p role="status" className="text-sm text-amber-700">Switch your wallet to Arc Mainnet to get a quote.</p>}
           {walletReady && uniswap.invalidAmount && <p role="status" className="text-sm text-slate-600">Enter a positive amount of at most {formatUnits(ARC_INPUT_CAPS[tokenIn], inDecimals)} {tokenIn} with at most {inDecimals} decimal places.</p>}
           {walletReady && circle.insufficientBalance && <p role="status" className="text-sm text-amber-700">Insufficient {tokenIn} balance for this amount.</p>}
-          {selected.state === 'error' && <p role="alert" className="break-words text-sm text-red-700">{selected.message} The other provider can be selected for a comparison.</p>}
+          {selected.state === 'error' && <p role="alert" className="break-words text-sm text-red-700">{selected.message}</p>}
           {loading && <p role="status" className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" aria-hidden="true" />Updating price…</p>}
         </div>
         <div aria-live="polite" aria-atomic="true" className="min-h-[2rem]">
-          {summary ? <p role="status" className="text-xs text-slate-500">Estimate only. You’ll see the exact amounts and fees before you confirm. The network fee shown is a maximum, not what is charged.</p>
+          {summary ? <p role="status" className="text-xs text-slate-500">Estimate only. Final amounts and fee limits are checked again before confirmation.</p>
             : <p role="status" className="text-xs text-slate-500">{loading ? 'Checking the current quote…' : 'Enter an amount to see a price.'}</p>}
         </div>
 
-        <ApprovalsPanel approvals={approvals} request={provider === 'uniswap' && uniswapAllowed ? uniswap.request : null} />
+        <ApprovalsPanel dialogOnly approvals={approvals} request={provider === 'uniswap' && uniswapAllowed ? uniswap.request : null} />
         <div className="space-y-2">
-          <button id="review-swap" type="button" onClick={() => { void active_.prepare() }} disabled={!canReview || busyPhase}
-            className="w-full rounded-xl bg-[#2F6E0C] px-5 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">{active_.view.phase === 'preparing' ? 'Preparing swap…' : 'Review Swap'}</button>
+          <button id="review-swap" type="button" onClick={continueSwap} disabled={!canContinue}
+            className="w-full rounded-xl bg-[#2F6E0C] px-5 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">{primaryLabel}</button>
           <div className="min-h-[1.25rem]">
             {reviewBlocked && <p role="status" className="text-xs text-slate-600">{reviewBlocked}</p>}
             {!reviewBlocked && retried === formKey && <p role="status" className="text-xs text-slate-600">The same swap is set up again. Review it to continue; nothing was sent.</p>}
             {/* A message about a transaction is shown once, inside that transaction's card; only Review-stage messages appear here. */}
             {active_.view.error && !active_.view.attempt && <PlainMessage raw={active_.view.error} />}
+            {provider === 'uniswap' && approvals.view.error && !approvals.view.attempt && <PlainMessage raw={approvals.view.error} />}
+            {provider === 'uniswap' && erc20Input && approvals.plan.state === 'error' && <p role="status" className="text-xs text-amber-800">Token permissions could not be checked. Change the amount to try again; nothing was requested.</p>}
+            {needsApproval && <p role="status" className="text-xs text-slate-500">Exact amount only. Review each permission before the swap.</p>}
           </div>
         </div>
         <UniswapReviewDialog execution={execution} />
         <CircleReviewDialog execution={circleExecution} />
       </div>
 
-      <SwapActivityPanel latest={latest} earlier={earlier} busy={executionBusy} onCheck={checkItem} onRetry={retryItem} onRecover={hash => { void (latest?.provider === 'circle' ? circleExecution.recover(hash) : execution.recover(hash)) }}
-        unreadable={execution.historyError || circleExecution.historyError || execution.stored.some(history => history.unreadable) || approvals.stored.some(history => history.unreadable) || circleExecution.stored.some(history => history.unreadable)}
+      <details aria-label="Swap activity" open={Boolean((showActivity && latest) || latest?.presentation.working || latest?.presentation.notice || latest?.live?.error || activityUnreadable)}
+        onToggle={event => setShowActivity(event.currentTarget.open)} className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
+        <summary className="cursor-pointer font-medium">Your swaps{latest ? ` · ${latest.presentation.short}` : ''}</summary>
+        <SwapActivityPanel latest={latest} earlier={earlier} busy={executionBusy} onCheck={checkItem} onRetry={retryItem} onRecover={hash => { void (latest?.provider === 'circle' ? circleExecution.recover(hash) : execution.recover(hash)) }}
+        unreadable={activityUnreadable}
         archiveUnreadable={[...execution.stored, ...approvals.stored, ...circleExecution.stored].reduce((sum, history) => sum + (history.archiveUnreadable ?? 0), 0)} />
+      </details>
 
+      <details aria-label="Swap details" className="text-sm text-slate-500">
+        <summary className="cursor-pointer text-center">Details & contracts</summary>
+        <p className="mt-3">{summary?.route ?? `${tokenIn} → ${tokenOut}`} · {PROVIDER_NAME[provider]}</p>
       <details aria-label="Route support" className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
         <summary className="cursor-pointer font-medium">How {tokenIn} → {tokenOut} works</summary>
         <div className="mt-3 space-y-3">{(['uniswap', 'circle'] as Provider[]).map(id => {
@@ -334,6 +361,7 @@ export default function MainnetSwapScreen() {
         <ul className="mt-3 space-y-3">{Object.values(MAINNET_SWAP_TOKENS).map(token => <li key={token.symbol} className="break-all"><strong>{token.symbol}</strong> · {token.decimals} decimals<br />{token.address}</li>)}</ul>
         <a href="https://docs.arc.io/arc/references/contract-addresses" target="_blank" rel="noopener noreferrer" className="mt-3 inline-block underline">Official Arc contract registry</a>
       </details>
+      </details>
     </section>
   </Container>
 }
@@ -342,18 +370,18 @@ function ProviderCard({ id, quote, selected, best, tokenOut, onSelect, onlyOne, 
   return <button type="button" role="radio" aria-checked={selected} aria-label={`${PROVIDER_NAME[id]} quote`} onClick={onSelect}
     className={`min-h-[5.5rem] w-full rounded-2xl border p-3 text-left text-sm transition-colors ${selected ? 'border-[#2F6E0C] bg-[#f4faef]' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
     <span className="flex items-center justify-between gap-2">
-      <span className="font-semibold text-slate-900">{PROVIDER_NAME[id]}</span>
-      <span className="flex items-center gap-2 text-xs">{best && <span className="rounded-full bg-[#2F6E0C] px-2 py-0.5 font-medium text-white">Best price</span>}{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span className="text-[#2F6E0C]">Selected</span>}</span>
+      <span className="font-semibold text-slate-900">{id === 'circle' ? 'Circle' : 'Uniswap'}</span>
+      <span className="flex flex-wrap items-center justify-end gap-1 text-xs">{best && <span className="rounded-full bg-[#2F6E0C] px-2 py-0.5 font-medium text-white">Best price</span>}{quotesOnly && <span className="rounded-full border border-slate-300 px-2 py-0.5 text-slate-600">Quotes only</span>}{selected && <span aria-hidden="true" className="text-[#2F6E0C]">✓</span>}</span>
     </span>
     {quote.state === 'quoted' && <span className="mt-1 block space-y-0.5">
       <span className="block text-base font-semibold text-slate-900" title={`${quote.estimated} ${tokenOut}`}>{shortenAmount(quote.estimated ?? '0')} {tokenOut}</span>
-      <span className="block text-xs text-slate-600">Minimum {shortenAmount(quote.minimum ?? '0')} · {quote.route} · fee {quote.fee} · {quote.expiresIn}s{onlyOne ? ' · other provider has no quote' : ''}</span>
+      <span className="block text-xs text-slate-600">Minimum {shortenAmount(quote.minimum ?? '0')} {tokenOut}{onlyOne ? ' · only available quote' : ''}</span>
     </span>}
     {quote.state === 'loading' && <span className="mt-1 flex items-center gap-2 text-xs text-slate-500"><Loader2 size={12} className="animate-spin" aria-hidden="true" />Updating price…</span>}
     {quote.state === 'idle' && <span className="mt-1 block text-xs text-slate-500">Enter an amount to see this provider’s price.</span>}
     {quote.state === 'unsupported' && <span role="status" className="mt-1 block break-words text-xs text-amber-800">{quote.message}</span>}
     {/* The selected provider's error is announced once, below; the other provider's is shown here. */}
-    {quote.state === 'error' && <span role={selected ? undefined : 'status'} className="mt-1 block break-words text-xs text-amber-800">{selected ? 'No quote from this provider.' : `${quote.message} No quote from this provider; it can still be selected once it can quote.`}</span>}
+    {quote.state === 'error' && <span role={selected ? undefined : 'status'} className="mt-1 block break-words text-xs text-amber-800">{selected ? 'Quote unavailable' : quote.message}</span>}
   </button>
 }
 function SummaryLine({ label, value, title }: { label: string; value: string; title?: string }) {

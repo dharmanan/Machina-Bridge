@@ -144,6 +144,13 @@ try {
   await page.clock.install()
   await page.clock.pauseAt(new Date(Date.now() + 1000))
   const amount = page.getByRole('textbox', { name: 'Swap amount' })
+  const setSlippage = async value => {
+    const field = page.getByRole('combobox', { name: 'Slippage tolerance', includeHidden: true })
+    const details = page.locator('details').filter({ has: field }).first()
+    if (!(await field.isVisible())) await details.locator(':scope > summary').click()
+    await field.selectOption(value)
+    await details.locator(':scope > summary').click()
+  }
   const receiveText = async () => (await page.getByLabel('Estimated receive').innerText()).trim()
   const noReceive = () => page.waitForFunction(() => document.querySelector('output[aria-label="Estimated receive"]')?.textContent === '0.00')
   async function advance(ms = 2600) {
@@ -176,20 +183,20 @@ try {
   })
   await test('automatic EURC quote shows independently checked output, minimum, fee and bounded TTL', async () => {
     await success(); assert.equal(await receiveText(), '0.890112')
-    for (const text of ['0.885661 EURC', '0.00026 USDC ceiling']) assert.ok(await page.getByText(text, { exact: true }).count(), text)
+    for (const text of ['0.885661 EURC', '≤ 0.00026 USDC']) assert.ok(await page.getByText(text, { exact: true }).count(), text)
     assert.equal(requests.at(-1).headers['x-api-key'], undefined)
     const ttl = await page.locator('dt').filter({ hasText: /^Quote expires in$/ }).locator('..').locator('dd').innerText()
     assert.ok(parseInt(ttl) > 0 && parseInt(ttl) <= 30)
   })
   await test('slippage changes automatically fetch the selected quote; Uniswap slippage values Circle does not offer are said so, never replaced', async () => {
-    await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('100'); await noReceive(); await advance()
+    await setSlippage('100'); await noReceive(); await advance()
     await page.getByText(/Estimate only\./).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 100)
-    await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('10'); await noReceive(); await advance()
+    await setSlippage('10'); await noReceive(); await advance()
     await page.getByText(/Estimate only\./).waitFor(); assert.equal(requests.at(-1).input.slippageBps, 10)
     await page.getByText(/Circle Swap Kit does not offer 0\.1% slippage/).waitFor()
-    await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('300'); await noReceive()
+    await setSlippage('300'); await noReceive()
     await page.getByText(/Uniswap does not offer 3% slippage/).waitFor()
-    await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('50')
+    await setSlippage('50')
   })
   await test('a cancelled late response cannot overwrite the next automatic amount; loading is visible', async () => {
     mode = 'held'; held = undefined; await change('0.1')
@@ -215,8 +222,10 @@ try {
   })
   await test('expired automatic quotes disappear without polling or automatic resubmission', async () => {
     await success(); const before = apiCalls; await advance(31000); await noReceive()
-    assert.equal(apiCalls, before); await page.getByText(/Quote expired. Change the amount/).first().waitFor()
+    assert.equal(apiCalls, before); await page.getByText(/Quote expired. Check the price again/).first().waitFor()
     await advance(60000); assert.equal(apiCalls, before)
+    await page.getByRole('button', { name: 'Check price again', exact: true }).click(); await advance()
+    await page.getByText(/Estimate only\./).waitFor(); assert.equal(apiCalls, before + 1)
   })
   await test('HTTP 429 and API errors stay bounded and never cause infinite retries', async () => {
     for (const [value, text] of [['rate', 'Too many preview requests'], ['error', 'The server could not verify a current quote'], ['origin', 'This site address is not allowed'], ['public-disabled', 'Public Uniswap previews are disabled']]) {
@@ -245,7 +254,7 @@ try {
     await page.getByText(/Estimate only\./).waitFor(); assert.equal(await receiveText(), '0.2'); assert.equal(apiCalls, before)
     const calls = circleCalls; await amount.fill('0.2'); await advance(); await page.getByText(/Estimate only\./).waitFor()
     assert.equal(circleCalls, calls + 1); assert.equal(await receiveText(), '0.4'); assert.equal(apiCalls, before + 1) // both providers refresh for a new amount
-    await page.getByRole('combobox', { name: 'Slippage tolerance' }).selectOption('100'); await advance()
+    await setSlippage('100'); await advance()
     assert.equal(circleCalls, calls + 2); assert.equal(apiCalls, before + 2)
   })
   await test('Circle ignores cancelled late SDK responses and never auto-retries failures', async () => {
@@ -253,7 +262,7 @@ try {
     for (let i = 0; i < 50 && !circleHeld; i++) await page.waitForTimeout(20)
     assert.ok(circleHeld); await amount.fill('0.3'); await noReceive(); circleMode = 'normal'; circleHeld()
     await advance(); await page.getByText(/Estimate only\./).waitFor(); assert.equal(await receiveText(), '0.6')
-    circleMode = 'error'; await change('0.1'); await page.getByText(/No quote from this provider/).first().waitFor()
+    circleMode = 'error'; await change('0.1'); await page.getByText(/Quote unavailable/).first().waitFor()
     const before = circleCalls; await advance(60000); assert.equal(circleCalls, before)
     circleMode = 'normal'
   })

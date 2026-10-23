@@ -85,7 +85,7 @@ export function swapWalletState(connected: boolean, chainId?: number): 'disconne
 export function isCurrentSwapQuote(quote: PreviewQuote | null, request: SwapQuoteRequest | null, now: number): boolean {
   return Boolean(quote && request && quote.requestKey === swapRequestKey(request) && now < quote.expiresAt)
 }
-export const CIRCLE_NO_ROUTE_MESSAGE = 'Circle cannot provide a quote for this amount. Try a different amount.'
+export const CIRCLE_NO_ROUTE_MESSAGE = 'Circle cannot provide a quote for this amount. No route with available liquidity right now; try another amount or Uniswap.'
 export function swapPreviewError(error: unknown): string {
   const code = error instanceof Error ? error.message : ''
   if (/timeout/i.test(code)) return 'The quote request timed out. Try again shortly.'
@@ -94,6 +94,7 @@ export function swapPreviewError(error: unknown): string {
   if (/wrong_network/.test(code)) return 'Select Arc Mainnet in your wallet to request a quote.'
   // The pair is supported, but Circle has no route at quote time for this amount (SDK code 1003).
   if (/no route available/i.test(code)) return CIRCLE_NO_ROUTE_MESSAGE
+  if (/insufficient swap amount/i.test(code)) return 'Circle cannot quote such a small amount. Increase it within the swap limit.'
   if (/liquidity|route|not supported|unsupported/i.test(code)) return 'No supported quote is available for this direction. Try another pair.'
   if (/invalid_amount/.test(code)) return 'Enter a positive amount within the token precision.'
   return 'A verified quote could not be loaded. Try again shortly.'
@@ -156,19 +157,31 @@ export function createSwapReadAdapter() {
 // The SDK has no estimate AbortSignal. Keep the in-flight slot until it actually settles,
 // even after our UI deadline/abort, so retries cannot accumulate unbounded provider requests.
 export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => Promise<unknown>, timeoutMs = MAINNET_SWAP_TIMEOUT_MS) {
-  let pending = false
+  let pending: { released: boolean } | null = null
   return async (request: SwapQuoteRequest, signal: AbortSignal): Promise<PreviewQuote> => {
     validateSwapRequest(request)
     if (signal.aborted) return fail('quote_cancelled')
-    if (pending) return fail('quote_busy')
-    pending = true
     const requestedAt = Date.now()
+    const budgetStarted = performance.now()
+    // The SDK cannot abort its HTTP operation. An obsolete consumer releases its UI, NOT its SDK slot.
+    // Wait locally for that one slot, with the same deadline; never retry the service or stack SDK calls.
+    // Polling owns only a short timer, so cancelled edits cannot accumulate callbacks on a hung SDK promise.
+    while (pending?.released) {
+      if (signal.aborted) return fail('quote_cancelled')
+      if (performance.now() - budgetStarted >= timeoutMs) return fail('quote_timeout')
+      await new Promise(resolve => setTimeout(resolve, Math.min(25, timeoutMs)))
+    }
+    if (signal.aborted) return fail('quote_cancelled')
+    if (pending) return fail('quote_busy')
+    if (performance.now() - budgetStarted >= timeoutMs) return fail('quote_timeout')
+    const slot = { released: false }
+    pending = slot
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: () => void = () => undefined
-    const operation = Promise.resolve().then(() => estimate(request)).finally(() => { pending = false })
+    const operation = Promise.resolve().then(() => estimate(request)).finally(() => { if (pending === slot) pending = null })
     try {
       const raw = await Promise.race([operation, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('quote_timeout')), timeoutMs)
+        timer = setTimeout(() => reject(new Error('quote_timeout')), Math.max(1, timeoutMs - (performance.now() - budgetStarted)))
         abort = () => reject(new Error('quote_cancelled'))
         signal.addEventListener('abort', abort, { once: true })
         if (signal.aborted) abort()
@@ -176,6 +189,7 @@ export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => P
       if (signal.aborted) return fail('quote_cancelled')
       return normalizeSwapQuote(raw, request, Date.now(), requestedAt)
     } finally {
+      slot.released = true
       clearTimeout(timer)
       signal.removeEventListener('abort', abort)
     }

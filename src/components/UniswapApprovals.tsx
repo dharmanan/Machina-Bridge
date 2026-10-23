@@ -115,19 +115,22 @@ const kindText = (step: { kind: string; token: string; amount: string }) => {
 }
 // Shown only for an ERC-20 input. Says exactly which approvals are missing, for which amount, and what each costs; each one is a
 // separate review and wallet confirmation. Nothing here is unlimited.
-export function ApprovalsPanel({ approvals, request }: { approvals: UniswapApprovals; request: ArcRequest | null }) {
+export function ApprovalsPanel({ approvals, request, dialogOnly = false }: { approvals: UniswapApprovals; request: ArcRequest | null; dialogOnly?: boolean }) {
   const { view, plan } = approvals
   if (!approvals.needsApproval || !request) return null
   const token = ARC_TOKENS[request.tokenIn], amountText = `${formatUnits(tokenUnits(request.amount, token.decimals), token.decimals)} ${request.tokenIn}`
   const busy = ['preparing', 'checking', 'awaiting_wallet', 'pending', 'unknown'].includes(view.phase)
   const review = view.review
-  return <section aria-label="Token approvals" className="min-h-[3.5rem] space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
+  if (dialogOnly && !review) return null
+  return <div role={dialogOnly ? 'dialog' : undefined} aria-modal={dialogOnly ? true : undefined} aria-label={dialogOnly ? 'Review token approval' : undefined}
+    className={dialogOnly ? 'fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/40 p-4' : undefined}>
+    <section aria-label="Token approvals" className="min-h-[3.5rem] w-full max-w-lg space-y-2 rounded-2xl border border-slate-200 bg-white p-4 text-sm">
     <h2 className="font-semibold text-slate-900">Approvals for {request.tokenIn}</h2>
     {plan.state === 'loading' || plan.state === 'idle' ? <p role="status" className="text-slate-500">Checking your current approvals…</p> : null}
     {plan.state === 'error' && <p role="status" className="text-amber-800">We couldn’t read your current approvals just now. Nothing was requested; please try again.</p>}
     {plan.state === 'blocked' && <p role="status" className="text-amber-800">Your wallet does not hold {amountText}.</p>}
     {plan.state === 'complete' && <p role="status" className="text-[#2F6E0C]">Approvals for exactly {amountText} are in place. You can review the swap.</p>}
-    {plan.state === 'needed' && !review && <>
+    {plan.state === 'needed' && !review && !dialogOnly && <>
       <p className="text-slate-700">This swap needs {plan.steps.length === 1 ? '1 approval' : `${plan.steps.length} approvals`} for exactly {amountText}, never more. Each one is confirmed separately in your wallet and has a small network fee.</p>
       <ol className="list-decimal space-y-1 pl-5 text-slate-700">{plan.steps.map(step => <li key={step.kind}>{kindText(step)}</li>)}</ol>
       <button type="button" onClick={() => { void approvals.prepare() }} disabled={busy}
@@ -152,7 +155,7 @@ export function ApprovalsPanel({ approvals, request }: { approvals: UniswapAppro
     {['awaiting_wallet', 'pending', 'unknown'].includes(view.phase) && view.attempt && <p role="status" className="text-sky-800">
       {view.phase === 'awaiting_wallet' ? 'Confirm the approval in your wallet…' : view.phase === 'pending' ? 'Verifying approval…' : 'We haven’t confirmed this approval yet. Please don’t approve again until it is settled.'}</p>}
     {view.error && !view.attempt && <PlainMessage raw={view.error} />}
-  </section>
+  </section></div>
 }
 function Row({ label, value }: { label: string; value: string }) {
   return <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3"><dt className="text-slate-500">{label}</dt><dd className="break-all text-right">{value}</dd></div>

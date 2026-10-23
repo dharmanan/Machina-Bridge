@@ -25,7 +25,7 @@ const V3_INPUT = parseAbiParameters('address recipient,uint256 amountIn,uint256 
 const dec = { USDC: 6, EURC: 6, cirBTC: 8, WETH: 18 }
 const AMOUNT = { USDC: '1', EURC: '1', cirBTC: '0.00001', WETH: '0.0003' }
 // Execution state the scenarios drive. clockOffset follows the page's fake clock so Arc's block time and the device clock stay consistent.
-const world = { receipts: new Map(), hidden: new Set(), walletAdjusts: false, rpcDown: new Set(), reads: [], errors: [], circleCalls: 0, circleBias: 99n, external: 0, clockOffset: 0, blockSeq: 0 }
+const world = { receipts: new Map(), hidden: new Set(), walletAdjusts: false, rpcDown: new Set(), reads: [], errors: [], circleCalls: 0, circleBias: 99n, circleDelayMs: 0, external: 0, clockOffset: 0, blockSeq: 0 }
 const rpc = createFakeArcRpc({ viem, policy: p, simulator, routerRuntime: runtime, now: () => Date.now() + world.clockOffset })
 rpc.state.owner = owner; rpc.state.block = 27_300_000n; rpc.state.gasPrice = 20_000_000_000n // about Arc's real gas price (21.5 gwei in the first swap)
 const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
@@ -130,6 +130,8 @@ try {
     const request = route.request(), url = request.url()
     if (new URL(url).pathname === '/__circle_quote' && url.startsWith(base)) {
       world.circleCalls++; const input = request.postDataJSON(), units = parseUnits(input.amount, dec[input.tokenIn])
+      const delay = world.circleDelayMs
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay))
       const out = rpc.quoteOut(input.tokenIn, input.tokenOut, units, [3000]) * world.circleBias / 100n, minimum = p.minimumAtSlippage(out, input.slippageBps)
       return route.fulfill({ json: { tokenIn: input.tokenIn, tokenOut: input.tokenOut, amountIn: input.amount, chain: 'Arc', chainIn: 'Arc', chainOut: 'Arc', fromAddress: input.address, toAddress: input.address,
         estimatedOutput: { token: input.tokenOut, amount: formatUnits(out, dec[input.tokenOut]) }, stopLimit: { token: input.tokenOut, amount: formatUnits(minimum, dec[input.tokenOut]) }, fees: [{ type: 'provider', token: input.tokenIn, amount: '0.0002' }, { type: 'gas', token: 'USDC', amount: '0.0218' }] } })
@@ -156,7 +158,7 @@ try {
     }
   })
   await page.goto(base + '/__swap_ui_test')
-  const amount = page.getByRole('textbox', { name: 'Swap amount' }), review = page.getByRole('button', { name: 'Review Swap', exact: true }), confirm = page.getByRole('button', { name: 'Confirm Swap', exact: true })
+  const amount = page.getByRole('textbox', { name: 'Swap amount' }), review = page.locator('#review-swap'), confirm = page.getByRole('button', { name: 'Confirm Swap', exact: true })
   const latest = page.getByRole('article', { name: 'Latest transaction' }), uniCard = page.getByRole('radio', { name: 'Uniswap quote' }), circleCard = page.getByRole('radio', { name: 'Circle Swap Kit quote' })
   const sends = () => page.evaluate(() => window.swapUiTest.state.sent.length)
   // A nudge to the status check. Once a result is final the Check status button is gone (nothing is left to check), and the automatic check may already have finished.
@@ -177,6 +179,9 @@ try {
     await circleCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); await uniCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap')
     assert.equal(await page.getByText('Preview only', { exact: true }).count(), 0)
     await page.evaluate(() => window.swapUiTest.connect(5042)); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap')
+    assert.equal(await page.getByLabel('Swap activity', { exact: true }).evaluate(node => node.open), false)
+    assert.equal(await page.getByLabel('Swap details', { exact: true }).evaluate(node => node.open), false)
+    assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0)
   })
 
   await test('all 12 directions quote in both providers; the better price is tagged, the other stays selectable, and no provider is switched silently', async () => {
@@ -195,9 +200,27 @@ try {
     world.circleBias = 105n; await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted()
     assert.ok(await circleCard.getByText('Best price', { exact: true }).count()); assert.equal(await uniCard.getByText('Best price', { exact: true }).count(), 0)
     assert.equal(await uniCard.getAttribute('aria-checked'), 'true'); world.circleBias = 99n
+    await shot('quotes-desktop')
+    await page.setViewportSize({ width: 390, height: 844 }); await shot('quotes-mobile')
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth))
+    await page.setViewportSize({ width: 1280, height: 900 })
+  })
+
+  await test('a slow obsolete Circle quote releases its single SDK slot for the newest edit without extra service calls or wallet requests', async () => {
+    await pick('USDC', 'EURC'); await amount.fill(''); await page.waitForTimeout(100)
+    const before = world.circleCalls, sent = await sends()
+    world.circleDelayMs = 3500; await amount.fill('0.1')
+    for (let i = 0; i < 70 && world.circleCalls === before; i++) await page.waitForTimeout(50)
+    assert.equal(world.circleCalls, before + 1)
+    world.circleDelayMs = 0; await amount.fill('0.2'); await quoted()
+    const expected = rpc.quoteOut('USDC', 'EURC', parseUnits('0.2', 6), [3000]) * world.circleBias / 100n
+    assert.equal(await circleCard.locator('[title]').first().getAttribute('title'), `${formatUnits(expected, 6)} EURC`)
+    assert.equal(world.circleCalls, before + 2); assert.equal(await sends(), sent)
+    assert.equal(await page.getByText(/previous quote request is still finishing/).count(), 0)
   })
 
   await test('the route support panel tells the truth for the selected pair in plain words: route, approvals, availability; the precise findings and what has been proven live sit in each provider\'s Technical details', async () => {
+    await page.getByLabel('Swap details', { exact: true }).locator(':scope > summary').click()
     await pick('EURC', 'cirBTC'); const details = page.getByLabel('Route support'); await details.locator(':scope > summary').click()
     const uni = details.getByRole('region', { name: 'Uniswap support' }), circ = details.getByRole('region', { name: 'Circle Swap Kit support' })
     const opened = async () => { await page.evaluate(() => document.querySelectorAll('[aria-label="Route support"] details').forEach(node => { node.open = true })) }
@@ -208,6 +231,7 @@ try {
     await pick('USDC', 'EURC'); await uni.getByText(/No approval needed: USDC is sent directly with the swap/).waitFor(); await circ.getByText(/One signature \(no fee\) that allows exactly the amount you swap, then the swap\./).waitFor()
     await opened(); await uni.getByText(/one real swap \(0x1a5e…a921\)/).waitFor()
     await pick('USDC', 'WETH'); await opened(); await circ.getByText(/no real swap of this direction was found among the decoded fixtures/).waitFor(); await details.locator(':scope > summary').click()
+    await page.getByLabel('Swap details', { exact: true }).locator(':scope > summary').click()
   })
 
   await test('any token can be paired with any other; choosing the other side token exchanges the sides; the amount clears only when the input token changes', async () => {
@@ -257,23 +281,24 @@ try {
 
   await test('ERC-20 input: both exact approvals are reviewed and confirmed separately, then the swap runs; nothing is unlimited and nothing else is signed', async () => {
     await pick('EURC', 'USDC'); await amount.fill('1'); await quoted()
-    const panel = page.getByRole('region', { name: 'Token approvals' }); await panel.getByText(/needs 2 approvals for exactly 1 EURC/).waitFor()
-    assert.equal(await review.isDisabled(), true); await page.getByText('Approve this exact amount first, then review the swap.').waitFor(); const before = await sends()
-    await panel.getByRole('button', { name: 'Review approval 1 of 2' }).click(); await panel.getByText('Let Uniswap use exactly 1 EURC').first().waitFor()
+    const panel = page.getByRole('region', { name: 'Token approvals' });
+    await page.getByRole('button', { name: 'Approve EURC · 2 steps' }).waitFor(); const before = await sends()
+    assert.equal(await panel.count(), 0, 'no separate approval panel on the form')
+    await review.click(); await panel.getByText('Let Uniswap use exactly 1 EURC').first().waitFor()
     await panel.getByText('1 EURC (exact)').waitFor(); assert.ok((await panel.textContent()).includes(`Allowed spender: ${p.ARC_PERMIT2}`)); assert.equal(await sends(), before) // the spender is in the closed Technical details
-    await panel.getByRole('button', { name: 'Confirm approval' }).click(); await panel.getByText(/Verifying approval/).waitFor()
+    await panel.getByRole('button', { name: 'Confirm approval' }).click(); await latest.getByText('Verifying approval', { exact: false }).waitFor()
     let sent = await lastSent(); assert.ok(p.sameAddress(sent.tx.to, p.ARC_TOKENS.EURC.address)); assert.equal(sent.tx.value, '0x0')
     const approval1 = decodeFunctionData({ abi: viem.parseAbi(['function approve(address spender, uint256 amount)']), data: sent.tx.data }); assert.ok(p.sameAddress(approval1.args[0], p.ARC_PERMIT2)); assert.equal(approval1.args[1], 1_000_000n)
     assert.equal(await review.isDisabled(), true) // an unresolved approval blocks a new swap
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Approval completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
-    await panel.getByRole('button', { name: 'Review approval 1 of 1' }).waitFor(); await panel.getByRole('button', { name: 'Review approval 1 of 1' }).click()
+    await page.getByRole('button', { name: 'Approve EURC · 1 step' }).waitFor(); await review.click()
     await panel.getByText(/Let the Uniswap router use exactly 1 EURC for 15 minutes/).first().waitFor(); await panel.getByRole('button', { name: 'Confirm approval' }).click()
-    await panel.getByText(/Verifying approval/).waitFor(); sent = await lastSent(); assert.ok(p.sameAddress(sent.tx.to, p.ARC_PERMIT2))
+    await latest.getByText('Verifying approval', { exact: false }).waitFor(); sent = await lastSent(); assert.ok(p.sameAddress(sent.tx.to, p.ARC_PERMIT2))
     const approval2 = decodeFunctionData({ abi: viem.parseAbi(['function approve(address token, address spender, uint160 amount, uint48 expiration)']), data: sent.tx.data })
     assert.ok(p.sameAddress(approval2.args[1], p.ARC_ROUTER)); assert.equal(approval2.args[2], 1_000_000n); await syncWalletSends(); setReceipt(sent.hash, 'success')
-    await recheck(); await panel.getByText(/Approvals for exactly 1 EURC are in place/).waitFor(); await bumpNonce(); await syncNonce()
-    assert.equal(await review.isEnabled(), true); await review.click(); await page.getByRole('dialog').getByText(/Your exact approvals are already in place/).waitFor()
+    await recheck(); await page.getByRole('button', { name: 'Review Swap', exact: true }).waitFor(); await bumpNonce(); await syncNonce()
+    assert.equal(await becomesEnabled(), true); await review.click(); await page.getByRole('dialog').getByText(/Your exact approvals are already in place/).waitFor()
     await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); sent = await lastSent(); assert.equal(sent.tx.value, '0x0')
     assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[0], '0x00')
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
@@ -289,7 +314,7 @@ try {
     }
     for (const { tokenIn, tokenOut } of tokens.SWAP_DIRECTIONS) {
       await pick(tokenIn, tokenOut); await amount.fill(''); await amount.fill(AMOUNT[tokenIn]); await quoted()
-      await page.getByRole('region', { name: 'Token approvals' }).getByText(/in place/).waitFor({ state: tokenIn === 'USDC' ? 'detached' : 'visible' })
+      await page.getByRole('button', { name: 'Review Swap', exact: true }).waitFor()
       const before = await sends(); await review.click(); await confirm.waitFor(); const reviewed = await page.getByRole('dialog').innerText()
       const units = parseUnits(AMOUNT[tokenIn], dec[tokenIn]), routes = pools.candidateRoutes(tokenIn, tokenOut)
       const best = routes.map(r => ({ r, out: rpc.quoteOut(tokenIn, tokenOut, units, r.hops.map(h => h.fee)) })).sort((a, b) => (b.out > a.out ? 1 : -1))[0]
@@ -386,6 +411,7 @@ try {
 
   await test('without any stored record, the first real swap can still be looked up by hash: chain facts are shown, the missing Review is stated, and nothing is called Confirmed', async () => {
     await page.evaluate(() => { for (const name of Object.keys(localStorage)) if (name.startsWith('machina.')) localStorage.removeItem(name) }); await page.reload(); await syncNonce()
+    await page.getByLabel('Swap activity', { exact: true }).locator(':scope > summary').click()
     const lookup = page.getByLabel('Look up a transaction'); await lookup.locator('summary').click()
     await lookup.getByLabel('Transaction hash to look up').fill(FIRST_HASH); await lookup.getByRole('button', { name: 'Look up' }).click()
     const result = lookup.getByRole('article', { name: 'Transaction look-up result' }); await result.getByText('This transaction succeeded on Arc.', { exact: true }).waitFor()

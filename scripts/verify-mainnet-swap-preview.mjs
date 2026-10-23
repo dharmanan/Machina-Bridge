@@ -149,25 +149,54 @@ await test('timeout does not release the in-flight slot or publish late output',
   const read = swap.createSwapQuoteReader(() => { calls++; return new Promise((done) => { resolve = done }) }, 10)
   const signal = new AbortController().signal
   await assert.rejects(read(request, signal), /quote_timeout/)
-  await assert.rejects(read(request, signal), /quote_busy/)
+  await assert.rejects(read(request, signal), /quote_timeout/)
   assert.equal(calls, 1)
   resolve(raw())
   await new Promise((done) => setTimeout(done, 0))
 })
 await test('aborted contexts cannot publish; settled operations allow a fresh request', async () => {
-  let resolve
-  const read = swap.createSwapQuoteReader(() => new Promise((done) => { resolve = done }), 100)
+  let resolve, calls = 0
+  const read = swap.createSwapQuoteReader(() => { calls++; return calls === 1 ? new Promise((done) => { resolve = done }) : Promise.resolve(raw()) }, 200)
   const controller = new AbortController()
   const promise = read(request, controller.signal)
   await Promise.resolve(); controller.abort()
   await assert.rejects(promise, /cancelled/)
-  await assert.rejects(read(request, new AbortController().signal), /busy/)
-  resolve(raw()); await new Promise((done) => setTimeout(done, 0))
   const next = read(request, new AbortController().signal)
-  await Promise.resolve(); resolve(raw())
+  await new Promise(done => setTimeout(done, 5)); assert.equal(calls, 1, 'obsolete SDK still owns its one slot')
+  resolve(raw())
   assert.equal((await next).estimatedOutput, '6.2')
+  assert.equal(calls, 2)
   const already = new AbortController(); already.abort()
   await assert.rejects(read(request, already.signal), /cancelled/)
+})
+await test('an active Circle consumer still rejects concurrent estimates; cancelled queued edits never reach the SDK', async () => {
+  let resolve, calls = 0
+  const read = swap.createSwapQuoteReader(input => { calls++; return calls === 1 ? new Promise(done => { resolve = done }) : Promise.resolve(raw(input)) }, 250)
+  const first = new AbortController(), second = new AbortController()
+  const old = read(request, first.signal)
+  await Promise.resolve()
+  await assert.rejects(read(request, new AbortController().signal), /quote_busy/)
+  first.abort(); await assert.rejects(old, /quote_cancelled/)
+  const superseded = read({ ...request, amount: '8' }, second.signal)
+  second.abort(); await assert.rejects(superseded, /quote_cancelled/)
+  const latest = read({ ...request, amount: '9' }, new AbortController().signal)
+  assert.equal(calls, 1)
+  resolve(raw())
+  const quote = await latest
+  assert.equal(quote.requestKey, swap.swapRequestKey({ ...request, amount: '9' }))
+  assert.equal(calls, 2, 'only the newest edit starts a replacement SDK call')
+})
+await test('waiting for a hung obsolete SDK call has a bounded monotonic deadline even when the device clock stops', async () => {
+  const originalNow = Date.now, controller = new AbortController()
+  const guard = setTimeout(() => controller.abort(), 300)
+  let calls = 0
+  try {
+    Date.now = () => 1000
+    const read = swap.createSwapQuoteReader(() => { calls++; return new Promise(() => {}) }, 15)
+    await assert.rejects(read(request, controller.signal), /quote_timeout/)
+    await assert.rejects(read(request, controller.signal), /quote_timeout/)
+    assert.equal(calls, 1)
+  } finally { Date.now = originalNow; clearTimeout(guard) }
 })
 await test('RPC and adapter boundaries deny all transaction/signature and wallet methods', () => {
   for (const method of ['eth_sendRawTransaction', 'eth_sendTransaction', 'eth_sign', 'personal_sign', 'eth_signTypedData_v4', 'wallet_switchEthereumChain', 'eth_requestAccounts']) assert.throws(() => swap.assertSwapReadMethod(method), /read_only/)
@@ -277,7 +306,7 @@ await test('Circle preview remains read-only; unified UI delegates Uniswap to a 
   const library = readFileSync(`${root}src/lib/mainnetSwap.ts`, 'utf8')
   for (const source of [component, library]) assert.doesNotMatch(source, /\.swap\(|\.approve\(|sendTransaction\(|writeContract\(|signTypedData\(|personal_sign|useWalletClient|window\.ethereum|privateKeyToAccount/)
   assert.match(component, /restrictionMessage/)
-  assert.match(component, /disabled=\{!canReview \|\| busyPhase\}/)
+  assert.match(component, /disabled=\{!canContinue\}/)
   assert.match(component, /balance\.isSuccess/)
   assert.match(component, /generation\.current === expectedGeneration/)
   assert.match(component, /controller\.current\?\.abort\(\)/)
