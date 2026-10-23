@@ -56,7 +56,7 @@ export interface ExecutionPorts {
   fresh(input: ArcRequest): Promise<ArcReview>; quoteNow(input: ArcRequest): number
   preflight(review: ArcReview): Promise<ExecutionNonceState>
   provider(): Promise<ExecutionProvider>
-  result(attempt: SwapAttempt): Promise<ChainResult>
+  result(attempt: SwapAttempt, submitted?: (intent: IntentSummary) => void): Promise<ChainResult>
   storage: Pick<Storage, 'getItem' | 'setItem'>
   lock<T>(owner: string, run: () => Promise<T>): Promise<T>
   changed?(view: ExecutionView): void; settled?(attempt: SwapAttempt): void
@@ -431,7 +431,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
         if (!attempt.hash && view.attempt?.id === stored.id && view.attempt.hash) attempt = { ...attempt, hash: view.attempt.hash }
         // `base` is what is recorded (plus a hash the wallet itself returned). A hash the user typed is `unrecorded` until the network has
         // shown that exact transaction: a mistyped or foreign hash must never replace the means of finding the real one.
-        const base = attempt
+        let base = attempt
         let unrecorded = false, replaced: Hex | undefined
         if (recoveredHash !== undefined) {
           if (!isTransactionHash(recoveredHash)) throw new ExecutionVerificationError('binding', false)
@@ -453,7 +453,14 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
         const withReplacement = (a: SwapAttempt, at: number): SwapAttempt => replaced === undefined ? a
           : { ...a, log: [...(a.log ?? []), { at, status: a.status, note: `Tracked under the hash you supplied. The previously recorded hash ${replaced} is unknown to the network and its nonce was used by another transaction.`.slice(0, 290) }].slice(-40) }
         try {
-          const result = await ports.result(structuredClone(attempt))
+          const result = await ports.result(structuredClone(attempt), intent => {
+            // Evidence only: never settle, authorize a retry, or persist an unverified recovery hash.
+            if (unrecorded || !unresolved(attempt) || !['mismatch', 'unbound'].includes(intent.verdict)) return
+            attempt = { ...attempt, intent }
+            journal.save(attempt)
+            base = attempt
+            emit({ ...view, attempt })
+          })
           const observedAt = Date.now()
           if (result.status === 'pending') {
             failures.delete(attempt.id)

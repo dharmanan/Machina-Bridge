@@ -225,7 +225,7 @@ export interface CirclePorts {
   // wallet, not to a test run) and is covered by estimateGas and the on-chain check.
   simulate?(owner: Hex, data: Hex, tokenIn: Hex, tokenOut: Hex): Promise<{ received: bigint; spent: bigint }>
   approval(attempt: CircleSwapAttempt, step: CircleStepRecord): Promise<CircleApprovalState>
-  result(attempt: CircleSwapAttempt): Promise<CircleChainResult>
+  result(attempt: CircleSwapAttempt, submitted?: (intent: IntentSummary) => void): Promise<CircleChainResult>
   storage: Pick<Storage, 'getItem' | 'setItem'>
   lock<T>(owner: string, run: () => Promise<T>): Promise<T>
   changed?(view: CircleView): void; settled?(attempt: CircleSwapAttempt): void
@@ -824,7 +824,7 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         }
         // `base` is what is recorded (plus a hash the wallet itself returned). A hash the user typed is `unrecorded` until the network has shown
         // that exact transaction: a mistyped or foreign hash must never replace the means of finding the real one.
-        const base = attempt
+        let base = attempt
         let unrecorded = false, replaced: Hex | undefined
         const swapStep = attempt.steps.find(step => step.kind === 'swap')
         if (recoveredHash !== undefined) {
@@ -864,7 +864,13 @@ export function createCircleSwapExecution(ports: CirclePorts) {
         const withReplacement = (a: CircleSwapAttempt, at: number): CircleSwapAttempt => replaced === undefined ? a
           : { ...a, log: [...(a.log ?? []), { at, status: a.status, note: `Tracked under the hash you supplied. The previously recorded hash ${replaced} is unknown to the network and its nonce was used by another transaction.`.slice(0, 290) }].slice(-40) }
         try {
-          const result = await ports.result(structuredClone(attempt))
+          const result = await ports.result(structuredClone(attempt), intent => {
+            if (unrecorded || !unresolved(attempt) || !['mismatch', 'unbound'].includes(intent.verdict)) return
+            attempt = { ...attempt, intent }
+            journal.save(attempt)
+            base = attempt
+            emit({ ...view, attempt })
+          })
           const observedAt = Date.now()
           if (result.status === 'pending') {
             failures.delete(attempt.id)
@@ -1014,13 +1020,14 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
   // One transaction, read by hash. A transaction or receipt the node does not have yet is `missing` / `unmined` (pending, not failed); any other
   // read problem is retryable; a hash that is not the recorded transaction (sender, nonce, network) is not retryable.
   type Loaded = { state: 'missing' } | { state: 'unmined' } | { state: 'ready'; tx: Awaited<ReturnType<PublicClient['getTransaction']>>; receipt: Awaited<ReturnType<PublicClient['getTransactionReceipt']>>; block: Awaited<ReturnType<PublicClient['getBlock']>>; latest: bigint; canonical: boolean }
-  async function load(txHash: Hex, bind: { owner: string; nonce: number }): Promise<Loaded> {
+  async function load(txHash: Hex, bind: { owner: string; nonce: number }, submitted?: (tx: ChainTx) => void): Promise<Loaded> {
     let chainId: number
     try { chainId = await rpc.getChainId() } catch { throw new ExecutionVerificationError('rpc', true) }
     if (chainId !== CIRCLE_CHAIN_ID) throw new ExecutionVerificationError('rpc', true)
     let tx
     try { tx = await rpc.getTransaction({ hash: txHash }) }
     catch (error) { if (error instanceof Error && error.name === 'TransactionNotFoundError') return { state: 'missing' }; throw new ExecutionVerificationError('rpc', true) }
+    submitted?.(toChainTx(tx))
     // From here the node has shown a transaction under this hash; it must be this wallet's transaction at the recorded nonce.
     if (lc(tx.hash) !== lc(txHash) || !same(tx.from, bind.owner) || tx.nonce !== bind.nonce || tx.chainId !== CIRCLE_CHAIN_ID) throw new ExecutionVerificationError('binding', false)
     let receipt
@@ -1052,11 +1059,20 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
     return { status: 'confirmed', fee }
   }
   // The swap transaction. Two answers are kept apart: what the chain says, and whether that transaction is the reviewed one.
-  async function result(attempt: CircleSwapAttempt): Promise<CircleChainResult> {
+  async function result(attempt: CircleSwapAttempt, submitted?: (intent: IntentSummary) => void): Promise<CircleChainResult> {
     const swap = attempt.steps.find(step => step.kind === 'swap')
     if (!hash(attempt.hash) || !swap || !swap.hash || lc(swap.hash) !== lc(attempt.hash)) throw new ExecutionVerificationError('binding', false)
     const request = attempt.review.request, owner = request.owner as Hex, tokenIn = swapToken(request.tokenIn), tokenOut = swapToken(request.tokenOut)
-    const loaded = await load(attempt.hash, { owner, nonce: swap.nonce })
+    const reviewed: CircleReviewedIntent = {
+      owner, adapter: CIRCLE_ADAPTER, inputToken: tokenIn.address as Hex, outputToken: tokenOut.address as Hex, amountIn: uint(attempt.review.amountIn), minimumOut: uint(attempt.review.requiredMinimum),
+      strategy: circleStrategy(request), chainId: CIRCLE_CHAIN_ID, feeCeiling: uint(attempt.review.networkFee), inputSymbol: request.tokenIn, inputDecimals: tokenIn.decimals,
+      outputSymbol: request.tokenOut, outputDecimals: tokenOut.decimals, nonce: swap.nonce, sentDataHash: swap.dataHash, approvalFees: 0n, maxFeeUnits: providerFeeUnits(attempt.review),
+      planned: swap.gasLimit !== undefined && swap.maxFee !== undefined && swap.maxTip !== undefined ? { gas: uint(swap.gasLimit), maxFeePerGas: uint(swap.maxFee), maxPriorityFeePerGas: uint(swap.maxTip) } : undefined,
+    }
+    const loaded = await load(attempt.hash, { owner, nonce: swap.nonce }, tx => {
+      submitted?.(summarizeIntent(compareCircleSwap({ attemptHash: attempt.hash!, tx, receipt: null,
+        observation: { canonical: false, latestBlock: 0n, blockTimestamp: null }, reviewed, received: null, sent: null }), clock()))
+    })
     if (loaded.state === 'missing') {
       // Unknown to the node. Whether its nonce has meanwhile been used by another transaction is read as well: then this hash can never be
       // mined, and only a replacement hash can identify the swap.
@@ -1083,12 +1099,7 @@ export function createCircleChainRpc(rpc: PublicClient, clock: () => number = Da
       const input = flows.flows.get(lc(tokenIn.address))
       sent = input ? input.sent - input.received : 0n
     }
-    const reviewed: CircleReviewedIntent = {
-      owner, adapter: CIRCLE_ADAPTER, inputToken: tokenIn.address as Hex, outputToken: tokenOut.address as Hex, amountIn: uint(attempt.review.amountIn), minimumOut: uint(attempt.review.requiredMinimum),
-      strategy: circleStrategy(request), chainId: CIRCLE_CHAIN_ID, feeCeiling: uint(attempt.review.networkFee), inputSymbol: request.tokenIn, inputDecimals: tokenIn.decimals,
-      outputSymbol: request.tokenOut, outputDecimals: tokenOut.decimals, nonce: swap.nonce, sentDataHash: swap.dataHash, approvalFees, maxFeeUnits: providerFeeUnits(attempt.review),
-      planned: swap.gasLimit !== undefined && swap.maxFee !== undefined && swap.maxTip !== undefined ? { gas: uint(swap.gasLimit), maxFeePerGas: uint(swap.maxFee), maxPriorityFeePerGas: uint(swap.maxTip) } : undefined,
-    }
+    reviewed.approvalFees = approvalFees
     const report = compareCircleSwap({ attemptHash: attempt.hash, tx: chainTx, receipt: chainReceipt, observation: { canonical: true, latestBlock: latest, blockTimestamp: typeof block.timestamp === 'bigint' ? block.timestamp : null }, reviewed, received, sent })
     if (report.verdict === 'unbound') throw new ExecutionVerificationError('binding', false)
     const checkedAt = clock()

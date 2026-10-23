@@ -24,6 +24,14 @@ await test('exchange rates are computed from exact amounts and formatted without
   assert.equal(r(1000000n, 6, 400000000000000n, 18), '0.0004')
   assert.equal(r(400000000000000n, 18, 1000000n, 6), '2,500')
 })
+await test('early mismatches warn while pending or unreadable, without claiming failure or allowing a retry', () => {
+  for (const status of ['pending', 'unknown']) for (const verdict of ['mismatch', 'unbound']) {
+    const view = pres.statusPresentation({ status, hash: HASH, intent: { verdict, checks: [], differences: ['Different calldata.'], checkedAt: 1 } })
+    assert.match(view.notice.title, /Security warning/); assert.match(view.notice.lines[0], /cannot cancel/)
+    assert.equal(view.retry, false); assert.equal(view.working, true); assert.doesNotMatch(view.headline, /completed|failed/i)
+  }
+  assert.equal(pres.statusPresentation({ status: 'pending', hash: HASH }).notice, null)
+})
 await test('the mode chip describes the route and the build, never whether an amount was typed', () => {
   const pilot = mode.swapExecutionConfig('true', owner, 'pilot'), open = mode.swapExecutionConfig('true', undefined, 'open'), off = mode.swapExecutionConfig('false', owner, 'pilot')
   const u = (tokenIn, tokenOut) => ({ provider: 'uniswap', tokenIn, tokenOut })

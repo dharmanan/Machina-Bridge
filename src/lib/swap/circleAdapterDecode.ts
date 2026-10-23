@@ -174,7 +174,7 @@ export interface CircleReviewedIntent extends CircleSwapIntent {
   planned?: { gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }
 }
 export interface CircleComparisonInput {
-  attemptHash: Hex; tx: ChainTx; receipt: ChainReceipt; observation: ChainObservation
+  attemptHash: Hex; tx: ChainTx; receipt: ChainReceipt | null; observation: ChainObservation
   reviewed: CircleReviewedIntent | null
   received: bigint | null // net output token gained by the owner
   sent: bigint | null     // net input token given up by the owner
@@ -191,7 +191,7 @@ const usdc18 = (value: bigint) => `${units(value, 18)} USDC`
 export function compareCircleSwap(input: CircleComparisonInput): IntentReport {
   const { tx, receipt, reviewed, observation } = input
   const checks: IntentCheck[] = [], differences: string[] = []
-  const identity = lc(tx.hash) === lc(input.attemptHash) && lc(receipt.transactionHash) === lc(input.attemptHash)
+  const identity = lc(tx.hash) === lc(input.attemptHash) && (receipt === null || lc(receipt.transactionHash) === lc(input.attemptHash))
   if (!reviewed) {
     checks.push(check('identity', 'Transaction hash', identity ? 'match' : 'mismatch', identity ? 'The hash is the one recorded for this attempt.' : 'The transaction and receipt do not carry the recorded hash.'))
     return { verdict: identity ? 'no_review' : 'unbound', checks, differences: ['No stored Review is available for this transaction, so only the chain facts could be verified.'] }
@@ -199,13 +199,13 @@ export function compareCircleSwap(input: CircleComparisonInput): IntentReport {
   const bound: [string, string, boolean, string][] = [
     ['identity', 'Transaction hash', identity, 'The recorded hash must match the transaction and its receipt.'],
     ['chain', 'Network', tx.chainId === reviewed.chainId, `Arc Mainnet ${reviewed.chainId} expected.`],
-    ['sender', 'Sender', same(tx.from, reviewed.owner) && same(receipt.from, reviewed.owner), 'The transaction must come from the reviewed wallet.'],
+    ['sender', 'Sender', same(tx.from, reviewed.owner) && (receipt === null || same(receipt.from, reviewed.owner)), 'The transaction must come from the reviewed wallet.'],
     ...(reviewed.nonce === undefined ? [] : [['nonce', 'Nonce', tx.nonce === reviewed.nonce, `Recorded nonce ${reviewed.nonce}.`] as [string, string, boolean, string]]),
   ]
   for (const [id, label, ok, detail] of bound) checks.push(check(id, label, ok ? 'match' : 'mismatch', ok ? `${label} matches the Review.` : detail))
   if (bound.some(item => !item[2])) return { verdict: 'unbound', checks, differences: ['This hash does not identify the reviewed transaction (hash, sender, nonce or network differ).'] }
 
-  const target = tx.to !== null && same(tx.to, reviewed.adapter) && receipt.to !== null && same(receipt.to, reviewed.adapter)
+  const target = tx.to !== null && same(tx.to, reviewed.adapter) && (receipt === null || (receipt.to !== null && same(receipt.to, reviewed.adapter)))
   checks.push(check('adapter', 'Circle adapter', target ? 'match' : 'mismatch', target ? 'The transaction targets the pinned Circle adapter.' : 'The transaction does not target the pinned Circle adapter.'))
   if (!target) differences.push('The transaction was sent to a contract other than the pinned Circle adapter.')
   checks.push(check('type', 'Transaction type', tx.type === 'eip1559' ? 'match' : 'mismatch', tx.type === 'eip1559' ? 'EIP-1559.' : `Transaction type ${tx.type} is not EIP-1559.`))
@@ -222,13 +222,14 @@ export function compareCircleSwap(input: CircleComparisonInput): IntentReport {
   else { checks.push(check('calldata-binding', 'Calldata as sent', 'mismatch', 'The on-chain calldata differs from the calldata the application allowed to reach the wallet.')); differences.push('The wallet sent different calldata than the application allowed.') }
 
   const worst = tx.gas * tx.maxFeePerGas
-  const feeOk = tx.gas > 0n && tx.gas <= CIRCLE_MAX_GAS_LIMIT && tx.gas >= receipt.gasUsed && tx.maxFeePerGas > 0n && tx.maxPriorityFeePerGas <= tx.maxFeePerGas && worst <= reviewed.feeCeiling
+  const feeOk = tx.gas > 0n && tx.gas <= CIRCLE_MAX_GAS_LIMIT && (receipt === null || tx.gas >= receipt.gasUsed) && tx.maxFeePerGas > 0n && tx.maxPriorityFeePerGas <= tx.maxFeePerGas && worst <= reviewed.feeCeiling
   const planned = reviewed.planned, sameFields = planned !== undefined && tx.gas === planned.gas && tx.maxFeePerGas === planned.maxFeePerGas && tx.maxPriorityFeePerGas === planned.maxPriorityFeePerGas
   if (sameFields && feeOk) checks.push(check('fee-fields', 'Gas fields', 'match', 'Gas limit and fee caps are the values the application asked the wallet to use.'))
   else checks.push(check('fee-fields', 'Gas fields', feeOk ? 'allowed' : 'mismatch', feeOk
     ? `The wallet chose gas limit ${tx.gas}, max fee ${gwei(tx.maxFeePerGas)}, priority fee ${gwei(tx.maxPriorityFeePerGas)}. Worst case ${usdc18(worst)} is within the reviewed fee ceiling ${usdc18(reviewed.feeCeiling)}.`
     : `The wallet's gas fields allow up to ${usdc18(worst)}, above the reviewed fee ceiling ${usdc18(reviewed.feeCeiling)}, or are malformed.`))
   if (!feeOk) differences.push('The transaction allowed a higher network fee than the reviewed ceiling.')
+  if (receipt === null) return { verdict: checks.some(item => item.status === 'mismatch') ? 'mismatch' : 'incomplete', checks, differences }
   const consistent = receipt.gasUsed <= tx.gas && receipt.effectiveGasPrice <= tx.maxFeePerGas
   checks.push(check('receipt-consistency', 'Receipt consistency', consistent ? 'match' : 'mismatch', consistent ? 'Gas used and the effective price are within the limits the transaction set.' : 'The receipt reports more gas or a higher price than the transaction allowed.'))
   if (!consistent) differences.push('The receipt is inconsistent with the transaction it belongs to.')

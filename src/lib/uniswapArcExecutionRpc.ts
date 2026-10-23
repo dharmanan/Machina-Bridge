@@ -2,7 +2,7 @@ import { createPublicClient, defineChain, erc20Abi, http, keccak256, parseAbi, t
 import { ARC_PERMIT2, ARC_ROUTER, ARC_ROUTER_HASH, ARC_TOKENS, sameAddress, tokenUnits, uint, type ArcReview } from './uniswapArcPolicy'
 import { reviewValue } from './swap/swapPolicy'
 import { ExecutionNonceObservationError, ExecutionVerificationError, executionDeadlineMs, executionTransaction, type ChainResult, type SwapAttempt } from './uniswapArcExecution'
-import { compareToReview, ownerFlows, summarizeIntent, type ChainLog, type ChainReceipt, type ChainTx, type ReviewedIntent } from './swap/transactionEvidence'
+import { compareToReview, ownerFlows, summarizeIntent, type IntentSummary, type ChainLog, type ChainReceipt, type ChainTx, type ReviewedIntent } from './swap/transactionEvidence'
 
 const RPC = 'https://rpc.mainnet.arc.io'
 const chain = defineChain({ id: 5042, name: 'Arc Mainnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [RPC] } } })
@@ -72,7 +72,7 @@ export function createArcExecutionRpc(rpc = client) {
   //   chain  : what the network says (success/reverted, block, fee, what the wallet received)
   //   intent : whether that transaction is the one that was reviewed (see swap/transactionEvidence)
   // Wallet-adjusted gas fields are judged by the approved fee ceiling; calldata, value, target, sender and nonce are never adjustable.
-  async function result(attempt: SwapAttempt): Promise<ChainResult> {
+  async function result(attempt: SwapAttempt, submitted?: (intent: IntentSummary) => void): Promise<ChainResult> {
     // A transient read problem is a retryable error; a hash that cannot identify the attempt is not.
     if (!hash(attempt.hash)) throw new ExecutionVerificationError('binding', false)
     let chainId: number
@@ -91,6 +91,18 @@ export function createArcExecutionRpc(rpc = client) {
       }
       throw new ExecutionVerificationError('rpc', true)
     }
+    const request = attempt.review.request
+    const outputToken = ARC_TOKENS[request.tokenOut]
+    const reviewed: ReviewedIntent = {
+      owner: request.owner as Hex, recipient: request.recipient as Hex, router: ARC_ROUTER as Hex, chainId: 5042, nonce: attempt.nonce,
+      value: BigInt(expected.value), calldata: attempt.review.transaction.data, gasLimit: BigInt(expected.gas), maxFeePerGas: BigInt(expected.maxFeePerGas),
+      maxPriorityFeePerGas: BigInt(expected.maxPriorityFeePerGas), feeCeiling: uint(attempt.review.networkFee), outputToken: outputToken.address as Hex,
+      requiredMinimum: uint(attempt.review.requiredMinimum), outputSymbol: request.tokenOut, outputDecimals: outputToken.decimals,
+    }
+    const chainTx: ChainTx = { hash: tx.hash, from: tx.from, to: tx.to ?? null, chainId: tx.chainId ?? 0, nonce: tx.nonce, type: tx.type, value: tx.value, gas: tx.gas,
+      maxFeePerGas: tx.maxFeePerGas ?? 0n, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 0n, input: tx.input }
+    submitted?.(summarizeIntent(compareToReview({ attemptHash: attempt.hash!, tx: chainTx, receipt: null,
+      observation: { canonical: false, latestBlock: 0n, blockTimestamp: null }, reviewed, received: null }), Date.now()))
     const identityOk = tx.hash.toLowerCase() === attempt.hash!.toLowerCase() && sameAddress(tx.from, expected.from) && tx.chainId === 5042 && tx.nonce === attempt.nonce
     if (!identityOk) throw new ExecutionVerificationError('binding', false)
     let receipt
@@ -106,16 +118,6 @@ export function createArcExecutionRpc(rpc = client) {
     catch { throw new ExecutionVerificationError('rpc', true) }
     if (block.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) return { status: 'pending', identified: true }
     if (latest < receipt.blockNumber + 1n) return { status: 'pending', identified: true } // Two observed blocks; not a promise against all reorgs.
-    const request = attempt.review.request
-    const outputToken = ARC_TOKENS[request.tokenOut]
-    const reviewed: ReviewedIntent = {
-      owner: request.owner as Hex, recipient: request.recipient as Hex, router: ARC_ROUTER as Hex, chainId: 5042, nonce: attempt.nonce,
-      value: BigInt(expected.value), calldata: attempt.review.transaction.data, gasLimit: BigInt(expected.gas), maxFeePerGas: BigInt(expected.maxFeePerGas),
-      maxPriorityFeePerGas: BigInt(expected.maxPriorityFeePerGas), feeCeiling: uint(attempt.review.networkFee), outputToken: outputToken.address as Hex,
-      requiredMinimum: uint(attempt.review.requiredMinimum), outputSymbol: request.tokenOut, outputDecimals: outputToken.decimals,
-    }
-    const chainTx: ChainTx = { hash: tx.hash, from: tx.from, to: tx.to ?? null, chainId: tx.chainId ?? 0, nonce: tx.nonce, type: tx.type, value: tx.value, gas: tx.gas,
-      maxFeePerGas: tx.maxFeePerGas ?? 0n, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 0n, input: tx.input }
     const chainReceipt: ChainReceipt = { transactionHash: receipt.transactionHash, from: receipt.from, to: receipt.to ?? null, status: receipt.status === 'success' ? 'success' : 'reverted',
       blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, transactionIndex: receipt.transactionIndex, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice,
       logs: receipt.logs as unknown as readonly ChainLog[] }

@@ -11,6 +11,7 @@ const root = fileURLToPath(new URL('..', import.meta.url)), p = require(`${root}
 const e = require(`${root}src/lib/uniswapArcExecution.ts`), { createArcExecutionRpc, assertExecutionReadMethod } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
 const pilot = require(`${root}src/lib/uniswapArcPilot.ts`)
 const fresh = require(`${root}scripts/fixtures/uniswap-arc/execution-review.cjs`)
+const evidence = require(`${root}src/lib/swap/transactionEvidence.ts`)
 const { decodeFunctionData, decodeAbiParameters, encodeFunctionData, encodeEventTopics, encodeAbiParameters, parseAbiParameters, keccak256 } = require('viem')
 const runtime = readFileSync(`${root}scripts/fixtures/uniswap-arc/router-runtime.hex`, 'utf8').trim()
 let external = 0, count = 0
@@ -35,7 +36,7 @@ function setup(options = {}) {
     context: () => context, input: () => input, fresh: async request => { stats.quotes++; return fresh(request, clock.now) }, quoteNow: () => clock.now,
     preflight: async review => { stats.preflight++; return options.preflight ? options.preflight(review, stats.preflight) : { nonce: 7, latestNonce: 7 } },
     provider: async () => provider,
-    result: async attempt => { stats.results++; return options.result ? options.result(attempt) : { status: 'pending' } },
+    result: async (attempt, submitted) => { stats.results++; return options.result ? options.result(attempt, submitted) : { status: 'pending' } },
     storage: { getItem: key => data.get(key) ?? null, setItem: (key, value) => { stats.writes++; if (options.write) options.write(stats.writes); data.set(key, value) } },
     lock: async (account, run) => { const key = account.toLowerCase(); if (locks.has(key)) throw Error('lock'); locks.add(key); try { return await run() } finally { locks.delete(key) } },
     // Generic engine scenarios retain both route profiles. Pilot authorization is tested separately below.
@@ -711,6 +712,102 @@ function rpcFixture(symbol = 'EURC', changes = {}) {
 async function notVerified(f) {
   try { const r = await f.adapter.result(f.attempt); return r.status === 'settled' ? ['verified', 'verified_with_notes'].includes(r.intent.verdict) === false : false } catch { return true }
 }
+await test('submitted transaction comparison runs before a receipt is available, with no false settlement or gas warning', async () => {
+  const missingReceipt = () => { throw Object.assign(Error('not mined'), { name: 'TransactionReceiptNotFoundError' }) }
+  for (const change of [{}, { maxPriorityFeePerGas: 1n }, { gas: 120000n }, { to: other }, { value: 1n }, { input: '0x12345678' }, { from: other }, { nonce: 8 }, { chainId: 1 }]) {
+    let observed
+    const f = rpcFixture('EURC', { getTransactionReceipt: async () => { assert.ok(observed, 'comparison precedes receipt read'); return missingReceipt() } })
+    Object.assign(f.tx, change)
+    const run = f.adapter.result(f.attempt, report => { observed = report })
+    if ('from' in change || 'nonce' in change || 'chainId' in change) await assert.rejects(run, error => error.reason === 'binding')
+    else assert.equal((await run).status, 'pending')
+    assert.equal(observed.verdict, Object.keys(change).some(k => ['to', 'value', 'input'].includes(k)) ? 'mismatch' : ['from', 'nonce', 'chainId'].some(k => k in change) ? 'unbound' : 'incomplete')
+    if ('gas' in change || 'maxPriorityFeePerGas' in change) assert.equal(observed.checks.find(c => c.id === 'fee-fields').status, 'allowed')
+  }
+})
+await test('read-only mainnet calldata fixtures distinguish the extra PAY_PORTION and changed recipient from the normal V3 program', () => {
+  const captured = JSON.parse(readFileSync(`${root}scripts/fixtures/swap/uniswap-integrity-transactions.json`, 'utf8'))
+  assert.equal(captured.transactions.length, 2)
+  for (const [index, raw] of captured.transactions.entries()) {
+    const tx = { ...raw, chainId: Number(BigInt(raw.chainId)), nonce: Number(BigInt(raw.nonce)), type: 'eip1559',
+      value: BigInt(raw.value), gas: BigInt(raw.gas), maxFeePerGas: BigInt(raw.maxFeePerGas), maxPriorityFeePerGas: BigInt(raw.maxPriorityFeePerGas) }
+    const [commands, inputs, deadline] = decodeFunctionData({ abi: p.EXECUTE_ABI, data: tx.input }).args
+    assert.equal(commands, index === 0 ? '0x00060404' : '0x0004')
+    const swap = [...decodeAbiParameters(p.V3_INPUT, inputs[0])]
+    let expected = tx.input
+    if (index === 0) {
+      const [token, recipient, bips] = decodeAbiParameters(parseAbiParameters('address,address,uint256'), inputs[1])
+      assert.ok(p.sameAddress(token, p.ARC_OUTPUTS.EURC.address)); assert.equal(bips, 160n)
+      assert.ok(p.sameAddress(recipient, '0x147cf09e7373b8fda6f12021f1b0f98d6da1a566'))
+      // Policy-compatible comparison fixture, NOT a claim to possess this transaction's historical Review.
+      swap[0] = tx.from
+      expected = encodeFunctionData({ abi: p.EXECUTE_ABI, functionName: 'execute', args: ['0x0004', [encodeAbiParameters(p.V3_INPUT, swap), inputs[2]], deadline] })
+    }
+    const reviewed = { owner: tx.from, recipient: tx.from, router: p.ARC_ROUTER, chainId: 5042, nonce: tx.nonce, value: tx.value, calldata: expected,
+      gasLimit: tx.gas, maxFeePerGas: tx.maxFeePerGas, maxPriorityFeePerGas: tx.maxPriorityFeePerGas, feeCeiling: tx.gas * tx.maxFeePerGas,
+      outputToken: p.ARC_OUTPUTS.EURC.address, requiredMinimum: swap[2], outputSymbol: 'EURC', outputDecimals: 6 }
+    const report = evidence.compareToReview({ attemptHash: tx.hash, tx, receipt: null, observation: { canonical: false, latestBlock: 0n, blockTimestamp: null }, reviewed, received: null })
+    assert.equal(report.verdict, index === 0 ? 'mismatch' : 'incomplete')
+    if (index === 0) assert.match(report.differences.join(' '), /1\.60%/)
+    else {
+      assert.equal(report.checks.find(c => c.id === 'calldata').status, 'match')
+      const changed = [...swap]; changed[0] = other
+      const altered = { ...tx, input: encodeFunctionData({ abi: p.EXECUTE_ABI, functionName: 'execute', args: [commands, [encodeAbiParameters(p.V3_INPUT, changed), inputs[1]], deadline] }) }
+      assert.equal(evidence.compareToReview({ attemptHash: tx.hash, tx: altered, receipt: null, observation: { canonical: false, latestBlock: 0n, blockTimestamp: null }, reviewed, received: null }).verdict, 'mismatch')
+    }
+  }
+})
+await test('unknown transaction and RPC errors are not evidence of a security violation; a receipt outage cannot erase an observed mismatch', async () => {
+  for (const failure of [Object.assign(Error('not found'), { name: 'TransactionNotFoundError' }), Error('RPC unavailable')]) {
+    let count = 0
+    const f = rpcFixture('EURC', { getTransaction: async () => { throw failure } })
+    try { await f.adapter.result(f.attempt, () => { count++ }) } catch (error) { assert.equal(error.reason, 'rpc') }
+    assert.equal(count, 0)
+  }
+  const f = rpcFixture('EURC', { getTransactionReceipt: async () => { throw Error('RPC down') } }); f.tx.to = other
+  let observed
+  await assert.rejects(f.adapter.result(f.attempt, report => { observed = report }), error => error.reason === 'rpc')
+  assert.equal(observed.verdict, 'mismatch')
+})
+await test('a slow receipt cannot postpone an already visible calldata warning', async () => {
+  let release, observed, finished = false
+  const f = rpcFixture('EURC', { getTransactionReceipt: () => new Promise(resolve => { release = resolve }) }); f.tx.input = '0x12345678'
+  const pending = f.adapter.result(f.attempt, report => { observed = report }).then(result => { finished = true; return result })
+  await waitFor(() => release !== undefined)
+  assert.equal(observed.verdict, 'mismatch'); assert.equal(finished, false)
+  release(f.receipt); const result = await pending
+  assert.equal(result.status, 'settled'); assert.equal(result.chain.state, 'success'); assert.equal(result.intent.verdict, 'mismatch')
+})
+await test('an early unbound report cannot persist an unverified recovery hash', async () => {
+  const f = setup(), original = f.provider.request
+  let requests = 0
+  f.provider.request = args => { if (args.method === 'eth_sendTransaction') { requests++; return Promise.reject(Error('unknown submission')) } return original(args) }
+  await f.controller.confirm(await f.review())
+  f.ports.result = async (_attempt, submitted) => {
+    submitted?.({ verdict: 'unbound', checks: [], differences: ['Different sender.'], checkedAt: 1 })
+    throw new e.ExecutionVerificationError('binding', false)
+  }
+  await f.controller.reconcile(owner, hash)
+  const stored = e.createExecutionJournal(f.ports.storage).read(owner)[0]
+  assert.equal(stored.hash, undefined); assert.equal(stored.intent, undefined); assert.equal(requests, 1)
+})
+await test('an early mismatch is durable through a receipt outage and reload, blocks resubmission and still settles normally', async () => {
+  const f = setup({ result: async (attempt, submitted) => {
+    const rpc = rpcFixture(); rpc.tx.input = '0x12345678'
+    rpc.rpc.getTransactionReceipt = async () => { throw Error('RPC down') }
+    return rpc.adapter.result({ ...rpc.attempt, review: attempt.review, nonce: attempt.nonce }, submitted)
+  } })
+  await f.controller.confirm(await f.review())
+  assert.equal(f.controller.current().attempt.intent.verdict, 'mismatch'); assert.equal(f.controller.current().phase, 'pending')
+  const restored = setup({ data: f.data }); assert.equal(restored.controller.history()[0].intent.verdict, 'mismatch')
+  await restored.controller.prepare(); assert.equal(restored.sent().length, 0)
+  f.ports.result = async attempt => {
+    const rpc = rpcFixture(); rpc.tx.input = '0x12345678'
+    return rpc.adapter.result({ ...rpc.attempt, review: attempt.review, nonce: attempt.nonce })
+  }
+  await f.controller.reconcile(owner); assert.equal(f.controller.current().phase, 'mismatch')
+  assert.equal(f.controller.current().attempt.chain.state, 'success'); assert.equal(f.sent().length, 1)
+})
 await test('actual preflight adapter rechecks both routes, runtime, decimals, balances, fees, gas and exact simulation', async () => {
   for (const symbol of ['EURC', 'cirBTC']) {
     const f = rpcFixture(symbol); assert.deepEqual(await f.adapter.preflight(f.review), { nonce: 7, latestNonce: 7 })

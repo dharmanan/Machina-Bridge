@@ -803,6 +803,65 @@ const verifyEntry = async (entry, over = {}, rpcOver = {}) => {
   return { result: await rpc.result(attempt), attempt, rpc }
 }
 const ids = report => Object.fromEntries(report.intent.checks.map(item => [item.id, item.status]))
+await test('Circle checks submitted bytes, target, value and identity before receipt availability; bounded wallet gas adjustments are allowed', async () => {
+  const entry = realSwaps[0]
+  for (const delta of [{}, { gas: entry.tx.gas - 1n }, { input: '0x12345678' }, { to: other }, { value: 1n }, { from: other }, { nonce: entry.tx.nonce + 1 }, { chainId: 1 }]) {
+    let observed
+    const rpc = c.createCircleChainRpc(fakeRpc(entry, { ...approveFixtures(entry), noReceipt: true, mutateTx: tx => ({ ...tx, ...delta }) }), () => 1)
+    const run = rpc.result(attemptFor(entry), report => { observed = report })
+    if ('from' in delta || 'nonce' in delta || 'chainId' in delta) await assert.rejects(run, error => error.reason === 'binding')
+    else assert.equal((await run).status, 'pending')
+    assert.equal(observed.verdict, ['from', 'nonce', 'chainId'].some(k => k in delta) ? 'unbound' : ['input', 'to', 'value'].some(k => k in delta) ? 'mismatch' : 'incomplete')
+    if ('gas' in delta) assert.equal(observed.checks.find(c => c.id === 'fee-fields').status, 'allowed')
+  }
+})
+await test('Circle missing hashes and RPC read failures cause no false integrity alert; receipt outages retain the submitted comparison', async () => {
+  const entry = realSwaps[0]
+  for (const over of [{ noTx: true }, { rpcError: 'getTransaction' }]) {
+    let observed = 0
+    const rpc = c.createCircleChainRpc(fakeRpc(entry, { ...approveFixtures(entry), ...over }), () => 1)
+    try { await rpc.result(attemptFor(entry), () => { observed++ }) } catch (error) { assert.equal(error.reason, 'rpc') }
+    assert.equal(observed, 0)
+  }
+  let observed
+  const rpc = c.createCircleChainRpc(fakeRpc(entry, { ...approveFixtures(entry), rpcError: 'getTransactionReceipt', mutateTx: tx => ({ ...tx, to: other }) }), () => 1)
+  await assert.rejects(rpc.result(attemptFor(entry), report => { observed = report }), error => error.reason === 'rpc')
+  assert.equal(observed.verdict, 'mismatch')
+})
+await test('Circle exposes a calldata warning while the receipt request is still waiting', async () => {
+  const entry = realSwaps[0], rpc = fakeRpc(entry, { ...approveFixtures(entry), mutateTx: tx => ({ ...tx, input: '0x12345678' }) })
+  let release, observed, finished = false
+  const getReceipt = rpc.getTransactionReceipt
+  rpc.getTransactionReceipt = args => args.hash === entry.hash ? new Promise(resolve => { release = () => resolve(getReceipt(args)) }) : getReceipt(args)
+  const pending = c.createCircleChainRpc(rpc, () => 1).result(attemptFor(entry), report => { observed = report }).then(result => { finished = true; return result })
+  await waitFor(() => release !== undefined)
+  assert.equal(observed.verdict, 'mismatch'); assert.equal(finished, false)
+  release(); const result = await pending
+  assert.equal(result.status, 'settled'); assert.equal(result.chain.state, 'success'); assert.equal(result.intent.verdict, 'mismatch')
+})
+await test('Circle cannot persist a supplied recovery hash on an early unbound comparison', async () => {
+  const f = setup({ tokenIn: 'USDC', tokenOut: 'EURC' })
+  f.world.wallet = () => { throw Error('submission unknown') }
+  await f.run(await f.review())
+  f.ports.result = async (_attempt, submitted) => {
+    submitted?.({ verdict: 'unbound', checks: [], differences: ['Different sender.'], checkedAt: 1 })
+    throw new x.ExecutionVerificationError('binding', false)
+  }
+  await f.controller.reconcile(owner, '0x' + 'd1'.repeat(32))
+  assert.equal(f.records()[0].hash, undefined); assert.equal(f.records()[0].intent, undefined)
+})
+await test('Circle early warnings persist across read failures and reload without resubmission; final settlement still owns the verdict', async () => {
+  const warning = { verdict: 'mismatch', checks: [{ id: 'calldata-binding', status: 'mismatch', detail: 'Different calldata.' }], differences: ['Different calldata.'], checkedAt: 1 }
+  const f = setup(), originalResult = f.ports.result
+  f.ports.result = async (_attempt, submitted) => { submitted?.(warning); throw new x.ExecutionVerificationError('rpc', true) }
+  await f.run(await f.review())
+  assert.equal(f.controller.current().attempt.intent.verdict, 'mismatch')
+  assert.equal(f.controller.current().phase, 'pending')
+  const reload = setup({ data: f.data }); assert.equal(reload.records()[0].intent.verdict, 'mismatch')
+  await reload.controller.prepare(); assert.equal(reload.world.issued.size, 0)
+  f.ports.result = originalResult; f.world.results.set(f.controller.current().attempt.hash, 'settle')
+  await f.controller.reconcile(); assert.equal(f.controller.current().phase, 'confirmed')
+})
 await test('real swaps, verified from the chain: every one of the 8 is Confirmed-grade (verified with notes: the wallet chose the gas fields), with the real received amount and the real fee', async () => {
   for (const entry of realSwaps) {
     const { result } = await verifyEntry(entry), label = `${entry.tokenIn}>${entry.tokenOut}`

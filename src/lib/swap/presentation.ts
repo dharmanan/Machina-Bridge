@@ -72,6 +72,10 @@ export function statusPresentation(input: StatusInput): StatusPresentation {
     for (const text of intent.differences) technical.push(`difference: ${text}`)
   }
   const base = { amounts, fee, received, paid, technical, notice: null as Notice | null }
+  if (['pending', 'unknown'].includes(status) && intent && ['mismatch', 'unbound'].includes(intent.verdict)) {
+    base.notice = { tone: 'warning', title: 'Security warning: transaction differs from your review',
+      lines: ['The public RPC shows different transaction details than you approved. This check cannot cancel the transaction. Do not submit another swap.', ...intent.differences.slice(0, 2)] }
+  }
   switch (status) {
     case 'awaiting_wallet': return { headline: 'Confirm in your wallet', tone: 'progress', detail: 'Waiting for your approval. Please keep this page open.', short: 'Waiting for wallet', retry: false, working: true, ...base }
     case 'rejected': return { headline: 'Swap cancelled', tone: 'neutral', detail: 'You declined the request in your wallet. Nothing was sent.', short: 'Cancelled', retry: true, working: false, ...base }

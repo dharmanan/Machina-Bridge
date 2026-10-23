@@ -259,6 +259,8 @@ try {
   await test('native USDC to cirBTC: Review shows the route and limits, the wallet receives exactly the reviewed transaction, and the result reads Swap completed with real amounts', async () => {
     await pick('USDC', 'cirBTC'); await amount.fill('1'); await quoted()
     const before = await sends(); await review.click(); await page.getByRole('dialog').waitFor()
+    await page.getByRole('dialog').getByText('Wallet security', { exact: true }).waitFor()
+    await page.getByRole('dialog').getByText(/Browser extensions may modify swap transactions before signing/).waitFor()
     assert.equal(await page.getByRole('button', { name: '↻ Refresh quotes', exact: true }).isDisabled(), true)
     const dialog = page.getByRole('dialog'); await dialog.getByText('USDC → cirBTC (0.01%)', { exact: true }).waitFor(); await dialog.getByText('Most USDC you could spend', { exact: true }).waitFor(); await dialog.getByText('Minimum you receive', { exact: true }).waitFor(); await dialog.getByText('Network fee (maximum)', { exact: true }).waitFor()
     await dialog.getByText(/no fee is taken by anyone else/).waitFor(); assert.equal(await dialog.getByText('Fee to another address').count(), 0); assert.doesNotMatch(await dialog.innerText(), /calldata|TAKE_PORTION|SWEEP|V4_SWAP|Universal Router|Permit2/i) // the plain Review shows every fee and the minimum, no jargon; assert.equal(await sends(), before)
@@ -332,6 +334,8 @@ try {
     await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); assert.equal(await review.isEnabled(), true)
     const before = await sends(); await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
+    await dialog.getByText('Wallet security', { exact: true }).waitFor()
+    await dialog.getByText(/Browser extensions may modify swap transactions before signing/).waitFor()
     await dialog.getByText('Circle fee', { exact: true }).waitFor(); await dialog.getByText('Minimum you receive', { exact: true }).waitFor(); await dialog.getByText('Network fee (maximum, all steps)', { exact: true }).waitFor(); assert.doesNotMatch(await dialog.innerText(), /calldata|adapter|execute|ERC-1967/i)
     await dialog.getByText(/Approve exactly this EURC amount for Circle/).first().waitFor(); assert.equal(await sends(), before)
     await dialog.getByRole('button', { name: 'Confirm Swap' }).click(); await dialog.getByText(/Step 1 of 2: Approve exactly this EURC amount/).waitFor(); assert.equal(await sends(), before) // nothing reaches the wallet before the step is confirmed
@@ -429,6 +433,13 @@ try {
   await test('Pending keeps its status while the chain is re-read; transient RPC trouble is retried with growing pauses and deterministic errors are not retried', async () => {
     await syncNonce(); await page.clock.install(); await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirm.click()
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); const sent = await lastSent(); await syncWalletSends()
+    const pendingEntry = world.receipts.get(lc(sent.hash)), reviewedData = pendingEntry.tx.data, submissions = await sends()
+    pendingEntry.tx = { ...pendingEntry.tx, data: '0x12345678' }; await recheck()
+    await latest.getByText('Security warning: transaction differs from your review', { exact: true }).waitFor()
+    await latest.getByText(/This check cannot cancel the transaction/).waitFor()
+    assert.equal(await latest.getByRole('button', { name: 'Try again', exact: true }).count(), 0)
+    assert.equal(await sends(), submissions)
+    pendingEntry.tx = { ...pendingEntry.tx, data: reviewedData }
     const states = []; await page.evaluate(() => { new MutationObserver(() => { (window.__texts ??= []).push(document.querySelector('article[aria-label="Latest transaction"] p')?.textContent ?? '') }).observe(document.body, { subtree: true, childList: true, characterData: true }) })
     const mine = () => world.reads.filter(r => lc(r.hash) === lc(sent.hash) && r.method === 'eth_getTransactionByHash').length
     const start = mine(); await advanceClock(60_000); await page.waitForTimeout(300); const steady = mine() - start; assert.ok(steady >= 8 && steady <= 14, `steady polling ${steady}`)

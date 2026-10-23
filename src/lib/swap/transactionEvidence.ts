@@ -87,7 +87,8 @@ export function ownerFlows(receipt: ChainReceipt, owner: string, tokens: readonl
 export interface ComparisonInput {
   attemptHash: Hex
   tx: ChainTx
-  receipt: ChainReceipt
+  // null: inspect the submitted transaction only; never claims a settled or verified result.
+  receipt: ChainReceipt | null
   observation: ChainObservation
   reviewed: ReviewedIntent | null
   // Net amount of the reviewed output token the owner gained in this transaction (from ownerFlows), or null when unavailable.
@@ -108,7 +109,7 @@ const usdc18 = (value: bigint) => `${units(value, 18)} USDC`
 export function compareToReview(input: ComparisonInput): IntentReport {
   const { tx, receipt, reviewed, observation } = input
   const checks: IntentCheck[] = []
-  const identity = lc(tx.hash) === lc(input.attemptHash) && lc(receipt.transactionHash) === lc(input.attemptHash)
+  const identity = lc(tx.hash) === lc(input.attemptHash) && (receipt === null || lc(receipt.transactionHash) === lc(input.attemptHash))
   if (!reviewed) {
     checks.push(check('identity', 'Transaction hash', identity ? 'match' : 'mismatch', identity ? 'The hash is the one recorded for this attempt.' : 'The transaction and receipt do not carry the recorded hash.'))
     return { verdict: identity ? 'no_review' : 'unbound', checks, differences: ['No stored Review is available for this transaction, so only the chain facts could be verified.'] }
@@ -117,14 +118,14 @@ export function compareToReview(input: ComparisonInput): IntentReport {
   const bound: [string, string, boolean, string][] = [
     ['identity', 'Transaction hash', identity, 'The recorded hash must match the transaction and its receipt.'],
     ['chain', 'Network', tx.chainId === reviewed.chainId, `Arc Mainnet ${reviewed.chainId} expected.`],
-    ['sender', 'Sender', sameAddress(tx.from, reviewed.owner) && sameAddress(receipt.from, reviewed.owner), 'The transaction must come from the reviewed wallet.'],
+    ['sender', 'Sender', sameAddress(tx.from, reviewed.owner) && (receipt === null || sameAddress(receipt.from, reviewed.owner)), 'The transaction must come from the reviewed wallet.'],
     ['nonce', 'Nonce', tx.nonce === reviewed.nonce, `Reviewed nonce ${reviewed.nonce}.`],
   ]
   for (const [id, label, ok, detail] of bound) checks.push(check(id, label, ok ? 'match' : 'mismatch', ok ? `${label} matches the Review.` : detail))
   if (bound.some(item => !item[2])) return { verdict: 'unbound', checks, differences: ['This hash does not identify the reviewed transaction (hash, sender, nonce or network differ).'] }
 
   const differences: string[] = []
-  const target = tx.to !== null && sameAddress(tx.to, reviewed.router) && receipt.to !== null && sameAddress(receipt.to, reviewed.router)
+  const target = tx.to !== null && sameAddress(tx.to, reviewed.router) && (receipt === null || (receipt.to !== null && sameAddress(receipt.to, reviewed.router)))
   checks.push(check('router', 'Router', target ? 'match' : 'mismatch', target ? 'The transaction targets the reviewed Universal Router.' : 'The transaction does not target the reviewed router.'))
   if (!target) differences.push('The transaction was sent to a different contract than the reviewed router.')
   checks.push(check('type', 'Transaction type', tx.type === 'eip1559' ? 'match' : 'mismatch', tx.type === 'eip1559' ? 'EIP-1559 as reviewed.' : `Transaction type ${tx.type} differs from the reviewed EIP-1559 transaction.`))
@@ -142,7 +143,7 @@ export function compareToReview(input: ComparisonInput): IntentReport {
   // Fee fields the wallet may adjust.
   const worst = tx.gas * tx.maxFeePerGas
   const sameFields = tx.gas === reviewed.gasLimit && tx.maxFeePerGas === reviewed.maxFeePerGas && tx.maxPriorityFeePerGas === reviewed.maxPriorityFeePerGas
-  const feeOk = tx.gas > 0n && tx.gas <= MAX_GAS_LIMIT && tx.gas >= receipt.gasUsed && tx.maxFeePerGas > 0n && tx.maxPriorityFeePerGas <= tx.maxFeePerGas && worst <= reviewed.feeCeiling
+  const feeOk = tx.gas > 0n && tx.gas <= MAX_GAS_LIMIT && (receipt === null || tx.gas >= receipt.gasUsed) && tx.maxFeePerGas > 0n && tx.maxPriorityFeePerGas <= tx.maxFeePerGas && worst <= reviewed.feeCeiling
   if (sameFields) checks.push(check('fee-fields', 'Gas fields', 'match', 'Gas limit and fee caps are the reviewed values.'))
   else if (feeOk) checks.push(check('fee-fields', 'Gas fields', 'allowed',
     `The wallet adjusted gas fields: limit ${tx.gas} (reviewed ${reviewed.gasLimit}), max fee ${gwei(tx.maxFeePerGas)} (reviewed ${gwei(reviewed.maxFeePerGas)}), priority fee ${gwei(tx.maxPriorityFeePerGas)} (reviewed ${gwei(reviewed.maxPriorityFeePerGas)}). Worst case ${usdc18(worst)} is within the approved ceiling ${usdc18(reviewed.feeCeiling)}.`))
@@ -150,6 +151,7 @@ export function compareToReview(input: ComparisonInput): IntentReport {
     checks.push(check('fee-fields', 'Gas fields', 'mismatch', `The wallet's gas fields allow up to ${usdc18(worst)}, above the approved ceiling ${usdc18(reviewed.feeCeiling)}, or are malformed.`))
     differences.push('The transaction allowed a higher network fee than the approved ceiling.')
   }
+  if (receipt === null) return { verdict: checks.some(item => item.status === 'mismatch') ? 'mismatch' : 'incomplete', checks, differences }
   // A receipt can never report more gas than the limit or a higher price than the cap the transaction allowed.
   const consistent = receipt.gasUsed <= tx.gas && receipt.effectiveGasPrice <= tx.maxFeePerGas
   checks.push(check('receipt-consistency', 'Receipt consistency', consistent ? 'match' : 'mismatch', consistent ? 'Gas used and the effective gas price are within the limits the transaction set.' : 'The receipt reports more gas or a higher price than the transaction allowed.'))
