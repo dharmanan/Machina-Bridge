@@ -60,10 +60,12 @@ export function createArcExecutionRpc(rpc = client) {
     }
     const call = { account, to: ARC_ROUTER, data: signedData ?? review.transaction.data, value, gas: uint(review.gasLimit),
       maxFeePerGas: uint(review.maxFeePerGas), maxPriorityFeePerGas: uint(review.maxPriorityFeePerGas), blockNumber } as const
+    let estimatedNetworkFee: string | undefined
     if (!erc20Input || signedData) {
       await rpc.call(call) // Exact tightened calldata, no state overrides or fake balances.
       const estimated = await rpc.estimateGas(call)
       if (estimated <= 0n || estimated > uint(review.gasLimit)) reject()
+      estimatedNetworkFee = (estimated * price).toString()
     } // An unsigned ERC-20 Review is preparation only; signing must be followed by the exact, non-overridden simulation above.
     try {
       const before = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
@@ -71,7 +73,7 @@ export function createArcExecutionRpc(rpc = client) {
       const latestNonce = await rpc.getTransactionCount({ address: account, blockTag: 'latest' })
       if (![before, nonce, latestNonce].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('public_nonce')
       if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('public', Math.max(before, nonce, latestNonce))
-      return { nonce, latestNonce, ...(allowanceNotice ? { allowanceNotice } : {}) }
+      return { nonce, latestNonce, ...(signedData && estimatedNetworkFee ? { estimatedNetworkFee } : {}), ...(allowanceNotice ? { allowanceNotice } : {}) }
     } catch (error) { if (error instanceof ExecutionNonceObservationError) throw error; throw new Error('public_nonce') }
   }
   // The transaction and receipt are read from the public RPC only. The result keeps two separate answers:

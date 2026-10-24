@@ -54,3 +54,14 @@ export function existingAllowanceNotice(reviewRequest: ArcReview['request'], all
   const existing = allowance === 2n ** 256n - 1n ? 'unlimited' : `${formatUnits(allowance, token.decimals)} ${reviewRequest.tokenIn}, above this swap amount`
   return `Existing ${reviewRequest.tokenIn} → Permit2 token allowance: ${existing}. It will be reused without another approval and will not be automatically increased or revoked. This swap's PermitSingle authorizes only ${reviewRequest.amount} ${reviewRequest.tokenIn} and expires with the transaction deadline (at most 120 seconds when prepared).`
 }
+
+// A PermitSingle authorizes only token/amount/spender/time, not a swap price. Reuse it only after a fresh,
+// independently validated Review, with its original deadline and bounds preserved. Never write this result to storage.
+export async function reusePermit(review: ArcReview, signedData: Hex, timestamp: bigint): Promise<Hex> {
+  const [commands, inputs] = decodeFunctionData({ abi: EXECUTE_ABI, data: signedData }).args
+  if (commands !== '0x0a00' || inputs.length !== 2) deny()
+  const [message, signature] = decodeAbiParameters(PERMIT_INPUT, inputs[0])
+  const expected = permitMessage(review, message.details.nonce, timestamp)
+  if (encodeAbiParameters(PERMIT_INPUT, [expected, signature]).toLowerCase() !== inputs[0].toLowerCase()) deny()
+  return attachPermit(review, message.details.nonce, timestamp, signature)
+}

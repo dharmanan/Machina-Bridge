@@ -63,6 +63,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_SIGNATURE_WINDOW_ONLY === '1' && !/^(the mode chip|a delayed PermitSingle)/.test(name)) return
   if (process.env.MACHINA_UI_POLISH_ONLY === '1' && !/^(the mode chip|compact provider cards|existing excessive token allowances)/.test(name)) return
   if (process.env.MACHINA_ALLOWANCE_ONLY === '1' && !/^(the mode chip|existing excessive token allowances)/.test(name)) return
   try { await fn(); count++; console.log(`PASS ${name}`) }
@@ -162,6 +163,15 @@ try {
   })
   await page.goto(base + '/__swap_ui_test')
   const amount = page.getByRole('textbox', { name: 'Swap amount' }), review = page.locator('#review-swap'), confirm = page.getByRole('button', { name: 'Confirm Swap', exact: true })
+  async function confirmUniswap() {
+    const sign = page.getByRole('button', { name: 'Sign permission', exact: true })
+    if (await sign.count()) {
+      await sign.click()
+      await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor()
+      await shot('uniswap-signed-review')
+    }
+    await confirm.click()
+  }
   const latest = page.getByRole('article', { name: 'Latest transaction' }), uniCard = page.getByRole('radio', { name: 'Uniswap quote' }), circleCard = page.getByRole('radio', { name: 'Circle Swap Kit quote' })
   const sends = () => page.evaluate(() => window.swapUiTest.state.sent.length)
   // A nudge to the status check. Once a result is final the Check status button is gone (nothing is left to check), and the automatic check may already have finished.
@@ -236,6 +246,27 @@ try {
     await page.evaluate(() => window.swapUiTest.chain(1))
     assert.equal(await page.getByRole('note', { name: 'Existing Permit2 token allowance', exact: true }).count(), 0)
     await page.evaluate(() => window.swapUiTest.chain(5042)); await pick('USDC', 'EURC'); await amount.fill('')
+  })
+
+  await test('a delayed PermitSingle outlives the price TTL, refreshes and simulates safely, then requires explicit final confirmation on mobile', async () => {
+    await syncNonce(); rpc.state.tokenAllowance.EURC = 1_000_000n
+    await uniCard.click(); await pick('EURC', 'USDC'); await amount.fill('1'); await quoted()
+    await page.evaluate(() => { window.swapUiTest.state.permitMode = 'held' })
+    const before = await sends(); await review.click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Sign the exact-amount permission in your wallet/).waitFor()
+    await page.setViewportSize({ width: 390, height: 844 }); await shot('permission-waiting-mobile')
+    await page.waitForTimeout(31_000) // controlled held provider request: real wall time exceeds the unchanged 30s TTL
+    assert.equal(await sends(), before)
+    await page.evaluate(() => { window.swapUiTest.state.permitMode = 'sign'; window.swapUiTest.releasePermit() })
+    await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor()
+    await page.getByRole('dialog').getByText('Network fee (estimate)', { exact: true }).waitFor()
+    await shot('permission-refreshed-mobile'); assert.equal(await sends(), before)
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth))
+    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    const sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
+    await latest.getByText('Swap completed', { exact: true }).waitFor(); await shot('permission-confirmed-mobile')
+    await page.setViewportSize({ width: 1280, height: 900 }); await bumpNonce(); await syncNonce()
+    rpc.state.tokenAllowance.EURC = 0n; await pick('USDC', 'EURC'); await amount.fill('')
   })
 
   await test('all 12 directions quote in both providers; the better price is tagged, the other stays selectable, and no provider is switched silently', async () => {
@@ -322,7 +353,7 @@ try {
     assert.equal(await dialog.getByText(/no fee is taken by anyone else/).count(), 0)
     assert.equal(await dialog.getByText('Fee to another address').count(), 0); assert.doesNotMatch(await dialog.innerText(), /calldata|TAKE_PORTION|SWEEP|V4_SWAP|Universal Router|Permit2/i) // the plain Review shows every fee and the minimum, no jargon
     assert.equal(await sends(), before)
-    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
     const sent = await lastSent(); assert.equal(await sends(), before + 1)
     assert.ok(p.sameAddress(sent.tx.to, p.ARC_ROUTER)); assert.equal(sent.tx.value, toHex(10n ** 18n)); assert.equal(sent.tx.type, '0x2'); assert.equal(sent.tx.chainId, '0x13b2'); assert.equal(sent.tx.maxPriorityFeePerGas, '0x0')
     const decoded = decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }); assert.equal(decoded.args[0], '0x0004') // native input: V3 swap then sweep
@@ -334,7 +365,7 @@ try {
 
   await test('a wallet that adds its own priority fee completes with the adjustment noted in plain words, because the approved fee ceiling still holds', async () => {
     world.walletAdjusts = true
-    await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirm.click()
+    await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirmUniswap()
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); const sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'success')
     await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
     await latest.getByText(/wallet adjusted the network fee slightly; it stayed within the maximum you approved/).waitFor(); assert.equal(await latest.getByRole('note').count(), 0); world.walletAdjusts = false; await bumpNonce(); await syncNonce()
@@ -342,6 +373,7 @@ try {
 
   await test('ERC-20 input: one exact approval continues to a fresh Review, then one PermitSingle signature and the atomic swap', async () => {
     await pick('EURC', 'USDC'); await amount.fill('1'); await quoted()
+    const walletStart = await page.evaluate(() => window.swapUiTest.state.requests.length)
     const panel = page.getByRole('region', { name: 'Token approvals' });
     await page.getByRole('button', { name: 'Approve EURC · 1 step' }).waitFor(); const before = await sends()
     assert.equal(await panel.count(), 0, 'no separate approval panel on the form')
@@ -354,23 +386,25 @@ try {
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Approval completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
     await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor()
-    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); sent = await lastSent(); assert.equal(sent.tx.value, '0x0')
+    await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); sent = await lastSent(); assert.equal(sent.tx.value, '0x0')
     assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[0], '0x0a00')
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(/Paid 1 EURC · Received 1\.1192 USDC|Paid 1 EURC · Received 1\.119/).waitFor()
     const history = page.getByLabel('Swap history'); await history.getByText(/earlier swaps?/).first().waitFor(); assert.equal(await history.locator('article').filter({ visible: true }).count(), 0) // earlier swaps are a closed list of short summaries; await bumpNonce(); await syncNonce()
-    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method))
+    const wallet = await page.evaluate(start => window.swapUiTest.state.requests.slice(start).map(r => r.method), walletStart)
     assert.equal(wallet.filter(m => m === 'eth_signTypedData_v4').length, 1); assert.equal(await sends(), before + 2)
   })
 
   await test('MetaMask-style hide and return during an explicitly confirmed PermitSingle request preserves context; no approval or send happens before signature release', async () => {
     await bumpNonce(); await syncNonce(); await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted()
     await page.evaluate(() => { window.swapUiTest.state.permitMode = 'held' })
-    const before = await sends(); await review.click(); await confirm.click()
-    await page.getByRole('dialog').getByText('Confirm the free, exact-amount Permit2 signature in your wallet. No swap has been sent.', { exact: true }).waitFor()
+    const before = await sends(); await review.click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Sign the exact-amount permission in your wallet/).waitFor()
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
     assert.equal(await sends(), before)
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')); window.swapUiTest.state.permitMode = 'sign'; window.swapUiTest.releasePermit() })
+    await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor(); assert.equal(await sends(), before)
+    await confirm.click()
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), before + 1)
     const sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
@@ -383,11 +417,11 @@ try {
     for (const { tokenIn, tokenOut } of tokens.SWAP_DIRECTIONS) {
       await pick(tokenIn, tokenOut); await amount.fill(''); await amount.fill(AMOUNT[tokenIn]); await quoted()
       await page.getByRole('button', { name: 'Review Swap', exact: true }).waitFor()
-      const before = await sends(); await review.click(); await confirm.waitFor(); const reviewed = await page.getByRole('dialog').innerText()
+      const before = await sends(); await review.click(); await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor(); const reviewed = await page.getByRole('dialog').innerText()
       const units = parseUnits(AMOUNT[tokenIn], dec[tokenIn]), routes = pools.candidateRoutes(tokenIn, tokenOut)
       const best = routes.map(r => ({ r, out: rpc.quoteOut(tokenIn, tokenOut, units, r.hops.map(h => h.fee)) })).sort((a, b) => (b.out > a.out ? 1 : -1))[0]
       assert.ok(reviewed.includes(pools.describeRoute(best.r)), `${tokenIn}>${tokenOut} route ${pools.describeRoute(best.r)}`); assert.ok(reviewed.includes(`${formatUnits(best.out, dec[tokenOut])} ${tokenOut}`))
-      await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), before + 1)
+      await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); assert.equal(await sends(), before + 1)
       const sent = await lastSent(); assert.equal(BigInt(sent.tx.value), tokenIn === 'USDC' ? units * 10n ** 12n : 0n)
       await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
       await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(new RegExp(`Paid ${AMOUNT[tokenIn].replace('.', '\\.')} ${tokenIn} · Received ${formatUnits(best.out, dec[tokenOut]).replace('.', '\\.')} ${tokenOut}`)).waitFor()
@@ -423,7 +457,8 @@ try {
   await test('Circle Swap Kit (test doubles for the SDK only): an exact approval and the adapter swap, each confirmed in the app first and then in the wallet, verified from the chain', async () => {
     await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); assert.equal(await review.isEnabled(), true)
-    const before = await sends(); await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
+    const before = await sends(), walletStart = await page.evaluate(() => window.swapUiTest.state.requests.length)
+    await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
     await dialog.getByText('Wallet security', { exact: true }).waitFor()
     await dialog.getByText(/Browser extensions may modify swap transactions before signing/).waitFor()
     await dialog.getByText(/An approval transaction also uses gas/).waitFor()
@@ -442,7 +477,7 @@ try {
     await syncWalletSends(); setReceipt(swap.hash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(/Paid 1 EURC · Received /).waitFor()
     await latest.getByLabel('Wallet steps').getByText(/Approval: done/).waitFor(); await bumpNonce(); await syncNonce()
-    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.some(m => /eth_sign$|personal_sign|wallet_/.test(m)), false)
+    const wallet = await page.evaluate(start => window.swapUiTest.state.requests.slice(start).map(r => r.method), walletStart); assert.deepEqual(wallet.filter(m => /eth_sign$|personal_sign|wallet_/.test(m)), [], 'Unexpected wallet method names only')
   })
 
   await test('Circle USDC input uses a one-time permit signature (no approval transaction); a declined step stops the flow and nothing later is requested', async () => {
@@ -459,6 +494,28 @@ try {
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(/Paid 1 USDC · Received /).waitFor(); await bumpNonce(); await syncNonce()
   })
 
+  await test('all 12 Circle directions: explicit permit or exact approval, confirmed swap and independently verified result', async () => {
+    for (const { tokenIn, tokenOut } of tokens.SWAP_DIRECTIONS) {
+      await pick(tokenIn, tokenOut); await amount.fill(''); await amount.fill(AMOUNT[tokenIn]); await quoted(); await circleCard.click()
+      const before = await sends(); await review.click(); const dialog = page.getByRole('dialog')
+      await dialog.getByText('Review Circle swap', { exact: true }).waitFor(); await shot(`circle-${tokenIn}-${tokenOut}-review`)
+      await dialog.getByRole('button', { name: 'Confirm Swap', exact: true }).click()
+      await dialog.getByText(/Step 1 of 2/).waitFor(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
+      if (tokenIn !== 'USDC') {
+        await latest.getByLabel('Wallet steps').getByText(/Approval: verifying/).waitFor()
+        const approval = await lastSent(); assert.equal(adapter.decodeApprove(approval.tx.data).amount, parseUnits(AMOUNT[tokenIn], dec[tokenIn]))
+        await syncWalletSends(); setReceipt(approval.hash, 'success'); await bumpNonce(); await syncNonce()
+      }
+      await dialog.getByText(/Step 2 of 2: Send the swap/).waitFor(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
+      await latest.getByLabel('Wallet steps').getByText(/Swap transaction: verifying/).waitFor()
+      assert.equal(await sends(), before + (tokenIn === 'USDC' ? 1 : 2))
+      const swap = await lastSent(); assert.equal(adapter.decodeAdapterExecute(swap.tx.data).ok, true)
+      await syncWalletSends(); setReceipt(swap.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
+      await shot(`circle-${tokenIn}-${tokenOut}-confirmed`); await bumpNonce(); await syncNonce()
+    }
+    await uniCard.click()
+  })
+
   await test('an unresolved Circle transaction holds a Uniswap swap of the same wallet (one wallet, one open transaction), and the other way round', async () => {
     await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByRole('button', { name: 'Confirm Swap' }).click(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
@@ -468,7 +525,7 @@ try {
     await bumpNonce(); await syncNonce(); const enabled = await becomesEnabled()
     assert.equal(enabled, true)
     // And the other way round: an unresolved Uniswap swap holds a Circle swap.
-    await review.click(); await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
+    await review.click(); await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
     assert.equal(await review.isDisabled(), true); await page.getByText(/Another swap or approval from this wallet is still being verified/).waitFor()
     const uniswapSwap = await lastSent(); await syncWalletSends(); setReceipt(uniswapSwap.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
     await bumpNonce(); await syncNonce(); assert.equal(await becomesEnabled(), true); await uniCard.click()
@@ -525,7 +582,7 @@ try {
   })
 
   await test('Pending keeps its status while the chain is re-read; transient RPC trouble is retried with growing pauses and deterministic errors are not retried', async () => {
-    await syncNonce(); await page.clock.install(); await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirm.click()
+    await syncNonce(); await page.clock.install(); await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirmUniswap()
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); const sent = await lastSent(); await syncWalletSends()
     const pendingEntry = world.receipts.get(lc(sent.hash)), reviewedData = pendingEntry.tx.data, submissions = await sends()
     pendingEntry.tx = { ...pendingEntry.tx, data: '0x12345678' }; await recheck()
@@ -549,7 +606,7 @@ try {
   })
 
   await test('a swap the wallet replaced (speed-up): the recorded hash is unknown and its nonce used; the replacement hash is accepted only after it is verified as the reviewed swap', async () => {
-    await syncNonce(); await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1'); await quoted(); await review.click(); await confirm.click()
+    await syncNonce(); await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1'); await quoted(); await review.click(); await confirmUniswap()
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); const sent = await lastSent(); await syncWalletSends()
     const nonce = parseInt(sent.tx.nonce, 16), replacement = `0x${'7'.repeat(64)}`, mistyped = `0x${'8'.repeat(64)}`
     world.hidden.add(lc(sent.hash)) // the node no longer knows the first hash ...
@@ -582,16 +639,16 @@ try {
   })
 
   await test('a reverted transaction reads Swap failed with the fee and a safe Try again; a declined wallet request is final and also offers it; a read outage is not a chain failure', async () => {
-    await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
     let sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'reverted'); await recheck()
     await latest.getByText('Swap failed', { exact: true }).waitFor(); await latest.getByText(/no tokens were swapped\. Only the network fee was charged/).waitFor(); await latest.getByText(/Network fee 0\./).waitFor(); await latest.getByRole('button', { name: 'Try again' }).waitFor(); await bumpNonce(); await syncNonce()
-    await page.evaluate(() => { window.swapUiTest.state.walletMode = 'reject' }); await review.click(); await confirm.click(); await latest.getByText('Swap cancelled', { exact: true }).waitFor(); await latest.getByRole('button', { name: 'Try again' }).waitFor()
+    await page.evaluate(() => { window.swapUiTest.state.walletMode = 'reject' }); await review.click(); await confirmUniswap(); await latest.getByText('Swap cancelled', { exact: true }).waitFor(); await latest.getByRole('button', { name: 'Try again' }).waitFor()
     assert.equal((await page.locator('body').innerText()).includes('synthetic-private-error'), false); await page.evaluate(() => { window.swapUiTest.state.walletMode = 'hash' })
     world.rpcDown.add('everything'); await pick('USDC', 'EURC'); await amount.fill('2'); await page.getByRole('alert').getByText(/Arc could not be read just now. This is a read problem, not a swap result/).waitFor(); assert.doesNotMatch(await uniCard.innerText(), /revert|failed/i); world.rpcDown.clear() // an outage is never worded as a swap failure
   })
 
   await test('Try again (only after a certain failure or a declined request) sets the same swap up again with a fresh Review and sends nothing; the swaps that happened offer no Try again', async () => {
-    await page.evaluate(() => { window.swapUiTest.state.walletMode = 'reject' }); await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirm.click()
+    await page.evaluate(() => { window.swapUiTest.state.walletMode = 'reject' }); await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); await review.click(); await confirmUniswap()
     await latest.getByText('Swap cancelled', { exact: true }).waitFor(); await page.evaluate(() => { window.swapUiTest.state.walletMode = 'hash' })
     await pick('EURC', 'WETH'); await amount.fill('2')
     const before = await sends(), retry = latest.getByRole('button', { name: 'Try again' }); await retry.click()
@@ -620,7 +677,7 @@ try {
   await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only approved read, exact PermitSingle/Circle signature and transaction methods are allowed', async () => {
     assert.equal(world.external, 0); assert.deepEqual(errors, [])
     assert.equal(methods.some(m => /send|sign|wallet_|personal/i.test(m)), false)
-    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)$/.test(m)).length, 0, wallet.filter(m => !/^eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)$/.test(m)).join())
+    const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).length, 0, wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).join())
   })
   console.log(`${count} Chromium unified Swap UI groups PASS. Controlled Arc RPC, Circle estimator and wallet; no real signature, approval or transaction.`)
 } finally { await browser?.close(); await server.close() }

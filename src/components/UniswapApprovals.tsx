@@ -161,5 +161,5 @@ export function ApprovalsPanel({ approvals, request, dialogOnly = false }: { app
   </section></div>
 }
 function Row({ label, value }: { label: string; value: string }) {
-  return <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3"><dt className="text-slate-500">{label}</dt><dd className="break-all text-right">{value}</dd></div>
+  return <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3"><dt className="text-slate-500">{label}</dt><dd className="min-w-0 break-words text-right">{value}</dd></div>
 }

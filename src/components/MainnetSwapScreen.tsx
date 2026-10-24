@@ -203,7 +203,7 @@ export default function MainnetSwapScreen() {
   const busyPhase = ['preparing', 'checking', 'awaiting_step', 'awaiting_wallet', 'pending', 'unknown'].includes(active_.view.phase)
   const needsApproval = provider === 'uniswap' && erc20Input && approvals.plan.state === 'needed'
   const canApprove = needsApproval && execution.enabled && uniswapAllowed && hasRequest && !executionBusy && !heldByOther && !approvals.blocking(address ?? '')
-  const canRetryPrice = hasRequest && selected.state === 'error' && walletReady && !circle.insufficientBalance && !executionBusy && !busyPhase && !heldByOther
+  const canRetryPrice = hasRequest && selected.state === 'error' && walletReady && !circle.insufficientBalance && !executionBusy && !busyPhase && !heldByOther && !approvals.blocking(address ?? '')
   const canContinue = (selected.state === 'quoted' && (canReview || canApprove) && !busyPhase) || canRetryPrice
   const primaryLabel = executionBusy ? 'Preparing…' : canRetryPrice ? 'Check price again' : needsApproval ? `Approve ${tokenIn} · ${approvals.plan.state === 'needed' ? approvals.plan.steps.length : ''} ${approvals.plan.state === 'needed' && approvals.plan.steps.length === 1 ? 'step' : 'steps'}` : 'Review Swap'
   function continueSwap() {
@@ -323,7 +323,7 @@ export default function MainnetSwapScreen() {
         {summary && <div className="space-y-2 rounded-2xl border border-slate-200 p-4 text-sm">
           <dl className="space-y-2">
             <SummaryLine label="Minimum receive" value={`${shortenAmount(summary.minimum ?? '0')} ${tokenOut}`} title={`${summary.minimum} ${tokenOut}`} />
-            <SummaryLine label="Network fee estimate · remaining" value={summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : 'Not available yet'} />
+            <SummaryLine label="Network fee estimate · remaining" value={summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : provider === 'uniswap' && tokenIn !== 'USDC' ? 'Available after permission signing and simulation' : 'Not available yet'} />
           </dl>
           <details aria-label="Fees and wallet steps" className="text-xs text-slate-500">
             <summary className="cursor-pointer">Fees & wallet steps</summary>

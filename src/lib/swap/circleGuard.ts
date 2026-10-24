@@ -168,6 +168,12 @@ export function createGuardedWalletClient(inner: CircleInnerWallet, policy: Circ
       await walletContext()
       if (!Number.isSafeInteger(plan.nonce) || plan.nonce < 0 || plan.gas <= 0n || plan.gas > CIRCLE_MAX_GAS_LIMIT || plan.maxFeePerGas > policy.maxFeePerGas || plan.maxPriorityFeePerGas > plan.maxFeePerGas) throw new CircleGuardError('fee_ceiling', 'The step plan is invalid.')
       if (plan.gas * plan.maxFeePerGas > policy.feeBudget()) throw new CircleGuardError('fee_ceiling', 'The network fee for this step would exceed the reviewed fee ceiling.')
+      // The final balance/nonce/simulation reads may outlive the service deadline.
+      // Recheck after every asynchronous preparation step, before contacting the wallet.
+      if (kind === 'swap') {
+        const final = checkSwapCalldata(data, policy, Math.floor(policy.now() / 1000))
+        if (!final.ok) throw new CircleGuardError('swap_calldata', `${final.detail} (${final.code})`)
+      }
       gas = plan.gas
       sent[kind]++; steps++; requested = true
       let hash: unknown

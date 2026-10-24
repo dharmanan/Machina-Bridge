@@ -320,7 +320,8 @@ try {
   })
   await test('expired review cannot confirm; Circle-only routes retain Preview and no execution button', async () => {
     await prepare(); await page.clock.fastForward(31000)
-    assert.equal(await page.getByRole('button', { name: 'Review expired', exact: true }).isDisabled(), true)
+    assert.equal(await page.getByRole('button', { name: 'Refresh review', exact: true }).isEnabled(), true)
+    const beforeRefresh = await sends(); await page.getByRole('button', { name: 'Refresh review', exact: true }).click(); await confirm.waitFor(); assert.equal(await sends(), beforeRefresh)
     await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
     await page.getByRole('combobox', { name: 'From token' }).selectOption('WETH')
     await page.getByText('Quotes only', { exact: true }).first().waitFor(); assert.equal(await review.isDisabled(), true)

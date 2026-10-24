@@ -10,7 +10,7 @@ const e = require('../src/lib/uniswapArcExecution.ts'), onchain = require('../sr
 const { createArcExecutionRpc } = require('../src/lib/uniswapArcExecutionRpc.ts')
 const evidence = require('../src/lib/swap/transactionEvidence.ts')
 const { privateKeyToAccount } = require('viem/accounts')
-const { decodeFunctionData, encodeFunctionData, encodeAbiParameters, keccak256, toHex } = require('viem')
+const { decodeFunctionData, encodeFunctionData, encodeAbiParameters, keccak256, toHex, decodeAbiParameters } = require('viem')
 const account = privateKeyToAccount('0x' + '00'.repeat(31) + '01'), owner = account.address
 const other = privateKeyToAccount('0x' + '00'.repeat(31) + '02')
 const NOW = 1_800_000_000_000, TS = BigInt(NOW / 1000), HASH = '0x' + 'ab'.repeat(32)
@@ -89,6 +89,7 @@ function fixture(options = {}) {
     if (method === 'eth_signTypedData_v4') {
       world.signs.push(params); if (world.reject) throw Object.assign(Error('private error'), { code: 4001 })
       world.time += world.signDelay ?? 0; const payload = JSON.parse(params[1]); delete payload.types.EIP712Domain
+      if (world.signOutput !== undefined) world.output = world.signOutput
       if (world.changePermitNonce) world.permitNonce++
       if (world.changeTokenAllowance) world.tokenAllowance = 2n ** 256n - 1n
       if (world.changeContext) world.ctx = { ...world.ctx, chainId: 1 }
@@ -98,7 +99,11 @@ function fixture(options = {}) {
     if (method === 'eth_sendTransaction') { world.sends.push(params[0]); return HASH }
     throw Error('unexpected method')
   } }
-  const ports = { context: () => world.ctx, input: () => request, fresh: async () => structuredClone(review), quoteNow: () => world.time,
+  const ports = { context: () => world.ctx, input: () => request, fresh: async () => {
+      if (world.freshFails) throw Error('quote_unavailable')
+      return onchain.createOnchainReview(request, { now: () => world.time, chain: async () => ({ blockNumber: 1n, timestamp: BigInt(Math.floor(world.time / 1000)), gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+        simulate: async () => ({ spent: 1_000_000n, received: world.output ?? 1_119_200n, gas: 140_000n }) }, world.ctx)
+    }, quoteNow: () => world.time,
     preflight: adapter.preflight, signPermit: adapter.signPermit, provider: async () => provider, result: async () => ({ status: 'pending', identified: true }),
     storage, lock: async (_owner, run) => run(), enabled: () => true, authorize: () => true }
   return { world, data, storage, adapter, controller: e.createUniswapArcExecution(ports), ports }
@@ -107,7 +112,9 @@ await test('existing token allowance: Review requests nothing; Confirm signs onc
   const f = fixture(); await f.controller.prepare(); assert.equal(f.controller.current().phase, 'review')
   assert.equal(f.world.signs.length, 0); assert.equal(f.world.sends.length, 0)
   await f.controller.confirm(f.controller.current().approvalId)
-  assert.equal(f.world.signs.length, 1); assert.equal(f.world.sends.length, 1); assert.equal(f.world.calls.length, 1)
+  assert.equal(f.controller.current().permitSigned, true); assert.equal(f.world.sends.length, 0)
+  await f.controller.confirm(f.controller.current().approvalId)
+  assert.equal(f.world.signs.length, 1); assert.equal(f.world.sends.length, 1); assert.equal(f.world.calls.length, 2)
   assert.equal(f.world.calls[0].stateOverride, undefined); assert.equal(f.world.calls[0].data, f.world.sends[0].data)
   const record = e.createExecutionJournal(f.storage).read(owner)[0]
   assert.equal(record.submittedCalldataHash, keccak256(f.world.sends[0].data)); assert.equal(record.review.transaction.data.toLowerCase(), review.transaction.data.toLowerCase())
@@ -117,7 +124,7 @@ await test('existing token allowance: Review requests nothing; Confirm signs onc
   const recovered = e.createUniswapArcExecution(f.ports); await recovered.prepare(); assert.equal(recovered.current().phase, 'pending'); assert.equal(f.world.sends.length, 1)
 })
 for (const [label, options] of [
-  ['broader token allowance appears while signing', { changeTokenAllowance: true }], ['missing token allowance', { tokenAllowance: 0n }], ['signature rejected', { reject: true }], ['quote expires while signing', { signDelay: 31_000 }],
+  ['broader token allowance appears while signing', { changeTokenAllowance: true }], ['missing token allowance', { tokenAllowance: 0n }], ['signature rejected', { reject: true }], ['signed deadline lacks wallet/mining time', { signDelay: 76_000 }],
   ['Permit2 nonce changes while signing', { changePermitNonce: true }], ['public/wallet nonce disagree', { walletNonce: 4 }], ['network changes while signing', { changeContext: true }], ['public/wallet diverge after signing', { changePublicNonce: true }],
   ['signed simulation reverts', { simulationFails: true }], ['signed gas exceeds Review limit', { estimates: 2_000_001n }],
 ]) await test(`${label}: no transaction and no on-chain Permit2 fallback`, async () => {
@@ -128,6 +135,7 @@ await test('unlimited pre-existing allowance is disclosed in fresh Review, reuse
   const unlimited = 2n ** 256n - 1n, f = fixture({ tokenAllowance: unlimited })
   await f.controller.prepare(); assert.match(f.controller.current().allowanceNotice, /unlimited/)
   await f.controller.confirm(f.controller.current().approvalId)
+  assert.equal(f.world.sends.length, 0); await f.controller.confirm(f.controller.current().approvalId)
   assert.equal(f.world.tokenAllowance, unlimited); assert.equal(f.world.sends.length, 1); assert.ok(p.sameAddress(f.world.sends[0].to, p.ARC_ROUTER))
   assert.equal(f.world.signs.length, 1); const signedPermit = JSON.parse(f.world.signs[0][1]).message
   assert.equal(BigInt(signedPermit.details.amount), 1_000_000n); assert.ok(BigInt(signedPermit.details.expiration) <= TS + 120n)
@@ -141,9 +149,46 @@ await test('an undisclosed broader allowance appearing after Review stops before
 await test('simultaneous Confirm clicks produce one signature and one send, and bad stored commitments cannot recover as authority', async () => {
   const f = fixture(); await f.controller.prepare(); const id = f.controller.current().approvalId
   await Promise.all([f.controller.confirm(id), f.controller.confirm(id)])
+  assert.equal(f.world.sends.length, 0)
+  const finalId = f.controller.current().approvalId
+  await Promise.all([f.controller.confirm(finalId), f.controller.confirm(finalId)])
   assert.equal(f.world.signs.length, 1); assert.equal(f.world.sends.length, 1)
   const key = [...f.data.keys()][0], stored = JSON.parse(f.data.get(key)); stored[0].submittedCalldataHash = '0x1234'; f.data.set(key, JSON.stringify(stored))
   assert.throws(() => e.createExecutionJournal(f.storage).read(owner), /storage/)
+})
+for (const delay of [31_000, 45_000]) await test(`a ${delay / 1000}s signature refreshes the 30s price, preserves the original deadline/ceiling/minimum, and requires a final Confirm`, async () => {
+  const f = fixture({ signDelay: delay, signOutput: 1_230_000n }); await f.controller.prepare()
+  const original = f.controller.current().review
+  await f.controller.confirm(f.controller.current().approvalId)
+  const next = f.controller.current(); assert.equal(next.phase, 'review'); assert.equal(next.permitSigned, true)
+  assert.equal(f.world.sends.length, 0); assert.ok(next.review.expiresAt > f.world.time)
+  assert.notEqual(next.review.estimatedOutput, original.estimatedOutput); assert.equal(next.review.estimatedOutput, '1230000')
+  assert.equal(e.executionDeadlineMs(next.review), e.executionDeadlineMs(original)); assert.equal(next.review.networkFee, original.networkFee)
+  assert.ok(BigInt(next.review.requiredMinimum) >= BigInt(original.requiredMinimum)); assert.equal(next.review.estimatedNetworkFee, '3000000000000000')
+  await f.controller.confirm(next.approvalId); assert.equal(f.world.sends.length, 1); assert.equal(f.world.signs.length, 1)
+  const sent = f.world.sends[0], outer = decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.data }).args
+  const finalSwap = decodeAbiParameters(p.V3_INPUT, outer[1][1])
+  assert.equal(finalSwap[2].toString(), next.review.requiredMinimum)
+  assert.equal(outer[1][1], decodeFunctionData({ abi: p.EXECUTE_ABI, data: next.review.transaction.data }).args[1][0])
+  assert.equal(f.world.calls.at(-1).data, sent.data); assert.equal(outer[2], message.sigDeadline)
+  const [signedMessage] = decodeAbiParameters(permit.PERMIT_INPUT, outer[1][0])
+  assert.equal(signedMessage.details.amount, message.details.amount); assert.equal(signedMessage.sigDeadline, message.sigDeadline)
+  await permit.validatePermitCalldata(next.review, sent.data, 7, BigInt(f.world.time / 1000))
+})
+await test('an expired refreshed price requires explicit refresh; the same live permission is reused without another signature', async () => {
+  const f = fixture(); await f.controller.prepare(); await f.controller.confirm(f.controller.current().approvalId)
+  f.world.time += 31_000; await f.controller.refresh()
+  assert.equal(f.controller.current().phase, 'review'); assert.equal(f.world.signs.length, 1); assert.equal(f.world.sends.length, 0)
+  await f.controller.confirm(f.controller.current().approvalId); assert.equal(f.world.sends.length, 1)
+})
+for (const mode of ['price', 'rpc', 'expiry', 'nonce', 'account']) await test(`post-sign ${mode} change stops before any send`, async () => {
+  const f = fixture(); await f.controller.prepare(); await f.controller.confirm(f.controller.current().approvalId)
+  if (mode === 'price') f.world.output = 900_000n
+  if (mode === 'rpc') f.world.freshFails = true
+  if (mode === 'expiry') f.world.time += 121_000
+  if (mode === 'nonce') f.world.nonce++
+  if (mode === 'account') f.world.ctx = { ...f.world.ctx, owner: other.address }
+  await f.controller.refresh(); assert.equal(f.world.sends.length, 0); assert.equal(f.controller.current().phase, 'idle')
 })
 await test('early and mined integrity comparisons use only the signed calldata commitment; mutations remain mismatches', async () => {
   const reviewed = { owner, recipient: owner, router: p.ARC_ROUTER, chainId: 5042, nonce: 3, value: 0n, calldata: review.transaction.data, calldataHash: keccak256(signed),

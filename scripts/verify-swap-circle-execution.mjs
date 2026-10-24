@@ -194,6 +194,17 @@ await test('guard: the exact approval and the swap reach the wallet in order, ea
   assert.equal(f.w.calls.length, 2); assert.equal(f.w.calls[1][1].to, ADAPTER); assert.equal(f.w.calls[1][1].gas, 1_050_000n); assert.equal(f.w.calls[1][1].nonce, 8)
   assert.deepEqual(f.wallet.sent, { approve: 1, swap: 1, permit: 0 })
 })
+await test('guard: a deadline consumed by final RPC preparation blocks the swap before the wallet, without a second send', async () => {
+  let f
+  f = guardFixture({ hooks: { before: async step => {
+    if (step.kind === 'swap') f.clock.ms += 600_000
+    return { nonce: 7 + step.index, gas: 1_050_000n, maxFeePerGas: gwei(30), maxPriorityFeePerGas: gwei(1) }
+  } } })
+  await f.wallet.sendTransaction(f.approve()); const params = f.swap()
+  await refused(f.wallet.sendTransaction(params), 'swap_calldata')
+  assert.equal(f.w.calls.length, 1); assert.equal(f.wallet.sent.swap, 0)
+  assert.ok(f.log.some(row => row[0] === 'failed' && row[2] === 'blocked'))
+})
 await test('guard: approvals other than exactly the reviewed amount to the adapter on the reviewed token are refused before the wallet', async () => {
   for (const [name, params, code] of [
     ['unlimited', f => f.approve(2n ** 256n - 1n), 'approve_amount'], ['amount + 1', f => f.approve(1_000_001n), 'approve_amount'], ['amount - 1', f => f.approve(999_999n), 'approve_amount'], ['zero', f => f.approve(0n), 'approve_amount'],
