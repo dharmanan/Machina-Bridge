@@ -21,7 +21,7 @@ globalThis.fetch = async () => { network++; throw Error('external_network_forbid
 async function test(name, run) { await run(); count++; console.log('PASS', name) }
 const request = p.validateArcRequest({ chainId: 5042, owner, recipient: owner, tokenIn: 'EURC', tokenOut: 'USDC', amount: '1', slippageBps: 50, minimumOutput: '1', maxNetworkFee: '100000000000000000' })
 const context = { owner, connected: true, chainId: 5042, connectorId: 'test' }
-const review = await onchain.createOnchainReview(request, { now: () => NOW, chain: async () => ({ blockNumber: 1n, timestamp: TS, gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+const review = await onchain.createOnchainReview(request, { now: () => NOW, assertSnapshot: async () => {}, chain: async () => ({ blockNumber: 1n, blockHash: `0x${'55'.repeat(32)}`, timestamp: TS, gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
   simulate: async () => ({ spent: 1_000_000n, received: 1_119_200n, gas: 140_000n }) }, context)
 const message = permit.permitMessage(review, 7, TS)
 const typed = { domain: permit.PERMIT_DOMAIN, types: permit.PERMIT_SINGLE_TYPES, primaryType: 'PermitSingle', message }
@@ -103,7 +103,7 @@ function fixture(options = {}) {
   } }
   const ports = { context: () => world.ctx, input: () => input, fresh: async () => {
       if (world.freshFails) throw Error('quote_unavailable')
-      return onchain.createOnchainReview(input, { now: () => world.time, chain: async () => ({ blockNumber: 1n, timestamp: BigInt(Math.floor(world.time / 1000)), gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+      return onchain.createOnchainReview(input, { now: () => world.time, assertSnapshot: async () => {}, chain: async () => ({ blockNumber: 1n, blockHash: `0x${'55'.repeat(32)}`, timestamp: BigInt(Math.floor(world.time / 1000)), gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
         simulate: async () => ({ spent: inputUnits, received: world.output ?? inputUnits * 11192n / 10000n, gas: 140_000n }) }, world.ctx)
     }, quoteNow: () => world.time,
     preflight: adapter.preflight, signPermit: adapter.signPermit, provider: async () => provider, result: async () => ({ status: 'pending', identified: true }),
@@ -230,7 +230,7 @@ await test('early and mined integrity comparisons use only the signed calldata c
 await test('large exact PermitSingle amounts survive signature encoding and reject any minimum or amount mutation', async () => {
   for (const value of ['1000.123456', '9007199254740993.123456']) {
     const input = p.validateArcRequest({ ...request, amount: value }), units = p.tokenUnits(value, 6)
-    const big = await onchain.createOnchainReview(input, { now: () => NOW, chain: async () => ({ blockNumber: 1n, timestamp: TS, gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+    const big = await onchain.createOnchainReview(input, { now: () => NOW, assertSnapshot: async () => {}, chain: async () => ({ blockNumber: 1n, blockHash: `0x${'55'.repeat(32)}`, timestamp: TS, gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
       simulate: async () => ({ spent: units, received: units * 11n / 10n, gas: 140_000n }) }, context)
     const msg = permit.permitMessage(big, 7, TS), sig = await account.signTypedData({ ...typed, message: msg })
     const data = await permit.attachPermit(big, 7, TS, sig)

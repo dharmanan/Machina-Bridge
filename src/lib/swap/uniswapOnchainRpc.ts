@@ -2,7 +2,7 @@ import { decodeFunctionResult, encodeAbiParameters, encodeFunctionData, keccak25
 import { ARC_PERMIT2, ARC_ROUTER, ARC_TOKENS, type ArcSymbol } from '../uniswapArcPolicy'
 import { arcReadClient } from '../uniswapArcExecutionRpc'
 import { SIMULATOR_ABI, SIMULATOR_RUNTIME } from './simulatorCode'
-import { OnchainQuoteError, SIMULATION_RECIPIENT, type OnchainPorts, type SimulationInput } from './uniswapOnchain'
+import { OnchainQuoteError, SIMULATION_RECIPIENT, type OnchainPorts, type OnchainChain, type SimulationInput } from './uniswapOnchain'
 
 // Read-only adapter for the keyless Uniswap quote. Every call is an eth_call/eth_getBlock/eth_getBalance/eth_getCode/eth_gasPrice on
 // the public Arc RPC. A simulation runs the REAL Universal Router against the REAL pools inside state overrides that exist only for
@@ -55,17 +55,35 @@ export function createOnchainPorts(rpc: typeof arcReadClient = arcReadClient, no
       }
     }
   }
+  const validHash = (value: unknown): value is Hex => typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value)
+  async function assertSnapshot(snapshot: OnchainChain) {
+    if (typeof snapshot.blockNumber !== 'bigint' || snapshot.blockNumber < 0n || !validHash(snapshot.blockHash)) throw new OnchainQuoteError('snapshot_changed')
+    const block = await withBackoff(() => rpc.getBlock({ blockNumber: snapshot.blockNumber }))
+    if (block.number !== snapshot.blockNumber || block.hash !== snapshot.blockHash || block.timestamp !== snapshot.timestamp) throw new OnchainQuoteError('snapshot_changed')
+  }
   return {
     now,
-    async chain(owner) {
+    assertSnapshot,
+    async chain(owner, pricingOnly = false) {
+      if (await withBackoff(() => rpc.getChainId()) !== 5042) throw new OnchainQuoteError('rpc_unavailable')
       const blockNumber = await withBackoff(() => rpc.getBlockNumber({ cacheTime: 0 }))
-      const [block, code, balance, price] = await withBackoff(() => Promise.all([
-        rpc.getBlock({ blockNumber }), rpc.getCode({ address: ARC_ROUTER, blockNumber }), rpc.getBalance({ address: owner as Hex, blockNumber }), rpc.getGasPrice()]))
+      const block = await withBackoff(() => rpc.getBlock({ blockNumber }))
+      if (block.number !== blockNumber || !validHash(block.hash)) throw new OnchainQuoteError('snapshot_changed')
+      const blockHash = block.hash
+      const [code, balance, price] = await withBackoff(() => Promise.all([
+        rpc.getCode({ address: ARC_ROUTER, blockHash, requireCanonical: true }),
+        pricingOnly ? Promise.resolve(0n) : rpc.getBalance({ address: owner as Hex, blockHash, requireCanonical: true }),
+        pricingOnly ? Promise.resolve(0n) : rpc.getGasPrice()]))
       const base = typeof block.baseFeePerGas === 'bigint' ? block.baseFeePerGas : 0n
-      return { blockNumber, timestamp: block.timestamp, gasPrice: price > base ? price : base, nativeBalance: balance, routerHash: code && code !== '0x' ? keccak256(code) : '0x' }
+      const snapshot = { blockNumber, blockHash: block.hash, timestamp: block.timestamp, gasPrice: price > base ? price : base, nativeBalance: balance, routerHash: code && code !== '0x' ? keccak256(code) : '0x' as Hex }
+      await assertSnapshot(snapshot)
+      return snapshot
     },
+    // EIP-1898 + state override is mandatory: unsupported RPCs fail closed, never retry against latest or a different block.
     async simulate(input) {
-      const result = await withBackoff(() => rpc.call({ account: CALLER, to: SIMULATION_RECIPIENT, data: simulationCall(input), gas: SIMULATION_GAS, stateOverride: simulationOverrides(input.tokenIn, input.amountIn) }))
+      await assertSnapshot(input.snapshot)
+      const result = await withBackoff(() => rpc.call({ account: CALLER, to: SIMULATION_RECIPIENT, data: simulationCall(input), blockHash: input.snapshot.blockHash, requireCanonical: true, gas: SIMULATION_GAS, stateOverride: simulationOverrides(input.tokenIn, input.amountIn) }))
+      await assertSnapshot(input.snapshot)
       if (!result.data) throw new Error('reverted')
       const out = decodeFunctionResult({ abi: SIMULATOR_ABI, functionName: 'simulate', data: result.data }) as { inBefore: bigint; inAfter: bigint; outBefore: bigint; outAfter: bigint; gasUsed: bigint }
       if (out.outAfter < out.outBefore || out.inBefore < out.inAfter) throw new Error('reverted')

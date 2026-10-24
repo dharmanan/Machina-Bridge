@@ -138,11 +138,13 @@ function pathOf(data) {
 }
 function fakePorts(options = {}) {
   const calls = { simulate: [], chain: 0 }
-  const chain = { blockNumber: 5_000n, timestamp: CHAIN_TS, gasPrice: 20_000_000_000n, nativeBalance: 5n * 10n ** 18n, routerHash: p.ARC_ROUTER_HASH, ...options.chain }
+  const chain = { blockNumber: 5_000n, blockHash: `0x${'55'.repeat(32)}`, timestamp: CHAIN_TS, gasPrice: 20_000_000_000n, nativeBalance: 5n * 10n ** 18n, routerHash: p.ARC_ROUTER_HASH, ...options.chain }
   return { calls, ports: {
     now: () => options.now ?? NOW,
     chain: async o => { calls.chain++; if (options.chainError) throw Error('down'); assert.ok(p.sameAddress(o, owner)); return chain },
+    assertSnapshot: async snapshot => { assert.equal(snapshot, chain); if (options.reorg) throw new onchain.OnchainQuoteError('snapshot_changed') },
     simulate: async input => {
+      assert.equal(input.snapshot, chain)
       calls.simulate.push(input)
       const { id, swap, deadline: d } = pathOf(input.data)
       assert.equal(swap[0], getAddress(onchain.SIMULATION_RECIPIENT)); assert.equal(d, CHAIN_TS + 120n) // simulations trade for the helper, on the chain's own clock
@@ -387,8 +389,9 @@ await test('simulation overrides give the helper exactly the input amount and no
 await test('the read-only adapter separates reverts from outages, backs off on rate limits, and reads the chain at one pinned block', async () => {
   const result = (r, i, o, g) => encodeFunctionData({ abi: [{ type: 'function', name: 'r', stateMutability: 'view', inputs: [], outputs: [{ type: 'tuple', components: ['inBefore', 'inAfter', 'outBefore', 'outAfter', 'gasUsed'].map(name => ({ name, type: 'uint256' })) }] }], functionName: 'r' }) && require('viem').encodeAbiParameters([{ type: 'tuple', components: ['inBefore', 'inAfter', 'outBefore', 'outAfter', 'gasUsed'].map(name => ({ name, type: 'uint256' })) }], [{ inBefore: 10n, inAfter: 10n - i, outBefore: 5n, outAfter: 5n + o, gasUsed: g }])
   let pauses = 0
-  const ports = rpc => rpcAdapter.createOnchainPorts(rpc, () => NOW, async () => { pauses++ })
-  const input = { data: '0x1234', tokenIn: 'EURC', tokenOut: 'USDC', amountIn: 7n }
+  const snapshot = { blockNumber: 77n, blockHash: `0x${'55'.repeat(32)}`, timestamp: 1234n }
+  const ports = rpc => rpcAdapter.createOnchainPorts({ getBlock: async () => ({ number: 77n, hash: snapshot.blockHash, timestamp: 1234n }), ...rpc }, () => NOW, async () => { pauses++ })
+  const input = { data: '0x1234', tokenIn: 'EURC', tokenOut: 'USDC', amountIn: 7n, snapshot }
   assert.deepEqual(await ports({ call: async () => ({ data: result(0, 7n, 900n, 80_000n) }) }).simulate(input), { received: 900n, spent: 7n, gas: 80_000n })
   await assert.rejects(ports({ call: async () => { const e = Error('x'); e.name = 'CallExecutionError'; e.cause = Object.assign(Error('execution reverted'), { name: 'ExecutionRevertedError', code: 3 }); throw e } }).simulate(input), e => e.message === 'reverted')
   let attempts = 0
@@ -397,9 +400,9 @@ await test('the read-only adapter separates reverts from outages, backs off on r
   await assert.rejects(ports({ call: async () => { throw Object.assign(new Error('fetch failed'), { name: 'HttpRequestError' }) } }).simulate(input), e => e.code === 'rpc_unavailable')
   await assert.rejects(ports({ call: async () => ({ data: undefined }) }).simulate(input), e => e.message === 'reverted')
   const pinned = []
-  const chain = await ports({ getBlockNumber: async () => 77n, getBlock: async ({ blockNumber }) => { pinned.push(blockNumber); return { timestamp: 1234n, baseFeePerGas: 30n } }, getCode: async ({ blockNumber }) => { pinned.push(blockNumber); return runtime },
-    getBalance: async ({ blockNumber }) => { pinned.push(blockNumber); return 9n }, getGasPrice: async () => 20n }).chain(owner)
-  assert.deepEqual(pinned, [77n, 77n, 77n]); assert.equal(chain.gasPrice, 30n); assert.equal(chain.routerHash, p.ARC_ROUTER_HASH); assert.equal(chain.timestamp, 1234n); assert.equal(chain.nativeBalance, 9n)
+  const chain = await ports({ getChainId: async () => 5042, getBlockNumber: async () => 77n, getBlock: async ({ blockNumber }) => { pinned.push(blockNumber); return { number: 77n, hash: snapshot.blockHash, timestamp: 1234n, baseFeePerGas: 30n } }, getCode: async ({ blockHash, requireCanonical }) => { assert.equal(requireCanonical, true); pinned.push(blockHash); return runtime },
+    getBalance: async ({ blockHash, requireCanonical }) => { assert.equal(requireCanonical, true); pinned.push(blockHash); return 9n }, getGasPrice: async () => 20n }).chain(owner)
+  assert.deepEqual(pinned, [77n, snapshot.blockHash, snapshot.blockHash, 77n]); assert.equal(chain.gasPrice, 30n); assert.equal(chain.routerHash, p.ARC_ROUTER_HASH); assert.equal(chain.timestamp, 1234n); assert.equal(chain.nativeBalance, 9n)
 })
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -452,6 +455,55 @@ await test('bounded amount parser rejects malformed, excessive precision and uin
     assert.throws(() => tokens.swapInputUnits(value, 'USDC'))
   assert.equal(tokens.parseSwapUnits(tokens.SWAP_UINT256_MAX.toString(), 0), tokens.SWAP_UINT256_MAX)
   assert.throws(() => tokens.parseSwapUnits((tokens.SWAP_UINT256_MAX + 1n).toString(), 0), /input_range/)
+})
+await test('all candidate and minimum-bound simulations share one snapshot, even when the head advances', async () => {
+  const f = fakePorts(), r = requestFor('USDC', 'EURC')
+  await onchain.createOnchainReview(r, f.ports, context)
+  assert.ok(f.calls.simulate.length > 1)
+  for (const input of f.calls.simulate) { assert.equal(input.snapshot.blockNumber, 5000n); assert.equal(input.snapshot.blockHash, `0x${'55'.repeat(32)}`) }
+})
+await test('a reorg rejects the whole quote, including when another candidate succeeds or only the final check changes', async () => {
+  await assert.rejects(onchain.quoteRoutes(requestFor('USDC', 'EURC'), fakePorts({ reorg: true }).ports), e => e.code === 'snapshot_changed')
+  const f = fakePorts(), original = f.ports.simulate
+  let n = 0
+  f.ports.simulate = async input => { if (++n === 1) throw new onchain.OnchainQuoteError('snapshot_changed'); return original(input) }
+  await assert.rejects(onchain.quoteRoutes(requestFor('USDC', 'EURC'), f.ports), e => e.code === 'snapshot_changed')
+  const final = fakePorts(); let checks = 0
+  final.ports.assertSnapshot = async () => { if (++checks === 2) throw new onchain.OnchainQuoteError('snapshot_changed') }
+  await assert.rejects(onchain.createOnchainReview(requestFor('USDC', 'EURC'), final.ports, context), e => e.code === 'snapshot_changed')
+})
+await test('adapter pins the real Viem call arguments; reorg, wrong block, missing hash, or unsupported overrides never fall back to latest', async () => {
+  const snapshot = { blockNumber: 77n, blockHash: `0x${'55'.repeat(32)}`, timestamp: 1234n }
+  const input = { data: '0x1234', tokenIn: 'USDC', tokenOut: 'EURC', amountIn: 7n, snapshot }
+  const output = encodeAbiParameters([{ type: 'tuple', components: ['inBefore', 'inAfter', 'outBefore', 'outAfter', 'gasUsed'].map(name => ({ name, type: 'uint256' })) }], [{ inBefore: 7n, inAfter: 0n, outBefore: 0n, outAfter: 9n, gasUsed: 10n }])
+  let calls = 0, reads = 0
+  const rpc = { getBlock: async ({ blockNumber }) => { reads++; assert.equal(blockNumber, 77n); return { ...snapshot, number: 77n, hash: snapshot.blockHash } },
+    call: async args => { calls++; assert.equal(args.blockHash, snapshot.blockHash); assert.equal(args.requireCanonical, true); assert.equal(args.blockNumber, undefined); assert.equal(args.blockTag, undefined); assert.ok(args.stateOverride[0].code); return { data: output } } }
+  assert.equal((await rpcAdapter.createOnchainPorts(rpc).simulate(input)).received, 9n); assert.equal(reads, 2); assert.equal(calls, 1)
+  for (const block of [{ number: 77n, hash: `0x${'66'.repeat(32)}`, timestamp: 1234n }, { number: 78n, hash: snapshot.blockHash, timestamp: 1234n }, { number: 77n, hash: null, timestamp: 1234n }]) {
+    await assert.rejects(rpcAdapter.createOnchainPorts({ ...rpc, getBlock: async () => block }).simulate(input), e => e.code === 'snapshot_changed')
+  }
+  let phase = 0
+  await assert.rejects(rpcAdapter.createOnchainPorts({ ...rpc, getBlock: async () => ({ number: 77n, timestamp: 1234n, hash: ++phase === 1 ? snapshot.blockHash : `0x${'66'.repeat(32)}` }) }).simulate(input), e => e.code === 'snapshot_changed')
+  let failures = 0
+  await assert.rejects(rpcAdapter.createOnchainPorts({ ...rpc, call: async args => { failures++; assert.equal(args.blockHash, snapshot.blockHash); assert.equal(args.requireCanonical, true); assert.equal(args.blockNumber, undefined); throw Object.assign(Error('unsupported state overrides'), { code: -32602 }) } }).simulate(input), e => e.code === 'rpc_unavailable')
+  assert.equal(failures, 1)
+  // Real installed Viem serialization, controlled transport: prove the outbound RPC carries EIP-1898 AND state override.
+  let wires = 0
+  const { createPublicClient, custom } = require('viem')
+  const realClient = createPublicClient({ transport: custom({ request: async args => {
+    wires++; assert.equal(args.method, 'eth_call'); assert.deepEqual(args.params[1], { blockHash: snapshot.blockHash, requireCanonical: true })
+    assert.ok(args.params[2][onchain.SIMULATION_RECIPIENT].code); return output
+  } }, { retryCount: 0 }) })
+  await rpcAdapter.createOnchainPorts({ ...rpc, call: args => realClient.call(args) }).simulate(input)
+  assert.equal(wires, 1)
+  await assert.rejects(rpcAdapter.createOnchainPorts({ ...rpc, getBlock: async () => { throw Error('historical state unavailable') } }).simulate(input), e => e.code === 'rpc_unavailable')
+  const pricing = rpcAdapter.createOnchainPorts({ ...rpc, getChainId: async () => 5042, getBlockNumber: async () => 77n,
+    getCode: async args => { assert.equal(args.blockHash, snapshot.blockHash); assert.equal(args.requireCanonical, true); return runtime },
+    getBalance: async () => { throw Error('pricing must not read wallet balance') }, getGasPrice: async () => { throw Error('pricing must not depend on execution fees') } })
+  const pricingSnapshot = await pricing.chain(owner, true)
+  assert.equal(pricingSnapshot.nativeBalance, 0n); assert.equal(pricingSnapshot.gasPrice, 0n); assert.equal(pricingSnapshot.routerHash, p.ARC_ROUTER_HASH)
+  await assert.rejects(rpcAdapter.createOnchainPorts({ getChainId: async () => 1 }).chain(owner), e => e.code === 'rpc_unavailable')
 })
 assert.equal(external, 0, 'no network request was made')
 console.log(`${count} Uniswap on-chain provider groups PASS. Controlled ports only; zero network, signatures, approvals or transactions.`)

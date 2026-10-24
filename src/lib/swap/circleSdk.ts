@@ -7,8 +7,7 @@ import { readMainnetSwapQuote, decimalUnits, type PreviewQuote } from '../mainne
 import { swapToken } from './tokens'
 import { CIRCLE_ADAPTER } from './circleAdapterDecode'
 import { MAINNET_SWAP_QUOTE_TTL_MS } from '../../config/mainnetSwap'
-import { validateArcRequest } from '../uniswapArcPolicy'
-import { createOnchainReview } from './uniswapOnchain'
+import { quoteReference } from './uniswapOnchain'
 import { createOnchainPorts } from './uniswapOnchainRpc'
 import type { CirclePerformance } from './circlePerformance'
 
@@ -84,10 +83,8 @@ async function buildCircleReviewData(request: CircleSwapRequest, deps: CircleRev
 // The independent price: what the keyless Uniswap route (the real Universal Router against the real pools, read-only) would pay for the same swap.
 // It is only a market reference for the sanity check on Circle's guaranteed minimum; nothing from it is ever sent.
 export async function uniswapReferenceOutput(request: CircleSwapRequest, ports = createOnchainPorts()): Promise<string> {
-  const arc = validateArcRequest({ chainId: 5042, tokenIn: request.tokenIn, tokenOut: request.tokenOut, owner: request.owner, recipient: request.owner, amount: request.amount,
-    minimumOutput: '1', slippageBps: request.slippageBps, maxNetworkFee: '100000000000000000' })
-  const review = await createOnchainReview(arc, ports, { owner: request.owner, chainId: 5042, connected: true })
-  return formatUnits(BigInt(review.estimatedOutput), swapToken(request.tokenOut).decimals)
+  const quote = await quoteReference({ chainId: 5042, tokenIn: request.tokenIn, tokenOut: request.tokenOut, owner: request.owner, amount: request.amount }, ports)
+  return formatUnits(quote.best.received, swapToken(request.tokenOut).decimals)
 }
 export const circleReviewDeps = (): CircleReviewDeps => ({
   reference: request => uniswapReferenceOutput(request),

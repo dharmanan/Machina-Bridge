@@ -24,6 +24,7 @@ export function onchainErrorMessage(error: unknown): string {
       simulation_failed: 'Arc rejected the simulated swap for this amount. No quote is shown.',
       router_changed: 'The Universal Router on Arc no longer matches the audited code, so Uniswap quotes are switched off.',
       insufficient_native_balance: 'The native USDC balance cannot cover the network fee ceiling (plus the amount, when USDC is what you pay).',
+      snapshot_changed: 'Arc’s block snapshot changed during verification. Request a fresh quote; nothing was sent.',
       rpc_unavailable: 'Arc could not be read just now. This is a read problem, not a swap result; try again.',
       clock: 'This device’s clock differs from Arc’s by more than a minute. Correct the clock and request a new quote.',
       fee_limit: 'The current network fee is above the safety ceiling of 0.1 USDC. No quote is shown.',

@@ -12,9 +12,9 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
 let chromium
 try { ({ chromium } = require('playwright-core')) } catch { ({ chromium } = require(process.env.PLAYWRIGHT_CORE_PATH ?? '/opt/codex/runtimes/cua/lib/node_modules/playwright-core')) }
 // Playwright forces every attached page to appear focused/visible. For the real-tab
-// suite only, disable that AUTOMATION setting in its originating CDP sessions.
+// scenarios (also included in the unfiltered suite), disable that AUTOMATION setting in its originating CDP sessions.
 // document.hidden/visibilityState and visibilitychange are never overridden.
-if (process.env.MACHINA_REAL_TABS_ONLY === '1') {
+{
   const entry = require.resolve(process.env.PLAYWRIGHT_CORE_PATH ?? '/opt/codex/runtimes/cua/lib/node_modules/playwright-core')
   ;({ chromium } = require(entry))
   const { CRSession } = require(require('node:path').join(require('node:path').dirname(entry), 'lib/server/chromium/crConnection.js'))
@@ -77,7 +77,7 @@ export const readMainnetSwapQuote = testCircleReader;
   }] })
 await server.listen()
 const base = `http://127.0.0.1:${server.httpServer.address().port}`
-let browser, page, count = 0
+let browser, page, peer, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
   if (process.env.MACHINA_INPUT_RANGE_ONLY === '1' && !/^(the mode chip|balance shortcuts|input range:|no unapproved wallet)/.test(name)) return
@@ -150,7 +150,7 @@ function firstSwapResponse(method) {
 }
 
 try {
-  browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', headless: process.env.MACHINA_REAL_TABS_ONLY !== '1', args: ['--no-sandbox', '--disable-dev-shm-usage'] })
+  browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } }); page = await context.newPage(); page.setDefaultTimeout(20000)
   page.on('pageerror', error => errors.push(error.message))
   await page.route('**/*', async route => {
@@ -189,17 +189,17 @@ try {
       return route.fulfill({ json: { jsonrpc: '2.0', id: body.id, error: revert ? { code: 3, message: 'execution reverted' } : { code: -32603, message: String(error.message) } } })
     }
   })
-  if (process.env.MACHINA_REAL_TABS_ONLY === '1') await page.addInitScript(() => {
+  await page.addInitScript(() => {
     window.nativeTabEvents = []
     document.addEventListener('visibilitychange', event => window.nativeTabEvents.push({ state: document.visibilityState, trusted: event.isTrusted }))
   })
   await page.goto(base + '/__swap_ui_test')
-  let peer
-  if (process.env.MACHINA_REAL_TABS_ONLY === '1') {
+  {
     const session = await context.newCDPSession(page), { targetInfo } = await session.send('Target.getTargetInfo')
     const created = context.waitForEvent('page')
     await session.send('Target.createTarget', { url: 'about:blank', browserContextId: targetInfo.browserContextId, newWindow: false, background: true })
     peer = await created
+    assert.equal(peer.isClosed(), false)
     const otherSession = await context.newCDPSession(peer)
     assert.equal((await session.send('Browser.getWindowForTarget')).windowId, (await otherSession.send('Browser.getWindowForTarget')).windowId)
     await page.bringToFront()
@@ -830,6 +830,8 @@ try {
     if (peer) await page.bringToFront()
     await page.goto(base + '/__lifecycle_reset'); await page.evaluate(() => window.localStorage.clear())
     world.receipts.clear(); world.rpcDown.clear(); world.hidden.clear(); world.clockOffset = 0
+    // A new fixture session must reset BOTH clocks after earlier polling/expiry scenarios advanced them.
+    await page.clock.setSystemTime(new Date())
     rpc.state.nonce = { latest: 7, pending: 7 }; rpc.state.tokenAllowance.EURC = allowance
     await page.goto(base + '/__swap_ui_test')
     await page.evaluate(() => window.swapUiTest.connect(5042)); await pick(input, input === 'EURC' ? 'USDC' : 'EURC'); await amount.fill('1'); await quoted()
@@ -881,8 +883,11 @@ try {
     assert.equal(await confirm.count(), 0); await page.clock.setSystemTime(new Date()); world.clockOffset = 0
   })
   for (const source of ['uniswap', 'circle']) await test(`confirmed form lifecycle: ${source} clears its own input and quotes, refreshes balances, retains success/history and ignores a repeated verification`, async () => {
-    const sent = await pendingLifecycle(source); assert.equal(await amount.inputValue(), '1')
-    if (source === 'uniswap') world.receipts.get(lc(sent.hash)).adjusted = true // verified_with_notes is also a confirmed result
+    // Fee fields belong to the transaction from its first RPC observation; do not mutate a pending hash mid-read.
+    let sent
+    world.walletAdjusts = source === 'uniswap'
+    try { sent = await pendingLifecycle(source) } finally { world.walletAdjusts = false }
+    assert.equal(await amount.inputValue(), '1') // verified_with_notes is also a confirmed result
     await page.evaluate(() => { window.swapUiTest.state.nativeBalance = 99n * 10n ** 18n })
     setReceipt(sent.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
     await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '')
@@ -1055,4 +1060,8 @@ try {
     const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).length, 0, wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).join())
   })
   console.log(`${count} Chromium unified Swap UI groups PASS. Controlled Arc RPC, Circle estimator and wallet; no real signature, approval or transaction.`)
-} finally { await browser?.close(); await server.close() }
+} finally {
+  // Close the peer explicitly on success and failure; browser close also releases the remaining pages/context.
+  try { if (peer && !peer.isClosed()) { await peer.close(); assert.equal(peer.isClosed(), true) } }
+  finally { try { await browser?.close() } finally { await server.close() } }
+}

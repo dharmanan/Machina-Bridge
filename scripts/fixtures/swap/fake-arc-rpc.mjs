@@ -11,7 +11,7 @@ export function createFakeArcRpc({ viem, policy, simulator, routerRuntime, now =
     balances: { EURC: 50_000_000n, cirBTC: 10_000_000n, WETH: 10n ** 18n }, // wallet token balances (base units)
     tokenAllowance: {}, permit: {},                                   // `${token}` -> bigint / { amount, expiration }
     txs: new Map(),                                                   // hash -> { tx, receipt }
-    blockTimes: new Map(),                                            // block number -> timestamp (seconds); other blocks carry the current time
+    blockTimes: new Map(),                                            // block number -> immutable timestamp (seconds)
     calls: [], methods: [], simulations: [],
   }
   const decimals = { USDC: 6, EURC: 6, cirBTC: 8, WETH: 18 }
@@ -56,12 +56,16 @@ export function createFakeArcRpc({ viem, policy, simulator, routerRuntime, now =
     if (state.mode === 'swap-call-reverts') throw Object.assign(new Error('execution reverted'), { code: 3 })
     return '0x'
   }
-  const block = number => ({ number: toHex(number), hash: BLOCK_HASH, parentHash: BLOCK_HASH, timestamp: toHex(state.blockTimes.get(number) ?? BigInt(Math.floor(now() / 1000))), baseFeePerGas: toHex(state.gasPrice), gasLimit: '0x1c9c380', gasUsed: '0x186a0', transactions: [] })
+  const block = number => {
+    // A historical block cannot acquire a new timestamp between snapshot checks.
+    if (!state.blockTimes.has(number)) state.blockTimes.set(number, BigInt(Math.floor(now() / 1000)))
+    return { number: toHex(number), hash: BLOCK_HASH, parentHash: BLOCK_HASH, timestamp: toHex(state.blockTimes.get(number)), baseFeePerGas: toHex(state.gasPrice), gasLimit: '0x1c9c380', gasUsed: '0x186a0', transactions: [] }
+  }
   function handle(method, params) {
     state.methods.push(method)
     switch (method) {
       case 'eth_chainId': return '0x13b2'
-      case 'eth_blockNumber': return toHex(state.block + 1n)
+      case 'eth_blockNumber': return toHex(++state.block)
       case 'eth_getBlockByNumber': return block(typeof params[0] === 'string' && params[0].startsWith('0x') && params[0] !== 'latest' ? BigInt(params[0]) : state.block)
       case 'eth_getStorageAt': return '0x' + '00'.repeat(32)
       case 'eth_getCode': return policy.sameAddress(params[0], policy.ARC_ROUTER) ? routerRuntime : policy.sameAddress(params[0], state.owner ?? '0x0000000000000000000000000000000000000001') ? '0x' : '0x6000'

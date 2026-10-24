@@ -21,15 +21,16 @@ export const FEE_CEILING_MULTIPLIER = 2n     // maximum gas price = 2x the curre
 export const DEADLINE_WINDOW_SECONDS = 120n  // counted from the latest Arc block, not from the local clock
 export const REVIEW_TTL_MS = 30_000
 
-export interface OnchainChain { blockNumber: bigint; timestamp: bigint; gasPrice: bigint; nativeBalance: bigint; routerHash: Hex }
-export interface SimulationInput { data: Hex; tokenIn: ArcSymbol; tokenOut: ArcSymbol; amountIn: bigint }
+export interface OnchainChain { blockNumber: bigint; blockHash: Hex; timestamp: bigint; gasPrice: bigint; nativeBalance: bigint; routerHash: Hex }
+export interface SimulationInput { data: Hex; tokenIn: ArcSymbol; tokenOut: ArcSymbol; amountIn: bigint; snapshot: OnchainChain }
 export interface SimulationResult { received: bigint; spent: bigint; gas: bigint }
 export interface OnchainPorts {
   now(): number
-  chain(owner: Hex): Promise<OnchainChain>
+  chain(owner: Hex, pricingOnly?: boolean): Promise<OnchainChain>
+  assertSnapshot(snapshot: OnchainChain): Promise<void>
   simulate(input: SimulationInput): Promise<SimulationResult>
 }
-export type OnchainErrorCode = 'no_route' | 'simulation_failed' | 'router_changed' | 'insufficient_native_balance' | 'rpc_unavailable' | 'clock' | 'fee_limit'
+export type OnchainErrorCode = 'no_route' | 'simulation_failed' | 'router_changed' | 'insufficient_native_balance' | 'rpc_unavailable' | 'clock' | 'fee_limit' | 'snapshot_changed'
 export class OnchainQuoteError extends Error { constructor(readonly code: OnchainErrorCode) { super(code); this.name = 'OnchainQuoteError' } }
 
 export interface RouteOutcome { route: UniswapRoute; routeText: string; received: bigint; gas: bigint }
@@ -39,25 +40,26 @@ export interface RouteQuotes { chain: OnchainChain; startedAt: number; best: Rou
 // Simulates every candidate route (best pools first, at most four) and keeps the best real output. A route that reverts, spends
 // anything other than exactly the input, or yields nothing is dropped, never guessed at. A read outage is reported as such and
 // is never mistaken for "no route".
-export async function quoteRoutes(request: ArcRequest, ports: OnchainPorts): Promise<RouteQuotes> {
+export async function quoteRoutes(request: ArcRequest, ports: OnchainPorts, pricingOnly = false): Promise<RouteQuotes> {
   const r = validateArcRequest(request), startedAt = ports.now()
   const candidates = candidateRoutes(r.tokenIn, r.tokenOut)
   if (candidates.length === 0) throw new OnchainQuoteError('no_route')
   let chain: OnchainChain
-  try { chain = await ports.chain(r.owner as Hex) } catch { throw new OnchainQuoteError('rpc_unavailable') }
+  try { chain = await ports.chain(r.owner as Hex, pricingOnly) } catch (error) { if (error instanceof OnchainQuoteError) throw error; throw new OnchainQuoteError('rpc_unavailable') }
   if (chain.routerHash !== ARC_ROUTER_HASH) throw new OnchainQuoteError('router_changed')
   const amountIn = tokenUnits(r.amount, ARC_TOKENS[r.tokenIn].decimals)
   // A scratch request routed to the simulation helper: minimum 1 so the simulation reports the real output instead of reverting on a bound.
   const scratch = { ...r, owner: SIMULATION_RECIPIENT, recipient: SIMULATION_RECIPIENT }
   const deadline = chain.timestamp + DEADLINE_WINDOW_SECONDS
+  if (Math.abs(Number(chain.timestamp) * 1000 - startedAt) > 60_000) throw new OnchainQuoteError('clock')
   const settled = await Promise.allSettled(candidates.map(async route => {
     const data = buildRouteCalldata({ request: scratch, route, minimumOutput: 1n, deadline, recipient: SIMULATION_RECIPIENT })
-    return { route, simulation: await ports.simulate({ data, tokenIn: r.tokenIn, tokenOut: r.tokenOut, amountIn }) }
+    return { route, simulation: await ports.simulate({ data, tokenIn: r.tokenIn, tokenOut: r.tokenOut, amountIn, snapshot: chain }) }
   }))
   const outcomes: RouteOutcome[] = [], failures: RouteFailure[] = []
   settled.forEach((result, i) => {
     const route = candidates[i], routeText = describeRoute(route)
-    if (result.status === 'rejected') { failures.push({ route, routeText, reason: result.reason instanceof OnchainQuoteError && result.reason.code === 'rpc_unavailable' ? 'rpc' : 'reverted' }); return }
+    if (result.status === 'rejected') { if (result.reason instanceof OnchainQuoteError && result.reason.code === 'snapshot_changed') throw result.reason; failures.push({ route, routeText, reason: result.reason instanceof OnchainQuoteError && result.reason.code === 'rpc_unavailable' ? 'rpc' : 'reverted' }); return }
     const { simulation } = result.value
     if (simulation.spent !== amountIn) failures.push({ route, routeText, reason: 'wrong_amount' })
     else if (simulation.received <= 0n) failures.push({ route, routeText, reason: 'zero_output' })
@@ -68,6 +70,7 @@ export async function quoteRoutes(request: ArcRequest, ports: OnchainPorts): Pro
     if (failures.some(f => f.reason === 'rpc')) throw new OnchainQuoteError('rpc_unavailable')
     throw new OnchainQuoteError(failures.every(f => f.reason === 'reverted') ? 'simulation_failed' : 'no_route')
   }
+  await ports.assertSnapshot(chain)
   outcomes.sort((x, y) => (y.received > x.received ? 1 : y.received < x.received ? -1 : x.route.hops.length - y.route.hops.length))
   return { chain, startedAt, best: outcomes[0], alternatives: outcomes.slice(1), failures }
 }
@@ -88,7 +91,7 @@ export async function createOnchainReview(request: ArcRequest, ports: OnchainPor
   // The Review's own calldata is simulated once more with the minimum bound in place, so the bound itself is proven reachable.
   const bounded = buildRouteCalldata({ request: { ...r, owner: SIMULATION_RECIPIENT, recipient: SIMULATION_RECIPIENT }, route: best.route, minimumOutput: minimum, deadline, recipient: SIMULATION_RECIPIENT })
   let proof: SimulationResult
-  try { proof = await ports.simulate({ data: bounded, tokenIn: r.tokenIn, tokenOut: r.tokenOut, amountIn }) } catch { throw new OnchainQuoteError('simulation_failed') }
+  try { proof = await ports.simulate({ data: bounded, tokenIn: r.tokenIn, tokenOut: r.tokenOut, amountIn, snapshot: chain }) } catch (error) { if (error instanceof OnchainQuoteError) throw error; throw new OnchainQuoteError('simulation_failed') }
   if (proof.spent !== amountIn || proof.received < minimum) throw new OnchainQuoteError('simulation_failed')
   const data = buildRouteCalldata({ request: r, route: best.route, minimumOutput: minimum, deadline })
   const gas = gasLimitFor(proof.gas > best.gas ? proof.gas : best.gas), maxFee = chain.gasPrice * FEE_CEILING_MULTIPLIER, fee = gas * maxFee
@@ -107,5 +110,12 @@ export async function createOnchainReview(request: ArcRequest, ports: OnchainPor
   // Defensive: the decoder must reproduce exactly the route that was simulated.
   const decoded = verifyRouteCalldata(review.transaction, r, minimum, startedAt)
   if (decoded.routeText !== best.routeText) fail('unverified_review')
+  await ports.assertSnapshot(chain)
   return review
+}
+
+// Pricing only: slippage/minimum/gas budget here are canonical builder inputs, not a Circle execution policy.
+// No wallet balance or fee-budget eligibility check and no executable Review is produced. Technical input limits remain.
+export async function quoteReference(request: Pick<ArcRequest, 'chainId' | 'tokenIn' | 'tokenOut' | 'owner' | 'amount'>, ports: OnchainPorts): Promise<RouteQuotes> {
+  return quoteRoutes({ ...request, recipient: request.owner, minimumOutput: '1', slippageBps: 1, maxNetworkFee: '100000000000000000' }, ports, true)
 }

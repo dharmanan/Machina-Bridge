@@ -1376,6 +1376,26 @@ await test('review building: the reference is read independently, a failing refe
   const failing = await sdk.buildCircleReview(request, deps({ reference: async () => { throw Error('rpc down') } })); assert.equal(failing.reference, undefined)
   assert.equal((await sdk.buildCircleReview(request, deps({ reference: async () => null }))).reference, undefined)
 })
+await test('Circle reference uses pricing only at 0.5%, 1%, and 3%; no balance/fee eligibility, weaker minimum, or missing-reference bypass', async () => {
+  const sdk = require(`${root}src/lib/swap/circleSdk.ts`), onchain = require(`${root}src/lib/swap/uniswapOnchain.ts`)
+  const snapshot = { blockNumber: 123n, blockHash: `0x${'55'.repeat(32)}`, timestamp: BigInt(Math.floor(NOW_MS / 1000)), gasPrice: 10n ** 20n, nativeBalance: 0n, routerHash: require(`${root}src/lib/uniswapArcPolicy.ts`).ARC_ROUTER_HASH }
+  for (const slippageBps of [50, 100, 300]) {
+    let simulations = 0, checks = 0
+    const request = c.validateCircleRequest({ chainId: 5042, tokenIn: 'EURC', tokenOut: 'USDC', owner, amount: '1', slippageBps })
+    const ports = { now: () => NOW_MS, chain: async (_owner, pricingOnly) => { assert.equal(pricingOnly, true); return snapshot }, assertSnapshot: async snap => { checks++; assert.equal(snap, snapshot) },
+      simulate: async input => { simulations++; assert.equal(input.snapshot, snapshot); return { received: 1_100_000n, spent: input.amountIn, gas: 10_000_000n } } }
+    assert.equal(await sdk.uniswapReferenceOutput(request, ports), '1.1'); assert.ok(simulations >= 1); assert.equal(checks, 1)
+    const review = { request, reference: { source: 'uniswap', estimatedOutput: '1100000' }, requiredMinimum: (1_100_000n * BigInt(10000 - slippageBps) / 10000n).toString() }
+    assert.doesNotThrow(() => c.independentPriceCheck(review))
+    const boundary = 1_100_000n * BigInt(10000 - slippageBps - c.CIRCLE_REFERENCE_TOLERANCE_BPS) / 10000n
+    assert.doesNotThrow(() => c.independentPriceCheck({ ...review, requiredMinimum: boundary.toString() }))
+    assert.throws(() => c.independentPriceCheck({ ...review, requiredMinimum: (boundary - 1n).toString() }), /price_check/)
+    assert.throws(() => c.independentPriceCheck({ ...review, reference: undefined }), /price_check_unavailable/)
+    await assert.rejects(sdk.uniswapReferenceOutput(request, { ...ports, simulate: async () => { throw new onchain.OnchainQuoteError('rpc_unavailable') } }), /rpc_unavailable/)
+    await assert.rejects(sdk.uniswapReferenceOutput(request, { ...ports, assertSnapshot: async () => { throw new onchain.OnchainQuoteError('snapshot_changed') } }), /snapshot_changed/)
+    await assert.rejects(sdk.uniswapReferenceOutput(request, { ...ports, now: () => NOW_MS + 600_000 }), /clock/)
+  }
+})
 await test('the production example preserves 18-decimal gas math, separate 6-decimal provider fees and the existing safety margins', async () => {
   // Controlled reproduction: the exact estimate is inferred from the reported ceiling; the historical raw quote was not supplied.
   const sdk = require(`${root}src/lib/swap/circleSdk.ts`)
