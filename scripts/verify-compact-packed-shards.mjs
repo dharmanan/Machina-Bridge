@@ -17,7 +17,7 @@ import { FAMILY_FIELDS } from '../server/compact/families.js';
 import { processHour } from '../server/compact/hour.js';
 import { createSyntheticChain } from '../server/compact/offline.js';
 import {
-  PACKED_ADDRESS_ROWS, PACKED_COLUMN_ROWS, PACKED_DATASETS, PACKED_HOUR_DATASETS, PACKED_MAX_RAW_PIECE_BYTES, PACKED_SHARDS_VERSION, packedShardsConfig,
+  PACKED_ADDRESS_ROWS, PACKED_COLUMN_ROWS, PACKED_DATASETS, PACKED_HOUR_DATASETS, PACKED_MAX_RAW_PIECE_BYTES, PACKED_SHARDS_VERSION, createPackedShards, packedShardsConfig,
 } from '../server/compact/packed-shards.js';
 import { PROJECTIONS } from '../server/compact/projections.js';
 import { createProvider } from '../server/compact/provider.js';
@@ -26,6 +26,7 @@ import { bootstrapV3Registry, bootstrapV4Registry, registrySnapshot } from '../s
 import { COMPACT_DEFINITION_VERSION } from '../server/compact/sources.js';
 import { createCompactStore } from '../server/compact/store.js';
 import { archiveConfig } from '../server/compact/evidence-archive.js';
+import { identitySource } from '../server/compact/identity-evidence.js';
 
 globalThis.fetch = async () => { throw new Error('external_network_forbidden'); };
 delete process.env.COMPACT_PACKED_SHARDS_ENABLED;
@@ -339,8 +340,119 @@ await test('recovery accessor: persistedActiveAddresses reads a packed hour when
   copyFileSync(join(dir, 'daily.sqlite'), join(dir, 'daily-off.sqlite'));
   const offCopy = open('daily-off.sqlite');
   offCopy.prepare('DELETE FROM compact_hour_addresses WHERE hour_start = ?').run(DAY0 + 3600);
-  assert.equal(createCompactStore(offCopy).persistedActiveAddresses(DAY0 + 3600), null, 'OFF keeps the previous behaviour');
+  const offStore = createCompactStore(offCopy);
+  assert.equal(offStore.packedShards.enabled, false);
+  const packedCounts = () => ['compact_packed_sets', 'compact_packed_pieces', 'compact_packed_payloads'].map((table) => count(offCopy, table));
+  const before = packedCounts();
+  offCopy.exec('PRAGMA query_only=ON');
+  const changes = offCopy.prepare('SELECT total_changes() AS n').get().n;
+  assert.deepEqual(offStore.persistedActiveAddresses(DAY0 + 3600), expected,
+    'OFF disables new packing, not verified recovery from an existing packed copy');
+  assert.equal(offStore.packedShards.packHour(DAY0 + 3600), null, 'OFF does not repack during recovery');
+  assert.equal(offCopy.prepare('SELECT total_changes() AS n').get().n, changes, 'recovery writes nothing');
+  offCopy.exec('PRAGMA query_only=OFF');
+  assert.equal(offStore.commitHour(identityHour(48, identities(9000, 3))).outcome, 'inserted');
+  assert.equal(offStore.packedShards.status('compact_hour_addresses', DAY0 + 48 * 3600), null, 'OFF does not pack the new hour');
+  assert.deepEqual(packedCounts(), before, 'a new canonical hour with packing OFF creates no packed sets, pieces or payloads');
   offCopy.close();
+});
+
+// Every corruption below is confined to a separate disposable copy. The runtime's immutable guards stay intact;
+// dropping a copy's trigger is only fault injection, never an application migration or recovery technique.
+const recoveryHour = DAY0 + 3600;
+function recoveryCopy(name) {
+  copyFileSync(join(dir, 'daily.sqlite'), join(dir, name));
+  const db = open(name);
+  const store = createCompactStore(db, { packedShards: { config: packedShardsConfig({}) } });
+  assert.equal(store.packedShards.enabled, false);
+  db.prepare('DELETE FROM compact_hour_addresses WHERE hour_start=?').run(recoveryHour);
+  return { db, store };
+}
+function rejectsRecovery(db, store, code) {
+  db.exec('PRAGMA query_only=ON');
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
+  const checkpoint = store.checkpoint();
+  let published = null;
+  assert.throws(() => { published = store.persistedActiveAddresses(recoveryHour); }, (error) => error.code === code);
+  assert.equal(published, null, 'a failed full verification never returns a partial address array');
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before, 'failed recovery writes nothing');
+  assert.deepEqual(store.checkpoint(), checkpoint, 'failed recovery leaves the canonical checkpoint intact');
+}
+
+await test('OFF recovery: existing packed identities verify on an actual read-only SQLite connection', async () => {
+  const fixture = recoveryCopy('recovery-readonly.sqlite');
+  closeAndCheckpoint(fixture.db);
+  const db = new DatabaseSync(join(dir, 'recovery-readonly.sqlite'), { readOnly: true });
+  try {
+    const packed = createPackedShards(db, { config: packedShardsConfig({}) });
+    const source = identitySource(db, 'compact_hour_addresses', recoveryHour, 500, { packed });
+    assert.equal(source.source, 'packed');
+    assert.deepEqual([...source.openRows()].map((row) => `0x${Buffer.from(row.address).toString('hex')}`), identities(1, 500));
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, 0);
+  } finally { db.close(); }
+});
+
+await test('OFF recovery: a missing packed set stays unavailable even when the adjacent hour has identical addresses', async () => {
+  const { db, store } = recoveryCopy('recovery-no-set.sqlite');
+  try {
+    db.exec('DROP TRIGGER compact_packed_set_delete_guard');
+    db.prepare("DELETE FROM compact_packed_sets WHERE dataset='compact_hour_addresses' AND scope_start=?").run(recoveryHour);
+    db.exec('PRAGMA query_only=ON');
+    const changes = db.prepare('SELECT total_changes() AS n').get().n;
+    assert.deepEqual(store.persistedActiveAddresses(recoveryHour + 3600), identities(1, 500));
+    assert.equal(store.persistedActiveAddresses(recoveryHour), null, 'another hour is never a substitute for missing evidence');
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+  } finally { db.close(); }
+});
+
+await test('OFF recovery: a missing piece rejects the whole address result', async () => {
+  const { db, store } = recoveryCopy('recovery-no-piece.sqlite');
+  try {
+    db.exec('DROP TRIGGER compact_packed_piece_delete_guard');
+    db.prepare("DELETE FROM compact_packed_pieces WHERE dataset='compact_hour_addresses' AND scope_start=? AND part=0").run(recoveryHour);
+    rejectsRecovery(db, store, 'packed_pieces_corrupt');
+  } finally { db.close(); }
+});
+
+await test('OFF recovery: changed compressed payload bytes fail checksum verification', async () => {
+  const { db, store } = recoveryCopy('recovery-bad-payload.sqlite');
+  try {
+    const piece = db.prepare("SELECT payload_sha256 FROM compact_packed_pieces WHERE dataset='compact_hour_addresses' AND scope_start=? AND part=0").get(recoveryHour);
+    const bytes = Buffer.from(db.prepare('SELECT payload FROM compact_packed_payloads WHERE payload_sha256=?').get(piece.payload_sha256).payload);
+    bytes[0] ^= 1;
+    db.exec('DROP TRIGGER compact_packed_payload_no_update');
+    db.prepare('UPDATE compact_packed_payloads SET payload=? WHERE payload_sha256=?').run(bytes, piece.payload_sha256);
+    rejectsRecovery(db, store, 'packed_payload_corrupt');
+  } finally { db.close(); }
+});
+
+await test('OFF recovery: a binding from another hour is rejected even with identical membership and payload', async () => {
+  const { db, store } = recoveryCopy('recovery-wrong-hour.sqlite');
+  try {
+    const other = store.packedShards.status('compact_hour_addresses', recoveryHour + 3600);
+    const target = store.packedShards.status('compact_hour_addresses', recoveryHour);
+    assert.equal(other.rowCount, target.rowCount);
+    assert.notEqual(other.rowsSha256, target.rowsSha256, 'typed row digests include the hour scope');
+    const payload = (hour) => db.prepare("SELECT payload_sha256 FROM compact_packed_pieces WHERE dataset='compact_hour_addresses' AND scope_start=? AND part=0").get(hour).payload_sha256;
+    assert.equal(payload(recoveryHour), payload(recoveryHour + 3600), 'identical address bytes share the payload, not the canonical binding');
+    db.exec('DROP TRIGGER compact_packed_set_no_update');
+    db.prepare(`UPDATE compact_packed_sets SET binding_sha256=(SELECT binding_sha256 FROM compact_packed_sets
+      WHERE dataset='compact_hour_addresses' AND scope_start=?) WHERE dataset='compact_hour_addresses' AND scope_start=?`)
+      .run(recoveryHour + 3600, recoveryHour);
+    rejectsRecovery(db, store, 'packed_binding_mismatch');
+  } finally { db.close(); }
+});
+
+await test('OFF recovery: a valid packed copy cannot override the independent identity commitment', async () => {
+  const { db, store } = recoveryCopy('recovery-bad-commitment.sqlite');
+  try {
+    const key = `identity_membership:v1:compact_hour_addresses:${recoveryHour}`;
+    const commitment = JSON.parse(db.prepare('SELECT value FROM compact_meta WHERE key=?').get(key).value);
+    commitment.sha256 = commitment.sha256 === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64);
+    db.exec('DROP TRIGGER compact_identity_commitment_no_update');
+    db.prepare('UPDATE compact_meta SET value=? WHERE key=?').run(JSON.stringify(commitment), key);
+    rejectsRecovery(db, store, 'identity_commitment_corrupt');
+  } finally { db.close(); }
 });
 
 await test('bounds: 256-row and 4096-address pieces, oversized pieces split, a zero-row set, large values and NULLs stay exact', async () => {
