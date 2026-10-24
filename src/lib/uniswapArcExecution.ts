@@ -26,7 +26,7 @@ export interface SwapAttempt {
 export interface ExecutionView {
   phase: 'idle' | 'preparing' | 'review' | 'checking' | AttemptStatus
   allowanceNotice?: string
-  permitSigned?: boolean; notice?: string
+  permitSigned?: boolean; notice?: string; recheckRequired?: boolean
   stage?: 'balances' | 'wallet' | 'permission' | 'quote' | 'simulation'
   approvalId?: string; review?: ArcReview; attempt?: SwapAttempt; error?: string; walletWindowMs?: number; walletRequestOpen?: boolean
   // A status lookup in progress. The status already known stays visible; only this flag changes.
@@ -303,7 +303,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     if (a.status === status && a.log && a.log.length > 0) return { ...a, status }
     return { ...a, status, log: [...(a.log ?? []), { at, status, note }].slice(-40) }
   }
-  let intent: { signedData?: Hex; allowanceNotice?: string; id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
+  let intent: { highestObserved?: number; signedData?: Hex; allowanceNotice?: string; id: string; review: ArcReview; nonce: number; context: string; version: number } | null = null
   const contextKey = () => { const c = ports.context(); return JSON.stringify([c.owner.toLowerCase(), c.connected, c.chainId, c.connectorId]) }
   function emit(next: ExecutionView) { view = structuredClone(next); try { ports.changed?.(structuredClone(view)) } catch { /* Observer cannot interrupt recording. */ } }
   function requireEnabled() {
@@ -343,7 +343,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
   async function checkedNonce(selected: NonNullable<typeof intent>, provider: ExecutionProvider, expected?: number, signedData?: Hex) {
     // One bounded recheck can reconcile a moving head or transient stale result.
     // Repeat the full balance/gas/router/simulation preflight, not just the nonce.
-    let highestObserved = -1
+    let highestObserved = selected.highestObserved ?? -1
     for (let pass = 0; pass < 2; pass++) {
       try {
         ready(selected)
@@ -370,7 +370,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
           continue
         }
         throw error
-      }
+      } finally { selected.highestObserved = highestObserved }
     }
     return stop('nonce_rpc')
   }
@@ -402,18 +402,41 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     emit({ phase: 'review', approvalId: selected.id, review: selected.review, permitSigned: true, allowanceNotice: selected.allowanceNotice,
       notice: 'Permission ready. The price was refreshed and the signed transaction simulated. Check the current amounts, then confirm the swap. No second permission signature is needed.' })
   }
-  async function refresh() {
+  function blockedReview(selected: NonNullable<typeof intent>, error: unknown, stage: 'Review' | 'Confirm') {
+    let fatal = error instanceof Error && ['permit_invalid', 'nonce', 'storage'].includes(error.message)
+    let expired = false
+    try { sameIntent(selected) } catch (reason) {
+      if (!(reason instanceof Error) || reason.message !== 'expired') {
+        intent = null; emit({ phase: 'idle', error: failureMessage(reason, stage) }); return
+      }
+      expired = true; fatal = true
+    }
+    intent = fatal ? null : selected
+    emit({ phase: 'review', review: selected.review, approvalId: selected.id, permitSigned: !fatal && Boolean(selected.signedData), recheckRequired: true,
+      error: expired ? 'The original transaction deadline or safe wallet approval window has ended. Prepare a fresh review; a new permission signature is required for token swaps.' : failureMessage(error, stage),
+      notice: expired ? 'The old permission cannot be used. No swap was requested.' : fatal ? 'This permission cannot be reused after the failed safety check. Prepare a fresh review; no swap was requested.'
+        : selected.signedData ? 'Permission kept in this page only. Checks are paused. Retry review to obtain a fresh price and repeat all safety checks; then confirm explicitly.'
+          : 'Review checks are paused. Retry review before continuing; no wallet request will start automatically.' })
+  }
+  async function refresh(recheckOnly = false) {
     if (busy || tracking) return
-    if (!intent?.signedData) { await prepare(); return }
+    if (!intent || (!intent.signedData && (!recheckOnly || intent.review.expiresAt - ports.quoteNow(intent.review.request) < 5000))) { await prepare(); return }
     busy = true
     const selected = intent
     try {
       await ports.lock(selected.review.request.owner, async () => {
         sameIntent(selected)
         if (journal.read(selected.review.request.owner).some(blocking)) stop('busy')
-        await refreshSignedReview(selected, await ports.provider(), selected.signedData!)
+        const provider = await ports.provider()
+        if (selected.signedData) await refreshSignedReview(selected, provider, selected.signedData)
+        else {
+          emit({ phase: 'checking', stage: 'balances', review: selected.review })
+          await checkedNonce(selected, provider, selected.nonce)
+          ready(selected)
+          emit({ phase: 'review', review: selected.review, approvalId: selected.id, allowanceNotice: selected.allowanceNotice, notice: 'Review checked again. Confirm the next wallet step explicitly.' })
+        }
       })
-    } catch (error) { intent = null; emit({ phase: 'idle', error: failureMessage(error, 'Review') }) }
+    } catch (error) { blockedReview(selected, error, 'Review') }
     finally { busy = false }
   }
   async function prepare() {
@@ -447,7 +470,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
     finally { busy = false }
   }
   async function confirm(approvalId: string) {
-    if (busy || tracking || !intent || view.phase !== 'review' || approvalId !== intent.id) return
+    if (busy || tracking || !intent || view.phase !== 'review' || view.recheckRequired || approvalId !== intent.id) return
     busy = true
     const selected = intent
     let attempt: SwapAttempt | undefined, requested = false
@@ -467,6 +490,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
           emit({ phase: 'checking', stage: 'permission', approvalId, allowanceNotice: selected.allowanceNotice, review: selected.review, walletRequestOpen: true })
           const permission = await ports.signPermit!(structuredClone(selected.review), provider)
           if (!permission) stop('permit_invalid')
+          selected.signedData = permission // retain only in memory if the fresh price/read fails after signing
           // No broadcast from the signature callback. A fresh Review and explicit final confirmation follow.
           await refreshSignedReview(selected, provider, permission)
           return
@@ -501,6 +525,7 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
         } finally { clearTimeout(walletTimer); sending = false }
       })
     } catch (error) {
+      if (!requested && !attempt && selected.signedData) { blockedReview(selected, error, 'Confirm'); return }
       intent = null
       if (!requested && attempt) { attempt = { ...attempt, status: 'rejected' }; try { journal.save(attempt) } catch { /* Original durable record blocks retry. */ } }
       if (!requested) emit({ phase: 'idle', error: failureMessage(error, 'Confirm') })
@@ -623,11 +648,12 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
       if (!(error instanceof Error && error.message === 'lock')) emit({ ...view, checking: false, error: executionMessage(error instanceof ExecutionVerificationError ? (error.retryable ? 'verification' : 'verification_binding') : error instanceof Error && error.message === 'verification' ? 'verification' : 'storage') })
     } finally { tracking = false }
   }
-  function invalidate() {
+  function invalidate(reason?: string) {
+    const wasReview = view.phase === 'review' || view.phase === 'checking' || view.phase === 'preparing'
     version++; intent = null
-    if (!sending && !['pending', 'unknown', 'confirmed', 'failed', 'rejected'].includes(view.phase)) emit({ phase: 'idle' })
+    if (!sending && !['pending', 'unknown', 'confirmed', 'failed', 'rejected'].includes(view.phase)) emit({ phase: 'idle', ...(wasReview && reason ? { error: reason } : {}) })
   }
-  return { prepare, confirm, refresh, reconcile, invalidate, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view),
+  return { prepare, confirm, refresh, resume: () => refresh(true), reconcile, invalidate, history: (owner = ports.context().owner) => journal.read(owner), current: () => structuredClone(view),
     // True while a record of this wallet is unresolved (or could not be re-verified). Unreadable storage counts as blocking.
     blocking: (owner: string) => { try { return journal.read(owner).some(blocking) } catch { return true } } }
 }

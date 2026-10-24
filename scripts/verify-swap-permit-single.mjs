@@ -90,6 +90,7 @@ function fixture(options = {}) {
       world.signs.push(params); if (world.reject) throw Object.assign(Error('private error'), { code: 4001 })
       world.time += world.signDelay ?? 0; const payload = JSON.parse(params[1]); delete payload.types.EIP712Domain
       if (world.signOutput !== undefined) world.output = world.signOutput
+      if (world.failFreshAfterSign) world.freshFails = true
       if (world.changePermitNonce) world.permitNonce++
       if (world.changeTokenAllowance) world.tokenAllowance = 2n ** 256n - 1n
       if (world.changeContext) world.ctx = { ...world.ctx, chainId: 1 }
@@ -129,7 +130,10 @@ for (const [label, options] of [
   ['signed simulation reverts', { simulationFails: true }], ['signed gas exceeds Review limit', { estimates: 2_000_001n }],
 ]) await test(`${label}: no transaction and no on-chain Permit2 fallback`, async () => {
   const f = fixture(options); await f.controller.prepare(); if (f.controller.current().phase === 'review') await f.controller.confirm(f.controller.current().approvalId)
-  assert.equal(f.world.sends.length, 0); assert.equal(f.controller.current().phase, 'idle')
+  assert.equal(f.world.sends.length, 0)
+  const blocked = f.controller.current()
+  if (blocked.phase === 'review') { assert.equal(blocked.recheckRequired, true); await f.controller.confirm(blocked.approvalId); assert.equal(f.world.sends.length, 0) }
+  else assert.equal(blocked.phase, 'idle')
 })
 await test('unlimited pre-existing allowance is disclosed in fresh Review, reused unchanged, and still produces one exact short-lived signature and only the router transaction', async () => {
   const unlimited = 2n ** 256n - 1n, f = fixture({ tokenAllowance: unlimited })
@@ -188,7 +192,27 @@ for (const mode of ['price', 'rpc', 'expiry', 'nonce', 'account']) await test(`p
   if (mode === 'expiry') f.world.time += 121_000
   if (mode === 'nonce') f.world.nonce++
   if (mode === 'account') f.world.ctx = { ...f.world.ctx, owner: other.address }
-  await f.controller.refresh(); assert.equal(f.world.sends.length, 0); assert.equal(f.controller.current().phase, 'idle')
+  await f.controller.refresh(); assert.equal(f.world.sends.length, 0)
+  const blocked = f.controller.current()
+  if (blocked.phase === 'review') { assert.equal(blocked.recheckRequired, true); await f.controller.confirm(blocked.approvalId); assert.equal(f.world.sends.length, 0) }
+  else assert.equal(blocked.phase, 'idle')
+})
+for (const afterSign of [false, true]) await test(`transient price RPC failure ${afterSign ? 'immediately after signing' : 'on return'} retains permission, disables Confirm and recovers without a second signature`, async () => {
+  const f = fixture({ failFreshAfterSign: afterSign }); await f.controller.prepare(); await f.controller.confirm(f.controller.current().approvalId)
+  if (!afterSign) { f.world.freshFails = true; await f.controller.refresh() }
+  const paused = f.controller.current(); assert.equal(paused.phase, 'review'); assert.equal(paused.recheckRequired, true); assert.equal(paused.permitSigned, true)
+  await f.controller.confirm(paused.approvalId); assert.equal(f.world.sends.length, 0)
+  f.world.freshFails = false; await f.controller.refresh()
+  assert.equal(f.controller.current().recheckRequired, undefined); assert.equal(f.world.signs.length, 1)
+  await f.controller.confirm(f.controller.current().approvalId); assert.equal(f.world.sends.length, 1)
+})
+await test('Retry review cannot forget a higher nonce observed while retaining the same signed intent', async () => {
+  const f = fixture(); await f.controller.prepare(); await f.controller.confirm(f.controller.current().approvalId)
+  f.world.nonce = 4; f.world.walletNonce = 3; await f.controller.refresh()
+  assert.equal(f.controller.current().recheckRequired, true)
+  f.world.nonce = 3; await f.controller.refresh()
+  assert.equal(f.controller.current().recheckRequired, true); assert.match(f.controller.current().error, /moved backwards/)
+  await f.controller.confirm(f.controller.current().approvalId); assert.equal(f.world.sends.length, 0)
 })
 await test('early and mined integrity comparisons use only the signed calldata commitment; mutations remain mismatches', async () => {
   const reviewed = { owner, recipient: owner, router: p.ARC_ROUTER, chainId: 5042, nonce: 3, value: 0n, calldata: review.transaction.data, calldataHash: keccak256(signed),

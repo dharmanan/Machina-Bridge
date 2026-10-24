@@ -11,6 +11,16 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, file)
 let chromium
 try { ({ chromium } = require('playwright-core')) } catch { ({ chromium } = require(process.env.PLAYWRIGHT_CORE_PATH ?? '/opt/codex/runtimes/cua/lib/node_modules/playwright-core')) }
+// Playwright forces every attached page to appear focused/visible. For the real-tab
+// suite only, disable that AUTOMATION setting in its originating CDP sessions.
+// document.hidden/visibilityState and visibilitychange are never overridden.
+if (process.env.MACHINA_REAL_TABS_ONLY === '1') {
+  const entry = require.resolve(process.env.PLAYWRIGHT_CORE_PATH ?? '/opt/codex/runtimes/cua/lib/node_modules/playwright-core')
+  ;({ chromium } = require(entry))
+  const { CRSession } = require(require('node:path').join(require('node:path').dirname(entry), 'lib/server/chromium/crConnection.js'))
+  const send = CRSession.prototype.send
+  CRSession.prototype.send = function(method, params) { return send.call(this, method, method === 'Emulation.setFocusEmulationEnabled' ? { enabled: false } : params) }
+}
 const root = fileURLToPath(new URL('..', import.meta.url))
 const p = require(`${root}src/lib/uniswapArcPolicy.ts`), e = require(`${root}src/lib/uniswapArcExecution.ts`), simulator = require(`${root}src/lib/swap/simulatorCode.ts`)
 const tokens = require(`${root}src/lib/swap/tokens.ts`), pools = require(`${root}src/lib/swap/uniswapPools.ts`), adapter = require(`${root}src/lib/swap/circleAdapterDecode.ts`)
@@ -32,6 +42,13 @@ const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
 
 const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) },
   cacheDir: `${root}.verification/vite-unified-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
+    name: 'read-only-baseline-lifecycle-probe', enforce: 'pre', transform(code, id) {
+      if (process.env.MACHINA_TAB_BASELINE_PROBE !== '1') return
+      const relative = id.split('?')[0].slice(root.length)
+      if (['src/components/UniswapArcExecution.tsx', 'src/lib/uniswapArcExecution.ts'].includes(relative))
+        return require('node:child_process').execFileSync('git', ['show', `49172aa98d2cbd80f70e335e98c7f6c3bdd56a84:${relative}`], { cwd: root, encoding: 'utf8' })
+    },
+  }, {
     name: 'controlled-circle-estimator', enforce: 'pre', transform(code, id) {
       if (id.split('?')[0] !== `${root}src/lib/mainnetSwap.ts`) return
       return code.replace('export function readMainnetSwapQuote(', 'function originalReadMainnetSwapQuote(') + `
@@ -63,6 +80,8 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_TAB_BASELINE_PROBE === '1' && !/^(the mode chip|real tabs: unsigned)/.test(name)) return
+  if (process.env.MACHINA_REAL_TABS_ONLY === '1' && !/^(the mode chip|real tabs|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_APPROVAL_HANDOFF_ONLY === '1' && !/^(the mode chip|approval handoff|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_POST_SWAP_UNKNOWN_ONLY === '1' && !/^(the mode chip|nonconfirmed form lifecycle: wallet unknown|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_POST_SWAP_ONLY === '1' && !/^(the mode chip|signed Review lifecycle|confirmed form lifecycle|nonconfirmed form lifecycle|new input lifecycle|no unapproved wallet)/.test(name)) return
@@ -129,7 +148,7 @@ function firstSwapResponse(method) {
 }
 
 try {
-  browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
+  browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', headless: process.env.MACHINA_REAL_TABS_ONLY !== '1', args: ['--no-sandbox', '--disable-dev-shm-usage'] })
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } }); page = await context.newPage(); page.setDefaultTimeout(20000)
   page.on('pageerror', error => errors.push(error.message))
   await page.route('**/*', async route => {
@@ -164,7 +183,21 @@ try {
       return route.fulfill({ json: { jsonrpc: '2.0', id: body.id, error: revert ? { code: 3, message: 'execution reverted' } : { code: -32603, message: String(error.message) } } })
     }
   })
+  if (process.env.MACHINA_REAL_TABS_ONLY === '1') await page.addInitScript(() => {
+    window.nativeTabEvents = []
+    document.addEventListener('visibilitychange', event => window.nativeTabEvents.push({ state: document.visibilityState, trusted: event.isTrusted }))
+  })
   await page.goto(base + '/__swap_ui_test')
+  let peer
+  if (process.env.MACHINA_REAL_TABS_ONLY === '1') {
+    const session = await context.newCDPSession(page), { targetInfo } = await session.send('Target.getTargetInfo')
+    const created = context.waitForEvent('page')
+    await session.send('Target.createTarget', { url: 'about:blank', browserContextId: targetInfo.browserContextId, newWindow: false, background: true })
+    peer = await created
+    const otherSession = await context.newCDPSession(peer)
+    assert.equal((await session.send('Browser.getWindowForTarget')).windowId, (await otherSession.send('Browser.getWindowForTarget')).windowId)
+    await page.bringToFront()
+  }
   const amount = page.getByRole('textbox', { name: 'Swap amount' }), review = page.locator('#review-swap'), confirm = page.getByRole('button', { name: 'Confirm Swap', exact: true })
   async function confirmUniswap() {
     const sign = page.getByRole('button', { name: 'Sign permission', exact: true })
@@ -682,6 +715,7 @@ try {
   await page.route(base + '/__lifecycle_reset', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Test reset</title>' }))
   async function resetLifecycle(source = 'uniswap', input = 'EURC', allowance = 1_000_000n) {
     // Dispose the previous controller BEFORE clearing storage, so an in-flight poll cannot restore its journal.
+    if (peer) await page.bringToFront()
     await page.goto(base + '/__lifecycle_reset'); await page.evaluate(() => window.localStorage.clear())
     world.receipts.clear(); world.rpcDown.clear(); world.hidden.clear(); world.clockOffset = 0
     rpc.state.nonce = { latest: 7, pending: 7 }; rpc.state.tokenAllowance.EURC = allowance
@@ -731,8 +765,8 @@ try {
   await test('signed Review lifecycle: expired signature/deadline on return is discarded and cannot send', async () => {
     await signedLifecycle(); const before = await sends(); await page.clock.install(); await visibility(true)
     await page.clock.fastForward(121_000); world.clockOffset += 121_000; await visibility(false)
-    await page.getByRole('dialog').waitFor({ state: 'hidden' }); assert.equal(await sends(), before)
-    await page.getByText(/expired|approval window/i).first().waitFor(); await page.clock.setSystemTime(new Date()); world.clockOffset = 0
+    await page.getByRole('dialog').getByText(/original transaction deadline|safe wallet approval window/).waitFor(); assert.equal(await sends(), before)
+    assert.equal(await confirm.count(), 0); await page.clock.setSystemTime(new Date()); world.clockOffset = 0
   })
   for (const source of ['uniswap', 'circle']) await test(`confirmed form lifecycle: ${source} clears its own input and quotes, refreshes balances, retains success/history and ignores a repeated verification`, async () => {
     const sent = await pendingLifecycle(source); assert.equal(await amount.inputValue(), '1')
@@ -824,6 +858,83 @@ try {
     await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '')
     await page.getByText('Balance: 0 EURC', { exact: true }).waitFor()
     assert.equal(await sends(), 2); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
+  })
+
+  async function tab(away) {
+    await (away ? peer : page).bringToFront()
+    await page.waitForFunction(value => document.hidden === value, away)
+    assert.equal(await page.evaluate(() => Object.hasOwn(document, 'hidden')), false)
+  }
+  await test('real tabs: unsigned Review survives native tab hide/return with no wallet request', async () => {
+    await resetLifecycle(); await review.click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).waitFor()
+    await tab(true)
+    if (process.env.MACHINA_TAB_BASELINE_PROBE === '1') {
+      await tab(false); await page.getByRole('dialog').waitFor({ state: 'hidden' })
+      console.log('BASELINE REPRODUCED: unsigned Review disappears on a native tab switch.')
+      await signedLifecycle(); world.rpcDown.add('everything'); await tab(true); await tab(false)
+      await page.getByRole('dialog').waitFor({ state: 'hidden' }); assert.equal(await sends(), 0)
+      console.log('BASELINE REPRODUCED: a return RPC failure discards the signed Review.')
+      world.rpcDown.clear(); return
+    }
+    await tab(false); await page.getByRole('button', { name: 'Sign permission', exact: true }).waitFor({ state: 'visible' })
+    await page.waitForFunction(() => [...document.querySelectorAll('dialog button')].some(b => b.textContent === 'Sign permission' && !b.disabled))
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    const events = await page.evaluate(() => window.nativeTabEvents)
+    assert.ok(events.some(e => e.state === 'hidden' && e.trusted)); assert.ok(events.some(e => e.state === 'visible' && e.trusted))
+  })
+  await test('real tabs: a held MetaMask-style signature completes in the background and still needs final confirmation', async () => {
+    await resetLifecycle(); await page.evaluate(() => { window.swapUiTest.state.permitMode = 'held' })
+    await review.click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Sign the exact-amount permission in your wallet/).waitFor()
+    await tab(true); await page.evaluate(() => { window.swapUiTest.releasePermit() }); await tab(false)
+    await page.getByRole('dialog').getByText(/Permission ready. The price was refreshed/).waitFor()
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
+  })
+  await test('real tabs: 31 seconds after signing refreshes price, preserves permission and never sends automatically', async () => {
+    await signedLifecycle(); await tab(true); await page.waitForTimeout(31_000); await tab(false)
+    await page.getByRole('dialog').getByText(/Permission ready. The price was refreshed/).waitFor()
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
+  })
+  await test('real tabs: short RPC outage keeps the signature behind Retry review; recovery and explicit Confirm send once and retain result UX', async () => {
+    await signedLifecycle(); world.rpcDown.add('everything'); await tab(true); await tab(false)
+    await page.getByRole('button', { name: 'Retry review', exact: true }).waitFor()
+    await page.getByRole('dialog').getByText(/Permission kept in this page only/).waitFor()
+    assert.equal(await confirm.count(), 0); assert.equal(await sends(), 0)
+    world.rpcDown.clear(); await page.getByRole('button', { name: 'Retry review', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Permission ready. The price was refreshed/).waitFor()
+    assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1); assert.equal(await sends(), 0)
+    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    const sent = await lastSent(); await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
+    await latest.getByText('Swap completed', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === ''); assert.equal(await sends(), 1)
+  })
+  await test('real tabs: expired original deadline cannot send, explains loss and requires a new explicitly signed Review', async () => {
+    await signedLifecycle(); await page.clock.install(); await tab(true); await page.clock.fastForward(121_000); world.clockOffset += 121_000; await tab(false)
+    await page.getByRole('dialog').getByText(/original transaction deadline|safe wallet approval window/).waitFor()
+    assert.equal(await confirm.count(), 0); assert.equal(await sends(), 0)
+    await page.getByRole('button', { name: 'Retry review', exact: true }).click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).waitFor()
+    assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
+    await page.clock.setSystemTime(new Date()); world.clockOffset = 0
+  })
+  for (const change of ['account', 'chain', 'input']) await test(`real tabs: ${change} change invalidates old authority with a reason, not an automatic wallet action`, async () => {
+    await signedLifecycle(); await tab(true)
+    if (change === 'account') await page.evaluate(() => window.swapUiTest.account(true))
+    if (change === 'chain') await page.evaluate(() => window.swapUiTest.chain(1))
+    if (change === 'input') await page.evaluate(() => {
+      const field = document.querySelector('input[aria-label="Swap amount"]')
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, '2')
+      field.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await tab(false); await page.getByRole('dialog').waitFor({ state: 'hidden' })
+    await page.getByText(/wallet, network, connector or swap inputs changed/).first().waitFor()
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
+  })
+  await test('real tabs: reload never restores a signature or an automatic transaction', async () => {
+    await signedLifecycle(); await page.reload(); await page.evaluate(() => window.swapUiTest.connect(5042))
+    assert.equal(await page.getByRole('dialog').count(), 0); assert.equal(await sends(), 0)
+    assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    await pick('EURC', 'USDC'); await amount.fill('1'); await quoted(); await review.click()
+    await page.getByRole('button', { name: 'Sign permission', exact: true }).waitFor(); assert.equal(await sends(), 0)
   })
 
   await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only approved read, exact PermitSingle/Circle signature and transaction methods are allowed', async () => {

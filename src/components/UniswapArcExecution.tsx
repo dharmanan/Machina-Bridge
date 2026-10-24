@@ -1,3 +1,4 @@
+import { PlainMessage } from './PlainMessage'
 import { connectedExecutionProvider } from '../lib/uniswapArcWalletRpc'
 import { useEffect, useRef, useState } from 'react'
 import { useAccount } from 'wagmi'
@@ -54,7 +55,7 @@ export function useUniswapArcExecution(input: ArcRequest | null, blocked: (owner
   }, [address, isConnected, controller, view])
   const binding = JSON.stringify([address, chainId, isConnected, connector?.uid, input ? requestKey(input) : null])
   useEffect(() => {
-    controller.invalidate(); source.invalidate()
+    controller.invalidate('The wallet, network, connector or swap inputs changed. Prepare a fresh review; no swap was requested.'); source.invalidate()
   }, [binding, controller, source])
   useEffect(() => {
     if (address && isConnected) void controller.reconcile(address)
@@ -66,13 +67,10 @@ export function useUniswapArcExecution(input: ArcRequest | null, blocked: (owner
     }
     const hidden = () => {
       const current = controller.current()
-      if (document.hidden) {
-        // A signed Review belongs to this mounted page only. Hiding it is not a wallet/input change.
-        if (!current.walletRequestOpen && !current.permitSigned) { controller.invalidate(); source.invalidate() }
-      } else if (current.phase === 'review' && current.permitSigned) {
-        // Fresh price, original signed deadline/limits, nonce reconciliation and exact simulation;
-        // refresh never signs or broadcasts, and final Confirm remains mandatory.
-        void controller.refresh()
+      if (!document.hidden && current.phase === 'review') {
+        // Hiding alone never changes Review authority. Resume only reads; every write
+        // still needs explicit consent after current-context and freshness checks.
+        void controller.resume()
       }
     }
     window.addEventListener('storage', changed); document.addEventListener('visibilitychange', hidden)
@@ -171,7 +169,7 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
         </dl>
         {feeToOthers && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">This swap sends part of what you receive to another address, as shown above. Confirm only if you accept this fee.</p>}
         {portions === null && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">We couldn’t read every detail of this swap. Don’t confirm it; review a fresh swap.</p>}
-        <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked in the transaction prepared by this app: all swap output goes to your wallet, with no additional recipient fee. Your wallet or browser extensions may change the transaction before signing.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Your token approval is in place. Sign one free, exact-amount permission, then check the refreshed price and confirm one gas-paying swap transaction. Reject either wallet request to stop.'} Confirm before this review expires.</p>
+        <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked in the transaction prepared by this app: all swap output goes to your wallet, with no additional recipient fee. Your wallet or browser extensions may change the transaction before signing.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Token → Permit2 approval is a gas-paying blockchain transaction, needed only when the current allowance is too small. An exact allowance can be consumed by a swap, so a later amount may need a new exact approval. PermitSingle is a separate free, exact-amount signature; the swap is the final gas-paying transaction. Check the refreshed price and confirm it explicitly. Reject either wallet request to stop.'} Confirm before this review expires.</p>
         <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
           <dl className="mt-2 space-y-1">
             <ReviewLine label="Contract" value={`Uniswap Universal Router · ${ARC_ROUTER}`} />
@@ -183,13 +181,14 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
             <ReviewLine label="Network" value="Arc Mainnet · 5042" />
           </dl></details>
       </>}
+      {view.error && <PlainMessage raw={view.error} />}
       {view.notice && <p role="status" className="text-sm text-slate-600">{view.notice}</p>}
       {view.phase === 'checking' && view.walletRequestOpen && <p role="status" className="text-sm text-slate-600">{review && executionDeadlineMs(review) - Date.now() <= 15000 ? 'The permission window ended. Reject the outstanding wallet request; no swap will be sent.' : 'Sign the exact-amount permission in your wallet. The price will be refreshed before you confirm the swap; the signature keeps its original deadline.'}</p>}
 
       <div className="flex gap-3">
         <button type="button" onClick={execution.cancel} className="flex-1 rounded-xl border border-slate-300 px-4 py-3">Cancel</button>
-        <button type="button" onClick={() => { void (remainingMs < 5000 ? execution.refresh() : execution.confirm()) }} disabled={view.phase !== 'review' || portions === null}
-          className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? (view.stage === 'permission' ? 'Sign permission in wallet…' : view.stage === 'quote' ? 'Refreshing price…' : view.stage === 'simulation' ? 'Simulating signed swap…' : 'Checking wallet and fees…') : remainingMs < 5000 ? 'Refresh review' : !nativeIn && !view.permitSigned ? 'Sign permission' : 'Confirm Swap'}</button>
+        <button type="button" onClick={() => { void ((view.recheckRequired || remainingMs < 5000) ? execution.refresh() : execution.confirm()) }} disabled={view.phase !== 'review' || portions === null}
+          className="flex-1 rounded-xl bg-[#2F6E0C] px-4 py-3 font-semibold text-white disabled:opacity-50">{view.phase === 'checking' ? (view.stage === 'permission' ? 'Sign permission in wallet…' : view.stage === 'quote' ? 'Refreshing price…' : view.stage === 'simulation' ? 'Simulating signed swap…' : 'Checking wallet and fees…') : view.recheckRequired ? 'Retry review' : remainingMs < 5000 ? 'Refresh review' : !nativeIn && !view.permitSigned ? 'Sign permission' : 'Confirm Swap'}</button>
       </div>
     </div>
   </dialog>
