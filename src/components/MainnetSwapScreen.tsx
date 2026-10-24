@@ -40,7 +40,7 @@ interface ProviderQuote {
 }
 
 export default function MainnetSwapScreen() {
-  const { address, isConnected, chainId } = useAccount()
+  const { address, isConnected, chainId, connector } = useAccount()
   const [tokenIn, setTokenIn] = useState<MainnetSwapToken>('USDC')
   const [tokenOut, setTokenOut] = useState<MainnetSwapToken>('EURC')
   const [amount, setAmount] = useState('')
@@ -79,6 +79,33 @@ export default function MainnetSwapScreen() {
   let circleRequest: CircleSwapRequest | null = null
   if (circle.request && circle.validAmount) { try { circleRequest = validateCircleRequest({ chainId: 5042, tokenIn, tokenOut, owner: circle.request.address, amount, slippageBps }) } catch { circleRequest = null } }
   const circleExecution = useCircleSwapExecution(provider === 'circle' ? circleRequest : null, owner => other.current.uniswap(owner))
+  // Identity changes even when an edited form later returns to the same text. Old results must
+  // never clear a newer user intent, and recovered historical records have no ownership ticket.
+  const cleanupKey = JSON.stringify([address?.toLowerCase(), isConnected, chainId, connector?.uid, provider, tokenIn, tokenOut, amount, slippageBps])
+  const formGeneration = useRef({ key: cleanupKey })
+  if (formGeneration.current.key !== cleanupKey) formGeneration.current = { key: cleanupKey }
+  const reviewedForms = useRef(new Map<string, { key: string }>())
+  useEffect(() => {
+    for (const [source, view] of [['uniswap', execution.view], ['circle', circleExecution.view]] as const) {
+      if (view.phase === 'review' && view.approvalId && view.review) {
+        const r = view.review.request, id = `${source}:${view.approvalId}`
+        if (!reviewedForms.current.has(id) && source === provider && isConnected && chainId === r.chainId && address?.toLowerCase() === r.owner.toLowerCase() &&
+          tokenIn === r.tokenIn && tokenOut === r.tokenOut && amount === r.amount && slippageBps === r.slippageBps) {
+          reviewedForms.current.set(id, formGeneration.current)
+          if (reviewedForms.current.size > 64) reviewedForms.current.delete(reviewedForms.current.keys().next().value!)
+        }
+      }
+      const attempt = view.attempt
+      if (view.phase !== 'confirmed' || view.checking || attempt?.status !== 'confirmed' || attempt.chain?.state !== 'success' ||
+        !['verified', 'verified_with_notes'].includes(attempt.intent?.verdict ?? '')) continue
+      const id = `${source}:${attempt.id}`, ownedForm = reviewedForms.current.get(id)
+      reviewedForms.current.delete(id) // one result, at most one cleanup, even after Check status
+      if (ownedForm !== formGeneration.current) continue
+      setAmount('')
+      setSelectionEpoch(epoch => ({ uniswap: epoch.uniswap + 1, circle: epoch.circle + 1 }))
+      // The existing settled hooks refresh balances; journals/status/history remain intact.
+    }
+  }, [cleanupKey, execution.view, circleExecution.view])
   // Read from the journals themselves (never from React state) and fail closed when a journal cannot be read.
   other.current = { uniswap: owner => approvals.blocking(owner) || execution.blocking(owner), circle: owner => circleExecution.blocking(owner), swapOrCircle: owner => execution.blocking(owner) || circleExecution.blocking(owner) }
   const arcReady = isConnected && chainId === 5042

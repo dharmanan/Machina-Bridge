@@ -63,6 +63,8 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_POST_SWAP_UNKNOWN_ONLY === '1' && !/^(the mode chip|nonconfirmed form lifecycle: wallet unknown|no unapproved wallet)/.test(name)) return
+  if (process.env.MACHINA_POST_SWAP_ONLY === '1' && !/^(the mode chip|signed Review lifecycle|confirmed form lifecycle|nonconfirmed form lifecycle|new input lifecycle|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_SIGNATURE_WINDOW_ONLY === '1' && !/^(the mode chip|a delayed PermitSingle)/.test(name)) return
   if (process.env.MACHINA_UI_POLISH_ONLY === '1' && !/^(the mode chip|compact provider cards|existing excessive token allowances)/.test(name)) return
   if (process.env.MACHINA_ALLOWANCE_ONLY === '1' && !/^(the mode chip|existing excessive token allowances)/.test(name)) return
@@ -672,6 +674,114 @@ try {
     assert.equal(await page.getByRole('region', { name: 'Swap transactions' }).count(), 1); assert.equal(await page.getByRole('article', { name: 'Latest transaction' }).count(), 1)
     const latestText = await latest.innerText(); const history = page.getByLabel('Swap history'); if (await history.count()) assert.equal((await history.innerText()).includes(latestText.split('\n')[0]) && (await history.locator(`article[aria-label^="Transaction"]`).count()) === 0, false)
     await page.setViewportSize({ width: 1280, height: 900 })
+  })
+
+  // Focused lifecycle regressions reuse this suite's controlled provider/SDK/receipts.
+  const visibility = hidden => page.evaluate(value => { Object.defineProperty(document, 'hidden', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }, hidden)
+  await page.route(base + '/__lifecycle_reset', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Test reset</title>' }))
+  async function resetLifecycle(source = 'uniswap', input = 'EURC') {
+    // Dispose the previous controller BEFORE clearing storage, so an in-flight poll cannot restore its journal.
+    await page.goto(base + '/__lifecycle_reset'); await page.evaluate(() => window.localStorage.clear())
+    world.receipts.clear(); world.rpcDown.clear(); world.hidden.clear(); world.clockOffset = 0
+    rpc.state.nonce = { latest: 7, pending: 7 }; rpc.state.tokenAllowance.EURC = 1_000_000n
+    await page.goto(base + '/__swap_ui_test')
+    await page.evaluate(() => window.swapUiTest.connect(5042)); await pick(input, input === 'EURC' ? 'USDC' : 'EURC'); await amount.fill('1'); await quoted()
+    await (source === 'circle' ? circleCard : uniCard).click()
+  }
+  async function signedLifecycle() {
+    await resetLifecycle(); await review.click(); await page.getByRole('button', { name: 'Sign permission', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor()
+  }
+  async function pendingLifecycle(source, holdTransaction = false) {
+    await resetLifecycle(source, 'USDC')
+    if (holdTransaction) world.holdMethod = 'eth_getTransactionByHash'
+    await review.click()
+    if (source === 'uniswap') await confirm.click()
+    else {
+      const dialog = page.getByRole('dialog'); await dialog.getByRole('button', { name: 'Confirm Swap', exact: true }).click()
+      await dialog.getByText(/Step 1 of 2/).waitFor(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
+      await dialog.getByText(/Step 2 of 2/).waitFor(); await dialog.getByRole('button', { name: 'Continue to wallet' }).click()
+    }
+    await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    const sent = await lastSent(); await syncWalletSends(); return sent
+  }
+  await test('signed Review lifecycle: hide/return preserves one signature, rechecks without a send, and final explicit confirmation uses the same permission', async () => {
+    await signedLifecycle(); const before = await sends(), signs = await page.evaluate(() => window.swapUiTest.state.signs.length)
+    const deadline = await page.evaluate(() => JSON.parse(window.swapUiTest.state.signs.at(-1)[1]).message.sigDeadline)
+    await visibility(true); await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor()
+    await visibility(false); await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor()
+    assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
+    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    const sent = await lastSent(); assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[2], BigInt(deadline))
+    assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
+  })
+  await test('signed Review lifecycle: a price expires while hidden, refresh reuses the live signature, a complete reload does not restore it', async () => {
+    await signedLifecycle(); await page.clock.install(); const before = await sends()
+    await visibility(true); await page.clock.fastForward(31_000); world.clockOffset += 31_000
+    await visibility(false); await page.getByRole('dialog').getByText(/Permission ready\. The price was refreshed/).waitFor()
+    assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1); assert.equal(await sends(), before)
+    assert.equal(await confirm.isEnabled(), true)
+    await page.clock.setSystemTime(new Date()); world.clockOffset = 0
+    await page.reload(); await page.evaluate(() => window.swapUiTest.connect(5042)); assert.equal(await page.getByRole('dialog').count(), 0)
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    await amount.fill('1'); await pick('EURC', 'USDC'); await amount.fill('1'); await quoted(); await review.click()
+    await page.getByRole('button', { name: 'Sign permission', exact: true }).waitFor()
+  })
+  await test('signed Review lifecycle: expired signature/deadline on return is discarded and cannot send', async () => {
+    await signedLifecycle(); const before = await sends(); await page.clock.install(); await visibility(true)
+    await page.clock.fastForward(121_000); world.clockOffset += 121_000; await visibility(false)
+    await page.getByRole('dialog').waitFor({ state: 'hidden' }); assert.equal(await sends(), before)
+    await page.getByText(/expired|approval window/i).first().waitFor(); await page.clock.setSystemTime(new Date()); world.clockOffset = 0
+  })
+  for (const source of ['uniswap', 'circle']) await test(`confirmed form lifecycle: ${source} clears its own input and quotes, refreshes balances, retains success/history and ignores a repeated verification`, async () => {
+    const sent = await pendingLifecycle(source); assert.equal(await amount.inputValue(), '1')
+    if (source === 'uniswap') world.receipts.get(lc(sent.hash)).adjusted = true // verified_with_notes is also a confirmed result
+    await page.evaluate(() => { window.swapUiTest.state.nativeBalance = 99n * 10n ** 18n })
+    setReceipt(sent.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '')
+    await page.getByText('Balance: 99 USDC', { exact: true }).waitFor(); await shot(`postswap-${source}-confirmed`)
+    if (source === 'uniswap') await latest.getByText(/wallet adjusted the network fee slightly/).waitFor()
+    assert.equal(await page.getByLabel('Estimated receive').getAttribute('title'), null)
+    assert.equal(await review.isDisabled(), true); await latest.getByRole('link', { name: 'View on Arc Explorer' }).waitFor()
+    await amount.fill('0.2'); const reads = world.reads.length
+    await page.evaluate(prefix => window.dispatchEvent(new StorageEvent('storage', { key: prefix })), source === 'circle' ? 'machina.circle.swap.execution.v1:' : 'machina.uniswap.arc.execution.v1:')
+    for (let i = 0; i < 40 && world.reads.length === reads; i++) await page.waitForTimeout(50)
+    assert.ok(world.reads.length > reads); await latest.getByText('Swap completed', { exact: true }).waitFor(); assert.equal(await amount.inputValue(), '0.2')
+  })
+  await test('confirmed form lifecycle: ERC-20 zero balance after success does not leave a stale insufficient-balance form', async () => {
+    await signedLifecycle(); await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    const sent = await lastSent(); await syncWalletSends(); await page.evaluate(() => { window.swapUiTest.state.balances.EURC = 0n })
+    setReceipt(sent.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '')
+    await page.getByText('Balance: 0 EURC', { exact: true }).waitFor(); assert.equal(await page.getByText(/Insufficient EURC balance/).count(), 0)
+  })
+  for (const status of ['pending', 'failed', 'unknown', 'mismatch']) await test(`nonconfirmed form lifecycle: ${status} never clears the input`, async () => {
+    const sent = await pendingLifecycle('uniswap', status === 'mismatch')
+    if (status === 'failed') setReceipt(sent.hash, 'reverted')
+    if (status === 'unknown') world.rpcDown.add('all')
+    if (status === 'mismatch') {
+      // Set immutable chain data BEFORE any transaction read can observe it; don't mutate a hash mid-read.
+      const item = world.receipts.get(lc(sent.hash)); item.tx = { ...item.tx, data: item.tx.data + '00' }; setReceipt(sent.hash, 'success')
+      world.holdMethod = null; world.releases.splice(0).forEach(resolve => resolve())
+    }
+    await recheck(); await page.waitForTimeout(100); assert.equal(await amount.inputValue(), '1')
+    if (status === 'mismatch') await latest.getByText('This swap differs from your review', { exact: true }).waitFor()
+    else assert.equal(await latest.getByText('Swap completed', { exact: true }).count(), 0)
+    world.rpcDown.clear()
+  })
+  await test('nonconfirmed form lifecycle: wallet unknown outcome retains input, stays blocked and never retries a send', async () => {
+    await resetLifecycle('uniswap', 'USDC'); await page.evaluate(() => { window.swapUiTest.state.walletMode = 'unknown' })
+    await review.click(); await confirm.click(); await latest.getByText('Waiting for confirmation', { exact: true }).waitFor()
+    assert.equal(await amount.inputValue(), '1'); assert.equal(await review.isDisabled(), true); assert.equal(await sends(), 1)
+    const status = await page.evaluate(() => JSON.parse(window.localStorage.getItem(Object.keys(window.localStorage).find(k => k.startsWith('machina.uniswap.arc.execution.v1:'))))[0].status)
+    assert.equal(status, 'unknown'); assert.equal(await latest.getByText('Swap completed', { exact: true }).count(), 0)
+  })
+  for (const source of ['uniswap', 'circle']) for (const edit of ['different amount', 'edit and restore', 'provider']) await test(`new input lifecycle: ${source} older success preserves ${edit}`, async () => {
+    const sent = await pendingLifecycle(source)
+    if (edit === 'provider') await (source === 'uniswap' ? circleCard : uniCard).click()
+    else { await amount.fill('2'); if (edit === 'edit and restore') await amount.fill('1') }
+    setReceipt(sent.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
+    assert.equal(await amount.inputValue(), edit === 'different amount' ? '2' : '1')
   })
 
   await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only approved read, exact PermitSingle/Circle signature and transaction methods are allowed', async () => {

@@ -64,7 +64,17 @@ export function useUniswapArcExecution(input: ArcRequest | null, blocked: (owner
     const changed = (event: StorageEvent) => {
       if (event.key?.startsWith('machina.uniswap.arc.execution.v1:')) { controller.invalidate(); void controller.reconcile() }
     }
-    const hidden = () => { if (document.hidden && !controller.current().walletRequestOpen) { controller.invalidate(); source.invalidate() } }
+    const hidden = () => {
+      const current = controller.current()
+      if (document.hidden) {
+        // A signed Review belongs to this mounted page only. Hiding it is not a wallet/input change.
+        if (!current.walletRequestOpen && !current.permitSigned) { controller.invalidate(); source.invalidate() }
+      } else if (current.phase === 'review' && current.permitSigned) {
+        // Fresh price, original signed deadline/limits, nonce reconciliation and exact simulation;
+        // refresh never signs or broadcasts, and final Confirm remains mandatory.
+        void controller.refresh()
+      }
+    }
     window.addEventListener('storage', changed); document.addEventListener('visibilitychange', hidden)
     return () => {
       alive.current = false; controller.invalidate(); source.invalidate()
