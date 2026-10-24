@@ -54,7 +54,7 @@ const server = await createServer({ configFile: false, root, define: { 'import.m
       return code.replace('export function readMainnetSwapQuote(', 'function originalReadMainnetSwapQuote(') + `
 const testCircleReader = createSwapQuoteReader(async input => {
   const response = await fetch('/__circle_quote', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
-  if (!response.ok) throw new Error('quote_unavailable');
+  if (!response.ok) throw new Error(response.status === 404 ? 'No route available' : 'quote_unavailable');
   return response.json();
 });
 export const readMainnetSwapQuote = testCircleReader;
@@ -80,6 +80,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_QUOTE_UX_ONLY === '1' && !/^(the mode chip|compact provider cards|quote UX:|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_TAB_BASELINE_PROBE === '1' && !/^(the mode chip|real tabs: unsigned)/.test(name)) return
   if (process.env.MACHINA_REAL_TABS_ONLY === '1' && !/^(the mode chip|real tabs|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_APPROVAL_HANDOFF_ONLY === '1' && !/^(the mode chip|approval handoff|no unapproved wallet)/.test(name)) return
@@ -155,12 +156,16 @@ try {
     const request = route.request(), url = request.url()
     if (new URL(url).pathname === '/__circle_quote' && url.startsWith(base)) {
       world.circleCalls++; const input = request.postDataJSON(), units = parseUnits(input.amount, dec[input.tokenIn])
+      if (world.circleNoRoute && input.tokenOut === 'cirBTC' && input.amount === '0.1') return route.fulfill({ status: 404, json: { code: 1003 } })
       const delay = world.circleDelayMs
       if (delay) await new Promise(resolve => setTimeout(resolve, delay))
       const out = rpc.quoteOut(input.tokenIn, input.tokenOut, units, [3000]) * world.circleBias / 100n, minimum = p.minimumAtSlippage(out, input.slippageBps)
       return route.fulfill({ json: { tokenIn: input.tokenIn, tokenOut: input.tokenOut, amountIn: input.amount, chain: 'Arc', chainIn: 'Arc', chainOut: 'Arc', fromAddress: input.address, toAddress: input.address,
-        estimatedOutput: { token: input.tokenOut, amount: formatUnits(out, dec[input.tokenOut]) }, stopLimit: { token: input.tokenOut, amount: formatUnits(minimum, dec[input.tokenOut]) }, fees: [{ type: 'provider', token: input.tokenIn, amount: '0.0002' }, { type: 'gas', token: 'USDC', amount: '0.0218' }] } })
+        estimatedOutput: { token: input.tokenOut, amount: formatUnits(out, dec[input.tokenOut]) }, stopLimit: { token: input.tokenOut, amount: formatUnits(minimum, dec[input.tokenOut]) }, fees: world.circleFees ?? [{ type: 'provider', token: input.tokenIn, amount: '0.0002' }, { type: 'gas', token: 'USDC', amount: '0.0218' }] } })
     }
+    // Reset must dispose the fixture without booting the unrelated full application
+    // (its other wallet metadata/network discovery is outside this Swap-only test).
+    if (url === base + '/__lifecycle_reset') return route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Swap fixture reset</title>' })
     if (url.startsWith(base + '/')) return route.continue()
     if (url.startsWith('https://fonts.googleapis.com/')) return route.fulfill({ contentType: 'text/css', body: '' })
     if (url !== 'https://rpc.mainnet.arc.io/') { world.external++; return route.abort() }
@@ -261,6 +266,84 @@ try {
     }
     assert.equal(await sends(), before); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), signs)
     await page.setViewportSize({ width: 1280, height: 900 })
+  })
+
+  await test('quote UX: amount-specific Circle no-route keeps the Uniswap price and provider choice, then both quote at a higher amount', async () => {
+    try {
+      world.circleNoRoute = true
+      await resetLifecycle('uniswap', 'USDC'); await pick('USDC', 'cirBTC'); await amount.fill('0.1')
+      await uniCard.getByText(/Minimum/).waitFor()
+      await circleCard.getByText(/amount and direction right now/).waitFor()
+      assert.doesNotMatch(await circleCard.innerText(), /liquidity|minimum amount|0\.5 USDC/i)
+      for (const width of [320, 375, 1280]) {
+        await page.setViewportSize({ width, height: 900 })
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false)
+        await shot(`quote-no-route-${width}`)
+      }
+      assert.equal(await uniCard.getAttribute('aria-checked'), 'true')
+      await circleCard.click(); await page.getByRole('alert').getByText(/Another amount may work/).waitFor()
+      assert.equal(await amount.inputValue(), '0.1'); assert.equal(await circleCard.getAttribute('aria-checked'), 'true')
+      await uniCard.click(); await uniCard.getByText(/Minimum/).waitFor()
+      assert.equal(await amount.inputValue(), '0.1')
+      await amount.fill('0.5'); await quoted()
+      await page.getByText('Higher output · before gas', { exact: true }).waitFor()
+      assert.equal(await uniCard.getAttribute('aria-checked'), 'true')
+      assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    } finally { world.circleNoRoute = false }
+  })
+  await test('quote UX: small-amount cost notice requires current known fees, never the cap, and fits mobile and desktop', async () => {
+    try {
+      world.circleFees = [{ type: 'provider', token: 'USDC', amount: '0.00002' }, { type: 'gas', token: 'USDC', amount: '0.024103558015686187' }]
+      await resetLifecycle('circle', 'USDC'); await amount.fill('0.1'); await quoted()
+      const note = page.getByRole('note', { name: 'Small swap cost', exact: true })
+      for (const width of [320, 375, 1280]) {
+        await page.setViewportSize({ width, height: 900 }); await note.getByText(/24\.1%/).waitFor()
+        const detail = page.getByLabel('Fees and wallet steps', { exact: true }); await detail.locator(':scope > summary').click()
+        await detail.getByText(/maximum budget, not the expected fee/).waitFor()
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false)
+        const overflowing = await page.evaluate(() => [...document.querySelectorAll('dd, [aria-label="Small swap cost"]')]
+          .filter(n => n.getClientRects().length && n.scrollWidth > n.clientWidth + 1).map(n => ({ text: n.textContent, width: n.clientWidth, scroll: n.scrollWidth })))
+        assert.deepEqual(overflowing, [])
+        await shot(`quote-cost-${width}`); await detail.locator(':scope > summary').click()
+      }
+      await amount.fill('0.5'); await quoted(); assert.equal(await note.count(), 0)
+      // An unknown SDK gas estimate must not be replaced by Circle's 0.05 USDC fallback cap.
+      world.circleFees = [{ type: 'provider', token: 'USDC', amount: '0.00002' }, { type: 'gas', token: 'USDC', amount: '0' }]
+      await amount.fill('0.1'); await quoted(); await page.getByText('Not available yet', { exact: true }).waitFor()
+      assert.equal(await note.count(), 0)
+      // A missing fee breakdown is not proof of zero provider fees.
+      world.circleFees = [{ type: 'gas', token: 'USDC', amount: '0.024103558015686187' }]
+      await amount.fill('0.11'); await quoted(); assert.equal(await note.count(), 0)
+      assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    } finally { world.circleFees = undefined; await page.setViewportSize({ width: 1280, height: 900 }) }
+  })
+  await test('quote UX: ERC-20 estimate explanations do not invent a net result or change permission steps', async () => {
+    await resetLifecycle('uniswap', 'EURC', 0n); await quoted()
+    for (const width of [320, 1280]) {
+      await page.setViewportSize({ width, height: 900 }); await uniCard.click()
+      await page.getByText(/The signed permission is needed/).waitFor()
+      const details = page.getByLabel('Fees and wallet steps', { exact: true }); await details.locator(':scope > summary').click()
+      await details.getByText('3 interactions · 1 free signature + 2 blockchain transactions', { exact: true }).waitFor()
+      await details.getByText('Unavailable until all remaining network costs are verified', { exact: true }).waitFor()
+      assert.equal(await page.getByRole('note', { name: 'Small swap cost', exact: true }).count(), 0)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false)
+      await details.locator(':scope > summary').click(); await circleCard.click()
+      await page.getByText(/A reliable total network estimate/).waitFor()
+      assert.equal(await page.getByRole('note', { name: 'Small swap cost', exact: true }).count(), 0)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false)
+      await shot(`quote-unknown-fees-${width}`)
+    }
+    await page.setViewportSize({ width: 1280, height: 900 })
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+  })
+  await test('quote UX: expiry removes the cost notice and never treats old quotes as transaction authority', async () => {
+    await resetLifecycle('circle', 'USDC'); await amount.fill('0.1'); await quoted()
+    await page.getByRole('note', { name: 'Small swap cost', exact: true }).waitFor()
+    await page.clock.install(); await page.clock.fastForward(31_000); world.clockOffset += 31_000
+    await page.getByRole('note', { name: 'Small swap cost', exact: true }).waitFor({ state: 'hidden' })
+    await page.getByRole('alert').getByText(/Quote expired/).waitFor()
+    assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    await page.clock.setSystemTime(new Date()); world.clockOffset = 0
   })
 
   await test('existing excessive token allowances are visible on the Swap screen and in fresh Review for EURC, WETH and cirBTC, without any extra wallet request', async () => {

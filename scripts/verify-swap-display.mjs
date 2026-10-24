@@ -139,4 +139,17 @@ await test('the technical details keep everything the plain view leaves out: wal
   for (const status of ['pending', 'awaiting_wallet', 'unknown', 'confirmed', 'mismatch']) assert.equal(act.swapActivity(swapAttempt(`s-${status}`, 42, status)).again, undefined, status)
   assert.equal(act.circleActivity.length, 1)
 })
+await test('small-swap notice uses only current comparable estimates, never a cap or a guessed token conversion', () => {
+  const unit = 10n ** 18n
+  // Archived audit values, used solely as deterministic display inputs (not new live evidence).
+  assert.match(display.quoteCostWarning(unit / 10n, 24_103_558_015_686_187n, 20_000_000_000_000n), /24\.1%/)
+  assert.equal(display.quoteCostWarning(unit / 2n, 24_660_270_047_357_355n, 100_000_000_000_000n), null)
+  assert.equal(display.quoteCostWarning(unit / 10n, 3_357_919_038_051_875n, 0n), null)
+  assert.match(display.quoteCostWarning(unit, unit / 10n, 0n), /10%/)
+  assert.equal(display.quoteCostWarning(unit, unit / 10n - 1n, 0n), null)
+  for (const gas of [undefined, null, 0n, -1n]) assert.equal(display.quoteCostWarning(unit / 10n, gas, 0n), null)
+  for (const fee of [undefined, null, -1n]) assert.equal(display.quoteCostWarning(unit / 10n, unit, fee), null)
+  assert.equal(display.quoteCostWarning(0n, unit, 0n), null)
+  assert.match(display.quoteCostWarning(1n, 10n ** 30n, 1n), /%/)
+})
 console.log(`${count} Swap display groups PASS. Pure functions only; zero network, signatures or transactions.`)

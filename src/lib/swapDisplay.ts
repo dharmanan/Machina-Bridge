@@ -1,5 +1,16 @@
 import { formatUnits } from 'viem'
 
+// Display only, with all amounts in 18-decimal USDC. Do not convert other tokens
+// or substitute a fee ceiling for a missing estimate. 10% is a notice threshold,
+// never an execution limit; listed provider fees are already reflected in price.
+export function quoteCostWarning(amount: bigint, gasEstimate: bigint | null | undefined, listedFees: bigint | null | undefined): string | null {
+  if (amount <= 0n || gasEstimate == null || gasEstimate <= 0n || listedFees == null || listedFees < 0n) return null
+  const cost = gasEstimate + listedFees
+  if (cost * 10n < amount) return null
+  const tenths = (cost * 1000n + amount / 2n) / amount
+  return `Estimated network and listed provider fees are about ${formatUnits(tenths, 1)}% of this USDC amount. Listed provider fees are already included in the price.`
+}
+
 const group = (whole: string) => whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 
 // Display-only: truncates (never rounds up) to 6 decimals, or 6 significant digits below 1. Exact values stay in the quote.

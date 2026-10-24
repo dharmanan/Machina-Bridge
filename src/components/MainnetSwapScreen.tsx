@@ -15,7 +15,7 @@ import { plainMessage } from '../lib/swap/userMessages'
 import { PlainMessage } from './PlainMessage'
 import { ARC_ROUTER, ARC_INPUT_CAPS } from '../lib/uniswapArcPolicy'
 import { decimalUnits } from '../lib/mainnetSwap'
-import { exchangeRate, shortenAmount } from '../lib/swapDisplay'
+import { exchangeRate, quoteCostWarning, shortenAmount } from '../lib/swapDisplay'
 import { useSwapAutoQuote } from './useSwapAutoQuote'
 import { NATIVE_SWAP_FEE_RESERVE, swapShortcutAmount } from '../lib/swapAmountShortcuts'
 import { ARC_PILOT_MAX_INPUT } from '../lib/uniswapArcPilot'
@@ -36,7 +36,7 @@ const CHIP_CLASS = { live: 'border-[#66D121]/40 bg-[#eef7e8] text-[#2F6E0C]', pi
 
 interface ProviderQuote {
   provider: Provider; state: 'idle' | 'loading' | 'quoted' | 'error' | 'unsupported'
-  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; otherFees?: string; steps?: string; gasEstimate?: bigint | null; route?: string; expiresIn?: number; message?: string
+  estimated?: string; estimatedUnits?: bigint; minimum?: string; fee?: string; otherFees?: string; steps?: string; gasEstimate?: bigint | null; listedFeesUsdc?: bigint | null; route?: string; expiresIn?: number; message?: string
 }
 
 export default function MainnetSwapScreen() {
@@ -158,7 +158,7 @@ export default function MainnetSwapScreen() {
   const uniswapQuote: ProviderQuote = !uniswapOffers ? { provider: 'uniswap', state: 'unsupported', message: `Uniswap does not offer ${slippageBps / 100}% slippage. Choose 0.1%, 0.5% or 1%.` }
     : uniswap.current ? { provider: 'uniswap', state: 'quoted', estimatedUnits: BigInt(uniswap.current.estimatedOutput), estimated: formatUnits(BigInt(uniswap.current.estimatedOutput), outDecimals), minimum: formatUnits(BigInt(uniswap.current.requiredMinimum), outDecimals),
       fee: `${formatUnits(BigInt(uniswap.current.networkFee) + (tokenIn === 'USDC' ? 0n : APPROVAL_FEE_CEILING * BigInt(approvals.plan.state === 'needed' ? approvals.plan.steps.length : approvals.plan.state === 'complete' ? 0 : 1)), 18)} USDC`,
-      gasEstimate: uniswap.current.source === 'onchain' && uniswap.current.estimatedNetworkFee !== undefined ? BigInt(uniswap.current.estimatedNetworkFee) : null, otherFees: 'Pool fees included in price', steps: tokenIn === 'USDC' ? '1 blockchain transaction' : `${approvals.plan.state === 'needed' ? '3 interactions · 1 free signature + 2 blockchain transactions' : approvals.plan.state === 'complete' ? '2 interactions · 1 free signature + 1 blockchain transaction' : 'Permission check pending; step count unavailable'}`, route: uniswap.current.route ?? `${tokenIn} → ${tokenOut}`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
+      gasEstimate: uniswap.current.source === 'onchain' && uniswap.current.estimatedNetworkFee !== undefined ? BigInt(uniswap.current.estimatedNetworkFee) : null, listedFeesUsdc: 0n, otherFees: 'Pool fees included in price', steps: tokenIn === 'USDC' ? '1 blockchain transaction' : `${approvals.plan.state === 'needed' ? '3 interactions · 1 free signature + 2 blockchain transactions' : approvals.plan.state === 'complete' ? '2 interactions · 1 free signature + 1 blockchain transaction' : 'Permission check pending; step count unavailable'}`, route: uniswap.current.route ?? `${tokenIn} → ${tokenOut}`, expiresIn: Math.ceil(uniswap.remainingMs / 1000) }
       : uniswap.loading ? { provider: 'uniswap', state: 'loading' } : uniswap.error ? { provider: 'uniswap', state: 'error', message: uniswap.error }
         : uniswap.expired ? { provider: 'uniswap', state: 'error', message: 'Quote expired. Check the price again before continuing.' } : { provider: 'uniswap', state: 'idle' }
   let circleQuote: ProviderQuote
@@ -171,7 +171,9 @@ export default function MainnetSwapScreen() {
     const gasEstimate = gas.length > 0 && gas.every(fee => fee.amount !== null && fee.token === 'USDC') ? gas.reduce((sum, fee) => sum + decimalUnits(fee.amount, 18), 0n) : null
     circleQuote = { provider: 'circle', state: 'quoted', estimated: quote.estimatedOutput, estimatedUnits: units, minimum: quote.minimumOutput,
       fee: `${formatUnits(circleFeeCeiling(gasEstimate), 18)} USDC`, otherFees: other.map(fee => text(fee)).join(' · ') || 'Not reported',
-      gasEstimate: tokenIn === 'USDC' ? gasEstimate : null, steps: tokenIn === 'USDC' ? '1 free signature + 1 blockchain transaction' : '1 approval + 1 swap · 2 blockchain transactions', route: 'Circle Swap Kit router', expiresIn: Math.max(0, Math.ceil((quote.expiresAt - circle.now) / 1000)) }
+      gasEstimate: tokenIn === 'USDC' ? gasEstimate : null,
+      listedFeesUsdc: other.length > 0 && other.every(fee => fee.amount !== null && fee.token === 'USDC') ? other.reduce((sum, fee) => sum + decimalUnits(fee.amount, 18), 0n) : null,
+      steps: tokenIn === 'USDC' ? '1 free signature + 1 blockchain transaction' : '1 approval + 1 swap · 2 blockchain transactions', route: 'Circle Swap Kit router', expiresIn: Math.max(0, Math.ceil((quote.expiresAt - circle.now) / 1000)) }
   } else if (circle.loading) circleQuote = { provider: 'circle', state: 'loading' }
   else if (circle.error) circleQuote = { provider: 'circle', state: 'error', message: circle.error }
   else if (circle.expired) circleQuote = { provider: 'circle', state: 'error', message: 'Quote expired. Check the price again before continuing.' }
@@ -180,6 +182,8 @@ export default function MainnetSwapScreen() {
   const best: Provider | null = uniswapQuote.estimatedUnits !== undefined && circleQuote.estimatedUnits !== undefined && uniswapQuote.estimatedUnits !== circleQuote.estimatedUnits
     ? (uniswapQuote.estimatedUnits > circleQuote.estimatedUnits ? 'uniswap' : 'circle') : null
   const selected = quotes[provider]
+  const costNotice = tokenIn === 'USDC' && selected.state === 'quoted'
+    ? quoteCostWarning(decimalUnits(amount, 18), selected.gasEstimate, selected.listedFeesUsdc) : null
   let rateText: string | null = null
   try {
     if (selected.state === 'quoted' && selected.estimatedUnits !== undefined) rateText = inversePrice
@@ -352,6 +356,10 @@ export default function MainnetSwapScreen() {
             <SummaryLine label="Minimum receive" value={`${shortenAmount(summary.minimum ?? '0')} ${tokenOut}`} title={`${summary.minimum} ${tokenOut}`} />
             <SummaryLine label="Network fee estimate · remaining" value={summary.gasEstimate !== undefined && summary.gasEstimate !== null ? `${formatUnits(summary.gasEstimate, 18)} USDC` : provider === 'uniswap' && tokenIn !== 'USDC' ? 'Available after permission signing and simulation' : 'Not available yet'} />
           </dl>
+          {tokenIn !== 'USDC' && summary.gasEstimate == null && <p className="break-words text-xs text-slate-500">{provider === 'uniswap'
+            ? 'The signed permission is needed to simulate the final swap and estimate its network fee. The signature itself is free; any token approval costs gas separately.'
+            : 'A reliable total network estimate for the remaining approval and swap is not available yet.'}</p>}
+          {costNotice && <p role="note" aria-label="Small swap cost" className="break-words rounded-lg bg-amber-50 p-2 text-xs text-amber-900">{costNotice}</p>}
           <details aria-label="Fees and wallet steps" className="text-xs text-slate-500">
             <summary className="cursor-pointer">Fees & wallet steps</summary>
             <dl className="mt-2 space-y-2">
@@ -361,6 +369,7 @@ export default function MainnetSwapScreen() {
               <SummaryLine label={provider === 'circle' ? 'Circle fees' : 'Trading fees'} value={summary.otherFees ?? '—'} />
               <SummaryLine label="Quote expires in" value={`${summary.expiresIn} seconds`} />
             </dl>
+            <p className="mt-2 break-words">The fee cap is a maximum budget, not the expected fee. Provider fees shown above are included in the price.</p>
           </details>
         </div>}
 
@@ -454,5 +463,5 @@ function ProviderCard({ id, quote, selected, best, tokenOut, onSelect, onlyOne, 
   </button>
 }
 function SummaryLine({ label, value, title }: { label: string; value: string; title?: string }) {
-  return <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-3"><dt className="text-slate-500">{label}</dt><dd title={title} className="min-w-0 break-words text-right font-medium text-slate-900">{value}</dd></div>
+  return <div className="grid min-w-0 grid-cols-1 gap-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:gap-3"><dt className="min-w-0 text-slate-500">{label}</dt><dd title={title} className="min-w-0 break-words font-medium text-slate-900 sm:text-right">{value}</dd></div>
 }

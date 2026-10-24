@@ -208,6 +208,11 @@ await test('RPC and adapter boundaries deny all transaction/signature and wallet
 await test('error messages are bounded and do not expose raw provider payloads', () => {
   assert.match(swap.swapPreviewError(new Error('no liquidity')), /No supported quote/)
   assert.match(swap.swapPreviewError(new Error('Stablecoin Service createSwap failed: Route or resource not found. Details: No route available')), /Circle cannot provide a quote for this amount/)
+  const noRoute = swap.swapPreviewError(Object.assign(new Error('No route available'), { code: 1003 }))
+  assert.match(noRoute, /amount and direction right now/)
+  assert.match(noRoute, /Another amount may work/)
+  assert.match(noRoute, /choose Uniswap if it has a current quote/)
+  assert.doesNotMatch(noRoute, /liquidity|minimum|0\.5|0\.1/)
   assert.match(swap.swapPreviewError(new Error('WETH is not supported')), /No supported quote/)
   assert.match(swap.swapPreviewError(new Error('quote_timeout')), /timed out/)
   assert.equal(swap.swapPreviewError(new Error('sensitive body and credentials')), 'A verified quote could not be loaded. Try again shortly.')

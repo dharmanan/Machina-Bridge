@@ -85,14 +85,14 @@ export function swapWalletState(connected: boolean, chainId?: number): 'disconne
 export function isCurrentSwapQuote(quote: PreviewQuote | null, request: SwapQuoteRequest | null, now: number): boolean {
   return Boolean(quote && request && quote.requestKey === swapRequestKey(request) && now < quote.expiresAt)
 }
-export const CIRCLE_NO_ROUTE_MESSAGE = 'Circle cannot provide a quote for this amount. No route with available liquidity right now; try another amount or Uniswap.'
+export const CIRCLE_NO_ROUTE_MESSAGE = 'Circle cannot provide a quote for this amount and direction right now. Another amount may work. You can choose Uniswap if it has a current quote.'
 export function swapPreviewError(error: unknown): string {
   const code = error instanceof Error ? error.message : ''
   if (/timeout/i.test(code)) return 'The quote request timed out. Try again shortly.'
   if (/quote_busy/.test(code)) return 'The previous quote request is still finishing. Try again shortly.'
   if (/expired/.test(code)) return 'The quote is no longer fresh. Request a new quote.'
   if (/wrong_network/.test(code)) return 'Select Arc Mainnet in your wallet to request a quote.'
-  // The pair is supported, but Circle has no route at quote time for this amount (SDK code 1003).
+  // SDK code 1003 does not distinguish amount constraints, liquidity or internal routing filters.
   if (/no route available/i.test(code)) return CIRCLE_NO_ROUTE_MESSAGE
   if (/insufficient swap amount/i.test(code)) return 'Circle cannot quote such a small amount. Increase it within the swap limit.'
   if (/liquidity|route|not supported|unsupported/i.test(code)) return 'No supported quote is available for this direction. Try another pair.'
