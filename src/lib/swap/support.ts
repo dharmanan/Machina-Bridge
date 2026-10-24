@@ -29,7 +29,7 @@ function uniswapEntry(tokenIn: SwapSymbol, tokenOut: SwapSymbol): SupportEntry {
     routing: pilot ? 'Uniswap Universal Router, V3 pools from the pinned registry (the pilot build uses the Trading API V4 route)' : 'Uniswap Universal Router, V3 pools from the pinned registry',
     routes, approval: native ? { kind: 'none', steps: 0, text: 'Native USDC is sent as transaction value; no approval.' } : { kind: 'permit2_exact', steps: 1, text: `One exact ${tokenIn} approval to Permit2 if needed, then a free exact PermitSingle signature and the swap. Up to three wallet interactions, two on-chain transactions; never unlimited.` },
     verification: 'Strict calldata decoder before the wallet; receipt, transfers and fee ceiling checked after, separately from the Review.',
-    execution: { pilot: pilot ? 'enabled' : 'quotes_only', open: 'enabled', text: pilot ? 'Available in the default multi-direction mode; the explicit pilot build also allows it (approved wallet, up to 0.1 USDC).' : 'Available in the default multi-direction mode (any wallet, up to the per-swap ceiling). Quotes only in the explicit pilot build.' },
+    execution: { pilot: pilot ? 'enabled' : 'quotes_only', open: 'enabled', text: pilot ? 'Available in the default multi-direction mode; the explicit pilot build also allows it (approved wallet, up to 0.1 USDC).' : 'Available in the default multi-direction mode (any wallet, subject to balance and transaction checks). Quotes only in the explicit pilot build.' },
     liveTransaction: pilot ? 'Yes: one real swap (0x1a5e…a921) through the earlier Trading API path; its verification is reported separately. The keyless route used by default has not yet been sent with a user\'s wallet.' : 'None yet by this application. The route was only simulated read-only against the live router.',
   }
 }
@@ -52,6 +52,6 @@ export const supportFor = (provider: SwapProviderId, tokenIn: SwapSymbol, tokenO
 // What the selected build lets this provider do for a route right now (the screen shows this; it never claims more).
 export function executionInBuild(entry: SupportEntry, config: SwapExecutionConfig, circleOpen: boolean): { available: boolean; text: string } {
   if (!config.enabled) return { available: false, text: 'Execution is switched off in this build: quotes only.' }
-  if (config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off in this build: quotes only.' } : { available: true, text: 'Available (any wallet, up to the per-swap ceiling).' }
+  if (config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off in this build: quotes only.' } : { available: true, text: 'Available (any wallet, subject to balance and transaction checks).' }
   return entry.execution.pilot === 'enabled' ? { available: true, text: 'Available in the controlled pilot (approved wallet, up to 0.1 USDC).' } : { available: false, text: 'Quotes only in the controlled pilot.' }
 }

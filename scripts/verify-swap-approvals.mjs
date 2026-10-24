@@ -10,7 +10,7 @@ require.extensions['.ts'] = (mod, file) => mod._compile(ts.transpileModule(readF
 const root = fileURLToPath(new URL('..', import.meta.url))
 const p = require(`${root}src/lib/uniswapArcPolicy.ts`), a = require(`${root}src/lib/swap/uniswapApprovals.ts`), rpcModule = require(`${root}src/lib/swap/uniswapApprovalsRpc.ts`)
 const e = require(`${root}src/lib/uniswapArcExecution.ts`)
-const { encodeFunctionData, parseAbi, toHex } = require('viem')
+const { decodeFunctionData, encodeFunctionData, parseAbi, toHex } = require('viem')
 let count = 0, external = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
 async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`) }
@@ -42,6 +42,17 @@ await test('EURC, WETH and cirBTC existing unlimited allowances are reused witho
     assert.deepEqual(a.planApprovals(r, reads({ balance: need, tokenAllowance: 2n ** 256n - 1n })), { state: 'complete' })
     const missing = a.planApprovals(r, reads({ balance: need, tokenAllowance: need - 1n }))
     assert.equal(missing.steps.length, 1); assert.equal(missing.steps[0].kind, 'token'); assert.equal(missing.steps[0].amount, need.toString())
+  }
+})
+await test('large inputs above Number precision still approve exactly once, reuse enough allowance, and block insufficient balance', () => {
+  for (const [symbol, value] of [['EURC', '9007199254740993.123456'], ['WETH', '10000.123456789012345678'], ['cirBTC', '100.12345678']]) {
+    const r = request(symbol, value), need = p.tokenUnits(value, p.ARC_TOKENS[symbol].decimals)
+    const plan = a.planApprovals(r, reads({ balance: need }))
+    assert.equal(plan.steps.length, 1); assert.equal(plan.steps[0].amount, need.toString())
+    const tx = a.approvalTransaction(owner, plan.steps[0]), decoded = decodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), data: tx.data })
+    assert.equal(decoded.args[1], need)
+    assert.deepEqual(a.planApprovals(r, reads({ balance: need, tokenAllowance: need })), { state: 'complete' })
+    assert.deepEqual(a.planApprovals(r, reads({ balance: need - 1n })), { state: 'blocked', reason: 'insufficient_balance' })
   }
 })
 await test('no step can be unlimited, to another spender, for another token or amount, or valid for long', () => {

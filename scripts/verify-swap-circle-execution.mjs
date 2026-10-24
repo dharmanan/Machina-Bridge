@@ -16,12 +16,12 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const d = require(`${root}src/lib/swap/circleAdapterDecode.ts`), g = require(`${root}src/lib/swap/circleGuard.ts`), c = require(`${root}src/lib/swap/circleSwap.ts`)
 const tk = require(`${root}src/lib/swap/tokens.ts`), ev = require(`${root}src/lib/swap/transactionEvidence.ts`), x = require(`${root}src/lib/uniswapArcExecution.ts`)
 const perf = require(`${root}src/lib/swap/circlePerformance.ts`)
-const { encodeFunctionData, encodeAbiParameters, parseAbiParameters, keccak256, formatTransaction, formatTransactionReceipt, parseUnits } = require('viem')
+const { decodeFunctionData, encodeFunctionData, encodeAbiParameters, parseAbi, parseAbiParameters, keccak256, formatTransaction, formatTransactionReceipt, parseUnits, formatUnits } = require('viem')
 const swaps = JSON.parse(readFileSync(`${root}scripts/fixtures/swap/circle/arc-circle-swaps.json`, 'utf8'))
 const earn = JSON.parse(readFileSync(`${root}scripts/fixtures/swap/circle/arc-adapter-earn-txs.json`, 'utf8'))
 let count = 0, external = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
-async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`) }
+async function test(name, fn) { if (process.env.MACHINA_CIRCLE_LARGE_ONLY && !/^(large Circle|a large Circle)/.test(name)) return; await fn(); count++; console.log(`PASS ${name}`) }
 // setImmediate, not setTimeout: the timer tests mock setTimeout.
 const waitFor = async predicate => { for (let i = 0; i < 20000; i++) { if (predicate()) return; await new Promise(resolve => setImmediate(resolve)) } assert.fail('Expected asynchronous state') }
 const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', other = '0x2222222222222222222222222222222222222222', ZERO = '0x' + '0'.repeat(40)
@@ -429,14 +429,13 @@ await test('review: a quote that breaks the rules (slippage, expiry, balances, f
     const f = setup({ fresh: mutateReview(fn) }); await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle', name); assert.ok(f.controller.current().error, name); assert.equal(f.world.sends.length, 0)
   }
 })
-await test('review rules: per-token caps, USDC permit only, USDC input must leave room for gas, supported slippage and distinct tokens', () => {
+await test('review rules: contract ranges, USDC permit only, USDC input must leave room for gas, supported slippage and distinct tokens', () => {
   const ok = { chainId: 5042, tokenIn: 'USDC', tokenOut: 'EURC', owner, amount: '1', slippageBps: 50 }
   // USDC is signed for (permit), every other token gets an exact approval; the SDK's increaseAllowance for USDC is not offered.
   assert.equal(c.validateCircleRequest(ok).allowanceStrategy, 'permit'); assert.equal(c.validateCircleRequest({ ...ok, tokenIn: 'EURC', tokenOut: 'USDC' }).allowanceStrategy, 'approve')
   assert.throws(() => c.validateCircleRequest({ ...ok, allowanceStrategy: 'approve' }), /invalid_strategy/); assert.throws(() => c.validateCircleRequest({ ...ok, tokenIn: 'cirBTC', tokenOut: 'USDC', amount: '0.0001', allowanceStrategy: 'permit' }), /invalid_strategy/)
   assert.equal(c.circleStrategy({ tokenIn: 'USDC' }), 'permit'); assert.equal(c.circleStrategy({ tokenIn: 'WETH' }), 'approve'); assert.equal(c.circleStrategy({ tokenIn: 'WETH', allowanceStrategy: 'approve' }), 'approve')
-  for (const [name, over] of [['over the USDC cap', { amount: '10.000001' }], ['over the EURC cap', { tokenIn: 'EURC', tokenOut: 'USDC', amount: '9.000001' }], ['over the cirBTC cap', { tokenIn: 'cirBTC', amount: '0.00012001' }],
-    ['over the WETH cap', { tokenIn: 'WETH', amount: '0.004000000000000001' }], ['too many decimals', { amount: '1.0000001' }], ['same token', { tokenOut: 'USDC' }], ['unknown token', { tokenOut: 'DAI' }], ['wrong network', { chainId: 1 }],
+  for (const [name, over] of [['too many decimals', { amount: '1.0000001' }], ['same token', { tokenOut: 'USDC' }], ['unknown token', { tokenOut: 'DAI' }], ['wrong network', { chainId: 1 }],
     ['unsupported slippage', { slippageBps: 75 }], ['permit for EURC', { tokenIn: 'EURC', tokenOut: 'USDC', allowanceStrategy: 'permit' }], ['zero', { amount: '0' }], ['no owner', { owner: ZERO }], ['extra field', { recipient: other }]]) {
     assert.throws(() => c.validateCircleRequest({ ...ok, ...over }), undefined, name)
   }
@@ -1600,4 +1599,39 @@ await test('REAL SDK end to end with the controller and the real read path: Revi
   assert.equal(f.records()[0].hash, view.attempt.hash)
 })
 globalThis.fetch = noNetwork
+await test('large Circle inputs retain exact uint256 amounts without product caps or unlimited sentinels', async () => {
+  for (const [tokenIn, tokenOut, amount] of [['EURC', 'USDC', '9007199254740993.123456'], ['WETH', 'USDC', '10000.123456789012345678'], ['cirBTC', 'EURC', '100.12345678']]) {
+    const reference = setup({ tokenIn, tokenOut, amount })
+    const f = setup({ tokenIn, tokenOut, amount, fresh: async request => {
+      const r = await reference.ports.fresh(request)
+      // The controlled serviceCall charges amount/5000; the Review must show that
+      // exact fee too. Its old fixed 0.0002 fixture was valid only at amount=1.
+      r.fees = [{ type: 'provider', token: tokenIn, amount: formatUnits(BigInt(r.amountIn) / 5000n, T(tokenIn).decimals) }]
+      return r
+    } }), id = await f.review()
+    const need = parseUnits(amount, T(tokenIn).decimals)
+    assert.equal(f.controller.current().review.amountIn, need.toString())
+    await f.run(id)
+    assert.equal(f.controller.current().phase, 'pending', JSON.stringify({ tokenIn, error: f.controller.current().error, log: f.controller.current().attempt?.log }))
+    assert.equal(f.world.sends.length, 2)
+    assert.equal(decodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), data: f.world.sends[0].data }).args[1], need)
+    assert.equal(f.controller.current().attempt.review.amountIn, need.toString())
+  }
+  const max = tk.SWAP_UINT256_MAX
+  const base = { chainId: 5042, tokenIn: 'EURC', tokenOut: 'USDC', owner, slippageBps: 50 }
+  assert.doesNotThrow(() => c.validateCircleRequest({ ...base, amount: formatUnits(max - 1n, 6) }))
+  for (const n of [max, max + 1n]) assert.throws(() => c.validateCircleRequest({ ...base, amount: formatUnits(n, 6) }), /input_range/)
+  assert.throws(() => c.validateCircleRequest({ ...base, tokenIn: 'USDC', tokenOut: 'EURC', amount: formatUnits(max / 10n ** 12n + 1n, 6) }), /input_range/)
+})
+await test('a large Circle review with insufficient funds or weakened minimum remains blocked before any wallet request', async () => {
+  const reference = setup({ amount: '9007199254740993.123456' })
+  for (const change of [r => { r.tokenBalance = (BigInt(r.amountIn) - 1n).toString() }, r => { r.nativeBalance = '0' }, r => { r.requiredMinimum = '1' }, r => { r.estimatedOutput = (2n ** 256n).toString() }]) {
+    const f = setup({ amount: '9007199254740993.123456', fresh: async request => { const r = await reference.ports.fresh(request); change(r); return r } })
+    await f.controller.prepare(); assert.equal(f.controller.current().phase, 'idle'); assert.equal(f.world.sends.length, 0); assert.equal(f.world.signs.length, 0)
+  }
+  const wrongFee = setup({ amount: '1000' }), id = await wrongFee.review()
+  await wrongFee.run(id)
+  assert.equal(wrongFee.controller.current().phase, 'rejected')
+  assert.equal(wrongFee.world.sends.length, 1, 'only the explicitly confirmed exact approval; the unreviewed fee must block the swap')
+})
 console.log(`\n${count} Circle Swap Kit execution tests passed; ${external} external requests`)

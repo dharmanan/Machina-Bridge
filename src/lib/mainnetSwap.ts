@@ -1,6 +1,7 @@
 import { createPublicClient, defineChain, erc20Abi, http, type Transport } from 'viem'
 import { ViemAdapter } from '@circle-fin/adapter-viem-v2'
 import { SwapKit, getChainByEnum } from '@circle-fin/swap-kit'
+import { parseSwapUnits, swapInputUnits } from './swap/tokens'
 import {
   MAINNET_SWAP_CHAIN_ID, MAINNET_SWAP_RPC, MAINNET_SWAP_TOKENS,
   MAINNET_SWAP_READ_ONLY_ENABLED, MAINNET_SWAP_WRITES_ENABLED,
@@ -27,10 +28,7 @@ export interface PreviewQuote {
 const addressPattern = /^0x[0-9a-fA-F]{40}$/
 const fail = (code: string): never => { throw new Error(code) }
 export function decimalUnits(value: unknown, decimals: number): bigint {
-  if (typeof value !== 'string' || value.length > 70 || !/^(0|[1-9]\d{0,29})(\.\d+)?$/.test(value)) return fail('invalid_amount')
-  const [whole, fraction = ''] = value.split('.')
-  if (fraction.length > decimals) return fail('invalid_amount')
-  return BigInt(whole + fraction.padEnd(decimals, '0'))
+  return parseSwapUnits(value, decimals)
 }
 export function validateSwapRequest(request: SwapQuoteRequest): void {
   if (!MAINNET_SWAP_READ_ONLY_ENABLED || MAINNET_SWAP_WRITES_ENABLED) fail('read_only_gate')
@@ -40,7 +38,7 @@ export function validateSwapRequest(request: SwapQuoteRequest): void {
   // Circle's service quotes every ordered pair of the four Arc tokens (verified live for all 12 directions); an identical pair is not a swap.
   if (request.tokenIn === request.tokenOut) fail('unsupported_route')
   if (!(MAINNET_SWAP_SLIPPAGE_BPS as readonly number[]).includes(request.slippageBps)) fail('invalid_slippage')
-  if (decimalUnits(request.amount, MAINNET_SWAP_TOKENS[request.tokenIn].decimals) <= 0n) fail('invalid_amount')
+  swapInputUnits(request.amount, request.tokenIn)
 }
 export function swapRequestKey(request: SwapQuoteRequest): string {
   return [request.address.toLowerCase(), request.chainId, request.tokenIn, request.tokenOut, request.amount, request.slippageBps].join(':')
@@ -94,7 +92,8 @@ export function swapPreviewError(error: unknown): string {
   if (/wrong_network/.test(code)) return 'Select Arc Mainnet in your wallet to request a quote.'
   // SDK code 1003 does not distinguish amount constraints, liquidity or internal routing filters.
   if (/no route available/i.test(code)) return CIRCLE_NO_ROUTE_MESSAGE
-  if (/insufficient swap amount/i.test(code)) return 'Circle cannot quote such a small amount. Increase it within the swap limit.'
+  if (/insufficient swap amount/i.test(code)) return 'Circle cannot quote such a small amount. Try a larger amount within your available balance.'
+  if (code === 'input_range') return 'This amount exceeds the supported contract number range. Enter a smaller amount.'
   if (/liquidity|route|not supported|unsupported/i.test(code)) return 'No supported quote is available for this direction. Try another pair.'
   if (/invalid_amount/.test(code)) return 'Enter a positive amount within the token precision.'
   return 'A verified quote could not be loaded. Try again shortly.'

@@ -15,7 +15,7 @@ const onchain = require(`${root}src/lib/swap/uniswapOnchain.ts`), rpcAdapter = r
 const tokens = require(`${root}src/lib/swap/tokens.ts`), mode = require(`${root}src/lib/swap/executionMode.ts`), pilot = require(`${root}src/lib/uniswapArcPilot.ts`)
 const ur = require(`${root}src/lib/swap/universalRouter.ts`), sim = require(`${root}src/lib/swap/simulatorCode.ts`)
 const { createArcExecutionRpc } = require(`${root}src/lib/uniswapArcExecutionRpc.ts`)
-const { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbiParameters, getAddress, pad, toHex } = require('viem')
+const { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbiParameters, parseUnits, formatUnits, getAddress, pad, toHex } = require('viem')
 let count = 0, external = 0
 globalThis.fetch = async () => { external++; throw Error('network_forbidden') }
 async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`) }
@@ -219,17 +219,25 @@ await test('the Review factory stops on: insufficient native balance, a fee abov
   await assert.rejects(onchain.createOnchainReview(request, fakePorts({ now: NOW + 600_000 }).ports, context), e => e.code === 'clock')
   const unreachable = fakePorts({ simulate: (id, input, n) => (n > pools.candidateRoutes('USDC', 'EURC').length ? { received: 1n } : undefined), outputs: { 'USDC>500>EURC': 900_000 } })
   await assert.rejects(onchain.createOnchainReview(request, unreachable.ports, context), e => e.code === 'simulation_failed')
-  await assert.rejects(onchain.createOnchainReview({ ...request, amount: '10.000001' }, fakePorts().ports, context), /input_limit/) // per-token ceiling stops before any RPC read
-  const spy = fakePorts(); await assert.rejects(onchain.createOnchainReview({ ...request, amount: '11' }, spy.ports, context)); assert.equal(spy.calls.chain, 0)
+  const spy = fakePorts(); await assert.rejects(onchain.createOnchainReview({ ...request, amount: '1' + '0'.repeat(100) }, spy.ports, context)); assert.equal(spy.calls.chain, 0)
   await assert.rejects(onchain.createOnchainReview(request, fakePorts().ports, { ...context, owner: other }), /wallet_context_changed/)
 })
-await test('the per-token input ceilings hold for all four tokens', () => {
-  for (const [symbol, tooMuch] of [['USDC', '10.000001'], ['EURC', '9.000001'], ['cirBTC', '0.00012001'], ['WETH', '0.004000000000000001']]) {
+await test('open inputs have no product-value caps; ABI bounds and precision remain enforced', () => {
+  for (const [symbol, amount] of [['USDC', '1000000.123456'], ['EURC', '9007199254740993.123456'], ['cirBTC', '100.12345678'], ['WETH', '10000.123456789012345678']]) {
     const other = symbol === 'EURC' ? 'USDC' : 'EURC'
-    assert.throws(() => p.validateArcRequest(requestFor(symbol, other, { amount: tooMuch })), /input_limit/, symbol)
-    assert.doesNotThrow(() => p.validateArcRequest(requestFor(symbol, other, { amount: { USDC: '10', EURC: '9', cirBTC: '0.00012', WETH: '0.004' }[symbol] })))
+    const r = p.validateArcRequest(requestFor(symbol, other, { amount }))
+    assert.equal(p.tokenUnits(r.amount, p.ARC_TOKENS[symbol].decimals), parseUnits(amount, p.ARC_TOKENS[symbol].decimals))
   }
-  assert.deepEqual(p.ARC_INPUT_CAPS, tokens.SWAP_INPUT_CAPS)
+  for (const symbol of ['EURC', 'cirBTC', 'WETH']) {
+    const other = symbol === 'EURC' ? 'USDC' : 'EURC', decimals = p.ARC_TOKENS[symbol].decimals
+    const boundary = n => formatUnits(n, decimals)
+    assert.doesNotThrow(() => p.validateArcRequest(requestFor(symbol, other, { amount: boundary(tokens.SWAP_UINT160_MAX - 1n) })))
+    for (const n of [tokens.SWAP_UINT160_MAX, tokens.SWAP_UINT160_MAX + 1n, tokens.SWAP_UINT256_MAX])
+      assert.throws(() => p.validateArcRequest(requestFor(symbol, other, { amount: boundary(n) })), /input_range/)
+  }
+  const nativeMax = tokens.SWAP_UINT256_MAX / 10n ** 12n
+  assert.doesNotThrow(() => p.validateArcRequest(requestFor('USDC', 'EURC', { amount: formatUnits(nativeMax, 6) })))
+  assert.throws(() => p.validateArcRequest(requestFor('USDC', 'EURC', { amount: formatUnits(nativeMax + 1n, 6) })), /input_range/)
 })
 await test('an on-chain Review cannot be altered or relabelled without validation failing', async () => {
   const request = p.validateArcRequest(requestFor('WETH', 'EURC')), f = fakePorts(), review = await onchain.createOnchainReview(request, f.ports, context)
@@ -417,12 +425,33 @@ await test('pilot mode lets exactly one request through: the approved wallet, US
   assert.equal(pilot.arcPilotAllows(pilot.arcPilotConfig('true', owner), r('EURC', 'USDC', '1'), ctx), false); assert.equal(pilot.arcPilotAllows(pilot.arcPilotConfig('true', owner), r('USDC', 'cirBTC', '0.1'), ctx), false)
   for (const key of Object.keys(mode)) if (key.endsWith('Message')) assert.ok(mode[key]('pilot_direction').length > 20)
 })
-await test('open mode allows every supported direction inside the per-token ceilings for any wallet, and still needs the execution switch, the network and the wallet', () => {
+await test('open mode allows every supported direction within contract bounds for any wallet, and still needs the execution switch, the network and the wallet', () => {
   const config = mode.swapExecutionConfig('true', undefined, 'open'), ctx = { connected: true, owner: other, chainId: 5042 }
   for (const { tokenIn, tokenOut } of tokens.SWAP_DIRECTIONS) assert.equal(mode.swapExecutionRestriction(config, p.validateArcRequest(requestFor(tokenIn, tokenOut, { owner: other, recipient: other })), ctx), null, `${tokenIn}>${tokenOut}`)
   assert.equal(mode.swapExecutionRestriction(mode.swapExecutionConfig('false', undefined, 'open'), p.validateArcRequest(requestFor('USDC', 'EURC', { owner: other, recipient: other })), ctx), 'disabled')
-  assert.equal(mode.swapExecutionRestriction(config, { ...requestFor('USDC', 'EURC', { owner: other, recipient: other }), amount: '11' }, ctx), 'request') // above the ceiling never reaches a wallet
+  assert.equal(mode.swapExecutionRestriction(config, { ...requestFor('USDC', 'EURC', { owner: other, recipient: other }), amount: '1' + '0'.repeat(100) }, ctx), 'request') // ABI-invalid input never reaches a wallet
   assert.equal(mode.swapExecutionRestriction(config, p.validateArcRequest(requestFor('USDC', 'EURC', { owner: other, recipient: other })), { ...ctx, chainId: 1 }), 'network')
+})
+await test('large native and ERC-20 reviews preserve exact amounts, minimums, gas caps and fail closed on liquidity or balance failure', async () => {
+  for (const [symbol, amount] of [['USDC', '11'], ['USDC', '1000000000.123456'], ['EURC', '9007199254740993.123456'], ['WETH', '10000.123456789012345678'], ['cirBTC', '100.12345678']]) {
+    const out = symbol === 'EURC' ? 'USDC' : 'EURC', request = p.validateArcRequest(requestFor(symbol, out, { amount }))
+    const units = p.tokenUnits(amount, dec[symbol]), nativeValue = program.routeTransactionValue(request)
+    const simulated = units * 10n ** BigInt(dec[out]) / 10n ** BigInt(dec[symbol]) * 9n / 10n
+    const options = { chain: { nativeBalance: nativeValue + 10n ** 18n }, simulate: () => ({ received: simulated }) }
+    const review = await onchain.createOnchainReview(request, fakePorts(options).ports, context)
+    assert.equal(BigInt(review.transaction.value), nativeValue)
+    assert.equal(pathOf(review.transaction.data).swap[1], units)
+    assert.equal(BigInt(review.requiredMinimum), simulated * 9950n / 10000n)
+    assert.ok(BigInt(review.networkFee) <= 10n ** 17n)
+    await assert.rejects(onchain.createOnchainReview(request, fakePorts({ ...options, simulate: () => 'revert' }).ports, context), e => e.code === 'simulation_failed')
+    await assert.rejects(onchain.createOnchainReview(request, fakePorts({ ...options, chain: { nativeBalance: nativeValue } }).ports, context), e => e.code === 'insufficient_native_balance')
+  }
+})
+await test('bounded amount parser rejects malformed, excessive precision and uint256 overflow without a provider request', () => {
+  for (const value of ['0', '-1', '+1', '01', '1e6', ' 1', '1.', '.1', 'Infinity', '1' + '0'.repeat(1000), 100, null, '1.0000001'])
+    assert.throws(() => tokens.swapInputUnits(value, 'USDC'))
+  assert.equal(tokens.parseSwapUnits(tokens.SWAP_UINT256_MAX.toString(), 0), tokens.SWAP_UINT256_MAX)
+  assert.throws(() => tokens.parseSwapUnits((tokens.SWAP_UINT256_MAX + 1n).toString(), 0), /input_range/)
 })
 assert.equal(external, 0, 'no network request was made')
 console.log(`${count} Uniswap on-chain provider groups PASS. Controlled ports only; zero network, signatures, approvals or transactions.`)

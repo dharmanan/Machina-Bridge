@@ -76,10 +76,11 @@ await test('extra commands, allow-revert bits, suffixes, manipulated recipient a
 })
 function fixture(options = {}) {
   const world = { time: NOW, nonce: 3, permitNonce: 7, tokenAllowance: 1_000_000n, sends: [], signs: [], calls: [], estimates: 150_000n, ctx: { ...context }, ...options }
+  const input = p.validateArcRequest({ ...request, amount: world.amount ?? '1' }), inputUnits = p.tokenUnits(input.amount, 6)
   const data = new Map(), storage = { getItem: key => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) }
   const rpc = { getChainId: async () => 5042, getBlockNumber: async () => 1n, getBlock: async () => ({ timestamp: BigInt(Math.floor(world.time / 1000)), baseFeePerGas: 20_000_000_000n }),
     getCode: async ({ address }) => p.sameAddress(address, p.ARC_ROUTER) ? runtime : p.sameAddress(address, owner) ? '0x' : '0x6000',
-    readContract: async ({ address, functionName }) => functionName === 'decimals' ? 6 : functionName === 'balanceOf' ? 5_000_000n : p.sameAddress(address, p.ARC_PERMIT2) ? [0n, 0, world.permitNonce] : world.tokenAllowance,
+    readContract: async ({ address, functionName }) => functionName === 'decimals' ? 6 : functionName === 'balanceOf' ? world.tokenBalance ?? 5_000_000n : p.sameAddress(address, p.ARC_PERMIT2) ? [0n, 0, world.permitNonce] : world.tokenAllowance,
     getBalance: async () => 10n ** 20n, getGasPrice: async () => 20_000_000_000n,
     getTransactionCount: async () => world.nonce, call: async call => { world.calls.push(call); if (world.simulationFails) throw Error('reverted'); return { data: '0x' } }, estimateGas: async () => world.estimates }
   const adapter = createArcExecutionRpc(rpc)
@@ -100,10 +101,10 @@ function fixture(options = {}) {
     if (method === 'eth_sendTransaction') { world.sends.push(params[0]); return HASH }
     throw Error('unexpected method')
   } }
-  const ports = { context: () => world.ctx, input: () => request, fresh: async () => {
+  const ports = { context: () => world.ctx, input: () => input, fresh: async () => {
       if (world.freshFails) throw Error('quote_unavailable')
-      return onchain.createOnchainReview(request, { now: () => world.time, chain: async () => ({ blockNumber: 1n, timestamp: BigInt(Math.floor(world.time / 1000)), gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
-        simulate: async () => ({ spent: 1_000_000n, received: world.output ?? 1_119_200n, gas: 140_000n }) }, world.ctx)
+      return onchain.createOnchainReview(input, { now: () => world.time, chain: async () => ({ blockNumber: 1n, timestamp: BigInt(Math.floor(world.time / 1000)), gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+        simulate: async () => ({ spent: inputUnits, received: world.output ?? inputUnits * 11192n / 10000n, gas: 140_000n }) }, world.ctx)
     }, quoteNow: () => world.time,
     preflight: adapter.preflight, signPermit: adapter.signPermit, provider: async () => provider, result: async () => ({ status: 'pending', identified: true }),
     storage, lock: async (_owner, run) => run(), enabled: () => true, authorize: () => true }
@@ -225,6 +226,34 @@ await test('early and mined integrity comparisons use only the signed calldata c
   const mined = { ...args, receipt, observation: { canonical: true, latestBlock: 2n, blockTimestamp: TS + 1n }, received: BigInt(review.estimatedOutput) }
   assert.equal(evidence.compareToReview(mined).verdict, 'verified')
   assert.equal(evidence.compareToReview({ ...mined, tx: { ...tx, input: signed + '00' } }).verdict, 'mismatch')
+})
+await test('large exact PermitSingle amounts survive signature encoding and reject any minimum or amount mutation', async () => {
+  for (const value of ['1000.123456', '9007199254740993.123456']) {
+    const input = p.validateArcRequest({ ...request, amount: value }), units = p.tokenUnits(value, 6)
+    const big = await onchain.createOnchainReview(input, { now: () => NOW, chain: async () => ({ blockNumber: 1n, timestamp: TS, gasPrice: 20_000_000_000n, nativeBalance: 10n ** 20n, routerHash: p.ARC_ROUTER_HASH }),
+      simulate: async () => ({ spent: units, received: units * 11n / 10n, gas: 140_000n }) }, context)
+    const msg = permit.permitMessage(big, 7, TS), sig = await account.signTypedData({ ...typed, message: msg })
+    const data = await permit.attachPermit(big, 7, TS, sig)
+    await permit.validatePermitCalldata(big, data, 7, TS)
+    assert.equal(msg.details.amount, units); assert.equal(msg.sigDeadline, TS + 120n)
+    await assert.rejects(permit.validatePermitCalldata({ ...big, request: { ...big.request, amount: require('viem').formatUnits(units + 1n, 6) } }, data, 7, TS))
+    await assert.rejects(permit.validatePermitCalldata({ ...big, requiredMinimum: (BigInt(big.requiredMinimum) + 1n).toString() }, data, 7, TS))
+  }
+})
+await test('large input completes preflight, explicit signature, signed simulation and exactly one explicit send; insufficient funds still stop before signing', async () => {
+  const amount = '9007199254740993.123456', need = p.tokenUnits(amount, 6)
+  const f = fixture({ amount, tokenAllowance: need, tokenBalance: need })
+  await f.controller.prepare(); assert.equal(f.controller.current().phase, 'review')
+  assert.equal(f.world.signs.length, 0); assert.equal(f.world.sends.length, 0)
+  await f.controller.confirm(f.controller.current().approvalId)
+  assert.equal(f.controller.current().permitSigned, true); assert.equal(f.world.sends.length, 0)
+  assert.equal(BigInt(JSON.parse(f.world.signs[0][1]).message.details.amount), need)
+  await f.controller.confirm(f.controller.current().approvalId)
+  assert.equal(f.world.sends.length, 1); assert.equal(f.world.calls.length, 2)
+  assert.equal(f.world.calls[0].data, f.world.sends[0].data)
+  const missing = fixture({ amount, tokenAllowance: need, tokenBalance: need - 1n })
+  await missing.controller.prepare(); assert.equal(missing.controller.current().phase, 'idle')
+  assert.equal(missing.world.signs.length, 0); assert.equal(missing.world.sends.length, 0)
 })
 assert.equal(network, 0); globalThis.fetch = realFetch
 console.log(`${count} PermitSingle/security groups PASS; disposable local test-key signatures only, zero external RPC or broadcasts.`)

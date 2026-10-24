@@ -3,8 +3,8 @@ import { arcPilotAllows, arcPilotConfig, ARC_PILOT_APPROVED_WALLET, ARC_PILOT_MA
 import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '../uniswapArcPolicy'
 
 // Who may execute which swap. Two modes:
-//   open  (the default) every supported direction, both providers, any externally owned wallet, up to the per-token ceilings of
-//         uniswapArcPolicy (ARC_INPUT_CAPS: roughly 10 USD per swap while no route has been proven with a user's own wallet).
+//   open  (the default) every supported direction, both providers, any externally owned wallet.
+//         Amounts remain bounded by balances, contract types and the existing economic/transaction checks.
 //   pilot the earlier controlled pilot, kept only as an explicit fallback: exactly the approved wallet, native USDC -> EURC, at most
 //         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
 // In both modes the execution switch itself (VITE_UNISWAP_ARC_PILOT_ENABLED === "true") must be on: it remains the single kill switch of

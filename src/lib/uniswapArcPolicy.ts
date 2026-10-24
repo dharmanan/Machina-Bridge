@@ -1,4 +1,5 @@
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getAddress, getCreate2Address, keccak256, parseAbi, parseAbiParameters, type Hex } from 'viem'
+import { parseSwapUnits, swapInputUnits, SWAP_UINT160_MAX } from './swap/tokens.ts'
 
 // Source release approved for the restricted pilot only. Execution additionally requires
 // the default-off pilot configuration, pinned wallet authorization and explicit confirmation.
@@ -26,16 +27,13 @@ export const ARC_TOKENS = {
 } as const
 export type ArcSymbol = keyof typeof ARC_TOKENS
 export const isArcSymbol = (value: unknown): value is ArcSymbol => typeof value === 'string' && Object.prototype.hasOwnProperty.call(ARC_TOKENS, value)
-// Largest input per transaction in base units of the input token (about 10 USD each). Raising one is a release decision, not a setting.
-export const ARC_INPUT_CAPS: Record<ArcSymbol, bigint> = { USDC: 10_000_000n, EURC: 9_000_000n, cirBTC: 12_000n, WETH: 4_000_000_000_000_000n }
 // The API-sourced profiles exist only for native USDC to EURC or cirBTC.
 export function legacyApiOutput(request: { tokenIn: ArcSymbol; tokenOut: ArcSymbol }): (typeof ARC_OUTPUTS)[keyof typeof ARC_OUTPUTS] {
   if (request.tokenIn !== 'USDC' || !Object.prototype.hasOwnProperty.call(ARC_OUTPUTS, request.tokenOut)) return fail('unsupported_direction')
   return ARC_OUTPUTS[request.tokenOut as keyof typeof ARC_OUTPUTS]
 }
 export function tokenUnits(amount: string, decimals: number): bigint {
-  const [whole, fraction = ''] = amount.split('.')
-  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, '0'))
+  return parseSwapUnits(amount, decimals)
 }
 export const EXECUTE_ABI = parseAbi(['function execute(bytes commands, bytes[] inputs, uint256 deadline) payable'])
 export const V4_ENVELOPE = parseAbiParameters('bytes actions, bytes[] params')
@@ -80,17 +78,15 @@ export function validateArcRequest(input: unknown): ArcRequest {
   if (Object.keys(r).some(k => !keys.includes(k)) || keys.some(k => !Object.prototype.hasOwnProperty.call(r, k))) fail('invalid_request')
   if (r.chainId !== 5042 || !isArcSymbol(r.tokenIn) || !isArcSymbol(r.tokenOut) || r.tokenIn === r.tokenOut) fail('unsupported_direction')
   if (!sameAddress(r.owner, r.recipient) || !sameAddress(r.owner, getAddress(r.owner)) || BigInt(r.owner) <= 2n || sameAddress(r.owner, ARC_ROUTER)) fail('invalid_recipient')
-  const decimals = ARC_TOKENS[r.tokenIn].decimals
-  if (typeof r.amount !== 'string' || !new RegExp(`^(0|[1-9]\\d{0,${r.tokenIn === 'USDC' ? 2 : 11}})(\\.\\d{1,${decimals}})?$`).test(r.amount)) fail('invalid_amount')
-  const amount = tokenUnits(r.amount, decimals)
-  if (amount <= 0n || amount > ARC_INPUT_CAPS[r.tokenIn]) fail('input_limit') // conservative per-token ceiling (USDC: 10)
+  const amount = swapInputUnits(r.amount, r.tokenIn)
+  // Permit2's maximum uint160 amount is an unlimited allowance sentinel.
+  if (r.tokenIn !== 'USDC' && amount >= SWAP_UINT160_MAX) fail('input_range')
   if (uint(r.minimumOutput) <= 0n || !Number.isInteger(r.slippageBps) || r.slippageBps < 1 || r.slippageBps > 100) fail('invalid_minimum_or_slippage')
   if (uint(r.maxNetworkFee) <= 0n || uint(r.maxNetworkFee) > 10n ** 17n) fail('fee_limit') // <=0.1 USDC
   return Object.freeze({ chainId: r.chainId, tokenIn: r.tokenIn, tokenOut: r.tokenOut, owner: getAddress(r.owner), recipient: getAddress(r.recipient), amount: r.amount, minimumOutput: r.minimumOutput, slippageBps: r.slippageBps, maxNetworkFee: r.maxNetworkFee })
 }
 export function nativeAmount(amount: string): bigint {
-  const [whole, fraction = ''] = amount.split('.')
-  return BigInt(whole) * 10n ** 18n + BigInt(fraction.padEnd(18, '0'))
+  return parseSwapUnits(amount, 18)
 }
 export function requestKey(r: ArcRequest): string { return JSON.stringify(validateArcRequest(r)) }
 export interface ArcTransaction { chainId: number; from: string; to: string; data: Hex; value: string }

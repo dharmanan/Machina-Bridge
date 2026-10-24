@@ -13,7 +13,7 @@ import { MAINNET_SWAP_TOKENS, type MainnetSwapToken } from '../config/mainnetSwa
 import { SWAP_EXECUTION } from '../config/swapExecution'
 import { plainMessage } from '../lib/swap/userMessages'
 import { PlainMessage } from './PlainMessage'
-import { ARC_ROUTER, ARC_INPUT_CAPS } from '../lib/uniswapArcPolicy'
+import { ARC_ROUTER } from '../lib/uniswapArcPolicy'
 import { decimalUnits } from '../lib/mainnetSwap'
 import { exchangeRate, quoteCostWarning, shortenAmount } from '../lib/swapDisplay'
 import { useSwapAutoQuote } from './useSwapAutoQuote'
@@ -120,7 +120,7 @@ export default function MainnetSwapScreen() {
   const [shortcutBusy, setShortcutBusy] = useState(false)
   const [shortcutError, setShortcutError] = useState<{ context: { key: string }; message: string } | null>(null)
   const pilotRoute = SWAP_EXECUTION.mode === 'pilot' && provider === 'uniswap' && tokenIn === 'USDC' && tokenOut === 'EURC'
-  const inputCap = pilotRoute ? ARC_PILOT_MAX_INPUT / 10n ** 12n : ARC_INPUT_CAPS[tokenIn]
+  const inputCap = pilotRoute ? ARC_PILOT_MAX_INPUT / 10n ** 12n : undefined
   async function selectBalance(percent: number) {
     if (!arcReady || !address || shortcutLock.current) return
     const selected = selection.current
@@ -311,7 +311,7 @@ export default function MainnetSwapScreen() {
           <div className="space-y-1 text-xs text-slate-500">
             {shortcutBusy && <p role="status">Checking current token balance…</p>}
             {shortcutError?.context === selection.current && <p role="status" className="text-amber-800">{shortcutError.message}</p>}
-            <p>Limit {formatUnits(inputCap, inDecimals)} {tokenIn}{pilotRoute ? ' · Pilot' : ''}{tokenIn === 'USDC' ? ' · MAX keeps 0.1 USDC for fees' : gasBalanceText ? ` · Gas balance ${gasBalanceText}` : ''}</p>
+            <p>{inputCap !== undefined ? `Pilot limit ${formatUnits(inputCap, inDecimals)} ${tokenIn} · ` : ''}{tokenIn === 'USDC' ? 'MAX keeps 0.1 USDC for fees' : gasBalanceText ? `Gas balance ${gasBalanceText}` : 'Amount is checked against your balance before confirmation.'}</p>
           </div>
         </div>
         <div className="flex justify-center">
@@ -376,7 +376,7 @@ export default function MainnetSwapScreen() {
         <div className="space-y-1 empty:hidden">
           {!isConnected && <p role="status" className="text-sm text-slate-600">Connect your wallet using the header to get a quote. Nothing is signed.</p>}
           {isConnected && chainId !== 5042 && <p role="status" className="text-sm text-amber-700">Switch your wallet to Arc Mainnet to get a quote.</p>}
-          {walletReady && uniswap.invalidAmount && <p role="status" className="text-sm text-slate-600">Enter a positive amount of at most {formatUnits(ARC_INPUT_CAPS[tokenIn], inDecimals)} {tokenIn} with at most {inDecimals} decimal places.</p>}
+          {walletReady && amount && (provider === 'uniswap' ? uniswap.invalidAmount : !circle.validAmount && circleOffers) && <p role="status" className="text-sm text-slate-600">Enter a positive {tokenIn} amount with at most {inDecimals} decimal places, within the supported contract number range.</p>}
           {walletReady && circle.insufficientBalance && <p role="status" className="text-sm text-amber-700">Insufficient {tokenIn} balance for this amount.</p>}
           {selected.state === 'error' && <p role="alert" className="break-words text-sm text-red-700">{selected.message}</p>}
           {loading && <p role="status" className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" aria-hidden="true" />Updating price…</p>}

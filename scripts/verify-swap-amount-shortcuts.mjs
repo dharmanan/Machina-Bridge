@@ -37,4 +37,11 @@ test('unavailable or malformed balances and invalid precision/percentages fail c
   for (const share of [0, 30, 101, NaN]) assert.throws(() => amount(100n, 6, share, false), /balance/)
   assert.throws(() => amount(1n, 6, 25, false), /zero/)
 })
+test('open MAX uses full balances beyond former caps and preserves uint-sized precision', () => {
+  assert.equal(amount(100n * 10n ** 18n, 6, 100, true, reserve), '99.9')
+  assert.equal(amount(123456789123456789123456n, 6, 100, false), '123456789123456789.123456')
+  assert.equal(amount(10n ** 30n, 18, 100, false), '1000000000000')
+  const nearUint256 = 2n ** 256n - 2n
+  assert.equal(require('viem').parseUnits(amount(nearUint256, 18, 75, false), 18), nearUint256 * 75n / 100n)
+})
 console.log(`${count} balance shortcut groups PASS; no network or wallet operations.`)

@@ -38,7 +38,7 @@ export function onchainErrorMessage(error: unknown): string {
   if (error instanceof ArcPreviewError) return uniswapArcPreviewErrorMessage(error)
   const code = error instanceof Error ? error.message : ''
   if (code === 'wallet_context_changed') return onchainErrorMessage(new ReviewSourceError('context'))
-  if (code === 'input_limit') return 'This amount is above the per-swap ceiling for this token.'
+  if (code === 'input_range') return 'This amount exceeds the supported contract number range. Enter a smaller amount.'
   if (code === 'invalid_amount' || code === 'invalid_minimum_or_slippage') return 'Enter a valid amount.'
   return onchainErrorMessage(new ReviewSourceError('policy'))
 }

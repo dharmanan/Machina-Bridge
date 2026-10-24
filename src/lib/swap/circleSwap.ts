@@ -10,7 +10,7 @@ import {
   CircleGuardError, bufferedGas, createGuardedWalletClient,
   type CircleGuardHooks, type CircleGuardPolicy, type CircleInnerWallet, type CircleStepInfo, type CircleStepKind, type CircleStepOutcome, type CircleStepPlan, type GuardedWallet,
 } from './circleGuard'
-import { SWAP_INPUT_CAPS, isSwapSymbol, swapToken, type SwapSymbol } from './tokens'
+import { parseSwapUnits, swapInputUnits, SWAP_UINT256_MAX, isSwapSymbol, swapToken, type SwapSymbol } from './tokens'
 import { archiveRecord, archiveUnreadable, readArchive } from './journalArchive'
 import { viemInnerWallet } from './circleWallet'
 import { WalletRpcFailure, walletRpcRead, walletRpcMessage } from '../uniswapArcWalletRpc'
@@ -52,7 +52,7 @@ const stop = (code: string): never => { throw new Error(code) }
 const isNonce = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
 const decimalText = (v: unknown): v is string => typeof v === 'string' && /^\d{1,78}$/.test(v)
 const boundedText = (v: unknown, max: number): v is string => typeof v === 'string' && v.length <= max
-const uint = (value: unknown): bigint => { if (!decimalText(value)) return stop('invalid_integer'); return BigInt(value) }
+const uint = (value: unknown): bigint => { if (!decimalText(value)) return stop('invalid_integer'); const n = BigInt(value); return n <= SWAP_UINT256_MAX ? n : stop('invalid_integer') }
 
 // --- Request and Review ----------------------------------------------------------------------------------------------------
 export type CircleStrategy = 'approve' | 'permit'
@@ -83,10 +83,7 @@ export interface CircleProvider { request(args: { method: string; params?: unkno
 
 const REQUEST_KEYS = ['chainId', 'tokenIn', 'tokenOut', 'owner', 'amount', 'slippageBps', 'allowanceStrategy']
 export function parseCircleAmount(amount: unknown, decimals: number): bigint {
-  if (typeof amount !== 'string' || amount.length > 70 || !/^(0|[1-9]\d{0,29})(\.\d+)?$/.test(amount)) return stop('invalid_amount')
-  const [whole, fraction = ''] = amount.split('.')
-  if (fraction.length > decimals) return stop('invalid_amount')
-  return BigInt(whole + fraction.padEnd(decimals, '0'))
+  return parseSwapUnits(amount, decimals)
 }
 export function validateCircleRequest(input: unknown): CircleSwapRequest {
   const r = input as Record<string, unknown> | null
@@ -101,9 +98,7 @@ export function validateCircleRequest(input: unknown): CircleSwapRequest {
   const strategy = r.allowanceStrategy === undefined ? (r.tokenIn === 'USDC' ? 'permit' : 'approve') : r.allowanceStrategy
   if (strategy !== 'approve' && strategy !== 'permit') return stop('invalid_request')
   if ((strategy === 'permit') !== (r.tokenIn === 'USDC')) return stop('invalid_strategy')
-  const units = parseCircleAmount(r.amount, swapToken(r.tokenIn).decimals)
-  if (units <= 0n) return stop('invalid_amount')
-  if (units > SWAP_INPUT_CAPS[r.tokenIn]) return stop('amount_cap')
+  swapInputUnits(r.amount, r.tokenIn)
   return { chainId: CIRCLE_CHAIN_ID, tokenIn: r.tokenIn, tokenOut: r.tokenOut, owner: r.owner, amount: r.amount as string, slippageBps: r.slippageBps as number, allowanceStrategy: strategy }
 }
 export const circleRequestKey = (request: CircleSwapRequest): string => {
@@ -300,7 +295,7 @@ export function circleSwapMessage(code: string): string {
     extra_field: 'The transaction contained unexpected fields, so it was blocked.',
     sealed: 'This swap session is closed.',
     hash: 'The wallet did not return a transaction hash. Check your wallet and Arc Explorer; do not submit again.',
-    amount_cap: 'This amount is above the per-transaction limit for this release.',
+    input_range: 'This amount exceeds the supported contract number range. Enter a smaller amount.',
     invalid_amount: 'Enter a positive amount within the token precision.',
     unsupported_route: 'Choose two different swap tokens.',
     wrong_network: 'Select Arc Mainnet in your wallet.',

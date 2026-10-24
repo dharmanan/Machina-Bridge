@@ -277,6 +277,14 @@ try {
     assert.ok(rpcCalls.includes('eth_call') && rpcCalls.includes('eth_gasPrice'))
     assert.ok(serviceBodies.every((body) => body.tokenInChain === 'Arc' && body.tokenOutChain === 'Arc' && body.slippageBps === 100))
   })
+  await test('real SDK quote serialization preserves large input strings beyond Number precision', async () => {
+    for (const [tokenIn, tokenOut, amount] of [['USDC', 'EURC', '1000000.123456'], ['EURC', 'USDC', '9007199254740993.123456'], ['WETH', 'USDC', '1000000000000.123456789012345678'], ['cirBTC', 'EURC', '100.12345678']]) {
+      const input = { ...request, tokenIn, tokenOut, amount }
+      const quote = await swap.readMainnetSwapQuote(input, new AbortController().signal)
+      assert.ok(quote.estimatedOutput)
+      assert.equal(serviceBodies.at(-1).amount, swap.decimalUnits(amount, tokens[tokenIn].decimals).toString())
+    }
+  })
   await test('WETH reverse direction requires a successful SDK quote and preserves 18-decimal input', async () => {
     const input = { ...request, tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004123456789012345' }
     const result = await swap.readMainnetSwapQuote(input, new AbortController().signal)

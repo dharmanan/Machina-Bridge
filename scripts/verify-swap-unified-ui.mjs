@@ -80,6 +80,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_INPUT_RANGE_ONLY === '1' && !/^(the mode chip|balance shortcuts|input range:|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_QUOTE_UX_ONLY === '1' && !/^(the mode chip|compact provider cards|quote UX:|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_TAB_BASELINE_PROBE === '1' && !/^(the mode chip|real tabs: unsigned)/.test(name)) return
   if (process.env.MACHINA_REAL_TABS_ONLY === '1' && !/^(the mode chip|real tabs|no unapproved wallet)/.test(name)) return
@@ -346,6 +347,34 @@ try {
     await page.clock.setSystemTime(new Date()); world.clockOffset = 0
   })
 
+  await test('input range: open amounts above former caps quote in both providers without changing selection or asking the wallet', async () => {
+    const priorNative = rpc.state.nativeBalance, priorBalances = { ...rpc.state.balances }
+    try { for (const [symbol, value] of [['USDC', '1000.123456'], ['EURC', '1000.123456'], ['WETH', '1.123456789012345678'], ['cirBTC', '0.12345678']]) {
+      rpc.state.nativeBalance = 10n ** 25n
+      if (symbol !== 'USDC') rpc.state.balances[symbol] = 10n ** 30n
+      await page.goto(base + '/__lifecycle_reset'); await page.evaluate(() => window.localStorage.clear())
+      await page.goto(base + '/__swap_ui_test')
+      await page.evaluate(async ({ symbol }) => {
+        window.swapUiTest.state.nativeBalance = 10n ** 25n
+        if (symbol !== 'USDC') window.swapUiTest.state.balances[symbol] = 10n ** 30n
+        await window.swapUiTest.connect(5042)
+      }, { symbol })
+      // Both independent readers start with the funded test account; no stale
+      // cached ERC-20 balance is borrowed from a prior small-amount fixture.
+      await pick(symbol, symbol === 'EURC' ? 'USDC' : 'EURC')
+      await amount.fill(value); await quoted()
+      assert.equal(await amount.inputValue(), value)
+      assert.equal(await uniCard.getAttribute('aria-checked'), 'true')
+      assert.equal(await page.getByText(/Limit 10 USDC|Limit 9 EURC|Limit 0\.004 WETH|Limit 0\.00012 cirBTC/).count(), 0)
+      await circleCard.click(); await quoted(); assert.equal(await amount.inputValue(), value)
+      assert.equal(await circleCard.getAttribute('aria-checked'), 'true')
+      assert.equal(await sends(), 0); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 0)
+    } } finally {
+      rpc.state.nativeBalance = priorNative; rpc.state.balances = priorBalances
+      await resetLifecycle('uniswap', 'USDC')
+    }
+  })
+
   await test('existing excessive token allowances are visible on the Swap screen and in fresh Review for EURC, WETH and cirBTC, without any extra wallet request', async () => {
     for (const [symbol, input, unlimited] of [['EURC', '1', true], ['WETH', '0.0003', false], ['cirBTC', '0.00001', true]]) {
       const need = parseUnits(input, dec[symbol])
@@ -431,7 +460,7 @@ try {
     await uni.getByText(/EURC → USDC \(0\.05%\) → cirBTC \(0\.01%\)/).waitFor(); await uni.getByText(/An exact token approval if needed, one free short-lived Permit2 signature/).waitFor(); await uni.getByText('Yes', { exact: true }).waitFor()
     await circ.getByText(/One approval for exactly the amount you swap, then the swap\./).waitFor(); await circ.getByText('Yes', { exact: true }).waitFor()
     await opened(); await uni.getByText(/None yet by this application\. The route was only simulated/).waitFor(); await circ.getByText(/Real swaps on this direction by other wallets are on chain/).waitFor()
-    await uni.getByText(/Available \(any wallet, up to the per-swap ceiling\)/).waitFor(); await circ.getByText(/Available \(any wallet, up to the per-swap ceiling\)/).waitFor()
+    await uni.getByText(/Available \(any wallet, subject to balance and transaction checks\)/).waitFor(); await circ.getByText(/Available \(any wallet, subject to balance and transaction checks\)/).waitFor()
     await pick('USDC', 'EURC'); await uni.getByText(/No approval needed: USDC is sent directly with the swap/).waitFor(); await circ.getByText(/One signature \(no fee\) that allows exactly the amount you swap, then the swap\./).waitFor()
     await opened(); await uni.getByText(/one real swap \(0x1a5e…a921\)/).waitFor()
     await pick('USDC', 'WETH'); await opened(); await circ.getByText(/no real swap of this direction was found among the decoded fixtures/).waitFor(); await details.locator(':scope > summary').click()
@@ -447,14 +476,14 @@ try {
     assert.equal(await page.getByRole('combobox', { name: 'From token' }).inputValue(), 'USDC'); assert.equal(await page.getByRole('combobox', { name: 'To token' }).inputValue(), 'cirBTC')
   })
 
-  await test('balance shortcuts use real balances for every token, keep the gas reserve for native USDC and respect the per-swap ceiling', async () => {
+  await test('balance shortcuts use full real balances without product caps and keep the gas reserve for native USDC', async () => {
     const shortcut = async name => { await page.getByRole('button', { name, exact: true }).click(); await page.waitForTimeout(150) }
-    await pick('EURC', 'USDC'); await amount.fill(''); await shortcut('25%'); assert.equal(await amount.inputValue(), '9') // 12.5 EURC held-25%, limited to the 9 EURC ceiling
-    await pick('WETH', 'USDC'); await shortcut('25%'); assert.equal(await amount.inputValue(), '0.004') // 0.25 WETH, limited to 0.004 WETH
-    await pick('cirBTC', 'USDC'); await amount.fill(''); await shortcut('MAX'); assert.equal(await amount.inputValue(), '0.00012')
+    await pick('EURC', 'USDC'); await amount.fill(''); await shortcut('25%'); assert.equal(await amount.inputValue(), '12.5')
+    await pick('WETH', 'USDC'); await shortcut('25%'); assert.equal(await amount.inputValue(), '0.25')
+    await pick('cirBTC', 'USDC'); await amount.fill(''); await shortcut('MAX'); assert.equal(await amount.inputValue(), '0.1')
     await page.evaluate(() => { window.swapUiTest.state.balances.cirBTC = 5000n }); await amount.fill(''); await shortcut('50%'); assert.equal(await amount.inputValue(), '0.000025')
     await page.evaluate(() => { window.swapUiTest.state.balances.cirBTC = 10_000_000n })
-    await pick('USDC', 'EURC'); await amount.fill(''); await shortcut('MAX'); assert.equal(await amount.inputValue(), '10') // 100 USDC held, 0.1 reserved, limited to the 10 USDC ceiling
+    await pick('USDC', 'EURC'); await amount.fill(''); await shortcut('MAX'); assert.equal(await amount.inputValue(), '99.9')
     await page.evaluate(() => { window.swapUiTest.state.nativeBalance = 5n * 10n ** 18n }); await amount.fill(''); await shortcut('MAX'); assert.equal(await amount.inputValue(), '4.9')
     await page.evaluate(() => { window.swapUiTest.state.nativeBalance = 10n ** 17n }); await amount.fill(''); await shortcut('MAX'); await page.getByText(/cannot cover the reserved network fee/).waitFor()
     await page.evaluate(() => { window.swapUiTest.state.nativeBalance = 100n * 10n ** 18n })

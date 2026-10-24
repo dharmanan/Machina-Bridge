@@ -138,10 +138,10 @@ try {
       await amount.fill('0.1')
     }
   })
-  await test('ERC-20 percentages use the selected token decimals and the per-swap ceiling; Circle never enables execution', async () => {
+  await test('ERC-20 percentages use the full selected balance; the pilot still never enables this route or Circle', async () => {
     await page.getByRole('combobox', { name: 'From token' }).selectOption('cirBTC')
     await page.getByRole('button', { name: '75%', exact: true }).click()
-    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.00012') // 0.75 cirBTC held, limited to 0.00012 cirBTC per swap
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '0.75') // full 75% share; pilot execution of this route remains closed
     assert.equal(await review.isDisabled(), true)
     assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0) // the pilot build never offers an approval for a route it cannot send
     await page.getByRole('combobox', { name: 'From token' }).selectOption('USDC'); await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')

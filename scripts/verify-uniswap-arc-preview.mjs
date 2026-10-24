@@ -58,8 +58,8 @@ await test('the request validator accepts any ordered pair of the four tokens bu
   // Generalised (every direction is a valid request shape); what each route may do is decided by the policy layers, not by this validator.
   p.validateArcRequest({ ...request, tokenIn: 'EURC', tokenOut: 'USDC', amount: '1' }); p.validateArcRequest({ ...request, tokenOut: 'WETH' })
   p.validateArcRequest({ ...request, tokenIn: 'cirBTC', tokenOut: 'WETH', amount: '0.0001', minimumOutput: '1' }); p.validateArcRequest({ ...request, tokenIn: 'WETH', tokenOut: 'EURC', amount: '0.004', minimumOutput: '1' })
-  for (const delta of [{ chainId: 1 }, { tokenOut: 'USDC' }, { tokenIn: 'DAI' }, { tokenOut: 'DAI' }, { apiKey: 'forbidden' }, { recipient: wrong }, { amount: '11' }, { amount: '0' }, { amount: '1e18' }, { slippageBps: 101 }, { minimumOutput: '0' }, { maxNetworkFee: '100000000000000001' },
-    { tokenIn: 'EURC', amount: '9.000001' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.00012001' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.000000001' }, { tokenIn: 'WETH', tokenOut: 'EURC', amount: '0.0040001' }]) assert.throws(() => p.validateArcRequest({ ...request, ...delta }))
+  for (const delta of [{ chainId: 1 }, { tokenOut: 'USDC' }, { tokenIn: 'DAI' }, { tokenOut: 'DAI' }, { apiKey: 'forbidden' }, { recipient: wrong }, { amount: '0' }, { amount: '1e18' }, { slippageBps: 101 }, { minimumOutput: '0' }, { maxNetworkFee: '100000000000000001' },
+    { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.000000001' }]) assert.throws(() => p.validateArcRequest({ ...request, ...delta }))
 })
 await test('the Trading API profiles stay native USDC to EURC/cirBTC only: every other direction is refused before any API request', async () => {
   for (const delta of [{ tokenIn: 'EURC', tokenOut: 'USDC' }, { tokenIn: 'cirBTC', tokenOut: 'EURC', amount: '0.0001' }, { tokenOut: 'WETH' }, { tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004' }]) {
