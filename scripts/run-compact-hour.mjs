@@ -15,8 +15,10 @@
 // with writer_lock_held before any request or write, and the scheduler simply retries the hour later.
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
+// Optional MACHINA_COMPACT_IO_DIAGNOSTICS=1 adds best-effort phase counters; every other value leaves it OFF.
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
 import { stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { FAMILY_FIELDS } from '../server/compact/families.js';
@@ -60,9 +62,57 @@ export function runnerConfig({ argv = process.argv.slice(2), env = process.env }
   return { hourStart, sqlitePath: resolve(sqlitePath), minIntervalMs };
 }
 
+// Opt-in process-wide I/O diagnostics, never SQLite-specific accounting. rchar includes other reads and these
+// counter reads; read_bytes includes other files and kernel readahead. Cgroup memory includes sibling processes.
+// Missing/unreadable/malformed counters are null, never fabricated zeroes. No DB/PRAGMA/RPC reads or persistent state.
+export function createCompactIoDiagnostics({ env = process.env, print = console.log, read = path => readFileSync(path, 'utf8'),
+  clock = () => performance.now(), utc = () => new Date().toISOString(), pid = process.pid } = {}) {
+  if (env.MACHINA_COMPACT_IO_DIAGNOSTICS !== '1') return { start() {}, end() {} };
+  let active = null;
+  const text = path => { try { const value = read(path); return typeof value === 'string' ? value.slice(0, 65536) : ''; } catch { return ''; } };
+  const counter = (value, name, separator) => {
+    const match = value.match(new RegExp(`^${name}${separator}([0-9]{1,40})[ \t]*$`, 'm'));
+    return match ? BigInt(match[1]).toString() : null;
+  };
+  const sample = () => {
+    const leaf = text('/proc/self/cgroup').match(/^0::(\/[^\r\n]*)$/m)?.[1];
+    // Do not silently report host/root counters when the process cgroup cannot be resolved.
+    const memory = leaf && !leaf.split('/').includes('..') ? text(`/sys/fs/cgroup${leaf === '/' ? '' : leaf}/memory.stat`) : '';
+    const io = text('/proc/self/io');
+    return { io: { read_bytes: counter(io, 'read_bytes', ':[ \t]*'), rchar: counter(io, 'rchar', ':[ \t]*') },
+      cgroup: { anon: counter(memory, 'anon', '[ \t]+'), file: counter(memory, 'file', '[ \t]+') } };
+  };
+  const emit = event => { try { print(`COMPACT_IO_DIAGNOSTIC ${JSON.stringify({ version: 1, utc: utc(), pid, ...event })}`); } catch { /* diagnostics cannot affect collection */ } };
+  const delta = (before, after) => before !== null && after !== null && BigInt(after) >= BigInt(before) ? (BigInt(after) - BigInt(before)).toString() : null;
+  function end(outcome = 'ok') {
+    const span = active; active = null;
+    if (!span) return;
+    try {
+      const after = sample();
+      emit({ stage: span.stage, event: 'exit', outcome, elapsed_ms: Math.max(0, clock() - span.started),
+        counters: after.io, delta: { read_bytes: delta(span.before.io.read_bytes, after.io.read_bytes), rchar: delta(span.before.io.rchar, after.io.rchar) }, cgroup: after.cgroup });
+    } catch { /* diagnostics cannot affect collection */ }
+  }
+  return {
+    start(stage) {
+      try {
+        if (active?.stage === stage) return;
+        end();
+        active = { stage, started: clock(), before: sample() };
+        emit({ stage, event: 'enter', elapsed_ms: 0, counters: active.before.io, delta: null, cgroup: active.before.cgroup });
+      } catch { active = null; }
+    },
+    end,
+  };
+}
+
 export async function runCompactHour({ sqlitePath, hourStart, provider, registryFromBlock = V3_FACTORY_DEPLOYMENT_BLOCK,
-  safeHeadMargin = SAFE_HEAD_MARGIN_BLOCKS, print = console.log }) {
+  safeHeadMargin = SAFE_HEAD_MARGIN_BLOCKS, print = console.log, ioDiagnostics = null }) {
   const started = performance.now();
+  const io = ioDiagnostics ?? createCompactIoDiagnostics({ print });
+  // Also isolate an injected diagnostic sink; neither a read failure nor a log failure may alter a commit.
+  const ioStart = stage => { try { io.start(stage); } catch { /* diagnostics only */ } };
+  const ioEnd = outcome => { try { io.end(outcome); } catch { /* diagnostics only */ } };
   const summary = { targetHour: iso(hourStart), sqlitePath, hourMode: null, repairFamilies: null, registryMode: null, registryBefore: null,
     registryAfter: null, officialV3Pools: null, hourOutcome: null, families: null, projections: null, valuations: null, valuationPass: null,
     metadata: null, tvl: null, protocols: null, checkpoint: null, provider: null, elapsedMs: null, sqliteBytes: null, ok: false, reason: null, diagnostics: null };
@@ -72,6 +122,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
   let lock = null;
   try {
     lock = acquireWriterLock(sqlitePath, { owner: 'run-compact-hour' });
+    ioStart('sqlite_open_store_preflight');
     const { DatabaseSync } = await import('node:sqlite');
     db = new DatabaseSync(sqlitePath);
     const store = createCompactStore(db);
@@ -79,6 +130,8 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     print(`STORAGE_PREFLIGHT ${JSON.stringify(capacity)}`);
     // Physical exhaustion is a live-indexing blocker too. Refuse new RPC/work; existing evidence stays intact.
     if (!capacity.ok) throw new RunnerError(capacity.reason);
+    ioEnd('ok');
+    ioStart('registry_prepare');
     const before = store.v3Registry();
     summary.registryBefore = span(before);
     const stored = store.familyRows(hourStart);
@@ -90,6 +143,7 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
       summary.hourMode = 'stored';
       summary.registryMode = before ? 'reused' : 'none';
       summary.hourOutcome = 'already_committed';
+      ioEnd('ok');
     } else {
       // Repair: this exact stored hour again, on the persisted registry only (never a registry scan). commitHour then
       // upgrades unavailable families, keeps available ones immutable and leaves the checkpoint where it is.
@@ -113,28 +167,44 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
         store.extendRegistry(await catchUpV3Registry(provider, before, target));
       } else summary.registryMode = 'reused';
       // Additional protocol activity (Archery CL) only for a new live hour: a repaired hour never gets it.
-      const result = await processHour({ provider, hourStart, safeHead, v3Registry: store.v3Registry(), bounds, protocolActivity: !repair });
+      const registry = store.v3Registry();
+      ioEnd('ok');
+      ioStart('process_hour');
+      const result = await processHour({ provider, hourStart, safeHead, v3Registry: registry, bounds, protocolActivity: !repair });
+      ioEnd('ok');
+      ioStart('commit_hour');
       summary.hourOutcome = store.commitHour(result).outcome;
+      ioEnd('ok');
       if (result.protocols) summary.protocols = Object.fromEntries(Object.entries(result.protocols)
         .map(([name, entry]) => [name, entry.status === 'available' ? 'available' : `unavailable(${entry.reason})`]));
       // Display metadata of newly met pool tokens, read at the safe head. Never fails the run.
+      ioStart('token_metadata');
       summary.metadata = await refreshTokenMetadata({ store, provider, blockNumber: safeHead, limit: METADATA_TOKENS_PER_RUN });
+      ioEnd('ok');
       // Liquidity of the 24H top pools at the new hour's last block (a repaired older hour keeps what it has). Never fails the run.
       if (!repair) {
+        ioStart('tvl');
         summary.tvl = await collectPoolTvl({ store, provider, hourStart, blockNumber: bounds.last.number,
           poolManager: UNISWAP_REGISTRY.v4PoolManager.address });
+        ioEnd('ok');
       }
     }
     // Candidates survive a crash between hour COMMIT and this bounded historical-tag enrichment step.
     // Runs on stored hours too: old unresolved candidates remain reachable without an independent indexer.
+    ioStart('discovery');
     summary.discovery = await refreshDiscoverySafely({ store, provider });
+    ioEnd('ok');
     print(`EVIDENCE_ARCHIVE ${JSON.stringify(store.archive.report())}`);
     // Valuations of stored hours that have none yet (hours stored before valuations existed). No RPC; never fails the run.
+    ioStart('pending_valuations');
     try {
       summary.valuationPass = { derived: store.derivePendingValuations({ limit: VALUATION_HOURS_PER_RUN }).hours.length, error: null };
+      ioEnd('ok');
     } catch (error) {
+      ioEnd('error');
       summary.valuationPass = { derived: 0, error: error?.code ?? error?.message ?? 'valuation_pass_failed' };
     }
+    ioStart('final_status_close');
     // What is stored now, which a repair can only improve: an available family is never replaced or downgraded.
     summary.families = Object.fromEntries(store.familyRows(hourStart).map((row) => [row.family, statusOf(row)]));
     summary.projections = Object.fromEntries(store.projectionStatus(hourStart).map((row) => [row.projection, statusOf(row)]));
@@ -148,13 +218,16 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
     summary.ok = unavailable.length === 0;
     if (!summary.ok) summary.reason = `families_unavailable:${unavailable.join(',')}`;
   } catch (error) {
+    ioEnd('error');
     summary.reason = error?.code ?? `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}`;
     if (error instanceof ProviderError) {
       summary.diagnostics = { endpoint: error.endpoint, httpStatus: error.httpStatus, rpcCode: error.rpcCode, detail: error.detail };
     } else if (error instanceof WriterLockError) summary.diagnostics = { holder: error.holder?.owner ?? null, since: error.holder?.since ?? null };
   } finally {
-    db?.close();
-    lock?.release();
+    ioStart('final_status_close');
+    let closed = false;
+    try { db?.close(); lock?.release(); closed = true; }
+    finally { ioEnd(closed ? 'ok' : 'error'); }
   }
   summary.provider = { requests: provider.stats.requests, retries: provider.stats.retries, calls: { ...provider.stats.calls },
     responseMbDecoded: mb(provider.stats.responseBytes) };
