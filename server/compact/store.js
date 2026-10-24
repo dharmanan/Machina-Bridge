@@ -612,18 +612,31 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
   };
   const coverage = () => coverageOf(V3_POOL_KIND);
 
-  function transaction(work, beforeCommit = null) {
-    checkCapacity(); // Applies to every historical/live store writer before its transaction.
-    archive.begin();
-    packed.begin();
-    db.exec('BEGIN IMMEDIATE');
+  // Only commitHour opts in. Diagnostic callbacks never own the work, its return value or its exception.
+  // With no sink this does not read counters, clocks, environment variables or log anything.
+  function observe(io, stage, work) {
+    if (!io) return work();
+    try { io.start(stage); } catch { /* diagnostics cannot affect a writer */ }
+    let ok = false;
+    try { const value = work(); ok = true; return value; }
+    finally { try { io.end(ok ? 'ok' : 'error'); } catch { /* retain the original work result/error */ } }
+  }
+
+  function transaction(work, beforeCommit = null, io = null) {
+    observe(io, 'transaction_setup', () => {
+      checkCapacity(); // Applies to every historical/live store writer before its transaction.
+      archive.begin();
+      packed.begin();
+    });
+    observe(io, 'sqlite_begin', () => db.exec('BEGIN IMMEDIATE'));
     try {
       const value = work();
       beforeCommit?.(); // test hook: runs after every write and before COMMIT
-      db.exec('COMMIT');
+      observe(io, 'sqlite_commit', () => db.exec('COMMIT'));
       return value;
     } catch (error) {
-      try { db.exec('ROLLBACK'); } catch { /* the original error is the one to report */ }
+      try { io?.end('error'); } catch { /* mark unlabelled failing work without affecting rollback */ }
+      try { observe(io, 'sqlite_rollback', () => db.exec('ROLLBACK')); } catch { /* the original error is the one to report */ }
       throw error;
     }
   }
@@ -1039,31 +1052,37 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
 
   // Outcomes: inserted | unchanged | upgraded. A stored hour is immutable except that an unavailable family becomes
   // available when the same hour (same network hash) is processed again; an available family is never replaced.
-  function commitHour(result, { beforeCommit = null } = {}) {
-    const rows = hourRows(result);
+  function commitHour(result, { beforeCommit = null, ioDiagnostics = null } = {}) {
+    const phase = (stage, work) => observe(ioDiagnostics, stage, work);
+    const rows = phase('hour_rows', () => hourRows(result));
     const { range, network } = result;
     return transaction(() => {
-      const existing = sql.hour.get(int(range.hourStart));
-      if (existing && existing.network_sha256 !== rows.networkSha) throw new StoreError('hour_conflict');
+      const existing = phase('canonical_checkpoint', () => {
+        const stored = sql.hour.get(int(range.hourStart));
+        if (stored && stored.network_sha256 !== rows.networkSha) throw new StoreError('hour_conflict');
+        if (!stored) {
+          // Forward only: after the first hour, a new hour must be the checkpoint's next canonical hour, so no hour is ever
+          // stored ahead of (or behind) the contiguous, hash-linked run. Refused before any row is written.
+          const current = checkpoint();
+          if (current && range.hourStart > current.hourStart + HOUR) throw new StoreError('checkpoint_gap');
+          if (current && range.hourStart < current.hourStart + HOUR) throw new StoreError('hour_before_checkpoint');
+          if (current && (range.firstBlock !== current.lastBlock + 1 || range.parentHash !== current.lastHash)) {
+            throw new StoreError('checkpoint_discontinuity');
+          }
+        }
+        return stored;
+      });
       let outcome = existing ? 'unchanged' : 'inserted';
       if (!existing) {
-        // Forward only: after the first hour, a new hour must be the checkpoint's next canonical hour, so no hour is ever
-        // stored ahead of (or behind) the contiguous, hash-linked run. Refused before any row is written.
-        const current = checkpoint();
-        if (current && range.hourStart > current.hourStart + HOUR) throw new StoreError('checkpoint_gap');
-        if (current && range.hourStart < current.hourStart + HOUR) throw new StoreError('hour_before_checkpoint');
-        if (current && (range.firstBlock !== current.lastBlock + 1 || range.parentHash !== current.lastHash)) {
-          throw new StoreError('checkpoint_discontinuity');
-        }
         sql.insertHour.run(int(range.hourStart), result.definitionVersion, int(range.firstBlock), int(range.lastBlock), range.parentHash,
           range.firstHash, range.lastHash, int(network.blockCount), int(network.transactionCount), int(network.uniqueActiveAddresses),
           rows.networkJson, rows.networkSha);
         for (const family of rows.families) {
           sql.insertFamily.run(int(range.hourStart), family.name, family.status, family.reason, family.json, family.sha);
         }
-        storeAddresses(range.hourStart, result.activeAddresses);
-        dailyActiveAddresses.observeHour(range.hourStart, result.activeAddresses);
-        advanceCheckpoint(range.hourStart);
+        phase('store_addresses', () => storeAddresses(range.hourStart, result.activeAddresses));
+        phase('daily_active_addresses', () => dailyActiveAddresses.observeHour(range.hourStart, result.activeAddresses));
+        phase('advance_checkpoint', () => advanceCheckpoint(range.hourStart));
         // Additional protocol activity (archery-cl.js), in this same transaction and only for a newly committed hour that
         // computed it: a repaired, replayed or prepended hour never gets a record, so no older hour is ever filled in.
         if (result.protocols?.archeryCl !== undefined) {
@@ -1085,17 +1104,17 @@ export function createCompactStore(db, { archive: archiveOptions, packedShards: 
           }
         }
       }
-      if (rows.v3) advanceRegistry(range, rows.v3);
+      if (rows.v3) phase('registry_update', () => advanceRegistry(range, rows.v3));
       // Same transaction as the hour: a crash leaves neither the hour nor its projections.
-      const projections = rows.projections ? writeProjections(range, rows.projections) : null;
-      intelligence.recordHour(result);
-      packed.packHour(range.hourStart);
+      const projections = rows.projections ? phase('projections_valuations', () => writeProjections(range, rows.projections)) : null;
+      phase('intelligence_record_hour', () => intelligence.recordHour(result));
+      phase('packed_pack_hour', () => packed.packHour(range.hourStart));
       // Retention (OFF by default): one bounded pass per live hour, every scope in its own savepoint, never blocking.
-      packed.maintain(sql.newestHour.get().hour_start);
+      phase('packed_maintain', () => packed.maintain(sql.newestHour.get().hour_start));
       // History expiry (OFF by default): the same, for detail rows before the 61-day floor of the checkpoint hour.
-      history.maintain(checkpoint().hourStart);
+      phase('history_maintain', () => history.maintain(checkpoint().hourStart));
       return { outcome, checkpoint: checkpoint(), projections };
-    }, beforeCommit);
+    }, beforeCommit, ioDiagnostics);
   }
 
   // Historical prepend for operator backfill only. A new hour must be exactly one UTC hour before the oldest stored

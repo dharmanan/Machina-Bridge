@@ -16,6 +16,8 @@
 // Primary Arc RPC only: no secondary, no failover. No daemon, scheduler or server.
 //   COMPACT_SQLITE_PATH=/data/arc-compact.sqlite [COMPACT_RPC_MIN_INTERVAL_MS=1000] \
 // Optional MACHINA_COMPACT_IO_DIAGNOSTICS=1 adds best-effort phase counters; every other value leaves it OFF.
+// MACHINA_COMPACT_IO_DIAGNOSTICS_HOUR=YYYY-MM-DDTHH:00:00.000Z restricts all diagnostics to that hour and
+// replaces commit_hour's inclusive span with exclusive subphases. Invalid/nonmatching targets disable diagnostics.
 //   node --expose-gc --max-old-space-size=64 --max-semi-space-size=2 scripts/run-compact-hour.mjs 2026-10-01T07:00:00Z
 import { stat } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -66,8 +68,14 @@ export function runnerConfig({ argv = process.argv.slice(2), env = process.env }
 // counter reads; read_bytes includes other files and kernel readahead. Cgroup memory includes sibling processes.
 // Missing/unreadable/malformed counters are null, never fabricated zeroes. No DB/PRAGMA/RPC reads or persistent state.
 export function createCompactIoDiagnostics({ env = process.env, print = console.log, read = path => readFileSync(path, 'utf8'),
-  clock = () => performance.now(), utc = () => new Date().toISOString(), pid = process.pid } = {}) {
-  if (env.MACHINA_COMPACT_IO_DIAGNOSTICS !== '1') return { start() {}, end() {} };
+  clock = () => performance.now(), utc = () => new Date().toISOString(), pid = process.pid, hourStart } = {}) {
+  const off = () => ({ start() {}, end() {}, commitHour: null });
+  if (env.MACHINA_COMPACT_IO_DIAGNOSTICS !== '1') return off();
+  const target = env.MACHINA_COMPACT_IO_DIAGNOSTICS_HOUR;
+  if (target !== undefined) {
+    const seconds = typeof target === 'string' ? Date.parse(target) / 1000 : NaN;
+    if (!Number.isSafeInteger(seconds) || seconds % HOUR !== 0 || iso(seconds) !== target || seconds !== hourStart) return off();
+  }
   let active = null;
   const text = path => { try { const value = read(path); return typeof value === 'string' ? value.slice(0, 65536) : ''; } catch { return ''; } };
   const counter = (value, name, separator) => {
@@ -82,7 +90,9 @@ export function createCompactIoDiagnostics({ env = process.env, print = console.
     return { io: { read_bytes: counter(io, 'read_bytes', ':[ \t]*'), rchar: counter(io, 'rchar', ':[ \t]*') },
       cgroup: { anon: counter(memory, 'anon', '[ \t]+'), file: counter(memory, 'file', '[ \t]+') } };
   };
-  const emit = event => { try { print(`COMPACT_IO_DIAGNOSTIC ${JSON.stringify({ version: 1, utc: utc(), pid, ...event })}`); } catch { /* diagnostics cannot affect collection */ } };
+  const emit = event => { try { print(`COMPACT_IO_DIAGNOSTIC ${JSON.stringify({ version: 1, utc: utc(), pid,
+    ...(target === undefined ? {} : { target_hour: target }),
+    ...(event.stage.startsWith('commit_hour.') ? { scope: 'commit_hour', accounting: 'exclusive' } : {}), ...event })}`); } catch { /* diagnostics cannot affect collection */ } };
   const delta = (before, after) => before !== null && after !== null && BigInt(after) >= BigInt(before) ? (BigInt(after) - BigInt(before)).toString() : null;
   function end(outcome = 'ok') {
     const span = active; active = null;
@@ -93,7 +103,7 @@ export function createCompactIoDiagnostics({ env = process.env, print = console.
         counters: after.io, delta: { read_bytes: delta(span.before.io.read_bytes, after.io.read_bytes), rchar: delta(span.before.io.rchar, after.io.rchar) }, cgroup: after.cgroup });
     } catch { /* diagnostics cannot affect collection */ }
   }
-  return {
+  const diagnostics = {
     start(stage) {
       try {
         if (active?.stage === stage) return;
@@ -104,12 +114,25 @@ export function createCompactIoDiagnostics({ env = process.env, print = console.
     },
     end,
   };
+  const commitStages = new Set(['hour_rows', 'canonical_checkpoint', 'store_addresses', 'daily_active_addresses', 'advance_checkpoint',
+    'registry_update', 'projections_valuations', 'intelligence_record_hour', 'packed_pack_hour', 'packed_maintain', 'history_maintain',
+    'transaction_setup', 'sqlite_begin', 'sqlite_commit', 'sqlite_rollback']);
+  diagnostics.commitHour = target === undefined ? null : {
+    start(stage) { if (commitStages.has(stage)) diagnostics.start(`commit_hour.${stage}`); },
+    end(outcome) {
+      diagnostics.end(outcome);
+      // This is a partition, not a nested inclusive timer. Writes, final checkpoint reads and beforeCommit hooks
+      // outside named phases remain explicit. Diagnostic sampling/logging overhead is not a measured work phase.
+      diagnostics.start('commit_hour.unattributed');
+    },
+  };
+  return diagnostics;
 }
 
 export async function runCompactHour({ sqlitePath, hourStart, provider, registryFromBlock = V3_FACTORY_DEPLOYMENT_BLOCK,
   safeHeadMargin = SAFE_HEAD_MARGIN_BLOCKS, print = console.log, ioDiagnostics = null }) {
   const started = performance.now();
-  const io = ioDiagnostics ?? createCompactIoDiagnostics({ print });
+  const io = ioDiagnostics ?? createCompactIoDiagnostics({ print, hourStart });
   // Also isolate an injected diagnostic sink; neither a read failure nor a log failure may alter a commit.
   const ioStart = stage => { try { io.start(stage); } catch { /* diagnostics only */ } };
   const ioEnd = outcome => { try { io.end(outcome); } catch { /* diagnostics only */ } };
@@ -172,8 +195,10 @@ export async function runCompactHour({ sqlitePath, hourStart, provider, registry
       ioStart('process_hour');
       const result = await processHour({ provider, hourStart, safeHead, v3Registry: registry, bounds, protocolActivity: !repair });
       ioEnd('ok');
-      ioStart('commit_hour');
-      summary.hourOutcome = store.commitHour(result).outcome;
+      let commitIo = null;
+      try { commitIo = io.commitHour ?? null; } catch { /* an injected diagnostic sink cannot affect the transaction */ }
+      ioStart(commitIo ? 'commit_hour.unattributed' : 'commit_hour');
+      summary.hourOutcome = store.commitHour(result, { ioDiagnostics: commitIo }).outcome;
       ioEnd('ok');
       if (result.protocols) summary.protocols = Object.fromEntries(Object.entries(result.protocols)
         .map(([name, entry]) => [name, entry.status === 'available' ? 'available' : `unavailable(${entry.reason})`]));
