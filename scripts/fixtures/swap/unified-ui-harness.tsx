@@ -16,7 +16,7 @@ const TOKENS: Record<string, string> = {
 }
 const state = {
   signs: [] as unknown[], permitMode: 'sign', walletMode: 'hash', requests: [] as { method: string; params?: unknown[] }[], sent: [] as { tx: Record<string, string>; hash: string }[], hash: '',
-  nativeBalance: 100n * 10n ** 18n, balances: { EURC: 50_000_000n, cirBTC: 10_000_000n, WETH: 10n ** 18n } as Record<string, bigint>, walletNonce: 7,
+  nonceReadTimeouts: 0, nativeBalance: 100n * 10n ** 18n, balances: { EURC: 50_000_000n, cirBTC: 10_000_000n, WETH: 10n ** 18n } as Record<string, bigint>, walletNonce: 7,
 }
 let releasePermit: (() => void) | undefined
 let release: ((value: string) => void) | undefined
@@ -40,7 +40,10 @@ connector.getProvider = async args => {
   return { ...original, request: async (args: { method: string; params?: unknown[] }) => {
     state.requests.push(structuredClone(args))
     if (args.method === 'eth_accounts') return [selectedAccount]
-    if (args.method === 'eth_getTransactionCount') return toHex(state.walletNonce)
+    if (args.method === 'eth_getTransactionCount') {
+      if (state.nonceReadTimeouts > 0) { state.nonceReadTimeouts--; return new Promise(() => {}) }
+      return toHex(state.walletNonce)
+    }
     if (args.method === 'eth_signTypedData_v4') { state.signs.push(structuredClone(args.params)); const typed = JSON.parse(String(args.params?.[1])); if (typed.primaryType === 'PermitSingle' && state.permitMode === 'held') await new Promise<void>(resolve => { releasePermit = resolve }); return typed.primaryType === 'PermitSingle' ? testAccount.signTypedData(typed) : `0x${'11'.repeat(32)}${'22'.repeat(32)}1b` }
     if (args.method !== 'eth_sendTransaction') return original.request(args as never)
     const tx = structuredClone(args.params![0]) as Record<string, string>

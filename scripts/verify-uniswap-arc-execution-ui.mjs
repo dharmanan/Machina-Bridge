@@ -183,7 +183,7 @@ try {
       await page.evaluate(mode => { window.executionUiTest.state.walletReadFailure = mode }, mode)
       await review.click()
       const alert = page.getByRole('alert').filter({ hasText: 'eth_getTransactionCount(pending)' })
-      await alert.waitFor(); await alert.getByText('We couldn’t confirm your wallet’s state just now, so nothing was sent.').waitFor() // the plain sentence is what a person sees
+      await alert.waitFor(); await alert.getByText(/No swap transaction was requested\./).waitFor() // the plain sentence is what a person sees
       assert.ok((await alert.textContent()).includes(label)); assert.ok(!(await page.locator('body').textContent()).includes('SECRET-PROVIDER-DETAILS')) // the precise wording stays in the closed Technical details
       assert.equal(await alert.locator('details').getAttribute('open'), null)
       if (mode === 'malformed') {

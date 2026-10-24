@@ -258,14 +258,23 @@ export async function walletIdentity(provider: ExecutionProvider, owner: string)
     if (!Array.isArray(accounts) || !accounts.every(a => typeof a === 'string' && /^0x[0-9a-f]{40}$/i.test(a))) throw new WalletRpcFailure(accountStage, 'invalid-response')
     if (!sameAddress(accounts[0], owner)) throw new WalletRpcFailure(accountStage, 'account-mismatch')
   }
-  await identity(false)
-  // Only this already-authorized execution path opts into pending failure shape diagnostics.
-  const read = async (stage: 'latest-before' | 'pending' | 'latest-after') => walletRpcQuantity(await walletRpcRead(provider, stage, owner), stage, stage === 'pending')
-  const before = await read('latest-before'), nonce = await read('pending'), latestNonce = await read('latest-after')
-  if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', Math.max(before, nonce, latestNonce), before !== latestNonce ? 'latest-changed' : 'pending-behind-latest')
-  const state = { nonce, latestNonce }
-  await identity(true) // No wallet, chain or account mutation during the reads.
-  return state
+  let highestObserved = -1
+  try {
+    await identity(false)
+    // Preserve every validated partial observation across a bounded read retry. Never log its value.
+    const read = async (stage: 'latest-before' | 'pending' | 'latest-after') => {
+      const value = walletRpcQuantity(await walletRpcRead(provider, stage, owner), stage, stage === 'pending')
+      highestObserved = Math.max(highestObserved, value)
+      return value
+    }
+    const before = await read('latest-before'), nonce = await read('pending'), latestNonce = await read('latest-after')
+    if (before !== latestNonce || nonce < latestNonce) throw new ExecutionNonceObservationError('wallet', highestObserved, before !== latestNonce ? 'latest-changed' : 'pending-behind-latest')
+    await identity(true)
+    return { nonce, latestNonce }
+  } catch (error) {
+    if (error instanceof WalletRpcFailure && highestObserved >= 0) throw new WalletRpcFailure(error.stage, error.kind, error.rpcCode, error.responseShape, highestObserved)
+    throw error
+  }
 }
 
 // Never select the higher/lower of disagreeing mempool views, silently rebase a
@@ -352,8 +361,14 @@ export function createUniswapArcExecution(ports: ExecutionPorts) {
         return reconcileExecutionNonce(publicState, walletState, expected)
       } catch (error) {
         const code = error instanceof Error ? error.message : ''
-        if (error instanceof ExecutionNonceObservationError && isNonce(error.highestObserved)) highestObserved = Math.max(highestObserved, error.highestObserved)
-        if (pass === 0 && (code === 'nonce_rpc' || error instanceof ExecutionNonceObservationError)) continue
+        if ((error instanceof ExecutionNonceObservationError || error instanceof WalletRpcFailure) && isNonce(error.highestObserved)) highestObserved = Math.max(highestObserved, error.highestObserved)
+        const transientReviewRead = expected === undefined && error instanceof WalletRpcFailure && ['timeout', 'rpc-error'].includes(error.kind)
+        if (pass === 0 && (code === 'nonce_rpc' || error instanceof ExecutionNonceObservationError || transientReviewRead)) {
+          // One fixed pause lets independently updated RPCs catch up. The next pass repeats every
+          // safety check; pending, regressed, malformed or still-disagreeing states remain blocked.
+          await new Promise(resolve => setTimeout(resolve, 300))
+          continue
+        }
         throw error
       }
     }

@@ -5,7 +5,7 @@ import type { ExecutionProvider } from './uniswapArcExecution'
 export type WalletRpcStage = 'provider' | 'chain-before' | 'accounts-before' | 'latest-before' | 'pending' | 'latest-after' | 'chain-after' | 'accounts-after'
 type FailureKind = 'rejected' | 'unauthorized' | 'unsupported' | 'disconnected' | 'wrong-chain' | 'invalid-request' | 'rpc-error' | 'unknown' | 'invalid-response' | 'timeout' | 'network-mismatch' | 'account-mismatch'
 export class WalletRpcFailure extends Error {
-  constructor(readonly stage: WalletRpcStage, readonly kind: FailureKind, readonly rpcCode?: number, readonly responseShape?: string) { super('wallet_rpc') }
+  constructor(readonly stage: WalletRpcStage, readonly kind: FailureKind, readonly rpcCode?: number, readonly responseShape?: string, readonly highestObserved?: number) { super('wallet_rpc') }
 }
 function field(value: unknown, key: string): unknown {
   try { return value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined } catch { return undefined }

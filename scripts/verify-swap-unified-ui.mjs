@@ -63,6 +63,7 @@ const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, count = 0
 const errors = [], methods = []
 async function test(name, fn) {
+  if (process.env.MACHINA_APPROVAL_HANDOFF_ONLY === '1' && !/^(the mode chip|approval handoff|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_POST_SWAP_UNKNOWN_ONLY === '1' && !/^(the mode chip|nonconfirmed form lifecycle: wallet unknown|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_POST_SWAP_ONLY === '1' && !/^(the mode chip|signed Review lifecycle|confirmed form lifecycle|nonconfirmed form lifecycle|new input lifecycle|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_SIGNATURE_WINDOW_ONLY === '1' && !/^(the mode chip|a delayed PermitSingle)/.test(name)) return
@@ -679,11 +680,11 @@ try {
   // Focused lifecycle regressions reuse this suite's controlled provider/SDK/receipts.
   const visibility = hidden => page.evaluate(value => { Object.defineProperty(document, 'hidden', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }, hidden)
   await page.route(base + '/__lifecycle_reset', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Test reset</title>' }))
-  async function resetLifecycle(source = 'uniswap', input = 'EURC') {
+  async function resetLifecycle(source = 'uniswap', input = 'EURC', allowance = 1_000_000n) {
     // Dispose the previous controller BEFORE clearing storage, so an in-flight poll cannot restore its journal.
     await page.goto(base + '/__lifecycle_reset'); await page.evaluate(() => window.localStorage.clear())
     world.receipts.clear(); world.rpcDown.clear(); world.hidden.clear(); world.clockOffset = 0
-    rpc.state.nonce = { latest: 7, pending: 7 }; rpc.state.tokenAllowance.EURC = 1_000_000n
+    rpc.state.nonce = { latest: 7, pending: 7 }; rpc.state.tokenAllowance.EURC = allowance
     await page.goto(base + '/__swap_ui_test')
     await page.evaluate(() => window.swapUiTest.connect(5042)); await pick(input, input === 'EURC' ? 'USDC' : 'EURC'); await amount.fill('1'); await quoted()
     await (source === 'circle' ? circleCard : uniCard).click()
@@ -782,6 +783,47 @@ try {
     else { await amount.fill('2'); if (edit === 'edit and restore') await amount.fill('1') }
     setReceipt(sent.hash, 'success'); await recheck(); await latest.getByText('Swap completed', { exact: true }).waitFor()
     assert.equal(await amount.inputValue(), edit === 'different amount' ? '2' : '1')
+  })
+
+  for (const mode of ['aligned', 'lag', 'persistent', 'timeout']) await test(`approval handoff: ${mode} wallet reads retain confirmed approval, require safe Review and never repeat approval`, async () => {
+    await resetLifecycle('uniswap', 'EURC', 0n)
+    await page.getByRole('button', { name: 'Approve EURC · 1 step' }).waitFor(); await review.click()
+    const panel = page.getByRole('region', { name: 'Token approvals' })
+    await panel.getByRole('button', { name: 'Confirm approval' }).click(); await latest.getByText(/Verifying approval/).waitFor()
+    const approval = await lastSent(); await syncWalletSends()
+    const beforeReads = await page.evaluate(() => window.swapUiTest.state.requests.filter(r => r.method === 'eth_getTransactionCount').length)
+    rpc.state.nonce = { latest: 8, pending: 8 }
+    await page.evaluate(mode => { window.swapUiTest.state.walletNonce = ['lag', 'persistent'].includes(mode) ? 7 : 8; window.swapUiTest.state.nonceReadTimeouts = mode === 'timeout' ? 1 : 0 }, mode)
+    setReceipt(approval.hash, 'success'); await recheck()
+    if (mode === 'lag') {
+      for (let i = 0; i < 200; i++) {
+        const reads = await page.evaluate(() => window.swapUiTest.state.requests.filter(r => r.method === 'eth_getTransactionCount').length)
+        if (reads >= beforeReads + 3) break
+        await page.waitForTimeout(5)
+      }
+      await page.evaluate(() => { window.swapUiTest.state.walletNonce = 8 })
+    }
+    if (mode === 'persistent') {
+      await page.getByRole('alert').getByText(/wallet and Arc do not report a consistent transaction state/).waitFor()
+      assert.equal(await sends(), 1); assert.equal(await page.getByRole('dialog').count(), 0)
+      await visibility(true); await visibility(false)
+      await page.evaluate(() => { window.swapUiTest.state.walletNonce = 8 }); await quoted(); await review.click()
+    }
+    await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor()
+    assert.equal(await sends(), 1); assert.equal(rpc.state.tokenAllowance.EURC, 1_000_000n)
+    assert.equal(await page.getByRole('button', { name: 'Confirm approval', exact: true }).count(), 0)
+    assert.equal(await page.getByRole('alert').filter({ hasText: /could not be verified|consistent transaction state/ }).count(), 0)
+    const approvals = await page.evaluate(() => JSON.parse(window.localStorage.getItem(Object.keys(window.localStorage).find(k => k.startsWith('machina.uniswap.arc.approvals.v1:')))))
+    assert.equal(approvals[0].status, 'confirmed')
+    await page.getByRole('button', { name: 'Sign permission', exact: true }).click()
+    await page.getByRole('dialog').getByText(/Permission ready. The price was refreshed/).waitFor(); assert.equal(await sends(), 1)
+    await confirm.click(); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
+    assert.equal(await sends(), 2); const swap = await lastSent(); assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: swap.tx.data }).args[0], '0x0a00')
+    await syncWalletSends(); await page.evaluate(() => { window.swapUiTest.state.balances.EURC = 0n }); setReceipt(swap.hash, 'success'); await recheck()
+    await latest.getByText('Swap completed', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Swap amount"]').value === '')
+    await page.getByText('Balance: 0 EURC', { exact: true }).waitFor()
+    assert.equal(await sends(), 2); assert.equal(await page.evaluate(() => window.swapUiTest.state.signs.length), 1)
   })
 
   await test('no unapproved wallet or RPC methods, external traffic or uncaught errors; only approved read, exact PermitSingle/Circle signature and transaction methods are allowed', async () => {

@@ -15,6 +15,14 @@ async function test(name, fn) { await fn(); count++; console.log(`PASS ${name}`)
 const owner = '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321'
 const HASH = `0x${'1a'.repeat(32)}`
 
+await test('nonce errors retain their operation and reason; a confirmed approval is never described as an unsent swap', () => {
+  const { plainMessage } = require(`${root}src/lib/swap/userMessages.ts`)
+  const cases = [['Review nonce check: wallet RPC method unsupported', /does not support/], ['Review nonce check: RPC read timed out', /timed out/],
+    ['Review nonce check: invalid EIP-1193 response', /invalid response/], ['Review nonce check: RPC and wallet RPC disagree', /consistent transaction state/]]
+  for (const [raw, reason] of cases) { const message = plainMessage(raw); assert.match(message, reason); assert.match(message, /No swap transaction was requested/); assert.match(message, /confirmed token approval is unchanged/) }
+  assert.match(plainMessage('Approval nonce check: nonce'), /No new approval transaction was requested/)
+  assert.match(plainMessage('Confirm nonce check: nonce'), /final wallet checks/)
+})
 await test('exchange rates are computed from exact amounts and formatted without grouping the decimals', () => {
   const r = display.exchangeRate
   assert.equal(r(1000000n, 6, 892564n, 6), '0.89256'); assert.equal(r(1000000n, 6, 1119247n, 6), '1.1192'); assert.equal(r(1000000n, 6, 1225n, 8), '0.00001225')

@@ -242,10 +242,10 @@ export function createUniswapApprovals(ports: ApprovalPorts) {
   }
   const code = (error: unknown) => error instanceof Error ? error.message : ''
   function failureMessage(error: unknown) {
-    if (error instanceof WalletRpcFailure) return `Nonce check: ${walletRpcMessage(error)}`
-    if (error instanceof ExecutionNonceObservationError) return `Nonce check: ${approvalMessage('nonce')}`
+    if (error instanceof WalletRpcFailure) return `Approval nonce check: ${walletRpcMessage(error)}`
+    if (error instanceof ExecutionNonceObservationError) return `Approval nonce check: ${approvalMessage('nonce')}`
     const c = code(error)
-    return approvalMessage(['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(c) ? 'nonce' : c)
+    return ['nonce', 'nonce_rpc', 'nonce_pending', 'nonce_regression', 'public_nonce', 'wallet_nonce'].includes(c) ? `Approval nonce check: ${approvalMessage('nonce')}` : approvalMessage(c)
   }
   async function currentStep(request: ArcRequest, owner: Hex): Promise<{ step: ApprovalStep; remaining: number; reads: ApprovalReads }> {
     let reads: ApprovalReads

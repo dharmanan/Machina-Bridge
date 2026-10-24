@@ -5,6 +5,14 @@
 // Order matters: the first rule that matches wins, so the specific messages come before the general ones (a replaced swap mentions a
 // nonce too, but it was sent; a binding mismatch names the nonce among other fields).
 const RULES: [RegExp, string][] = [
+  [/^Review nonce check:.*method unsupported/i, 'Swap review is blocked because your wallet does not support a required read. No swap transaction was requested. Any confirmed token approval is unchanged.'],
+  [/^Review nonce check:.*timed out/i, 'The wallet read timed out while preparing this swap review. No swap transaction was requested. Any confirmed token approval is unchanged. Try Review Swap again in a moment.'],
+  [/^Review nonce check:.*invalid EIP-1193 response/i, 'Your wallet returned an invalid response while preparing this swap review. No swap transaction was requested. Any confirmed token approval is unchanged.'],
+  [/^Review nonce check:.*another pending transaction/i, 'Swap review is blocked by a pending wallet transaction. Wait for it to finish. No swap transaction was requested; any confirmed token approval is unchanged.'],
+  [/^Review nonce check:.*disagree|^Review nonce check:.*inconsistent eth_getTransactionCount/i, 'Your wallet and Arc do not report a consistent transaction state for this swap review. No swap transaction was requested. Any confirmed token approval is unchanged. Try Review Swap again in a moment.'],
+  [/^Review nonce check:/i, 'The wallet checks for this swap review could not be verified. No swap transaction was requested. Any confirmed token approval is unchanged. Try Review Swap again in a moment.'],
+  [/^Confirm nonce check:/i, 'The final wallet checks for this swap could not be verified. No swap transaction was requested. Any confirmed token approval is unchanged. Review a fresh swap before continuing.'],
+  [/^Approval nonce check:/i, 'The wallet checks for this token approval could not be verified. No new approval transaction was requested. Previously confirmed approvals are unchanged.'],
   [/nonce was used by another transaction/i, 'This swap was replaced in your wallet (for example by a speed-up or cancel). Paste the hash your wallet shows for the replacement. It is only accepted if it is the swap you reviewed.'],
   [/does not know that hash/i, 'Arc doesn’t know that transaction hash (yet), so it was not saved. Check the hash in your wallet or on Arc Explorer and paste it again.'],
   [/does not identify the reviewed|hash differ/i, 'This transaction doesn’t match the swap you reviewed, so it isn’t counted as this swap. You can look at it on Arc Explorer. Please don’t send another swap until the earlier one is settled.'],

@@ -413,7 +413,7 @@ await test('EIP-1193 rejection, permissions, unsupported methods and connectivit
     f.provider.request = args => args.method === 'eth_getTransactionCount' ? Promise.reject({ cause: { data: { originalError: { code, message: 'SECRET' } } } }) : original(args)
     await f.controller.prepare(); const message = f.controller.current().error
     assert.ok(message.includes(label), message); assert.ok(message.includes(`code ${code}`), message)
-    assert.ok(!message.includes('disagree')); assert.ok(!message.includes('SECRET')); assert.equal(f.stats.preflight, 1); assert.equal(f.sent().length, 0)
+    assert.ok(!message.includes('disagree')); assert.ok(!message.includes('SECRET')); assert.equal(f.stats.preflight, code === -32000 ? 2 : 1); assert.equal(f.sent().length, 0)
   }
 })
 await test('unrecognized or hostile error objects cannot leak arbitrary fields, names or codes', async () => {
@@ -540,10 +540,42 @@ await test('nonce read timeout is bounded and a late result cannot authorize a t
     f.provider.request = args => args.method === 'eth_getTransactionCount' ? new Promise(resolve => { release = resolve }) : original(args)
     const pending = f.controller.prepare()
     for (let i = 0; i < 100 && !release; i++) await Promise.resolve()
-    assert.ok(release); mock.timers.tick(3000); await pending
+    assert.ok(release); mock.timers.tick(3000)
+    for (let i = 0; i < 100; i++) await Promise.resolve()
+    mock.timers.tick(300)
+    for (let i = 0; i < 100; i++) await Promise.resolve()
+    mock.timers.tick(3000); await pending
     assert.match(f.controller.current().error, /latest.*RPC read timed out/); release('0x7'); await Promise.resolve()
     assert.equal(f.controller.current().phase, 'idle'); assert.equal(f.sent().length, 0)
   } finally { mock.timers.reset() }
+})
+await test('a transient wallet read error retries once with a full preflight; unsupported and malformed responses are not retried', async () => {
+  for (const mode of ['transient', 'persistent', 'unsupported', 'malformed']) {
+    const f = setup(), original = f.provider.request; let reads = 0
+    f.provider.request = args => {
+      if (args.method === 'eth_getTransactionCount') {
+        reads++
+        if (mode === 'malformed') return Promise.resolve(null)
+        if (mode === 'unsupported' || mode === 'persistent' || reads === 1) return Promise.reject({ code: mode === 'unsupported' ? -32601 : -32000 })
+      }
+      return original(args)
+    }
+    await f.controller.prepare(); assert.equal(f.sent().length, 0)
+    assert.equal(f.stats.preflight, ['transient', 'persistent'].includes(mode) ? 2 : 1)
+    assert.equal(f.controller.current().phase, mode === 'transient' ? 'review' : 'idle')
+  }
+})
+await test('a wallet read failure retains a higher partial nonce observation; a later agreeing lower nonce remains blocked', async () => {
+  const f = setup(), original = f.provider.request; let reads = 0
+  f.provider.request = args => {
+    if (args.method === 'eth_getTransactionCount') {
+      reads++; if (reads === 1) return Promise.resolve('0x8')
+      if (reads === 2) return Promise.reject({ code: -32000 })
+    }
+    return original(args)
+  }
+  await f.controller.prepare(); assert.equal(f.stats.preflight, 2); assert.equal(f.sent().length, 0)
+  assert.equal(f.controller.current().phase, 'idle'); assert.match(f.controller.current().error, /moved backwards/i)
 })
 await test('provider acquisition timeout and malformed identity data never produce a prepared intent', async () => {
   mock.timers.enable({ apis: ['setTimeout'] })
