@@ -57,7 +57,7 @@ jobs:
           done
       - name: Confirm source gates remain closed until wallet canary
         run: |
-          node -e "const fs=require('fs');const x=fs.readFileSync('src/config/mainnetBorrow.ts','utf8');for(const s of ['MAINNET_BORROW_WRITES_ENABLED = false','MAINNET_BORROW_EXECUTION_BOUND = false'])if(!x.includes(s))process.exitCode=1;"
+          node -e "const fs=require('fs');const x=fs.readFileSync('src/config/mainnetBorrow.ts','utf8');for(const name of ['MAINNET_BORROW_WRITES_ENABLED','MAINNET_BORROW_EXECUTION_BOUND']){const pattern=new RegExp('export\\s+const\\s+'+name+'(?:\\s*:\\s*boolean)?\\s*=\\s*false\\b');if(!pattern.test(x)){console.error(name+' must remain false');process.exitCode=1;}}"
 
   security-audit:
     runs-on: ubuntu-latest
