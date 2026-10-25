@@ -119,7 +119,7 @@ export default function MainnetSwapScreen() {
   const shortcutLock = useRef(false)
   const [shortcutBusy, setShortcutBusy] = useState(false)
   const [shortcutError, setShortcutError] = useState<{ context: { key: string }; message: string } | null>(null)
-  const pilotRoute = SWAP_EXECUTION.mode === 'pilot' && provider === 'uniswap' && tokenIn === 'USDC' && tokenOut === 'EURC'
+  const pilotRoute = SWAP_EXECUTION.enabled && SWAP_EXECUTION.mode === 'pilot' && provider === 'uniswap' && tokenIn === 'USDC' && tokenOut === 'EURC'
   const inputCap = pilotRoute ? ARC_PILOT_MAX_INPUT / 10n ** 12n : undefined
   async function selectBalance(percent: number) {
     if (!arcReady || !address || shortcutLock.current) return

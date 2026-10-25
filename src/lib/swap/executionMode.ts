@@ -9,13 +9,13 @@ import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '..
 //         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
 // In both modes the execution switch itself (VITE_UNISWAP_ARC_PILOT_ENABLED === "true") must be on: it remains the single kill switch of
 // the build. Neither mode weakens a transaction check; they only decide whether a request may start.
-export type SwapExecutionMode = 'pilot' | 'open'
+export type SwapExecutionMode = 'off' | 'pilot' | 'open'
 export interface SwapExecutionConfig { enabled: boolean; mode: SwapExecutionMode; wallet: string }
 
 export function swapExecutionConfig(enabled?: string, wallet?: string, mode?: string): SwapExecutionConfig {
   if (mode === 'pilot') { const pilot = arcPilotConfig(enabled, wallet); return Object.freeze({ enabled: pilot.enabled, mode: 'pilot', wallet: pilot.wallet }) }
   // Missing, misspelled or whitespace-padded modes never grant execution authority.
-  if (mode !== 'open') return Object.freeze({ enabled: false, mode: 'pilot', wallet: '' })
+  if (mode !== 'open') return Object.freeze({ enabled: false, mode: 'off', wallet: '' })
   const valid = typeof wallet === 'string' && isAddress(wallet) && BigInt(wallet) > 2n && !sameAddress(wallet, ARC_ROUTER)
   return Object.freeze({ enabled: enabled === 'true', mode: 'open', wallet: valid ? getAddress(wallet) : '' })
 }

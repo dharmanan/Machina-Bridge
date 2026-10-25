@@ -73,6 +73,7 @@ await test('execution claims match the real gates: the explicit pilot allows exa
   for (const invalid of [undefined, '', 'OPEN', 'PILOT', 'open ', ' pilot', 'invalid']) {
     const closed = mode.swapExecutionConfig('true', owner, invalid)
     assert.equal(closed.enabled, false)
+    assert.equal(closed.mode, 'off')
     assert.equal(buildStates(closed, true).filter(Boolean).length, 0, String(invalid))
     assert.equal(mode.executionChip(closed, { provider: 'uniswap', tokenIn: 'USDC', tokenOut: 'EURC' }, true).label, 'Preview only')
     assert.equal(mode.executionChip(closed, { provider: 'circle', tokenIn: 'EURC', tokenOut: 'USDC' }, true).label, 'Preview only')
