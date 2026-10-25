@@ -162,6 +162,8 @@ export function describeVerificationReason(reason: MarketVerificationReason): st
       return 'The market has no oracle.'
     case 'oracle_price_unavailable':
       return 'The oracle price could not be read or is zero.'
+    case 'block_context_changed':
+      return 'The chain snapshot changed during verification. Read the market again.'
     case 'irm_missing':
       return 'The market has no interest rate model.'
   }

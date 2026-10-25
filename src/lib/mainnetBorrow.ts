@@ -6,6 +6,7 @@ import {
   MAINNET_BORROW_CHAIN_ID,
   MAINNET_BORROW_READ_ONLY_ENABLED,
   MAINNET_BORROW_WRITES_ENABLED,
+  MAINNET_BORROW_EXECUTION_BOUND,
 } from '../config/mainnetBorrow'
 import {
   borrowActionAmount,
@@ -1066,6 +1067,7 @@ export async function executeBorrowWrite(request: BorrowWriteRequest): Promise<B
   // The gate is checked first: while it is false no wallet is read, no quote is requested, no adapter is created and no SDK
   // write method is reached, so no wallet prompt can appear.
   if (MAINNET_BORROW_WRITES_ENABLED !== true) return { status: 'refused', blockers: ['writes_disabled'] }
+  if (MAINNET_BORROW_EXECUTION_BOUND !== true) return { status: 'refused', blockers: ['execution_unbound'] }
   const boundary = await verifyBorrowWriteBoundary(request)
   if (boundary.status === 'refused') return boundary
   const { plan, adapter, idempotencyKey, attempts } = boundary

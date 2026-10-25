@@ -666,9 +666,9 @@ await test('persistent ledger: records survive a reload, a cut-off send becomes 
   // Resolving needs the person's confirmation and a position read after the attempt.
   assert.equal(page2.resolve(SCOPE_A, { positionReadAt: 500, acknowledged: false }), false)
   assert.equal(page2.resolve(SCOPE_A, { positionReadAt: 100, acknowledged: true }), false, 'a position read from before the attempt proves nothing')
-  assert.equal(page2.resolve(SCOPE_A, { positionReadAt: 500, acknowledged: true }), true)
-  assert.equal(page2.list().length, 0)
-  assert.equal(page2.begin(RECORD(), 600), true, 'after it was resolved a new, reviewed attempt may be recorded')
+  assert.equal(page2.resolve(SCOPE_A, { positionReadAt: 500, acknowledged: true }), false, 'a position timestamp cannot prove settlement of an interrupted submission')
+  assert.equal(page2.list().length, 1)
+  assert.equal(page2.begin(RECORD(), 600), false, 'unknown submissions remain blocked without independent receipt verification')
 })
 
 await test('persistent ledger: submitted, failed and confirmed attempts stay until resolved; a running one cannot be resolved', () => {
@@ -678,6 +678,7 @@ await test('persistent ledger: submitted, failed and confirmed attempts stay unt
   assert.equal(ledger.resolve(SCOPE_A, { positionReadAt: 999, acknowledged: true }), false, 'a send that is still running cannot be resolved')
   ledger.discard(SCOPE_A); assert.equal(ledger.get(SCOPE_A), null, 'a send that never reached the SDK is removed')
   for (const [status, detail] of [['submitted', { batchId: 'b1' }], ['failed', { errorCode: 'service_unavailable' }], ['confirmed', { batchId: 'b1', txHash: '0xabc' }]]) {
+    const storage = fakeStorage(), ledger = persistent(storage)
     assert.equal(ledger.begin(RECORD(), 100), true)
     ledger.finish(SCOPE_A, status, 150, detail)
     const record = ledger.get(SCOPE_A)
@@ -687,7 +688,8 @@ await test('persistent ledger: submitted, failed and confirmed attempts stay unt
     assert.equal(persistent(storage, 'page-2').get(SCOPE_A).status, status, `${status} survives a reload`)
     assert.equal(ledger.begin(RECORD(), 200), false)
     assert.equal(ledger.resolve(SCOPE_A, { positionReadAt: 150, acknowledged: true }), false, 'a read at the same moment is not after the attempt')
-    assert.equal(ledger.resolve(SCOPE_A, { positionReadAt: 151, acknowledged: true }), true)
+    assert.equal(ledger.resolve(SCOPE_A, { positionReadAt: 151, acknowledged: true }), false, 'SDK status plus a fresh position timestamp is not independent settlement proof')
+    assert.equal(persistent(storage).list().length, 1, 'the unresolved record survives')
   }
   assert.equal(persistent(storage).list().length, 0)
 })
@@ -841,8 +843,8 @@ await test('boundary: a second call while one is running, and a call after an un
   request.attempts.finish(scopeId, 'submitted', NOW + 1000)
   assert.deepEqual((await borrow.verifyBorrowWriteBoundary(request)).blockers, ['attempt_unresolved'])
   assert.equal(counters.getAdapter, 1)
-  assert.equal(request.attempts.resolve(scopeId, { positionReadAt: NOW + 2000, acknowledged: true }), true)
-  assert.equal((await borrow.verifyBorrowWriteBoundary(request)).status, 'cleared', 'after the position was read again a new, reviewed attempt may go ahead')
+  assert.equal(request.attempts.resolve(scopeId, { positionReadAt: NOW + 2000, acknowledged: true }), false)
+  assert.equal((await borrow.verifyBorrowWriteBoundary(request)).status, 'refused', 'a fresh service position cannot settle an unknown batch')
 })
 
 await test('boundary: the confirmed action must be this action for this wallet', async () => {
@@ -991,7 +993,7 @@ await test('boundary: after a reload an attempt that was running is "interrupted
   assert.equal(view.resolve(plan.scopeId, { positionReadAt: NOW - 1e9, acknowledged: true }), false)
   assert.equal(view.list().length, 1)
   assert.equal(view.resolve(plan.scopeId, { positionReadAt: NOW + 1e9, acknowledged: false }), false)
-  assert.equal(view.resolve(plan.scopeId, { positionReadAt: NOW + 1e9, acknowledged: true }), true)
+  assert.equal(view.resolve(plan.scopeId, { positionReadAt: NOW + 1e9, acknowledged: true }), false, 'failed SDK submissions also require independent settlement')
 })
 
 await test('boundary: a write that finished unknown, failed or confirmed stays recorded and blocks the next one', async () => {

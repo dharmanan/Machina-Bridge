@@ -6,6 +6,9 @@ export const MAINNET_BORROW_READ_ONLY_ENABLED: boolean = true
 // mainnet canary are reviewed. This is a source constant on purpose: no
 // environment variable, URL parameter or browser storage value can enable it.
 export const MAINNET_BORROW_WRITES_ENABLED: boolean = false
+// Separate from product rollout: the current EIP-5792 adapter cannot enforce the reviewed maximum wallet gas cost.
+// No environment variable or UI test option may assert that the production transport is economically bound.
+export const MAINNET_BORROW_EXECUTION_BOUND: boolean = false
 
 // BorrowChain.Arc in @circle-fin/borrow-kit@1.0.0 (API chain "ARC").
 export const MAINNET_BORROW_CHAIN = 'Arc' as const

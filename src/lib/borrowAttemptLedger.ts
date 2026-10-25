@@ -1,5 +1,6 @@
 import { MAINNET_BORROW_CHAIN_ID } from '../config/mainnetBorrow'
 import type { AttemptLogHealth, BorrowAttemptRecord, BorrowAttemptStatus, BorrowWriteAction } from './borrowWriteSafety'
+import { isBorrowSettlementProof, type BorrowSettlementProof } from './borrowSettlement'
 
 // The record of Borrow writes that were started from this browser, so a double click, a page reload or an unclear answer from the
 // wallet or the RPC cannot send the same write twice. Pure apart from the storage handed in; it has no wallet, SDK or network
@@ -9,13 +10,14 @@ import type { AttemptLogHealth, BorrowAttemptRecord, BorrowAttemptStatus, Borrow
 //  - fail closed: if the history cannot be read, written or understood, it says so (health().ok is false) and nothing is
 //    prepared. It is never emptied, repaired or reset on its own, because an empty history would allow a second send;
 //  - an attempt that is running, submitted, interrupted by a reload, failed or finished is "unresolved" until a person has
-//    confirmed it after a fresh read of the position (resolve); nothing clears it automatically, not even time;
+//    acknowledged an independently verified receipt/position proof (resolve); nothing clears it automatically, not even time;
 //  - what is saved is public and small: the wallet address and network the record belongs to, the market or loan, the amount,
 //    the status, an idempotency key and, if known, a batch ID or transaction hash. No key, seed phrase, signature, balance or
 //    quote is ever saved;
 //  - records are only applied to the wallet and network they were saved for, and one that does not match is treated as unreadable,
 //    not skipped.
 //
+// This ledger is not a cross-tab mutex. Submission must additionally hold the wallet-wide Web Lock.
 // Limits (also reported to the user): browser storage does not follow the person to another device or browser, and it can be
 // cleared by the person or the browser. It protects against reloads and double clicks, not against those.
 
@@ -29,9 +31,9 @@ export type BorrowAttemptLedger = {
   // Removes an attempt that provably never reached the SDK (the adapter could not be built or belongs to another wallet).
   discard(scopeId: string): void
   finish(scopeId: string, status: Exclude<BorrowAttemptStatus, 'in-flight' | 'interrupted'>, now: number, detail?: { batchId?: string; txHash?: string; errorCode?: string }): void
-  // Clears an unresolved attempt. Needs the person's confirmation and a read of the position made after the attempt. Returns
+  // Clears an unresolved attempt only with acknowledgment, a fresh position and independently issued settlement proof. Returns
   // whether it cleared.
-  resolve(scopeId: string, proof: { positionReadAt: number; acknowledged: boolean }): boolean
+  resolve(scopeId: string, proof: { positionReadAt: number; acknowledged: boolean; settlement?: BorrowSettlementProof }): boolean
 }
 
 // The part of the Web Storage API the ledger uses.
@@ -249,6 +251,11 @@ export function createPersistentAttemptLedger(
       // A cut-off attempt (another page's in-flight record) can be resolved like a submitted one; this page's own running attempt cannot.
       const status = record ? view(record).status : null
       if (!record || status === 'in-flight' || !(proof.positionReadAt > record.updatedAt)) return false
+      // A fresh service position timestamp is NOT proof that a submitted/unknown batch settled. Keep legacy records
+      // without a known hash unresolved; an independent exact-batch/receipt proof is required before re-enabling sends.
+      if (!isBorrowSettlementProof(proof.settlement) || !record.txHash
+        || proof.settlement.scopeId !== scopeId || proof.settlement.owner !== address.toLowerCase()
+        || proof.settlement.chainId !== chainId || proof.settlement.txHash.toLowerCase() !== record.txHash.toLowerCase()) return false
       return write(state.records.filter((candidate) => candidate !== record))
     },
   }

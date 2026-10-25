@@ -59,6 +59,7 @@ export type BorrowWalletState = {
 
 export type BorrowWriteBlocker =
   | 'writes_disabled'
+  | 'execution_unbound'
   | 'wallet_missing'
   | 'wrong_chain'
   | 'wallet_capability_missing'
@@ -847,6 +848,7 @@ export function borrowQuoteChange(reviewed: PreparedBorrowQuote, fresh: Prepared
 // Plain wording
 
 export const WRITE_BLOCKER_TEXT: Record<BorrowWriteBlocker, string> = {
+  execution_unbound: 'Exact batch and wallet fee limits are not bound to production execution.',
   writes_disabled: 'Real Borrow transactions are switched off in this release.',
   wallet_missing: 'No wallet is connected.',
   wrong_chain: 'The wallet is not on Arc mainnet.',

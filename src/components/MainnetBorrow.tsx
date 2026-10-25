@@ -1,3 +1,4 @@
+import { BorrowOperations } from './BorrowOperations'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useAccount } from 'wagmi'
 import {
@@ -1091,7 +1092,7 @@ function useBorrowModel({ market, verification, walletAddress, wallet, attemptLe
     gasWei === null ? null : `${formatUnitsText(gasWei, MAINNET_ARC_NATIVE_CURRENCY.decimals, 6)} ${MAINNET_ARC_NATIVE_CURRENCY.symbol} gas`,
     ...full.fees.map((fee) => { const text = amountText(fee.amount); return text === null ? null : `${text} ${fee.type} fee` }),
   ].filter((part): part is string => part !== null) : []
-  const gasFeesText = full ? (feeParts.length === 0 ? null : full.fees.length === 0 ? `${feeParts.join(' + ')}, no service fee` : feeParts.join(' + ')) : null
+  const gasFeesText = full ? (feeParts.length === 0 ? null : full.fees.length === 0 ? `${feeParts.join(' + ')}, no service fee reported in this quote` : feeParts.join(' + ')) : null
   // Raw comparison with the selected target; the two-decimal display never decides it.
   const met = shown ? healthTargetMet(shown.healthFactor, targetHealthFactor) : null
   const interest = full ? illustrativeYearlyInterest(full.loanAsset.amount, full.borrowApy) : null
@@ -1639,6 +1640,9 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
         <MarketsSection state={marketsState} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
         <CurrentLoan walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
         <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />
+        <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
+          positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
+          attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />
         <AdvancedDetails model={model} inputs={inputs} markets={markets} verifications={verifications} selectedId={selectedId} borrowAmount={borrowAmount}
           walletChainId={walletChainId} positions={positions} onRefreshQuote={refreshQuote} />
       </div>
