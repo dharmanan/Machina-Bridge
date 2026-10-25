@@ -9,13 +9,16 @@ import type { WalletBalanceReader } from './borrowWalletBalances'
 import { withBorrowOperationLock, type BorrowLockManager } from './borrowOperationLock'
 import { isBorrowSettlementProof, borrowSettlementMatchesQuote, type BorrowSettlementProof } from './borrowSettlement'
 
+import type { BorrowRecoveryResult } from './borrowRecovery'
+
 export class BorrowOperationError extends Error {}
+export class BorrowNotRequestedError extends BorrowOperationError {}
 const explain = (error: unknown) => error instanceof BorrowOperationError ? error.message : error instanceof Error && error.message === 'borrow_operation_busy' ? 'Another tab is using this wallet. No transaction was requested.' : error instanceof Error && error.message === 'borrow_lock_unavailable' ? 'Browser transaction locking is unavailable. Nothing was requested.' : 'The operation could not be independently verified. Nothing further was requested.'
-export const BORROW_EXECUTION_BLOCKER = 'Real transactions are closed. Exact SDK batch binding, enforceable wallet fee ceilings and independent result recovery are not connected to the production transport.'
+export const BORROW_EXECUTION_BLOCKER = 'Real transactions are closed. The production write gates are closed. EOA execution uses the separately bound SDK batch; unsupported atomic-wallet fee contracts remain blocked.'
 export type BorrowReview = { action: BorrowWriteAction; wallet: BorrowWalletState; prepared: PreparedBorrowQuote; evidence: BorrowWriteEvidence; maxGasCostWei: bigint; expiresAt: number; actionId: string }
 export type BorrowOperationState = {
   phase: 'idle' | 'quoting' | 'review' | 'checking' | 'wallet' | 'pending' | 'verified' | 'failed' | 'unknown' | 'blocked'
-  review: BorrowReview | null; message: string; batchId?: string; txHash?: string; actualGasWei?: bigint
+  review: BorrowReview | null; message: string; batchId?: string; txHash?: string; actualGasWei?: bigint; rpcEstimatedFeeWei?: bigint; requestFeeCeilingWei?: bigint; executionDeadlineMs?: number
 }
 export type BorrowOperationPorts = {
   readWallet(): Promise<BorrowWalletState | null>
@@ -23,8 +26,11 @@ export type BorrowOperationPorts = {
   attempts: BorrowAttemptLedger; locks: BorrowLockManager | null
   // Production intentionally provides neither callback until the SDK boundary has been independently bound.
   // Test doubles may exercise the lifecycle, but cannot enable the production SDK gate.
-  submit?: (review: BorrowReview, onSubmitted: (batchId: string, hash?: string) => void) => Promise<{ batchId: string; txHash?: string }>
+  walletStage?: 'bound'
+  submit?: (review: BorrowReview, onSubmitted: (batchId: string, hash?: string) => void, onWalletRequested?: () => void, onPrepared?: (details: Pick<BorrowOperationState, 'rpcEstimatedFeeWei' | 'requestFeeCeilingWei' | 'executionDeadlineMs'>) => void, isCurrent?: () => boolean) => Promise<{ batchId: string; txHash?: string }>
   verify?: (review: BorrowReview, batchId: string, hash?: string) => Promise<BorrowSettlementProof | null>
+  recover?: (scopeId: string) => Promise<BorrowRecoveryResult>
+  acknowledge?: (scopeId: string) => Promise<boolean>
   executionBlocker(): string | null
   now?: () => number
 }
@@ -36,7 +42,7 @@ export function borrowNativeBudget(prepared: PreparedBorrowQuote, gasCap: bigint
   return nativeLoan === null ? null : gasCap + nativeLoan
 }
 export function productionBorrowExecutionBlocker(): string | null {
-  return MAINNET_BORROW_WRITES_ENABLED !== true || MAINNET_BORROW_EXECUTION_BOUND !== true ? BORROW_EXECUTION_BLOCKER : 'Production SDK transport is not connected.'
+  return MAINNET_BORROW_WRITES_ENABLED !== true || MAINNET_BORROW_EXECUTION_BOUND !== true ? BORROW_EXECUTION_BLOCKER : null
 }
 export function createBorrowOperationController(ports: BorrowOperationPorts) {
   let state: BorrowOperationState = { phase: 'idle', review: null, message: '' }, generation = 0, busy = false
@@ -50,6 +56,20 @@ export function createBorrowOperationController(ports: BorrowOperationPorts) {
       generation++
       if (!busy && !['pending', 'unknown', 'verified'].includes(state.phase)) set({ phase: 'idle', review: null, message: 'Wallet, network or input changed. Request a new review.' })
       // A submitted/ambiguous transaction is never discarded by context changes.
+    },
+    async recover(scopeId: string) {
+      if (busy || !ports.recover) return
+      busy = true
+      try {
+        const result = await ports.recover(scopeId)
+        if ('proof' in result && isBorrowSettlementProof(result.proof)) set({ phase: result.status, review: null, txHash: result.proof.txHash, actualGasWei: result.proof.gasCostWei, message: result.message })
+        else set({ phase: result.status === 'pending' ? 'pending' : 'unknown', review: null, message: result.message })
+      } catch { set({ phase: 'unknown', review: null, message: 'Recovery could not be verified. Do not submit again.' }) }
+      finally { busy = false }
+    },
+    async acknowledge(scopeId: string) {
+      if (busy || !ports.acknowledge) return false
+      return ports.acknowledge(scopeId)
     },
     async prepare(action: BorrowWriteAction, target: number, maximumGas: string) {
       if (busy || ['pending', 'unknown'].includes(state.phase)) return
@@ -86,8 +106,10 @@ export function createBorrowOperationController(ports: BorrowOperationPorts) {
       if (blocker || !ports.submit || !ports.verify) { set({ ...state, message: blocker ?? BORROW_EXECUTION_BLOCKER }); return }
       busy = true
       let submitted = false
+      let feeDetails: Pick<BorrowOperationState, 'rpcEstimatedFeeWei' | 'requestFeeCeilingWei' | 'executionDeadlineMs'> = {}
       try {
         await withBorrowOperationLock(review.wallet.address!, async () => {
+          if (ports.attempts.list().length > 0) throw new BorrowNotRequestedError('An unresolved Borrow operation already uses this wallet. Recheck and acknowledge its verified result before another transaction.')
           set({ phase: 'checking', review, message: 'Checking wallet, quote and fee budget…' })
           const wallet = await ports.readWallet()
           if (!sameWallet(wallet, review.wallet) || token !== generation || now() >= review.expiresAt) throw new BorrowOperationError('Wallet changed or review expired. Request a new review.')
@@ -99,21 +121,22 @@ export function createBorrowOperationController(ports: BorrowOperationPorts) {
           const fee = 'gasFees' in fresh.quote.quote ? fresh.quote.quote.gasFees.reduce((s, x) => s + BigInt(x.feeWei), 0n) : null
           const nativeBudget = borrowNativeBudget(fresh.quote, review.maxGasCostWei)
           if (nativeBudget === null || fee === null || fee < 0n || fresh.evidence?.balances?.data.native == null || fresh.evidence.balances.data.native < nativeBudget || fee > review.maxGasCostWei || token !== generation || now() >= review.expiresAt || !sameWallet(await ports.readWallet(), review.wallet)) throw new BorrowOperationError('The fee budget, wallet or review is no longer valid.')
-          set({ phase: 'wallet', review, message: 'Waiting for your explicit wallet confirmation…' })
+          set({ phase: ports.walletStage === 'bound' ? 'checking' : 'wallet', review, message: ports.walletStage === 'bound' ? 'Preparing and simulating the signed atomic batch…' : 'Waiting for your explicit wallet confirmation…' })
           // The production port must call the existing executeBorrowWrite under this lock. It is intentionally absent.
           submitted = true // Once the boundary is reached, a thrown error may have submitted; retain ambiguity.
           const result = await ports.submit!(review, (batchId, txHash) => {
-            set({ phase: 'pending', review, batchId, txHash, message: 'Submitted. Waiting for independent chain verification.' })
-          })
-          set({ phase: 'pending', review, ...result, message: 'Checking the receipt and position independently…' })
+            set({ phase: 'pending', review, ...feeDetails, batchId, txHash, message: 'Submitted. Waiting for independent chain verification.' })
+          }, () => set({ phase: 'wallet', review, ...feeDetails, message: 'Check the final amounts and fee cap in your wallet.' }), details => { feeDetails = details; set({ ...state, ...details }) }, () => token === generation)
+          set({ phase: 'pending', review, ...feeDetails, ...result, message: 'Checking the receipt and position independently…' })
           const proof = await ports.verify!(review, result.batchId, result.txHash)
           if (!isBorrowSettlementProof(proof) || !borrowSettlementMatchesQuote(proof, review.action, review.prepared, review.evidence.market!.data.marketId, review.maxGasCostWei, review.evidence.targetHealthFactor) || proof.owner !== review.wallet.address!.toLowerCase() || proof.chainId !== MAINNET_BORROW_CHAIN_ID || proof.scopeId !== borrowAttemptScope(review.action, review.wallet.address!) || !result.txHash || proof.txHash.toLowerCase() !== result.txHash.toLowerCase()) {
-            set({ phase: 'unknown', review, ...result, message: 'Submission or result is not independently verified. Do not submit again.' }); return
+            set({ phase: 'unknown', review, ...feeDetails, ...result, message: 'Submission or result is not independently verified. Do not submit again.' }); return
           }
-          set({ phase: proof.status === 'verified' ? 'verified' : 'failed', review, batchId: result.batchId, txHash: proof.txHash, actualGasWei: proof.gasCostWei, message: proof.status === 'verified' ? 'Receipt and position changes independently verified.' : 'The chain receipt confirms that the transaction reverted. Gas was spent; no successful loan change is claimed.' })
+          set({ phase: proof.status === 'verified' ? 'verified' : 'failed', review, ...feeDetails, batchId: result.batchId, txHash: proof.txHash, actualGasWei: proof.gasCostWei, message: proof.status === 'verified' ? 'Receipt and position changes independently verified.' : 'The chain receipt confirms that the transaction reverted. Gas was spent; no successful loan change is claimed.' })
         }, ports.locks)
       } catch (error) {
-        set({ phase: submitted ? 'unknown' : 'blocked', review, message: submitted ? 'The submission outcome is unknown. No automatic retry is allowed.' : explain(error) })
+        if (error instanceof BorrowNotRequestedError) submitted = false
+        set({ phase: submitted ? 'unknown' : 'blocked', review, ...feeDetails, message: submitted ? 'The submission outcome is unknown. No automatic retry is allowed.' : explain(error) })
       } finally { busy = false }
     },
   }

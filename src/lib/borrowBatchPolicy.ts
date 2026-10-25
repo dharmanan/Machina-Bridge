@@ -46,7 +46,7 @@ export function verifyBorrowAtomicBatch(review: BorrowBatchReview, calls: readon
   if (execute.functionName !== 'execute') fail('borrow_execution_method')
   const [params, inputs, signature] = execute.args!
   if (params.metadata !== '0x' || signature.length !== 132 || params.deadline <= BigInt(Math.floor(now / 1000)) || params.deadline > BigInt(Math.floor(now / 1000) + 600)) fail('borrow_execution_deadline_or_metadata')
-  const add = review.kind === 'add-collateral'
+  const add = review.kind === 'add-collateral' || review.kind === 'repay'
   if (add) { if (executeIndex !== calls.length - 1) fail('borrow_extra_calls') }
   else {
     if (executeIndex < 1 || executeIndex !== calls.length - 2) fail('borrow_authorization_order')
@@ -104,7 +104,7 @@ export function verifyBorrowAtomicBatch(review: BorrowBatchReview, calls: readon
     } else if (decoded.functionName === 'repay') {
       const [, assets, shares, owner, data] = decoded.args
       if (!same(owner, review.owner) || data !== '0x' || !same(instruction.tokenIn, review.market.loanToken) || instruction.amountToApprove !== review.repayAssets
-        || (review.kind === 'close-loan' ? shares !== review.repayShares || shares <= 0n || assets !== 0n : shares !== 0n || assets !== review.repayAssets || assets <= 0n)) fail('borrow_repay_amount')
+        || (review.kind === 'close-loan' ? shares !== review.repayShares || shares <= 0n || assets !== 0n : !((shares === 0n && assets === review.repayAssets && assets > 0n) || (assets === 0n && shares === review.repayShares && shares > 0n)))) fail('borrow_repay_amount')
     } else if (decoded.functionName === 'withdrawCollateral') {
       const [, assets, owner, receiver] = decoded.args
       if (assets !== review.collateralOut || assets <= 0n || !same(owner, review.owner) || !same(receiver, ADAPTER) || instruction.amountToApprove !== 0n || !same(instruction.tokenIn, ZERO)) fail('borrow_collateral_out')

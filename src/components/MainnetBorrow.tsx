@@ -1,3 +1,4 @@
+import { detectBorrowAtomicSupport } from '../lib/borrowProduction'
 import { BorrowOperations } from './BorrowOperations'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useAccount } from 'wagmi'
@@ -238,11 +239,17 @@ function useWalletState(address: string | null, chainId: number | null, requestW
         throw error
       }
     }
-    detectAtomicBatchCapability(recording, address).then(
+    let adapterConfirmed = false
+    detectAtomicBatchCapability(recording, address).then(async capability => {
+      if (capability === 'supported') return capability
+      const resolved = await detectBorrowAtomicSupport(recording, address as `0x${string}`)
+      adapterConfirmed = resolved === 'supported'
+      return resolved
+    }).then(
       (capability) => {
         if (!live) return
         const answer = seen.outcome === 'response' ? { response: seen.value } : seen.outcome === 'error' ? { error: seen.value } : { timedOut: true }
-        setProbe({ session, capability, summary: summarizeCapabilityAnswer(answer) })
+        setProbe({ session, capability, summary: adapterConfirmed ? 'The official Borrow adapter confirms an atomic mechanism for this address on Arc. Batch simulation and fee binding are checked separately.' : summarizeCapabilityAnswer(answer) })
       },
       () => { if (live) setProbe({ session, capability: 'unknown', summary: 'The question to the wallet failed.' }) },
     )
@@ -898,7 +905,7 @@ function StatusCard({ status, walletSupported, onRefresh }: { status: BorrowStat
           {walletSupported && status.id === 'checks-passed' && (
             <p className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-emerald-800" data-borrow-wallet-ok>
               <CheckCircle2 size={12} />
-              Wallet supports atomic transactions on Arc
+              Atomic transaction support is available on Arc
             </p>
           )}
         </div>

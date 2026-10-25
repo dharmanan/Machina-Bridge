@@ -19,6 +19,7 @@
   "dependencies": {
     "@circle-fin/adapter-solana": "^1.5.5",
     "@circle-fin/adapter-viem-v2": "^1.8.3",
+    "@circle-fin/borrow-adapter-viem-v2": "npm:@circle-fin/adapter-viem-v2@1.19.0",
     "@circle-fin/borrow-kit": "1.0.0",
     "@circle-fin/bridge-kit": "^1.8.3",
     "@circle-fin/earn-kit": "^1.7.0",

@@ -1,5 +1,6 @@
 import { MAINNET_BORROW_CHAIN_ID } from '../config/mainnetBorrow'
 import type { AttemptLogHealth, BorrowAttemptRecord, BorrowAttemptStatus, BorrowWriteAction } from './borrowWriteSafety'
+import { isBorrowUnsentProof, type BorrowUnsentProof } from './borrowSubmissionGuard'
 import { isBorrowSettlementProof, type BorrowSettlementProof } from './borrowSettlement'
 
 // The record of Borrow writes that were started from this browser, so a double click, a page reload or an unclear answer from the
@@ -29,7 +30,7 @@ export type BorrowAttemptLedger = {
   // or when the record could not be saved, so two clicks cannot both go ahead and nothing goes ahead unrecorded.
   begin(record: { scopeId: string; actionId: string; kind: BorrowWriteAction['kind']; idempotencyKey: string }, now: number): boolean
   // Removes an attempt that provably never reached the SDK (the adapter could not be built or belongs to another wallet).
-  discard(scopeId: string): void
+  discard(scopeId: string, unsent?: BorrowUnsentProof): void
   finish(scopeId: string, status: Exclude<BorrowAttemptStatus, 'in-flight' | 'interrupted'>, now: number, detail?: { batchId?: string; txHash?: string; errorCode?: string }): void
   // Clears an unresolved attempt only with acknowledgment, a fresh position and independently issued settlement proof. Returns
   // whether it cleared.
@@ -230,12 +231,15 @@ export function createPersistentAttemptLedger(
       if (state.records.length >= MAX_RECORDS) return false
       return write([...state.records, { ...record, status: 'in-flight', startedAt: now, updatedAt: now, session: instance }])
     },
-    discard(scopeId) {
+    discard(scopeId, unsent) {
       const state = read()
       if (!state.ok) return
       const record = state.records.find((candidate) => candidate.scopeId === scopeId)
-      // Only this page's own running attempt, and only when it never reached the SDK.
-      if (record && record.status === 'in-flight' && record.session === instance) write(state.records.filter((candidate) => candidate !== record))
+      // Only this page's own attempt. A post-SDK failure additionally requires a sealed transport proof; a mismatched proof never clears an older in-flight attempt.
+      const provenUnsent = record && isBorrowUnsentProof(unsent) && unsent.owner === address.toLowerCase() && unsent.scopeId === record.scopeId
+        && unsent.actionId === record.actionId && unsent.idempotencyKey === record.idempotencyKey && !record.txHash && !record.batchId
+        && ['in-flight', 'failed'].includes(record.status)
+      if (record && record.session === instance && (unsent === undefined ? record.status === 'in-flight' : provenUnsent)) write(state.records.filter((candidate) => candidate !== record))
     },
     finish(scopeId, status, now, detail = {}) {
       const state = read()

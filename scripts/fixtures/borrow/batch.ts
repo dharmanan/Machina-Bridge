@@ -34,9 +34,9 @@ export function batchFixture(kind = 'borrow', now = Date.now(), prepared = null)
   const auth = value => ({ to: BLUE, data: encodeFunctionData({ abi: BORROW_MORPHO_ABI, functionName: 'setAuthorization', args: [ADAPTER, value] }) })
   const encode = () => [
     ...tokenInputs.map(t => ({ to: t.token, data: encodeFunctionData({ abi: BORROW_TOKEN_ABI, functionName: 'approve', args: [ADAPTER, t.amount] }) })),
-    ...(kind === 'add-collateral' ? [] : [auth(true)]),
+    ...(['add-collateral', 'repay'].includes(kind) ? [] : [auth(true)]),
     { to: ADAPTER, data: encodeFunctionData({ abi: BORROW_ADAPTER_ABI, functionName: 'execute', args: [params, tokenInputs, signature] }) },
-    ...(kind === 'add-collateral' ? [] : [auth(false)]),
+    ...(['add-collateral', 'repay'].includes(kind) ? [] : [auth(false)]),
   ]
   return { review, calls: encode(), params, tokenInputs, encode }
 }

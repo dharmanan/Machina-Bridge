@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatUnits } from 'viem'
 import { MAINNET_CONFIG } from '../config/mainnet'
 import { MAINNET_BORROW_CHAIN_ID } from '../config/mainnetBorrow'
+import { createProductionBorrowPorts, detectBorrowAtomicSupport } from '../lib/borrowProduction'
+import { browserAttemptStorage } from '../lib/borrowAttemptLedger'
 import { browserBorrowLocks } from '../lib/borrowOperationLock'
 import { createBorrowOperationController, productionBorrowExecutionBlocker, readBorrowOperation, type BorrowOperationPorts, type BorrowOperationState } from '../lib/borrowOperations'
 import { borrowWalletSession, borrowActionAmount, describeBorrowWrite, type BorrowWalletState, type BorrowWriteAction } from '../lib/borrowWriteSafety'
@@ -30,8 +32,8 @@ export function BorrowOperations(props: BorrowOperationsProps) {
   const controller = useMemo(() => {
     if (props.ports) return createBorrowOperationController(props.ports)
     if (!props.attempts) return null
-    return createBorrowOperationController({
-      attempts: props.attempts, locks: browserBorrowLocks(), executionBlocker: productionBorrowExecutionBlocker,
+    return createBorrowOperationController(createProductionBorrowPorts({
+      attempts: props.attempts, request: () => ref.current.requestWallet, storage: browserAttemptStorage,
       async readWallet() {
         const current = ref.current
         if (!current.wallet?.address || !current.requestWallet) return null
@@ -39,13 +41,13 @@ export function BorrowOperations(props: BorrowOperationsProps) {
           const request = current.requestWallet
           const [chain, accounts] = await Promise.all([request({ method: 'eth_chainId' }), request({ method: 'eth_accounts' })])
           if (chain !== '0x13b2' || !Array.isArray(accounts) || typeof accounts[0] !== 'string' || accounts[0].toLowerCase() !== current.wallet.address.toLowerCase()) return null
-          const atomicBatch = await detectAtomicBatchCapability(request, current.wallet.address)
+          const atomicBatch = await detectBorrowAtomicSupport(request, current.wallet.address as `0x${string}`)
           return { address: current.wallet.address, chainId: MAINNET_BORROW_CHAIN_ID, atomicBatch, atomicBatchFor: borrowWalletSession(current.wallet.address, MAINNET_BORROW_CHAIN_ID) }
         } catch { return null }
       },
       prepare: (action, wallet, hf) => readBorrowOperation(action, wallet, hf, { client: ref.current.client,
         verifyMarket: ref.current.verifyMarket ?? (m => verifyBorrowMarket(m, reader)), balances: ref.current.readBalances ?? balances }),
-    })
+    }))
   }, [props.attempts, props.ports, reader, balances])
   useEffect(() => {
     setState(controller?.getState() ?? { phase: 'idle', review: null, message: '' })
@@ -81,7 +83,7 @@ export function BorrowOperations(props: BorrowOperationsProps) {
   const busy = ['quoting', 'checking', 'wallet', 'pending', 'unknown'].includes(state.phase)
   const history = props.attempts?.list() ?? props.ports?.attempts.list() ?? []
   return <section className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 sm:p-6" data-borrow-operations data-phase={state.phase}>
-    <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-semibold text-slate-900">Review loan actions</h2><span className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-900">Transactions closed</span></div>
+    <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-semibold text-slate-900">Review loan actions</h2><span className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-900">{blocked ? 'Transactions closed' : 'Review before wallet confirmation'}</span></div>
     <p className="mt-2 text-xs leading-5 text-slate-600">Prepare a current review for any loan action. Reviewing never requests an approval, signature or transaction.</p>
     <div className="mt-4 grid gap-3 sm:grid-cols-2">
       <label className="text-xs font-medium text-slate-600">Action<select aria-label="Borrow action" value={kind} onChange={e => setKind(e.target.value as BorrowWriteAction['kind'])} className={inputStyle} disabled={busy}>{Object.entries(TITLES).map(([value, title]) => <option value={value} key={value}>{title}</option>)}</select></label>
@@ -100,17 +102,20 @@ export function BorrowOperations(props: BorrowOperationsProps) {
         <div><dt>Wallet / recipient</dt><dd className="break-all">{state.review.wallet.address}</dd></div>
         <div><dt>Market</dt><dd className="break-all">{state.review.evidence.market?.data.marketId}</dd></div>
         {description.movements.map((m, i) => <div key={i} className="flex flex-wrap justify-between gap-2"><dt>{m.label}</dt><dd className="font-medium tabular-nums">{m.ceiling ? 'Up to ' : ''}{m.amount.amount} {m.amount.token}</dd></div>)}
-        <div><dt>Resulting health factor</dt><dd>{quote?.resultingHealthFactor ?? 'Not reported'}</dd></div>
-        <div><dt>Estimated gas cost</dt><dd>{gas === null ? 'Not reported' : `${formatUnits(gas, 18)} USDC`}</dd></div>
-        <div><dt>Your maximum gas budget</dt><dd>{formatUnits(state.review.maxGasCostWei, 18)} USDC — transport enforcement not yet available</dd></div>
+        <div><dt>Estimated resulting health factor</dt><dd>{quote?.resultingHealthFactor ?? 'Not reported'}</dd></div>
+        <div><dt>Circle quote gas estimate</dt><dd>{gas === null ? 'Not reported' : `${formatUnits(gas, 18)} USDC`}</dd></div>
+        {state.rpcEstimatedFeeWei !== undefined && <div><dt>Atomic batch RPC fee estimate</dt><dd>{formatUnits(state.rpcEstimatedFeeWei, 18)} USDC</dd></div>}
+        {state.requestFeeCeilingWei !== undefined && <div><dt>Maximum fee requested from wallet</dt><dd>{formatUnits(state.requestFeeCeilingWei, 18)} USDC</dd></div>}
+        {state.executionDeadlineMs !== undefined && <div><dt>On-chain execution deadline (UTC)</dt><dd>{new Date(state.executionDeadlineMs).toISOString()}</dd></div>}
+        <div><dt>Your maximum gas budget</dt><dd>{formatUnits(state.review.maxGasCostWei, 18)} USDC — reject a higher fee in your wallet; unsupported fee transports are blocked</dd></div>
         <div><dt>Service fees</dt><dd>{description.fees.length ? description.fees.map(f => `${f.amount.amount} ${f.amount.token} (${f.type})`).join(', ') : 'None reported in this quote'}</dd></div>
         <div><dt>Quote validity</dt><dd>{expired ? 'Expired — request a new review' : `${Math.max(0, Math.ceil((state.review.expiresAt - now) / 1000))} seconds`}</dd></div>
       </dl>
-      <p className="mt-3 text-xs leading-5 text-slate-600">Check final amounts, recipient and additional fees in your wallet. A browser extension may modify a request after this review. A service quote is not a verified executable batch.</p>
+      <p className="mt-3 text-xs leading-5 text-slate-600">Check final amounts, recipient and additional fees in your wallet. A browser extension may modify a request after this review. The actual signed batch must pass independent decoding and atomic simulation before the wallet is requested. Wallet edits can still change what is signed. Reject a delayed wallet request after expiry: an expired execution can revert and still spend gas; this page cannot cancel it.</p>
       <button className={buttonStyle + ' mt-3'} disabled={Boolean(blocked) || expired || state.phase !== 'review'} onClick={() => void controller?.confirm()}>Confirm {description.title}</button>
     </div>}
     {state.txHash && <p className="mt-3 break-all text-xs"><a target="_blank" rel="noreferrer" href={`https://arcscan.app/tx/${state.txHash}`}>View transaction {state.txHash}</a></p>}
     {state.actualGasWei !== undefined && <p className="mt-2 text-sm">Actual verified gas cost: {formatUnits(state.actualGasWei, 18)} USDC</p>}
-    {history.length > 0 && <details className="mt-4 text-xs"><summary>Unresolved operation history ({history.length})</summary>{history.map(row => <div key={row.scopeId} className="mt-2 break-all">{row.kind}: {row.status}{row.batchId && ` · batch ${row.batchId}`}{row.txHash && <a href={`https://arcscan.app/tx/${row.txHash}`} target="_blank" rel="noreferrer"> · Explorer</a>}<p>Do not resubmit an unresolved operation. A new position timestamp alone cannot unlock it.</p></div>)}</details>}
+    {history.length > 0 && <details className="mt-4 text-xs"><summary>Unresolved operation history ({history.length})</summary>{history.map(row => <div key={row.scopeId} className="mt-2 break-all">{row.kind}: {row.status}{row.batchId && ` · batch ${row.batchId}`}{row.txHash && <a href={`https://arcscan.app/tx/${row.txHash}`} target="_blank" rel="noreferrer"> · Explorer</a>}<p>Do not resubmit an unresolved operation. A new position timestamp alone cannot unlock it.</p><button className="mt-2 underline" onClick={() => void controller?.recover(row.scopeId)}>Recheck on-chain status</button>{['verified', 'failed'].includes(state.phase) && state.txHash === row.txHash && <button className="ml-3 underline" onClick={() => { void controller?.acknowledge(row.scopeId).then(ok => { if (ok) setNow(Date.now()) }) }}>Acknowledge verified result</button>}</div>)}</details>}
   </section>
 }

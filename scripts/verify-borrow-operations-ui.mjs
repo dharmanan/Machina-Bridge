@@ -9,6 +9,8 @@ let chromium; try { ({ chromium } = require('playwright-core')) } catch { ({ chr
 const root = fileURLToPath(new URL('..', import.meta.url)), artifacts = '/workspace/artifacts/borrow-production-ui'
 mkdirSync(artifacts, { recursive: true })
 const server = await createServer({ root, configFile: false, cacheDir: '/tmp/machina-borrow-vite-cache', server: { host: '127.0.0.1', port: 0 }, plugins: [{ name: 'borrow-controlled-ui', configureServer(s) {
+  s.middlewares.use('/__borrow_sdk_ui', async (_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(await s.transformIndexHtml('/__borrow_sdk_ui', '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="root"></div><script type="module" src="/scripts/fixtures/borrow/ui.tsx"></script></body></html>')) })
+  s.middlewares.use('/__borrow_workspace', async (_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(await s.transformIndexHtml('/__borrow_workspace', '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="root"></div><script type="module" src="/scripts/fixtures/borrow/ui.tsx"></script></body></html>')) })
   s.middlewares.use('/__borrow_test', async (_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(await s.transformIndexHtml('/__borrow_test', '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="root"></div><script type="module" src="/scripts/fixtures/borrow/ui.tsx"></script></body></html>')) })
 } }] })
 await server.listen(); const base = `http://127.0.0.1:${server.httpServer.address().port}`
@@ -74,9 +76,42 @@ try {
   })
   await test('mobile review retains warnings, fee distinction and no horizontal overflow', async () => {
     await reset(page, 'production-closed'); await page.setViewportSize({ width: 390, height: 844 }); await review(page, 'close-loan')
-    assert.match(await page.locator('body').innerText(), /transport enforcement not yet available/)
+    assert.match(await page.locator('body').innerText(), /reject a higher fee in your wallet; unsupported fee transports are blocked/)
+    assert.match(await page.locator('body').innerText(), /expired execution can revert and still spend gas/)
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: artifacts + '/mobile-close-review.png', fullPage: true })
+  })
+  await test('the complete existing Borrow workspace mounts the production read/review ports with both write gates closed', async () => {
+    await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base + '/__borrow_workspace')
+    await page.getByLabel('Borrow action', { exact: true }).waitFor(); await review(page, 'repay')
+    assert.equal(await page.getByRole('button', { name: 'Confirm Repay', exact: true }).isDisabled(), true)
+    assert.ok((await page.evaluate(() => window.workspaceReads)).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
+    await page.screenshot({ path: artifacts + '/workspace-desktop.png', fullPage: true })
+    await page.setViewportSize({ width: 390, height: 844 })
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
+    await page.screenshot({ path: artifacts + '/workspace-mobile.png', fullPage: true })
+  })
+  await test('ordinary EOA without native EIP-5792 is recognized through the official adapter without enabling writes', async () => {
+    let codeReads = 0
+    await page.route('https://rpc.mainnet.arc.io/**', async route => {
+      const body = route.request().postDataJSON(); assert.ok(['eth_getCode','eth_chainId'].includes(body.method))
+      if (body.method === 'eth_getCode') codeReads++
+      return route.fulfill({ json: { jsonrpc: '2.0', id: body.id, result: body.method === 'eth_chainId' ? '0x13b2' : body.params[0].toLowerCase() === '0x1111111111111111111111111111111111111111' ? '0x' : '0x6000' } })
+    })
+    await page.evaluate(() => localStorage.clear()); await page.goto(base + '/__borrow_workspace?eoa=1'); await review(page, 'repay')
+    assert.ok(codeReads >= 2); assert.equal(await page.getByRole('button', { name: 'Confirm Repay', exact: true }).isDisabled(), true)
+    assert.ok((await page.evaluate(() => window.workspaceReads)).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
+    await page.unroute('https://rpc.mainnet.arc.io/**')
+  })
+  for (const kind of ['borrow','borrow-more','repay','close-loan','add-collateral','withdraw-collateral']) await test('actual SDK in Chromium: ' + kind + ' → bounded EIP-1193 request → independently verified result', async () => {
+    await page.evaluate(() => localStorage.clear()); await page.goto(base + '/__borrow_sdk_ui'); await page.getByLabel('Borrow action', { exact: true }).waitFor()
+    await review(page, kind)
+    assert.equal(await page.evaluate(() => window.sdkUi.walletRequests.filter(r => r.method === 'eth_sendTransaction').length), 0)
+    await page.getByRole('button', { name: /^Confirm / }).click(); await phase(page, 'verified')
+    assert.equal(await page.evaluate(() => window.sdkUi.walletRequests.filter(r => r.method === 'eth_sendTransaction').length), 1)
+    assert.match(await page.locator('body').innerText(), /Atomic batch RPC fee estimate/)
+    assert.match(await page.locator('body').innerText(), /Maximum fee requested from wallet/)
+    if (kind === 'close-loan') await page.screenshot({ path: artifacts + '/sdk-browser-close-result.png', fullPage: true })
   })
   assert.deepEqual(errors, []); assert.equal(external, 0)
   console.log(`RESULT ${count}/${count} PASS; real external requests/signatures/transactions=0; Chromium controlled ports`)
