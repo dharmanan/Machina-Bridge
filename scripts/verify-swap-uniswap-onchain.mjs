@@ -407,12 +407,18 @@ await test('the read-only adapter separates reverts from outages, backs off on r
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // Execution mode
-await test('the execution mode defaults to the full multi-direction swap; the earlier pilot is selected only by the exact string "pilot", and the execution switch stays the kill switch of both', () => {
-  for (const value of [undefined, '', 'OPEN', 'open', 'PILOT', 'Pilot', 'pilot ', 'true', '1']) assert.equal(mode.swapExecutionConfig('true', owner, value).mode, 'open', String(value))
-  assert.equal(mode.swapExecutionConfig('true', owner, 'pilot').mode, 'pilot'); assert.equal(mode.swapExecutionConfig('true', undefined, undefined).enabled, true) // the build switch alone enables the default mode
+await test('only explicit open grants general execution; missing/invalid modes fail closed and pilot/kill switch restrictions remain', () => {
+  for (const value of [undefined, '', 'OPEN', 'PILOT', 'Pilot', 'pilot ', ' open', 'open ', 'true', '1']) {
+    const config = mode.swapExecutionConfig('true', owner, value)
+    assert.equal(config.enabled, false, String(value))
+    assert.equal(mode.swapExecutionRestriction(config, requestFor('USDC', 'EURC'), { connected: true, owner, chainId: 5042 }), 'disabled')
+    assert.equal(mode.circleExecutionRestriction(config, { owner }, { connected: true, owner, chainId: 5042 }, true), 'disabled')
+  }
+  assert.equal(mode.swapExecutionConfig('true', owner, 'open').enabled, true)
+  assert.equal(mode.swapExecutionConfig('true', owner, 'pilot').mode, 'pilot')
   for (const value of [undefined, 'open', 'pilot']) { assert.equal(mode.swapExecutionConfig('false', owner, value).enabled, false, String(value)); assert.equal(mode.swapExecutionConfig('TRUE', owner, value).enabled, false, String(value)); assert.equal(mode.swapExecutionConfig(undefined, owner, value).enabled, false, String(value)) }
   assert.equal(mode.swapExecutionConfig('true', other, 'pilot').enabled, false) // the pilot still demands the approved wallet
-  assert.equal(mode.swapExecutionConfig('true', other, undefined).mode, 'open'); assert.equal(mode.swapExecutionConfig('true', p.ARC_ROUTER, undefined).wallet, '') // a router address is never taken as a wallet
+  assert.equal(mode.swapExecutionConfig('true', other, 'open').mode, 'open'); assert.equal(mode.swapExecutionConfig('true', p.ARC_ROUTER, 'open').wallet, '') // a router address is never taken as a wallet
 })
 await test('pilot mode lets exactly one request through: the approved wallet, USDC to EURC, at most 0.1 USDC', () => {
   const config = mode.swapExecutionConfig('true', owner, 'pilot'), ctx = { connected: true, owner, chainId: 5042 }

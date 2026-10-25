@@ -3,7 +3,7 @@ import { arcPilotAllows, arcPilotConfig, ARC_PILOT_APPROVED_WALLET, ARC_PILOT_MA
 import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '../uniswapArcPolicy'
 
 // Who may execute which swap. Two modes:
-//   open  (the default) every supported direction, both providers, any externally owned wallet.
+//   open  (explicit opt-in only) every supported direction, both providers, any externally owned wallet.
 //         Amounts remain bounded by balances, contract types and the existing economic/transaction checks.
 //   pilot the earlier controlled pilot, kept only as an explicit fallback: exactly the approved wallet, native USDC -> EURC, at most
 //         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
@@ -14,6 +14,8 @@ export interface SwapExecutionConfig { enabled: boolean; mode: SwapExecutionMode
 
 export function swapExecutionConfig(enabled?: string, wallet?: string, mode?: string): SwapExecutionConfig {
   if (mode === 'pilot') { const pilot = arcPilotConfig(enabled, wallet); return Object.freeze({ enabled: pilot.enabled, mode: 'pilot', wallet: pilot.wallet }) }
+  // Missing, misspelled or whitespace-padded modes never grant execution authority.
+  if (mode !== 'open') return Object.freeze({ enabled: false, mode: 'pilot', wallet: '' })
   const valid = typeof wallet === 'string' && isAddress(wallet) && BigInt(wallet) > 2n && !sameAddress(wallet, ARC_ROUTER)
   return Object.freeze({ enabled: enabled === 'true', mode: 'open', wallet: valid ? getAddress(wallet) : '' })
 }

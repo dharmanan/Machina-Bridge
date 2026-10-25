@@ -53,7 +53,7 @@ await test('approval claims match the code of each controller', () => {
     }
   }
 })
-await test('execution claims match the real gates: the explicit pilot allows exactly Uniswap USDC>EURC; the default mode allows all Uniswap and all Circle directions; Circle is never in the pilot', () => {
+await test('execution claims match the real gates: the explicit pilot allows exactly Uniswap USDC>EURC; explicit open allows all Uniswap and all Circle directions; Circle is never in the pilot', () => {
   const pilot = mode.swapExecutionConfig('true', owner, 'pilot'), open = mode.swapExecutionConfig('true', undefined, 'open'), ctx = { connected: true, owner, chainId: 5042 }
   const req = (tokenIn, tokenOut, extra = {}) => p.validateArcRequest({ chainId: 5042, tokenIn, tokenOut, owner, recipient: owner, amount: tokenIn === 'cirBTC' ? '0.00001' : tokenIn === 'WETH' ? '0.0003' : '0.1', minimumOutput: '1', slippageBps: 50, maxNetworkFee: '100000000000000000', ...extra })
   let pilotEnabled = 0
@@ -70,7 +70,13 @@ await test('execution claims match the real gates: the explicit pilot allows exa
   assert.equal(pilotEnabled, 1); assert.equal(circle.CIRCLE_SWAP_WRITES_ENABLED, true)
   const buildStates = (config, circleOpen) => m.SUPPORT_MATRIX.map(e => m.executionInBuild(e, config, circleOpen).available)
   assert.equal(buildStates(pilot, false).filter(Boolean).length, 1); assert.equal(buildStates(open, false).filter(Boolean).length, 12); assert.equal(buildStates(open, true).filter(Boolean).length, 24)
-  assert.equal(buildStates(mode.swapExecutionConfig('true', undefined, undefined), circle.CIRCLE_SWAP_WRITES_ENABLED).filter(Boolean).length, 24) // the default build opens all 24
+  for (const invalid of [undefined, '', 'OPEN', 'PILOT', 'open ', ' pilot', 'invalid']) {
+    const closed = mode.swapExecutionConfig('true', owner, invalid)
+    assert.equal(closed.enabled, false)
+    assert.equal(buildStates(closed, true).filter(Boolean).length, 0, String(invalid))
+    assert.equal(mode.executionChip(closed, { provider: 'uniswap', tokenIn: 'USDC', tokenOut: 'EURC' }, true).label, 'Preview only')
+    assert.equal(mode.executionChip(closed, { provider: 'circle', tokenIn: 'EURC', tokenOut: 'USDC' }, true).label, 'Preview only')
+  }
   assert.equal(buildStates(mode.swapExecutionConfig('false', owner, 'pilot'), true).filter(Boolean).length, 0)
 })
 await test('Circle fixture claims match the decoded real transactions: 8 swaps over 7 directions; the other 5 are stated as not seen, never implied', () => {

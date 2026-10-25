@@ -1,4 +1,4 @@
-// Unified Swap screen in real Chromium (React + wagmi mock connector + localStorage + Web Locks), the default (multi-direction) execution mode.
+// Unified Swap screen in real Chromium (React + wagmi mock connector + localStorage + Web Locks), the explicit open (multi-direction) execution mode.
 // Arc RPC, Circle estimator and wallet are controlled test doubles: quotes are simulated by the fake RPC, wallet sends are recorded and
 // never broadcast. This verifies the product flows end to end; it is NOT live evidence and signs or sends nothing real.
 import assert from 'node:assert/strict'
@@ -40,7 +40,7 @@ const rpc = createFakeArcRpc({ viem, policy: p, simulator, routerRuntime: runtim
 rpc.state.owner = owner; rpc.state.block = 27_300_000n; rpc.state.gasPrice = 20_000_000_000n // about Arc's real gas price (21.5 gwei in the first swap)
 const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
 
-const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) },
+const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_SWAP_EXECUTION_MODE': JSON.stringify('open'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) },
   cacheDir: `${root}.verification/vite-unified-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
     name: 'read-only-baseline-lifecycle-probe', enforce: 'pre', transform(code, id) {
       if (process.env.MACHINA_TAB_BASELINE_PROBE !== '1') return
