@@ -1,0 +1,101 @@
+name: Machina production verification
+
+on:
+  push:
+    branches:
+      - main
+      - feature/uniswap-swap-preview
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: machina-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: TypeScript, lint, production bundle
+        run: |
+          npx tsc --noEmit
+          npm run lint
+          npm run build
+      - name: Borrow, Swap, Bridge, Earn, Activity and Dashboard
+        run: |
+          set -euo pipefail
+          for suite in \
+            verify-release-dependency-security \
+            verify-mainnet-borrow verify-mainnet-borrow-preview \
+            verify-mainnet-borrow-write-safety verify-borrow-operations \
+            verify-borrow-sdk-integration \
+            verify-mainnet-swap-preview verify-swap-support-matrix \
+            verify-swap-amount-shortcuts verify-swap-approvals \
+            verify-swap-display verify-swap-verification \
+            verify-swap-uniswap-onchain verify-uniswap-arc-preview \
+            verify-uniswap-arc-timing verify-uniswap-arc-api-security \
+            verify-uniswap-arc-execution verify-swap-permit-single \
+            verify-swap-circle-execution verify-wallet-activity-fixes \
+            verify-mainnet-solana-bridgekit \
+            verify-arc-intelligence-dashboard \
+            verify-arc-intelligence-dashboard-completion
+          do
+            echo "::group::$suite"
+            node "scripts/$suite.mjs"
+            echo "::endgroup::"
+          done
+      - name: Confirm source gates remain closed until wallet canary
+        run: |
+          node -e "const fs=require('fs');const x=fs.readFileSync('src/config/mainnetBorrow.ts','utf8');for(const s of ['MAINNET_BORROW_WRITES_ENABLED = false','MAINNET_BORROW_EXECUTION_BOUND = false'])if(!x.includes(s))process.exitCode=1;"
+
+  security-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Production dependency advisories (blocking; no suppression)
+        run: npm audit --omit=dev --audit-level=high
+
+  browser-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Prepare Chromium test dependencies
+        run: |
+          npm install --no-save --package-lock=false --ignore-scripts playwright-core@1.58.2
+          npx --yes playwright@1.58.2 install --with-deps chromium
+          CHROME="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f | head -n 1)"
+          test -n "$CHROME"
+          sudo ln -sf "$CHROME" /usr/bin/chromium
+          sudo mkdir -p /workspace/artifacts/borrow-production-ui
+          sudo chown -R "$(id -u):$(id -g)" /workspace/artifacts
+      - name: Borrow and Swap real-Chromium fixture regressions (no wallet sends)
+        env:
+          PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
+        run: |
+          node scripts/verify-borrow-operations-ui.mjs
+          node scripts/verify-swap-unified-ui.mjs
