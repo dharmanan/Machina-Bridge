@@ -3406,7 +3406,9 @@ await test('Public Beta 4 Borrow write gate and supported transaction boundaries
   const app = readFileSync(sourcePath('src/App.tsx'), 'utf8');
   const mainnetNav = app.slice(app.indexOf("{appNetwork === 'mainnet' && (", app.indexOf('{/* Row 1')), app.indexOf('<main className="flex-1">'));
   assert.match(mainnetNav, /id: 'earn'/, 'inspect the populated mainnet navigation');
-  assert.doesNotMatch(mainnetNav, /id: 'swap'/, 'no mainnet Swap navigation');
+  assert.match(mainnetNav, /id: 'swap'/, 'the integrated mainnet Swap entry remains available');
+  assert.match(app, /lazy\(\(\) => import\('\.\/components\/MainnetSwapScreen'\)\)/, 'mainnet Swap loads the unified screen, not the testnet engine');
+  assert.match(app, /<MainnetSwapPreview \/>/);
   assert.match(app, /activeTab === 'swap' && <SwapTab \/>/);
   assert.match(readFileSync(sourcePath('src/components/SwapTab.tsx'), 'utf8'), /Testnet swaps on Sepolia/);
   const earn = readFileSync(sourcePath('src/components/MainnetEarnPreview.tsx'), 'utf8');
