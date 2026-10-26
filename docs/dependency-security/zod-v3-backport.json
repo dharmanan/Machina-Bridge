@@ -1,0 +1,52 @@
+{
+  "advisory": "https://github.com/advisories/GHSA-mrhx-c7xc-m3w5",
+  "upstreamFix": "https://github.com/colinhacks/zod/commit/a0ebf970f2d752e5f58527cd2942ff48be4f46bd",
+  "upstreamPatchSha256": "ff9d50e239b53358f97855b86a9efb4f58e2bd4263cad0603fcf70b89945fe2f",
+  "scope": "Zod v3 array.max, array.length upper bound, set.max and set.size upper bound; CJS/ESM and 3.22.4 UMD. Package versions unchanged; raw npm audit still reports the advisory.",
+  "versions": {
+    "3.22.4": {
+      "lib/types.js": {
+        "before": "a6d505f69c7206366c02c5a219060eaa31c068753456d5cc00048dbd871ea937",
+        "after": "932d431ab73a34436da78ec4ffd847af209fcc3cf1edfdaa1891e5b9f97e48ec"
+      },
+      "lib/index.mjs": {
+        "before": "261f684c8d43538f73fd03d02fb063e10c5a378ed4c5ec654377b9d3bf2eb159",
+        "after": "71ed2c6a5eb96b4f0d1a313be385b1da01cd9e0386ce0c3664f9525cb9ece142"
+      },
+      "lib/index.umd.js": {
+        "before": "091773df10e773fcf5eee91628e8664cb6d447022e594b678624254300aee4cf",
+        "after": "c40cc72a7253c53de896c7b6731629af3f55539fb73807a56454df948c3d277b"
+      }
+    },
+    "3.25.67": {
+      "dist/cjs/v3/types.js": {
+        "before": "4c427c3e171c6c7b29203290304cfb09333fe7fd258e7570bfe9264e1a400904",
+        "after": "9e7b4ad710bc9f4e12d771f641db23af4ccfd4dfe711b0754ae31816251976e5"
+      },
+      "dist/esm/v3/types.js": {
+        "before": "e4f224b14e10b239d91ea444f027fce180f63043b24c5f22ede975e25e4fa951",
+        "after": "a3fb9c52d2d311cdb7a15116cfa796ccddd42342385869497549478fa8c815cd"
+      }
+    },
+    "3.25.76": {
+      "v3/types.cjs": {
+        "before": "06487cc05ed45c5dd29789bf0aa75734d1ce06592a7f2665ba4ca90a68e8a3e1",
+        "after": "bb3b8ea760f03943d5728d1098fa4b012691296c39919c314b76b382500ef84f"
+      },
+      "v3/types.js": {
+        "before": "9763a2938f0e7f983363ef4bf6530e7583e3f2d54f8a4a6684efad58febc6e8e",
+        "after": "b300b37df3a6cccd1608210af9dc0306a8c061221aeb6adb19651859c85d76d3"
+      }
+    },
+    "4.6.7": {
+      "v3/types.cjs": {
+        "before": "7a2f06d88e280bdd198c60e0d292ed7f1e3993e877be4415de07e6abc7746dd1",
+        "after": "2808423bdcafffeaff1bfc011271fb8a9c70797afcc25718d28b2ac72096e210"
+      },
+      "v3/types.js": {
+        "before": "d7214e1dacf9e6e70c9ca80247717b4be13b240510428fef132b7da3260d1a32",
+        "after": "0e0727d6514b71129c523d831501fe636a1145a3bc041177931180d3ea9322b6"
+      }
+    }
+  }
+}

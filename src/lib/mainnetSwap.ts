@@ -1,6 +1,8 @@
 import { createPublicClient, defineChain, erc20Abi, http, type Transport } from 'viem'
 import { ViemAdapter } from '@circle-fin/adapter-viem-v2'
 import { SwapKit, getChainByEnum } from '@circle-fin/swap-kit'
+import { installCircleResponseLimits } from './circleResponseLimits'
+import { parseSwapUnits, swapInputUnits } from './swap/tokens'
 import {
   MAINNET_SWAP_CHAIN_ID, MAINNET_SWAP_RPC, MAINNET_SWAP_TOKENS,
   MAINNET_SWAP_READ_ONLY_ENABLED, MAINNET_SWAP_WRITES_ENABLED,
@@ -27,19 +29,17 @@ export interface PreviewQuote {
 const addressPattern = /^0x[0-9a-fA-F]{40}$/
 const fail = (code: string): never => { throw new Error(code) }
 export function decimalUnits(value: unknown, decimals: number): bigint {
-  if (typeof value !== 'string' || value.length > 70 || !/^(0|[1-9]\d{0,29})(\.\d+)?$/.test(value)) return fail('invalid_amount')
-  const [whole, fraction = ''] = value.split('.')
-  if (fraction.length > decimals) return fail('invalid_amount')
-  return BigInt(whole + fraction.padEnd(decimals, '0'))
+  return parseSwapUnits(value, decimals)
 }
 export function validateSwapRequest(request: SwapQuoteRequest): void {
   if (!MAINNET_SWAP_READ_ONLY_ENABLED || MAINNET_SWAP_WRITES_ENABLED) fail('read_only_gate')
   if (!addressPattern.test(request.address) || /^0x0{40}$/i.test(request.address)) fail('wallet_required')
   if (request.chainId !== MAINNET_SWAP_CHAIN_ID) fail('wrong_network')
   if (!Object.prototype.hasOwnProperty.call(MAINNET_SWAP_TOKENS, request.tokenIn) || !Object.prototype.hasOwnProperty.call(MAINNET_SWAP_TOKENS, request.tokenOut)) fail('unsupported_token')
-  if (request.tokenIn === request.tokenOut || (request.tokenIn !== 'USDC' && request.tokenOut !== 'USDC')) fail('unsupported_route')
+  // Circle's service quotes every ordered pair of the four Arc tokens (verified live for all 12 directions); an identical pair is not a swap.
+  if (request.tokenIn === request.tokenOut) fail('unsupported_route')
   if (!(MAINNET_SWAP_SLIPPAGE_BPS as readonly number[]).includes(request.slippageBps)) fail('invalid_slippage')
-  if (decimalUnits(request.amount, MAINNET_SWAP_TOKENS[request.tokenIn].decimals) <= 0n) fail('invalid_amount')
+  swapInputUnits(request.amount, request.tokenIn)
 }
 export function swapRequestKey(request: SwapQuoteRequest): string {
   return [request.address.toLowerCase(), request.chainId, request.tokenIn, request.tokenOut, request.amount, request.slippageBps].join(':')
@@ -84,12 +84,17 @@ export function swapWalletState(connected: boolean, chainId?: number): 'disconne
 export function isCurrentSwapQuote(quote: PreviewQuote | null, request: SwapQuoteRequest | null, now: number): boolean {
   return Boolean(quote && request && quote.requestKey === swapRequestKey(request) && now < quote.expiresAt)
 }
+export const CIRCLE_NO_ROUTE_MESSAGE = 'Circle cannot provide a quote for this amount and direction right now. Another amount may work. You can choose Uniswap if it has a current quote.'
 export function swapPreviewError(error: unknown): string {
   const code = error instanceof Error ? error.message : ''
   if (/timeout/i.test(code)) return 'The quote request timed out. Try again shortly.'
   if (/quote_busy/.test(code)) return 'The previous quote request is still finishing. Try again shortly.'
   if (/expired/.test(code)) return 'The quote is no longer fresh. Request a new quote.'
   if (/wrong_network/.test(code)) return 'Select Arc Mainnet in your wallet to request a quote.'
+  // SDK code 1003 does not distinguish amount constraints, liquidity or internal routing filters.
+  if (/no route available/i.test(code)) return CIRCLE_NO_ROUTE_MESSAGE
+  if (/insufficient swap amount/i.test(code)) return 'Circle cannot quote such a small amount. Try a larger amount within your available balance.'
+  if (code === 'input_range') return 'This amount exceeds the supported contract number range. Enter a smaller amount.'
   if (/liquidity|route|not supported|unsupported/i.test(code)) return 'No supported quote is available for this direction. Try another pair.'
   if (/invalid_amount/.test(code)) return 'Enter a positive amount within the token precision.'
   return 'A verified quote could not be loaded. Try again shortly.'
@@ -152,19 +157,31 @@ export function createSwapReadAdapter() {
 // The SDK has no estimate AbortSignal. Keep the in-flight slot until it actually settles,
 // even after our UI deadline/abort, so retries cannot accumulate unbounded provider requests.
 export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => Promise<unknown>, timeoutMs = MAINNET_SWAP_TIMEOUT_MS) {
-  let pending = false
+  let pending: { released: boolean } | null = null
   return async (request: SwapQuoteRequest, signal: AbortSignal): Promise<PreviewQuote> => {
     validateSwapRequest(request)
     if (signal.aborted) return fail('quote_cancelled')
-    if (pending) return fail('quote_busy')
-    pending = true
     const requestedAt = Date.now()
+    const budgetStarted = performance.now()
+    // The SDK cannot abort its HTTP operation. An obsolete consumer releases its UI, NOT its SDK slot.
+    // Wait locally for that one slot, with the same deadline; never retry the service or stack SDK calls.
+    // Polling owns only a short timer, so cancelled edits cannot accumulate callbacks on a hung SDK promise.
+    while (pending?.released) {
+      if (signal.aborted) return fail('quote_cancelled')
+      if (performance.now() - budgetStarted >= timeoutMs) return fail('quote_timeout')
+      await new Promise(resolve => setTimeout(resolve, Math.min(25, timeoutMs)))
+    }
+    if (signal.aborted) return fail('quote_cancelled')
+    if (pending) return fail('quote_busy')
+    if (performance.now() - budgetStarted >= timeoutMs) return fail('quote_timeout')
+    const slot = { released: false }
+    pending = slot
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: () => void = () => undefined
-    const operation = Promise.resolve().then(() => estimate(request)).finally(() => { pending = false })
+    const operation = Promise.resolve().then(() => estimate(request)).finally(() => { if (pending === slot) pending = null })
     try {
       const raw = await Promise.race([operation, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('quote_timeout')), timeoutMs)
+        timer = setTimeout(() => reject(new Error('quote_timeout')), Math.max(1, timeoutMs - (performance.now() - budgetStarted)))
         abort = () => reject(new Error('quote_cancelled'))
         signal.addEventListener('abort', abort, { once: true })
         if (signal.aborted) abort()
@@ -172,6 +189,7 @@ export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => P
       if (signal.aborted) return fail('quote_cancelled')
       return normalizeSwapQuote(raw, request, Date.now(), requestedAt)
     } finally {
+      slot.released = true
       clearTimeout(timer)
       signal.removeEventListener('abort', abort)
     }
@@ -179,6 +197,7 @@ export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => P
 }
 let reader: ReturnType<typeof createSwapQuoteReader> | undefined
 export function readMainnetSwapQuote(request: SwapQuoteRequest, signal: AbortSignal): Promise<PreviewQuote> {
+  installCircleResponseLimits()
   if (!reader) {
     const kit = new SwapKit({ disableAnalytics: true, disableErrorReporting: true })
     const adapter = createSwapReadAdapter()

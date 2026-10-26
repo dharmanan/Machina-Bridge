@@ -1,0 +1,150 @@
+name: Machina production verification
+
+on:
+  push:
+    branches:
+      - main
+      - feature/uniswap-swap-preview
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full_release:
+        description: Run complete pre-merge acceptance
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: machina-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Source safety and compatible dependency guards
+        run: |
+          npx tsc --noEmit
+          node scripts/verify-production-ci.mjs
+          node scripts/verify-zod-collection-backport.mjs
+          node scripts/verify-circle-response-limits.mjs
+          node scripts/verify-borrow-source-gates.mjs
+  source-regressions:
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: TypeScript, lint, production bundle
+        run: |
+          npx tsc --noEmit
+          npm run lint
+          npm run build
+      - name: Borrow, Swap, Bridge, Earn, Activity and Dashboard
+        run: |
+          set -euo pipefail
+          for suite in \
+            verify-production-ci verify-zod-collection-backport verify-circle-response-limits verify-release-dependency-security \
+            verify-mainnet-borrow verify-mainnet-borrow-preview \
+            verify-mainnet-borrow-write-safety verify-borrow-operations \
+            verify-borrow-sdk-integration \
+            verify-mainnet-swap-preview verify-swap-support-matrix \
+            verify-swap-amount-shortcuts verify-swap-approvals \
+            verify-swap-display verify-swap-verification \
+            verify-swap-uniswap-onchain verify-uniswap-arc-preview \
+            verify-uniswap-arc-timing verify-uniswap-arc-api-security \
+            verify-uniswap-arc-execution verify-swap-permit-single \
+            verify-swap-circle-execution verify-wallet-activity-fixes \
+            verify-mainnet-solana-bridgekit \
+            verify-arc-intelligence-dashboard \
+            verify-arc-intelligence-dashboard-completion
+          do
+            echo "::group::$suite"
+            node "scripts/$suite.mjs"
+            echo "::endgroup::"
+          done
+      - name: Confirm public source gates remain closed; bounded canary is tested separately
+        run: node scripts/verify-borrow-source-gates.mjs
+      - name: Production dependency reachability evidence
+        run: node scripts/verify-security-bundle.mjs security-bundle.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-bundle-evidence
+          path: security-bundle.json
+
+  security-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Raw dependency advisories and explicit risk report
+        run: |
+          if npm audit --omit=dev --json > npm-audit-production.json; then
+            AUDIT_EXIT=0
+          else
+            AUDIT_EXIT=$?
+          fi
+          node scripts/report-dependency-audit.mjs npm-audit-production.json "$AUDIT_EXIT"
+          if npm audit --json > npm-audit-full.json; then
+            FULL_AUDIT_EXIT=0
+          else
+            FULL_AUDIT_EXIT=$?
+          fi
+          node scripts/report-dependency-audit.mjs npm-audit-full.json "$FULL_AUDIT_EXIT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: raw-production-audit
+          path: npm-audit-*.json
+
+  browser-regressions:
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Prepare Chromium test dependencies
+        run: |
+          npm install --no-save --package-lock=false --ignore-scripts playwright-core@1.58.2
+          npx --yes playwright@1.58.2 install --with-deps chromium
+          CHROME="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f | head -n 1)"
+          test -n "$CHROME"
+          sudo ln -sf "$CHROME" /usr/bin/chromium
+          sudo mkdir -p /workspace/artifacts/borrow-production-ui
+          sudo chown -R "$(id -u):$(id -g)" /workspace/artifacts
+      - name: Borrow and Swap real-Chromium fixture regressions (no wallet sends)
+        env:
+          PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
+        run: |
+          node scripts/verify-borrow-operations-ui.mjs
+          node scripts/verify-swap-unified-ui.mjs

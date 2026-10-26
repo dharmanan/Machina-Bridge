@@ -1,0 +1,319 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "@circle-fin/adapter-solana": {
+      "name": "@circle-fin/adapter-solana",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/adapter-solana"
+      ],
+      "fixAvailable": false
+    },
+    "@circle-fin/adapter-viem-v2": {
+      "name": "@circle-fin/adapter-viem-v2",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/adapter-viem-v2"
+      ],
+      "fixAvailable": false
+    },
+    "@circle-fin/borrow-kit": {
+      "name": "@circle-fin/borrow-kit",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@circle-fin/provider-borrow-service",
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/borrow-kit"
+      ],
+      "fixAvailable": false
+    },
+    "@circle-fin/bridge-kit": {
+      "name": "@circle-fin/bridge-kit",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@circle-fin/provider-cctp-v2",
+        "@circle-fin/provider-cctpx",
+        "@circle-fin/provider-fee-v1",
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/bridge-kit"
+      ],
+      "fixAvailable": false
+    },
+    "@circle-fin/earn-kit": {
+      "name": "@circle-fin/earn-kit",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@circle-fin/provider-earn-service",
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/earn-kit"
+      ],
+      "fixAvailable": false
+    },
+    "@circle-fin/provider-borrow-service": {
+      "name": "@circle-fin/provider-borrow-service",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/provider-borrow-service"
+      ],
+      "fixAvailable": true
+    },
+    "@circle-fin/provider-cctp-v2": {
+      "name": "@circle-fin/provider-cctp-v2",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/provider-cctp-v2"
+      ],
+      "fixAvailable": true
+    },
+    "@circle-fin/provider-cctpx": {
+      "name": "@circle-fin/provider-cctpx",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/provider-cctpx"
+      ],
+      "fixAvailable": true
+    },
+    "@circle-fin/provider-earn-service": {
+      "name": "@circle-fin/provider-earn-service",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/provider-earn-service"
+      ],
+      "fixAvailable": true
+    },
+    "@circle-fin/provider-fee-v1": {
+      "name": "@circle-fin/provider-fee-v1",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/provider-fee-v1"
+      ],
+      "fixAvailable": true
+    },
+    "@circle-fin/swap-kit": {
+      "name": "@circle-fin/swap-kit",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@ethersproject/abi"
+      ],
+      "effects": [],
+      "range": "",
+      "nodes": [
+        "node_modules/@circle-fin/swap-kit"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/abi": {
+      "name": "@ethersproject/abi",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/hash"
+      ],
+      "effects": [
+        "@circle-fin/adapter-solana",
+        "@circle-fin/adapter-viem-v2",
+        "@circle-fin/borrow-kit",
+        "@circle-fin/bridge-kit",
+        "@circle-fin/earn-kit",
+        "@circle-fin/provider-borrow-service",
+        "@circle-fin/provider-cctp-v2",
+        "@circle-fin/provider-cctpx",
+        "@circle-fin/provider-earn-service",
+        "@circle-fin/provider-fee-v1",
+        "@circle-fin/swap-kit"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/abi"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/abstract-provider": {
+      "name": "@ethersproject/abstract-provider",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/transactions"
+      ],
+      "effects": [
+        "@ethersproject/abstract-signer"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/abstract-provider"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/abstract-signer": {
+      "name": "@ethersproject/abstract-signer",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abstract-provider"
+      ],
+      "effects": [
+        "@ethersproject/hash"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/abstract-signer"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/hash": {
+      "name": "@ethersproject/hash",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/abstract-signer"
+      ],
+      "effects": [
+        "@ethersproject/abi"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/hash"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/signing-key": {
+      "name": "@ethersproject/signing-key",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "elliptic"
+      ],
+      "effects": [
+        "@ethersproject/transactions"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/signing-key"
+      ],
+      "fixAvailable": false
+    },
+    "@ethersproject/transactions": {
+      "name": "@ethersproject/transactions",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@ethersproject/signing-key"
+      ],
+      "effects": [
+        "@ethersproject/abstract-provider"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/@ethersproject/transactions"
+      ],
+      "fixAvailable": false
+    },
+    "elliptic": {
+      "name": "elliptic",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1112030,
+          "name": "elliptic",
+          "dependency": "elliptic",
+          "title": "Elliptic Uses a Cryptographic Primitive with a Risky Implementation",
+          "url": "https://github.com/advisories/GHSA-848j-6mx2-7j84",
+          "severity": "low",
+          "cwe": [
+            "CWE-1240"
+          ],
+          "cvss": {
+            "score": 5.6,
+            "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L"
+          },
+          "range": "<=6.6.1"
+        }
+      ],
+      "effects": [
+        "@ethersproject/signing-key"
+      ],
+      "range": "",
+      "nodes": [
+        "node_modules/elliptic"
+      ],
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 18,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 18
+    },
+    "dependencies": {
+      "prod": 718,
+      "dev": 224,
+      "optional": 29,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 943
+    }
+  }
+}

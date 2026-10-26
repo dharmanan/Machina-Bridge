@@ -1,0 +1,13 @@
+{
+  "source": "user-uploaded Machina-Uniswap-Quote-Evidence.zip",
+  "zipSha256": "e4168e35f8b2e17cb777e5d85d674ffd84d1f7d68f6260e4ade81d1d7e2f9e2e",
+  "files": {
+    "USDC-EURC.json": "c606f0ad1580f436750d8600cd12718e7abd99b398dc63252828a52d0dffa4d7",
+    "USDC-cirBTC.json": "5b72bce184b86deaaed6260e5338997650b7dae5b145ac3682ffc0860aa03889"
+  },
+  "omittedCaptureFields": [
+    "isTokenApprovalApplicable",
+    "permitData"
+  ],
+  "liveExecutionEligible": false
+}

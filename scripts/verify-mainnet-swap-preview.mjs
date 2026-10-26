@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url'
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 for (const extension of ['.ts', '.tsx']) require.extensions[extension] = (module, filename) => {
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
+  // Match the source-controlled canary release with no environment overrides.
+  const source = readFileSync(filename, 'utf8').replace(/import\.meta\.env\.VITE_(UNISWAP_ARC_PILOT_(ENABLED|WALLET)|SWAP_EXECUTION_MODE)/g, 'undefined')
+  const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true }, fileName: filename,
   })
   module._compile(outputText, filename)
@@ -54,7 +56,7 @@ await test('wallet, network, pair and slippage gates fail closed', () => {
   assert.equal(swap.swapWalletState(false), 'disconnected')
   assert.equal(swap.swapWalletState(true, 1), 'wrong_network')
   assert.equal(swap.swapWalletState(true, 5042), 'ready')
-  for (const change of [{ address: '' }, { address: `0x${'0'.repeat(40)}` }, { chainId: 1 }, { chainId: 5042002 }, { tokenOut: 'DAI' }, { tokenIn: 'constructor' }, { tokenOut: 'USDC' }, { tokenIn: 'cirBTC' }, { slippageBps: 0 }, { slippageBps: 301 }]) {
+  for (const change of [{ address: '' }, { address: `0x${'0'.repeat(40)}` }, { chainId: 1 }, { chainId: 5042002 }, { tokenOut: 'DAI' }, { tokenIn: 'constructor' }, { tokenOut: 'USDC' }, { tokenIn: 'EURC' }, { slippageBps: 0 }, { slippageBps: 301 }]) {
     assert.throws(() => swap.validateSwapRequest({ ...request, ...change }))
   }
 })
@@ -96,14 +98,16 @@ await test('WETH output, minimum, slippage and fee amounts retain all 18 decimal
     assert.throws(() => swap.normalizeSwapQuote({ ...data, [field]: { token: 'WETH', amount: '0.0041234567890123451' } }, input, 1000))
   }
 })
-await test('WETH input and balances use exact 18-decimal units and still require Arc USDC pairs', () => {
+await test('WETH input and balances use exact 18-decimal units; any ordered pair of the four tokens may be quoted, an identical pair may not', () => {
   const input = { ...request, tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004123456789012345' }
   assert.doesNotThrow(() => swap.validateSwapRequest(input))
   assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', 4123456789012344n), true)
   assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', 4123456789012345n), false)
   assert.equal(swap.hasInsufficientSwapBalance(input.amount, 'WETH', undefined), false)
   assert.throws(() => swap.validateSwapRequest({ ...input, amount: '0.0041234567890123451' }))
-  assert.throws(() => swap.validateSwapRequest({ ...input, tokenOut: 'EURC' }), /unsupported_route/)
+  // Circle's service returned a live quote for all 12 directed pairs on Arc (scripts/swap-provider-evidence.json); the old USDC-leg rule is gone.
+  for (const tokenOut of ['EURC', 'cirBTC']) assert.doesNotThrow(() => swap.validateSwapRequest({ ...input, tokenOut }))
+  assert.throws(() => swap.validateSwapRequest({ ...input, tokenOut: 'WETH' }), /unsupported_route/)
   assert.throws(() => swap.validateSwapRequest({ ...input, chainId: 1 }), /wrong_network/)
 })
 
@@ -145,25 +149,54 @@ await test('timeout does not release the in-flight slot or publish late output',
   const read = swap.createSwapQuoteReader(() => { calls++; return new Promise((done) => { resolve = done }) }, 10)
   const signal = new AbortController().signal
   await assert.rejects(read(request, signal), /quote_timeout/)
-  await assert.rejects(read(request, signal), /quote_busy/)
+  await assert.rejects(read(request, signal), /quote_timeout/)
   assert.equal(calls, 1)
   resolve(raw())
   await new Promise((done) => setTimeout(done, 0))
 })
 await test('aborted contexts cannot publish; settled operations allow a fresh request', async () => {
-  let resolve
-  const read = swap.createSwapQuoteReader(() => new Promise((done) => { resolve = done }), 100)
+  let resolve, calls = 0
+  const read = swap.createSwapQuoteReader(() => { calls++; return calls === 1 ? new Promise((done) => { resolve = done }) : Promise.resolve(raw()) }, 200)
   const controller = new AbortController()
   const promise = read(request, controller.signal)
   await Promise.resolve(); controller.abort()
   await assert.rejects(promise, /cancelled/)
-  await assert.rejects(read(request, new AbortController().signal), /busy/)
-  resolve(raw()); await new Promise((done) => setTimeout(done, 0))
   const next = read(request, new AbortController().signal)
-  await Promise.resolve(); resolve(raw())
+  await new Promise(done => setTimeout(done, 5)); assert.equal(calls, 1, 'obsolete SDK still owns its one slot')
+  resolve(raw())
   assert.equal((await next).estimatedOutput, '6.2')
+  assert.equal(calls, 2)
   const already = new AbortController(); already.abort()
   await assert.rejects(read(request, already.signal), /cancelled/)
+})
+await test('an active Circle consumer still rejects concurrent estimates; cancelled queued edits never reach the SDK', async () => {
+  let resolve, calls = 0
+  const read = swap.createSwapQuoteReader(input => { calls++; return calls === 1 ? new Promise(done => { resolve = done }) : Promise.resolve(raw(input)) }, 250)
+  const first = new AbortController(), second = new AbortController()
+  const old = read(request, first.signal)
+  await Promise.resolve()
+  await assert.rejects(read(request, new AbortController().signal), /quote_busy/)
+  first.abort(); await assert.rejects(old, /quote_cancelled/)
+  const superseded = read({ ...request, amount: '8' }, second.signal)
+  second.abort(); await assert.rejects(superseded, /quote_cancelled/)
+  const latest = read({ ...request, amount: '9' }, new AbortController().signal)
+  assert.equal(calls, 1)
+  resolve(raw())
+  const quote = await latest
+  assert.equal(quote.requestKey, swap.swapRequestKey({ ...request, amount: '9' }))
+  assert.equal(calls, 2, 'only the newest edit starts a replacement SDK call')
+})
+await test('waiting for a hung obsolete SDK call has a bounded monotonic deadline even when the device clock stops', async () => {
+  const originalNow = Date.now, controller = new AbortController()
+  const guard = setTimeout(() => controller.abort(), 300)
+  let calls = 0
+  try {
+    Date.now = () => 1000
+    const read = swap.createSwapQuoteReader(() => { calls++; return new Promise(() => {}) }, 15)
+    await assert.rejects(read(request, controller.signal), /quote_timeout/)
+    await assert.rejects(read(request, controller.signal), /quote_timeout/)
+    assert.equal(calls, 1)
+  } finally { Date.now = originalNow; clearTimeout(guard) }
 })
 await test('RPC and adapter boundaries deny all transaction/signature and wallet methods', () => {
   for (const method of ['eth_sendRawTransaction', 'eth_sendTransaction', 'eth_sign', 'personal_sign', 'eth_signTypedData_v4', 'wallet_switchEthereumChain', 'eth_requestAccounts']) assert.throws(() => swap.assertSwapReadMethod(method), /read_only/)
@@ -174,6 +207,12 @@ await test('RPC and adapter boundaries deny all transaction/signature and wallet
 })
 await test('error messages are bounded and do not expose raw provider payloads', () => {
   assert.match(swap.swapPreviewError(new Error('no liquidity')), /No supported quote/)
+  assert.match(swap.swapPreviewError(new Error('Stablecoin Service createSwap failed: Route or resource not found. Details: No route available')), /Circle cannot provide a quote for this amount/)
+  const noRoute = swap.swapPreviewError(Object.assign(new Error('No route available'), { code: 1003 }))
+  assert.match(noRoute, /amount and direction right now/)
+  assert.match(noRoute, /Another amount may work/)
+  assert.match(noRoute, /choose Uniswap if it has a current quote/)
+  assert.doesNotMatch(noRoute, /liquidity|minimum|0\.5|0\.1/)
   assert.match(swap.swapPreviewError(new Error('WETH is not supported')), /No supported quote/)
   assert.match(swap.swapPreviewError(new Error('quote_timeout')), /timed out/)
   assert.equal(swap.swapPreviewError(new Error('sensitive body and credentials')), 'A verified quote could not be loaded. Try again shortly.')
@@ -238,6 +277,14 @@ try {
     assert.ok(rpcCalls.includes('eth_call') && rpcCalls.includes('eth_gasPrice'))
     assert.ok(serviceBodies.every((body) => body.tokenInChain === 'Arc' && body.tokenOutChain === 'Arc' && body.slippageBps === 100))
   })
+  await test('real SDK quote serialization preserves large input strings beyond Number precision', async () => {
+    for (const [tokenIn, tokenOut, amount] of [['USDC', 'EURC', '1000000.123456'], ['EURC', 'USDC', '9007199254740993.123456'], ['WETH', 'USDC', '1000000000000.123456789012345678'], ['cirBTC', 'EURC', '100.12345678']]) {
+      const input = { ...request, tokenIn, tokenOut, amount }
+      const quote = await swap.readMainnetSwapQuote(input, new AbortController().signal)
+      assert.ok(quote.estimatedOutput)
+      assert.equal(serviceBodies.at(-1).amount, swap.decimalUnits(amount, tokens[tokenIn].decimals).toString())
+    }
+  })
   await test('WETH reverse direction requires a successful SDK quote and preserves 18-decimal input', async () => {
     const input = { ...request, tokenIn: 'WETH', tokenOut: 'USDC', amount: '0.004123456789012345' }
     const result = await swap.readMainnetSwapQuote(input, new AbortController().signal)
@@ -267,71 +314,82 @@ await test('only mainnet receives the new lazy Swap tab; legacy routes and defau
   const activity = readFileSync(`${root}src/components/MainnetWalletActivity.tsx`, 'utf8')
   assert.match(activity, /Activity data provided by Blockscout\./)
 })
-await test('UI cannot import execution helpers, and all requests are contextual and abortable', () => {
-  const component = readFileSync(`${root}src/components/MainnetSwapPreview.tsx`, 'utf8')
+await test('Circle preview remains read-only; unified UI delegates Uniswap to a separately gated controller', () => {
+  const component = readFileSync(`${root}src/components/MainnetSwapPreview.tsx`, 'utf8') + readFileSync(`${root}src/components/MainnetSwapScreen.tsx`, 'utf8') + readFileSync(`${root}src/components/UniswapArcExecution.tsx`, 'utf8') + readFileSync(`${root}src/components/UniswapApprovals.tsx`, 'utf8') + readFileSync(`${root}src/components/SwapActivity.tsx`, 'utf8')
   const library = readFileSync(`${root}src/lib/mainnetSwap.ts`, 'utf8')
   for (const source of [component, library]) assert.doesNotMatch(source, /\.swap\(|\.approve\(|sendTransaction\(|writeContract\(|signTypedData\(|personal_sign|useWalletClient|window\.ethereum|privateKeyToAccount/)
-  assert.match(component, /Swap disabled in Preview/)
-  assert.match(component, /<button type="button" disabled/)
+  assert.match(component, /restrictionMessage/)
+  assert.match(component, /disabled=\{!canContinue\}/)
   assert.match(component, /balance\.isSuccess/)
   assert.match(component, /generation\.current === expectedGeneration/)
   assert.match(component, /controller\.current\?\.abort\(\)/)
   assert.match(component, /sm:grid-cols-2/)
   assert.match(component, /break-all/)
+  assert.match(component, /UniswapReviewDialog/); assert.match(component, /ApprovalsPanel/); assert.match(component, /SwapActivityPanel/)
+  assert.match(readFileSync(`${root}src/lib/uniswapArcPolicy.ts`, 'utf8'), /export const UNISWAP_ARC_WRITES_ENABLED = true/)
 })
-console.log(`\n${passed} Mainnet Swap Preview checks passed. No live RPC, wallet or Circle request was sent.`)
 
 const Module = require('node:module')
 const originalRequire = Module.prototype.require
 const React = require('react')
 const { renderToStaticMarkup } = require('react-dom/server')
+const { QueryClient, QueryClientProvider } = require('@tanstack/react-query')
+const renderSwap = () => renderToStaticMarkup(React.createElement(QueryClientProvider, { client: new QueryClient() }, React.createElement(Component)))
 let wallet = { isConnected: false, chainId: undefined, address: undefined }
 let mockBalance = { isSuccess: false, isError: false, data: undefined }
+let mockNative = { data: undefined, isError: false }
 Module.prototype.require = function (id) {
-  if (id === 'wagmi') return { useAccount: () => wallet, useReadContract: () => mockBalance }
+  if (id === 'wagmi') return { useAccount: () => wallet, useReadContract: () => mockBalance, useBalance: () => mockNative }
   return originalRequire.apply(this, arguments)
 }
 let Component
-try { Component = require(`${root}src/components/MainnetSwapPreview.tsx`).default }
+try { Component = require(`${root}src/components/MainnetSwapScreen.tsx`).default }
 finally { Module.prototype.require = originalRequire }
 await test('disconnected DOM keeps quote and execution controls disabled', () => {
-  const html = renderToStaticMarkup(React.createElement(Component))
+  const html = renderSwap()
   assert.match(html, /Connect your wallet using the header/)
-  assert.match(html, /disabled=""[^>]*>Get live quote/)
-  assert.match(html, /disabled=""[^>]*>Swap disabled in Preview/)
-  assert.doesNotMatch(html, /Estimated receive/)
+  assert.doesNotMatch(html, />Get quote|>Refresh quote/)
+  assert.match(html, /disabled=""[^>]*>Review Swap/)
+  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
+  assert.doesNotMatch(html, /Estimated from a live quote/)
+  assert.match(html, /Controlled canary/)
+  assert.doesNotMatch(html, /Balance:/)
 })
 await test('wrong-network DOM is explicit and cannot request a quote', () => {
   wallet = { isConnected: true, chainId: 1, address }
-  const html = renderToStaticMarkup(React.createElement(Component))
-  assert.match(html, /Select Arc Mainnet \(chain ID 5042\)/)
-  assert.match(html, /disabled=""[^>]*>Get live quote/)
+  const html = renderSwap()
+  assert.match(html, /Switch your wallet to Arc Mainnet to get a quote/)
+  assert.doesNotMatch(html, />Get quote|>Refresh quote/)
 })
-await test('Arc wallet DOM reads token balance without claiming execution capacity', () => {
+await test('Arc wallet DOM shows independent native USDC balance without claiming execution capacity', () => {
   wallet = { isConnected: true, chainId: 5042, address }
-  mockBalance = { isSuccess: true, isError: false, data: 12345678n }
-  const html = renderToStaticMarkup(React.createElement(Component))
-  assert.match(html, /ERC-20 balance: 12\.345678 USDC/)
-  assert.match(html, /does not confirm gas coverage or transaction success/)
-  assert.match(html, /disabled=""[^>]*>Swap disabled in Preview/)
-  mockBalance = { isSuccess: false, isError: true, data: undefined }
-  const errorHtml = renderToStaticMarkup(React.createElement(Component))
-  assert.match(errorHtml, /Balance unavailable/)
-  assert.doesNotMatch(errorHtml, /ERC-20 balance: 0/)
+  mockNative = { data: { value: 192154955500000000n }, isError: false }
+  const html = renderSwap()
+  assert.match(html, /Balance: (<!-- -->)?0\.192154 USDC/)
+  assert.match(html, /disabled=""[^>]*>Review Swap/)
+  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
+  mockNative = { data: undefined, isError: true }
+  const errorHtml = renderSwap()
+  assert.match(errorHtml, /Balance: (<!-- -->)?unavailable/)
+  assert.doesNotMatch(errorHtml, /Balance: (<!-- -->)?0/)
 })
 await test('WETH is selectable in both directions and renders its full ERC-20 balance', () => {
   wallet = { isConnected: true, chainId: 5042, address }
-  const initialHtml = renderToStaticMarkup(React.createElement(Component))
+  const initialHtml = renderSwap()
   assert.equal((initialHtml.match(/<option>WETH<\/option>/g) ?? []).length, 2)
   assert.doesNotMatch(initialHtml, /WETH is not enabled/)
   const originalUseState = React.useState
   mockBalance = { isSuccess: true, isError: false, data: 4123456789012345n }
   React.useState = (initial) => originalUseState(initial === 'USDC' ? 'WETH' : initial === 'EURC' ? 'USDC' : initial)
   try {
-    const html = renderToStaticMarkup(React.createElement(Component))
-    assert.match(html, /ERC-20 balance: 0\.004123456789012345 WETH/)
-    assert.match(html, /Swap disabled in Preview/)
-    assert.match(html, /Route availability is confirmed only by a successful quote, including reverse directions/)
+    const html = renderSwap()
+    assert.match(html, /Balance: (<!-- -->)?0\.004123456789012345 WETH/)
+    // Both providers are always offered for every pair; neither is silently chosen on the user's behalf.
+    assert.match(html, /role="radiogroup" aria-label="Quote source"/)
+    assert.match(html, /aria-label="Uniswap quote"/); assert.match(html, /aria-label="Circle Swap Kit quote"/)
+    assert.equal((html.match(/aria-checked="true"/g) ?? []).length, 1)
+    assert.match(html, /disabled=""[^>]*>Review Swap/)
+    assert.match(html, /Controlled canary/)
   } finally { React.useState = originalUseState }
 })
 console.log(`${passed} total Mainnet Swap checks passed, including DOM states.`)

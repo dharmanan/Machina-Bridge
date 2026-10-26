@@ -9,7 +9,8 @@
     "verify:arc-dashboard": "node scripts/verify-arc-intelligence-dashboard.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
-    "postinstall": "node scripts/fix-viem-tsconfig.mjs",
+    "postinstall": "node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs",
+    "prebuild": "node scripts/apply-zod-collection-backport.mjs --check",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "verify:mainnet-cctp": "node scripts/verify-mainnet-cctp-production.mjs",
@@ -19,6 +20,7 @@
   "dependencies": {
     "@circle-fin/adapter-solana": "^1.5.5",
     "@circle-fin/adapter-viem-v2": "^1.8.3",
+    "@circle-fin/borrow-adapter-viem-v2": "npm:@circle-fin/adapter-viem-v2@1.19.0",
     "@circle-fin/borrow-kit": "1.0.0",
     "@circle-fin/bridge-kit": "^1.8.3",
     "@circle-fin/earn-kit": "^1.7.0",
@@ -75,10 +77,13 @@
     "uuid": "^14.0.0",
     "socket.io-parser": "4.2.7",
     "tmp": "0.2.7",
-    "toml": "^4.3.0",
+    "toml": "5.0.1",
     "browserslist": "^4.28.7",
     "decode-uri-component": "^0.5.0",
-    "stream-json": "^3.5.0",
-    "postcss-selector-parser": "^7.1.6"
+    "postcss-selector-parser": "^7.1.6",
+    "porto": {
+      "zod@^4.1.5": "4.6.7"
+    },
+    "jayson": "5.0.0"
   }
 }

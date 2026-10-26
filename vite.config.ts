@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { handleBorrowMarketsProxy } from './api/_lib/borrow-markets-proxy.js'
 import { handleIntelligenceProxy } from './api/_lib/intelligence-proxy.js'
+import { uniswapArcDevPreview } from './api/_lib/uniswap-arc-dev'
 
 function intelligenceDevProxy(): Plugin {
   return {
@@ -45,7 +46,7 @@ function intelligenceDevProxy(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), intelligenceDevProxy()],
+  plugins: [react(), intelligenceDevProxy(), uniswapArcDevPreview()],
   define: {
     global: 'globalThis',
   },

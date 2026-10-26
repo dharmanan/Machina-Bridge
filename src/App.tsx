@@ -21,7 +21,7 @@ import './index.css'
 
 // Loaded on first visit so the Borrow Kit SDK stays out of the main bundle.
 const MainnetBorrow = lazy(() => import('./components/MainnetBorrow'))
-const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapPreview'))
+const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapScreen'))
 
 type Tab = 'swap' | 'bridge' | 'earn' | 'borrow' | 'dashboard' | 'activity'
 

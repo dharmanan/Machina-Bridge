@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2022", "DOM", "DOM.Iterable"] },
+  "include": ["api/uniswap-arc-preview.ts", "api/_lib/uniswap-arc-preview.ts", "api/_lib/uniswap-arc-dev.ts", "src/lib/uniswapArcPolicy.ts", "src/lib/uniswapArcPreview.ts"],
+  "references": []
+}

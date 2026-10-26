@@ -1,5 +1,5 @@
 import { createPublicClient, encodeAbiParameters, http, keccak256, parseAbi, type Hex } from 'viem'
-import { MAINNET_BORROW_CHAIN_ID, MAINNET_BORROW_MORPHO_BLUE } from '../config/mainnetBorrow'
+import { MAINNET_BORROW_CHAIN_ID, MAINNET_BORROW_MAX_EVIDENCE_AGE_MS, MAINNET_BORROW_MORPHO_BLUE } from '../config/mainnetBorrow'
 import type { BorrowMarket } from './mainnetBorrow'
 
 // On-chain check of a Borrow Kit market against Morpho Blue on Arc. Circle's market list is a cache; this reads the market
@@ -28,10 +28,12 @@ export type OnchainMarketState = {
 // The reads verification needs. Injectable so the logic is testable without a network.
 export type MarketChainReader = {
   chainId(): Promise<number>
-  marketParams(id: string): Promise<MorphoMarketParams>
-  marketState(id: string): Promise<OnchainMarketState>
+  marketParams(id: string, blockNumber?: bigint): Promise<MorphoMarketParams>
+  marketState(id: string, blockNumber?: bigint): Promise<OnchainMarketState>
   // Morpho oracle price(): collateral priced in loan token, scaled by 10^(36 + loan decimals - collateral decimals).
-  oraclePrice(oracle: string): Promise<bigint>
+  oraclePrice(oracle: string, blockNumber?: bigint): Promise<bigint>
+  snapshot?(): Promise<{ number: bigint; hash: Hex; timestamp: bigint }>
+  canonical?(block: { number: bigint; hash: Hex }): Promise<boolean>
 }
 
 export type MarketVerificationReason =
@@ -44,6 +46,7 @@ export type MarketVerificationReason =
   | 'oracle_missing'
   | 'oracle_price_unavailable'
   | 'irm_missing'
+  | 'block_context_changed'
 
 export type MarketVerificationDetails = {
   params: MorphoMarketParams
@@ -51,6 +54,7 @@ export type MarketVerificationDetails = {
   oraclePrice: bigint | null
   // totalSupplyAssets - totalBorrowAssets, the amount Morpho can lend out right now.
   liquidity: bigint
+  block?: { number: bigint; hash: Hex; timestamp: bigint }
 }
 
 export type MarketVerification =
@@ -105,16 +109,22 @@ export async function verifyBorrowMarket(market: VerifiableMarket, reader: Marke
   try {
     const chainId = await reader.chainId()
     if (chainId !== MAINNET_BORROW_CHAIN_ID) return { status: 'unverified', reasons: ['wrong_chain'], details: null }
-    const [params, state] = await Promise.all([reader.marketParams(market.marketId), reader.marketState(market.marketId)])
+    const block = reader.snapshot ? await reader.snapshot() : undefined
+    if (block && (block.number < 0n || !/^0x[0-9a-fA-F]{64}$/.test(block.hash) || Math.abs(Date.now() - Number(block.timestamp) * 1000) > MAINNET_BORROW_MAX_EVIDENCE_AGE_MS)) return { status: 'unavailable' }
+    if (block && !reader.canonical) return { status: 'unavailable' }
+    const [params, state] = await Promise.all([reader.marketParams(market.marketId, block?.number), reader.marketState(market.marketId, block?.number)])
     let oraclePrice: bigint | null = null
     if (!same(params.oracle, ZERO_ADDRESS)) {
       try {
-        oraclePrice = await reader.oraclePrice(params.oracle)
+        oraclePrice = await reader.oraclePrice(params.oracle, block?.number)
       } catch {
         oraclePrice = null
       }
     }
-    return evaluateMarketVerification(market, { chainId, params, oraclePrice, ...state })
+    if (block && !await reader.canonical!(block)) return { status: 'unverified', reasons: ['block_context_changed'], details: null }
+    const result = evaluateMarketVerification(market, { chainId, params, oraclePrice, ...state })
+    if (result.status !== 'unavailable' && result.status !== 'checking' && result.details && block) result.details.block = block
+    return result
   } catch {
     return { status: 'unavailable' }
   }
@@ -133,16 +143,22 @@ export function createViemMarketReader(rpcUrl: string): MarketChainReader {
   return {
     // A failed read is not cached, so the next check asks again.
     chainId: () => (chain ??= client.getChainId().catch((error) => { chain = null; throw error })),
-    async marketParams(id) {
+    async snapshot() {
+      const block = await client.getBlock()
+      if (!block.hash) throw new Error('missing_block_hash')
+      return { number: block.number, hash: block.hash, timestamp: block.timestamp }
+    },
+    async canonical(block) { return (await client.getBlock({ blockNumber: block.number })).hash === block.hash },
+    async marketParams(id, blockNumber) {
       const [loanToken, collateralToken, oracle, irm, lltv] = await client.readContract({
-        address: MAINNET_BORROW_MORPHO_BLUE, abi: BLUE_ABI, functionName: 'idToMarketParams', args: [id as Hex],
+        address: MAINNET_BORROW_MORPHO_BLUE, abi: BLUE_ABI, functionName: 'idToMarketParams', args: [id as Hex], blockNumber,
       })
       return { loanToken, collateralToken, oracle, irm, lltv }
     },
-    async marketState(id) {
-      const state = await client.readContract({ address: MAINNET_BORROW_MORPHO_BLUE, abi: BLUE_ABI, functionName: 'market', args: [id as Hex] })
+    async marketState(id, blockNumber) {
+      const state = await client.readContract({ address: MAINNET_BORROW_MORPHO_BLUE, abi: BLUE_ABI, functionName: 'market', args: [id as Hex], blockNumber })
       return { totalSupplyAssets: state[0], totalBorrowAssets: state[2] }
     },
-    oraclePrice: (oracle) => client.readContract({ address: oracle as Hex, abi: ORACLE_ABI, functionName: 'price' }),
+    oraclePrice: (oracle, blockNumber) => client.readContract({ address: oracle as Hex, abi: ORACLE_ABI, functionName: 'price', blockNumber }),
   }
 }

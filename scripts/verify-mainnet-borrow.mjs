@@ -572,7 +572,12 @@ await test('application-facing exports cannot reach the raw Borrow Kit or its wr
     .flatMap((directory) => sourceFiles(join(root, directory)))
     .filter((path) => /\.(ts|tsx|js|mjs|cjs)$/.test(path))
     .filter((path) => /(from\s*|require\(\s*|import\(\s*)['"]@circle-fin\/(borrow-kit|provider-borrow-service)['"]/.test(readFileSync(path, 'utf8')))
-  assert.deepEqual(sdkImporters, [libPath])
+  assert.deepEqual(sdkImporters.sort(), [join(root, 'src/lib/borrowProduction.ts'), join(root, 'src/lib/borrowSdkTransport.ts'), libPath].sort())
+  for (const path of sdkImporters.filter(path => path !== libPath)) {
+    const source = readFileSync(path, 'utf8')
+    assert.match(source, /import \{ getChainByEnum, Blockchain \} from '@circle-fin\/borrow-kit'/)
+    assert.ok(!/new BorrowKit|new BorrowServiceProvider/.test(source), 'extra SDK importers use chain metadata, never instantiate another Borrow engine')
+  }
 })
 
 await test('caller input cannot override Arc or inject SDK config, base URL or credentials', async () => {
@@ -706,8 +711,10 @@ await test('SDK write calls exist only behind the write gate in executeBorrowWri
   const start = libSource.indexOf('export async function executeBorrowWrite(')
   assert.ok(start > 0)
   const body = libSource.slice(start)
-  const gate = body.indexOf("if (MAINNET_BORROW_WRITES_ENABLED !== true) return { status: 'refused', blockers: ['writes_disabled'] }")
+  const gate = body.indexOf("if (MAINNET_BORROW_WRITES_ENABLED !== true && !canary) return { status: 'refused', blockers: ['writes_disabled'] }")
   assert.ok(gate > 0, 'gate check present')
+  assert.ok(body.indexOf('borrowCanaryAdapterOwner(request.canaryAdapter)') < gate, 'canary requires a guarded-adapter identity')
+  assert.ok(body.indexOf('boundary.adapter !== request.canaryAdapter') > gate, 'the actual SDK adapter must be the attested instance')
   for (const method of borrow.MAINNET_BORROW_WRITE_METHODS) {
     const pattern = new RegExp(`client\\.${method}\\(`, 'g')
     const total = libSource.match(pattern)?.length ?? 0
@@ -721,7 +728,7 @@ await test('SDK write calls exist only behind the write gate in executeBorrowWri
   assert.ok(libSource.indexOf('request.getAdapter()') < start, 'and that place is the boundary, which executeBorrowWrite calls only after its gate')
 })
 
-await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reaches it only through read-only imports', () => {
+await test('Borrow stays isolated from Earn, Bridge and the engine; connected SDK writes remain independently gated', () => {
   const sourceFiles = (directory) => readdirSync(directory).flatMap((entry) => {
     const path = join(directory, entry)
     return statSync(path).isDirectory() ? sourceFiles(path) : [path]
@@ -735,11 +742,19 @@ await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reach
     importers.map((path) => relative(root, path)).sort(),
     [
       'src/components/ArcIntelligenceOverview.tsx',
+      'src/components/BorrowOperations.tsx',
       'src/components/MainnetBorrow.tsx',
       'src/lib/arcIntelligence.ts',
       'src/lib/borrowAttemptLedger.ts',
+      'src/lib/borrowBatchPolicy.ts',
       'src/lib/borrowMarketVerification.ts',
+      'src/lib/borrowOperationLock.ts',
+      'src/lib/borrowOperations.ts',
       'src/lib/borrowPreview.ts',
+      'src/lib/borrowProduction.ts',
+      'src/lib/borrowRecovery.ts',
+      'src/lib/borrowSdkTransport.ts',
+      'src/lib/borrowSettlement.ts',
       'src/lib/borrowWalletBalances.ts',
       'src/lib/borrowWriteSafety.ts',
     ],
@@ -750,6 +765,11 @@ await test('Borrow stays isolated from Earn, Bridge and the engine; the UI reach
   const WRITE_PATHS = /executeBorrowWrite|verifyBorrowWriteBoundary|BorrowWriteClient|MAINNET_BORROW_WRITE_METHODS|getAdapter|createViemAdapter|useWalletClient|signTypedData|sendTransaction|writeContract|eth_sendTransaction|wallet_sendCalls|wallet_switchEthereumChain|personal_sign/
   for (const path of importers) {
     const code = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+    if (['borrowProduction.ts', 'borrowSdkTransport.ts'].includes(path.split('/').at(-1))) {
+      if (path.endsWith('borrowProduction.ts')) { assert.match(code, /productionBorrowExecutionBlocker\(review.wallet.address\)/); assert.match(code, /requireCanary: true/) }
+      else { assert.match(code, /verifyBorrowAtomicBatch/); assert.match(code, /assertBorrowFeeBinding/); assert.match(code, /guard.markRequested\(\)/) }
+      continue
+    }
     assert.ok(!WRITE_PATHS.test(code), `${relative(root, path)} must not reach a Borrow write path`)
   }
   const engine = sourceFiles(join(root, 'server/compact')).filter((path) => /borrow-kit|mainnetBorrow/.test(readFileSync(path, 'utf8')))
