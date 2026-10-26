@@ -14,16 +14,16 @@ import { useSuiWallet } from './hooks/useSuiWallet'
 import { addChainToWallet, getEvmChainOptionsForNetwork, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
-import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp, Banknote, Activity as ActivityIcon } from 'lucide-react'
+import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp, Activity as ActivityIcon } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import DesignedByFooter from './components/DesignedByFooter'
 import './index.css'
 
-// Loaded on first visit so the Borrow Kit SDK stays out of the main bundle.
-const MainnetBorrow = lazy(() => import('./components/MainnetBorrow'))
+// Borrow is paused: its implementation remains in the repository, but no production
+// navigation or route imports it. The independent Intelligence lending data stays visible.
 const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapScreen'))
 
-type Tab = 'swap' | 'bridge' | 'earn' | 'borrow' | 'dashboard' | 'activity'
+type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard' | 'activity'
 
 export default function App() {
   const { isConnected, chainId } = useAccount()
@@ -521,7 +521,6 @@ export default function App() {
                 { id: 'bridge' as const, label: 'Bridge', icon: <GitBranch size={20} /> },
                 { id: 'swap' as const, label: 'Swap', icon: <Zap size={20} /> },
                 { id: 'earn' as const, label: 'Earn', icon: <TrendingUp size={20} /> },
-                { id: 'borrow' as const, label: 'Borrow', icon: <Banknote size={20} /> },
                 { id: 'dashboard' as const, label: 'Dashboard', icon: <BarChart3 size={20} /> },
                 { id: 'activity' as const, label: 'Activity', icon: <ActivityIcon size={20} /> },
               ].map((tab) => (
@@ -549,15 +548,9 @@ export default function App() {
             ? <MainnetDashboard />
             : activeTab === 'earn'
               ? <MainnetEarnPreview />
-              : activeTab === 'borrow'
-                ? (
-                  <Suspense fallback={<Container className="py-8"><p className="text-sm text-slate-500">Loading Borrow...</p></Container>}>
-                    <MainnetBorrow />
-                  </Suspense>
-                )
-                : activeTab === 'swap'
-                  ? <Suspense fallback={<Container className="py-8"><p className="text-sm text-slate-500">Loading Swap Preview...</p></Container>}><MainnetSwapPreview /></Suspense>
-                  : activeTab === 'activity'
+              : activeTab === 'swap'
+                ? <Suspense fallback={<Container className="py-8"><p className="text-sm text-slate-500">Loading Swap Preview...</p></Container>}><MainnetSwapPreview /></Suspense>
+                : activeTab === 'activity'
                   ? <MainnetWalletActivity />
                   : <MainnetPreviewGate />
         ) : (

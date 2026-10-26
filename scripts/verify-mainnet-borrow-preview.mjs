@@ -165,14 +165,19 @@ test('the Borrow tab states the risks and never recommends a market or amount', 
   assert.ok(tabSource.includes('Not reported') && !/\?\? 0\b|\|\| 0\b/.test(code(tabSource)), 'missing values stay "Not reported", never 0')
 })
 
-test('the tab is wired into the Mainnet navigation only, and loads lazily', () => {
-  assert.match(appSource, /const MainnetBorrow = lazy\(\(\) => import\('\.\/components\/MainnetBorrow'\)\)/)
-  assert.match(appSource, /id: 'borrow' as const, label: 'Borrow'/)
-  assert.ok(!/import MainnetBorrow from/.test(appSource), 'not statically imported')
+test('paused Borrow has no public navigation or component route; code and read-only intelligence remain preserved', () => {
+  assert.ok(!/import\s*\(\s*'\.\/components\/MainnetBorrow'\s*\)|import\s+MainnetBorrow\s+from/.test(appSource),
+    'Borrow SDK must not be loaded through the app')
+  assert.ok(!/activeTab\s*===\s*'borrow'/.test(appSource), 'no Borrow application route')
+  assert.ok(!/\|\s*'borrow'/.test(appSource), 'no Borrow navigation state')
   const mainnetNav = appSource.slice(appSource.indexOf("appNetwork === 'mainnet' && ("), appSource.indexOf('<main'))
-  assert.ok(mainnetNav.includes("id: 'borrow'"))
+  assert.ok(!/id: 'borrow'|label: 'Borrow'/.test(mainnetNav), 'Borrow not present in public mainnet menu')
+  for (const name of ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity']) assert.ok(mainnetNav.includes(`label: '${name}'`), name)
   const testnetNav = appSource.slice(appSource.indexOf("appNetwork === 'testnet' && (\n        <div className=\"border-b"), appSource.indexOf("appNetwork === 'mainnet' && ("))
   assert.ok(!/borrow/i.test(testnetNav), 'no Borrow tab on testnet')
+  assert.ok(tabSource.includes('export default function MainnetBorrow'), 'Borrow implementation remains preserved')
+  const intelligenceSource = readFileSync(`${root}src/components/ArcIntelligenceOverview.tsx`, 'utf8')
+  assert.ok(intelligenceSource.includes('BorrowSection'), 'read-only intelligence section remains preserved')
 })
 
 
