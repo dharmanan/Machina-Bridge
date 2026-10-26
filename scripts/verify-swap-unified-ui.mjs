@@ -824,6 +824,12 @@ try {
 
   await test('the screen fits a phone without horizontal scrolling, keeps its layout while quotes load and statuses refresh, and keeps one transactions panel', async () => {
     await page.setViewportSize({ width: 390, height: 844 }); await pick('USDC', 'EURC'); await amount.fill(''); await amount.fill('1')
+    // The production UI deliberately collapses completed swap history. Open it
+    // explicitly to verify visible transaction content on a mobile viewport.
+    const mobileActivity = page.locator('details[aria-label="Swap activity"]')
+    if (!(await mobileActivity.evaluate(node => node.open))) await mobileActivity.locator(':scope > summary').click()
+    await mobileActivity.waitFor({ state: 'visible' })
+    assert.equal(await mobileActivity.evaluate(node => node.open), true)
     const overflow = () => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     await quoted(); await shot('quotes-mobile'); assert.ok((await overflow()) <= 0, 'no horizontal overflow'); const top = () => review.evaluate(node => node.getBoundingClientRect().top + window.scrollY)
     const settled = await top(); await amount.fill(''); await amount.fill('1.5'); await page.getByText('Updating price…').first().waitFor().catch(() => {}); await quoted(); const reloaded = await top()
