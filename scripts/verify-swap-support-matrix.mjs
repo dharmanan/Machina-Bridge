@@ -80,21 +80,36 @@ await test('execution claims match the real gates: the explicit pilot allows exa
   }
   assert.equal(buildStates(mode.swapExecutionConfig('false', owner, 'pilot'), true).filter(Boolean).length, 0)
 })
-await test('the production release grants only the approved wallet both providers and retains explicit kill switches', () => {
-  for (const requested of [undefined, 'open', 'canary']) {
-    const config = mode.controlledSwapRelease(undefined, '0x' + '22'.repeat(20), requested)
-    assert.equal(config.canaryWallet, owner); assert.equal(config.enabled, true)
-    for (const {tokenIn, tokenOut} of tokens.SWAP_DIRECTIONS) {
-      const request = p.validateArcRequest({ chainId:5042, tokenIn, tokenOut, owner, recipient:owner, amount:'1', minimumOutput:'1', slippageBps:50, maxNetworkFee:'100000000000000000' })
-      assert.equal(mode.swapExecutionRestriction(config, request, { connected:true, owner, chainId:5042 }), null)
-      assert.equal(mode.circleExecutionRestriction(config, { owner }, { connected:true, owner, chainId:5042 }, true), null)
-      const other = '0x' + '22'.repeat(20)
-      assert.equal(mode.swapExecutionRestriction(config, request, { connected:true, owner:other, chainId:5042 }), 'pilot_wallet')
-      assert.equal(mode.circleExecutionRestriction(config, { owner:other }, { connected:true, owner:other, chainId:5042 }, true), 'pilot_wallet')
+await test('explicit Live Swap restores both providers to any valid wallet while default stays canary and off remains closed', () => {
+  const other = '0x' + '22'.repeat(20)
+  const ctx = (who) => ({ connected:true, owner:who, chainId:5042 })
+  const request = (who, tokenIn='USDC', tokenOut='EURC') => p.validateArcRequest({
+    chainId:5042, tokenIn, tokenOut, owner:who, recipient:who,
+    amount:'1', minimumOutput:'1', slippageBps:50, maxNetworkFee:'100000000000000000'
+  })
+  const live = mode.controlledSwapRelease('true', owner, 'open')
+  assert.equal(live.enabled,true)
+  assert.equal(live.mode,'open')
+  assert.equal(live.canaryWallet,undefined)
+  assert.equal(mode.executionChip(live,{provider:'uniswap',tokenIn:'USDC',tokenOut:'EURC'},true).label,'Live swap')
+  for(const who of [owner,other]){
+    for(const {tokenIn,tokenOut} of tokens.SWAP_DIRECTIONS){
+      assert.equal(mode.swapExecutionRestriction(live, request(who,tokenIn,tokenOut), ctx(who)),null)
+      assert.equal(mode.circleExecutionRestriction(live,{owner:who},ctx(who),true),null)
+      assert.equal(mode.circleExecutionRestriction(live,{owner:who},ctx(who),false),'provider_closed')
     }
-    assert.equal(mode.executionChip(config, { provider:'circle',tokenIn:'EURC',tokenOut:'USDC' }, true).label, 'Controlled canary')
   }
-  for (const [enabled,requested] of [['false',undefined],['',undefined],['TRUE','open'],['true ','canary'],[undefined,'off'],['true','OPEN'],['true',''],['true','open ']]) assert.equal(mode.controlledSwapRelease(enabled, owner, requested).enabled, false)
+  const canary = mode.controlledSwapRelease(undefined,other,undefined)
+  assert.equal(canary.enabled,true); assert.equal(canary.canaryWallet,owner)
+  assert.equal(mode.swapExecutionRestriction(canary,request(other),ctx(other)),'pilot_wallet')
+  assert.equal(mode.circleExecutionRestriction(canary,{owner:other},ctx(other),true),'pilot_wallet')
+  assert.equal(mode.swapExecutionRestriction(canary,request(owner),ctx(owner)),null)
+  assert.equal(mode.executionChip(canary,{provider:'circle',tokenIn:'USDC',tokenOut:'EURC'},true).label,'Controlled canary')
+  for(const [enabled,requested] of [
+    [undefined,'open'],['false','open'],['TRUE','open'],['true ','open'],
+    ['false',undefined],['',undefined],[undefined,'off'],
+    ['true','OPEN'],['true',''],['true','open ']
+  ]) assert.equal(mode.controlledSwapRelease(enabled,owner,requested).enabled,false)
 })
 await test('Circle fixture claims match the decoded real transactions: 8 swaps over 7 directions; the other 5 are stated as not seen, never implied', () => {
   const symbolOf = a => tokens.SWAP_SYMBOLS.find(s => tokens.swapToken(s).address.toLowerCase() === a.toLowerCase())

@@ -402,9 +402,9 @@ export default function MainnetSwapScreen() {
         <CircleReviewDialog execution={circleExecution} />
       </div>
 
-      <details aria-label="Swap activity" open={Boolean((showActivity && latest) || latest?.presentation.working || latest?.presentation.notice || latest?.live?.error || activityUnreadable)}
-        onToggle={event => setShowActivity(event.currentTarget.open)} className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
-        <summary className="cursor-pointer font-medium">Your swaps{latest ? ` · ${latest.presentation.short}` : ''}</summary>
+      <details aria-label="Swap activity" open={Boolean(showActivity || latest?.presentation.working || latest?.live?.error || activityUnreadable)}
+        className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
+        <summary className="cursor-pointer font-medium" onClick={event => { event.preventDefault(); setShowActivity(open => !open) }}>Your swaps{latest ? ` · ${latest.presentation.short}` : ''}</summary>
         <SwapActivityPanel latest={latest} earlier={earlier} busy={executionBusy} onCheck={checkItem} onRetry={retryItem} onRecover={hash => { void (latest?.provider === 'circle' ? circleExecution.recover(hash) : execution.recover(hash)) }}
         unreadable={activityUnreadable}
         archiveUnreadable={[...execution.stored, ...approvals.stored, ...circleExecution.stored].reduce((sum, history) => sum + (history.archiveUnreadable ?? 0), 0)} />
