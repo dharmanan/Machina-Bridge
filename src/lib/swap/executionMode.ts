@@ -7,12 +7,16 @@ import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '..
 //         Amounts remain bounded by balances, contract types and the existing economic/transaction checks.
 //   pilot the earlier controlled pilot, kept only as an explicit fallback: exactly the approved wallet, native USDC -> EURC, at most
 //         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
-// The generic factory requires the explicit enabled switch. The source-controlled release below additionally restricts
-// both providers to its approved canary and honors explicit false/off switches. Neither factory weakens transaction checks.
+// Explicit open restores the earlier Live Swap mode; absent mode remains approved-wallet canary.
+// The hard off switch and the guarded transaction lifecycle are preserved.
 export type SwapExecutionMode = 'off' | 'pilot' | 'open'
 export interface SwapExecutionConfig { enabled: boolean; mode: SwapExecutionMode; wallet: string; canaryWallet?: string }
 
 export function controlledSwapRelease(enabled?: string, wallet?: string, mode?: string): SwapExecutionConfig {
+  // Restore the previous explicit Live Swap opt-in. No implicit public access:
+  // the execution switch must be exactly 'true' and the mode exactly 'open'.
+  // Other preflight, minimum-output, fee-ceiling, approval and receipt checks remain in force.
+  if (mode === 'open') return swapExecutionConfig(enabled, wallet, 'open')
   const approved = ARC_PILOT_APPROVED_WALLET
   if ((enabled !== undefined && enabled !== 'true') || mode === 'off' || (mode !== undefined && !['open', 'pilot', 'canary'].includes(mode))) return Object.freeze({ enabled: false, mode: 'off', wallet: '', canaryWallet: approved })
   const base = mode === 'pilot' ? swapExecutionConfig(enabled ?? 'true', wallet ?? approved, 'pilot') : swapExecutionConfig('true', approved, 'open')

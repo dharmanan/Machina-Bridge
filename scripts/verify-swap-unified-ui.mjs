@@ -697,6 +697,7 @@ try {
     const readsBefore = world.reads.length; await recheck()
     const headline = 'Swap completed'
     await latest.getByText(headline, { exact: true }).waitFor(); assert.ok(world.reads.length > readsBefore)
+    await page.getByLabel('Swap activity', { exact: true }).locator(':scope > summary').click()
     await latest.getByText('This swap differs from your review', { exact: true }).waitFor(); await shot('first-swap-desktop')
     await latest.getByText(/A fee of 1\.6\d?% was taken from the amount you received\. It was not part of your review\./).waitFor()
     await latest.getByText(/Paid 0\.1 USDC · Received 0\.087854 EURC · Network fee 0\.003800899 USDC/).waitFor()
@@ -919,7 +920,11 @@ try {
       world.holdMethod = null; world.releases.splice(0).forEach(resolve => resolve())
     }
     await recheck(); await page.waitForTimeout(100); assert.equal(await amount.inputValue(), '1')
-    if (status === 'mismatch') await latest.getByText('This swap differs from your review', { exact: true }).waitFor()
+    if (status === 'mismatch') {
+      const activity = page.getByLabel('Swap activity', { exact: true })
+      if (!(await activity.evaluate(node => node.open))) await activity.locator(':scope > summary').click()
+      await latest.getByText('This swap differs from your review', { exact: true }).waitFor()
+    }
     else assert.equal(await latest.getByText('Swap completed', { exact: true }).count(), 0)
     world.rpcDown.clear()
   })
