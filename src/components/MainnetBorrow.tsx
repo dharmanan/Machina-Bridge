@@ -486,7 +486,7 @@ function SubHeading({ children }: { children: ReactNode }) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Header and the one-line risk
 
-function BorrowHeader({ loading, onRefresh }: { loading: boolean; onRefresh: () => void }) {
+function BorrowHeader({ loading, onRefresh, controlled }: { loading: boolean; onRefresh: () => void; controlled: boolean }) {
   return (
     <div className="flex flex-wrap items-start justify-between gap-3">
       <div className="min-w-0">
@@ -495,7 +495,7 @@ function BorrowHeader({ loading, onRefresh }: { loading: boolean; onRefresh: () 
           <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Borrow USDC</h1>
           <span className="inline-flex items-center gap-1 rounded-full border border-[#66D121]/30 bg-[#eef7e8] px-2.5 py-0.5 text-xs font-medium text-[#2F6E0C]" data-borrow-preview-chip>
             <Lock size={11} />
-            Preview only
+            {controlled ? 'Controlled Borrow test' : 'Preview only'}
           </span>
         </div>
         <p className="mt-1 text-sm leading-6 text-slate-500">Use cirBTC as collateral to borrow USDC on Arc.</p>
@@ -1639,18 +1639,24 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
     market: selected, verification: selected ? verifications[selected.marketId.toLowerCase()] : undefined, walletAddress, wallet, attemptLedger,
     positions, client, verifyMarket, readBalances, epoch, inputs,
   })
+  const controlled = borrowCanaryAllows(walletAddress)
 
   return (
     <Container className="py-6">
-      <BorrowHeader loading={marketsState.status === 'loading'} onRefresh={bump} />
+      <BorrowHeader loading={marketsState.status === 'loading'} onRefresh={bump} controlled={controlled} />
       <div className="mt-4 space-y-4">
         <RiskLine />
         <MarketsSection state={marketsState} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
         <CurrentLoan walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
-        <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />
-        <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
+        {controlled && <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
           positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
-          attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />
+          attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />}
+        {controlled
+          ? <Disclosure id="borrow-optional-estimate" title="Optional read-only estimate"
+              hint="For comparison only. The Borrow review above uses fresh transaction checks." level="outer">
+              <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />
+            </Disclosure>
+          : <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />}
         <AdvancedDetails model={model} inputs={inputs} markets={markets} verifications={verifications} selectedId={selectedId} borrowAmount={borrowAmount}
           walletChainId={walletChainId} positions={positions} onRefreshQuote={refreshQuote} />
       </div>
