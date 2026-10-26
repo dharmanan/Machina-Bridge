@@ -697,7 +697,11 @@ try {
     const readsBefore = world.reads.length; await recheck()
     const headline = 'Swap completed'
     await latest.getByText(headline, { exact: true }).waitFor(); assert.ok(world.reads.length > readsBefore)
-    await page.getByLabel('Swap activity', { exact: true }).locator(':scope > summary').click()
+    // Open for assertions, but never toggle an already-open activity panel closed.
+    // A completed transaction may leave it open after a pending-state transition.
+    const swapActivity = page.getByLabel('Swap activity', { exact: true })
+    if (!(await swapActivity.evaluate(node => node.open))) await swapActivity.locator(':scope > summary').click()
+    await swapActivity.evaluate(node => { if (!node.open) throw new Error('Swap activity must be expanded for visible-history assertions') })
     await latest.getByText('This swap differs from your review', { exact: true }).waitFor(); await shot('first-swap-desktop')
     await latest.getByText(/A fee of 1\.6\d?% was taken from the amount you received\. It was not part of your review\./).waitFor()
     await latest.getByText(/Paid 0\.1 USDC · Received 0\.087854 EURC · Network fee 0\.003800899 USDC/).waitFor()
@@ -718,7 +722,11 @@ try {
 
   await test('without any stored record, the first real swap can still be looked up by hash: chain facts are shown, the missing Review is stated, and nothing is called Confirmed', async () => {
     await page.evaluate(() => { for (const name of Object.keys(localStorage)) if (name.startsWith('machina.')) localStorage.removeItem(name) }); await page.reload(); await syncNonce()
-    await page.getByLabel('Swap activity', { exact: true }).locator(':scope > summary').click()
+    // Open for assertions, but never toggle an already-open activity panel closed.
+    // A completed transaction may leave it open after a pending-state transition.
+    const swapActivity = page.getByLabel('Swap activity', { exact: true })
+    if (!(await swapActivity.evaluate(node => node.open))) await swapActivity.locator(':scope > summary').click()
+    await swapActivity.evaluate(node => { if (!node.open) throw new Error('Swap activity must be expanded for visible-history assertions') })
     const lookup = page.getByLabel('Look up a transaction'); await lookup.locator('summary').click()
     await lookup.getByLabel('Transaction hash to look up').fill(FIRST_HASH); await lookup.getByRole('button', { name: 'Look up' }).click()
     const result = lookup.getByRole('article', { name: 'Transaction look-up result' }); await result.getByText('This transaction succeeded on Arc.', { exact: true }).waitFor()
