@@ -409,16 +409,20 @@ test('the tab says "Preview only" and uses status language, never "safe"', () =>
   for (const phrase of ['Preview only', 'Selected safety target not met']) assert.ok(tabSource.includes(phrase), phrase)
 })
 
-test('automatic Borrow estimate is primary and technical loan actions stay collapsed for canary', () => {
+test('automatic Borrow estimate connects to one guarded Review, leaving manual controls in Advanced', () => {
   const body = tabSource
+  const operations = readFileSync(`${root}src/components/BorrowOperations.tsx`, 'utf8')
   assert.match(body, /const controlled = borrowCanaryAllows\(walletAddress\)/)
   assert.match(body, /<NewBorrow model=\{model\} inputs=\{inputs\} onRefreshQuote=\{refreshQuote\} controlled=\{controlled\}/)
-  assert.match(body, /<Disclosure id="borrow-advanced-operations" title="Advanced loan actions"/)
-  assert.match(body, /\{controlled \? 'Controlled Borrow test' : 'Preview only'\}/)
-  assert.ok(body.indexOf('<NewBorrow model=') < body.indexOf('<BorrowOperations wallet='), 'the automatic quote precedes optional technical operations')
+  assert.match(body, /actions=\{controlled \? <BorrowOperations guidedBorrow=\{guidedBorrow\}/)
+  assert.match(body, /model\.status\.id === 'checks-passed'/)
+  assert.match(body, /automaticGasCeilingWei <= 250_000_000_000_000_000n/)
   assert.match(body, /data-borrow-review-guidance/)
-  assert.match(body, /\{controlled \? \(/)
-  assert.ok(!body.includes('borrow-optional-estimate'), 'the automatic quote must not be hidden')
+  assert.match(operations, /<details id="borrow-advanced-operations"/)
+  assert.match(operations, /data-borrow-guided-flow/)
+  assert.match(operations, /controller\?\.prepare\(request, guided\.targetHealthFactor, guided\.maxGasCost\)/)
+  assert.match(operations, /disabled=\{!controller \|\| !guidedReady\}/)
+  assert.ok(!body.includes('borrow-optional-estimate'))
 })
 
 test('the standard screen is short and plain; every technical detail sits in a closed section', () => {

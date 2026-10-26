@@ -963,7 +963,7 @@ function StatusCard({ status, walletSupported, onRefresh, controlled = false }: 
         {controlled ? (
           <p className="text-xs leading-5 text-slate-600" data-borrow-review-guidance>
             Collateral, estimated fees and Health Factor are calculated automatically here.
-            For a real wallet operation, open Advanced loan actions below; a fresh independent review is required before any confirmation.
+            Use Review Borrow below for a fresh quote and independent transaction checks. No wallet approval or signature is requested until you confirm the review.
           </p>
         ) : (
           <>
@@ -1304,7 +1304,7 @@ function EstimateCard({ model }: { model: BorrowModel }) {
   )
 }
 
-function NewBorrow({ model, inputs, onRefreshQuote, controlled = false }: { model: BorrowModel; inputs: QuoteInputs; onRefreshQuote: () => void; controlled?: boolean }) {
+function NewBorrow({ model, inputs, onRefreshQuote, controlled = false, actions }: { model: BorrowModel; inputs: QuoteInputs; onRefreshQuote: () => void; controlled?: boolean; actions?: ReactNode }) {
   const { market, loanSymbol, target, targetHealthFactor, status, action, unverified } = model
   const noMarket = market === null
   return (
@@ -1354,6 +1354,7 @@ function NewBorrow({ model, inputs, onRefreshQuote, controlled = false }: { mode
             <StatusCard status={status} walletSupported={model.wallet.compat === 'supported'} onRefresh={onRefreshQuote} controlled={controlled} />
           </div>
         </div>
+        {actions}
       </div>
     </Panel>
   )
@@ -1714,6 +1715,23 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
     positions, client, verifyMarket, readBalances, epoch, inputs,
   })
   const controlled = borrowCanaryAllows(walletAddress)
+  // The automatic quote is a preview, NEVER a transaction authority. Derive only
+  // the user's maximum native-USDC budget here; the operation controller fetches
+  // fresh evidence and checks its fee estimate against this bound again.
+  // A bounded 2x estimate + 0.001 USDC covers normal fee movement while the
+  // independent atomic transport still fails closed if it cannot bind the cap.
+  const previewGasWei = model.full ? totalGasWei(model.full.gasFees) : null
+  const automaticGasCeilingWei = previewGasWei !== null && previewGasWei > 0n
+    ? previewGasWei * 2n + 1_000_000_000_000_000n : null
+  const automaticGasBudget = automaticGasCeilingWei !== null && automaticGasCeilingWei <= 250_000_000_000_000_000n
+    ? unitsToDecimal(automaticGasCeilingWei, MAINNET_ARC_NATIVE_CURRENCY.decimals) : null
+  const guidedBorrow = controlled ? {
+    action: model.action,
+    targetHealthFactor: model.targetHealthFactor,
+    maxGasCost: automaticGasBudget,
+    ready: model.status.id === 'checks-passed' && model.prepared !== null && model.met === true &&
+      (model.action?.kind === 'borrow' || model.action?.kind === 'borrow-more'),
+  } : null
 
   return (
     <Container className="py-6">
@@ -1722,13 +1740,11 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
         <RiskLine />
         <MarketsSection state={marketsState} eurcMarkets={eurcMarkets} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
         <CurrentLoan walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
-        <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} controlled={controlled} />
-        {controlled && <Disclosure id="borrow-advanced-operations" title="Advanced loan actions"
-          hint="Borrow, repay or close a loan with a fresh, independent wallet review" level="outer">
-          <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
+        <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} controlled={controlled}
+          actions={controlled ? <BorrowOperations guidedBorrow={guidedBorrow} wallet={walletAddress ? wallet.state : null} market={selected}
             positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
-            attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />
-        </Disclosure>}
+            attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump}
+          /> : null} />
         <AdvancedDetails model={model} inputs={inputs} markets={markets} verifications={verifications} selectedId={selectedId} borrowAmount={borrowAmount}
           walletChainId={walletChainId} positions={positions} onRefreshQuote={refreshQuote} />
       </div>

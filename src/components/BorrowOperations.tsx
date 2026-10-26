@@ -15,12 +15,21 @@ import { createViemBalanceReader, type WalletBalanceReader } from '../lib/borrow
 const TITLES: Record<BorrowWriteAction['kind'], string> = { borrow: 'Borrow', 'borrow-more': 'Borrow more', repay: 'Repay', 'close-loan': 'Close loan', 'add-collateral': 'Add collateral', 'withdraw-collateral': 'Withdraw collateral' }
 const inputStyle = 'w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#66D121]'
 const buttonStyle = 'rounded-xl bg-[#2F6E0C] px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50'
+export type GuidedBorrowInput = {
+  action: BorrowWriteAction | null
+  targetHealthFactor: number
+  maxGasCost: string | null
+  ready: boolean
+}
 export type BorrowOperationsProps = {
   wallet: BorrowWalletState | null; market: BorrowMarket | null; positions: BorrowPosition[]; attempts: BorrowAttemptLedger | null
   requestWallet?: Eip1193Request; client?: BorrowReadClient; verifyMarket?: (market: BorrowMarket) => Promise<MarketVerification>; readBalances?: WalletBalanceReader
   // Explicit in-process controlled test seam. Production supplies none; no URL/env/browser flag supplies a transport.
   ports?: BorrowOperationPorts
   onVerified?: () => void
+  // In the primary Borrow flow this receives the automatic estimate input;
+  // it never reuses the preview's prepared quote as execution authority.
+  guidedBorrow?: GuidedBorrowInput | null
 }
 export function BorrowOperations(props: BorrowOperationsProps) {
   const ref = useRef(props); ref.current = props
@@ -54,7 +63,9 @@ export function BorrowOperations(props: BorrowOperationsProps) {
     setState(controller?.getState() ?? { phase: 'idle', review: null, message: '' })
     return controller?.subscribe(setState)
   }, [controller])
-  useEffect(() => { controller?.invalidate() }, [controller, kind, amount, maximum, target, loanId, props.market?.marketId, props.wallet?.address, props.wallet?.chainId])
+  const guided = props.guidedBorrow
+  const guideKey = guided?.action ? JSON.stringify(guided.action) + ':' + guided.targetHealthFactor + ':' + guided.maxGasCost : ''
+  useEffect(() => { controller?.invalidate() }, [controller, kind, amount, maximum, target, loanId, props.market?.marketId, props.wallet?.address, props.wallet?.chainId, guideKey])
   const [now, setNow] = useState(Date.now())
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer) }, [])
   const handled = useRef<string | undefined>()
@@ -83,10 +94,30 @@ export function BorrowOperations(props: BorrowOperationsProps) {
   const blocked = props.ports ? props.ports.executionBlocker() : productionBorrowExecutionBlocker(props.wallet?.address)
   const busy = ['quoting', 'checking', 'wallet', 'pending', 'unknown'].includes(state.phase)
   const history = props.attempts?.list() ?? props.ports?.attempts.list() ?? []
-  return <section className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 sm:p-6" data-borrow-operations data-phase={state.phase}>
-    <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-semibold text-slate-900">Review loan actions</h2><span className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-900">{blocked ? 'Transactions closed' : 'Review before wallet confirmation'}</span></div>
-    <p className="mt-2 text-xs leading-5 text-slate-600">Prepare a current review for any loan action. Reviewing never requests an approval, signature or transaction.</p>
+  const guidedReady = Boolean(guided?.ready && guided.action && guided.maxGasCost && !blocked && !busy)
+  const guidedTitle = guided?.action?.kind === 'borrow-more' ? 'Review Borrow more' : 'Review Borrow'
+  return <section className={guided ? 'mt-4 min-w-0 border-t border-slate-200 pt-4' : 'min-w-0 rounded-2xl border border-slate-200 bg-white p-4 sm:p-6'} data-borrow-operations data-phase={state.phase}>
+    {guided ? (
+      <div data-borrow-guided-flow className="space-y-2">
+        <h3 className="text-sm font-semibold text-slate-900">Borrow review</h3>
+        <p className="text-xs leading-5 text-slate-600">The estimated fee and maximum budget are calculated automatically. Review refreshes the market, wallet, quote and gas checks; nothing is signed until you explicitly confirm.</p>
+        {guided.maxGasCost
+          ? <p className="text-xs text-slate-600" data-borrow-auto-gas>Maximum fee budget: {guided.maxGasCost} native USDC (automatic, not the expected fee).</p>
+          : <p className="text-xs text-amber-800" data-borrow-auto-gas-unavailable>Automatic gas budget unavailable or above the 0.25 USDC safety ceiling. Refresh the estimate or use Advanced loan actions.</p>}
+        <button className={buttonStyle} disabled={!controller || !guidedReady} onClick={() => {
+          const request = guided?.action
+          if (request && guided?.ready && guided.maxGasCost) void controller?.prepare(request, guided.targetHealthFactor, guided.maxGasCost)
+        }}>{guidedTitle}</button>
+        {!guided.ready && <p className="text-xs text-slate-500" data-borrow-guided-wait>Enter a valid amount and complete the automatic safety checks before reviewing.</p>}
+      </div>
+    ) : <div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-semibold text-slate-900">Review loan actions</h2><span className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-900">{blocked ? 'Transactions closed' : 'Review before wallet confirmation'}</span></div>
+      <p className="mt-2 text-xs leading-5 text-slate-600">Prepare a current review for any loan action. Reviewing never requests an approval, signature or transaction.</p>
+    </div>}
     {!props.ports && !blocked && <p className="mt-2 text-xs leading-5 text-amber-800">Controlled canary for the approved wallet. Address restriction is not identity authentication. Each operation must still pass independent checks and your explicit wallet confirmation; live Borrow and full exit are not yet verified.</p>}
+    {guided ? <details id="borrow-advanced-operations" className="mt-3 rounded-xl border border-slate-200 p-3 text-sm">
+      <summary className="cursor-pointer font-medium text-slate-700">Advanced loan actions · repay, close loan and manual review</summary>
+      <div className="mt-3">
     <div className="mt-4 grid gap-3 sm:grid-cols-2">
       <label className="text-xs font-medium text-slate-600">Action<select aria-label="Borrow action" value={kind} onChange={e => setKind(e.target.value as BorrowWriteAction['kind'])} className={inputStyle} disabled={busy}>{Object.entries(TITLES).map(([value, title]) => <option value={value} key={value}>{title}</option>)}</select></label>
       {kind === 'borrow' ? <div className="text-xs leading-6 text-slate-600">Morpho market: {operationMarket ? `${operationMarket.collateralAsset.symbol} / ${operationMarket.loanAsset.symbol}` : 'Choose a market above'}<br />Via Circle Borrow Kit{operationMarket && ` · LLTV ${operationMarket.lltv === null ? 'Not reported' : (operationMarket.lltv * 100).toFixed(2) + '%'} · Variable APY ${operationMarket.borrowApy === null ? 'Not reported' : (operationMarket.borrowApy * 100).toFixed(2) + '%'}`}</div>
@@ -97,6 +128,19 @@ export function BorrowOperations(props: BorrowOperationsProps) {
     </div>
     <p className="mt-3 text-xs leading-5 text-slate-600">Liquidation can occur if collateral value falls or debt grows. Approvals, when needed, are exact amounts. Morpho authorization must be granted and revoked in the same atomic batch; an existing larger token allowance is not a new exact approval.</p>
     <button className={buttonStyle + ' mt-4'} disabled={!controller || busy || !action()} onClick={() => { const value = action(); if (value) void controller?.prepare(value, Number(target), maximum) }}>Get operation review</button>
+      </div>
+    </details> : <>
+    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+      <label className="text-xs font-medium text-slate-600">Action<select aria-label="Borrow action" value={kind} onChange={e => setKind(e.target.value as BorrowWriteAction['kind'])} className={inputStyle} disabled={busy}>{Object.entries(TITLES).map(([value, title]) => <option value={value} key={value}>{title}</option>)}</select></label>
+      {kind === 'borrow' ? <div className="text-xs leading-6 text-slate-600">Morpho market: {operationMarket ? `${operationMarket.collateralAsset.symbol} / ${operationMarket.loanAsset.symbol}` : 'Choose a market above'}<br />Via Circle Borrow Kit{operationMarket && ` · LLTV ${operationMarket.lltv === null ? 'Not reported' : (operationMarket.lltv * 100).toFixed(2) + '%'} · Variable APY ${operationMarket.borrowApy === null ? 'Not reported' : (operationMarket.borrowApy * 100).toFixed(2) + '%'}`}</div>
+        : <label className="text-xs font-medium text-slate-600">Position<select aria-label="Borrow position" className={inputStyle} value={loan?.loanId ?? ''} onChange={e => setLoanId(e.target.value)} disabled={busy}>{!props.positions.length && <option value="">No position available</option>}{props.positions.map(p => <option value={p.loanId} key={p.loanId}>{p.loanId.slice(0, 8)} · debt {p.borrowed?.amount ?? 'Not reported'} {p.borrowed?.token ?? ''}</option>)}</select></label>}
+      {kind !== 'close-loan' && <label className="text-xs font-medium text-slate-600">{kind === 'add-collateral' || kind === 'withdraw-collateral' ? 'Collateral amount' : 'Loan token amount'}<input aria-label="Operation amount" className={inputStyle} value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" disabled={busy} /></label>}
+      <label className="text-xs font-medium text-slate-600">Maximum gas cost (native USDC)<input aria-label="Maximum gas cost" className={inputStyle} value={maximum} onChange={e => setMaximum(e.target.value)} inputMode="decimal" placeholder="Your cost limit" disabled={busy} /></label>
+      {(kind === 'borrow' || kind === 'borrow-more' || kind === 'withdraw-collateral') && <label className="text-xs font-medium text-slate-600">Minimum resulting health factor<input aria-label="Operation health factor" className={inputStyle} value={target} onChange={e => setTarget(e.target.value)} inputMode="decimal" disabled={busy} /></label>}
+    </div>
+    <p className="mt-3 text-xs leading-5 text-slate-600">Liquidation can occur if collateral value falls or debt grows. Approvals, when needed, are exact amounts. Morpho authorization must be granted and revoked in the same atomic batch; an existing larger token allowance is not a new exact approval.</p>
+    <button className={buttonStyle + ' mt-4'} disabled={!controller || busy || !action()} onClick={() => { const value = action(); if (value) void controller?.prepare(value, Number(target), maximum) }}>Get operation review</button>
+    </>}
     {state.message && <p role="status" className="mt-3 break-words text-sm leading-6 text-slate-700">{state.message}</p>}
     {state.review && description && <div role="region" aria-label="Borrow review" className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
       <h3 className="font-semibold text-slate-900">{description.title} review</h3>
