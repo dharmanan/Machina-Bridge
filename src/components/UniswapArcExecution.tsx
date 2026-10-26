@@ -145,10 +145,9 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
   return <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="uniswap-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
       <h2 id="uniswap-review-title" className="text-xl font-semibold">Review Uniswap swap</h2>
-      <SwapMarketRiskNotice />
-      <div className="text-xs leading-5 text-slate-600">
+      <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
         <p className="font-medium">Wallet security</p>
-        <p>Browser extensions may modify swap transactions before signing. Compare the wallet's final amount, fees and recipient with this review; reject differences.</p>
+        <p>Browser extensions may modify swap transactions before signing. Check the final amount, additional fees and recipient in your wallet. If anything differs from this review, reject the transaction.</p>
       </div>
       {view.allowanceNotice && <p role="note" aria-label="Existing Permit2 token allowance" className="break-words rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{view.allowanceNotice}</p>}
       {review && inp && out && <>
@@ -173,6 +172,7 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
         {portions === null && <p role="note" className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">We couldn’t read every detail of this swap. Don’t confirm it; review a fresh swap.</p>}
         <p className="text-xs text-slate-600">If the price moves so you would receive less than the minimum, the swap does not go through.{portions !== null && !feeToOthers ? ' Checked in the transaction prepared by this app: all swap output goes to your wallet, with no additional recipient fee. Your wallet or browser extensions may change the transaction before signing.' : ''}{nativeIn ? ' Native USDC is sent with the swap, so no approval is needed.' : ' Token → Permit2 approval is a gas-paying blockchain transaction, needed only when the current allowance is too small. An exact allowance can be consumed by a swap, so a later amount may need a new exact approval. PermitSingle is a separate free, exact-amount signature; the swap is the final gas-paying transaction. Check the refreshed price and confirm it explicitly. Reject either wallet request to stop.'} Confirm before this review expires.</p>
         <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+          <SwapMarketRiskNotice />
           <dl className="mt-2 space-y-1">
             <ReviewLine label="Contract" value={`Uniswap Universal Router · ${ARC_ROUTER}`} />
             <ReviewLine label="Recipient" value={review.request.recipient} />

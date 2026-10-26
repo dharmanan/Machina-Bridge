@@ -121,10 +121,9 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
   return <><dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="circle-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
       <h2 id="circle-review-title" className="text-xl font-semibold">Review Circle swap</h2>
-      <SwapMarketRiskNotice />
-      <div className="text-xs leading-5 text-slate-600">
+      <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
         <p className="font-medium">Wallet security</p>
-        <p>Browser extensions may modify swap transactions before signing. Compare the wallet's final amount, fees and recipient with this review; reject differences.</p>
+        <p>Browser extensions may modify swap transactions before signing. Check the final amount, additional fees and recipient in your wallet. If anything differs from this review, reject the transaction.</p>
       </div>
       {review && request && tokenIn && tokenOut && <>
         <p>You pay {request.amount} {request.tokenIn} and receive about {formatUnits(BigInt(review.estimatedOutput), tokenOut.decimals)} {request.tokenOut}.</p>
@@ -148,6 +147,7 @@ export function CircleReviewDialog({ execution }: { execution: CircleExecution }
           <p className="text-xs text-slate-600">Never more than the amount above. Each step is confirmed here first, then in your wallet. If a step fails, the next ones are not requested. If the price moves so you would receive less than the minimum, the swap does not go through.</p>
         </div>
         <details className="text-xs text-slate-500"><summary className="cursor-pointer">Technical details</summary>
+          <SwapMarketRiskNotice />
           <dl className="mt-2 space-y-1">
             <Line label="Contract" value={`Circle adapter · ${CIRCLE_ADAPTER}`} />
             <Line label="Recipient" value={request.owner} />

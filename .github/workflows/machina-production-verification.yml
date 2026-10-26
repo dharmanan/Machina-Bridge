@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - feature/uniswap-swap-preview
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -40,7 +39,7 @@ jobs:
           node scripts/verify-circle-response-limits.mjs
           node scripts/verify-borrow-source-gates.mjs
   source-regressions:
-    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -121,7 +120,7 @@ jobs:
           path: npm-audit-*.json
 
   browser-regressions:
-    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

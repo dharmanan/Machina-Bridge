@@ -1,7 +1,12 @@
 import { controlledSwapRelease } from '../lib/swap/executionMode'
 
-// Production execution policy: explicit mode=open and enabled=true restores prior Live Swap.
-// Missing mode retains the approved-wallet canary; mode=pilot retains the old 0.1 USDC fallback.
-// Explicit false/off and malformed modes fail closed. Mode is not transaction authorization;
-// simulation, slippage/minimum, fees, wallet and settlement checks are unchanged.
-export const SWAP_EXECUTION = controlledSwapRelease(import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED, import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET, import.meta.env.VITE_SWAP_EXECUTION_MODE)
+// Restore the existing Mainnet Live Swap product rather than silently downgrading
+// an unset/legacy "canary" build to restricted access. Explicit off/false remains
+// an immediate kill switch, and explicit pilot remains the 0.1 USDC fallback.
+// No wallet approval, fee, minimum-output, simulation or receipt guard is bypassed.
+const configuredMode = import.meta.env.VITE_SWAP_EXECUTION_MODE
+export const SWAP_EXECUTION = controlledSwapRelease(
+  import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED ?? 'true',
+  import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET,
+  configuredMode === undefined || configuredMode === 'canary' ? 'open' : configuredMode,
+)

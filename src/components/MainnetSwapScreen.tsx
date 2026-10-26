@@ -240,7 +240,9 @@ export default function MainnetSwapScreen() {
   function continueSwap() {
     if (!canContinue) return
     if (canRetryPrice) { setSelectionEpoch(epoch => ({ ...epoch, [provider]: epoch[provider] + 1 })); return }
-    setShowActivity(true)
+    // Starting a fresh Review must never reopen a completed historical warning.
+    // Pending/unknown operations still open the activity automatically for recovery.
+    setShowActivity(false)
     if (needsApproval) continuingApproval.current = quoteKey
     void (needsApproval ? approvals.prepare() : active_.prepare())
   }
@@ -403,8 +405,8 @@ export default function MainnetSwapScreen() {
       </div>
 
       <details aria-label="Swap activity" open={Boolean(showActivity || latest?.presentation.working || latest?.live?.error || activityUnreadable)}
-        className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
-        <summary className="cursor-pointer font-medium" onClick={event => { event.preventDefault(); setShowActivity(open => !open) }}>Your swaps{latest ? ` · ${latest.presentation.short}` : ''}</summary>
+        onToggle={event => setShowActivity(event.currentTarget.open)} className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
+        <summary className="cursor-pointer font-medium">Your swaps{latest ? ` · ${latest.presentation.short}` : ''}</summary>
         <SwapActivityPanel latest={latest} earlier={earlier} busy={executionBusy} onCheck={checkItem} onRetry={retryItem} onRecover={hash => { void (latest?.provider === 'circle' ? circleExecution.recover(hash) : execution.recover(hash)) }}
         unreadable={activityUnreadable}
         archiveUnreadable={[...execution.stored, ...approvals.stored, ...circleExecution.stored].reduce((sum, history) => sum + (history.archiveUnreadable ?? 0), 0)} />

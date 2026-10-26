@@ -24,13 +24,15 @@ test('duplicate or mutable declarations are rejected', () => {
   assert.throws(() => assertBorrowSourceGates(source + `\nexport const ${BORROW_SOURCE_GATES[0]} = false`))
   assert.throws(() => assertBorrowSourceGates(source.replace('export const MAINNET_BORROW_WRITES_ENABLED', 'export let MAINNET_BORROW_WRITES_ENABLED')))
 })
-test('CI records the real audit, reports known risks, preserves JSON and does not run heavy suites on every feature push', () => {
+test('CI records the real audit, reports known risks, preserves JSON and runs full suites only for main release checks and PRs', () => {
   const workflow = readFileSync(new URL('../.github/workflows/machina-production-verification.yml', import.meta.url), 'utf8')
   assert.match(workflow, /run: node scripts\/verify-borrow-source-gates\.mjs/)
   assert.match(workflow, /if npm audit --omit=dev --json > npm-audit-production.json/)
   assert.match(workflow, /report-dependency-audit\.mjs npm-audit-production.json/)
   assert.match(workflow, /actions\/upload-artifact@v4/)
   assert.equal((workflow.match(/contains\(github.event.head_commit.message, '\[release-check\]'\)/g) ?? []).length, 2)
+  assert.doesNotMatch(workflow, /feature\/uniswap-swap-preview/)
+  assert.match(workflow, /refs\/heads\/main/)
   assert.match(workflow, /pull_request:\n\s+branches: \[main\]/)
   assert.doesNotMatch(workflow, /continue-on-error|npm audit[^\n]*\|\|\s*true/)
 })

@@ -350,9 +350,9 @@ await test('disconnected DOM keeps quote and execution controls disabled', () =>
   assert.match(html, /Connect your wallet using the header/)
   assert.doesNotMatch(html, />Get quote|>Refresh quote/)
   assert.match(html, /disabled=""[^>]*>Review Swap/)
-  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
+  assert.match(html, /Live swap/); assert.match(html, /Available \(any wallet/)
   assert.doesNotMatch(html, /Estimated from a live quote/)
-  assert.match(html, /Controlled canary/)
+  assert.match(html, /Live swap/)
   assert.doesNotMatch(html, /Balance:/)
 })
 await test('wrong-network DOM is explicit and cannot request a quote', () => {
@@ -367,7 +367,7 @@ await test('Arc wallet DOM shows independent native USDC balance without claimin
   const html = renderSwap()
   assert.match(html, /Balance: (<!-- -->)?0\.192154 USDC/)
   assert.match(html, /disabled=""[^>]*>Review Swap/)
-  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
+  assert.match(html, /Live swap/); assert.match(html, /Available \(any wallet/)
   mockNative = { data: undefined, isError: true }
   const errorHtml = renderSwap()
   assert.match(errorHtml, /Balance: (<!-- -->)?unavailable/)
@@ -389,7 +389,7 @@ await test('WETH is selectable in both directions and renders its full ERC-20 ba
     assert.match(html, /aria-label="Uniswap quote"/); assert.match(html, /aria-label="Circle Swap Kit quote"/)
     assert.equal((html.match(/aria-checked="true"/g) ?? []).length, 1)
     assert.match(html, /disabled=""[^>]*>Review Swap/)
-    assert.match(html, /Controlled canary/)
+    assert.match(html, /Live swap/)
   } finally { React.useState = originalUseState }
 })
 console.log(`${passed} total Mainnet Swap checks passed, including DOM states.`)

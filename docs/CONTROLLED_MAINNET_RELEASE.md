@@ -7,17 +7,18 @@ market prices. No real wallet signature or fund operation is part of CI.
 ## Release boundaries
 
 - Bridge/Earn retain their existing runtime and execution configuration.
-- Swap execution is source-restricted to
-  `0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321`, on Arc 5042, for the existing
-  supported token pairs/providers. Quotes remain available to other wallets.
-  No build value, including `VITE_SWAP_EXECUTION_MODE=open`, grants public
-  execution in this source release. Address gating is rollout policy, not
-  wallet authentication or a defense against arbitrary browser JavaScript.
+- Swap Live execution is restored on Arc 5042 using the existing supported
+  token directions and Uniswap/Circle providers. Default and legacy `canary`
+  build mode resolve to `open`; `VITE_SWAP_EXECUTION_MODE=pilot` remains an
+  explicit approved-wallet Uniswap USDC/EURC 0.1-USDC rollback option.
 - `VITE_UNISWAP_ARC_PILOT_ENABLED=false` or
-  `VITE_SWAP_EXECUTION_MODE=off` disables Swap execution in a subsequent build.
-  Malformed values fail closed. An absent mode selects only the source canary.
-  Explicit `pilot` preserves the former approved-wallet Uniswap USDC/EURC
-  0.1-USDC fallback. Existing explicit off settings are never overwritten.
+  `VITE_SWAP_EXECUTION_MODE=off` disables Swap execution in a subsequent build;
+  malformed explicit modes fail closed. Review, quote validity, spender, calldata,
+  slippage/minimum, fee ceiling, wallet signing, receipts and recovery remain
+  mandatory. General Live mode does NOT prove oracle-independent market prices.
+- Historical mismatch records stay preserved but must not auto-open when a user
+  starts a new Review. The original wallet-extension warning remains in Review.
+  The absent independent oracle comparison is disclosed under Technical details.
 - Public Borrow gates `MAINNET_BORROW_WRITES_ENABLED` and
   `MAINNET_BORROW_EXECUTION_BOUND` remain literal false. A separate source
   canary permits only the same address through an attested guarded official
