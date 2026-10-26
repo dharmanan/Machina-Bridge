@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           for suite in \
-            verify-production-ci verify-release-dependency-security \
+            verify-production-ci verify-zod-collection-backport verify-release-dependency-security \
             verify-mainnet-borrow verify-mainnet-borrow-preview \
             verify-mainnet-borrow-write-safety verify-borrow-operations \
             verify-borrow-sdk-integration \

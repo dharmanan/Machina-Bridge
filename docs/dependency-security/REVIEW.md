@@ -1,4 +1,59 @@
-# Dependency security review — 2026-10-22
+# Dependency security review
+
+## 2026-10-26: compatible Zod v3 collection backport
+
+The application keeps Circle's pinned Zod 3 API. It does **not** force Zod 4
+under packages using `z.function().returns()` or v3 record schemas.
+
+The fix follows the semantics of the [upstream collection-size security
+commit](https://github.com/colinhacks/zod/commit/a0ebf970f2d752e5f58527cd2942ff48be4f46bd),
+for [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5):
+an oversized constrained collection is rejected before visiting elements or
+running outer refinements. Array `.max()` and the upper bound of `.length()`,
+and Set `.max()`/`.size()` are covered. Wrong types, valid inputs, lower bounds,
+transforms, async parsing, function signatures and record validation keep the v3
+API. V3 has no built-in bounded Map API; no artificial Map semantics are added.
+This is not a general input-size limit or a guarantee against all parser DoS.
+
+`scripts/apply-zod-collection-backport.mjs` applies the reviewed changes at
+postinstall. `zod-v3-backport.json` pins original and patched SHA256 values for
+the CJS/ESM parsers and Reown's UMD entry point. All 16 locked installations
+(33 v3 parser files) are checked. Unknown versions, missing files, lock mismatch
+or unexpected bytes fail installation. Every file is validated before writing;
+rerunning is idempotent. `prebuild` requires all patched hashes, so an install
+with skipped lifecycle scripts cannot silently produce an unpatched release.
+Update/review the manifest when updating Zod; do not accept unknown bytes.
+
+The backport **does not** rename packages, alter their versions, rewrite lockfile
+integrity, dismiss advisories or suppress `npm audit`. Raw audit still reports
+the upstream version range. Therefore a successful backport test is not called
+a clean npm audit. The audit CI job remains blocking and unchanged.
+The current raw production audit reports 25 high and 7 low affected-package
+entries (exit 1). Zod's collection advisory remains in the registry metadata;
+the separate elliptic advisory is not fixed by this patch.
+
+Scope limitation: old Zod 3 packages also ship historical v4 subpaths; those
+are not modified by this v3 backport. Production imports must not switch to
+those historical v4 parsers. The separate current Zod 4.6.7 consumer retains
+the official v4 fix; its v3 compatibility entry point is backported as well.
+Unconstrained collections, malicious provider responses and general input-body
+resource limits are separate concerns.
+
+Regression verification includes every installed v3 CJS/ESM entry, Reown UMD,
+oversized valid/invalid/sparse arrays, sets, async parsing, nesting, custom
+messages, no element/refinement visits, valid v3 SDK function/record APIs, and
+installer drift/unknown-version/missing-patch rejection. Full application
+quality, module and Chromium regression outcomes accompany the delivery.
+
+Rollback: revert this dependency patch and its install/build lifecycle changes,
+then reinstall the unchanged lockfile. That restores the known vulnerable v3
+behavior; it is not a security remediation. No automatic allowance, signature,
+transaction or production-setting change is involved.
+
+The earlier dated review below is historical. Its counts and test totals must
+not be presented as the current audit.
+
+## Historical review — 2026-10-22
 
 Repository: `dharmanan/Machina-Bridge`; branch: `feature/uniswap-swap-preview`.
 Reviewed parent: `329251bc5e0d6574df4ed63e4a224ba06ae3229e`.

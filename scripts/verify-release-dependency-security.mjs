@@ -72,10 +72,12 @@ await test('Solana SDK keeps its real JSON-RPC read path through the reviewed cl
   } })
   assert.equal(await connection.getBlockHeight(), 123); assert.equal(calls, 1)
 })
-await test('remaining Circle Zod 3 walks oversized constrained arrays: evidence is retained, never presented as a patched root', () => {
+await test('Circle Zod 3 retains its supported API and rejects oversized constrained arrays before traversal', () => {
   const z = createRequire(require.resolve('@circle-fin/borrow-kit'))('zod'); let visited = 0
   const result = z.array(z.string().refine(() => { visited++; return true })).max(2).safeParse(Array(10).fill('x'))
-  assert.equal(result.success, false); assert.equal(visited, 10)
-  console.log('RESIDUAL RISK: Circle Zod 3 collection traversal remains unpatched; this test documents it, not audit cleanliness')
+  assert.equal(result.success, false); assert.equal(visited, 0)
+  assert.equal(result.error.issues.length, 1)
+  assert.equal(z.function().returns(z.any()).parse(() => 'compatible')(), 'compatible')
+  console.log('LOCAL BACKPORT: Circle Zod 3 collection bound is patched; original package versions and raw audit advisories remain visible')
 })
 console.log(`RESULT ${count}/${count} PASS; dependency compatibility and explicit residual-risk evidence; no network or transactions`)
