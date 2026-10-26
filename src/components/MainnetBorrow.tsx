@@ -240,17 +240,23 @@ function useWalletState(address: string | null, chainId: number | null, requestW
         throw error
       }
     }
-    let adapterConfirmed = false
-    detectAtomicBatchCapability(recording, address).then(async capability => {
-      if (capability === 'supported') return capability
-      const resolved = await detectBorrowAtomicSupport(recording, address as `0x${string}`)
-      adapterConfirmed = resolved === 'supported'
-      return resolved
+    // EIP-5792 atomic=true is NOT sufficient to prepare fee-bound Borrow writes.
+    // The official /next adapter must independently confirm a sender-preserving
+    // EOA route with enforceable outer transaction fee fields. Never replace
+    // this answer with wallet_getCapabilities or infer it from UI quote success.
+    detectAtomicBatchCapability(recording, address).then(async nativeCapability => {
+      const feeBoundCapability = await detectBorrowAtomicSupport(recording, address as `0x${string}`)
+      return { nativeCapability, feeBoundCapability }
     }).then(
-      (capability) => {
+      ({ nativeCapability, feeBoundCapability }) => {
         if (!live) return
         const answer = seen.outcome === 'response' ? { response: seen.value } : seen.outcome === 'error' ? { error: seen.value } : { timedOut: true }
-        setProbe({ session, capability, summary: adapterConfirmed ? 'The official Borrow adapter confirms an atomic mechanism for this address on Arc. Batch simulation and fee binding are checked separately.' : summarizeCapabilityAnswer(answer) })
+        const summary = feeBoundCapability === 'supported'
+          ? 'The official Borrow adapter confirms an atomic EOA route. The maximum gas fee is independently checked again before a wallet request.'
+          : nativeCapability === 'supported'
+            ? 'This wallet reports atomic batching, but its current route has no confirmed enforceable network-fee ceiling. Native EIP-5792 alone is insufficient for Borrow. No wallet transaction is requested.'
+            : `No fee-bound atomic Borrow route was confirmed for this wallet on Arc. ${summarizeCapabilityAnswer(answer)}`
+        setProbe({ session, capability: feeBoundCapability, summary })
       },
       () => { if (live) setProbe({ session, capability: 'unknown', summary: 'The question to the wallet failed.' }) },
     )

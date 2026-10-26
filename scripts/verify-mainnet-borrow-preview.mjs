@@ -409,6 +409,20 @@ test('the tab says "Preview only" and uses status language, never "safe"', () =>
   for (const phrase of ['Preview only', 'Selected safety target not met']) assert.ok(tabSource.includes(phrase), phrase)
 })
 
+test('wallet capability does not promote native atomic batching into fee-bound execution readiness', () => {
+  const body = tabSource.slice(tabSource.indexOf('function useWalletState('), tabSource.indexOf('async function readBalancesOf('))
+  assert.match(body, /const feeBoundCapability = await detectBorrowAtomicSupport\(recording, address/)
+  assert.match(body, /capability: feeBoundCapability/)
+  assert.ok(!body.includes("if (capability === 'supported') return capability"), 'native atomic support alone must never enable Borrow')
+  const blocked = statusModule.chooseBorrowStatus({
+    marketChosen: true, amountEntered: true, walletConnected: true, wallet: 'unsupported',
+    history: { unresolved: null, unreliable: null }, checking: false, checks: [],
+    quoteFailure: null, facts: { collateralSymbol:'cirBTC',loanSymbol:'USDC',collateralBalance:null,collateralNeeded:null,
+      borrowAmount:'0.1 USDC',liquidityAvailable:null,estimatedHealthFactor:null,targetHealthFactor:'1.5',maxLtv:'80%' },
+  })
+  assert.equal(blocked.tone,'blocked')
+  assert.match(blocked.detail,/network fee/)
+})
 test('automatic Borrow estimate connects to one guarded Review, leaving manual controls in Advanced', () => {
   const body = tabSource
   const operations = readFileSync(`${root}src/components/BorrowOperations.tsx`, 'utf8')
@@ -525,8 +539,8 @@ test('status: the first thing a person needs to do or know, in a fixed order', (
   assert.equal(choose({ walletConnected: false, amountEntered: false }).title, 'Connect your wallet')
   assert.equal(choose({ amountEntered: false, checks: null }).title, 'Enter a borrow amount')
   assert.equal(choose({ wallet: 'wrong-network' }).title, 'Switch to Arc Mainnet')
-  assert.equal(choose({ wallet: 'unsupported' }).title, 'Wallet not supported')
-  assert.equal(choose({ wallet: 'unknown' }).title, 'Wallet not verified')
+  assert.equal(choose({ wallet: 'unsupported' }).title, 'Borrow transport unavailable')
+  assert.equal(choose({ wallet: 'unknown' }).title, 'Borrow transport unverified')
   assert.match(choose({ wallet: 'unknown' }).detail, /treated as not supported/)
   assert.equal(choose({ wallet: 'checking' }).tone, 'waiting')
   assert.equal(choose({ history: { unresolved: 'An earlier borrow is not settled.', unreliable: null } }).title, 'Earlier transaction not settled')
@@ -566,7 +580,7 @@ test('status: an expired quote is one message, however many checks have aged out
   assert.deepEqual([expired.id, expired.title, expired.detail, expired.canRefresh, expired.tone], ['quote-expired', 'Quote expired', 'Refresh to get current terms.', true, 'waiting'])
   assert.equal(choose({ checks: [chk('balance', 'evidence_stale', 'unknown')] }).title, 'Quote expired', 'any aged-out read expires the quote')
   assert.equal(choose({ checks: stale, checking: true }).title, 'Checking your borrow', 'while it is read again nothing else is claimed')
-  assert.equal(choose({ checks: stale, wallet: 'unsupported' }).title, 'Wallet not supported', 'a wallet that cannot run Borrow is said first')
+  assert.equal(choose({ checks: stale, wallet: 'unsupported' }).title, 'Borrow transport unavailable', 'a wallet that cannot run Borrow is said first')
   assert.equal(choose({ checks: [chk('attempt', 'attempt_unresolved', 'fail'), ...stale] }).title, 'Earlier transaction not settled', 'an unsettled transaction is said before the quote')
 })
 

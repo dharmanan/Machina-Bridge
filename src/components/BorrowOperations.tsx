@@ -141,7 +141,7 @@ export function BorrowOperations(props: BorrowOperationsProps) {
     <p className="mt-3 text-xs leading-5 text-slate-600">Liquidation can occur if collateral value falls or debt grows. Approvals, when needed, are exact amounts. Morpho authorization must be granted and revoked in the same atomic batch; an existing larger token allowance is not a new exact approval.</p>
     <button className={buttonStyle + ' mt-4'} disabled={!controller || busy || !action()} onClick={() => { const value = action(); if (value) void controller?.prepare(value, Number(target), maximum) }}>Get operation review</button>
     </>}
-    {state.message && <p role="status" className="mt-3 break-words text-sm leading-6 text-slate-700">{state.message}</p>}
+    {state.message && state.phase !== 'idle' && <p role="status" className="mt-3 break-words text-sm leading-6 text-slate-700">{state.message}</p>}
     {state.review && description && <div role="region" aria-label="Borrow review" className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
       <h3 className="font-semibold text-slate-900">{description.title} review</h3>
       <dl className="mt-3 space-y-2 break-words text-sm">

@@ -84,11 +84,11 @@ export function chooseBorrowStatus(input: StatusInput): BorrowStatus {
     case 'wrong-network':
       return status('switch-network', 'blocked', 'Switch to Arc Mainnet', 'Your wallet is on another network. Borrow works on Arc Mainnet (chain 5042).')
     case 'unsupported':
-      return status('wallet-not-supported', 'blocked', 'Wallet not supported', 'Your wallet does not support atomic transactions on Arc, which Borrow needs. Try another wallet.')
+      return status('wallet-not-supported', 'blocked', 'Borrow transport unavailable', 'A fee-bound atomic Borrow transaction is not supported by this wallet connection. An atomic-batch capability alone does not guarantee the maximum network fee. No wallet signature is requested.')
     case 'unknown':
-      return status('wallet-not-verified', 'blocked', 'Wallet not verified', 'Machina could not confirm that your wallet supports atomic transactions on Arc, so it is treated as not supported.')
+      return status('wallet-not-verified', 'blocked', 'Borrow transport unverified', 'Machina could not verify both atomic execution and enforceable maximum network fees. Borrow stays disabled; no wallet signature is requested.')
     case 'checking':
-      return status('wallet-checking', 'waiting', 'Checking your wallet', 'Asking your wallet whether it supports atomic transactions on Arc.')
+      return status('wallet-checking', 'waiting', 'Checking your wallet', 'Checking atomic execution and a fee-bound wallet transport on Arc. No signature is requested.')
     default:
       break
   }
