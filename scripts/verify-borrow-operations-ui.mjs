@@ -81,6 +81,20 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: artifacts + '/mobile-close-review.png', fullPage: true })
   })
+  // The read-only workspace checks EOA bytecode through Arc RPC. Stub only the
+  // two expected read methods, so the browser suite never calls a live RPC.
+  // Any other external request still increments the strict external counter.
+  let workspaceCodeReads = 0
+  await page.route('https://rpc.mainnet.arc.io/**', async route => {
+    const body = route.request().postDataJSON()
+    assert.ok(['eth_getCode', 'eth_chainId'].includes(body.method), 'unexpected Arc RPC method')
+    if (body.method === 'eth_getCode') workspaceCodeReads++
+    return route.fulfill({ json: {
+      jsonrpc: '2.0', id: body.id,
+      result: body.method === 'eth_chainId' ? '0x13b2'
+        : body.params[0].toLowerCase() === '0x1111111111111111111111111111111111111111' ? '0x' : '0x6000',
+    } })
+  })
   await test('ordinary wallet sees automatic Borrow estimate, with write controls absent', async () => {
     await page.setViewportSize({ width: 1280, height: 900 })
     await page.goto(base + '/__borrow_workspace')
@@ -103,6 +117,8 @@ try {
     assert.equal(await page.locator('[data-borrow-operations]').count(), 0)
     assert.ok((await page.evaluate(() => window.workspaceReads ?? [])).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
   })
+  assert.ok(workspaceCodeReads >= 2, 'the EOA read-only checks must actually be exercised')
+  await page.unroute('https://rpc.mainnet.arc.io/**')
   for (const kind of ['borrow','borrow-more','repay','close-loan','add-collateral','withdraw-collateral']) await test('actual SDK in Chromium: ' + kind + ' → bounded EIP-1193 request → independently verified result', async () => {
     await page.evaluate(() => localStorage.clear()); await page.goto(base + '/__borrow_sdk_ui'); await page.getByLabel('Borrow action', { exact: true }).waitFor()
     await review(page, kind)
