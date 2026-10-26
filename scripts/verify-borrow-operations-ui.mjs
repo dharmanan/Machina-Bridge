@@ -81,32 +81,27 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: artifacts + '/mobile-close-review.png', fullPage: true })
   })
-  await test('the complete Borrow workspace rejects native atomic transport without fee binding and leaves both public gates closed', async () => {
-    await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base + '/__borrow_workspace')
-    await page.getByLabel('Borrow action', { exact: true }).waitFor()
-    await page.getByLabel('Borrow action', { exact: true }).selectOption('repay')
-    await page.getByLabel('Operation amount', { exact: true }).fill('10')
-    await page.getByLabel('Maximum gas cost', { exact: true }).fill('1')
-    await page.getByRole('button', { name: 'Get operation review', exact: true }).click(); await phase(page, 'blocked')
-    assert.match(await page.getByRole('status').innerText(), /No supported fee-bound atomic Borrow transport/)
-    assert.equal(await page.getByRole('region', { name: 'Borrow review' }).count(), 0)
-    assert.ok((await page.evaluate(() => window.workspaceReads)).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
+  await test('ordinary wallet sees automatic Borrow estimate, with write controls absent', async () => {
+    await page.setViewportSize({ width: 1280, height: 900 })
+    await page.goto(base + '/__borrow_workspace')
+    await page.locator('[data-borrow-section="quote"]').waitFor()
+    assert.equal(await page.getByLabel('Borrow action', { exact: true }).count(), 0)
+    assert.equal(await page.locator('[data-borrow-operations]').count(), 0)
+    assert.ok(await page.getByRole('button', { name: 'Borrow USDC · not enabled' }).isDisabled())
+    assert.ok((await page.evaluate(() => window.workspaceReads ?? [])).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
     await page.screenshot({ path: artifacts + '/workspace-desktop.png', fullPage: true })
     await page.setViewportSize({ width: 390, height: 844 })
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: artifacts + '/workspace-mobile.png', fullPage: true })
   })
-  await test('ordinary EOA without native EIP-5792 is recognized through the official adapter without enabling writes', async () => {
-    let codeReads = 0
-    await page.route('https://rpc.mainnet.arc.io/**', async route => {
-      const body = route.request().postDataJSON(); assert.ok(['eth_getCode','eth_chainId'].includes(body.method))
-      if (body.method === 'eth_getCode') codeReads++
-      return route.fulfill({ json: { jsonrpc: '2.0', id: body.id, result: body.method === 'eth_chainId' ? '0x13b2' : body.params[0].toLowerCase() === '0x1111111111111111111111111111111111111111' ? '0x' : '0x6000' } })
-    })
-    await page.evaluate(() => localStorage.clear()); await page.goto(base + '/__borrow_workspace?eoa=1'); await review(page, 'repay')
-    assert.ok(codeReads >= 2); assert.equal(await page.getByRole('button', { name: 'Confirm Repay', exact: true }).isDisabled(), true)
-    assert.ok((await page.evaluate(() => window.workspaceReads)).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
-    await page.unroute('https://rpc.mainnet.arc.io/**')
+  await test('ordinary EOA remains preview-only with no approval or transaction controls', async () => {
+    await page.evaluate(() => localStorage.clear())
+    await page.goto(base + '/__borrow_workspace?eoa=1')
+    await page.locator('[data-borrow-section="quote"]').waitFor()
+    assert.equal(await page.getByLabel('Borrow action', { exact: true }).count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Confirm Repay' }).count(), 0)
+    assert.equal(await page.locator('[data-borrow-operations]').count(), 0)
+    assert.ok((await page.evaluate(() => window.workspaceReads ?? [])).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
   })
   for (const kind of ['borrow','borrow-more','repay','close-loan','add-collateral','withdraw-collateral']) await test('actual SDK in Chromium: ' + kind + ' → bounded EIP-1193 request → independently verified result', async () => {
     await page.evaluate(() => localStorage.clear()); await page.goto(base + '/__borrow_sdk_ui'); await page.getByLabel('Borrow action', { exact: true }).waitFor()
