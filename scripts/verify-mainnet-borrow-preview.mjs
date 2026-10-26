@@ -409,13 +409,16 @@ test('the tab says "Preview only" and uses status language, never "safe"', () =>
   for (const phrase of ['Preview only', 'Selected safety target not met']) assert.ok(tabSource.includes(phrase), phrase)
 })
 
-test('approved wallet sees one primary Borrow action form; read-only quote becomes optional', () => {
+test('automatic Borrow estimate is primary and technical loan actions stay collapsed for canary', () => {
   const body = tabSource
   assert.match(body, /const controlled = borrowCanaryAllows\(walletAddress\)/)
-  assert.match(body, /\{controlled && <BorrowOperations/)
-  assert.match(body, /<Disclosure id="borrow-optional-estimate"/)
+  assert.match(body, /<NewBorrow model=\{model\} inputs=\{inputs\} onRefreshQuote=\{refreshQuote\} controlled=\{controlled\}/)
+  assert.match(body, /<Disclosure id="borrow-advanced-operations" title="Advanced loan actions"/)
   assert.match(body, /\{controlled \? 'Controlled Borrow test' : 'Preview only'\}/)
-  assert.ok(body.indexOf('<BorrowOperations wallet=') < body.indexOf('<NewBorrow model='), 'the active review precedes optional read-only estimate')
+  assert.ok(body.indexOf('<NewBorrow model=') < body.indexOf('<BorrowOperations wallet='), 'the automatic quote precedes optional technical operations')
+  assert.match(body, /data-borrow-review-guidance/)
+  assert.match(body, /\{controlled \? \(/)
+  assert.ok(!body.includes('borrow-optional-estimate'), 'the automatic quote must not be hidden')
 })
 
 test('the standard screen is short and plain; every technical detail sits in a closed section', () => {

@@ -935,14 +935,14 @@ const STATUS_STYLE = {
   info: { box: 'border-slate-200 bg-slate-50', icon: Info, iconClass: 'text-slate-500', title: 'text-slate-800', text: 'text-slate-600' },
 } as const
 
-function StatusCard({ status, walletSupported, onRefresh }: { status: BorrowStatus; walletSupported: boolean; onRefresh: () => void }) {
+function StatusCard({ status, walletSupported, onRefresh, controlled = false }: { status: BorrowStatus; walletSupported: boolean; onRefresh: () => void; controlled?: boolean }) {
   const style = STATUS_STYLE[status.tone]
   return (
     <div className={`rounded-2xl border p-4 ${style.box}`} data-borrow-status={status.id} data-borrow-status-tone={status.tone}>
       <div className="flex items-start gap-3">
         <style.icon size={20} className={`mt-0.5 shrink-0 ${style.iconClass}`} />
         <div className="min-w-0 flex-1">
-          <p className={`text-base font-semibold leading-6 ${style.title}`} data-status-title>{status.title}{status.id === 'checks-passed' ? ' — Preview only' : ''}</p>
+          <p className={`text-base font-semibold leading-6 ${style.title}`} data-status-title>{status.title}{status.id === 'checks-passed' && !controlled ? ' — Preview only' : ''}</p>
           <p className={`mt-0.5 text-xs leading-5 [overflow-wrap:anywhere] ${style.text}`} data-status-detail>{status.detail}</p>
           {status.canRefresh && (
             <button type="button" onClick={onRefresh} data-borrow-refresh-quote
@@ -960,12 +960,21 @@ function StatusCard({ status, walletSupported, onRefresh }: { status: BorrowStat
         </div>
       </div>
       <div className="mt-3 space-y-2 border-t border-black/5 pt-3">
-        <button type="button" disabled aria-disabled="true" data-borrow-action="borrow" title="Borrowing is not enabled in this release"
-          className="inline-flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-400">
-          <Lock size={14} />
-          Borrow USDC · not enabled
-        </button>
-        <p className="text-[11px] leading-4 text-slate-500" data-borrow-preview-note>Preview only: real borrowing is not enabled in this version. Nothing is sent: no signature, approval or transaction.</p>
+        {controlled ? (
+          <p className="text-xs leading-5 text-slate-600" data-borrow-review-guidance>
+            Collateral, estimated fees and Health Factor are calculated automatically here.
+            For a real wallet operation, open Advanced loan actions below; a fresh independent review is required before any confirmation.
+          </p>
+        ) : (
+          <>
+            <button type="button" disabled aria-disabled="true" data-borrow-action="borrow" title="Borrowing is not enabled in this release"
+              className="inline-flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-400">
+              <Lock size={14} />
+              Borrow USDC · not enabled
+            </button>
+            <p className="text-[11px] leading-4 text-slate-500" data-borrow-preview-note>Preview only: real borrowing is not enabled in this version. Nothing is sent: no signature, approval or transaction.</p>
+          </>
+        )}
       </div>
     </div>
   )
@@ -1295,7 +1304,7 @@ function EstimateCard({ model }: { model: BorrowModel }) {
   )
 }
 
-function NewBorrow({ model, inputs, onRefreshQuote }: { model: BorrowModel; inputs: QuoteInputs; onRefreshQuote: () => void }) {
+function NewBorrow({ model, inputs, onRefreshQuote, controlled = false }: { model: BorrowModel; inputs: QuoteInputs; onRefreshQuote: () => void; controlled?: boolean }) {
   const { market, loanSymbol, target, targetHealthFactor, status, action, unverified } = model
   const noMarket = market === null
   return (
@@ -1342,7 +1351,7 @@ function NewBorrow({ model, inputs, onRefreshQuote }: { model: BorrowModel; inpu
             <EstimateCard model={model} />
           </div>
           <div className="min-w-0 lg:col-start-1 lg:row-start-2">
-            <StatusCard status={status} walletSupported={model.wallet.compat === 'supported'} onRefresh={onRefreshQuote} />
+            <StatusCard status={status} walletSupported={model.wallet.compat === 'supported'} onRefresh={onRefreshQuote} controlled={controlled} />
           </div>
         </div>
       </div>
@@ -1713,15 +1722,13 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
         <RiskLine />
         <MarketsSection state={marketsState} eurcMarkets={eurcMarkets} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
         <CurrentLoan walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
-        {controlled && <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
-          positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
-          attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />}
-        {controlled
-          ? <Disclosure id="borrow-optional-estimate" title="Optional read-only estimate"
-              hint="For comparison only. The Borrow review above uses fresh transaction checks." level="outer">
-              <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />
-            </Disclosure>
-          : <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} />}
+        <NewBorrow model={model} inputs={inputs} onRefreshQuote={refreshQuote} controlled={controlled} />
+        {controlled && <Disclosure id="borrow-advanced-operations" title="Advanced loan actions"
+          hint="Borrow, repay or close a loan with a fresh, independent wallet review" level="outer">
+          <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
+            positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
+            attempts={attemptLedger} requestWallet={requestWallet} client={client} verifyMarket={verifyMarket} readBalances={readBalances} onVerified={bump} />
+        </Disclosure>}
         <AdvancedDetails model={model} inputs={inputs} markets={markets} verifications={verifications} selectedId={selectedId} borrowAmount={borrowAmount}
           walletChainId={walletChainId} positions={positions} onRefreshQuote={refreshQuote} />
       </div>
