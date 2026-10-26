@@ -356,4 +356,37 @@ await test('capability discovery recognizes the official EOA path and refuses na
     }
   } finally { t.borrowPublicClient = originalClient }
 })
+await test('native EIP-5792 cannot silently switch the guarded transport to an unbound wallet batch', async () => {
+  const s = await setup('borrow', 'atomic-wallet')
+  // A wallet may claim native atomic batching. Our facade must refuse that
+  // execution mode until it exposes enforceable outer gas/fee terms.
+  try {
+    const result = await s.run()
+    assert.notEqual(result?.status, 'confirmed', 'native atomic wallet must not be treated as a completed bounded loan')
+  } catch (error) {
+    // A rejected SDK execution is expected. The invariant below is more
+    // important than the SDK's specific error class or prose.
+    void error
+  }
+  assert.equal(s.walletRequests.filter(x => x.method === 'eth_sendTransaction').length, 0,
+    'the adapter must not silently change to a direct EOA send')
+  assert.equal(s.walletRequests.filter(x => x.method === 'wallet_sendCalls').length, 0,
+    'unbounded EIP-5792 batch must never reach the connected wallet')
+  assert.equal(s.mined(), false)
+  assert.equal(s.getBound()?.txHash, undefined)
+})
+await test('fee-bound ordinary EOA SDK route is distinct from the native batch route', async () => {
+  const s = await setup('borrow')
+  await s.run()
+  const requests = s.walletRequests.filter(x => x.method === 'eth_sendTransaction')
+  assert.equal(requests.length, 1)
+  assert.equal(s.walletRequests.filter(x => x.method === 'wallet_sendCalls').length, 0)
+  const record = s.getBound()
+  const fields = requests[0].params[0]
+  assert.equal(fields.to.toLowerCase(), t.BORROW_BATCHER.toLowerCase())
+  assert.ok(BigInt(fields.gas) * BigInt(fields.maxFeePerGas) <= record.terms.maxGasCostWei)
+  assert.equal(BigInt(fields.nonce), BigInt(record.nonce))
+  assert.equal(policy.borrowBatchCommitment(t.decodeBorrowAggregate(fields.data)), record.callsHash)
+})
+
 console.log(`RESULT ${count}/${count} PASS; actual SDK/encoder/adapter, controlled HTTP/RPC/provider; no external traffic or real wallet signatures/transactions`)
