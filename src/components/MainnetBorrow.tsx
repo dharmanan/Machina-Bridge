@@ -612,6 +612,7 @@ function MarketCard({ market, verification, borrowAmount, selected, onSelect }: 
             <span className="text-sm font-semibold text-slate-900">{market.collateralAsset.symbol} / {market.loanAsset.symbol}</span>
             {/* Both markets carry the same pair; the short ID is what tells them apart. */}
             <span className="ml-2 font-mono text-[11px] text-slate-400" title={market.marketId}>{shortenMarketId(market.marketId)}</span>
+            <p className="mt-1 text-[11px] leading-4 text-slate-500">Morpho lending market · Circle Borrow Kit quotes</p>
           </div>
           <span className={`shrink-0 text-[11px] font-semibold ${selected ? 'text-[#2F6E0C]' : 'text-slate-400'}`}>{selected ? 'Selected' : 'Select'}</span>
         </div>
@@ -647,6 +648,9 @@ function MarketsSection({ state, verifications, borrowAmount, selectedId, onSele
     <Panel>
       <div data-borrow-section="markets">
         <SectionTitle title="Choose a market" />
+        <p className="mb-3 text-xs text-slate-600" data-borrow-provider>
+          On-chain lending protocol: <strong>Morpho</strong> (Arc Mainnet). Market discovery, estimates and execution integration: <strong>Circle Borrow Kit</strong>. Each card is a separate Morpho market.
+        </p>
         {state.status === 'loading' && <LoadingBars rows={3} />}
         {state.status === 'unavailable' && (
           <Notice tone="warn">

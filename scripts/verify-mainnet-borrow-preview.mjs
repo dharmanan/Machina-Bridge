@@ -441,6 +441,8 @@ test('the standard screen is short and plain; every technical detail sits in a c
   const details = body.slice(body.indexOf('function MarketDetailsBlock'), body.indexOf('// Current loan'))
   for (const label of ['Market ID', 'On-chain verification', 'Oracle', 'Oracle price', 'Rate model', 'LLTV (liquidation LTV)', 'Available liquidity (Circle)', 'Liquidity on-chain', 'Utilization', 'Total borrowed', 'Data timestamp']) assert.ok(details.includes(`label="${label}"`), label)
   assert.ok(body.includes('are not ranked') && body.includes('never shown as verified'))
+  assert.ok(body.includes('On-chain lending protocol:') && body.includes('Morpho lending market · Circle Borrow Kit quotes'), 'the market provider is visible without opening Advanced details')
+  assert.ok(readFileSync(`${root}src/components/BorrowOperations.tsx`, 'utf8').includes('Morpho market:'), 'the selected action identifies its protocol')
 
   // New borrow estimate: exactly these rows, in this order. Estimated Health Factor carries the target relation.
   const estimateStart = body.indexOf('data-borrow-estimate>')
