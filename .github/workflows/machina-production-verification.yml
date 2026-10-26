@@ -62,6 +62,7 @@ jobs:
           for suite in \
             verify-production-ci verify-zod-collection-backport verify-circle-response-limits verify-release-dependency-security \
             verify-mainnet-borrow verify-mainnet-borrow-preview \
+            verify-borrow-eurc-markets \
             verify-mainnet-borrow-write-safety verify-borrow-operations \
             verify-borrow-sdk-integration \
             verify-mainnet-swap-preview verify-swap-support-matrix \

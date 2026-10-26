@@ -591,6 +591,47 @@ function marketStatus(market: BorrowMarket, verification: MarketVerification | u
   return { tone: 'good' as const, icon: ShieldCheck, label: 'Available' }
 }
 
+// Morpho markets are permissionless, not owned by the vault managers who supply liquidity.
+type EurcMarketsState = { status: 'loading' | 'unavailable'; markets: [] } | { status: 'available'; markets: BorrowMarket[] }
+const EURC_SOURCE = 'https://morphowatch.com/markets/arc/cirbtc-eurc-86/'
+function MarketOwnership({ market }: { market: BorrowMarket }) {
+  const id = market.marketId.toLowerCase()
+  const knownEurc = market.loanAsset.symbol === 'EURC' && id.startsWith('0x6ea1ea96') && id.endsWith('37daf4')
+  const largeUsdc = id === '0xc2db905f174e5defcce01d321b09f15f78856a36a21b90cc7e1abbc29225815d'
+  const smallUsdc = id === '0xabd1763943714b96b6590238d484a240019b4b842eb67fbcff7d96c081b7b566'
+  const curators = knownEurc ? 'Galaxy Curation, Gauntlet, Steakhouse Financial' :
+    largeUsdc ? 'Galaxy Curation, Keyrock, Steakhouse Financial, Gauntlet' :
+    smallUsdc ? 'Pangolins' : null
+  return <div className="mt-2 space-y-1 text-[11px] leading-4 text-slate-600">
+    <p><strong>Market owner:</strong> None; permissionless Morpho market.</p>
+    <p><strong>Vault curators supplying liquidity:</strong> {curators ?? 'Not verified for this market'}</p>
+    <p className="text-slate-500">Vault curators do not own the underlying market.</p>
+  </div>
+}
+function EurcMarkets({ state }: { state: EurcMarketsState }) {
+  return <div className="mt-4 border-t border-slate-200 pt-4" data-borrow-eurc-markets>
+    <h3 className="font-semibold text-slate-900">cirBTC / EURC · Morpho</h3>
+    <p className="mt-1 text-xs text-slate-600">Live market information from Morpho. EURC loan execution in Machina remains disabled pending Circle Borrow Kit compatibility verification.</p>
+    {state.status === 'loading' && <p className="mt-2 text-xs text-slate-500">Loading EURC market…</p>}
+    {state.status === 'unavailable' && <p className="mt-2 text-xs text-amber-900">EURC market data temporarily unavailable. <a className="underline" href={EURC_SOURCE} target="_blank" rel="noreferrer">View external market details</a>.</p>}
+    {state.status === 'available' && <div className="mt-3 grid gap-3 md:grid-cols-2">{state.markets.map(market =>
+      <div key={market.marketId} data-borrow-eurc-market={market.marketId} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm font-semibold">cirBTC / EURC <span className="font-mono text-xs text-slate-500">{shortenMarketId(market.marketId)}</span></span>
+          <span className="rounded-full bg-slate-200 px-2 py-1 text-xs">View only</span>
+        </div>
+        <p className="mt-2 text-xs text-slate-600">Protocol: Morpho · Arc Mainnet · LLTV {market.lltv === null ? 'N/A' : (market.lltv * 100).toFixed(2) + '%'}</p>
+        <dl className="mt-3 grid grid-cols-2 gap-3 text-xs">
+          <div><dt className="text-slate-500">Borrow APY · variable</dt><dd className="text-base font-semibold">{percentText(market.borrowApy) ?? NOT_REPORTED}</dd></div>
+          <div><dt className="text-slate-500">EURC liquidity</dt><dd className="text-base font-semibold">{amountText(market.liquidity) ?? NOT_REPORTED}</dd></div>
+        </dl>
+        <MarketOwnership market={market} />
+        <a href={EURC_SOURCE} target="_blank" rel="noreferrer" className="mt-2 inline-block text-xs underline">Market details and suppliers</a>
+      </div>
+    )}</div>}
+  </div>
+}
+
 function MarketCard({ market, verification, borrowAmount, selected, onSelect }: {
   market: BorrowMarket
   verification: MarketVerification | undefined
@@ -630,12 +671,14 @@ function MarketCard({ market, verification, borrowAmount, selected, onSelect }: 
             <dd className="mt-0.5 break-words text-base font-semibold tabular-nums text-slate-900">{amountText(market.liquidity) ?? <span className="text-sm font-normal text-slate-400">{NOT_REPORTED}</span>}</dd>
           </div>
         </dl>
+        <MarketOwnership market={market} />
       </button>
     </div>
   )
 }
 
-function MarketsSection({ state, verifications, borrowAmount, selectedId, onSelect, onReload }: {
+function MarketsSection({ state, eurcMarkets, verifications, borrowAmount, selectedId, onSelect, onReload }: {
+  eurcMarkets: EurcMarketsState
   state: BorrowMarketState
   verifications: Record<string, MarketVerification>
   borrowAmount: string | null
@@ -649,7 +692,7 @@ function MarketsSection({ state, verifications, borrowAmount, selectedId, onSele
       <div data-borrow-section="markets">
         <SectionTitle title="Choose a market" />
         <p className="mb-3 text-xs text-slate-600" data-borrow-provider>
-          On-chain lending protocol: <strong>Morpho</strong> (Arc Mainnet). Market discovery, estimates and execution integration: <strong>Circle Borrow Kit</strong>. Each card is a separate Morpho market.
+          On-chain lending protocol: <strong>Morpho</strong> (Arc Mainnet). USDC loan quotes and execution: <strong>Circle Borrow Kit</strong>. EURC data: Morpho API, view-only.
         </p>
         {state.status === 'loading' && <LoadingBars rows={3} />}
         {state.status === 'unavailable' && (
@@ -673,6 +716,7 @@ function MarketsSection({ state, verifications, borrowAmount, selectedId, onSele
             ))}
           </div>
         )}
+        <EurcMarkets state={eurcMarkets} />
       </div>
     </Panel>
   )
@@ -1584,6 +1628,7 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
   // "Refresh quote": reads the quote and everything it depends on again (read only). It never touches what was typed.
   const [quoteTick, setQuoteTick] = useState(0)
   const [marketsState, setMarketsState] = useState<BorrowMarketState>({ status: 'loading' })
+  const [eurcMarkets, setEurcMarkets] = useState<EurcMarketsState>({ status: 'loading', markets: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [verifications, setVerifications] = useState<Record<string, MarketVerification>>({})
   const [collateralText, setCollateralText] = useState('')
@@ -1618,6 +1663,22 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
     return () => { live = false }
   }, [refresh])
 
+  // Separate EURC information feed. Never enters the Circle/USDC execution selection.
+  useEffect(() => {
+    let active = true
+    setEurcMarkets({ status: 'loading', markets: [] })
+    void fetch('/api/borrow-eurc-markets', { method: 'GET' }).then(async response => {
+      if (!response.ok) throw new Error('EURC read unavailable')
+      const result = await response.json()
+      if (result.schema !== 'machina.borrow.eurc.v1' || result.executionAvailable !== false || !Array.isArray(result.markets) ||
+        result.markets.length === 0 || !result.markets.every((market: BorrowMarket) => market.protocol === 'morpho' &&
+          market.collateralAsset?.symbol === 'cirBTC' && market.loanAsset?.symbol === 'EURC' &&
+          /^0x[0-9a-fA-F]{64}$/.test(market.marketId))) throw new Error('Invalid EURC market read')
+      if (active) setEurcMarkets({ status: 'available', markets: result.markets })
+    }).catch(() => { if (active) setEurcMarkets({ status: 'unavailable', markets: [] }) })
+    return () => { active = false }
+  }, [refresh])
+
   // Every listed market is checked against Morpho on-chain; the check never changes which markets are listed or their order.
   useEffect(() => {
     if (marketsState.status !== 'available') return undefined
@@ -1650,7 +1711,7 @@ export function BorrowWorkspace({ walletAddress, walletChainId = null, requestWa
       <BorrowHeader loading={marketsState.status === 'loading'} onRefresh={bump} controlled={controlled} />
       <div className="mt-4 space-y-4">
         <RiskLine />
-        <MarketsSection state={marketsState} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
+        <MarketsSection state={marketsState} eurcMarkets={eurcMarkets} verifications={verifications} borrowAmount={borrowAmount} selectedId={selectedId} onSelect={setSelectedId} onReload={bump} />
         <CurrentLoan walletAddress={walletAddress} positions={positions} markets={markets} bump={bump} />
         {controlled && <BorrowOperations wallet={walletAddress ? wallet.state : null} market={selected}
           positions={positions.first.status === 'available' ? [...positions.first.data.items, ...positions.extra] : []}
