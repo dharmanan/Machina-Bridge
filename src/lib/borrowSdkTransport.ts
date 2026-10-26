@@ -1,5 +1,5 @@
 // Borrow-only binding for the official /next adapter. The shared Swap/Bridge/Earn adapter is unchanged.
-import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeFunctionData, http, parseAbi, type Hex, type PublicClient, type WalletClient, UserRejectedRequestError } from 'viem'
+import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeFunctionData, http, parseAbi, type Hex, type PublicClient, type WalletClient, type Transport, UserRejectedRequestError } from 'viem'
 import { getChainByEnum, Blockchain } from '@circle-fin/borrow-kit'
 import { createViemAdapterContext, createViemAdapterFromContext } from '@circle-fin/borrow-adapter-viem-v2/next'
 import { MAINNET_BORROW_ADAPTER_CONTRACT, MAINNET_BORROW_CHAIN_ID } from '../config/mainnetBorrow'
@@ -11,6 +11,9 @@ import { createBorrowSubmissionGuard } from './borrowSubmissionGuard'
 import { readBorrowAtomicState } from './borrowRecovery'
 import type { BorrowReview } from './borrowOperations'
 import type { Eip1193Request } from './mainnetBorrow'
+import { borrowCanaryAllows } from '../config/borrowCanary'
+import { attestBorrowCanaryAdapter } from './borrowCanaryAuthority'
+export { borrowCanaryAdapterOwner } from './borrowCanaryAuthority'
 
 export const BORROW_BATCHER = '0x522fAf9A91c41c443c66765030741e4AaCe147D0' as const
 export const BORROW_AGGREGATE_ABI = parseAbi(['function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)'])
@@ -31,7 +34,16 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
 function closed(code: string): never { throw new Error(code) }
 const rawChain = getChainByEnum(Blockchain.Arc)
 const chain = rawChain.type === 'evm' ? rawChain : closed('borrow_invalid_chain_config')
-export function borrowPublicClient() { return createPublicClient({ transport: http(MAINNET_CONFIG.arcRpcUrl, { retryCount: 0, timeout: 10_000 }) }) }
+const BORROW_READ_RPC = new Set(['eth_chainId','eth_blockNumber','eth_getBlockByNumber','eth_getBlockByHash','eth_getCode','eth_getBalance','eth_getStorageAt','eth_getTransactionCount','eth_getTransactionByHash','eth_getTransactionReceipt','eth_getLogs','eth_gasPrice','eth_call','eth_estimateGas'])
+export function borrowPublicClient() {
+  const transport: Transport = options => {
+    const raw = http(MAINNET_CONFIG.arcRpcUrl, { retryCount: 0, timeout: 10_000 })(options)
+    const check = (method: string) => { if (!BORROW_READ_RPC.has(method)) closed('borrow_public_rpc_method_blocked') }
+    return { ...raw, request: ((args, opts) => { check(args.method); return raw.request(args, opts) }) as typeof raw.request,
+      config: { ...raw.config, request: (args => { check(args.method); return raw.config.request(args) }) as typeof raw.config.request } }
+  }
+  return createPublicClient({ transport, ccipRead: false, cacheTime: 0 })
+}
 export function decodeBorrowAggregate(data: Hex): BorrowCall[] {
   const decoded = decodeFunctionData({ abi: BORROW_AGGREGATE_ABI, data })
   if (encodeFunctionData({ abi: BORROW_AGGREGATE_ABI, functionName: 'aggregate3', args: decoded.args }).toLowerCase() !== data.toLowerCase()) closed('borrow_noncanonical_batch')
@@ -91,6 +103,7 @@ export type BorrowTransportOptions = {
   prepared?: (details: { rpcEstimatedFeeWei: bigint; requestFeeCeilingWei: bigint; executionDeadlineMs: number }) => void
   isCurrent?: () => boolean
   now?: () => number; idempotencyKey?: string; walletRequested?: () => void
+  requireCanary?: boolean
 }
 export function createBorrowSdkTransport(options: BorrowTransportOptions) {
   const { review, client, request } = options, owner = review.wallet.address as Hex, now = options.now ?? Date.now
@@ -106,6 +119,7 @@ export function createBorrowSdkTransport(options: BorrowTransportOptions) {
     return request(args)
   }) as any }, { retryCount: 0 }) })
   const requireContext = async () => {
+    if (options.requireCanary && !borrowCanaryAllows(owner)) closed('borrow_canary_wallet')
     guard.check()
     if (options.isCurrent?.() === false) closed('borrow_context_changed')
     if (now() >= review.expiresAt) closed('borrow_review_expired')
@@ -213,5 +227,6 @@ export function createBorrowSdkTransport(options: BorrowTransportOptions) {
       throw e
     }
   } })
+  if (options.requireCanary && borrowCanaryAllows(owner)) attestBorrowCanaryAdapter(adapter, owner)
   return { adapter, getBound: () => bound, sealUnsent: guard.sealUnsent, reason: () => lastReason }
 }

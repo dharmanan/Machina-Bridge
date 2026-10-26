@@ -1,4 +1,5 @@
 import { detectBorrowAtomicSupport } from '../lib/borrowProduction'
+import { borrowCanaryAllows } from '../config/borrowCanary'
 import { BorrowOperations } from './BorrowOperations'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useAccount } from 'wagmi'
@@ -1450,13 +1451,13 @@ function ChecksDetails({ model, walletChainId, onRefreshQuote }: { model: Borrow
           {chip && <span className={`rounded-lg border px-2 py-0.5 text-[11px] font-semibold leading-4 ${chip.className}`} data-readiness-status>{chip.label}</span>}
         </div>
         <p className="text-[11px] leading-5 text-slate-700" data-readiness-reason>{reason}</p>
-        <p className="mt-1 text-[11px] leading-4 text-slate-500">Preview only: real transactions are switched off in this release, whatever the result.</p>
+        <p className="mt-1 text-[11px] leading-4 text-slate-500">{borrowCanaryAllows(model.walletAddress) ? 'This preview is read-only. Use Review loan actions for the approved-wallet canary; fresh batch, simulation and fee checks remain mandatory.' : 'Preview only: real transactions are switched off for this wallet.'}</p>
       </section>
 
       <section data-borrow-wallet-compat={walletView ? walletView.state : 'no-wallet'}>
         <SubHeading>Wallet</SubHeading>
         <dl className={detailRows}>
-          <DetailRow label="Atomic transactions (EIP-5792)">
+          <DetailRow label="Atomic Borrow transport">
             <span className={`font-semibold ${walletView ? WALLET_TONE[walletView.tone] : 'text-slate-500'}`} data-wallet-compat-label>{walletView ? walletView.label : 'No wallet connected'}</span>
             {walletView && walletView.tone === 'bad' && walletView.state !== 'wrong-network' && <span className="text-slate-500"> (not suitable for Borrow)</span>}
           </DetailRow>

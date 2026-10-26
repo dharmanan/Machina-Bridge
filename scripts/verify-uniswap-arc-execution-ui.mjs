@@ -96,7 +96,7 @@ try {
     await page.getByRole('combobox', { name: 'To token' }).selectOption('EURC')
     await amount.fill('0.100001'); assert.equal(await review.isDisabled(), true); await page.getByText(/controlled pilot allows at most 0\.1 USDC/).waitFor()
     await amount.fill('0.1'); await page.evaluate(() => window.executionUiTest.account(true))
-    await page.getByText(/limited to the approved pilot wallet|Connect the wallet that will pay/).waitFor(); assert.equal(await review.isDisabled(), true)
+    await page.getByText(/limited to the approved canary wallet|Connect the wallet that will pay/).waitFor(); assert.equal(await review.isDisabled(), true)
     await page.evaluate(() => window.executionUiTest.account(false)); await page.waitForFunction(() => !document.evaluate("//button[normalize-space()='Review Swap']", document, null, 9, null).singleNodeValue?.disabled)
     await page.waitForFunction(() => !document.querySelector('#review-swap')?.disabled); assert.equal(await review.isEnabled(), true); assert.equal(await sends(), 0); assert.ok(apiCalls >= 1)
   })

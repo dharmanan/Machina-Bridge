@@ -1140,8 +1140,8 @@ await test('UI 17 Borrow is always present and respects the existing guarded Bor
     const write = /executeBorrowWrite|planBorrowWrite|detectAtomicBatchCapability|\bBorrowKit\b|wallet_sendCalls|wallet_getCapabilities|MAINNET_BORROW_WRITES_ENABLED\s*=/.exec(source);
     assert.equal(write, null, `${file}: no Borrow write path (${write?.[0]})`);
   }
-  // The guarded integration is untouched: its only write entry point still refuses first while the gate is false.
-  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
+  // Public writes still refuse first; only an attested, owner-bound guarded canary may pass this separate source boundary.
+  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true && !canary\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
 });
 
 await test('UI 18 Borrow market terms are read only, exact, and omitted when the service reports none', async () => {
@@ -1509,7 +1509,7 @@ await test('Borrow proxy 5 success is short-lived CDN cacheable and mapped exact
 await test('Borrow proxy 6 the Borrow write gate stays false and untouched; nothing on the market path can write', async () => {
   assert.equal(borrowConfig.MAINNET_BORROW_WRITES_ENABLED, false);
   assert.match(readFileSync(BORROW_CONFIG_PATH, 'utf8'), /export const MAINNET_BORROW_WRITES_ENABLED: boolean = false\n/);
-  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
+  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true && !canary\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
   for (const file of ['api/_lib/borrow-markets-proxy.js', 'api/borrow-markets.js', 'src/lib/arcIntelligence.ts', 'src/components/ArcIntelligenceOverview.tsx']) {
     const source = readFileSync(sourcePath(file), 'utf8');
     const write = /executeBorrowWrite|planBorrowWrite|MAINNET_BORROW_WRITES_ENABLED\s*=|wallet_sendCalls|eth_sendTransaction|signTypedData|privateKey|\/loans/.exec(source);
@@ -3402,7 +3402,7 @@ await test('Public Beta 3 Intelligence has no duplicate Beta and Borrow remains 
 
 await test('Public Beta 4 Borrow write gate and supported transaction boundaries stay unchanged', async () => {
   assert.equal(borrowConfig.MAINNET_BORROW_WRITES_ENABLED, false);
-  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
+  assert.match(readFileSync(BORROW_LIB_PATH, 'utf8'), /if \(MAINNET_BORROW_WRITES_ENABLED !== true && !canary\) return \{ status: 'refused', blockers: \['writes_disabled'\] \}/);
   const app = readFileSync(sourcePath('src/App.tsx'), 'utf8');
   const mainnetNav = app.slice(app.indexOf("{appNetwork === 'mainnet' && (", app.indexOf('{/* Row 1')), app.indexOf('<main className="flex-1">'));
   assert.match(mainnetNav, /id: 'earn'/, 'inspect the populated mainnet navigation');

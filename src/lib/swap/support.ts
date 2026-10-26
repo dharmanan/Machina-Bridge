@@ -52,6 +52,7 @@ export const supportFor = (provider: SwapProviderId, tokenIn: SwapSymbol, tokenO
 // What the selected build lets this provider do for a route right now (the screen shows this; it never claims more).
 export function executionInBuild(entry: SupportEntry, config: SwapExecutionConfig, circleOpen: boolean): { available: boolean; text: string } {
   if (!config.enabled) return { available: false, text: 'Execution is switched off in this build: quotes only.' }
+  if (config.canaryWallet && config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off in this build: quotes only.' } : { available: true, text: 'Approved-wallet canary only; balance and transaction checks still apply.' }
   if (config.mode === 'open') return entry.provider === 'circle' && !circleOpen ? { available: false, text: 'Switched off in this build: quotes only.' } : { available: true, text: 'Available (any wallet, subject to balance and transaction checks).' }
   return entry.execution.pilot === 'enabled' ? { available: true, text: 'Available in the controlled pilot (approved wallet, up to 0.1 USDC).' } : { available: false, text: 'Quotes only in the controlled pilot.' }
 }

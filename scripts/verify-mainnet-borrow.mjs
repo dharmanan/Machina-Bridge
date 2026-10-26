@@ -711,8 +711,10 @@ await test('SDK write calls exist only behind the write gate in executeBorrowWri
   const start = libSource.indexOf('export async function executeBorrowWrite(')
   assert.ok(start > 0)
   const body = libSource.slice(start)
-  const gate = body.indexOf("if (MAINNET_BORROW_WRITES_ENABLED !== true) return { status: 'refused', blockers: ['writes_disabled'] }")
+  const gate = body.indexOf("if (MAINNET_BORROW_WRITES_ENABLED !== true && !canary) return { status: 'refused', blockers: ['writes_disabled'] }")
   assert.ok(gate > 0, 'gate check present')
+  assert.ok(body.indexOf('borrowCanaryAdapterOwner(request.canaryAdapter)') < gate, 'canary requires a guarded-adapter identity')
+  assert.ok(body.indexOf('boundary.adapter !== request.canaryAdapter') > gate, 'the actual SDK adapter must be the attested instance')
   for (const method of borrow.MAINNET_BORROW_WRITE_METHODS) {
     const pattern = new RegExp(`client\\.${method}\\(`, 'g')
     const total = libSource.match(pattern)?.length ?? 0
@@ -764,7 +766,7 @@ await test('Borrow stays isolated from Earn, Bridge and the engine; connected SD
   for (const path of importers) {
     const code = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
     if (['borrowProduction.ts', 'borrowSdkTransport.ts'].includes(path.split('/').at(-1))) {
-      if (path.endsWith('borrowProduction.ts')) assert.match(code, /if \(productionBorrowExecutionBlocker\(\)\) throw/)
+      if (path.endsWith('borrowProduction.ts')) { assert.match(code, /productionBorrowExecutionBlocker\(review.wallet.address\)/); assert.match(code, /requireCanary: true/) }
       else { assert.match(code, /verifyBorrowAtomicBatch/); assert.match(code, /assertBorrowFeeBinding/); assert.match(code, /guard.markRequested\(\)/) }
       continue
     }

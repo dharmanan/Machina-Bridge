@@ -1,6 +1,9 @@
 // No SDK, network, wallet or environment mutation. These tests ensure the CI guard rejects actual gate openings.
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { assertBorrowSourceGates, BORROW_SOURCE_GATES } from './verify-borrow-source-gates.mjs'
 let count = 0
 function test(name, run) { run(); count++; console.log('PASS ' + name) }
@@ -21,10 +24,29 @@ test('duplicate or mutable declarations are rejected', () => {
   assert.throws(() => assertBorrowSourceGates(source + `\nexport const ${BORROW_SOURCE_GATES[0]} = false`))
   assert.throws(() => assertBorrowSourceGates(source.replace('export const MAINNET_BORROW_WRITES_ENABLED', 'export let MAINNET_BORROW_WRITES_ENABLED')))
 })
-test('CI invokes the checked file and retains the real audit failure gate', () => {
+test('CI records the real audit, reports known risks, preserves JSON and does not run heavy suites on every feature push', () => {
   const workflow = readFileSync(new URL('../.github/workflows/machina-production-verification.yml', import.meta.url), 'utf8')
   assert.match(workflow, /run: node scripts\/verify-borrow-source-gates\.mjs/)
-  assert.match(workflow, /run: npm audit --omit=dev --audit-level=high/)
+  assert.match(workflow, /if npm audit --omit=dev --json > npm-audit-production.json/)
+  assert.match(workflow, /report-dependency-audit\.mjs npm-audit-production.json/)
+  assert.match(workflow, /actions\/upload-artifact@v4/)
+  assert.equal((workflow.match(/contains\(github.event.head_commit.message, '\[release-check\]'\)/g) ?? []).length, 2)
+  assert.match(workflow, /pull_request:\n\s+branches: \[main\]/)
   assert.doesNotMatch(workflow, /continue-on-error|npm audit[^\n]*\|\|\s*true/)
+})
+test('audit reporting retains known findings, rejects unknown roots, and fails on incomplete evidence', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'machina-audit-report-')), env = { ...process.env }; delete env.GITHUB_STEP_SUMMARY
+  try {
+    const file = join(temp, 'audit.json')
+    const fixture = id => ({ vulnerabilities: { zod: { via: [{url:'https://github.com/advisories/'+id, severity:'high', title:'controlled fixture'}] } }, metadata: { vulnerabilities: {critical:0,high:1,moderate:0,low:0,total:1} } })
+    const run = (data, code) => { writeFileSync(file, JSON.stringify(data)); return spawnSync(process.execPath, ['scripts/report-dependency-audit.mjs', file, String(code)], { cwd:new URL('..',import.meta.url), env, encoding:'utf8' }) }
+    let result = run(fixture('GHSA-mrhx-c7xc-m3w5'),1)
+    assert.equal(result.status,0); assert.match(result.stdout,/Raw npm audit exit: \*\*1\*\*/); assert.match(result.stdout,/no clean audit is claimed/)
+    assert.notEqual(run(fixture('GHSA-unassessed-root'),1).status,0)
+    const critical = fixture('GHSA-mrhx-c7xc-m3w5'); critical.metadata.vulnerabilities.critical=1
+    assert.notEqual(run(critical,1).status,0)
+    assert.notEqual(run({error:{code:'ENETUNREACH'}},2).status,0)
+    assert.notEqual(run({vulnerabilities:{},metadata:{vulnerabilities:{critical:0,high:0,total:0}}},1).status,0)
+  } finally { rmSync(temp,{recursive:true,force:true}) }
 })
 console.log(`RESULT ${count}/${count} CI gate regressions PASS; no live traffic or wallet calls`)

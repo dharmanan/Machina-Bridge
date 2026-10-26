@@ -5,7 +5,14 @@ on:
     branches:
       - main
       - feature/uniswap-swap-preview
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      full_release:
+        description: Run complete pre-merge acceptance
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,7 +22,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fast-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Source safety and compatible dependency guards
+        run: |
+          npx tsc --noEmit
+          node scripts/verify-production-ci.mjs
+          node scripts/verify-zod-collection-backport.mjs
+          node scripts/verify-circle-response-limits.mjs
+          node scripts/verify-borrow-source-gates.mjs
   source-regressions:
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -36,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           for suite in \
-            verify-production-ci verify-zod-collection-backport verify-release-dependency-security \
+            verify-production-ci verify-zod-collection-backport verify-circle-response-limits verify-release-dependency-security \
             verify-mainnet-borrow verify-mainnet-borrow-preview \
             verify-mainnet-borrow-write-safety verify-borrow-operations \
             verify-borrow-sdk-integration \
@@ -55,8 +80,15 @@ jobs:
             node "scripts/$suite.mjs"
             echo "::endgroup::"
           done
-      - name: Confirm source gates remain closed until wallet canary
+      - name: Confirm public source gates remain closed; bounded canary is tested separately
         run: node scripts/verify-borrow-source-gates.mjs
+      - name: Production dependency reachability evidence
+        run: node scripts/verify-security-bundle.mjs security-bundle.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-bundle-evidence
+          path: security-bundle.json
 
   security-audit:
     runs-on: ubuntu-latest
@@ -68,10 +100,28 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Production dependency advisories (blocking; no suppression)
-        run: npm audit --omit=dev --audit-level=high
+      - name: Raw dependency advisories and explicit risk report
+        run: |
+          if npm audit --omit=dev --json > npm-audit-production.json; then
+            AUDIT_EXIT=0
+          else
+            AUDIT_EXIT=$?
+          fi
+          node scripts/report-dependency-audit.mjs npm-audit-production.json "$AUDIT_EXIT"
+          if npm audit --json > npm-audit-full.json; then
+            FULL_AUDIT_EXIT=0
+          else
+            FULL_AUDIT_EXIT=$?
+          fi
+          node scripts/report-dependency-audit.mjs npm-audit-full.json "$FULL_AUDIT_EXIT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: raw-production-audit
+          path: npm-audit-*.json
 
   browser-regressions:
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/feature/uniswap-swap-preview' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

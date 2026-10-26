@@ -11,6 +11,7 @@ import { executionRestrictionMessage, swapExecutionRestriction } from '../lib/sw
 import { browserExecutionLock, createUniswapArcExecution, executionDeadlineMs, listStoredAttempts, type ExecutionContext, type ExecutionView, type StoredHistory, type SwapAttempt } from '../lib/uniswapArcExecution'
 import { arcExecutionRpc } from '../lib/uniswapArcExecutionRpc'
 import { SWAP_EXECUTION } from '../config/swapExecution'
+import { SwapMarketRiskNotice } from './SwapMarketRiskNotice'
 import { decodeUniversalRouterCalldata, guaranteedNetMinimum } from '../lib/swap/universalRouter'
 
 // Uses the already connected wagmi connector. No new wallet, signing SDK, service or login.
@@ -144,6 +145,7 @@ export function UniswapReviewDialog({ execution }: { execution: UniswapExecution
   return <dialog ref={dialog} onCancel={execution.cancel} aria-labelledby="uniswap-review-title" className="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-black/40">
     <div className="space-y-4">
       <h2 id="uniswap-review-title" className="text-xl font-semibold">Review Uniswap swap</h2>
+      {SWAP_EXECUTION.canaryWallet && <SwapMarketRiskNotice />}
       <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
         <p className="font-medium">Wallet security</p>
         <p>Browser extensions may modify swap transactions before signing. Check the final amount, additional fees and recipient in your wallet. If anything differs from this review, reject the transaction.</p>

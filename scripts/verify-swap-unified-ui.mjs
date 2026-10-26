@@ -43,6 +43,8 @@ const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
 const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_SWAP_EXECUTION_MODE': JSON.stringify('open'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) },
   cacheDir: `${root}.verification/vite-unified-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
     name: 'read-only-baseline-lifecycle-probe', enforce: 'pre', transform(code, id) {
+      // TEST ONLY: a disposable signer replaces the canary address. Production policy has separate tests.
+      if (id.split('?')[0] === `${root}src/config/swapExecution.ts`) return `import { swapExecutionConfig } from '../lib/swap/executionMode'; export const SWAP_EXECUTION = Object.freeze({ ...swapExecutionConfig('true', '${owner}', 'open'), canaryWallet: '${owner}' });`
       if (process.env.MACHINA_TAB_BASELINE_PROBE !== '1') return
       const relative = id.split('?')[0].slice(root.length)
       if (['src/components/UniswapArcExecution.tsx', 'src/lib/uniswapArcExecution.ts'].includes(relative))
@@ -230,10 +232,10 @@ try {
 
   await test('the mode chip depends on the route and the build, not on whether an amount was typed; both providers are always offered', async () => {
     await page.getByRole('heading', { name: 'Swap', exact: true }).waitFor()
-    assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); assert.equal(await amount.inputValue(), '')
-    await circleCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); await uniCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap')
+    assert.equal(await page.getByLabel('Swap mode').innerText(), 'Controlled canary'); assert.equal(await amount.inputValue(), '')
+    await circleCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Controlled canary'); await uniCard.click(); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Controlled canary')
     assert.equal(await page.getByText('Preview only', { exact: true }).count(), 0)
-    await page.evaluate(() => window.swapUiTest.connect(5042)); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap')
+    await page.evaluate(() => window.swapUiTest.connect(5042)); assert.equal(await page.getByLabel('Swap mode').innerText(), 'Controlled canary')
     assert.equal(await page.getByLabel('Swap activity', { exact: true }).evaluate(node => node.open), false)
     assert.equal(await page.getByLabel('Swap details', { exact: true }).evaluate(node => node.open), false)
     assert.equal(await page.getByRole('region', { name: 'Token approvals' }).count(), 0)
@@ -460,7 +462,7 @@ try {
     await uni.getByText(/EURC → USDC \(0\.05%\) → cirBTC \(0\.01%\)/).waitFor(); await uni.getByText(/An exact token approval if needed, one free short-lived Permit2 signature/).waitFor(); await uni.getByText('Yes', { exact: true }).waitFor()
     await circ.getByText(/One approval for exactly the amount you swap, then the swap\./).waitFor(); await circ.getByText('Yes', { exact: true }).waitFor()
     await opened(); await uni.getByText(/None yet by this application\. The route was only simulated/).waitFor(); await circ.getByText(/Real swaps on this direction by other wallets are on chain/).waitFor()
-    await uni.getByText(/Available \(any wallet, subject to balance and transaction checks\)/).waitFor(); await circ.getByText(/Available \(any wallet, subject to balance and transaction checks\)/).waitFor()
+    await uni.getByText(/Approved-wallet canary only; balance and transaction checks still apply/).waitFor(); await circ.getByText(/Approved-wallet canary only; balance and transaction checks still apply/).waitFor()
     await pick('USDC', 'EURC'); await uni.getByText(/No approval needed: USDC is sent directly with the swap/).waitFor(); await circ.getByText(/One signature \(no fee\) that allows exactly the amount you swap, then the swap\./).waitFor()
     await opened(); await uni.getByText(/one real swap \(0x1a5e…a921\)/).waitFor()
     await pick('USDC', 'WETH'); await opened(); await circ.getByText(/no real swap of this direction was found among the decoded fixtures/).waitFor(); await details.locator(':scope > summary').click()
@@ -604,7 +606,7 @@ try {
   })
   await test('Circle Swap Kit (test doubles for the SDK only): an exact approval and the adapter swap, each confirmed in the app first and then in the wallet, verified from the chain', async () => {
     await pick('EURC', 'USDC'); await amount.fill(''); await amount.fill('1'); await quoted(); await circleCard.click(); await circleCard.getByText(/Minimum/).waitFor()
-    assert.equal(await page.getByLabel('Swap mode').innerText(), 'Live swap'); assert.equal(await review.isEnabled(), true)
+    assert.equal(await page.getByLabel('Swap mode').innerText(), 'Controlled canary'); assert.equal(await review.isEnabled(), true)
     const before = await sends(), walletStart = await page.evaluate(() => window.swapUiTest.state.requests.length)
     await review.click(); const dialog = page.getByRole('dialog'); await dialog.getByText('Review Circle swap').waitFor()
     await dialog.getByText('Wallet security', { exact: true }).waitFor()

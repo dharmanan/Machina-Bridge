@@ -80,6 +80,22 @@ await test('execution claims match the real gates: the explicit pilot allows exa
   }
   assert.equal(buildStates(mode.swapExecutionConfig('false', owner, 'pilot'), true).filter(Boolean).length, 0)
 })
+await test('the production release grants only the approved wallet both providers and retains explicit kill switches', () => {
+  for (const requested of [undefined, 'open', 'canary']) {
+    const config = mode.controlledSwapRelease(undefined, '0x' + '22'.repeat(20), requested)
+    assert.equal(config.canaryWallet, owner); assert.equal(config.enabled, true)
+    for (const {tokenIn, tokenOut} of tokens.SWAP_DIRECTIONS) {
+      const request = p.validateArcRequest({ chainId:5042, tokenIn, tokenOut, owner, recipient:owner, amount:'1', minimumOutput:'1', slippageBps:50, maxNetworkFee:'100000000000000000' })
+      assert.equal(mode.swapExecutionRestriction(config, request, { connected:true, owner, chainId:5042 }), null)
+      assert.equal(mode.circleExecutionRestriction(config, { owner }, { connected:true, owner, chainId:5042 }, true), null)
+      const other = '0x' + '22'.repeat(20)
+      assert.equal(mode.swapExecutionRestriction(config, request, { connected:true, owner:other, chainId:5042 }), 'pilot_wallet')
+      assert.equal(mode.circleExecutionRestriction(config, { owner:other }, { connected:true, owner:other, chainId:5042 }, true), 'pilot_wallet')
+    }
+    assert.equal(mode.executionChip(config, { provider:'circle',tokenIn:'EURC',tokenOut:'USDC' }, true).label, 'Controlled canary')
+  }
+  for (const [enabled,requested] of [['false',undefined],['',undefined],['TRUE','open'],['true ','canary'],[undefined,'off'],['true','OPEN'],['true',''],['true','open ']]) assert.equal(mode.controlledSwapRelease(enabled, owner, requested).enabled, false)
+})
 await test('Circle fixture claims match the decoded real transactions: 8 swaps over 7 directions; the other 5 are stated as not seen, never implied', () => {
   const symbolOf = a => tokens.SWAP_SYMBOLS.find(s => tokens.swapToken(s).address.toLowerCase() === a.toLowerCase())
   const adapter = require(`${root}src/lib/swap/circleAdapterDecode.ts`), seen = new Set()

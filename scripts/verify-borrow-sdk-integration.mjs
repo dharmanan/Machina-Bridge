@@ -15,11 +15,16 @@ const HASH = '0x' + 'aa'.repeat(32), BLOCK = '0x' + 'bb'.repeat(32), owner = f.W
 const stateAbi = parseAbi(['function price() view returns(uint256)', 'function accrueInterest((address loanToken,address collateralToken,address oracle,address irm,uint256 lltv) params)', 'function isAuthorized(address owner,address authorized) view returns(bool)'])
 let count = 0, external = 0
 async function test(name, run) { await run(); count++; console.log('PASS ' + name) }
-async function setup(kind = 'borrow', initialMode = '') {
+async function setup(kind = 'borrow', initialMode = '', canary = false) {
+  const owner = canary ? require('../src/config/borrowCanary.ts').BORROW_CANARY.wallet.toLowerCase() : f.WALLET
   let mode = initialMode
   const built = await f.build(kind, d => { if (mode === 'full-repay') { d.action.repayAmount = '1000.25'; d.response.repayAmount.amount = '1000.25' } }), now = Date.now(); built.context.quote.fetchedAt = now
+  if (canary) {
+    const rebind = value => typeof value === 'string' ? value.replaceAll(f.WALLET, owner) : Array.isArray(value) ? value.map(rebind) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k,v]) => [k,rebind(v)])) : value
+    built.context = rebind(built.context)
+  }
   const review = { action: built.action, prepared: built.context.quote, evidence: built.context.evidence, wallet: built.context.wallet, expiresAt: now + 60000, actionId: safety.borrowActionId(built.action, owner), maxGasCostWei: 10n ** 18n }
-  const x = b.batchFixture(kind, now, review.prepared)
+  const x = b.batchFixture(kind, now, review.prepared, owner)
   const before = { collateral: kind === 'borrow' ? 0n : 5000000n, debtShares: kind === 'borrow' ? 0n : 1000250000000000n }
   const borrowShares = x.review.borrowAssets * 1000000n, repayAssets = kind === 'close-loan' ? before.debtShares / 1000000n : x.review.repayAssets
   const repayShares = kind === 'close-loan' ? before.debtShares : repayAssets * 1000000n
@@ -76,7 +81,7 @@ async function setup(kind = 'borrow', initialMode = '') {
     estimateGas: async ({ blockNumber }) => { if (blockNumber !== undefined) assert.equal(blockNumber, 100n); return 400000n },
     waitForTransactionReceipt: async () => { if (mode === 'timeout') throw Error('controlled timeout'); return { status: 'success', logs: [] } },
   }
-  const transport = t.createBorrowSdkTransport({ review, request, client: rpc, isCurrent: () => mode !== 'context-changed', persist: record => { if (mode === 'storage-after-hash' && record.txHash) throw Error('controlled storage failure'); store.save(record); currentBound = structuredClone(record); persisted.push(currentBound) }, submitted: h => { hashCallbacks++; assert.equal(h, HASH) } })
+  const transport = t.createBorrowSdkTransport({ review, request, client: rpc, requireCanary: canary, isCurrent: () => mode !== 'context-changed', persist: record => { if (mode === 'storage-after-hash' && record.txHash) throw Error('controlled storage failure'); store.save(record); currentBound = structuredClone(record); persisted.push(currentBound) }, submitted: h => { hashCallbacks++; assert.equal(h, HASH) } })
   const signed = { loanId: '11111111-1111-4111-8111-111111111111', chain: 'Arc', executionParams: x.params, signature: '0x' + '11'.repeat(65) }
   const client = new BorrowKit({ disableAnalytics: true, disableErrorReporting: true, providers: [new BorrowServiceProvider()] })
   const serviceRequests = []
@@ -106,7 +111,7 @@ async function setup(kind = 'borrow', initialMode = '') {
       return await client.withdrawCollateralRepayIfNeeded({ from, loanId: signed.loanId, collateralAmount: '0.01' })
     } finally { globalThis.fetch = previousFetch }
   }
-  return { serviceRequests, storage, store, callbacks: () => hashCallbacks, setMode: m => { mode = m }, borrowShares, repayShares, repayAssets, run, transport, walletRequests, persisted, getBound: () => currentBound, x, rpc, request, before, after, review, mined: () => mined }
+  return { context: built.context, serviceRequests, storage, store, callbacks: () => hashCallbacks, setMode: m => { mode = m }, borrowShares, repayShares, repayAssets, run, transport, walletRequests, persisted, getBound: () => currentBound, x, rpc, request, before, after, review, mined: () => mined }
 }
 for (const kind of Object.keys(f.ACTIONS)) await test(kind + ': actual SDK builds the validated atomic batch and the wallet receives bounded gas/fee/nonce', async () => {
   const s = await setup(kind); await s.run(); const sends = s.walletRequests.filter(r => r.method === 'eth_sendTransaction')
@@ -116,6 +121,30 @@ for (const kind of Object.keys(f.ACTIONS)) await test(kind + ': actual SDK build
   assert.equal(policy.borrowBatchCommitment(t.decodeBorrowAggregate(tx.data)), record.callsHash)
   assert.ok(s.serviceRequests.some(p => !p.endsWith('/quote')), 'the actual SDK fetched and validated the signed HTTP envelope, no resume fixture bypass')
   assert.equal(record.txHash, HASH); assert.ok(s.persisted.length >= 2)
+})
+for (const kind of Object.keys(f.ACTIONS)) await test(kind + ': attested approved-wallet canary crosses the closed public SDK gate with all normal checks', async () => {
+  const s = await setup(kind, '', true), main = require('../src/lib/mainnetBorrow.ts')
+  const canaryOwner = s.review.wallet.address
+  assert.equal(t.borrowCanaryAdapterOwner(s.transport.adapter), canaryOwner.toLowerCase())
+  const attempts = f.persistent(s.storage, 'canary', canaryOwner)
+  const result = await main.executeBorrowWrite({ canaryAdapter: s.transport.adapter, action: s.review.action, reviewedQuote: s.review.prepared,
+    confirmedActionId: safety.borrowActionId(s.review.action, canaryOwner), readWallet: async () => s.review.wallet,
+    refresh: async () => ({ quote: s.review.prepared, evidence: s.review.evidence }), getAdapter: async () => s.transport.adapter,
+    attempts, client: Object.fromEntries(main.MAINNET_BORROW_WRITE_METHODS.map(k => [k, s.run])) })
+  assert.notEqual(result.status, 'refused', JSON.stringify(result))
+  assert.equal(s.walletRequests.filter(r => r.method === 'eth_sendTransaction').length, 1)
+})
+await test('forged canary adapters and another wallet cannot cross the public gate or request a transaction', async () => {
+  const s = await setup('borrow', '', true), main = require('../src/lib/mainnetBorrow.ts')
+  assert.equal(t.borrowCanaryAdapterOwner({ ...s.transport.adapter }), null)
+  const request = { canaryAdapter: { ...s.transport.adapter }, readWallet: async () => { throw Error('must not read') } }
+  assert.equal((await main.executeBorrowWrite(request)).status, 'refused')
+  const result = await main.executeBorrowWrite({ canaryAdapter: s.transport.adapter, action: s.review.action,
+    readWallet: async () => ({ ...s.review.wallet, address: f.WALLET }), attempts: f.persistent(s.storage), getAdapter: async () => s.transport.adapter })
+  assert.equal(result.status, 'refused'); assert.equal(s.walletRequests.length, 0)
+})
+for (const mode of ['fee', 'wallet-nonce', 'pending', 'balance', 'simulation', 'atomic-wallet', 'context-changed']) await test('approved-wallet canary still refuses ' + mode + ' before sending', async () => {
+  const s = await setup('borrow', mode, true); await assert.rejects(s.run()); assert.equal(s.walletRequests.filter(r => r.method === 'eth_sendTransaction').length, 0)
 })
 for (const mode of ['fee', 'wallet-nonce', 'pending', 'balance', 'simulation', 'atomic-wallet', 'context-changed']) await test(mode + ': real SDK stops before any wallet transaction', async () => {
   const s = await setup('borrow', mode); await assert.rejects(s.run()); assert.equal(s.walletRequests.filter(r => r.method === 'eth_sendTransaction').length, 0)
@@ -197,7 +226,7 @@ for (const mutation of ['target','amount','sweep','extra-call']) await test('rea
 })
 await test('wired production submit is independently closed before any SDK, RPC or wallet request', async () => {
   const production = require('../src/lib/borrowProduction.ts')
-  const ports = production.createProductionBorrowPorts({ attempts: f.persistent(f.fakeStorage()), storage: () => f.fakeStorage(), request: () => { throw Error('must not read') }, readWallet: async () => { throw Error('must not read') }, prepare: async () => { throw Error('must not read') } })
+  const ports = production.createProductionBorrowPorts({ currentOwner: () => undefined, attempts: f.persistent(f.fakeStorage()), storage: () => f.fakeStorage(), request: () => { throw Error('must not read') }, readWallet: async () => { throw Error('must not read') }, prepare: async () => { throw Error('must not read') } })
   await assert.rejects(ports.submit({}, () => {}), /closed/)
 })
 
@@ -275,7 +304,7 @@ await test('production recovery uses a durably recorded attempt hash if the meta
   let ports
   try {
     t.borrowPublicClient = () => s.rpc
-    ports = production.createProductionBorrowPorts({ attempts, storage: () => s.storage, request: () => s.request, readWallet: async () => s.review.wallet, prepare: async () => { throw Error('Recovery must never prepare another transaction') } })
+    ports = production.createProductionBorrowPorts({ currentOwner: () => undefined, attempts, storage: () => s.storage, request: () => s.request, readWallet: async () => s.review.wallet, prepare: async () => { throw Error('Recovery must never prepare another transaction') } })
   } finally { t.borrowPublicClient = previous }
   assert.equal((await ports.recover(record.scopeId)).status, 'verified')
   assert.equal(await ports.acknowledge(record.scopeId), true)
@@ -304,4 +333,27 @@ await test('read-only wallet calls time out safely and can never dispatch a sign
   finally { globalThis.setTimeout = original }
 })
 assert.equal(external, 0)
+await test('the real public client rejects all signing/send methods on client and transport paths before any network request', async () => {
+  const client = t.borrowPublicClient()
+  for (const method of ['eth_sendTransaction','eth_sendRawTransaction','eth_sign','eth_signTypedData_v4','personal_sign','wallet_sendCalls']) {
+    await assert.rejects(async () => client.request({method}), /borrow_public_rpc_method_blocked/)
+    await assert.rejects(async () => client.transport.request({method}), /borrow_public_rpc_method_blocked/)
+  }
+})
+await test('capability discovery recognizes the official EOA path and refuses native atomic transports without rewriting their reply', async () => {
+  const production = require('../src/lib/borrowProduction.ts'), originalClient = t.borrowPublicClient
+  try {
+    const eoa = await setup(); t.borrowPublicClient = () => eoa.rpc
+    assert.equal(await production.detectBorrowAtomicSupport(eoa.request, owner), 'supported')
+    assert.equal(eoa.walletRequests.filter(x => x.method === 'eth_sendTransaction').length, 0)
+    for (const atomic of [{status:'supported'}, {status:'ready'}, {supported:true}]) {
+      const native = await setup('borrow', 'atomic-wallet'); t.borrowPublicClient = () => native.rpc
+      const reply = { '0x13b2': {atomic} }
+      const request = async args => args.method === 'wallet_getCapabilities' ? reply : native.request(args)
+      assert.equal(await production.detectBorrowAtomicSupport(request, owner), 'unsupported')
+      assert.deepEqual(reply, {'0x13b2':{atomic}})
+      assert.equal(native.walletRequests.filter(x => x.method === 'eth_sendTransaction').length, 0)
+    }
+  } finally { t.borrowPublicClient = originalClient }
+})
 console.log(`RESULT ${count}/${count} PASS; actual SDK/encoder/adapter, controlled HTTP/RPC/provider; no external traffic or real wallet signatures/transactions`)

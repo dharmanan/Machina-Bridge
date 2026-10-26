@@ -12,19 +12,27 @@ import type { StorageLike } from './borrowAttemptLedger'
 // Capability discovery is read-only. EOA support is supplied by the official /next mechanism, never by skipping atomicity.
 export async function detectBorrowAtomicSupport(request: Eip1193Request, owner: Hex): Promise<'supported' | 'unsupported' | 'unknown'> {
   try {
+    let nativeAtomic = false
     const readOnlyRequest = async (args: Parameters<Eip1193Request>[0]) => {
       if (!['eth_chainId', 'eth_accounts', 'wallet_getCapabilities'].includes(args.method)) throw new Error('borrow_capability_method_blocked')
-      return borrowWalletRead(request, args)
+      const response = await borrowWalletRead(request, args)
+      if (args.method === 'wallet_getCapabilities' && response && typeof response === 'object') {
+        const caps = response as Record<string, { atomic?: { status?: string; supported?: boolean } }>
+        if (Object.keys(caps).length > 128) throw new Error('borrow_capabilities_unbounded')
+        nativeAtomic = Object.entries(caps).some(([id, value]) => /^(?:0x[0-9a-f]+|[1-9][0-9]*)$/i.test(id) && BigInt(id) === 5042n && (['supported', 'ready'].includes(value?.atomic?.status ?? '') || value?.atomic?.supported === true))
+      }
+      return response // Never hide or rewrite capabilities to force the SDK onto another mechanism.
     }
     const chain = getChainByEnum(Blockchain.Arc), client = borrowPublicClient()
     if (chain.type !== 'evm') return 'unknown'
     const wallet = createWalletClient({ account: owner, transport: custom({ request: readOnlyRequest as any }, { retryCount: 0 }) })
     const ctx = createViemAdapterContext({ capabilities: { addressContext: 'user-controlled', supportedChains: [chain] }, getPublicClient: () => client, getWalletClient: () => wallet })
-    return await createViemAdapterFromContext(ctx).supportsAtomicBatch(chain, { fromAddress: owner }) ? 'supported' : 'unsupported'
+    const supported = await createViemAdapterFromContext(ctx).supportsAtomicBatch(chain, { fromAddress: owner })
+    return supported && !nativeAtomic ? 'supported' : 'unsupported'
   } catch { return 'unknown' }
 }
 export function createProductionBorrowPorts(options: Pick<BorrowOperationPorts, 'readWallet' | 'prepare' | 'attempts'> & {
-  request(): Eip1193Request | undefined; storage(): StorageLike | null
+  request(): Eip1193Request | undefined; storage(): StorageLike | null; currentOwner(): string | undefined
 }): BorrowOperationPorts {
   const client = borrowPublicClient()
   const store = (owner: Hex) => createBorrowRecoveryStore(options.storage(), owner)
@@ -39,7 +47,7 @@ export function createProductionBorrowPorts(options: Pick<BorrowOperationPorts, 
       return recoverBorrowTransaction(client, record)
     } catch { return { status: 'unknown', message: 'The recovery record cannot be independently verified. No second transaction is allowed.' } }
   }
-  return { ...options, locks: browserBorrowLocks(), walletStage: 'bound', executionBlocker: productionBorrowExecutionBlocker, recover,
+  return { ...options, locks: browserBorrowLocks(), walletStage: 'bound', executionBlocker: () => productionBorrowExecutionBlocker(options.currentOwner()), recover,
     async acknowledge(scopeId) {
       const result = await recover(scopeId)
       if (!('proof' in result)) return false
@@ -47,16 +55,16 @@ export function createProductionBorrowPorts(options: Pick<BorrowOperationPorts, 
     },
     async submit(review: BorrowReview, onSubmitted, onWalletRequested, onPrepared, isCurrent) {
       // Guards are checked here as well as by the controller and existing SDK boundary. No environment flag bypasses them.
-      if (productionBorrowExecutionBlocker()) throw new BorrowOperationError('Real Borrow transactions are closed.')
+      if (!review?.wallet?.address || productionBorrowExecutionBlocker(review.wallet.address)) throw new BorrowOperationError('Real Borrow transactions are closed for this wallet.')
       if (!isCurrent || !isCurrent()) throw new BorrowNotRequestedError('Wallet or input changed. Request a new review; nothing was requested.')
       const owner = review.wallet.address as Hex, request = options.request()
       if (!request) throw new BorrowOperationError('Reconnect the wallet before preparing a transaction.')
       const ledger = options.attempts, persistence = store(owner), idempotencyKey = crypto.randomUUID()
-      const transport = createBorrowSdkTransport({ review, request, client, idempotencyKey, isCurrent, walletRequested: onWalletRequested, prepared: onPrepared, persist: r => persistence.save(r), submitted: hash => {
+      const transport = createBorrowSdkTransport({ review, request, client, idempotencyKey, isCurrent, requireCanary: true, walletRequested: onWalletRequested, prepared: onPrepared, persist: r => persistence.save(r), submitted: hash => {
         ledger.finish(borrowAttemptScope(review.action, owner), 'submitted', Date.now(), { batchId: hash, txHash: hash })
         onSubmitted(hash, hash)
       } })
-      const result = await executeBorrowWrite({ action: review.action, reviewedQuote: review.prepared, confirmedActionId: review.actionId,
+      const result = await executeBorrowWrite({ canaryAdapter: transport.adapter as unknown as Awaited<ReturnType<BorrowBoundaryRequest['getAdapter']>>, action: review.action, reviewedQuote: review.prepared, confirmedActionId: review.actionId,
         readWallet: options.readWallet,
         refresh: async wallet => { const c = await options.prepare(review.action, wallet, review.evidence.targetHealthFactor ?? 1.5); return { quote: c.quote, evidence: c.evidence } },
         getAdapter: async () => transport.adapter as unknown as Awaited<ReturnType<BorrowBoundaryRequest['getAdapter']>>, attempts: ledger, newIdempotencyKey: () => idempotencyKey })

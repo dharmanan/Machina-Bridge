@@ -27,9 +27,12 @@ Update/review the manifest when updating Zod; do not accept unknown bytes.
 The backport **does not** rename packages, alter their versions, rewrite lockfile
 integrity, dismiss advisories or suppress `npm audit`. Raw audit still reports
 the upstream version range. Therefore a successful backport test is not called
-a clean npm audit. The audit CI job remains blocking and unchanged.
-The current raw production audit reports 25 high and 7 low affected-package
-entries (exit 1). Zod's collection advisory remains in the registry metadata;
+a clean npm audit. CI preserves both raw audit JSON outputs and their actual exit codes. The assessed-risk report is separate from a clean audit; unknown advisory roots, critical findings or incomplete audit evidence fail that report.
+The 26 October final raw production audit reports 40 high and 7 low
+affected-package entries (exit 1); the full audit reports 42 high and 7 low.
+Earlier registry responses reported 25 high: affected-package propagation has
+changed, while both current raw reports still identify the same two advisory
+roots. Package counts are not independent vulnerabilities. Zod's collection advisory remains in the registry metadata;
 the separate elliptic advisory is not fixed by this patch.
 
 Scope limitation: old Zod 3 packages also ship historical v4 subpaths; those
@@ -37,7 +40,25 @@ are not modified by this v3 backport. Production imports must not switch to
 those historical v4 parsers. The separate current Zod 4.6.7 consumer retains
 the official v4 fix; its v3 compatibility entry point is backported as well.
 Unconstrained collections, malicious provider responses and general input-body
-resource limits are separate concerns.
+resource limits are separate concerns. This release adds a scoped fetch guard
+before Borrow/Swap SDK parsing: decoded bodies at most 256 KiB, 8,192 JSON
+nodes, depth 32, collection/object width 256, strings 128 KiB, and an 8-second
+fetch/body deadline. Actual stream bytes are counted even when Content-Length
+lies; violations fail closed without retry. The original JSON bytes and numeric
+representations are preserved. Bridge/Earn/RPC fetches are passed through.
+
+This bounds inputs but does not prove every schema algorithm immune to CPU
+amplification. WalletConnect WebSocket/relay processing before EIP-1193 returns
+is outside this HTTP guard. A hostile browser extension or arbitrary JavaScript
+can alter the provider; the guard is not a browser-compromise defense.
+
+The final production bundle evidence records 77 rendered Zod 3.25.67 modules,
+no rendered historical Zod v4 subpath and no rendered elliptic module. Elliptic
+remains in the dependency tree and audit; absence from this browser bundle does
+not establish absence in every dependency consumer or future build. The Vercel
+preview API's separately traced dependency chain does not use Zod or elliptic.
+Re-run the bundle and API dependency checks when imports/dependencies change.
+No vulnerable version is renamed and no advisory is dismissed.
 
 Regression verification includes every installed v3 CJS/ESM entry, Reown UMD,
 oversized valid/invalid/sparse arrays, sets, async parsing, nesting, custom

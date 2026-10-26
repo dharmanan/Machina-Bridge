@@ -1,6 +1,7 @@
 import { createPublicClient, defineChain, erc20Abi, formatUnits, http, parseUnits, type Hex, type Transport } from 'viem'
 import { ViemAdapter } from '@circle-fin/adapter-viem-v2'
 import { SwapKit, getChainByEnum } from '@circle-fin/swap-kit'
+import { installCircleResponseLimits } from '../circleResponseLimits'
 import { assertCircleExecutionReadMethod, circleFeeCeiling, createCircleChainRpc, type CircleSwapRequest, type CircleSwapReview } from './circleSwap'
 import type { GuardedWallet } from './circleGuard'
 import { readMainnetSwapQuote, decimalUnits, type PreviewQuote } from '../mainnetSwap'
@@ -27,6 +28,7 @@ export const circleChainRpc = createCircleChainRpc(circleReadClient)
 
 // Builds the SDK around the guarded wallet: the adapter's public client is the read-only client above and its wallet client is the guard.
 export function circleSdk(wallet: GuardedWallet) {
+  installCircleResponseLimits()
   const adapter = new ViemAdapter({ getPublicClient: () => circleReadClient, getWalletClient: () => wallet as never }, { addressContext: 'user-controlled', supportedChains: [getChainByEnum('Arc')] })
   return { kit: new SwapKit({ disableAnalytics: true, disableErrorReporting: true }) as unknown as { swap(params: Record<string, unknown>): Promise<unknown> }, adapter }
 }

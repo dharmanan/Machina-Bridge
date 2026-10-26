@@ -1,6 +1,7 @@
 import { createPublicClient, defineChain, erc20Abi, http, type Transport } from 'viem'
 import { ViemAdapter } from '@circle-fin/adapter-viem-v2'
 import { SwapKit, getChainByEnum } from '@circle-fin/swap-kit'
+import { installCircleResponseLimits } from './circleResponseLimits'
 import { parseSwapUnits, swapInputUnits } from './swap/tokens'
 import {
   MAINNET_SWAP_CHAIN_ID, MAINNET_SWAP_RPC, MAINNET_SWAP_TOKENS,
@@ -196,6 +197,7 @@ export function createSwapQuoteReader(estimate: (request: SwapQuoteRequest) => P
 }
 let reader: ReturnType<typeof createSwapQuoteReader> | undefined
 export function readMainnetSwapQuote(request: SwapQuoteRequest, signal: AbortSignal): Promise<PreviewQuote> {
+  installCircleResponseLimits()
   if (!reader) {
     const kit = new SwapKit({ disableAnalytics: true, disableErrorReporting: true })
     const adapter = createSwapReadAdapter()

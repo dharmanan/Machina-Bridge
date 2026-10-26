@@ -81,10 +81,15 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
     await page.screenshot({ path: artifacts + '/mobile-close-review.png', fullPage: true })
   })
-  await test('the complete existing Borrow workspace mounts the production read/review ports with both write gates closed', async () => {
+  await test('the complete Borrow workspace rejects native atomic transport without fee binding and leaves both public gates closed', async () => {
     await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base + '/__borrow_workspace')
-    await page.getByLabel('Borrow action', { exact: true }).waitFor(); await review(page, 'repay')
-    assert.equal(await page.getByRole('button', { name: 'Confirm Repay', exact: true }).isDisabled(), true)
+    await page.getByLabel('Borrow action', { exact: true }).waitFor()
+    await page.getByLabel('Borrow action', { exact: true }).selectOption('repay')
+    await page.getByLabel('Operation amount', { exact: true }).fill('10')
+    await page.getByLabel('Maximum gas cost', { exact: true }).fill('1')
+    await page.getByRole('button', { name: 'Get operation review', exact: true }).click(); await phase(page, 'blocked')
+    assert.match(await page.getByRole('status').innerText(), /No supported fee-bound atomic Borrow transport/)
+    assert.equal(await page.getByRole('region', { name: 'Borrow review' }).count(), 0)
     assert.ok((await page.evaluate(() => window.workspaceReads)).every(m => ['eth_chainId','eth_accounts','wallet_getCapabilities'].includes(m)))
     await page.screenshot({ path: artifacts + '/workspace-desktop.png', fullPage: true })
     await page.setViewportSize({ width: 390, height: 844 })

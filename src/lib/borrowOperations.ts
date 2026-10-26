@@ -10,6 +10,7 @@ import { withBorrowOperationLock, type BorrowLockManager } from './borrowOperati
 import { isBorrowSettlementProof, borrowSettlementMatchesQuote, type BorrowSettlementProof } from './borrowSettlement'
 
 import type { BorrowRecoveryResult } from './borrowRecovery'
+import { borrowCanaryAllows } from '../config/borrowCanary'
 
 export class BorrowOperationError extends Error {}
 export class BorrowNotRequestedError extends BorrowOperationError {}
@@ -24,8 +25,7 @@ export type BorrowOperationPorts = {
   readWallet(): Promise<BorrowWalletState | null>
   prepare(action: BorrowWriteAction, wallet: BorrowWalletState, target: number): Promise<BorrowWriteContext>
   attempts: BorrowAttemptLedger; locks: BorrowLockManager | null
-  // Production intentionally provides neither callback until the SDK boundary has been independently bound.
-  // Test doubles may exercise the lifecycle, but cannot enable the production SDK gate.
+  // Production supplies guarded SDK/recovery ports. Controlled test ports cannot create a canary adapter attestation.
   walletStage?: 'bound'
   submit?: (review: BorrowReview, onSubmitted: (batchId: string, hash?: string) => void, onWalletRequested?: () => void, onPrepared?: (details: Pick<BorrowOperationState, 'rpcEstimatedFeeWei' | 'requestFeeCeilingWei' | 'executionDeadlineMs'>) => void, isCurrent?: () => boolean) => Promise<{ batchId: string; txHash?: string }>
   verify?: (review: BorrowReview, batchId: string, hash?: string) => Promise<BorrowSettlementProof | null>
@@ -41,7 +41,8 @@ export function borrowNativeBudget(prepared: PreparedBorrowQuote, gasCap: bigint
   const nativeLoan = decimalToUnits(loan.amount, 18)
   return nativeLoan === null ? null : gasCap + nativeLoan
 }
-export function productionBorrowExecutionBlocker(): string | null {
+export function productionBorrowExecutionBlocker(owner?: string | null): string | null {
+  if (borrowCanaryAllows(owner)) return null
   return MAINNET_BORROW_WRITES_ENABLED !== true || MAINNET_BORROW_EXECUTION_BOUND !== true ? BORROW_EXECUTION_BLOCKER : null
 }
 export function createBorrowOperationController(ports: BorrowOperationPorts) {
@@ -122,7 +123,7 @@ export function createBorrowOperationController(ports: BorrowOperationPorts) {
           const nativeBudget = borrowNativeBudget(fresh.quote, review.maxGasCostWei)
           if (nativeBudget === null || fee === null || fee < 0n || fresh.evidence?.balances?.data.native == null || fresh.evidence.balances.data.native < nativeBudget || fee > review.maxGasCostWei || token !== generation || now() >= review.expiresAt || !sameWallet(await ports.readWallet(), review.wallet)) throw new BorrowOperationError('The fee budget, wallet or review is no longer valid.')
           set({ phase: ports.walletStage === 'bound' ? 'checking' : 'wallet', review, message: ports.walletStage === 'bound' ? 'Preparing and simulating the signed atomic batch…' : 'Waiting for your explicit wallet confirmation…' })
-          // The production port must call the existing executeBorrowWrite under this lock. It is intentionally absent.
+          // The production port calls the existing executeBorrowWrite under this lock.
           submitted = true // Once the boundary is reached, a thrown error may have submitted; retain ambiguity.
           const result = await ports.submit!(review, (batchId, txHash) => {
             set({ phase: 'pending', review, ...feeDetails, batchId, txHash, message: 'Submitted. Waiting for independent chain verification.' })

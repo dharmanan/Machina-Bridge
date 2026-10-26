@@ -1,4 +1,6 @@
 import { Blockchain, BorrowChain, BorrowKit, getChainByEnum, isKitError } from '@circle-fin/borrow-kit'
+import { installCircleResponseLimits } from './circleResponseLimits'
+import { borrowCanaryAdapterOwner } from './borrowCanaryAuthority'
 import {
   MAINNET_BORROW_ADAPTER_CONTRACT,
   MAINNET_BORROW_MAX_COLLATERAL_BUFFER_BPS,
@@ -190,6 +192,7 @@ const ARC = BorrowChain.Arc
 let mainnetBorrowKit: BorrowKit | null = null
 
 function getMainnetBorrowKit(): BorrowKit {
+  installCircleResponseLimits()
   // Machina does not forward Borrow activity or errors to Circle telemetry.
   mainnetBorrowKit ??= new BorrowKit({ disableAnalytics: true, disableErrorReporting: true })
   return mainnetBorrowKit
@@ -963,6 +966,8 @@ export function planBorrowWrite(action: BorrowWriteAction, context: BorrowWriteC
 type BorrowAdapter = Parameters<BorrowKit['repay']>[0]['from']['adapter']
 
 export type BorrowBoundaryRequest = {
+  // Only an attested guarded EOA transport can use the address-restricted canary while public gates are false.
+  canaryAdapter?: BorrowAdapter
   action: BorrowWriteAction
   // The quote the user reviewed, and the actionId of the plan they confirmed.
   reviewedQuote: PreparedBorrowQuote | null
@@ -1014,6 +1019,7 @@ export async function verifyBorrowWriteBoundary(request: BorrowBoundaryRequest):
     return refuse(['wallet_missing'])
   }
   const owner = wallet?.address && isAddress(wallet.address) ? wallet.address : null
+  if (request.canaryAdapter && borrowCanaryAdapterOwner(request.canaryAdapter) !== owner?.toLowerCase()) return refuse(['wallet_changed'])
   const actionId = borrowActionId(request.action, owner)
   if (!wallet || !actionId) return refuse([!actionId ? 'invalid_action' : 'wallet_missing'])
   if (request.confirmedActionId !== actionId) return refuse(['not_confirmed'])
@@ -1064,12 +1070,14 @@ export type BorrowWriteOutcome =
   | { status: 'failed'; error: BorrowError }
 
 export async function executeBorrowWrite(request: BorrowWriteRequest): Promise<BorrowWriteOutcome> {
-  // The gate is checked first: while it is false no wallet is read, no quote is requested, no adapter is created and no SDK
-  // write method is reached, so no wallet prompt can appear.
-  if (MAINNET_BORROW_WRITES_ENABLED !== true) return { status: 'refused', blockers: ['writes_disabled'] }
-  if (MAINNET_BORROW_EXECUTION_BOUND !== true) return { status: 'refused', blockers: ['execution_unbound'] }
+  // Without an attested canary transport, closed public gates refuse before any wallet/quote request.
+  // Canary identity only selects the guarded path; fresh safety, exact batch simulation and final wallet consent still apply.
+  const canary = request.canaryAdapter && borrowCanaryAdapterOwner(request.canaryAdapter)
+  if (MAINNET_BORROW_WRITES_ENABLED !== true && !canary) return { status: 'refused', blockers: ['writes_disabled'] }
+  if (MAINNET_BORROW_EXECUTION_BOUND !== true && !canary) return { status: 'refused', blockers: ['execution_unbound'] }
   const boundary = await verifyBorrowWriteBoundary(request)
   if (boundary.status === 'refused') return boundary
+  if (canary && boundary.adapter !== request.canaryAdapter) return { status: 'refused', blockers: ['wallet_changed'] }
   const { plan, adapter, idempotencyKey, attempts } = boundary
   const clock = request.clock ?? Date.now
 

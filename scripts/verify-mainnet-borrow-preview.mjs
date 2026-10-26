@@ -469,7 +469,8 @@ test('the standard screen is short and plain; every technical detail sits in a c
   assert.ok(body.includes('chooseBorrowStatus({') && body.includes('checks: plan ? plan.checks : null'), 'the status reads the shared safety checks')
   assert.ok(body.includes('groupWriteChecks(checks)') && body.includes('data-readiness-check={check.id}'), 'every check is listed, grouped, in Advanced details')
   for (const label of ['Ready for review', 'Blocked', 'Unavailable', 'Checking']) assert.ok(body.includes(`label: '${label}'`), label)
-  assert.ok(body.includes('Preview only: real transactions are switched off in this release, whatever the result.'))
+  assert.ok(body.includes('Preview only: real transactions are switched off for this wallet.'))
+  assert.ok(body.includes('Use Review loan actions for the approved-wallet canary; fresh batch, simulation and fee checks remain mandatory.'))
   assert.ok(body.includes('data-borrow-refresh-quote') && body.includes('Refresh quote'), 'an expired quote has one Refresh quote control')
 
   // Everything technical is a closed disclosure; none starts open.

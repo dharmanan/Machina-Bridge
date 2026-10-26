@@ -4,9 +4,9 @@ import { BORROW_ADAPTER_ABI, BORROW_MORPHO_ABI, BORROW_TOKEN_ABI } from '../../.
 import { computeMarketId } from '../../../src/lib/borrowMarketVerification'
 import { MAINNET_BORROW_ADAPTER_CONTRACT as ADAPTER, MAINNET_BORROW_MORPHO_BLUE as BLUE } from '../../../src/config/mainnetBorrow'
 import { VERIFIED, WALLET } from './operations'
-export function batchFixture(kind = 'borrow', now = Date.now(), prepared = null) {
+export function batchFixture(kind = 'borrow', now = Date.now(), prepared = null, owner = WALLET) {
   const market = VERIFIED.details.params, zero = '0x0000000000000000000000000000000000000000'
-  const review = { chainId: 5042, owner: WALLET, market, marketId: computeMarketId(market), kind,
+  const review = { chainId: 5042, owner, market, marketId: computeMarketId(market), kind,
     collateralIn: ['borrow', 'borrow-more', 'add-collateral'].includes(kind) ? 100n : 0n,
     collateralOut: ['close-loan', 'withdraw-collateral'].includes(kind) ? kind === 'close-loan' ? 1000n : 100n : 0n,
     borrowAssets: ['borrow', 'borrow-more'].includes(kind) ? 100n : 0n,
@@ -22,14 +22,14 @@ export function batchFixture(kind = 'borrow', now = Date.now(), prepared = null)
   }
   const instructions = []
   const instruction = (functionName, args, tokenIn = zero, amountToApprove = 0n) => instructions.push({ target: BLUE, data: encodeFunctionData({ abi: BORROW_MORPHO_ABI, functionName, args }), value: 0n, tokenIn, amountToApprove, tokenOut: zero, minTokenOut: 0n })
-  if (review.collateralIn) instruction('supplyCollateral', [market, review.collateralIn, WALLET, '0x'], market.collateralToken, review.collateralIn)
-  if (review.borrowAssets) instruction('borrow', [market, review.borrowAssets, 0n, WALLET, ADAPTER])
-  if (review.repayAssets) instruction('repay', [market, kind === 'close-loan' ? 0n : review.repayAssets, review.repayShares, WALLET, '0x'], market.loanToken, review.repayAssets)
-  if (review.collateralOut) instruction('withdrawCollateral', [market, review.collateralOut, WALLET, ADAPTER])
+  if (review.collateralIn) instruction('supplyCollateral', [market, review.collateralIn, owner, '0x'], market.collateralToken, review.collateralIn)
+  if (review.borrowAssets) instruction('borrow', [market, review.borrowAssets, 0n, owner, ADAPTER])
+  if (review.repayAssets) instruction('repay', [market, kind === 'close-loan' ? 0n : review.repayAssets, review.repayShares, owner, '0x'], market.loanToken, review.repayAssets)
+  if (review.collateralOut) instruction('withdrawCollateral', [market, review.collateralOut, owner, ADAPTER])
   const tokenInputs = []
   if (review.collateralIn) tokenInputs.push({ permitType: 0, token: market.collateralToken, amount: review.collateralIn, permitCalldata: '0x' })
   if (review.repayAssets) tokenInputs.push({ permitType: 0, token: market.loanToken, amount: review.repayAssets, permitCalldata: '0x' })
-  const params = { instructions, tokens: [market.loanToken, market.collateralToken].map(token => ({ token, beneficiary: WALLET })), execId: 1n, deadline: BigInt(Math.floor(now / 1000) + 120), metadata: '0x' }
+  const params = { instructions, tokens: [market.loanToken, market.collateralToken].map(token => ({ token, beneficiary: owner })), execId: 1n, deadline: BigInt(Math.floor(now / 1000) + 120), metadata: '0x' }
   const signature = '0x' + '11'.repeat(65)
   const auth = value => ({ to: BLUE, data: encodeFunctionData({ abi: BORROW_MORPHO_ABI, functionName: 'setAuthorization', args: [ADAPTER, value] }) })
   const encode = () => [

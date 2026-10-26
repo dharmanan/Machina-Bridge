@@ -852,7 +852,7 @@ export const WRITE_BLOCKER_TEXT: Record<BorrowWriteBlocker, string> = {
   writes_disabled: 'Real Borrow transactions are switched off in this release.',
   wallet_missing: 'No wallet is connected.',
   wrong_chain: 'The wallet is not on Arc mainnet.',
-  wallet_capability_missing: 'The wallet does not report atomic batch support (EIP-5792) on Arc.',
+  wallet_capability_missing: 'No supported fee-bound atomic Borrow transport was confirmed for this wallet on Arc. Native EIP-5792 alone cannot enforce the selected fee ceiling.',
   stale_wallet_session: 'The wallet or network changed; everything is read again.',
   chain_address_mismatch: 'The chain or Borrow Adapter address does not match what Machina pins.',
   invalid_action: 'The action or its amount is not valid.',

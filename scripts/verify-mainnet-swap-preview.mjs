@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 for (const extension of ['.ts', '.tsx']) require.extensions[extension] = (module, filename) => {
-  // Match an unconfigured Vite build in this CommonJS-only DOM harness.
+  // Match the source-controlled canary release with no environment overrides.
   const source = readFileSync(filename, 'utf8').replace(/import\.meta\.env\.VITE_(UNISWAP_ARC_PILOT_(ENABLED|WALLET)|SWAP_EXECUTION_MODE)/g, 'undefined')
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true }, fileName: filename,
@@ -350,9 +350,9 @@ await test('disconnected DOM keeps quote and execution controls disabled', () =>
   assert.match(html, /Connect your wallet using the header/)
   assert.doesNotMatch(html, />Get quote|>Refresh quote/)
   assert.match(html, /disabled=""[^>]*>Review Swap/)
-  assert.match(html, /Swap execution is switched off in this build/)
+  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
   assert.doesNotMatch(html, /Estimated from a live quote/)
-  assert.match(html, /Preview only/)
+  assert.match(html, /Controlled canary/)
   assert.doesNotMatch(html, /Balance:/)
 })
 await test('wrong-network DOM is explicit and cannot request a quote', () => {
@@ -367,7 +367,7 @@ await test('Arc wallet DOM shows independent native USDC balance without claimin
   const html = renderSwap()
   assert.match(html, /Balance: (<!-- -->)?0\.192154 USDC/)
   assert.match(html, /disabled=""[^>]*>Review Swap/)
-  assert.match(html, /Swap execution is switched off in this build/)
+  assert.match(html, /Controlled canary/); assert.doesNotMatch(html, /Available \(any wallet/)
   mockNative = { data: undefined, isError: true }
   const errorHtml = renderSwap()
   assert.match(errorHtml, /Balance: (<!-- -->)?unavailable/)
@@ -389,7 +389,7 @@ await test('WETH is selectable in both directions and renders its full ERC-20 ba
     assert.match(html, /aria-label="Uniswap quote"/); assert.match(html, /aria-label="Circle Swap Kit quote"/)
     assert.equal((html.match(/aria-checked="true"/g) ?? []).length, 1)
     assert.match(html, /disabled=""[^>]*>Review Swap/)
-    assert.match(html, /Preview only/)
+    assert.match(html, /Controlled canary/)
   } finally { React.useState = originalUseState }
 })
 console.log(`${passed} total Mainnet Swap checks passed, including DOM states.`)

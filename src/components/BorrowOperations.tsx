@@ -34,6 +34,7 @@ export function BorrowOperations(props: BorrowOperationsProps) {
     if (!props.attempts) return null
     return createBorrowOperationController(createProductionBorrowPorts({
       attempts: props.attempts, request: () => ref.current.requestWallet, storage: browserAttemptStorage,
+      currentOwner: () => ref.current.wallet?.address ?? undefined,
       async readWallet() {
         const current = ref.current
         if (!current.wallet?.address || !current.requestWallet) return null
@@ -79,12 +80,13 @@ export function BorrowOperations(props: BorrowOperationsProps) {
   const quote = state.review?.prepared.quote
   const gas = quote && 'gasFees' in quote ? quote.gasFees.reduce((sum, f) => sum + BigInt(f.feeWei), 0n) : null
   const expired = state.review ? now >= state.review.expiresAt : false
-  const blocked = props.ports ? props.ports.executionBlocker() : productionBorrowExecutionBlocker()
+  const blocked = props.ports ? props.ports.executionBlocker() : productionBorrowExecutionBlocker(props.wallet?.address)
   const busy = ['quoting', 'checking', 'wallet', 'pending', 'unknown'].includes(state.phase)
   const history = props.attempts?.list() ?? props.ports?.attempts.list() ?? []
   return <section className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 sm:p-6" data-borrow-operations data-phase={state.phase}>
     <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-semibold text-slate-900">Review loan actions</h2><span className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-900">{blocked ? 'Transactions closed' : 'Review before wallet confirmation'}</span></div>
     <p className="mt-2 text-xs leading-5 text-slate-600">Prepare a current review for any loan action. Reviewing never requests an approval, signature or transaction.</p>
+    {!props.ports && !blocked && <p className="mt-2 text-xs leading-5 text-amber-800">Controlled canary for the approved wallet. Address restriction is not identity authentication. Each operation must still pass independent checks and your explicit wallet confirmation; live Borrow and full exit are not yet verified.</p>}
     <div className="mt-4 grid gap-3 sm:grid-cols-2">
       <label className="text-xs font-medium text-slate-600">Action<select aria-label="Borrow action" value={kind} onChange={e => setKind(e.target.value as BorrowWriteAction['kind'])} className={inputStyle} disabled={busy}>{Object.entries(TITLES).map(([value, title]) => <option value={value} key={value}>{title}</option>)}</select></label>
       {kind === 'borrow' ? <div className="text-xs leading-6 text-slate-600">Market: {operationMarket ? `${operationMarket.collateralAsset.symbol} / ${operationMarket.loanAsset.symbol}` : 'Choose a market above'}<br />{operationMarket && `LLTV ${operationMarket.lltv === null ? 'Not reported' : (operationMarket.lltv * 100).toFixed(2) + '%'} · Variable APY ${operationMarket.borrowApy === null ? 'Not reported' : (operationMarket.borrowApy * 100).toFixed(2) + '%'}`}</div>
