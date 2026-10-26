@@ -790,10 +790,15 @@ try {
     await confirm.dblclick({ delay: 5 }); await latest.getByText('Confirm in your wallet', { exact: true }).waitFor(); assert.equal(await sends(), before + 1); assert.equal(await review.isDisabled(), true)
     await page.evaluate(() => window.swapUiTest.release()); await latest.getByText('Verifying transaction', { exact: true }).waitFor()
     await page.evaluate(() => { window.swapUiTest.state.walletMode = 'hash' }); assert.equal(await review.isDisabled(), true); await page.getByText(/still being verified|Verifying transaction/).first().waitFor()
-    const pendingHash = (await lastSent()).hash; await page.reload(); await syncNonce(); await page.evaluate(() => window.swapUiTest.connect(5042))
+    const pendingHash = (await lastSent()).hash
+    // Capture the pending wallet send before a reload clears the test-only
+    // in-page sent array. The chain fixture must outlive the browser page.
+    await syncWalletSends()
+    assert.ok(world.receipts.has(lc(pendingHash)), 'pending transaction must exist in the chain fixture before reload')
+    await page.reload(); await syncNonce(); await page.evaluate(() => window.swapUiTest.connect(5042))
     await latest.getByText('Verifying transaction', { exact: true }).waitFor(); await latest.locator(`a[href$="${pendingHash}"]`).waitFor(); assert.equal(await sends(), 0) // fresh page state: nothing was resent
     await pick('USDC', 'EURC'); await amount.fill('1'); await quoted(); assert.equal(await review.isDisabled(), true)
-    await syncWalletSends().catch(() => {}); const entry = world.receipts.get(lc(pendingHash)); entry.mode = 'success'; await recheck()
+    setReceipt(pendingHash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
   })
 
