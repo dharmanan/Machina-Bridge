@@ -828,7 +828,12 @@ try {
     await quoted(); await shot('quotes-mobile'); assert.ok((await overflow()) <= 0, 'no horizontal overflow'); const top = () => review.evaluate(node => node.getBoundingClientRect().top + window.scrollY)
     const settled = await top(); await amount.fill(''); await amount.fill('1.5'); await page.getByText('Updating price…').first().waitFor().catch(() => {}); await quoted(); const reloaded = await top()
     assert.ok(Math.abs(settled - reloaded) <= 4, `the Review button moved ${settled - reloaded}px while quotes refreshed`)
-    assert.equal(await page.getByRole('region', { name: 'Swap transactions' }).count(), 1); assert.equal(await page.getByRole('article', { name: 'Latest transaction' }).count(), 1)
+    // The completed history is intentionally collapsed in the live UI.
+    // Count the DOM records, not only accessibility-visible nodes inside an open details element.
+    const activityPanel = page.locator('details[aria-label="Swap activity"]')
+    assert.equal(await activityPanel.count(), 1)
+    assert.equal(await activityPanel.locator('section[aria-label="Swap transactions"]').count(), 1)
+    assert.equal(await activityPanel.locator('article[aria-label="Latest transaction"]').count(), 1)
     const latestText = await latest.innerText(); const history = page.getByLabel('Swap history'); if (await history.count()) assert.equal((await history.innerText()).includes(latestText.split('\n')[0]) && (await history.locator(`article[aria-label^="Transaction"]`).count()) === 0, false)
     await page.setViewportSize({ width: 1280, height: 900 })
   })
