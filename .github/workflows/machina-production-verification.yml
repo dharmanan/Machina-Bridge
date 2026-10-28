@@ -37,6 +37,7 @@ jobs:
           node scripts/verify-production-ci.mjs
           node scripts/verify-zod-collection-backport.mjs
           node scripts/verify-circle-response-limits.mjs
+          node scripts/verify-mainnet-transfer-recovery.mjs
           node scripts/verify-borrow-source-gates.mjs
   source-regressions:
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)

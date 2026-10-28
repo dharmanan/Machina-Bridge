@@ -16,7 +16,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { MAINNET_CONFIG } from '../config/mainnet'
 import { readCctpBurnProof, readBoundCctpAttestation } from '../lib/mainnetCctpRecovery'
-import { readSolanaCctpMessageUsed } from '../lib/mainnetSolanaRecovery'
+import { readSolanaCctpMessageUsed, SolanaNoncePendingError } from '../lib/mainnetSolanaRecovery'
 import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
@@ -927,7 +927,10 @@ export function useMainnetSolanaCctp(
         const receipt = await solanaReadRpc('getSignatureStatuses',[[destinationTxHash],{searchTransactionHistory:true}])
         const status = receipt?.value?.[0]
         if (status?.err) { updateMainnetSolanaActivity(attempt.id,{status:'failed'}); throw new Error('Solana destination mint failed. Recheck before any new request.') }
-        if (['confirmed','finalized'].includes(status?.confirmationStatus) && await isSolanaCctpMessageAlreadyMinted(attestation.message)) { confirmed=true; break }
+        if (['confirmed','finalized'].includes(status?.confirmationStatus)) {
+          try { if (await isSolanaCctpMessageAlreadyMinted(attestation.message)) { confirmed=true; break } }
+          catch(e) { if (!(e instanceof SolanaNoncePendingError)) throw e }
+        }
         await delay(2000)
       }
       if (!confirmed) throw new Error('Destination transaction outcome is not yet independently verified. Do not send again.')

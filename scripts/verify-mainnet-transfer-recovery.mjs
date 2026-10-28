@@ -56,4 +56,9 @@ try {
  await test('same amount never merges Solana and Arc source transactions or signature case',()=>{storage.clear();const base={evmWallet:owner,solanaWallet:wallet.toBase58(),amount:'0.1',direction:'solana-to-arc'};activity.recordMainnetSolanaActivity({...base,sourceTxHash:'Abc'});activity.recordMainnetSolanaActivity({...base,sourceTxHash:'abc'});activity.recordMainnetSolanaActivity({...base,sourceTxHash:'Abc',direction:'arc-to-solana'});assert.equal(activity.readMainnetSolanaActivity().length,3)})
 } finally {globalThis.fetch=originalFetch;for(const [name,fn]of originals)Connection.prototype[name]=fn}
 await test('Dashboard never treats pending, unknown, failed or a legacy SDK hash as independently confirmed',()=>{for(const status of ['pending','unknown','failed',undefined])assert.notEqual(activity.mainnetSolanaTransferStatus({status,destinationTxHash:'controlled-hash'}),'Complete');assert.equal(activity.mainnetSolanaTransferStatus({status:'complete'}),'Complete')})
+await test('a nonce already consumed at confirmed commitment cannot appear unused because finalized state lags',async()=>{
+ const signed=message({dst:5,nonce,executed:2000})
+ const data=Buffer.concat([Buffer.from(v.sha256(v.stringToHex('account:UsedNonce')).slice(2,18),'hex'),Buffer.from([1])])
+ await assert.rejects(()=>sn.readSolanaCctpMessageUsed(signed,async(_method,params)=>({value:params[1].commitment==='confirmed'?{owner:program.toBase58(),data:[data.toString('base64'),'base64']}:null})),sn.SolanaNoncePendingError)
+})
 console.log(`RESULT ${count}/${count} transfer recovery security groups PASS; real network/signatures/transactions=0`)
