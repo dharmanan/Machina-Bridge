@@ -25,7 +25,6 @@ import {
 } from '../lib/mainnetSolanaReclaim'
 import { deriveSolanaUsdcAta } from '../lib/solana'
 import { Card, Container } from './ui'
-import ArcIntelligenceOverview from './ArcIntelligenceOverview'
 
 const ERC20_BALANCE_ABI = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
@@ -381,11 +380,9 @@ export default function MainnetDashboard() {
             <span className="inline-flex shrink-0 items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-medium text-slate-600">Beta</span>
           </div>
           <p className="mt-2 text-sm text-slate-500">
-            Arc Intelligence, wallets, USDC balances, completed routes, recent activity, and Solana deposit tracking.
+            Wallet balances, USDC transfers, completed routes, and Solana deposit tracking.
           </p>
         </div>
-
-        <ArcIntelligenceOverview explorerUrl={MAINNET_NETWORKS.arc.explorerUrl} />
 
         {!isConnected ? (
           <Card className="text-center">

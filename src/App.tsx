@@ -20,7 +20,7 @@ import DesignedByFooter from './components/DesignedByFooter'
 import './index.css'
 
 // Borrow is paused: its implementation remains in the repository, but no production
-// navigation or route imports it. The independent Intelligence lending data stays visible.
+// navigation or route imports it. Retired Intelligence is not loaded by Dashboard.
 const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapScreen'))
 
 type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard' | 'activity'
@@ -297,7 +297,7 @@ export default function App() {
                 <p className="mt-2 max-w-[30rem] text-sm leading-6 text-slate-500 sm:text-base sm:leading-7">
                   {appNetwork === 'testnet'
                     ? 'Testnet swap and bridge flows for Arc, Sepolia, and Solana.'
-                    : 'Arc on-chain analytics, USDC bridging, and Earn in one app.'}
+                    : 'USDC bridging, mainnet Swap, Earn, and wallet tracking in one app.'}
                 </p>
               </div>
             </div>

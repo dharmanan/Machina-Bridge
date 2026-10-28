@@ -1,8 +1,8 @@
 # Machina Bridge
 
-**Arc DeFi, cross-chain USDC transfers, and on-chain intelligence.**
+**Arc DeFi, cross-chain USDC transfers, supported swaps, and wallet activity.**
 
-Machina Bridge is an independent, community-built interface for exploring activity on Arc and using supported blockchain and DeFi services. The application is available as a **Public Beta**.
+Machina Bridge is an independent, community-built interface for supported Arc blockchain and DeFi services. The application is available as a **Public Beta**.
 
 **[Launch Machina Bridge](https://www.machinabridge.xyz/)** · [Arc documentation](https://docs.arc.network/)
 
@@ -10,29 +10,19 @@ Machina Bridge is an independent, community-built interface for exploring activi
 
 | Feature | What it does | Availability |
 | --- | --- | --- |
-| **Arc Intelligence** | Explore Arc network activity, DEX markets, token discovery, lending activity, and cross-chain observations. | Mainnet · Read-only Beta |
+| **Wallet Activity** | View recent Arc wallet transactions and transfers reported by Blockscout. | Mainnet · Read-only |
 | **Bridge** | Transfer USDC between Arc and supported Ethereum, Base, OP Mainnet, Arbitrum, and Solana routes. | Mainnet · Wallet-confirmed transactions |
 | **Earn** | Explore selected Arc USDC vaults and request deposits or withdrawals through Circle Earn Kit. | Mainnet · Supported vaults |
-| **Borrow** | View Morpho cirBTC-collateral / USDC-loan markets, price a borrow with Circle Borrow Kit quotes, and review a wallet's existing loans. | Mainnet · **Read-only Preview** |
-| **Swap** | Swap test assets using the Ethereum Sepolia interface. | **Testnet only** |
+| **Borrow** | Experimental borrowing implementation retained in the source; removed from the public navigation. | **Paused** |
+| **Swap** | Swap supported Arc mainnet tokens through configured integrations; a separate testnet interface is available. | Mainnet · Supported routes; **Testnet only** for the separate testnet interface |
 
 The app also includes a separate testnet experience for development and experimentation. **Mainnet Gateway forwarding is not enabled.** Availability, supported routes, market terms, and liquidity may change.
 
 ## Arc Intelligence
 
-Arc Intelligence provides an overview of supported activity on the Arc network:
+Arc Intelligence was an experimental Arc network, DEX, lending and cross-chain analytics service. It has been **retired from the public application**. Its historical source code and validation scripts remain in this repository for reference, but its endpoints and datasets are not part of the supported live Machina product. The service is scheduled to be shut down independently from Bridge, Swap, Earn and Wallet Activity.
 
-- **Network:** transactions, blocks, gas usage, activity trends, and available unique-address metrics.
-- **DEX:** Uniswap V3/V4 swaps, trading volume, pool activity, and available liquidity data.
-- **Tokens and protocols:** observed contract and token activity, selected lending protocols, and other supported ecosystem data.
-- **Cross-chain activity:** observations from supported bridging and interoperability protocols.
-- **Wallet activity:** balances and supported transfer or Earn activity associated with the connected wallet.
-
-Select **24H**, **7D**, or **30D** to explore available history. Metrics can have different coverage; a missing or incomplete value is not presented as a confirmed zero. Historical address counts or asset valuations may be unavailable when supporting data is insufficient.
-
-**DEX pool trading fees are not Arc network gas fees.** Where displayed, pool fees are estimates and their calculation coverage is identified.
-
-Intelligence is informational. It does not provide investment recommendations or automatically execute transactions. Observed contracts, pools, and protocol activity should not be mistaken for endorsement or proof of asset safety.
+Any archived data is informational and does not provide investment recommendations; a missing or incomplete value is not presented as a confirmed zero. This is not a live data product.
 
 ## Bridge
 
@@ -60,7 +50,7 @@ Vaults are operated by third parties. Yields are not guaranteed, and funds remai
 
 ## Borrow Preview
 
-The Borrow tab shows the **Morpho cirBTC / USDC** markets on Arc through Circle Borrow Kit. It is one screen with two depths: a short **standard view** for anyone, and **Advanced details**, a section that is closed until opened and holds every technical check and piece of evidence. Nothing technical was removed; it was moved. Each market is also checked against Morpho Blue on Arc: its ID must hash from the on-chain parameters, and the tokens and LLTV must match Circle's data. A market that cannot be checked is never shown as verified. A market card shows only the asset pair, the short market ID that tells the two markets apart, Borrow APY, available liquidity and one short status (for example **Available** or **Unavailable for borrowing**), as facts, not advice; markets are never ranked or recommended. The market ID, oracle and oracle price, rate model, on-chain verification, LLTV, utilization, total borrowed and data timestamp are under **Advanced details › Market details**.
+**Borrow is paused and is not available in the public navigation.** The archived Borrow component shows the **Morpho cirBTC / USDC** markets on Arc through Circle Borrow Kit. It is one screen with two depths: a short **standard view** for anyone, and **Advanced details**, a section that is closed until opened and holds every technical check and piece of evidence. Nothing technical was removed; it was moved. Each market is also checked against Morpho Blue on Arc: its ID must hash from the on-chain parameters, and the tokens and LLTV must match Circle's data. A market that cannot be checked is never shown as verified. A market card shows only the asset pair, the short market ID that tells the two markets apart, Borrow APY, available liquidity and one short status (for example **Available** or **Unavailable for borrowing**), as facts, not advice; markets are never ranked or recommended. The market ID, oracle and oracle price, rate model, on-chain verification, LLTV, utilization, total borrowed and data timestamp are under **Advanced details › Market details**.
 
 The standard view answers a few questions in order. **Current loan** is the connected wallet's position from the Borrow Service: each loan shows its Current debt, Collateral, Current Health Factor and Liquidation Price, no wallet-wide Health Factor is ever computed, and **No active loan** is only said after a complete, successful read; a failed read says **Unavailable**. **New borrow estimate** has two inputs, the borrow amount and a Target Health Factor, and a real quote for your wallet: Borrow Amount, Collateral Required (with any collateral buffer stated as part of the collateral, not a separate fee), your wallet's real cirBTC balance (read on-chain), Borrow APY (variable), Estimated Gas / Fees, **Estimated Health Factor** with your target next to it (`Your target: 1.50 — Met`) and Liquidation Price. One **status** below the inputs says what matters most: the real blocker first (for example **Insufficient collateral**, **Wallet not supported**, **Target Health Factor not met**, **Market unavailable**) or **Transaction checks passed — Preview only**. The status only chooses which check to say first, from the same checks the write boundary runs ([`src/lib/borrowStatus.ts`](src/lib/borrowStatus.ts)); it never replaces, hides or overrides one. The optional collateral comparison and Circle's separate collateral sizing preview (reference only, not a quote a transaction could be prepared from) are inside Advanced details.
 
@@ -84,7 +74,7 @@ The current source-level control is defined in [`src/config/mainnetBorrow.ts`](s
 
 Machina currently displays no additional Machina service commission for its supported transaction flows. **That does not make transactions free:** blockchain gas, Circle or other protocol fees, and any applicable Solana account costs may still apply. Confirm current amounts in the interface before signing.
 
-Arc Intelligence reports supported observations and labels unavailable or incomplete data. Figures reflect the sources and periods covered, not necessarily every contract or transaction in the ecosystem. Historical coverage and available metrics may change as the Beta evolves.
+The retired Intelligence service is not required for Bridge, Swap, Earn, wallet activity or dashboard transaction tracking. These rely on their own chain, Circle and Blockscout integrations.
 
 Transactions involving real assets are irreversible and carry financial risks. Use a wallet you control and never share a seed phrase or private key.
 
@@ -93,7 +83,7 @@ Transactions involving real assets are irreversible and carry financial risks. U
 - **Frontend:** React, TypeScript, Vite, Wagmi, RainbowKit, and Solana wallet integration.
 - **Blockchain integrations:** Circle CCTP / Bridge Kit, Earn Kit, Borrow Kit market reads, and supported Arc DeFi protocols.
 - **Hosting:** Vercel for the web application and same-origin API proxies.
-- **Arc Intelligence service:** Node.js on Railway with a compact, SQLite-backed collection and read-model pipeline.
+- **Retired analytics source:** Experimental Node.js / SQLite code remains for reference only; Railway is not a dependency of supported mainnet user flows.
 
 Main code locations:
 
@@ -131,7 +121,7 @@ npm run verify:arc-dashboard
 npm run lint
 ```
 
-These commands are development checks, **not** proof of a successful mainnet transaction or a security audit. The live Intelligence service and some features depend on configured external endpoints and service availability.
+These commands are development checks, **not** proof of a successful mainnet transaction or a security audit. Supported user flows depend on their external chain, Circle and Blockscout services.
 
 Environment variables vary by deployment. Browser variables prefixed with `VITE_` are exposed to the frontend: **never put API secrets, private keys, or wallet recovery phrases in them**. See [`src/config/`](src/config/) for network-related configuration.
 

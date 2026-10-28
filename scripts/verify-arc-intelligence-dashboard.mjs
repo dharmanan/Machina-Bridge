@@ -3352,7 +3352,7 @@ await test('Public Beta 1 the actual brand markup labels both profiles without c
     assert.equal([...walk(tree)].filter(node => node.tag === 'h1').map(textOf).join(), 'Machina Bridge');
     assert.equal([...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Public Beta').length, 1);
     assert.doesNotMatch(textOf(tree), /recommendation|signal|one.click|complete ecosystem/i);
-    assert.match(textOf(tree), appNetwork === 'mainnet' ? /on-chain analytics, USDC bridging, and Earn/ : /Testnet swap and bridge flows/);
+    assert.match(textOf(tree), appNetwork === 'mainnet' ? /USDC bridging, mainnet Swap, Earn, and wallet tracking/ : /Testnet swap and bridge flows/);
   }
 });
 
@@ -3366,7 +3366,7 @@ await test('Public Beta 2 SEO titles descriptions and canonical agree with the d
   const description = meta('name', 'description');
   assert.equal(meta('property', 'og:description'), description);
   assert.equal(meta('name', 'twitter:description'), description);
-  for (const phrase of ['on-chain analytics', 'supported mainnet routes', 'USDC Earn', 'Testnet swaps', 'read-only Borrow Preview'])
+  for (const phrase of ['Bridge USDC', 'supported Arc mainnet routes', 'supported tokens', 'USDC Earn', 'Arc wallet activity'])
     assert.ok(description.includes(phrase), phrase);
   const canonical = byAttr(tree, 'rel', 'canonical')[0]?.attrs.href;
   assert.equal(canonical, 'https://www.machinabridge.xyz/');
@@ -3426,9 +3426,14 @@ await test('Public Beta 5 the Mainnet Dashboard heading owns the only Dashboard 
   const badges = [...walk(tree)].filter(node => node.tag === 'span' && textOf(node) === 'Beta');
   assert.equal(textOf(heading), 'Mainnet Dashboard');
   assert.equal(badges.length, 1);
-  assert.equal(heading.parent, badges[0].parent, 'badge is next to the main heading, outside Intelligence');
+  assert.equal(heading.parent, badges[0].parent, 'badge is next to the main heading');
   assert.match(heading.parent.attrs.class, /flex-wrap/);
   assert.match(badges[0].attrs.class, /shrink-0/);
+  const dashboardSource = readFileSync(sourcePath('src/components/MainnetDashboard.tsx'), 'utf8');
+  assert.doesNotMatch(dashboardSource, /import ArcIntelligenceOverview|<ArcIntelligenceOverview/, 'retired Intelligence must not load from Dashboard');
+  assert.match(dashboardSource, /useMainnetTransferQueue\(address\)/, 'pending transfers must remain intact');
+  assert.match(dashboardSource, /useMainnetSolanaActivity\(/, 'Solana deposit and reclaim records must remain intact');
+  assert.match(dashboardSource, /Bridge Activity/, 'transfer history remains visible');
   const combined = parseHtml(html + rendered.ready.html);
   assert.equal([...walk(combined)].filter(node => node.tag === 'span' && textOf(node) === 'Beta').length, 1);
   if (process.env.ARC_DASHBOARD_BETA_FIXTURE) {
@@ -3450,11 +3455,12 @@ await test('Public Beta 6 README documents current capabilities, validation, pub
 
   // Product availability, missing-data honesty and wallet-write safety must remain explicit.
   for (const phrase of ['independent, community-built interface', '**Public Beta**', '**Testnet only**',
-    '**Read-only Preview**', '**Borrow transactions are not enabled.**',
+    '**Borrow is paused', '**Borrow transactions are not enabled.**',
     'Galaxy USDC', 'Gauntlet USDC Prime', 'Node.js 24.x'])
     assert.ok(readme.includes(phrase), phrase);
   assert.match(readme, /a missing or incomplete value is not presented as a confirmed zero/);
-  assert.match(readme, /Select \*\*24H\*\*, \*\*7D\*\*, or \*\*30D\*\*/);
+  assert.match(readme, /retired from the public application/);
+  assert.doesNotMatch(readme, /Select \*\*24H\*\*, \*\*7D\*\*, or \*\*30D\*\*/);
   assert.match(readme, /The tab never asks a wallet to sign, approve a token, or send a transaction/);
   assert.match(readme, /Transactions involving real assets are irreversible and carry financial risks/);
   assert.match(readme, /never share a seed phrase or private key/);
