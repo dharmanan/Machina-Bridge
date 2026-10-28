@@ -1,3 +1,4 @@
+import { MainnetTransferRecovery } from './MainnetTransferRecovery'
 import { useEffect, useMemo, useState } from 'react'
 import { createPublicClient, formatUnits, http, parseAbi } from 'viem'
 import {
@@ -16,6 +17,7 @@ import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import { useMainnetSolanaActivity } from '../hooks/useMainnetSolanaActivity'
 import {
   updateMainnetSolanaActivity,
+  mainnetSolanaTransferStatus,
   type MainnetSolanaActivityRecord,
 } from '../lib/mainnetSolanaActivity'
 import {
@@ -235,6 +237,7 @@ export default function MainnetDashboard() {
     }
 
     for (const item of solanaActivity) {
+      if (item.status && item.status !== 'complete' || !item.status && !item.destinationTxHash) continue
       const key = item.direction === 'solana-to-arc'
         ? 'Solana → Arc'
         : 'Arc → Solana'
@@ -264,6 +267,7 @@ export default function MainnetDashboard() {
       && item.refundableDepositSol
     ) {
       return {
+        sourceTxHash:item.sourceTxHash,
         messageSentEventAccount: item.messageSentEventAccount,
         refundDestinationMessage: item.refundDestinationMessage,
         refundAttestation: item.refundAttestation,
@@ -349,7 +353,7 @@ export default function MainnetDashboard() {
         timestamp: item.createdAt,
         title: `${item.amount} USDC`,
         route: sourceIsSolana ? 'Solana → Arc' : 'Arc → Solana',
-        status: 'Complete',
+        status: mainnetSolanaTransferStatus(item),
         sourceUrl: item.sourceTxHash
           ? sourceIsSolana
             ? `${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${item.sourceTxHash}`
@@ -373,6 +377,7 @@ export default function MainnetDashboard() {
 
   return (
     <Container className="py-10">
+      <MainnetTransferRecovery />
       <div className="space-y-6">
         <div>
           <div className="flex flex-wrap items-center gap-2.5">

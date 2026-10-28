@@ -65,7 +65,7 @@ jobs:
             verify-borrow-eurc-markets \
             verify-mainnet-borrow-write-safety verify-borrow-operations \
             verify-borrow-sdk-integration \
-            verify-mainnet-swap-preview verify-swap-support-matrix \
+            verify-mainnet-transfer-recovery verify-mainnet-swap-preview verify-swap-support-matrix \
             verify-swap-amount-shortcuts verify-swap-approvals \
             verify-swap-display verify-swap-verification \
             verify-swap-uniswap-onchain verify-uniswap-arc-preview \
@@ -146,5 +146,6 @@ jobs:
         env:
           PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
         run: |
+          node scripts/verify-mainnet-transfer-recovery-ui.mjs
           node scripts/verify-borrow-operations-ui.mjs
           node scripts/verify-swap-unified-ui.mjs

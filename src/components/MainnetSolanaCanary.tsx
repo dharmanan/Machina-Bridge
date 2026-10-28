@@ -80,6 +80,7 @@ export default function MainnetSolanaCanary() {
   const [direction, setDirection] =
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
   const [amount, setAmount] = useState('')
+  const [recoveryHash, setRecoveryHash] = useState('')
   const [costDetailsOpen, setCostDetailsOpen] = useState(false)
   const [refundPanelOpen, setRefundPanelOpen] = useState(false)
   const [refunds, setRefunds] = useState<MainnetSolanaDiscoveredRefund[]>([])
@@ -722,6 +723,13 @@ export default function MainnetSolanaCanary() {
             )}
           </div>
         )}
+
+        {direction === 'arc-to-solana' && <details className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+          <summary className="cursor-pointer text-sm font-semibold">Recover an older Arc → Solana transfer</summary>
+          <p className="mt-2 text-xs leading-5 text-slate-500">The automatic check covers only the latest 4,000 Arc blocks. For an older burn, enter its source hash. Connect the original EVM and Phantom wallets. This never burns USDC again; recovery checks the existing message before requesting a destination mint.</p>
+          <input aria-label="Arc to Solana recovery source hash" className="mt-3 w-full rounded-lg border p-2 text-xs" placeholder="0x…" value={recoveryHash} onChange={e=>setRecoveryHash(e.target.value)} disabled={state.isLoading} />
+          <button type="button" className="mt-3 rounded-xl border px-3 py-2 text-xs disabled:opacity-50" disabled={state.isLoading || !evmConnected || !phantomConnected || !/^0x[0-9a-f]{64}$/i.test(recoveryHash.trim())} onClick={()=>void recoverPendingArcToSolana(recoveryHash.trim() as `0x${string}`).catch(()=>undefined)}>Recover existing burn · confirm in wallet if eligible</button>
+        </details>}
 
         {direction === 'arc-to-solana' && !state.isLoading && pendingArcToSolanaTx && (
           <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">

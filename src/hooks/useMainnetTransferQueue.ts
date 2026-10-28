@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { createPublicClient, fallback, http, type Hex } from 'viem'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPublicClient, fallback, http, parseUnits, type Hex } from 'viem'
 import { getMainnetCctpRoute } from '../config/mainnetCctp'
-import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
+import { inspectMainnetTransferRecovery } from '../lib/mainnetCctpRecovery'
 import {
   listMainnetTransfers,
   subscribeMainnetTransferQueue,
@@ -59,51 +59,25 @@ async function recoverTransactionStage(record: MainnetTransferRecord) {
     return
   }
 
-  if (record.stage === 'waiting_attestation' && record.sourceTxHash) {
+  if (['waiting_attestation','ready_to_mint','minting'].includes(record.stage) && record.sourceTxHash) {
     try {
-      const result = await fetchMainnetCctpAttestation({
-        sourceChainId: record.sourceChainId,
-        transactionHash: record.sourceTxHash as Hex,
-      })
-
-      if (result.status === 'complete') {
-        transitionMainnetTransfer(record.id, 'ready_to_mint', {
-          attestationReadyAt: Date.now(),
-          lastError: undefined,
-        })
-      }
-    } catch (error) {
-      updateMainnetTransferRecord(record.id, {
-        lastError: error instanceof Error ? error.message : 'Attestation check failed.',
-      })
-    }
-    return
-  }
-
-  if (record.stage === 'minting' && record.destinationTxHash) {
-    const client = makePublicClient(route.destination.rpcUrls)
-    try {
-      const receipt = await client.getTransactionReceipt({ hash: record.destinationTxHash as Hex })
-      if (receipt.status === 'success') {
-        transitionMainnetTransfer(record.id, 'complete', { lastError: undefined })
-      } else {
-        transitionMainnetTransfer(record.id, 'ready_to_mint', {
-          lastError: 'Mint transaction reverted.',
-        })
-      }
+      const result = await inspectMainnetTransferRecovery({ sourceChainId: record.sourceChainId, sourceTxHash: record.sourceTxHash, owner:record.walletAddress, sourceLogIndex:record.sourceLogIndex })
+      if (result.proof.destinationChainId !== record.destinationChainId || parseUnits(result.proof.amount,6) !== parseUnits(record.amount,6)) throw new Error('Source proof does not match the stored transfer.')
+      const stage = result.stage === 'complete' ? 'complete' : record.stage === 'minting' || record.mintRequestedAt || record.destinationTxHash ? 'minting' : result.stage
+      updateMainnetTransferRecord(record.id, { stage, sourceLogIndex:result.proof.sourceLogIndex, lastError:undefined, ...(stage === 'ready_to_mint' ? {attestationReadyAt:Date.now()} : {}) })
     } catch {
-      // Receipt not available yet.
+      updateMainnetTransferRecord(record.id, { lastError:'Transfer status could not be verified. No mint is allowed until a fresh check succeeds.' })
     }
   }
 }
 
 export function useMainnetTransferQueue(walletAddress?: string) {
   const [transfers, setTransfers] = useState<MainnetTransferRecord[]>(() =>
-    listMainnetTransfers(walletAddress),
+    walletAddress ? listMainnetTransfers(walletAddress) : [],
   )
 
   const refresh = useCallback(() => {
-    setTransfers(listMainnetTransfers(walletAddress))
+    setTransfers(walletAddress ? listMainnetTransfers(walletAddress) : [])
   }, [walletAddress])
 
   useEffect(() => {
@@ -111,20 +85,27 @@ export function useMainnetTransferQueue(walletAddress?: string) {
     return subscribeMainnetTransferQueue(refresh)
   }, [refresh])
 
+  const recovering = useRef(false), cursor = useRef(0), currentWallet = useRef(walletAddress)
+  currentWallet.current = walletAddress
   const recover = useCallback(async () => {
+    if (!walletAddress || recovering.current) return
     const current = listMainnetTransfers(walletAddress)
     const recoverable = current.filter((record) =>
-      ['approving', 'burning', 'waiting_attestation', 'minting'].includes(record.stage),
+      ['approving', 'burning', 'waiting_attestation', 'ready_to_mint', 'minting'].includes(record.stage),
     )
 
     if (recoverable.length === 0) return
 
-    await Promise.allSettled(recoverable.map((record) => recoverTransactionStage(record)))
-    refresh()
+    // Full source/nonce proofs cost more than a receipt lookup. Bound fanout and never overlap poll cycles.
+    const start = cursor.current % recoverable.length
+    const batch = Array.from({length:Math.min(2,recoverable.length)},(_,i)=>recoverable[(start+i)%recoverable.length])
+    cursor.current = start + batch.length; recovering.current = true
+    try { await Promise.allSettled(batch.map(record=>recoverTransactionStage(record))) }
+    finally { recovering.current = false; if (currentWallet.current === walletAddress) refresh() }
   }, [refresh, walletAddress])
 
   const hasRecoverable = transfers.some((record) =>
-    ['approving', 'burning', 'waiting_attestation', 'minting'].includes(record.stage),
+    ['approving', 'burning', 'waiting_attestation', 'ready_to_mint', 'minting'].includes(record.stage),
   )
 
   useEffect(() => {

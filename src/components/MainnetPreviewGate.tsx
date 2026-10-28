@@ -1,3 +1,4 @@
+import { MainnetTransferRecovery } from './MainnetTransferRecovery'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createPublicClient, fallback, formatUnits, http, parseAbi } from 'viem'
 import { useAccount } from 'wagmi'
@@ -164,6 +165,7 @@ export default function MainnetPreviewGate() {
 
   const [probe, setProbe] = useState<MainnetCapabilityProbeResult | null>(null)
   const [routeProbe, setRouteProbe] = useState<MainnetCctpRouteProbe | null>(null)
+  const [selectedTransferId, setSelectedTransferId] = useState<string | null>(null)
   const [source, setSource] = useState<RouteEndpoint>('arc')
   const [destination, setDestination] = useState<RouteEndpoint>('base')
   const [amount, setAmount] = useState('')
@@ -296,11 +298,13 @@ export default function MainnetPreviewGate() {
       : 'blocked'
 
   const swapRoute = () => {
+    setSelectedTransferId(null)
     setSource(destination)
     setDestination(source)
   }
 
   const selectSource = (nextSource: RouteEndpoint) => {
+    setSelectedTransferId(null)
     setSource(nextSource)
 
     if (nextSource === 'arc') {
@@ -312,6 +316,7 @@ export default function MainnetPreviewGate() {
   }
 
   const selectDestination = (nextDestination: RouteEndpoint) => {
+    setSelectedTransferId(null)
     setDestination(nextDestination)
 
     if (nextDestination === 'arc') {
@@ -455,18 +460,17 @@ export default function MainnetPreviewGate() {
     && canaryAmountRaw > 0n
     && quoteResult?.mode === selectedMode
 
-  const matchingTransfer =
-    activeTransfers.find((transfer) =>
-      transfer.sourceChainId === sourceChainId
-      && transfer.destinationChainId === destinationChainId
-      && Number(transfer.amount) === Number(amount),
-    )
-    ?? transfers.find((transfer) =>
-      transfer.stage === 'complete'
-      && transfer.sourceChainId === sourceChainId
-      && transfer.destinationChainId === destinationChainId
-      && Number(transfer.amount) === Number(amount),
-    )
+  // Amount is not identity: two equal-sized burns must never select each other's record.
+  const matchingTransfer = transfers.find(transfer => transfer.id === selectedTransferId
+    && transfer.sourceChainId === sourceChainId && transfer.destinationChainId === destinationChainId)
+
+  const selectTrackedTransfer = (transfer: typeof transfers[number]) => {
+    const keyFor = (chainId: number) => Object.entries(MAINNET_NETWORKS).find(([,n])=>n.chainId===chainId)?.[0] as RouteEndpoint | undefined
+    const from = keyFor(transfer.sourceChainId), to = keyFor(transfer.destinationChainId)
+    if (!from || !to) return
+    setSource(from); setDestination(to); setAmount(transfer.amount); setSelectedTransferId(transfer.id)
+    setIsActivityOpen(false); setIsTrackerOpen(true)
+  }
 
   const transferStage = matchingTransfer?.stage
 
@@ -578,6 +582,7 @@ export default function MainnetPreviewGate() {
           recipient: address,
           destinationCaller: address,
         })
+        setSelectedTransferId(transfer.id)
       }
 
       if (transfer.stage === 'approval_required') {
@@ -835,7 +840,7 @@ export default function MainnetPreviewGate() {
               step="0.01"
               inputMode="decimal"
               value={amount}
-              onChange={(event) => setAmount(event.target.value)}
+              onChange={(event) => { setSelectedTransferId(null); setAmount(event.target.value) }}
               placeholder="0.00"
               className="mt-2 h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-base text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-[#66D121]"
             />
@@ -1126,6 +1131,8 @@ export default function MainnetPreviewGate() {
         </div>
       )}
 
+      <MainnetTransferRecovery />
+
       {isActivityOpen && (
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm"
@@ -1195,6 +1202,7 @@ export default function MainnetPreviewGate() {
                           </span>
                         </div>
 
+                        <button type="button" className="mt-3 rounded-lg border px-3 py-2 text-xs" onClick={()=>selectTrackedTransfer(transfer)}>Open this transfer</button>
                         {transfer.sourceTxHash && (() => {
                           const sourceTxUrl = getMainnetTxExplorerUrl(
                             transfer.sourceChainId,
@@ -1328,6 +1336,7 @@ export default function MainnetPreviewGate() {
                           </span>
                         </div>
 
+                        <button type="button" className="mt-3 rounded-lg border px-3 py-2 text-xs" onClick={()=>selectTrackedTransfer(transfer)}>Open this transfer</button>
                         {transfer.sourceTxHash && (() => {
                           const sourceTxUrl = getMainnetTxExplorerUrl(
                             transfer.sourceChainId,

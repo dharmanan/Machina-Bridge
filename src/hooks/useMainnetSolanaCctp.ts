@@ -15,6 +15,9 @@ import {
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { MAINNET_CONFIG } from '../config/mainnet'
+import { readCctpBurnProof, readBoundCctpAttestation } from '../lib/mainnetCctpRecovery'
+import { readSolanaCctpMessageUsed } from '../lib/mainnetSolanaRecovery'
+import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 
@@ -163,45 +166,8 @@ async function readSolanaUsdcRawBalance(ownerAddress: string) {
   return BigInt(raw)
 }
 
-function decodeCctpV2Nonce(messageHex: string) {
-  const hex = messageHex.startsWith('0x') ? messageHex.slice(2) : messageHex
-  const nonceStart = 12 * 2
-  const nonceEnd = nonceStart + (32 * 2)
-
-  if (hex.length < nonceEnd) {
-    throw new Error('CCTP message is too short to contain the V2 nonce.')
-  }
-
-  const nonceHex = hex.slice(nonceStart, nonceEnd)
-  const bytes = new Uint8Array(32)
-
-  for (let index = 0; index < 32; index += 1) {
-    bytes[index] = Number.parseInt(nonceHex.slice(index * 2, index * 2 + 2), 16)
-  }
-
-  return bytes
-}
-
 async function isSolanaCctpMessageAlreadyMinted(messageHex: string) {
-  const nonce = decodeCctpV2Nonce(messageHex)
-  const programId = new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram)
-  const [usedNoncePda] = PublicKey.findProgramAddressSync(
-    [
-      new TextEncoder().encode('used_nonce'),
-      nonce,
-    ],
-    programId,
-  )
-
-  const result = await solanaReadRpc('getAccountInfo', [
-    usedNoncePda.toBase58(),
-    {
-      encoding: 'base64',
-      commitment: 'confirmed',
-    },
-  ])
-
-  return Boolean(result?.value)
+  return readSolanaCctpMessageUsed(messageHex, solanaReadRpc)
 }
 
 async function waitForSolanaUsdcCredit(
@@ -600,6 +566,8 @@ export function useMainnetSolanaCctp(
   phantomAddress: string | null,
 ) {
   const { address: evmAddress } = useAccount()
+  const recoveryContext = useRef('')
+  recoveryContext.current = `${evmAddress?.toLowerCase() ?? ''}|${phantomAddress ?? ''}`
   const { data: walletClient } = useWalletClient()
   const [state, setState] = useState<MainnetSolanaCanaryState>({
     isLoading: false,
@@ -768,6 +736,7 @@ export function useMainnetSolanaCctp(
 
         const chunkSize = 500n
         const maxChunks = 8
+        let checkedCandidates = 0
 
         for (let index = 0; index < maxChunks; index += 1) {
           const chunkTo = latestBlock - (BigInt(index) * chunkSize)
@@ -806,11 +775,11 @@ export function useMainnetSolanaCctp(
               Number(log.args?.destinationDomain) === 5
               && recipients.has(String(log.args?.mintRecipient || '').toLowerCase())
               && Boolean(txHash)
-              && !recovered.has(txHash)
             )
           })
 
           for (const match of matches as any[]) {
+            if (++checkedCandidates > 20) { setPendingArcToSolanaError('The bounded recent scan reached its limit. Enter the source transaction hash to recover an older burn.'); return null }
             const txHash = match.transactionHash as Hex | undefined
             if (!txHash) continue
 
@@ -878,7 +847,12 @@ export function useMainnetSolanaCctp(
       || pendingArcToSolanaTx
       || await findPendingArcToSolanaBurn()
     if (!sourceTxHash) throw new Error('No Arc to Solana burn was found for the connected wallets.')
-    if (!phantomProvider || !phantomAddress) throw new Error('Connect Phantom first.')
+    if (!phantomProvider || !phantomAddress || !evmAddress) throw new Error('Connect the original EVM and Phantom wallets first.')
+    if (!isMainnetSolanaCanaryWriteEnabled('arc-to-solana')) throw new Error('Arc to Solana receive is switched off.')
+    if (!navigator.locks) throw new Error('A safe browser transaction lock is required for recovery.')
+    const expectedContext = recoveryContext.current
+    return navigator.locks.request(`machina-arc-solana-recovery:${sourceTxHash}`, {ifAvailable:true}, async lock=>{
+    if (!lock) throw new Error('Another tab is processing this burn; no second mint was requested.')
 
     setState({
       isLoading: true,
@@ -895,55 +869,19 @@ export function useMainnetSolanaCctp(
         result: { sourceTxHash },
       })
 
-      const attestation = await waitForArcCctpAttestation(sourceTxHash)
-
-      const arcNetwork = MAINNET_NETWORKS.arc
-      const sourceClient = createPublicClient({
-        transport: http(arcNetwork.rpcUrls[0], { timeout: 15_000, retryCount: 0 }),
-      })
-      const receipt = await sourceClient.getTransactionReceipt({ hash: sourceTxHash })
-
-      let mintRecipient: string | null = null
-      let burnAmountRaw: bigint | null = null
-      for (const log of receipt.logs) {
-        if (
-          log.address.toLowerCase()
-          !== MAINNET_CONFIG.arcCctpTokenMessengerAddress.toLowerCase()
-        ) {
-          continue
-        }
-
-        try {
-          const decoded = decodeEventLog({
-            abi: [DEPOSIT_FOR_BURN_EVENT],
-            data: log.data,
-            topics: log.topics,
-          }) as any
-
-          if (
-            decoded.eventName === 'DepositForBurn'
-            && Number(decoded.args?.destinationDomain) === 5
-          ) {
-            mintRecipient = String(decoded.args?.mintRecipient || '')
-            burnAmountRaw = BigInt(decoded.args?.amount ?? 0)
-            break
-          }
-        } catch {
-          // Ignore unrelated TokenMessenger logs in the same transaction.
-        }
-      }
-
-      if (!mintRecipient || !burnAmountRaw || burnAmountRaw <= 0n) {
-        throw new Error('DepositForBurn mint recipient or amount was not found in the source transaction.')
-      }
-
       const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
-      if (
-        mintRecipient.toLowerCase() !== ownerHex.toLowerCase()
-        && mintRecipient.toLowerCase() !== ataHex.toLowerCase()
-      ) {
-        throw new Error('This burn belongs to a different Solana destination wallet.')
+      const proof = await readCctpBurnProof({sourceChainId:ARC_MAINNET_EVM_CHAIN_ID,sourceTxHash,owner:evmAddress,mintRecipients:[ownerHex,ataHex]})
+      if (proof.fields.destinationDomain !== 5 || !['0x'+'00'.repeat(32),ownerHex.toLowerCase()].includes(proof.fields.destinationCaller)) throw new Error('This burn does not authorize the connected Phantom destination.')
+      const attestation = await readBoundCctpAttestation(proof)
+      if (attestation.status !== 'complete' || !attestation.message || !attestation.attestation) throw new Error('Source burn verified, but Circle attestation is still pending. No mint was requested.')
+      const mintRecipient = proof.fields.mintRecipient
+      const prior = readMainnetSolanaActivity().find(x=>x.direction === 'arc-to-solana' && x.sourceTxHash?.toLowerCase() === sourceTxHash.toLowerCase())
+      if (await isSolanaCctpMessageAlreadyMinted(attestation.message)) {
+        recordMainnetSolanaActivity({evmWallet:evmAddress,solanaWallet:phantomAddress,direction:'arc-to-solana',amount:proof.amount,sourceTxHash,status:'complete'})
+        setState({isLoading:false,error:null,status:'Destination nonce proves this burn was already received. No second mint was requested.',result:{sourceTxHash,recovered:true}})
+        return {sourceTxHash,recovered:true}
       }
+      if (prior && ['pending','unknown'].includes(prior.status ?? '')) throw new Error('A prior wallet submission may still be pending. Its absence from one RPC is not permission to send again.')
 
       const kit = new BridgeKit()
       const { solana, arc } = resolveChains(kit)
@@ -973,14 +911,27 @@ export function useMainnetSolanaCctp(
       )
       if (!action?.execute) throw new Error('Solana receiveMessage action could not be prepared.')
 
-      const balanceBefore = await readSolanaUsdcRawBalance(phantomAddress)
-      const destinationTxHash = await action.execute()
-
-      await waitForSolanaUsdcCredit(
-        phantomAddress,
-        balanceBefore,
-        burnAmountRaw,
-      )
+      if (recoveryContext.current !== expectedContext || phantomProvider.publicKey?.toBase58() !== phantomAddress) throw new Error('The connected wallet changed. No destination request is allowed.')
+      // Persist uncertainty before the wallet request. Reload cannot silently authorize a second send.
+      const attempt = recordMainnetSolanaActivity({evmWallet:evmAddress,solanaWallet:phantomAddress,direction:'arc-to-solana',amount:proof.amount,sourceTxHash,status:'pending'})
+      if (!readMainnetSolanaActivity().some(x=>x.id===attempt.id && x.status==='pending')) throw new Error('Recovery record could not be persisted. No wallet request is allowed.')
+      let destinationTxHash: string
+      try { destinationTxHash = await action.execute() } catch(e) {
+        updateMainnetSolanaActivity(attempt.id,{status:(e as {code?:number})?.code===4001?'failed':'unknown'})
+        throw e
+      }
+      updateMainnetSolanaActivity(attempt.id,{destinationTxHash,status:'pending'})
+      const deadline = Date.now()+60_000
+      let confirmed = false
+      while (Date.now()<deadline) {
+        const receipt = await solanaReadRpc('getSignatureStatuses',[[destinationTxHash],{searchTransactionHistory:true}])
+        const status = receipt?.value?.[0]
+        if (status?.err) { updateMainnetSolanaActivity(attempt.id,{status:'failed'}); throw new Error('Solana destination mint failed. Recheck before any new request.') }
+        if (['confirmed','finalized'].includes(status?.confirmationStatus) && await isSolanaCctpMessageAlreadyMinted(attestation.message)) { confirmed=true; break }
+        await delay(2000)
+      }
+      if (!confirmed) throw new Error('Destination transaction outcome is not yet independently verified. Do not send again.')
+      updateMainnetSolanaActivity(attempt.id,{status:'complete'})
 
       try {
         const raw = window.localStorage.getItem(RECOVERED_ARC_SOLANA_TXS_KEY)
@@ -1021,7 +972,9 @@ export function useMainnetSolanaCctp(
       })
       throw error
     }
+    })
   }, [
+    evmAddress,
     findPendingArcToSolanaBurn,
     pendingArcToSolanaTx,
     phantomAddress,

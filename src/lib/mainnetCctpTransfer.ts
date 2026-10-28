@@ -6,7 +6,7 @@ import {
   parseUnits,
   type Hex,
 } from 'viem'
-import { CIRCLE_MAINNET } from '../config/circle'
+import { readCctpBurnProof, readBoundCctpAttestation } from './mainnetCctpRecovery'
 import {
   CCTP_V2_CONFIRMED_FINALITY,
   CCTP_V2_ERC20_ABI,
@@ -199,39 +199,8 @@ export async function fetchMainnetCctpAttestation(input: {
   sourceChainId: number
   transactionHash: Hex
 }): Promise<MainnetCctpAttestation> {
-  const source = getMainnetCctpChain(input.sourceChainId)
-
-  if (!source) {
-    throw new Error('Unsupported CCTP mainnet source chain')
-  }
-
-  const response = await fetch(
-    `${CIRCLE_MAINNET.irisApiBase}/v2/messages/${source.cctpDomain}?transactionHash=${encodeURIComponent(input.transactionHash)}`,
-    { headers: { Accept: 'application/json' } },
-  )
-
-  if (response.status === 404) {
-    return { status: 'pending' }
-  }
-
-  if (!response.ok) {
-    throw new Error(`Circle CCTP messages API HTTP ${response.status}`)
-  }
-
-  const payload = await response.json()
-  const message = Array.isArray(payload?.messages) ? payload.messages[0] : undefined
-
-  if (!message || message.status !== 'complete' || !message.message || !message.attestation) {
-    return { status: 'pending' }
-  }
-
-  return {
-    status: 'complete',
-    message: message.message as Hex,
-    attestation: message.attestation as Hex,
-    eventNonce: message.eventNonce != null ? String(message.eventNonce) : undefined,
-    decodedMessage: message.decodedMessage,
-  }
+  const proof = await readCctpBurnProof({ sourceChainId: input.sourceChainId, sourceTxHash: input.transactionHash })
+  return readBoundCctpAttestation(proof)
 }
 
 export function prepareMainnetCctpMint(input: {

@@ -30,6 +30,9 @@ export type MainnetTransferRecord = {
   createdAt: number
   updatedAt: number
   approvalTxHash?: string
+  recovered?: boolean
+  sourceLogIndex?: number
+  mintRequestedAt?: number
   sourceTxHash?: string
   destinationTxHash?: string
   attestationReadyAt?: number
@@ -64,7 +67,7 @@ const ALLOWED_TRANSITIONS: Record<MainnetTransferStage, readonly MainnetTransfer
 }
 
 function canUseStorage() {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
+  try { return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined' } catch { return false }
 }
 
 function createId() {
@@ -92,6 +95,33 @@ function emitQueueChange() {
   }
 }
 
+export function isValidMainnetTransferRecord(value: unknown): value is MainnetTransferRecord {
+  if (!value || typeof value !== 'object') return false
+  const r = value as MainnetTransferRecord
+  return typeof r.id === 'string' && r.id.length > 0 && r.id.length < 200
+    && [r.walletAddress, r.recipient, r.destinationCaller].every(x => typeof x === 'string' && /^0x[0-9a-f]{40}$/i.test(x))
+    && [r.sourceChainId, r.destinationChainId, r.createdAt, r.updatedAt].every(x => Number.isSafeInteger(x) && x > 0)
+    && r.sourceChainId !== r.destinationChainId && typeof r.amount === 'string' && r.amount.length < 100 && /^[0-9]+(?:\.[0-9]{1,6}0*)?$/.test(r.amount) && /[1-9]/.test(r.amount)
+    && r.token === 'USDC' && ['fast','standard'].includes(r.mode) && Object.prototype.hasOwnProperty.call(ALLOWED_TRANSITIONS, r.stage)
+    && typeof r.approvalRequired === 'boolean'
+    && [r.sourceTxHash, r.destinationTxHash, r.approvalTxHash].every(x => x === undefined || typeof x === 'string' && /^0x[0-9a-f]{64}$/i.test(x))
+    && (r.sourceLogIndex === undefined || Number.isSafeInteger(r.sourceLogIndex) && r.sourceLogIndex >= 0)
+}
+
+export function importRecoveredMainnetTransfer(input: CreateMainnetTransferInput & { sourceTxHash: string; sourceLogIndex: number; stage: 'waiting_attestation' | 'ready_to_mint' | 'complete' }): MainnetTransferRecord {
+  const records = readMainnetTransferQueue(), hash = input.sourceTxHash.toLowerCase()
+  const existing = records.find(r => r.sourceChainId === input.sourceChainId && r.sourceTxHash?.toLowerCase() === hash && (r.sourceLogIndex === undefined || r.sourceLogIndex === input.sourceLogIndex))
+  if (existing && normalizeWallet(existing.walletAddress) !== normalizeWallet(input.walletAddress)) throw new Error('This source transaction is bound to another wallet.')
+  if (existing?.stage === 'complete' && input.stage !== 'complete') throw new Error('Stored completion cannot be reconciled on-chain. No second mint is allowed.')
+  const now = Date.now()
+  const record: MainnetTransferRecord = { ...existing, ...input, id: existing?.id ?? `cctp-${input.sourceChainId}-${hash}-${input.sourceLogIndex}`, walletAddress: normalizeWallet(input.walletAddress), token:'USDC', recovered:true, createdAt:existing?.createdAt ?? now, updatedAt:now,
+    stage: existing && (existing.stage === 'minting' || existing.mintRequestedAt || existing.destinationTxHash) && input.stage !== 'complete' ? 'minting' : input.stage,
+    lastError: undefined }
+  if (!isValidMainnetTransferRecord(record)) throw new Error('Recovered transfer has invalid fields.')
+  writeMainnetTransferQueue([record, ...records.filter(r => r.id !== record.id)])
+  return record
+}
+
 export function readMainnetTransferQueue(): MainnetTransferRecord[] {
   if (!canUseStorage()) return []
 
@@ -99,14 +129,14 @@ export function readMainnetTransferQueue(): MainnetTransferRecord[] {
     const raw = window.localStorage.getItem(MAINNET_TRANSFER_QUEUE_KEY)
     const parsed = raw ? JSON.parse(raw) : []
     if (!Array.isArray(parsed)) return []
-    return prune(parsed as MainnetTransferRecord[])
+    return prune(parsed.filter(isValidMainnetTransferRecord))
   } catch {
     return []
   }
 }
 
 function writeMainnetTransferQueue(records: MainnetTransferRecord[]) {
-  if (!canUseStorage()) return
+  if (!canUseStorage()) throw new Error('Persistent transfer storage is unavailable. No wallet transaction is allowed.')
 
   const next = prune(records)
   window.localStorage.setItem(MAINNET_TRANSFER_QUEUE_KEY, JSON.stringify(next))

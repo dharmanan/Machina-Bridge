@@ -25,6 +25,7 @@ import {
   MAINNET_CCTP_CANARY_ENABLED,
   MAINNET_RUNTIME_IMPLEMENTED,
 } from '../config/runtime'
+import { inspectMainnetTransferRecovery } from '../lib/mainnetCctpRecovery'
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
   fetchMainnetCctpAttestation,
@@ -111,11 +112,11 @@ function assertCanaryTransferRecord(input: {
       record.sourceChainId,
       record.destinationChainId,
     )
-    || record.mode !== getDefaultMainnetCctpTransferMode(record.sourceChainId)
+    || (!record.recovered && record.mode !== getDefaultMainnetCctpTransferMode(record.sourceChainId))
     || amountRaw <= 0n
     || record.walletAddress.toLowerCase() !== connected
     || record.recipient.toLowerCase() !== connected
-    || record.destinationCaller.toLowerCase() !== connected
+    || (record.destinationCaller.toLowerCase() !== connected && !(record.recovered && /^0x0{40}$/.test(record.destinationCaller)))
   ) {
     throw new Error(
       'Transfer does not match the selected verified route or connected wallet.',
@@ -318,6 +319,8 @@ export function useMainnetCctp() {
       throw new Error('Connect a wallet before submitting a mainnet approval.')
     }
 
+    if (typeof navigator === 'undefined' || !navigator.locks) throw new Error('This browser cannot safely coordinate destination minting. Use a browser with transaction locks before starting a mainnet transfer.')
+
     assertCanaryApprovalAllowed({
       ...input,
       connectedAddress: address,
@@ -387,6 +390,8 @@ export function useMainnetCctp() {
     if (!address) {
       throw new Error('Connect a wallet before submitting a burn transaction.')
     }
+
+    if (typeof navigator === 'undefined' || !navigator.locks) throw new Error('This browser cannot safely coordinate destination minting. Use a browser with transaction locks before starting a mainnet transfer.')
 
     const recipient = input.recipient ?? address
     const destinationCaller = input.destinationCaller ?? address
@@ -500,11 +505,14 @@ export function useMainnetCctp() {
     message: Hex
     attestation: Hex
     transferId?: string
-  }): Promise<Hex> => {
+  }): Promise<Hex | undefined> => {
     if (!address) {
       throw new Error('Connect a wallet before submitting the mint transaction.')
     }
 
+    if (!input.transferId || !navigator.locks) throw new Error('Safe recovery requires a persistent transfer record and browser transaction lock.')
+    return navigator.locks.request(`machina-cctp-mint:${input.transferId}`, { ifAvailable: true }, async lock => {
+    if (!lock) throw new Error('Another tab is already processing this transfer. No second mint was requested.')
     assertCanaryMintAllowed({
       destinationChainId: input.destinationChainId,
       transferId: input.transferId,
@@ -517,12 +525,23 @@ export function useMainnetCctp() {
       throw new Error('Unsupported mainnet CCTP destination chain.')
     }
 
+    const record = getMainnetTransfer(input.transferId!)!
+    if (record.stage === 'minting' || record.mintRequestedAt || record.destinationTxHash) throw new Error('An earlier mint may still be pending. Recheck its status; do not submit again.')
+    const checked = await inspectMainnetTransferRecovery({ sourceChainId: record.sourceChainId, sourceTxHash: record.sourceTxHash!, owner: address, sourceLogIndex: record.sourceLogIndex })
+    if (checked.proof.destinationChainId !== record.destinationChainId || parseUnits(checked.proof.amount,6) !== parseUnits(record.amount,6)) throw new Error('Recovered burn does not match this transfer record.')
+    if (checked.stage === 'complete') {
+      updateMainnetTransferRecord(record.id, { stage:'complete', lastError:undefined })
+      setState({ step:'success',error:null,isLoading:false })
+      return undefined
+    }
+    if (checked.stage !== 'ready_to_mint' || checked.message?.toLowerCase() !== input.message.toLowerCase() || checked.attestation?.toLowerCase() !== input.attestation.toLowerCase()) throw new Error('Attestation changed or is not ready. Recheck this transfer before minting.')
     setState((current) => ({ ...current, step: 'minting', error: null, isLoading: true }))
     if (input.transferId) {
       transitionMainnetTransfer(input.transferId, 'minting', { lastError: undefined })
     }
 
     let hash: Hex | undefined
+    let requested = false
     try {
       const call = prepareMainnetCctpMint(input)
       const publicClient = makePublicClient(destination.rpcUrls)
@@ -566,6 +585,12 @@ export function useMainnetCctp() {
         input.destinationChainId,
       )
 
+      const [accounts, walletChain] = await Promise.all([walletClient.getAddresses(), walletClient.getChainId()])
+      if (accounts[0]?.toLowerCase() !== address.toLowerCase() || walletChain !== input.destinationChainId) throw new Error('Wallet or network changed. No mint was requested.')
+      const fresh = await inspectMainnetTransferRecovery({ sourceChainId:record.sourceChainId, sourceTxHash:record.sourceTxHash!, owner:address, sourceLogIndex:record.sourceLogIndex })
+      if (fresh.stage !== 'ready_to_mint' || fresh.message !== checked.message || fresh.attestation !== checked.attestation) throw new Error('Transfer state changed before wallet confirmation. Recheck without sending again.')
+      updateMainnetTransferRecord(record.id, { mintRequestedAt:Date.now() })
+      requested = true
       hash = await walletClient.sendTransaction({
         account: address,
         to: call.to,
@@ -579,7 +604,10 @@ export function useMainnetCctp() {
         })
       }
 
-      await publicClient.waitForTransactionReceipt({ hash })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') { requested = false; hash = undefined; updateMainnetTransferRecord(record.id, { mintRequestedAt:undefined, destinationTxHash:undefined }); throw new Error('Destination mint reverted. Recheck the transfer before trying again.') }
+      const verified = await inspectMainnetTransferRecovery({ sourceChainId:record.sourceChainId, sourceTxHash:record.sourceTxHash!, owner:address, sourceLogIndex:record.sourceLogIndex })
+      if (verified.stage !== 'complete') throw new Error('Mint receipt exists, but independent nonce verification is unavailable. Do not send again.')
 
       if (input.transferId) {
         transitionMainnetTransfer(input.transferId, 'complete', {
@@ -603,13 +631,16 @@ export function useMainnetCctp() {
             destinationTxHash: hash,
             lastError: message,
           })
+        } else if (!requested || (error as {code?:number})?.code === 4001) {
+          transitionMainnetTransfer(input.transferId, 'ready_to_mint', { lastError: message, mintRequestedAt:undefined })
         } else {
-          transitionMainnetTransfer(input.transferId, 'ready_to_mint', { lastError: message })
+          updateMainnetTransferRecord(input.transferId, { lastError:'Wallet submission outcome is unknown. Recheck; no second mint is allowed.' })
         }
       }
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
+    })
   }, [address, ensureWalletOnChain])
 
   return {

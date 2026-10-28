@@ -5,6 +5,8 @@ import {
   Transaction,
   TransactionInstruction,
 } from '@solana/web3.js'
+import { decodeCctpRecoveryMessage, immutableMessageMatches, readBoundCctpAttestation, cctpWord } from './mainnetCctpRecovery'
+import { getMainnetCctpChain } from '../config/mainnetCctp'
 import { CIRCLE_MAINNET } from '../config/circle'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 
@@ -21,6 +23,7 @@ const SOLANA_RECLAIM_RPCS = Array.from(new Set([
 ]))
 
 export type MainnetSolanaRefundMetadata = {
+  sourceTxHash?: string
   messageSentEventAccount: string
   refundableDepositSol: string
   refundAvailableAt: number
@@ -103,63 +106,25 @@ async function findMessageSentEventAccount(
 
     if (!parsed) return null
 
-    const keys = parsed.transaction.message.accountKeys.map((item) =>
-      new PublicKey(item.pubkey.toBase58()),
-    )
-    const infos = await connection.getMultipleAccountsInfo(keys, 'confirmed')
-
-    for (let index = 0; index < keys.length; index += 1) {
-      const info = infos[index]
-      if (!info || !info.owner.equals(programId)) continue
-
-      const data = Buffer.from(info.data)
-      if (data.length < 52) continue
-      if (!data.subarray(0, 8).equals(MESSAGE_SENT_ACCOUNT_DISCRIMINATOR)) continue
-
-      const rentPayer = new PublicKey(data.subarray(8, 40))
-      if (!rentPayer.equals(payee)) continue
-
-      const createdAtSeconds = readI64Le(data, 40)
-      if (createdAtSeconds <= 0n) continue
-
-      return {
-        messageSentEventAccount: keys[index].toBase58(),
-        refundableDepositSol: formatLamports(info.lamports),
-        refundAvailableAt: Number(createdAtSeconds) * 1000 + EVENT_ACCOUNT_WINDOW_MS,
-      }
-    }
-
-    return null
+    if (!parsed.meta || parsed.meta.err !== null || !parsed.transaction.message.accountKeys.some(k => k.signer && k.pubkey.equals(payee))) throw new Error('The Solana source transaction did not succeed for the connected Phantom wallet.')
+    const keys = parsed.transaction.message.accountKeys.map(item => new PublicKey(item.pubkey.toBase58()))
+    const infos = await connection.getMultipleAccountsInfo(keys, 'finalized')
+    const found = infos.flatMap((info, i) => {
+      if (!info || !info.owner.equals(programId)) return []
+      const candidate = parseOpenMessageSentAccount({pubkey:keys[i],lamports:info.lamports,data:Buffer.from(info.data),owner:info.owner,payee})
+      return candidate && isSolanaEventCreation(parsed, keys[i]) ? [candidate] : []
+    })
+    if (found.length !== 1) throw new Error('No unique open Circle deposit account matches this source transaction.')
+    return found[0]
   })
 }
 
-async function fetchSolanaSourceAttestation(sourceTxHash: string) {
-  const response = await fetch(
-    `${CIRCLE_MAINNET.irisApiBase}/v2/messages/${SOLANA_MAINNET_CCTP.cctpDomain}?transactionHash=${encodeURIComponent(sourceTxHash)}`,
-    { headers: { Accept: 'application/json' } },
-  )
-
-  if (!response.ok) {
-    throw new Error(`Circle CCTP messages API HTTP ${response.status}`)
-  }
-
-  const payload = await response.json()
-  const message = Array.isArray(payload?.messages)
-    ? payload.messages.find((item: any) =>
-        item?.status === 'complete'
-        && typeof item?.message === 'string'
-        && typeof item?.attestation === 'string'
-      )
-    : undefined
-
-  if (!message) {
-    throw new Error('Circle attestation for this Solana transfer is not available yet.')
-  }
-
-  return {
-    refundDestinationMessage: String(message.message),
-    refundAttestation: String(message.attestation),
-  }
+async function fetchSolanaSourceAttestation(sourceTxHash: string, sourceMessage: string) {
+  const fields = decodeCctpRecoveryMessage(sourceMessage)
+  if (fields.sourceDomain !== SOLANA_MAINNET_CCTP.cctpDomain) throw new Error('Wrong Solana source domain.')
+  const result = await readBoundCctpAttestation({ fields, sourceTxHash })
+  if (result.status !== 'complete' || !result.message || !result.attestation) throw new Error('Circle attestation for this deposit is pending. Recheck later.')
+  return { refundDestinationMessage: result.message, refundAttestation: result.attestation }
 }
 
 function readU32Be(buffer: Buffer, offset: number) {
@@ -169,28 +134,35 @@ function readU32Be(buffer: Buffer, offset: number) {
   return buffer.readUInt32BE(offset)
 }
 
-function parseOpenMessageSentAccount(input: {
+export function parseOpenMessageSentAccount(input: {
   pubkey: PublicKey
   lamports: number
   data: Buffer
+  owner: PublicKey
   payee: PublicKey
 }) {
-  const { pubkey, lamports, data, payee } = input
+  const { pubkey, lamports, data, payee, owner } = input
+  if (!owner.equals(new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram))) throw new Error('Solana RPC returned a deposit owned by another program.')
 
-  if (data.length < 64) return null
+  if (data.length < 52 + 376 || data.readUInt32LE(48) !== 376 || !Number.isSafeInteger(lamports) || lamports <= 0) return null
   if (!data.subarray(0, 8).equals(MESSAGE_SENT_ACCOUNT_DISCRIMINATOR)) return null
 
   const rentPayer = new PublicKey(data.subarray(8, 40))
   if (!rentPayer.equals(payee)) return null
 
   const createdAtSeconds = readI64Le(data, 40)
-  if (createdAtSeconds <= 0n) return null
+  if (createdAtSeconds <= 0n || createdAtSeconds > BigInt(Math.floor(Number.MAX_SAFE_INTEGER / 1000))) return null
 
   // MessageSent layout:
   // discriminator(8) + rent_payer(32) + created_at(8) + vec_len(4) + message(...)
   // CCTP V2 message destinationDomain is bytes 8..12 within the message.
   const messageOffset = 52
   const destinationDomain = readU32Be(data, messageOffset + 8)
+  const sourceMessage = '0x' + data.subarray(messageOffset, messageOffset + 376).toString('hex')
+  const parsed = decodeCctpRecoveryMessage(sourceMessage)
+  const solanaWord = (key: string) => ('0x' + new PublicKey(key).toBuffer().toString('hex')).toLowerCase()
+  if (parsed.burnToken !== solanaWord(SOLANA_MAINNET_CCTP.usdcMint) || parsed.sender !== solanaWord(SOLANA_MAINNET_CCTP.tokenMessengerMinterProgram) || parsed.recipient !== cctpWord(getMainnetCctpChain(5042)!.tokenMessengerAddress).toLowerCase() || parsed.amount <= 0n) throw new Error('Deposit is not a supported Solana USDC CCTP message.')
+  if (parsed.sourceDomain !== 5 || parsed.messageSender !== ('0x' + payee.toBuffer().toString('hex')).toLowerCase()) throw new Error('Solana deposit message belongs to a different source wallet.')
 
   return {
     messageSentEventAccount: pubkey.toBase58(),
@@ -198,40 +170,25 @@ function parseOpenMessageSentAccount(input: {
     refundAvailableAt: Number(createdAtSeconds) * 1000 + EVENT_ACCOUNT_WINDOW_MS,
     createdAt: Number(createdAtSeconds) * 1000,
     destinationDomain,
+    sourceMessage,
   }
 }
 
-async function findSourceTransactionForEventAccount(
-  connection: Connection,
-  eventAccount: PublicKey,
-  createdAtMs: number,
-) {
-  const signatures = await connection.getSignaturesForAddress(
-    eventAccount,
-    { limit: 10 },
-    'confirmed',
-  )
-
-  const successful = signatures.filter((item) => !item.err)
-  if (successful.length === 0) return null
-
-  const targetSeconds = Math.floor(createdAtMs / 1000)
-  const withBlockTime = successful.filter(
-    (item): item is typeof item & { blockTime: number } =>
-      typeof item.blockTime === 'number',
-  )
-
-  if (withBlockTime.length > 0) {
-    withBlockTime.sort(
-      (a, b) =>
-        Math.abs(a.blockTime - targetSeconds)
-        - Math.abs(b.blockTime - targetSeconds),
-    )
-    return withBlockTime[0].signature
+export function isSolanaEventCreation(tx: any, eventAccount: PublicKey): boolean {
+  const key = (x: any) => typeof x === 'string' ? x : x?.toBase58?.()
+  if (!tx?.meta || tx.meta.err !== null || !tx.transaction?.message?.accountKeys?.some((k: any)=>k.signer === true && key(k.pubkey) === eventAccount.toBase58())) return false
+  const instructions = [...(tx.transaction.message.instructions ?? []), ...(tx.meta.innerInstructions?.flatMap((x: any)=>x.instructions) ?? [])]
+  return instructions.some((i: any)=>key(i.programId) === SOLANA_MAINNET_CCTP.messageTransmitterProgram && i.accounts?.some((a: any)=>key(a) === eventAccount.toBase58()))
+}
+async function findSourceTransactionForEventAccount(connection: Connection, eventAccount: PublicKey, _createdAtMs: number) {
+  const signatures = await connection.getSignaturesForAddress(eventAccount,{limit:10},'finalized')
+  const found: string[] = []
+  for (const s of signatures.filter(s=>!s.err)) {
+    const tx = await connection.getParsedTransaction(s.signature,{commitment:'finalized',maxSupportedTransactionVersion:0})
+    if (isSolanaEventCreation(tx,eventAccount)) found.push(s.signature)
   }
-
-  // getSignaturesForAddress is newest-first; creation is the oldest interaction.
-  return successful[successful.length - 1].signature
+  if (found.length !== 1) throw new Error('The exact source transaction for this deposit could not be proven within the bounded lookup.')
+  return found[0]
 }
 
 async function callSameOriginSolanaRpc(
@@ -284,49 +241,26 @@ async function discoverProgramAccountsThroughProxy(
     },
   ])
 
-  if (!Array.isArray(result)) return []
+  if (!Array.isArray(result) || result.length > 256) throw new Error('Solana deposit scan returned invalid or excessive accounts.')
 
   return result.map((item: any) => ({
     pubkey: new PublicKey(String(item?.pubkey || '')),
     lamports: Number(item?.account?.lamports ?? 0),
     data: Buffer.from(String(item?.account?.data?.[0] || ''), 'base64'),
+    owner: new PublicKey(String(item?.account?.owner || '')),
   }))
 }
 
-async function findSourceTransactionThroughProxy(
-  eventAccount: PublicKey,
-  createdAtMs: number,
-) {
-  const result = await callSameOriginSolanaRpc('getSignaturesForAddress', [
-    eventAccount.toBase58(),
-    {
-      limit: 10,
-      commitment: 'confirmed',
-    },
-  ])
-
-  if (!Array.isArray(result)) return null
-
-  const successful = result.filter(
-    (item: any) => item && !item.err && typeof item.signature === 'string',
-  )
-  if (successful.length === 0) return null
-
-  const targetSeconds = Math.floor(createdAtMs / 1000)
-  const withBlockTime = successful.filter(
-    (item: any) => typeof item.blockTime === 'number',
-  )
-
-  if (withBlockTime.length > 0) {
-    withBlockTime.sort(
-      (a: any, b: any) =>
-        Math.abs(a.blockTime - targetSeconds)
-        - Math.abs(b.blockTime - targetSeconds),
-    )
-    return String(withBlockTime[0].signature)
+async function findSourceTransactionThroughProxy(eventAccount: PublicKey, _createdAtMs: number) {
+  const signatures = await callSameOriginSolanaRpc('getSignaturesForAddress',[eventAccount.toBase58(),{limit:10,commitment:'finalized'}])
+  if (!Array.isArray(signatures) || signatures.length>10) throw new Error('Invalid Solana source lookup response.')
+  const found: string[] = []
+  for (const s of signatures.filter(s=>!s.err && typeof s.signature === 'string')) {
+    const tx = await callSameOriginSolanaRpc('getTransaction',[s.signature,{encoding:'jsonParsed',commitment:'finalized',maxSupportedTransactionVersion:0}])
+    if (isSolanaEventCreation(tx,eventAccount)) found.push(s.signature)
   }
-
-  return String(successful[successful.length - 1].signature)
+  if (found.length !== 1) throw new Error('The exact Solana source transaction could not be proven. No amount/time matching is used.')
+  return found[0]
 }
 
 async function hydrateRefundCandidates(
@@ -336,6 +270,7 @@ async function hydrateRefundCandidates(
     refundAvailableAt: number
     createdAt: number
     destinationDomain: number
+    sourceMessage: string
   }>,
   findSourceTx: (
     eventAccount: PublicKey,
@@ -352,7 +287,7 @@ async function hydrateRefundCandidates(
       )
       if (!sourceTxHash) continue
 
-      const attestation = await fetchSolanaSourceAttestation(sourceTxHash)
+      const attestation = await fetchSolanaSourceAttestation(sourceTxHash, candidate.sourceMessage)
 
       refunds.push({
         sourceTxHash,
@@ -367,6 +302,7 @@ async function hydrateRefundCandidates(
     }
   }
 
+  if (candidates.length && !refunds.length) throw new Error('Open Solana deposits were found, but their source transaction or attestation is not yet verified. Refresh later; no reclaim is allowed.')
   return refunds.sort((a, b) => a.refundAvailableAt - b.refundAvailableAt)
 }
 
@@ -382,11 +318,12 @@ export async function discoverMainnetSolanaRefunds(
   try {
     const accounts = await discoverProgramAccountsThroughProxy(programId, payee)
     const candidates = accounts
-      .map(({ pubkey, lamports, data }) =>
+      .map(({ pubkey, lamports, data, owner }) =>
         parseOpenMessageSentAccount({
           pubkey,
           lamports,
           data,
+          owner,
           payee,
         }),
       )
@@ -431,6 +368,7 @@ export async function discoverMainnetSolanaRefunds(
             pubkey,
             lamports: account.lamports,
             data: Buffer.from(account.data),
+            owner: account.owner,
             payee,
           }),
         )
@@ -470,7 +408,7 @@ async function getReclaimConnection(eventAccount: PublicKey) {
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     try {
       const connection = new Connection(rpcUrl, 'confirmed')
-      const eventInfo = await connection.getAccountInfo(eventAccount, 'confirmed')
+      const eventInfo = await connection.getAccountInfo(eventAccount, 'finalized')
       return { connection, eventInfo }
     } catch (error) {
       lastError = error
@@ -488,18 +426,13 @@ export async function loadMainnetSolanaRefundMetadata(
   if (!sourceTxHash) throw new Error('Solana source transaction is missing.')
   if (!solanaWallet) throw new Error('Original Phantom wallet is missing.')
 
-  const [eventAccount, iris] = await Promise.all([
-    findMessageSentEventAccount(sourceTxHash, solanaWallet),
-    fetchSolanaSourceAttestation(sourceTxHash),
-  ])
+  const eventAccount = await findMessageSentEventAccount(sourceTxHash, solanaWallet)
+  const iris = await fetchSolanaSourceAttestation(sourceTxHash, eventAccount.sourceMessage)
+  return { ...eventAccount, ...iris, sourceTxHash }
 
-  return {
-    ...eventAccount,
-    ...iris,
-  }
 }
 
-export async function reclaimMainnetSolanaDeposit(input: {
+async function performMainnetSolanaReclaim(input: {
   provider: PhantomSolanaProvider
   connectedWallet: string
   originalWallet: string
@@ -523,6 +456,10 @@ export async function reclaimMainnetSolanaDeposit(input: {
 
   const { connection, eventInfo } = await getReclaimConnection(eventAccount)
   if (!eventInfo) {
+    if (!input.metadata.sourceTxHash) throw new Error('Account is absent, but its source identity cannot be verified. No reclaim is requested.')
+    const source = await connection.getParsedTransaction(input.metadata.sourceTxHash, {commitment:'finalized',maxSupportedTransactionVersion:0})
+    const provesIdentity = isSolanaEventCreation(source, eventAccount) && source!.transaction.message.accountKeys.some(k=>k.signer && k.pubkey.equals(payee))
+    if (!provesIdentity) throw new Error('The absent account cannot be bound to a successful Circle source transaction.')
     return { alreadyClosed: true }
   }
 
@@ -543,6 +480,10 @@ export async function reclaimMainnetSolanaDeposit(input: {
     throw new Error('Connected Phantom wallet is not the rent payer for this deposit.')
   }
 
+  const actual = parseOpenMessageSentAccount({ pubkey:eventAccount,lamports:eventInfo.lamports,data:eventData,owner:eventInfo.owner,payee })
+  if (!actual || !immutableMessageMatches(decodeCctpRecoveryMessage(actual.sourceMessage), decodeCctpRecoveryMessage(input.metadata.refundDestinationMessage))) throw new Error('The refund attestation is not bound to this deposit account.')
+  const chainTime = await connection.getBlockTime(await connection.getSlot('finalized'))
+  if (typeof chainTime !== 'number' || chainTime * 1000 < actual.refundAvailableAt) throw new Error('The five-day refund window is not proven elapsed on Solana.')
   const attestation = hexBytes(input.metadata.refundAttestation, 'Circle attestation')
   const destinationMessage = hexBytes(
     input.metadata.refundDestinationMessage,
@@ -569,12 +510,17 @@ export async function reclaimMainnetSolanaDeposit(input: {
     data: instructionData,
   }))
 
+  const simulation = await connection.simulateTransaction(transaction)
+  if (simulation.value.err) throw new Error('Solana reclaim simulation failed; no wallet signature was requested.')
+  const expectedMessage = transaction.serializeMessage()
+  if (input.provider.publicKey && input.provider.publicKey.toBase58() !== input.connectedWallet) throw new Error('Phantom account changed before signing.')
   // Phantom signs exactly once. RPC failover never causes a second wallet prompt.
   const signed = await input.provider.signTransaction(transaction) as Transaction
   if (!signed || typeof signed.serialize !== 'function') {
     throw new Error('Phantom did not return a signed Solana transaction.')
   }
 
+  if (!signed.serializeMessage().equals(expectedMessage)) throw new Error('Phantom changed the reclaim transaction; broadcasting is blocked.')
   const raw = signed.serialize()
   let txHash: string | null = null
   let sendError: unknown = null
@@ -614,4 +560,12 @@ export async function reclaimMainnetSolanaDeposit(input: {
     txHash,
     alreadyClosed: false,
   }
+}
+
+export async function reclaimMainnetSolanaDeposit(input: Parameters<typeof performMainnetSolanaReclaim>[0]): Promise<MainnetSolanaReclaimResult> {
+  if (typeof navigator === 'undefined' || !navigator.locks) throw new Error('Safe SOL reclaim requires browser transaction locks.')
+  return navigator.locks.request(`machina-solana-reclaim:${input.metadata.messageSentEventAccount}`, {ifAvailable:true}, async lock=>{
+    if (!lock) throw new Error('Another tab is already reclaiming this deposit. No second wallet request is allowed.')
+    return performMainnetSolanaReclaim(input)
+  })
 }

@@ -9,6 +9,7 @@ export type MainnetSolanaActivityRecord = {
   solanaWallet: string
   direction: MainnetSolanaActivityDirection
   amount: string
+  status?: 'pending' | 'unknown' | 'complete' | 'failed'
   createdAt: number
   sourceTxHash?: string
   destinationTxHash?: string
@@ -71,10 +72,11 @@ export function recordMainnetSolanaActivity(
   input: Omit<MainnetSolanaActivityRecord, 'id' | 'createdAt'> & { createdAt?: number },
 ) {
   const existing = readMainnetSolanaActivity()
-  const sourceHash = input.sourceTxHash?.toLowerCase()
+  const sourceHash = input.sourceTxHash
+  const sameHash = (other: MainnetSolanaActivityRecord) => other.direction === input.direction && (input.direction === 'arc-to-solana' ? other.sourceTxHash?.toLowerCase() === sourceHash?.toLowerCase() : other.sourceTxHash === sourceHash)
 
   const duplicate = sourceHash
-    ? existing.find((item) => item.sourceTxHash?.toLowerCase() === sourceHash)
+    ? existing.find(sameHash)
     : undefined
 
   const record: MainnetSolanaActivityRecord = {
@@ -141,4 +143,12 @@ export function subscribeMainnetSolanaActivity(listener: () => void) {
     window.removeEventListener('storage', onStorage)
     window.removeEventListener(MAINNET_SOLANA_ACTIVITY_EVENT, onLocal)
   }
+}
+
+export function mainnetSolanaTransferStatus(item: MainnetSolanaActivityRecord): string {
+  if (item.status === 'complete') return 'Complete'
+  if (item.status === 'failed') return 'Failed'
+  if (item.status === 'pending') return 'Pending verification'
+  if (!item.status && item.destinationTxHash) return 'SDK completion reported · not rechecked'
+  return 'Outcome unverified'
 }

@@ -533,14 +533,16 @@ try {
     let sent = await lastSent(); assert.ok(p.sameAddress(sent.tx.to, p.ARC_TOKENS.EURC.address)); assert.equal(sent.tx.value, '0x0')
     const approval1 = decodeFunctionData({ abi: viem.parseAbi(['function approve(address spender, uint256 amount)']), data: sent.tx.data }); assert.ok(p.sameAddress(approval1.args[0], p.ARC_PERMIT2)); assert.equal(approval1.args[1], 1_000_000n)
     assert.equal(await review.isDisabled(), true) // an unresolved approval blocks a new swap
-    await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
-    await latest.getByText('Approval completed', { exact: true }).waitFor(); await bumpNonce(); await syncNonce()
+    // A mined approval consumes its nonce before the receipt becomes visible. Otherwise the automatic Review races the fixture.
+    await syncWalletSends(); await bumpNonce(); await syncNonce(); setReceipt(sent.hash, 'success'); await recheck()
+    await latest.getByText('Approval completed', { exact: true }).waitFor()
     await page.getByRole('dialog').getByText('Review Uniswap swap', { exact: true }).waitFor()
     await confirmUniswap(); await latest.getByText('Verifying transaction', { exact: true }).waitFor(); sent = await lastSent(); assert.equal(sent.tx.value, '0x0')
     assert.equal(decodeFunctionData({ abi: p.EXECUTE_ABI, data: sent.tx.data }).args[0], '0x0a00')
     await syncWalletSends(); setReceipt(sent.hash, 'success'); await recheck()
     await latest.getByText('Swap completed', { exact: true }).waitFor(); await latest.getByText(/Paid 1 EURC · Received 1\.1192 USDC|Paid 1 EURC · Received 1\.119/).waitFor()
-    const history = page.getByLabel('Swap history'); await history.getByText(/earlier swaps?/).first().waitFor(); assert.equal(await history.locator('article').filter({ visible: true }).count(), 0) // earlier swaps are a closed list of short summaries; await bumpNonce(); await syncNonce()
+    const history = page.getByLabel('Swap history'); await history.getByText(/earlier swaps?/).first().waitFor(); assert.equal(await history.locator('article').filter({ visible: true }).count(), 0) // earlier swaps are a closed list of short summaries
+    await bumpNonce(); await syncNonce()
     const wallet = await page.evaluate(start => window.swapUiTest.state.requests.slice(start).map(r => r.method), walletStart)
     assert.equal(wallet.filter(m => m === 'eth_signTypedData_v4').length, 1); assert.equal(await sends(), before + 2)
   })
