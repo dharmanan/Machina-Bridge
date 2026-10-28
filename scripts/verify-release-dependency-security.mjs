@@ -7,6 +7,20 @@ const require = createRequire(import.meta.url)
 let count = 0
 async function test(name, run) { await run(); count++; console.log('PASS ' + name) }
 const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url)))
+await test('Sui and RainbowKit CSS supply chain excludes vulnerable deepmerge', () => {
+  const lock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url)))
+  const packages = lock.packages
+  assert.equal(manifest.overrides['@vanilla-extract/css'], '1.21.3')
+  assert.equal(packages['node_modules/@vanilla-extract/css']?.version, '1.21.3')
+  assert.equal(packages['node_modules/@vanilla-extract/css']?.dependencies['deepmerge-ts'], '^8.0.2')
+  assert.equal(packages['node_modules/deepmerge-ts']?.version, '8.0.2')
+  assert.equal(packages['node_modules/modern-ahocorasick']?.version, '3.3.0')
+  assert.equal(packages['node_modules/@mysten/dapp-kit']?.dependencies['@vanilla-extract/css'], '^1.18.0')
+  assert.equal(packages['node_modules/@rainbow-me/rainbowkit']?.dependencies['@vanilla-extract/css'], '1.17.3')
+  assert.equal(packages['node_modules/@mysten/dapp-kit/node_modules/@vanilla-extract/css'], undefined)
+  assert.ok(Object.entries(packages).every(([path, meta]) => !/(^|\\/)node_modules\\/deepmerge$/.test(path) && !meta.dependencies?.deepmerge), 'vulnerable deepmerge must be absent from the entire lock tree')
+})
+
 await test('only Porto Zod 4 is patched; Circle pinned Zod 3 is not forced across a major API boundary', () => {
   const fromPorto = createRequire(createRequire(require.resolve('@wagmi/connectors')).resolve('porto'))
   assert.equal(fromPorto('zod/package.json').version, '4.6.7')

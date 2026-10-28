@@ -84,6 +84,7 @@
     "porto": {
       "zod@^4.1.5": "4.6.7"
     },
-    "jayson": "5.0.0"
+    "jayson": "5.0.0",
+    "@vanilla-extract/css": "1.21.3"
   }
 }
