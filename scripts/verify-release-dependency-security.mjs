@@ -18,7 +18,7 @@ await test('Sui and RainbowKit CSS supply chain excludes vulnerable deepmerge', 
   assert.equal(packages['node_modules/@mysten/dapp-kit']?.dependencies['@vanilla-extract/css'], '^1.18.0')
   assert.equal(packages['node_modules/@rainbow-me/rainbowkit']?.dependencies['@vanilla-extract/css'], '1.17.3')
   assert.equal(packages['node_modules/@mysten/dapp-kit/node_modules/@vanilla-extract/css'], undefined)
-  assert.ok(Object.entries(packages).every(([path, meta]) => !/(^|\\/)node_modules\\/deepmerge$/.test(path) && !meta.dependencies?.deepmerge), 'vulnerable deepmerge must be absent from the entire lock tree')
+  assert.ok(Object.entries(packages).every(([path, meta]) => path !== 'node_modules/deepmerge' && !path.endsWith('/node_modules/deepmerge') && !meta.dependencies?.deepmerge), 'vulnerable deepmerge must be absent from the entire lock tree')
 })
 
 await test('only Porto Zod 4 is patched; Circle pinned Zod 3 is not forced across a major API boundary', () => {
