@@ -35,7 +35,9 @@ export function importSuiRecovery(result: SuiRecoveryResult) {
   const record: SuiRecoveryRecord = { ...result, id: suiTransferIdentity(result) }
   if (!valid(record)) throw new Error('Invalid Sui recovery record.')
   const records = readSuiRecoveryQueue(), old = records.find(r => r.id === record.id)
-  if (old && (old.evmOwner.toLowerCase() !== record.evmOwner.toLowerCase() || old.suiOwner.toLowerCase() !== record.suiOwner.toLowerCase() || old.amount !== record.amount)) throw new Error('Stored Sui source identity belongs to a different transfer.')
+  // Amounts are compared as USDC base units: '0.100000' (write path) and '0.1'
+  // (recovery) are the same 100000 units; any real difference stays a conflict.
+  if (old && (old.evmOwner.toLowerCase() !== record.evmOwner.toLowerCase() || old.suiOwner.toLowerCase() !== record.suiOwner.toLowerCase() || parseUnits(old.amount, 6) !== parseUnits(record.amount, 6))) throw new Error('Stored Sui source identity belongs to a different transfer.')
   if (old?.stage === 'complete' && record.stage !== 'complete') throw new Error('Stored completion cannot be reconciled. Keep history and do not request another mint.')
   // A cached completion never authorizes a send; the UI explicitly marks all
   // persisted rows as history until the user requests a fresh independent read.
