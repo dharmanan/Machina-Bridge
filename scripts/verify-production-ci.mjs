@@ -26,7 +26,10 @@ test('duplicate or mutable declarations are rejected', () => {
 })
 test('CI records the real audit, reports known risks, preserves JSON and runs full suites only for main release checks and PRs', () => {
   const workflow = readFileSync(new URL('../.github/workflows/machina-production-verification.yml', import.meta.url), 'utf8')
-  assert.match(workflow, /run: node scripts\/verify-borrow-source-gates\.mjs/)
+  // The Borrow gate guard runs on every push through the manifest's fast group.
+  const suites = JSON.parse(readFileSync(new URL('./ci-suites.json', import.meta.url), 'utf8'))
+  assert.ok(suites.groups.fast.includes('verify-borrow-source-gates'))
+  assert.match(workflow, /node scripts\/run-suites\.mjs fast/)
   assert.match(workflow, /if npm audit --omit=dev --json > npm-audit-production.json/)
   assert.match(workflow, /report-dependency-audit\.mjs npm-audit-production.json/)
   assert.match(workflow, /actions\/upload-artifact@v4/)

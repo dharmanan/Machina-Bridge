@@ -31,10 +31,7 @@
     "@solana/web3.js": "^1.98.4",
     "@tanstack/react-query": "^5.100.5",
     "buffer": "^6.0.3",
-    "canvas-confetti": "^1.9.4",
-    "clsx": "^2.0.0",
     "ethers": "^6.16.0",
-    "framer-motion": "^12.23.24",
     "lucide-react": "^0.292.0",
     "pg": "^8.23.0",
     "react": "^18.2.0",
@@ -79,7 +76,7 @@
     "tmp": "0.2.7",
     "toml": "5.0.1",
     "browserslist": "^4.28.7",
-    "decode-uri-component": "^0.5.0",
+    "decode-uri-component": "^0.5.1",
     "postcss-selector-parser": "^7.1.6",
     "porto": {
       "zod@^4.1.5": "4.6.7"

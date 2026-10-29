@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { SuiClientProvider, WalletProvider } from '@mysten/dapp-kit'
 import { getWallets } from '@mysten/wallet-standard'
 import MainnetSuiBridge from '../../src/components/MainnetSuiBridge'
+import { useSuiWallet } from '../../src/hooks/useSuiWallet'
 import { SUI_NETWORKS } from '../../src/config/sui'
 import '../../src/index.css'
 const state = { signatures: 0, address: `0x${'0'.repeat(62)}15`, listeners: new Set<(e: unknown) => void>() }
@@ -14,5 +15,7 @@ getWallets().register({ version: '1.0.0', name: 'Slush controlled', icon: 'data:
   'standard:events': { version: '1.0.0', on: (_e: string, cb: (e: unknown) => void) => { state.listeners.add(cb); return () => state.listeners.delete(cb) } },
   'sui:signTransaction': { version: '2.0.0', signTransaction: async () => { state.signatures++; throw Error('Unexpected signing request') } },
 } } as any)
+// Stands in for the app top bar: Slush is connected there, never inside the bridge.
+function TopBarStub() { const sui = useSuiWallet('mainnet'); return <button type="button" onClick={() => void sui.connect()}>{sui.isConnected ? 'Slush connected' : 'Connect Slush (top bar)'}</button> }
 ;(window as any).suiRecoveryUi = { state, evmOwner: '0xafbB6Cc5C0a9C0eB1BfF8dB2eD807e83aAB8e321', change: (address: string) => { state.address = address; for (const cb of state.listeners) cb({ accounts: [account()] }) } }
-createRoot(document.getElementById('root')!).render(<QueryClientProvider client={new QueryClient()}><SuiClientProvider networks={SUI_NETWORKS} defaultNetwork="mainnet"><WalletProvider autoConnect={false}><div className="mx-auto max-w-xl p-4"><MainnetSuiBridge /></div></WalletProvider></SuiClientProvider></QueryClientProvider>)
+createRoot(document.getElementById('root')!).render(<QueryClientProvider client={new QueryClient()}><SuiClientProvider networks={SUI_NETWORKS} defaultNetwork="mainnet"><WalletProvider autoConnect={false}><div className="mx-auto max-w-xl p-4"><TopBarStub /><MainnetSuiBridge /></div></WalletProvider></SuiClientProvider></QueryClientProvider>)

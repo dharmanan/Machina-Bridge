@@ -12,6 +12,10 @@ on:
         description: Run complete pre-merge acceptance
         type: boolean
         default: false
+      legacy:
+        description: Also run paused/retired feature suites (Borrow, Arc Intelligence UI)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,17 +35,11 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Source safety and compatible dependency guards
+      # Suite scope lives in scripts/ci-suites.json; verify-ci-coverage keeps it in step with the app.
+      - name: Typecheck and fast safety suites (CCTP, Sui/Arc wallets, recovery, mismatch, gates)
         run: |
           npx tsc --noEmit
-          node scripts/verify-production-ci.mjs
-          node scripts/verify-zod-collection-backport.mjs
-          node scripts/verify-circle-response-limits.mjs
-          node scripts/verify-mainnet-transfer-recovery.mjs
-          node scripts/verify-sui-cctp-foundation.mjs
-          node scripts/verify-sui-mainnet-recovery.mjs
-          node scripts/verify-sui-write-controller.mjs
-          node scripts/verify-borrow-source-gates.mjs
+          node scripts/run-suites.mjs fast
   source-regressions:
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
@@ -55,45 +53,21 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: TypeScript, lint, production bundle
+      - name: Lint and production bundle (the build runs tsc)
         run: |
-          npx tsc --noEmit
           npm run lint
           npm run build
-      - name: Borrow, Swap, Bridge, Earn, Activity and Dashboard
-        run: |
-          set -euo pipefail
-          for suite in \
-            verify-production-ci verify-zod-collection-backport verify-circle-response-limits verify-release-dependency-security \
-            verify-mainnet-borrow verify-mainnet-borrow-preview \
-            verify-borrow-eurc-markets \
-            verify-mainnet-borrow-write-safety verify-borrow-operations \
-            verify-borrow-sdk-integration \
-            verify-mainnet-transfer-recovery verify-sui-cctp-foundation verify-sui-mainnet-recovery verify-sui-write-controller \
-            verify-mainnet-swap-preview verify-swap-support-matrix \
-            verify-swap-amount-shortcuts verify-swap-approvals \
-            verify-swap-display verify-swap-verification \
-            verify-swap-uniswap-onchain verify-uniswap-arc-preview \
-            verify-uniswap-arc-timing verify-uniswap-arc-api-security \
-            verify-uniswap-arc-execution verify-swap-permit-single \
-            verify-swap-circle-execution verify-wallet-activity-fixes \
-            verify-mainnet-solana-bridgekit \
-            verify-arc-intelligence-dashboard \
-            verify-arc-intelligence-dashboard-completion
-          do
-            echo "::group::$suite"
-            node "scripts/$suite.mjs"
-            echo "::endgroup::"
-          done
-      - name: Confirm public source gates remain closed; bounded canary is tested separately
-        run: node scripts/verify-borrow-source-gates.mjs
+      - name: Swap, Solana Bridge, Activity and dependency release suites
+        run: node scripts/run-suites.mjs full --timings suite-timings-full.json
       - name: Production dependency reachability evidence
         run: node scripts/verify-security-bundle.mjs security-bundle.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: security-bundle-evidence
-          path: security-bundle.json
+          path: |
+            security-bundle.json
+            suite-timings-full.json
 
   security-audit:
     runs-on: ubuntu-latest
@@ -138,6 +112,47 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Playwright browser cache
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.58.2-${{ runner.os }}
+      - name: Prepare Chromium test dependencies
+        run: |
+          npm install --no-save --package-lock=false --ignore-scripts playwright-core@1.58.2
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            npx --yes playwright@1.58.2 install-deps chromium
+          else
+            npx --yes playwright@1.58.2 install --with-deps chromium
+          fi
+          CHROME="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f | head -n 1)"
+          test -n "$CHROME"
+          sudo ln -sf "$CHROME" /usr/bin/chromium
+          sudo mkdir -p /workspace/artifacts
+          sudo chown -R "$(id -u):$(id -g)" /workspace/artifacts
+      - name: Bridge, Sui, Swap and app-shell real-Chromium fixture regressions (no wallet sends)
+        env:
+          PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
+        run: node scripts/run-suites.mjs browser --timings suite-timings-browser.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-suite-timings
+          path: suite-timings-browser.json
+
+  # Paused Borrow and retired Arc Intelligence UI suites: kept runnable, never on push.
+  legacy-regressions:
+    if: github.event_name == 'workflow_dispatch' && inputs.legacy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
       - name: Prepare Chromium test dependencies
         run: |
           npm install --no-save --package-lock=false --ignore-scripts playwright-core@1.58.2
@@ -147,14 +162,7 @@ jobs:
           sudo ln -sf "$CHROME" /usr/bin/chromium
           sudo mkdir -p /workspace/artifacts/borrow-production-ui
           sudo chown -R "$(id -u):$(id -g)" /workspace/artifacts
-      - name: Bridge, Sui, Borrow and Swap real-Chromium fixture regressions (no wallet sends)
+      - name: Borrow and Arc Intelligence legacy suites
         env:
           PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
-        run: |
-          node scripts/verify-mainnet-transfer-recovery-ui.mjs
-          node scripts/verify-sui-wallet-foundation-ui.mjs
-          node scripts/verify-sui-recovery-ui.mjs
-          node scripts/verify-sui-write-browser.mjs
-          node scripts/verify-sui-transfer-review-ui.mjs
-          node scripts/verify-borrow-operations-ui.mjs
-          node scripts/verify-swap-unified-ui.mjs
+        run: node scripts/run-suites.mjs legacy

@@ -30,4 +30,4 @@ export const MAINNET_ARC_WALLET_SEND_ENABLED: boolean = true
 // action including mints. Raising it needs separate user approval; it is never
 // raised automatically for fees or protocol minimums.
 export const MAINNET_SUI_CCTP_TEST_MAX_UNITS = 100_000n
-export const MAINNET_SUI_CCTP_BLOCKER = 'Controlled live test: at most 0.1 USDC per transaction. Every wallet request needs your explicit Review and Confirm; a completed real transfer has not been proven yet.'
+export const MAINNET_SUI_CCTP_BLOCKER = 'Live test: at most 0.1 USDC per transfer. Every wallet step needs your Review and your confirmation in the wallet.'

@@ -1,0 +1,51 @@
+{
+  "$comment": "Reviewed status of the open GitHub Dependabot advisories. Every claim names how it can be re-checked. Raw npm audit output stays unsuppressed in CI (raw-production-audit artifact).",
+  "reviewed": "2026-10-29",
+  "advisories": [
+    {
+      "dependabot": 162,
+      "id": "GHSA-qr28-fpjm-wq7f",
+      "package": "decode-uri-component",
+      "severity": "high",
+      "range": "<=0.5.0",
+      "chain": "@walletconnect/utils -> query-string@7.1.3 -> decode-uri-component (pinned by package.json overrides)",
+      "status": "FIXED",
+      "fix": "overrides.decode-uri-component ^0.5.0 -> ^0.5.1; lockfile resolves 0.5.1",
+      "evidence": [
+        "npm pack decode-uri-component@0.5.0/0.5.1 diff: only index.js and version change; the quadratic per-key RegExp replace loop is replaced by one input.replace(multiMatcher, decode) pass",
+        "same maintainer and repository (SamVerschueren/decode-uri-component); no new dependency or install script",
+        "npm audit --omit=dev no longer lists decode-uri-component"
+      ]
+    },
+    {
+      "dependabot": 161,
+      "id": "GHSA-mrhx-c7xc-m3w5",
+      "package": "zod",
+      "severity": "high",
+      "range": "<4.6.6",
+      "chain": "@circle-fin/{bridge-kit,swap-kit,earn-kit,adapter-viem-v2,adapter-solana,provider-*,borrow-*} pin zod 3.25.67 exactly; @reown/appkit-wallet uses zod 3.22.4; root zod 3.25.76; @wagmi/connectors (porto) already on 4.6.7",
+      "status": "OPEN — no compatible fixed release",
+      "reason": "No zod 3.x release fixes the advisory (latest 3.25.76). Circle SDKs, including the newest @circle-fin/bridge-kit 1.16.1, pin zod 3.25.67 exactly; forcing zod 4 would break their runtime schemas.",
+      "mitigation": "scripts/apply-zod-collection-backport.mjs patches the oversized-collection checks into all locked zod v3 copies (verified by scripts/verify-zod-collection-backport.mjs); Circle responses are size-bounded before parsing (scripts/verify-circle-response-limits.mjs). Porto keeps zod 4.6.7 via overrides.",
+      "recheck": "npm view @circle-fin/bridge-kit dependencies.zod; npm view zod versions"
+    },
+    {
+      "dependabot": 17,
+      "id": "GHSA-848j-6mx2-7j84",
+      "package": "elliptic",
+      "severity": "low",
+      "range": "<=6.6.1",
+      "chain": "@circle-fin/* -> @ethersproject/abi@5 -> hash -> abstract-signer -> abstract-provider -> transactions -> signing-key@5.8.0 -> elliptic@6.6.1",
+      "status": "OPEN — no fixed release",
+      "reason": "6.6.1 is the latest published elliptic version.",
+      "reachability": "Not in the production bundle: elliptic-only strings (e.g. 'Signature without r or s', 'Key does not belong to curve') are absent from dist/assets. Machina never creates or signs with keys in the browser; wallets sign.",
+      "recheck": "npm run build && grep -l 'Signature without r or s' dist/assets/*.js"
+    }
+  ],
+  "removedUnusedDependencies": ["canvas-confetti", "clsx", "framer-motion"],
+  "keptForPausedOrRetiredCode": {
+    "@circle-fin/borrow-kit": "used by the paused Borrow implementation (src/lib/borrow*.ts, still type-checked)",
+    "@circle-fin/borrow-adapter-viem-v2": "same",
+    "pg": "Arc Intelligence server (server/arc-intelligence/db.js)"
+  }
+}

@@ -1,0 +1,181 @@
+{
+ "$comment": "Single source of truth for CI test scope. scripts/verify-ci-coverage.mjs keeps it consistent with the app and the workflow.",
+ "features": {
+  "evm-bridge": {
+   "status": "ACTIVE"
+  },
+  "solana-bridge": {
+   "status": "ACTIVE"
+  },
+  "sui-bridge": {
+   "status": "ACTIVE"
+  },
+  "swap": {
+   "status": "ACTIVE"
+  },
+  "earn": {
+   "status": "ACTIVE",
+   "coveredBy": "verify-app-shell-ui"
+  },
+  "dashboard": {
+   "status": "ACTIVE",
+   "coveredBy": "verify-app-shell-ui"
+  },
+  "activity": {
+   "status": "ACTIVE"
+  },
+  "testnet": {
+   "status": "ACTIVE",
+   "coveredBy": "verify-app-shell-ui"
+  },
+  "app-shell": {
+   "status": "ACTIVE"
+  },
+  "security": {
+   "status": "ACTIVE"
+  },
+  "ci": {
+   "status": "ACTIVE"
+  },
+  "borrow": {
+   "status": "PAUSED",
+   "entries": [
+    "src/components/MainnetBorrow.tsx",
+    "src/components/BorrowOperations.tsx"
+   ],
+   "guards": [
+    "verify-borrow-source-gates"
+   ]
+  },
+  "arc-intelligence": {
+   "status": "RETIRED",
+   "entries": [
+    "src/components/ArcIntelligenceOverview.tsx",
+    "src/lib/arcIntelligence.ts"
+   ]
+  }
+ },
+ "groups": {
+  "fast": [
+   "verify-production-ci",
+   "verify-ci-coverage",
+   "verify-zod-collection-backport",
+   "verify-circle-response-limits",
+   "verify-mainnet-transfer-recovery",
+   "verify-sui-cctp-foundation",
+   "verify-sui-mainnet-recovery",
+   "verify-sui-write-controller",
+   "verify-borrow-source-gates"
+  ],
+  "full": [
+   "verify-release-dependency-security",
+   "verify-mainnet-swap-preview",
+   "verify-swap-support-matrix",
+   "verify-swap-amount-shortcuts",
+   "verify-swap-approvals",
+   "verify-swap-display",
+   "verify-swap-verification",
+   "verify-swap-uniswap-onchain",
+   "verify-uniswap-arc-preview",
+   "verify-uniswap-arc-timing",
+   "verify-uniswap-arc-api-security",
+   "verify-uniswap-arc-execution",
+   "verify-swap-permit-single",
+   "verify-swap-circle-execution",
+   "verify-wallet-activity-fixes",
+   "verify-mainnet-solana-bridgekit"
+  ],
+  "browser": [
+   "verify-sui-transfer-review-ui",
+   "verify-swap-unified-ui",
+   "verify-sui-recovery-ui",
+   "verify-app-shell-ui",
+   "verify-mainnet-transfer-recovery-ui",
+   "verify-sui-write-browser",
+   "verify-sui-wallet-foundation-ui"
+  ],
+  "legacy": [
+   "verify-mainnet-borrow",
+   "verify-mainnet-borrow-preview",
+   "verify-borrow-eurc-markets",
+   "verify-mainnet-borrow-write-safety",
+   "verify-borrow-operations",
+   "verify-borrow-sdk-integration",
+   "verify-borrow-operations-ui",
+   "verify-arc-intelligence-dashboard",
+   "verify-arc-intelligence-dashboard-completion"
+  ]
+ },
+ "concurrency": {
+  "fast": 4,
+  "full": 4,
+  "browser": 3,
+  "legacy": 2
+ },
+ "feature": {
+  "verify-production-ci": "ci",
+  "verify-ci-coverage": "ci",
+  "verify-zod-collection-backport": "security",
+  "verify-circle-response-limits": "security",
+  "verify-mainnet-transfer-recovery": "evm-bridge",
+  "verify-sui-cctp-foundation": "sui-bridge",
+  "verify-sui-mainnet-recovery": "sui-bridge",
+  "verify-sui-write-controller": "sui-bridge",
+  "verify-borrow-source-gates": "borrow",
+  "verify-release-dependency-security": "security",
+  "verify-mainnet-swap-preview": "swap",
+  "verify-swap-support-matrix": "swap",
+  "verify-swap-amount-shortcuts": "swap",
+  "verify-swap-approvals": "swap",
+  "verify-swap-display": "swap",
+  "verify-swap-verification": "swap",
+  "verify-swap-uniswap-onchain": "swap",
+  "verify-uniswap-arc-preview": "swap",
+  "verify-uniswap-arc-timing": "swap",
+  "verify-uniswap-arc-api-security": "swap",
+  "verify-uniswap-arc-execution": "swap",
+  "verify-swap-permit-single": "swap",
+  "verify-swap-circle-execution": "swap",
+  "verify-wallet-activity-fixes": "activity",
+  "verify-mainnet-solana-bridgekit": "solana-bridge",
+  "verify-sui-transfer-review-ui": "sui-bridge",
+  "verify-swap-unified-ui": "swap",
+  "verify-sui-recovery-ui": "sui-bridge",
+  "verify-app-shell-ui": "app-shell",
+  "verify-mainnet-transfer-recovery-ui": "evm-bridge",
+  "verify-sui-write-browser": "sui-bridge",
+  "verify-sui-wallet-foundation-ui": "sui-bridge",
+  "verify-mainnet-borrow": "borrow",
+  "verify-mainnet-borrow-preview": "borrow",
+  "verify-borrow-eurc-markets": "borrow",
+  "verify-mainnet-borrow-write-safety": "borrow",
+  "verify-borrow-operations": "borrow",
+  "verify-borrow-sdk-integration": "borrow",
+  "verify-borrow-operations-ui": "borrow",
+  "verify-arc-intelligence-dashboard": "arc-intelligence",
+  "verify-arc-intelligence-dashboard-completion": "arc-intelligence"
+ },
+ "manual": {
+  "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",
+  "verify-mainnet-cctp-route": "live Mainnet reads",
+  "verify-mainnet-cctp-simulation": "live Mainnet simulation",
+  "verify-mainnet-cctp-state-override": "live Mainnet simulation",
+  "verify-mainnet-solana-cctp": "live Solana reads (npm run verify:mainnet-solana-cctp)",
+  "verify-uniswap-arc-ui": "known pre-existing failure on 4235dfb; not a release gate until fixed",
+  "verify-uniswap-arc-execution-ui": "timing-flaky on clean base (1/8); manual until stabilised",
+  "verify-uniswap-arc-serverless": "serverless API lab check",
+  "verify-security-bundle": "runs as its own release step with an output file argument",
+  "verify-arc-borrow-live": "Borrow (paused): live reads",
+  "verify-mainnet-borrow-live-read": "Borrow (paused): live reads",
+  "verify-mainnet-borrow-markets-onchain": "Borrow (paused): live reads",
+  "verify-mainnet-borrow-target-live": "Borrow (paused): live reads",
+  "verify-borrow-adapter-119-isolated": "Borrow (paused): SDK isolation lab"
+ },
+ "patterns": [
+  {
+   "regex": "^verify-(arc-intelligence|compact)-",
+   "feature": "arc-intelligence",
+   "reason": "Arc Intelligence backend/data pipeline: retired from the app UI; run manually with its server"
+  }
+ ]
+}

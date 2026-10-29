@@ -1,6 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useRef } from 'react'
 import { useAccount, useSwitchChain, useWalletClient } from 'wagmi'
-import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { SwapTab } from './components/SwapTab'
 import { BridgeTab } from './components/BridgeTab'
 import { DashboardTab } from './components/DashboardTab'
@@ -17,6 +16,7 @@ import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config
 import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp, Activity as ActivityIcon } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import DesignedByFooter from './components/DesignedByFooter'
+import WalletBar from './components/WalletBar'
 import './index.css'
 
 // Borrow is paused: its implementation remains in the repository, but no production
@@ -40,6 +40,8 @@ export default function App() {
     isPhantomInstalled,
   } = usePhantomSolana()
   const {
+    address: suiAddress,
+    walletSupportsNetwork: suiSupported,
     connect: connectSuiWallet,
     currentWalletName: suiCurrentWalletName,
     defaultWalletName: defaultSuiWalletName,
@@ -367,91 +369,14 @@ export default function App() {
                     )}
                   </div>
                 )}
-                <ConnectButton chainStatus="none" accountStatus="address" showBalance={false} />
               </div>
 
-              {appNetwork === 'mainnet' && (
-                <>
-                  <div className="flex items-center gap-3 lg:justify-end">
-                    <div className="flex items-center gap-1.5">
-                      <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
-                      <span className="text-xs text-slate-600">
-                        {isPhantomConnected ? 'Connected Solana' : 'Solana'}
-                      </span>
-                      <button
-                        onClick={handlePhantomAction}
-                        disabled={!isPhantomInstalled || isConnectingPhantomSolana}
-                        className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <p className="text-[11px] text-slate-400 lg:text-right">
-                    Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
-                  </p>
-
-                  {phantomSolanaError && (
-                    <div className="text-[11px] text-red-500 lg:text-right">
-                      <p>{phantomSolanaError}</p>
-                    </div>
-                  )}
-                </>
-              )}
-
-              {appNetwork === 'testnet' && (
-                <>
-                {/* Row 2 — Solana + Sui side by side */}
-                <div className="flex items-center gap-3 lg:justify-end">
-                  {/* Solana */}
-                  <div className="flex items-center gap-1.5">
-                    <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isPhantomConnected ? 'bg-green-500' : 'bg-slate-300'}`} />
-                    <span className="text-xs text-slate-600">
-                      {isPhantomConnected ? 'Connected Solana' : 'Solana'}
-                    </span>
-                    <button
-                      onClick={handlePhantomAction}
-                      disabled={!isPhantomInstalled || isConnectingPhantomSolana}
-                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {isConnectingPhantomSolana ? '...' : isPhantomConnected ? 'Disconnect' : 'Connect'}
-                    </button>
-                  </div>
-  
-                  <div className="h-4 w-px bg-slate-200" />
-  
-                  {/* Sui */}
-                  <div className="flex items-center gap-1.5">
-                    <span className={`h-2 w-2 rounded-full flex-shrink-0 ${isSuiWalletConnected ? 'bg-sky-500' : 'bg-slate-300'}`} />
-                    <span className="text-xs text-slate-600">
-                      {isSuiWalletConnected ? 'Connected Sui' : 'Sui'}
-                    </span>
-                    <button
-                      onClick={handleSuiWalletAction}
-                      disabled={(!isSuiWalletAvailable && !isSuiWalletConnected) || isConnectingSuiWallet}
-                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {isConnectingSuiWallet ? '...' : isSuiWalletConnected ? 'Disconnect' : 'Connect'}
-                    </button>
-                  </div>
-                </div>
-  
-                {/* Row 3 — wallet name status */}
-                <p className="text-[11px] text-slate-400 lg:text-right">
-                  Solana wallet: {isPhantomConnected ? 'Phantom' : '—'}
-                  {' · '}
-                  Sui wallet: {isSuiWalletConnected ? (suiCurrentWalletName || 'Connected') : '—'}
-                </p>
-  
-                {(phantomSolanaError || suiWalletError) && (
-                  <div className="text-[11px] text-red-500 lg:text-right">
-                    {phantomSolanaError && <p>{phantomSolanaError}</p>}
-                    {suiWalletError && <p>{suiWalletError}</p>}
-                  </div>
-                )}
-                </>
-              )}
+              <WalletBar
+                appNetwork={appNetwork}
+                evmNetworkName={selectedNetworkLabel}
+                solana={{ address: phantomSolanaAddress ?? null, connecting: isConnectingPhantomSolana, available: isPhantomInstalled, error: phantomSolanaError ?? null, connect: () => void handlePhantomAction(), disconnect: () => void handlePhantomAction() }}
+                sui={{ address: suiAddress, walletName: suiCurrentWalletName, connecting: isConnectingSuiWallet, available: isSuiWalletAvailable, supported: suiSupported, error: suiWalletError, connect: () => void handleSuiWalletAction(), disconnect: () => void handleSuiWalletAction() }}
+              />
             </div>
           </div>
         </Container>

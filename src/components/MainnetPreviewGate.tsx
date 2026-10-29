@@ -1133,7 +1133,8 @@ export default function MainnetPreviewGate() {
         </div>
       )}
 
-      <MainnetTransferRecovery />
+      {/* Sui has its own single transfer history; the EVM/Solana recovery stays for those routes. */}
+      {bridgeView !== 'sui' && <MainnetTransferRecovery />}
 
       {isActivityOpen && (
         <div
