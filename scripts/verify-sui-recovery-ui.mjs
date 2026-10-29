@@ -1,0 +1,73 @@
+import assert from 'node:assert/strict'
+import {createRequire} from 'node:module'
+import {readFileSync,mkdirSync} from 'node:fs'
+import {fileURLToPath} from 'node:url'
+import {createServer} from 'vite'
+import {GrpcTypes} from '@mysten/sui/grpc'
+const require=createRequire(import.meta.url),ts=require('typescript')
+require.extensions['.ts']=(m,p)=>m._compile(ts.transpileModule(readFileSync(p,'utf8').replaceAll('import.meta.env','({})'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,p)
+const {fixture,sourceDigest,digest,R,f}=require('./fixtures/sui-mainnet-recovery.cjs'),x=fixture(),root=fileURLToPath(new URL('..',import.meta.url))
+let chromium;try{({chromium}=require('playwright-core'))}catch{({chromium}=require('/opt/codex/runtimes/cua/lib/node_modules/playwright-core'))}
+const server=await createServer({root,configFile:false,cacheDir:'/tmp/machina-sui-recovery-ui',plugins:[{name:'controlled-sui-recovery',enforce:'pre',resolveId(id){if(id==='wagmi')return '\0sui-wagmi'},load(id){if(id==='\0sui-wagmi')return `export function useAccount(){return {address:window.suiRecoveryUi.evmOwner,isConnected:true,chainId:5042}}`},configureServer(s){s.middlewares.use('/__sui-recovery',async(_req,res)=>{res.setHeader('Content-Type','text/html');res.end(await s.transformIndexHtml('/__sui-recovery','<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div><script type="module" src="/scripts/fixtures/sui-recovery-ui.tsx"></script></body></html>'))})}}],server:{host:'127.0.0.1',port:0}})
+await server.listen();const base=`http://127.0.0.1:${server.httpServer.address().port}/__sui-recovery`,out=process.env.MACHINA_SUI_SCREEN_DIR||'/tmp/machina-sui-recovery-screens';mkdirSync(out,{recursive:true})
+let browser,page,mode='',used=0,count=0,rpc=0,release,held=false
+const errors=[],external=[],methods=[]
+const u=n=>'0x'+BigInt(n).toString(16)
+function frame(bytes){const head=Buffer.alloc(5);head.writeUInt32BE(bytes.length,1);const tail=Buffer.from('grpc-status: 0\r\n'),th=Buffer.alloc(5);th[0]=128;th.writeUInt32BE(tail.length,1);return Buffer.concat([head,bytes,th,tail]).toString('base64')}
+function block(){return {hash:mode==='bad-arc-block'?null:f.bh,parentHash:f.bh,number:mode==='bad-arc-block'?null:'0x64',timestamp:u(Math.floor(Date.now()/1000)),gasLimit:'0x1c9c380',gasUsed:'0x1',baseFeePerGas:'0x1',transactions:[],nonce:'0x0000000000000000',difficulty:'0x0',size:'0x1',extraData:'0x',miner:f.owner}}
+async function test(name,fn){try{await fn();count++;console.log('PASS '+name)}catch(e){console.error('Controlled UI state:',await page.locator('body').innerText(),errors,methods.slice(-8));throw e}}
+try{
+ browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage']})
+ const context=await browser.newContext();await context.route('**/*',async route=>{
+  const req=route.request(),url=new URL(req.url());if(url.hostname==='127.0.0.1')return route.continue()
+  // Existing application font import is an asset, not an RPC. Serve it locally
+  // so this fixture makes no real font request and retains strict RPC checks.
+  if(url.hostname==='fonts.googleapis.com'&&url.pathname==='/css2')return route.fulfill({status:200,contentType:'text/css',body:''})
+  if(url.hostname==='fullnode.mainnet.sui.io'){
+   rpc++;if(mode==='rpc-error')return route.abort()
+   const headers={'access-control-allow-origin':'*','access-control-allow-headers':'*','access-control-expose-headers':'grpc-status,grpc-message','content-type':'application/grpc-web-text'}
+   if(req.method()==='OPTIONS')return route.fulfill({status:200,headers,body:''})
+   const name=url.pathname.split('/').pop(),Type=GrpcTypes[name+'Request'],raw=Buffer.from(req.postData(),'base64'),input=Type.fromBinary(raw.subarray(5,5+raw.readUInt32BE(1)));methods.push(name)
+   let response
+   if(name==='GetServiceInfo')response=GrpcTypes.GetServiceInfoResponse.create({chainId:'4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S'})
+   else if(name==='GetBalance')response=GrpcTypes.GetBalanceResponse.fromJson({balance:{coinType:input.coinType,balance:'1000000000',coinBalance:'0',addressBalance:'1000000000'}})
+   else if(name==='GetPackage')response=GrpcTypes.GetPackageResponse.create({package:x.packages.get(input.packageId)})
+   else if(name==='GetObject'&&input.readMask?.paths?.join()==='object_id,package'&&x.linkage.has(input.objectId))response=GrpcTypes.GetObjectResponse.create({object:{objectId:input.objectId,package:{storageId:input.objectId,linkage:x.linkage.get(input.objectId),modules:[],typeOrigins:[]}}})
+   else if(name==='BatchGetObjects')response=GrpcTypes.BatchGetObjectsResponse.fromJson({objects:input.requests.map(r=>{const o=x.states.get(r.objectId);if(!o)throw Error('Unexpected object '+r.objectId);return {object:{objectId:o.objectId,objectType:o.type,version:o.version,digest:o.digest,owner:{kind:'SHARED',version:'1'},json:o.json,contents:{value:Buffer.from(o.content).toString('base64')},previousTransaction:o.previousTransaction}}})})
+   else if(name==='GetTransaction')response=GrpcTypes.GetTransactionResponse.create({transaction:x.tx})
+   else if(name==='GetCheckpoint')response=GrpcTypes.GetCheckpointResponse.create({checkpoint:x.cp})
+   else throw Error('Unapproved Sui method '+name)
+   return route.fulfill({status:200,headers,body:frame(Buffer.from(GrpcTypes[name+'Response'].toBinary(response)))})
+  }
+  if(url.hostname==='iris-api.circle.com'){
+   if(mode==='hold'){held=true;await new Promise(resolve=>{release=resolve})}
+   return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({messages:mode==='pending'?[{status:'pending_confirmations',message:'0x',attestation:'PENDING'}]:[{status:'complete',message:x.signed,attestation:f.fixture().sig}]})})
+  }
+  if(url.hostname==='rpc.mainnet.arc.io'){
+   const body=req.postDataJSON();methods.push(body.method);let result
+   if(body.method==='eth_chainId')result='0x13b2'
+   else if(body.method==='eth_getBlockByNumber')result=block()
+   else if(body.method==='eth_call')result=body.params[0].to.toLowerCase()===f.source.tokenMessengerAddress.toLowerCase()?x.auth:'0x'+used.toString(16).padStart(64,'0')
+   else throw Error('Unapproved Arc method '+body.method)
+   return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({jsonrpc:'2.0',id:body.id,result})})
+  }
+  external.push(req.url());return route.abort()
+ })
+ page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));await page.goto(base)
+ const source=page.getByLabel('Sui recovery source transaction'),check=page.getByRole('button',{name:'Check existing transfer',exact:true})
+ await test('no wallet connection or page load requests source/mint evidence automatically',async()=>{await page.getByRole('button',{name:'Connect Slush'}).waitFor();assert.equal(rpc,0);assert.equal(await page.evaluate(()=>window.suiRecoveryUi.state.signatures),0)})
+ await test('real Slush hook reads separate SIP-58 balances; with the live-test gate the Review stays disabled without an amount or above 0.1 USDC and requests nothing',async()=>{await page.getByRole('button',{name:'Connect Slush'}).click();await page.getByText('1000',{exact:true}).waitFor();const review=page.getByRole('button',{name:'Review: Burn USDC on Sui'});assert.equal(await review.isDisabled(),true);for(const v of ['0.2','1']){await page.getByLabel('Sui transfer amount').fill(v);assert.equal(await review.isDisabled(),true,v)}await page.getByLabel('Sui transfer amount').fill('');assert.ok((await page.locator('body').innerText()).includes('at most 0.1 USDC'));assert.equal(await page.evaluate(()=>window.suiRecoveryUi.state.signatures),0)})
+ await test('fresh-device Sui digest passes actual reader, BCS events, Iris binding and Arc nonce checks',async()=>{await source.fill(sourceDigest);await check.click();await page.getByRole('status').getByText('Attestation checked · receiving remains locked',{exact:true}).waitFor();assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('machina_mainnet_sui_transfers_v1')).length),1)})
+ await test('same source recheck is idempotent and no new burn or signature is requested',async()=>{await check.click();await page.getByRole('status').getByText('Attestation checked · receiving remains locked',{exact:true}).waitFor();assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('machina_mainnet_sui_transfers_v1')).length),1)})
+ await test('attestation pending stays pending instead of a ready or failed mint',async()=>{mode='pending';await check.click();await page.getByRole('status').getByText('Waiting for Circle attestation',{exact:true}).waitFor();mode=''})
+ await test('missing Arc snapshot stops before the remote-messenger contract read; no latest fallback',async()=>{const before=methods.filter(m=>m==='eth_call').length;mode='bad-arc-block';await check.click();await page.getByRole('alert').getByText(/could not be verified/).waitFor();assert.equal(methods.filter(m=>m==='eth_call').length,before);mode=''})
+ await test('already-consumed Arc nonce reports independently verified completion, with no send',async()=>{used=1;await check.click();await page.getByRole('status').getByText('Destination mint independently verified',{exact:true}).waitFor();used=0})
+ await test('RPC error removes active completion and does not claim funds failed or resend',async()=>{mode='rpc-error';await check.click();await page.getByRole('alert').getByText(/could not be verified/).waitFor();assert.equal(await page.getByRole('status').count(),0);mode=''})
+ await test('route/input edits while a read is held discard the response and retain provider-independent history',async()=>{mode='hold';await check.click();for(let n=0;n<100&&!held;n++)await page.waitForTimeout(30);assert.equal(held,true);await source.fill(digest(51));mode='';release();await page.waitForTimeout(300);assert.equal(await page.getByRole('status').count(),0);assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('machina_mainnet_sui_transfers_v1')).length),1);await source.fill(sourceDigest)})
+ await test('changing the Slush account discards held evidence and rejects a new check of another wallet source',async()=>{mode='hold';held=false;await check.click();for(let n=0;n<100&&!held;n++)await page.waitForTimeout(30);assert.equal(held,true);await page.evaluate(()=>window.suiRecoveryUi.change('0x'+'0'.repeat(62)+'16'));await page.getByText('Sui Bridge Tracker (0)',{exact:true}).waitFor();mode='';release();await page.waitForTimeout(200);assert.equal(await page.getByRole('status').count(),0);await check.click();await page.getByRole('alert').getByText('Sui source transaction belongs to another wallet.',{exact:true}).waitFor();await page.evaluate(owner=>window.suiRecoveryUi.change(owner),x.input.suiOwner);await page.getByText('Sui Bridge Tracker (1)',{exact:true}).waitFor()})
+ await test('reload retains only stored history and never restores live proof or requests a signature',async()=>{await page.reload();await page.getByRole('button',{name:'Connect Slush'}).click();assert.equal(await page.getByRole('status').count(),0);await page.getByText('Sui Bridge Tracker (1)',{exact:true}).click();await page.getByText(/not rechecked/).waitFor()})
+ await test('both directions are selectable, source identity hints stay correct and no automatic query is started',async()=>{const before=methods.length;await page.getByLabel('Sui recovery route').selectOption('arc-to-sui');assert.equal(await source.getAttribute('placeholder'),'0x…');await page.waitForTimeout(100);assert.equal(methods.length,before);await page.getByLabel('Sui recovery route').selectOption('sui-to-arc')})
+ await test('desktop/mobile read-only recovery and stored tracker fit without horizontal overflow',async()=>{for(const [name,width,height]of [['desktop',1280,900],['mobile',390,844]]){await page.setViewportSize({width,height});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:`${out}/sui-recovery-${name}.png`,fullPage:true})}})
+ assert.equal(await page.evaluate(()=>window.suiRecoveryUi.state.signatures),0);assert.deepEqual(errors,[]);assert.deepEqual(external,[])
+ console.log(`RESULT ${count}/${count} Chromium Sui recovery groups PASS; actual controller/readers/protobuf/BCS, controlled chain responses; real network/signatures/burns/mints=0.`)
+}finally{await browser?.close();await server.close()}

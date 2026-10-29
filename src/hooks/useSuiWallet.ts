@@ -1,15 +1,21 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import {
   useConnectWallet,
   useCurrentAccount,
   useCurrentWallet,
   useDisconnectWallet,
   useWallets,
-  useSuiClientQuery,
+  useSuiClientContext,
 } from '@mysten/dapp-kit'
+import { useQuery } from '@tanstack/react-query'
+import { SuiGrpcClient } from '@mysten/sui/grpc'
+import { SUI_NETWORKS, type SuiNetwork } from '../config/sui'
+import { readSuiWalletBalances, validateSuiWalletAccount } from '../lib/suiBalances'
 
-const SUI_TESTNET_USDC_COIN_TYPE =
-  '0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC'
+const suiClients = {
+  mainnet: new SuiGrpcClient({ network: 'mainnet', baseUrl: SUI_NETWORKS.mainnet.url, timeout: 10_000 }),
+  testnet: new SuiGrpcClient({ network: 'testnet', baseUrl: SUI_NETWORKS.testnet.url, timeout: 10_000 }),
+}
 
 function normalizeWalletName(name: string) {
   return name.trim().toLowerCase()
@@ -24,7 +30,10 @@ function pickDefaultWalletName(walletNames: string[]) {
   return walletNames[0] ?? null
 }
 
-export function useSuiWallet() {
+export function useSuiWallet(requestedNetwork?: SuiNetwork) {
+  const context = useSuiClientContext()
+  const network: SuiNetwork = requestedNetwork ?? (context.network === 'mainnet' ? 'mainnet' : 'testnet')
+  useEffect(() => { if (context.network !== network) context.selectNetwork(network) }, [context, network])
   const wallets = useWallets()
   const currentAccount = useCurrentAccount()
   const currentWalletState = useCurrentWallet()
@@ -36,23 +45,15 @@ export function useSuiWallet() {
 
   const suiAddress = currentAccount?.address ?? null
 
-  const { data: allBalancesData, isPending: isLoadingBalance, refetch: refetchBalance } = useSuiClientQuery(
-    'getAllBalances',
-    { owner: suiAddress ?? '' },
-    { enabled: Boolean(suiAddress), gcTime: 30_000, staleTime: 10_000 },
-  )
-
-  const usdcBalanceRaw = useMemo(() => {
-    if (!allBalancesData) return null
-    const entry = allBalancesData.find(
-      (b) => b.coinType === SUI_TESTNET_USDC_COIN_TYPE,
-    )
-    return entry ? entry.totalBalance : null
-  }, [allBalancesData])
-
-  const usdcBalance = usdcBalanceRaw !== null
-    ? (Number(usdcBalanceRaw) / 1_000_000).toFixed(6)
-    : null
+  let accountError: string | null = null
+  try { if (currentAccount) validateSuiWalletAccount(currentAccount, network) } catch (e) { accountError = e instanceof Error ? e.message : 'Unsupported Sui wallet account.' }
+  const { data: balances, isFetching: isLoadingBalance, refetch: refetchBalance, error: balanceError } = useQuery({
+    queryKey: ['machina-sui-balances', network, suiAddress],
+    queryFn: ({ signal }) => readSuiWalletBalances(suiClients[network].core, suiAddress!, network, signal),
+    enabled: Boolean(suiAddress) && !accountError,
+    gcTime: 30_000, staleTime: 10_000, retry: false,
+  })
+  const usdcBalance = !accountError && !balanceError ? balances?.usdcDisplay ?? null : null
 
   const connect = useCallback(
     async (walletName?: string | null) => {
@@ -91,6 +92,11 @@ export function useSuiWallet() {
     isConnecting: currentWalletState.isConnecting || connectWallet.isPending,
     isLoadingBalance,
     isWalletAvailable: wallets.length > 0,
+    network,
+    walletSupportsNetwork: Boolean(suiAddress) && !accountError,
+    balanceError: accountError ?? (balanceError ? 'Sui balance or network verification is unavailable. No transfer is allowed.' : null),
+    suiBalance: !accountError && !balanceError ? balances?.suiDisplay ?? null : null,
+    balances: !accountError && !balanceError ? balances ?? null : null,
     refetchBalance,
     usdcBalance,
     walletNames,

@@ -38,6 +38,9 @@ jobs:
           node scripts/verify-zod-collection-backport.mjs
           node scripts/verify-circle-response-limits.mjs
           node scripts/verify-mainnet-transfer-recovery.mjs
+          node scripts/verify-sui-cctp-foundation.mjs
+          node scripts/verify-sui-mainnet-recovery.mjs
+          node scripts/verify-sui-write-controller.mjs
           node scripts/verify-borrow-source-gates.mjs
   source-regressions:
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
@@ -66,7 +69,8 @@ jobs:
             verify-borrow-eurc-markets \
             verify-mainnet-borrow-write-safety verify-borrow-operations \
             verify-borrow-sdk-integration \
-            verify-mainnet-transfer-recovery verify-mainnet-swap-preview verify-swap-support-matrix \
+            verify-mainnet-transfer-recovery verify-sui-cctp-foundation verify-sui-mainnet-recovery verify-sui-write-controller \
+            verify-mainnet-swap-preview verify-swap-support-matrix \
             verify-swap-amount-shortcuts verify-swap-approvals \
             verify-swap-display verify-swap-verification \
             verify-swap-uniswap-onchain verify-uniswap-arc-preview \
@@ -143,10 +147,14 @@ jobs:
           sudo ln -sf "$CHROME" /usr/bin/chromium
           sudo mkdir -p /workspace/artifacts/borrow-production-ui
           sudo chown -R "$(id -u):$(id -g)" /workspace/artifacts
-      - name: Borrow and Swap real-Chromium fixture regressions (no wallet sends)
+      - name: Bridge, Sui, Borrow and Swap real-Chromium fixture regressions (no wallet sends)
         env:
           PLAYWRIGHT_CORE_PATH: ${{ github.workspace }}/node_modules/playwright-core
         run: |
           node scripts/verify-mainnet-transfer-recovery-ui.mjs
+          node scripts/verify-sui-wallet-foundation-ui.mjs
+          node scripts/verify-sui-recovery-ui.mjs
+          node scripts/verify-sui-write-browser.mjs
+          node scripts/verify-sui-transfer-review-ui.mjs
           node scripts/verify-borrow-operations-ui.mjs
           node scripts/verify-swap-unified-ui.mjs

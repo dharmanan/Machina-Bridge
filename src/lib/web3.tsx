@@ -4,6 +4,8 @@ import { SuiClientProvider, WalletProvider } from '@mysten/dapp-kit'
 import { RainbowKitProvider } from '@rainbow-me/rainbowkit'
 import { WagmiProvider } from 'wagmi'
 import { wagmiConfig } from './wagmi.config'
+import { SUI_NETWORKS } from '../config/sui'
+import { readStoredAppNetwork } from '../config/runtime'
 
 const queryClient = new QueryClient()
 
@@ -12,13 +14,8 @@ export function Web3Provider({ children }: { children: ReactNode }) {
     <WagmiProvider config={wagmiConfig}>
       <QueryClientProvider client={queryClient}>
         <SuiClientProvider
-          networks={{
-            testnet: {
-              url: 'https://fullnode.testnet.sui.io:443',
-              network: 'testnet',
-            },
-          }}
-          defaultNetwork="testnet"
+          networks={SUI_NETWORKS}
+          defaultNetwork={readStoredAppNetwork()}
         >
           <WalletProvider
             autoConnect

@@ -21,6 +21,7 @@ import { MAINNET_RUNTIME_IMPLEMENTED } from '../config/runtime'
 import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import MainnetSolanaCanary from './MainnetSolanaCanary'
+import MainnetSuiBridge from './MainnetSuiBridge'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
 import {
@@ -177,7 +178,7 @@ export default function MainnetPreviewGate() {
   const [isActivityOpen, setIsActivityOpen] = useState(false)
   const [isTrackerOpen, setIsTrackerOpen] = useState(false)
   const [feeDetailsOpen, setFeeDetailsOpen] = useState(false)
-  const [bridgeView, setBridgeView] = useState<'evm' | 'solana'>('evm')
+  const [bridgeView, setBridgeView] = useState<'evm' | 'solana' | 'sui'>('evm')
   const [sourceUsdcBalance, setSourceUsdcBalance] = useState<string | null>(null)
   const [sourceUsdcBalanceError, setSourceUsdcBalanceError] = useState<string | null>(null)
 
@@ -686,7 +687,7 @@ export default function MainnetPreviewGate() {
 
   return (
     <section className="bg-slate-50 px-4 py-5 text-slate-900">
-      <div className="mx-auto mb-4 grid max-w-xl grid-cols-2 gap-2 rounded-2xl border border-slate-200 bg-white p-1.5 shadow-[0_10px_28px_rgba(15,23,42,0.05)]">
+      <div className="mx-auto mb-4 grid max-w-xl grid-cols-3 gap-2 rounded-2xl border border-slate-200 bg-white p-1.5 shadow-[0_10px_28px_rgba(15,23,42,0.05)]">
         <button
           type="button"
           onClick={() => setBridgeView('evm')}
@@ -709,6 +710,7 @@ export default function MainnetPreviewGate() {
         >
           Solana Bridge
         </button>
+        <button type="button" onClick={() => setBridgeView('sui')} className={`rounded-xl px-3 py-2.5 text-sm font-semibold ${bridgeView === 'sui' ? 'bg-[#eef7e8] text-[#2F6E0C] ring-1 ring-[#66D121]/35' : 'text-slate-500 hover:bg-slate-50'}`}>Sui Bridge</button>
       </div>
 
       {bridgeView === 'evm' ? (
@@ -963,7 +965,7 @@ export default function MainnetPreviewGate() {
       </div>
       ) : (
         <div className="mx-auto max-w-xl">
-          <MainnetSolanaCanary />
+          {bridgeView === 'solana' ? <MainnetSolanaCanary /> : <MainnetSuiBridge />}
         </div>
       )}
 

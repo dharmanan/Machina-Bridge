@@ -34,14 +34,14 @@ export type CctpBurnProof = {
   sourceMessage: Hex; fields: ReturnType<typeof decodeCctpRecoveryMessage>
 }
 // Injected ports are test-only read clients; production always uses configured mainnet RPCs.
-export async function readCctpBurnProof(input: { sourceChainId: number; sourceTxHash: string; owner?: string; sourceLogIndex?: number; mintRecipients?: readonly string[] }, client: any = undefined): Promise<CctpBurnProof> {
+export async function readCctpBurnProof(input: { sourceChainId: number; sourceTxHash: string; owner?: string; sourceLogIndex?: number; mintRecipients?: readonly string[]; suiDestinationMessenger?: Hex }, client: any = undefined): Promise<CctpBurnProof> {
   assertSourceHash(input.sourceTxHash)
   const source = getMainnetCctpChain(input.sourceChainId)
   if (!source || (input.owner !== undefined && !isAddress(input.owner))) throw new Error('Unsupported source chain or invalid connected wallet.')
   client ??= cctpRecoveryClient(source.rpcUrls)
   if (await client.getChainId() !== source.chainId) throw new Error('Source RPC returned the wrong chain.')
   const [tx, receipt] = await Promise.all([client.getTransaction({ hash: input.sourceTxHash }), client.getTransactionReceipt({ hash: input.sourceTxHash })])
-  if (receipt.status !== 'success' || !same(receipt.transactionHash, input.sourceTxHash) || !same(tx.hash, input.sourceTxHash) || !receipt.blockHash || !same(tx.blockHash ?? '', receipt.blockHash)) throw new Error('The source transaction is not a successful confirmed burn.')
+  if (receipt.status !== 'success' || typeof receipt.blockNumber !== 'bigint' || receipt.blockNumber < 0n || tx.blockNumber !== receipt.blockNumber || !same(receipt.transactionHash, input.sourceTxHash) || !same(tx.hash, input.sourceTxHash) || !receipt.blockHash || !same(tx.blockHash ?? '', receipt.blockHash)) throw new Error('The source transaction is not a successful confirmed burn.')
   const block = await client.getBlock({ blockNumber: receipt.blockNumber })
   if (typeof receipt.blockNumber !== 'bigint' || block.number !== receipt.blockNumber || tx.blockNumber !== receipt.blockNumber || !same(block.hash ?? '', receipt.blockHash)) throw new Error('The source receipt is no longer canonical. Retry the read.')
   const deposits: any[] = [], messages: Hex[] = []
@@ -67,7 +67,11 @@ export async function readCctpBurnProof(input: { sourceChainId: number; sourceTx
   if (![1000, 2000].includes(fields.minFinality) || fields.maxFee >= fields.amount) throw new Error('Unsupported finality or invalid CCTP fee bound.')
   const destination = [1, 5042, 8453, 10, 42161].map(getMainnetCctpChain).find(c => c?.cctpDomain === fields.destinationDomain)
   if (destination && !same(fields.recipient, cctpWord(destination.tokenMessengerAddress))) throw new Error('Unexpected destination TokenMessenger.')
-  if (!destination && (fields.destinationDomain !== 5 || !same(fields.recipient, ('0x' + BufferlessSolanaProgram()) as Hex))) throw new Error('Unsupported destination domain or TokenMessenger.')
+  const solanaDestination = fields.destinationDomain === 5 && same(fields.recipient, ('0x' + BufferlessSolanaProgram()) as Hex)
+  // Explicit read-only proof extension. Existing EVM mint execution still
+  // requires a non-null allowlisted destinationChainId and cannot use this.
+  const suiDestination = fields.destinationDomain === 8 && input.suiDestinationMessenger && same(fields.recipient, input.suiDestinationMessenger)
+  if (!destination && !solanaDestination && !suiDestination) throw new Error('Unsupported destination domain or TokenMessenger.')
   return { sourceChainId: source.chainId, destinationChainId: destination?.chainId ?? null, sourceTxHash: input.sourceTxHash, sourceLogIndex: d.logIndex, owner: getAddress(d.depositor), amount: formatUnits(fields.amount, 6), mode: fields.minFinality === 1000 ? 'fast' : 'standard', sourceBlockNumber: receipt.blockNumber, sourceBlockHash: receipt.blockHash, sourceMessage: matched[0], fields }
 }
 // Solana program's base58 bytes, derived by the same PublicKey implementation used by the existing bridge.
@@ -91,7 +95,7 @@ export async function readBoundCctpAttestation(proof: Pick<CctpBurnProof, 'field
     const matches = payload.messages.filter((v: any) => { try { return typeof v.message === 'string' && immutableMessageMatches(proof.fields, decodeCctpRecoveryMessage(v.message)) } catch { return false } })
     if (matches.length > 1) throw new Error('Multiple Circle messages match this burn. Recovery is blocked rather than guessing.')
     if (!matches.length) {
-      if (!payload.messages.length || payload.messages.every((v: any) => v?.status !== 'complete' && !v?.message)) return { status: 'pending' }
+      if (!payload.messages.length || payload.messages.every((v: any) => v?.status !== 'complete' && (!v?.message || (v?.status === 'pending_confirmations' && v?.message === '0x' && v?.attestation === 'PENDING')))) return { status: 'pending' }
       throw new Error('Circle message does not match the source-chain burn evidence.')
     }
     const v = matches[0], m = decodeCctpRecoveryMessage(v.message)

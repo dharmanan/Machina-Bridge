@@ -26,6 +26,7 @@ const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapScreen'))
 type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard' | 'activity'
 
 export default function App() {
+  const [appNetwork, setAppNetwork] = useState<AppNetwork>(() => readStoredAppNetwork())
   const { isConnected, chainId } = useAccount()
   const { switchChainAsync } = useSwitchChain()
   const { data: walletClient } = useWalletClient()
@@ -47,9 +48,8 @@ export default function App() {
     isConnected: isSuiWalletConnected,
     isConnecting: isConnectingSuiWallet,
     isWalletAvailable: isSuiWalletAvailable,
-  } = useSuiWallet()
+  } = useSuiWallet(appNetwork)
   const [activeTab, setActiveTab] = useState<Tab>(() => readStoredAppNetwork() === 'mainnet' ? 'bridge' : 'swap')
-  const [appNetwork, setAppNetwork] = useState<AppNetwork>(() => readStoredAppNetwork())
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
   const [isMobileExperience, setIsMobileExperience] = useState(false)

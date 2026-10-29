@@ -1,4 +1,5 @@
 import { MainnetTransferRecovery } from './MainnetTransferRecovery'
+import MainnetSuiBridge from './MainnetSuiBridge'
 import { useEffect, useMemo, useState } from 'react'
 import { createPublicClient, formatUnits, http, parseAbi } from 'viem'
 import {
@@ -378,6 +379,7 @@ export default function MainnetDashboard() {
   return (
     <Container className="py-10">
       <MainnetTransferRecovery />
+      <MainnetSuiBridge compact />
       <div className="space-y-6">
         <div>
           <div className="flex flex-wrap items-center gap-2.5">
