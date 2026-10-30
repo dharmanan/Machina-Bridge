@@ -23,7 +23,7 @@ export default function BridgeHistoryList({ items, empty, limit = 30 }: { items:
           <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${tone[item.status]}`}>{item.statusLabel}</span>
           <div className="flex flex-wrap justify-end gap-2 text-[11px]">
             {item.sourceUrl && <a href={item.sourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-blue-600 hover:underline">Source <ExternalLink size={11} /></a>}
-            {item.destinationUrl && <a href={item.destinationUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-blue-600 hover:underline">Destination <ExternalLink size={11} /></a>}
+            {item.destinationUrl ? <a href={item.destinationUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-blue-600 hover:underline">Destination <ExternalLink size={11} /></a> : item.status === 'complete' && <span className="text-slate-400">Destination tx not found yet</span>}
           </div>
         </div>
       </div>

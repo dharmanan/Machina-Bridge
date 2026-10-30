@@ -1,7 +1,7 @@
 // Shared Sui/Arc write lifecycle. Ports never own retry or user consent. The
 // production factory keeps the source gate closed; controlled tests inject ports.
 import { keccak256, type Hex } from 'viem'
-import { MAINNET_SUI_CCTP_TEST_MAX_UNITS, MAINNET_SUI_CCTP_WRITES_ENABLED } from '../config/sui'
+import { MAINNET_SUI_CCTP_WRITES_ENABLED } from '../config/sui'
 
 export type SuiWriteAction = 'sui-burn' | 'arc-approval' | 'arc-burn' | 'sui-mint' | 'arc-mint'
 export type SuiWriteIntent = {
@@ -98,10 +98,6 @@ function validExpected(e: unknown): e is SuiArcExpected {
   const x = e as SuiArcExpected
   return Boolean(x) && /^0x[0-9a-f]{40}$/i.test(x.to) && HASH.test(x.dataHash) && Number.isSafeInteger(x.nonce) && x.nonce >= 0 && [x.gas, x.maxFeePerGas, x.fromBlock].every(v => typeof v === 'bigint' && v >= 0n && v < 1n << 128n) && x.gas > 0n && x.maxFeePerGas > 0n && (x.cctpNonce === undefined || HASH.test(x.cctpNonce))
 }
-// Live-test cap, enforced before any preparation and again at Confirm.
-export function assertSuiTestAmount(amount: bigint) {
-  if (amount > MAINNET_SUI_CCTP_TEST_MAX_UNITS) throw new Error('This test phase allows at most 0.1 USDC per transaction. A higher limit needs separate approval.')
-}
 async function bounded<T>(run: () => Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try { return await Promise.race([Promise.resolve().then(run), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) })]) }
@@ -145,7 +141,6 @@ export function createSuiWriteController(port: SuiWritePort, env: SuiWriteEnviro
     async prepare(input: SuiWriteIntent): Promise<SuiWriteReview> {
       if (active) throw new Error('A wallet operation is already active.')
       validateIntent(input)
-      assertSuiTestAmount(input.amount)
       if (unresolved(env.load())) throw new Error('An earlier wallet operation is unresolved. Recover it before preparing another transfer.')
       const i = Object.freeze(cleanIntent(input)), id = ++generation
       held = undefined; active = true
@@ -165,7 +160,6 @@ export function createSuiWriteController(port: SuiWritePort, env: SuiWriteEnviro
       if (!env.gate()) throw new Error('Sui Mainnet writes remain disabled. No wallet request was made.')
       const h = held
       if (active || !h || h.review !== review) throw new Error('No current approved review or an operation is already active.')
-      assertSuiTestAmount(review.intent.amount)
       active = true
       try {
         return await env.lock(`${review.intent.suiOwner.toLowerCase()}:${review.intent.evmOwner.toLowerCase()}`, async () => {

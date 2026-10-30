@@ -19,7 +19,7 @@ const state = {
   prepares: 0, signatures: 0, broadcasts: 0, walletSends: 0, holdSend: false, holdPrepare: false, releasePrepare: null as null | (() => void), releaseSend: null as null | (() => void), signUnsupported: false, failBroadcast: false,
   recoverTo: 'verified' as 'pending' | 'verified' | 'reverted' | 'mismatch', ttl: 100_000, locate: null as string | null,
   evidence: ['controlled mismatch evidence line'] as string[], evidenceFail: false, reconcileReads: 0,
-  allowance: 0n, stage: 'waiting_attestation' as SuiRecoveryResult['stage'], inspectFail: '' as string, inspectCalls: 0,
+  allowance: 0n, stage: 'waiting_attestation' as SuiRecoveryResult['stage'], inspectFail: '' as string, inspectCalls: 0, inspectAmount: '0.1',
   intents: [] as SuiWriteIntent[], reviews: [] as SuiWriteReview[],
 }
 const digestOf = (i: SuiWriteIntent) => i.action === 'sui-burn' ? SUI_BURN : i.action === 'sui-mint' ? REAL.suiMint : i.action === 'arc-burn' ? REAL.arcBurn : i.action === 'arc-mint' ? ARC_MINT : ARC_APPROVAL
@@ -46,7 +46,7 @@ const port: SuiWritePort = {
   async locate() { return state.locate },
   async reconcile(a) { state.reconcileReads++; if (state.evidenceFail) throw new Error('The mismatched receipt is not in the canonical chain served by this RPC. The transfer stays locked.'); const lines = [...state.evidence]; return { key: keccak256(stringToHex(JSON.stringify(lines))), digest: a.digest!, lines } },
 }
-const ctx = { suiOwner: REAL.sui, evmOwner: REAL.evm, ready: true }
+const ctx = { suiOwner: REAL.sui, evmOwner: REAL.evm, ready: true, usdcUnits: 1_000_000n, suiUsdc: '1', suiGas: '2' }
 const productionEnvironment = browserSuiWriteEnvironment(i => ctx.ready && i.suiOwner === ctx.suiOwner && i.evmOwner === ctx.evmOwner)
 // Explicit local test authority. The production writer (useSuiMainnetWrite) has no such override.
 const api = createSuiWriteController(port, { ...productionEnvironment, gate: () => true })
@@ -55,7 +55,7 @@ function writer(enabled: boolean): SuiTransferWriter {
     writesEnabled: enabled, walletSendEnabled: enabled,
     prepare: async i => { if (!enabled) throw new Error('locked'); const r = await api.prepare(i); state.reviews.push(r); return r },
     confirm: r => { if (!enabled) throw new Error('locked'); return api.confirm(r) },
-    recover: () => api.recover(), saved: () => api.saved(), invalidate: () => api.invalidate(), feeBps: async () => 0,
+    recover: () => api.recover(), saved: () => api.saved(), invalidate: () => api.invalidate(), feeBps: async () => Number(params.get('feeBps') ?? 0),
     inspectMismatch: async () => await api.reconcile() as SuiWriteReconciliation, reconcile: async k => await api.reconcile(k) as SuiWriteAttempt,
   }
 }
@@ -64,7 +64,7 @@ async function inspect(input: SuiRecoveryInput): Promise<SuiRecoveryResult> {
   state.inspectCalls++
   if (state.inspectFail) throw new Error(state.inspectFail)
   const complete = state.stage === 'complete'
-  const r: SuiRecoveryResult = { ...input, amount: '0.1', maxFeeUnits: '0', sourceEventIndex: 6, stage: state.stage, ...(state.stage === 'waiting_attestation' ? {} : { feeUsdc: '0', receivedUsdc: '0.1' }), ...(complete ? { destinationTx: input.direction === 'arc-to-sui' ? REAL.suiMint : ARC_MINT } : {}), checkedAt: Date.now() }
+  const r: SuiRecoveryResult = { ...input, amount: state.inspectAmount, maxFeeUnits: '0', sourceEventIndex: 6, stage: state.stage, ...(state.stage === 'waiting_attestation' ? {} : { feeUsdc: '0', receivedUsdc: state.inspectAmount }), ...(complete ? { destinationTx: input.direction === 'arc-to-sui' ? REAL.suiMint : ARC_MINT } : {}), checkedAt: Date.now() }
   importSuiRecovery(r); return r
 }
 let set: (v: Partial<typeof ctx>) => void = () => {}
@@ -75,8 +75,8 @@ function App() {
   set = p => setC(old => { const n = { ...old, ...p }; Object.assign(ctx, n); return n })
   return <div className="mx-auto max-w-xl p-4"><header data-testid="above-panel" className="mb-4 rounded-xl bg-slate-900 p-3 text-sm font-semibold text-white">Machina Bridge · Sui ↔ Arc (layout reference)</header><SuiBridgeFlow writer={params.get('gate') === 'production' ? lockedWriter : enabledWriter} records={records} inspect={inspect}
     pollMs={fast ? { status: 300, attestation: 300 } : { status: 600_000, attestation: 600_000 }}
-    evm={{ address: c.evmOwner, walletName: 'MetaMask', onArc: c.ready }} sui={{ address: c.suiOwner, walletName: 'Slush', ready: c.ready, usdc: '1', gas: '2' }}
-    arc={{ usdcUnits: 1_000_000n, refresh: async () => ({ allowanceUnits: state.allowance }) }} /></div>
+    evm={{ address: c.evmOwner, walletName: 'MetaMask', onArc: c.ready }} sui={{ address: c.suiOwner, walletName: 'Slush', ready: c.ready, usdc: c.suiUsdc, gas: c.suiGas }}
+    arc={{ usdcUnits: c.usdcUnits, refresh: async () => ({ allowanceUnits: state.allowance }) }} /></div>
 }
 ;(window as unknown as { reviewUi: unknown }).reviewUi = { state, REAL, set: (p: Partial<typeof ctx>) => set(p), productionGate: () => productionEnvironment.gate(), staleConfirm: (back = 1) => api.confirm(state.reviews[state.reviews.length - back]).then(() => 'UNSAFE', e => e.message), directPrepare: () => api.prepare({ ...state.intents[state.intents.length - 1] }).then(() => 'UNSAFE', e => e.message) }
 createRoot(document.getElementById('root')!).render(<App />)

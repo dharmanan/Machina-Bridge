@@ -4,8 +4,11 @@ import { getMainnetCctpChain } from '../config/mainnetCctp'
 import { readCctpBurnProof, readBoundCctpAttestation, decodeCctpRecoveryMessage, cctpRecoveryClient, CCTP_RECOVERY_ABI, cctpWord } from './mainnetCctpRecovery'
 import { createSuiMainnetReadPort, readSuiMainnetIdentity, readSuiBurnProof, readSuiNonceStatus, type SuiMainnetReadPort } from './mainnetSuiRead'
 import { validateSuiWalletAccount } from './suiBalances'
+import { findArcMintForMessage } from './arcMintProof'
 
-export type SuiRecoveryInput = { direction: 'sui-to-arc' | 'arc-to-sui'; sourceId: string; suiOwner: string; evmOwner: string }
+export type SuiRecoveryInput = { direction: 'sui-to-arc' | 'arc-to-sui'; sourceId: string; suiOwner: string; evmOwner: string
+  // Sui -> Arc only: candidate Arc mint hashes (write journal, saved record). Each is verified on chain before use.
+  destinationHints?: string[] }
 export type SuiRecoveryResult = SuiRecoveryInput & { stage: 'waiting_attestation' | 'ready_to_mint' | 'complete'; amount: string; sourceEventIndex: number; destinationTx?: string; feeUsdc?: string; receivedUsdc?: string; checkedAt: number
   // Source burn maxFee in USDC base units; a destination-mint review must bind to it exactly.
   maxFeeUnits?: string }
@@ -21,7 +24,8 @@ export async function inspectSuiMainnetRecovery(input: SuiRecoveryInput, ports: 
     : await readCctpBurnProof({ sourceChainId: 5042, sourceTxHash: input.sourceId, owner: input.evmOwner, mintRecipients: [input.suiOwner], suiDestinationMessenger: identity.inboundAuthRecipient }, ports.arc)
   const f = proof.fields, zero = `0x${'0'.repeat(64)}`
   if (f.minFinality !== 2000 || f.amount > (1n << 64n) - 1n || (input.direction === 'arc-to-sui' && (f.destinationDomain !== 8 || ![zero, input.suiOwner.toLowerCase()].includes(f.destinationCaller)))) throw new Error('This transfer is outside the supported standard Sui/Arc recovery policy.')
-  const base = { ...input, sourceId: input.direction === 'arc-to-sui' ? input.sourceId.toLowerCase() : input.sourceId, amount: formatUnits(f.amount, 6), maxFeeUnits: f.maxFee.toString(), sourceEventIndex: proof.sourceLogIndex }
+  const { destinationHints, ...plain } = input
+  const base = { ...plain, sourceId: input.direction === 'arc-to-sui' ? input.sourceId.toLowerCase() : input.sourceId, amount: formatUnits(f.amount, 6), maxFeeUnits: f.maxFee.toString(), sourceEventIndex: proof.sourceLogIndex }
   const signed = await readBoundCctpAttestation(proof, ports.fetcher)
   if (signed.status !== 'complete') return { ...base, stage: 'waiting_attestation', checkedAt: Date.now() }
   const message = signed.message!, m = decodeCctpRecoveryMessage(message)
@@ -41,6 +45,9 @@ export async function inspectSuiMainnetRecovery(input: SuiRecoveryInput, ports: 
     if ((await client.getBlock({ blockNumber: block.number })).hash !== block.hash) throw new Error('Arc canonical block changed.')
     used = nonce === 1n
     if (!used && m.expirationBlock > 0n && block.number >= m.expirationBlock) throw new Error('Arc attestation expired; no mint may be requested.')
+    // A used nonce stays complete even when the mint transaction cannot be found;
+    // destinationTx is set only for an independently verified Arc transaction.
+    if (used) destinationTx = (await findArcMintForMessage(client, { message, evmOwner: input.evmOwner, hints: [...(destinationHints ?? []), signed.destinationTxHint] })).txHash
   }
   return { ...base, stage: used ? 'complete' : 'ready_to_mint', destinationTx, feeUsdc: formatUnits(m.feeExecuted, 6), receivedUsdc: formatUnits(m.amount - m.feeExecuted, 6), checkedAt: Date.now() }
 }

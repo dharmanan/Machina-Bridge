@@ -6,8 +6,7 @@ import type { SuiRecoveryInput, SuiRecoveryResult } from '../lib/mainnetSuiRecov
 import { suiTransferIdentity, type SuiRecoveryRecord } from '../lib/mainnetSuiQueue'
 import { noteSuiSessionCheck } from '../lib/bridgeHistory'
 import type { SuiTransferWriter } from '../hooks/useSuiMainnetWrite'
-import { MAINNET_SUI_CCTP_TEST_MAX_UNITS } from '../config/sui'
-import SuiStepReview, { SuiAttemptCard, arcExplorer, attemptLabels, suiExplorer, unresolvedAttempt, type SuiStepPhase } from './MainnetSuiTransfer'
+import SuiStepReview, { SUI_GAS_CEILING_MIST, SuiAttemptCard, arcExplorer, attemptLabels, suiExplorer, unresolvedAttempt, type SuiStepPhase } from './MainnetSuiTransfer'
 
 type Direction = SuiRecoveryInput['direction']
 type Stage = SuiRecoveryResult['stage']
@@ -22,7 +21,6 @@ export type SuiBridgeFlowProps = {
   pollMs?: { status: number; attestation: number }
 }
 
-const MAX = MAINNET_SUI_CCTP_TEST_MAX_UNITS
 const DRAFT = 'machina_sui_bridge_draft_v1'
 const chainOf = (d: Direction, side: 'from' | 'to') => (d === 'arc-to-sui') === (side === 'from') ? 'Arc' : 'Sui'
 const short = (v?: string) => !v ? '' : v.length > 14 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v
@@ -36,6 +34,11 @@ export function stageTitle(stage: Stage, d: Direction) {
 function parseAmount(text: string) {
   if (!/^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,6})?$/.test(text.trim())) return null
   const v = parseUnits(text.trim(), 6); return v > 0n ? v : null
+}
+// Display balances ('0.3', '1.25') to base units; undefined when unknown or malformed.
+function unitsOf(text: string | null | undefined, decimals: number) {
+  if (typeof text !== 'string' || !/^[0-9]{1,30}(?:\.[0-9]+)?$/.test(text)) return undefined
+  const [i, f = ''] = text.split('.'); return f.length > decimals ? undefined : parseUnits(`${i}.${f || '0'}`, decimals)
 }
 function readDraft(): { direction: Direction; amount: string } | null {
   try { const d = JSON.parse(window.sessionStorage.getItem(DRAFT) ?? 'null'); return d && ['arc-to-sui', 'sui-to-arc'].includes(d.direction) && typeof d.amount === 'string' && d.amount.length < 24 ? d : null } catch { return null }
@@ -52,7 +55,7 @@ export type SuiFlowView = { steps: SuiFlowStep[]; headline: string; detail?: str
 export function describeSuiFlow(x: {
   direction: Direction; approval: boolean; evmWallet: string
   attempt: SuiWriteAttempt | null; open: boolean; step: SuiWriteAction | null; phase: SuiStepPhase
-  stage: Stage | null; hasFresh: boolean; aboveLimit: boolean; checkFailed: boolean; justSent: boolean
+  stage: Stage | null; hasFresh: boolean; checkFailed: boolean; justSent: boolean
 }): SuiFlowView {
   const from = chainOf(x.direction, 'from'), to = chainOf(x.direction, 'to')
   const walletFor = (k: StepKey) => (k === 'receive' ? to : from) === 'Sui' ? 'Slush' : x.evmWallet
@@ -94,7 +97,6 @@ export function describeSuiFlow(x: {
       cursor = 'receive'
       if (x.justSent) { state = 'run'; label = `Confirming receipt on ${to}…`; headline = `Confirming receipt on ${to}` }
       else if (!x.hasFresh) { state = x.checkFailed ? 'warn' : 'run'; label = x.checkFailed ? 'Could not check the chains · use Check now' : 'Checking the chains before you can receive…' }
-      else if (x.aboveLimit) { state = 'error'; label = 'Above the test limit · receiving is not offered' }
       else [state, label, , detail] = reviewing('receive', x.attempt?.state === 'rejected' && stepOf(x.attempt.intent.action) === 'receive')
     }
   } else if (x.attempt?.state === 'verified' && x.attempt.intent.action === 'arc-approval') {
@@ -184,6 +186,19 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
   // released after review) ends this flow; the form opens again.
   useEffect(() => { if (attempt && !step && (attempt.state === 'reverted' || attempt.state === 'reconciled')) { setFlow(null); setPhase('idle') } }, [attempt, step])
 
+  // Completed Sui -> Arc records saved before the Arc mint hash was recorded get one
+  // silent, read-only re-check per page session, one at a time, never during a wallet step.
+  const backfilled = useRef(new Set<string>())
+  useEffect(() => {
+    if (!ready || checking || open || step || (active && activeStage !== 'complete')) return
+    const r = mine.find(x => x.direction === 'sui-to-arc' && x.stage === 'complete' && !x.destinationTx && !backfilled.current.has(x.id))
+    if (!r) return
+    backfilled.current.add(r.id); setChecking(r.sourceId)
+    inspect({ direction: r.direction, sourceId: r.sourceId, suiOwner: sui.address!, evmOwner: evm.address! })
+      .then(res => { const id = suiTransferIdentity(res); setFresh(f => ({ ...f, [id]: res })); noteSuiSessionCheck(id, res) }, () => { /* stays "not found yet"; Check status retries */ })
+      .finally(() => setChecking(null))
+  }, [ready, checking, open, step, active?.id, activeStage, mine])
+
   // Fresh check when a transfer becomes active, then read-only polling while
   // Circle verifies it (backing off; paused in a hidden tab).
   const lastChecked = useRef<string | null>(null)
@@ -200,11 +215,20 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
 
   const units = parseAmount(amount)
   const fee = units !== null && feeBps !== null ? (units * BigInt(Math.ceil(feeBps * 1000)) + 9_999_999n) / 10_000_000n : null
-  const sourceBalance = direction === 'arc-to-sui' ? (arc.usdcUnits !== undefined ? formatUnits(arc.usdcUnits, 6) : null) : sui.usdc ?? null
-  const amountError = amount.trim() && units === null ? 'Enter a USDC amount with up to 6 decimals.' : units !== null && units > MAX ? `This test phase allows at most ${formatUnits(MAX, 6)} USDC per transfer.` : null
+  const sourceUnits = direction === 'arc-to-sui' ? arc.usdcUnits : unitsOf(sui.usdc, 6)
+  const sourceBalance = sourceUnits !== undefined ? formatUnits(sourceUnits, 6) : null
+  const suiGas = unitsOf(sui.gas, 9)
+  // No product cap: the amount must be valid base units, covered by the wallet and above the Circle fee.
+  // Protocol limits (CCTP burn limit per message, u64 amounts), exact balances and gas are proven again at Review.
+  const amountError = amount.trim() && units === null ? 'Enter a positive USDC amount with up to 6 decimals.'
+    : units === null ? null
+    : sourceUnits !== undefined && units > sourceUnits ? `Not enough USDC: your ${chainOf(direction, 'from')} balance is ${formatUnits(sourceUnits, 6)} USDC.`
+    : fee !== null && fee >= units ? 'This amount does not cover the Circle fee.'
+    : direction === 'sui-to-arc' && suiGas !== undefined && suiGas < SUI_GAS_CEILING_MIST ? `Not enough SUI for the Sui network fee (up to ${formatUnits(SUI_GAS_CEILING_MIST, 9)} SUI).`
+    : null
   const [starting, setStarting] = useState(false)
   async function startReview() {
-    if (!units || units > MAX || !ready || starting) return
+    if (!units || amountError || !ready || starting) return
     setCheckError(null)
     if (direction === 'sui-to-arc') { setFlow({ direction, units, approval: false }); setPhase('idle'); setStep({ action: 'sui-burn', units }); return }
     let allowance: bigint | undefined
@@ -224,7 +248,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
     {!sui.address || !evm.address ? <p className="mt-2 text-xs text-slate-500">Connect your Arc and Sui wallets in the top bar to see their transfers.</p> : mine.length === 0 && <p className="mt-2 text-xs text-slate-500">No Sui transfers for these wallets yet.</p>}
     <ul className="mt-2 divide-y divide-slate-100">{mine.map(r => { const v = view(r), dest = destinationLink(v); return <li key={r.id} className="space-y-1 py-3 text-xs" aria-label="Transfer">
       <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold">{chainOf(r.direction, 'from')} → {chainOf(r.direction, 'to')} · {r.amount} USDC</span><span className={v.stage === 'complete' ? 'text-[#2F6E0C]' : 'text-amber-800'}>{stageTitle(v.stage, r.direction)}</span></div>
-      <div className="flex flex-wrap gap-3"><a className="underline" href={sourceLink(r)} target="_blank" rel="noreferrer">Source transaction</a>{dest && <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a>}
+      <div className="flex flex-wrap gap-3"><a className="underline" href={sourceLink(r)} target="_blank" rel="noreferrer">Source transaction</a>{dest ? <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a> : v.stage === 'complete' && <span className="text-slate-500">Destination transaction not found yet</span>}
         <button type="button" className="font-semibold underline disabled:text-slate-400" disabled={!ready || Boolean(checking) || Boolean(step) || open} onClick={() => { setClosed(c => c.filter(x => x !== r.id)); setFlow(null); setActiveId(r.id); lastChecked.current = null; void check(r) }}>{checking === r.sourceId ? 'Checking…' : fresh[r.id] ? 'Check again' : 'Check status'}</button></div>
       <p className="text-slate-400">{fresh[r.id] ? `Verified on chain at ${new Date(fresh[r.id].checkedAt).toLocaleTimeString()}` : `Saved status${r.createdAt ? ` · recorded ${new Date(r.createdAt).toLocaleString()}` : ''}; open it to check the chains again.`}</p>
     </li> })}</ul>
@@ -254,7 +278,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
     const approval = Boolean(flow?.approval || step?.action === 'arc-approval' || (attempt && open && attempt.intent.action === 'arc-approval'))
     const justSent = Boolean(tracking && attempt?.state === 'verified' && stepOf(attempt.intent.action) === 'receive' && attempt.intent.sourceId?.toLowerCase() === tracking.sourceId.toLowerCase() && v?.stage !== 'complete')
     const d = describeSuiFlow({ direction: opDirection, approval, evmWallet: walletName, attempt, open, step: step?.action ?? null, phase,
-      stage: !(attempt && open) && !step ? v?.stage ?? null : null, hasFresh: Boolean(activeFresh), aboveLimit: Boolean(activeFresh && parseUnits(activeFresh.amount, 6) > MAX),
+      stage: !(attempt && open) && !step ? v?.stage ?? null : null, hasFresh: Boolean(activeFresh),
       checkFailed: Boolean(tracking && errorFor(tracking.sourceId)), justSent })
     // In a wallet step the panel explains that step in its own words (the step component is bare).
     if (step && !(attempt && open)) d.detail = step.note ?? (step.action === 'arc-approval' ? `First, ${walletName} asks you to let the bridge use exactly ${formatUnits(step.units, 6)} USDC. This is a separate approval and moves no USDC. You then confirm the transfer itself.` : step.action === 'arc-burn' ? `Your USDC leaves your Arc wallet and is sent to your Sui wallet. Nothing is sent until you confirm in ${walletName}.` : 'Your USDC leaves your Sui wallet and is sent to your Arc wallet. Nothing is sent until you confirm in Slush.')
@@ -271,13 +295,12 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
     else if (tracking && v) {
       const stage = v.stage
       action = <div className="space-y-3">
-        {receive && parseUnits(receive.amount, 6) <= MAX && !justSent && <SuiStepReview key={receive.sourceId} bare writer={writer} action={tracking.direction === 'arc-to-sui' ? 'sui-mint' : 'arc-mint'} ready={ready} evmWallet={walletName} onPhase={setPhase} onAttempt={a => { setAttempt(a); setPhase('idle') }}
+        {receive && !justSent && <SuiStepReview key={receive.sourceId} bare writer={writer} action={tracking.direction === 'arc-to-sui' ? 'sui-mint' : 'arc-mint'} ready={ready} evmWallet={walletName} onPhase={setPhase} onAttempt={a => { setAttempt(a); setPhase('idle') }}
           base={{ suiOwner: sui.address!, evmOwner: evm.address!, amount: parseUnits(receive.amount, 6), maxCctpFee: BigInt(receive.maxFeeUnits!), sourceId: receive.sourceId }}
           explain={<p>Receive {receive.receivedUsdc ?? receive.amount} USDC in your {chainOf(tracking.direction, 'to')} wallet. Confirm in {tracking.direction === 'arc-to-sui' ? 'Slush' : walletName}; the {chainOf(tracking.direction, 'to')} network fee is paid there.</p>} />}
-        {stage === 'ready_to_mint' && activeFresh && parseUnits(activeFresh.amount, 6) > MAX && <p className="text-xs text-amber-800">This transfer is above the {formatUnits(MAX, 6)} USDC test limit, so receiving is not offered in this test phase. Nothing was sent.</p>}
         {!(receive && phase !== 'idle') && <Summary rows={[['Amount', `${tracking.amount} USDC`], ['Circle fee', v.feeUsdc !== undefined ? `${v.feeUsdc} USDC` : 'known after verification'], [stage === 'complete' ? 'You received' : 'You receive', v.receivedUsdc !== undefined ? `${v.receivedUsdc} USDC` : `≈ ${tracking.amount} USDC`], ['Started', tracking.createdAt ? new Date(tracking.createdAt).toLocaleString() : 'before this browser recorded start times']]} />}
         {stage === 'complete' && <p className="text-xs text-slate-600">You received {v.receivedUsdc ?? tracking.amount} USDC{v.feeUsdc && v.feeUsdc !== '0' ? ` (Circle fee ${v.feeUsdc} USDC)` : ''}.</p>}
-        <div className="flex flex-wrap gap-3 text-xs"><a className="underline" href={sourceLink(tracking)} target="_blank" rel="noreferrer">Source transaction</a>{dest && <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a>}</div>
+        <div className="flex flex-wrap gap-3 text-xs"><a className="underline" href={sourceLink(tracking)} target="_blank" rel="noreferrer">Source transaction</a>{dest ? <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a> : v.stage === 'complete' && <span className="text-slate-500">Destination transaction not found yet</span>}</div>
       </div>
     } else action = flow ? <div className="space-y-2"><Summary rows={[['Amount', `${formatUnits(flow.units, 6)} USDC`], ['Route', `${chainOf(flow.direction, 'from')} → ${chainOf(flow.direction, 'to')}`]]} />
       {!(attempt?.state === 'verified') && <button type="button" onClick={reset} className="text-xs font-semibold text-slate-500 underline">Cancel</button>}</div> : null
@@ -302,11 +325,11 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
       <div className="-my-1 flex justify-center"><button type="button" aria-label="Switch direction" onClick={() => setDirection(d => d === 'arc-to-sui' ? 'sui-to-arc' : 'arc-to-sui')} className="rounded-full border border-slate-200 bg-white p-2 text-slate-600 shadow-sm hover:text-[#2F6E0C]"><ArrowDownUp size={16} /></button></div>
       <Side label="To" chain={chainOf(direction, 'to')} wallet={direction === 'arc-to-sui' ? (sui.address ? `${sui.walletName ?? 'Slush'} · ${short(sui.address)}` : null) : (evm.address ? `${walletName} · ${short(evm.address)}` : null)} />
       <label className="block text-sm font-medium">Amount<div className="mt-1 flex items-center gap-2 rounded-xl border border-slate-200 px-3"><input aria-label="Sui transfer amount" inputMode="decimal" autoComplete="off" value={amount} onChange={e => setAmount(e.target.value)} className="min-w-0 flex-1 bg-transparent py-3 text-lg outline-none" placeholder="0.00" /><span className="text-sm text-slate-500">USDC</span></div></label>
-      <p className="text-xs text-slate-500">Test limit: at most {formatUnits(MAX, 6)} USDC per transaction.{sourceBalance !== null ? ` Balance: ${sourceBalance} USDC.` : ''}</p>
+      <p className="text-xs text-slate-500">{sourceBalance !== null ? `Balance: ${sourceBalance} USDC.` : 'Balance not loaded yet; it is checked again at Review.'} Real Mainnet USDC; every step is confirmed in your wallet.</p>
       {amountError && <p className="text-xs text-amber-800">{amountError}</p>}
       <dl className="space-y-1 rounded-xl bg-slate-50 p-3 text-xs">
         <Line k="Circle fee" v={fee === null ? (feeBps === null ? 'Checking…' : '—') : `${formatUnits(fee, 6)} USDC`} />
-        <Line k="You receive" v={units !== null && fee !== null && units <= MAX ? `≈ ${formatUnits(units - fee, 6)} USDC` : '—'} />
+        <Line k="You receive" v={units !== null && fee !== null && fee < units ? `≈ ${formatUnits(units - fee, 6)} USDC` : '—'} />
         <Line k={`${chainOf(direction, 'from')} network fee`} v={direction === 'arc-to-sui' ? 'up to 0.02 USDC · exact in review' : 'up to 0.05 SUI · exact in review'} />
         <Line k={`${chainOf(direction, 'to')} network fee`} v={direction === 'arc-to-sui' ? 'up to 0.05 SUI · paid when you receive' : 'up to 0.02 USDC · paid when you receive'} />
       </dl>
@@ -314,7 +337,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
         {lastFinal && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">Last wallet step: {attemptLabels[lastFinal.state]}.</p>}
         {errorFor(null) && <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">{errorFor(null)}</p>}
         {!ready && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{!evm.address ? 'Connect your EVM wallet (Arc) in the top bar.' : !evm.onArc ? 'Switch your EVM wallet to Arc Mainnet in the top bar.' : !sui.address ? 'Connect Slush (Sui) in the top bar.' : 'Use a Slush account on Sui Mainnet.'}</p>}
-        <button type="button" onClick={() => void startReview()} disabled={!ready || !units || units > MAX || !writer.writesEnabled || starting} className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{starting && <Loader2 size={16} className="animate-spin" aria-hidden />}{!writer.writesEnabled ? 'Sui transfers locked' : starting ? 'Checking your allowance…' : 'Review transfer'}</button>
+        <button type="button" onClick={() => void startReview()} disabled={!ready || !units || Boolean(amountError) || !writer.writesEnabled || starting} className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{starting && <Loader2 size={16} className="animate-spin" aria-hidden />}{!writer.writesEnabled ? 'Sui transfers locked' : starting ? 'Checking your allowance…' : 'Review transfer'}</button>
       </div>
     </div>
   }

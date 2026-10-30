@@ -28,7 +28,8 @@ async function test(name, fn) { try { await fn(); count++; console.log('PASS ' +
 const evmRecord = { id: 'cctp-1-0x' + 'aa'.repeat(32) + '-3', walletAddress: REAL.evm, sourceChainId: 1, destinationChainId: 5042, amount: '2', token: 'USDC', mode: 'standard', recipient: REAL.evm, destinationCaller: '0x' + '0'.repeat(40), stage: 'complete', approvalRequired: false, createdAt: Date.parse('2026-10-20T10:00:00Z'), updatedAt: Date.parse('2026-10-20T10:30:00Z'), sourceTxHash: '0x' + 'aa'.repeat(32), sourceLogIndex: 3, destinationTxHash: '0x' + 'bb'.repeat(32), recovered: true }
 const solanaRecord = { id: 'sol-1', evmWallet: REAL.evm, solanaWallet: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', direction: 'solana-to-arc', amount: '1.5', status: 'complete', createdAt: Date.parse('2026-10-25T08:00:00Z'), sourceTxHash: '5'.repeat(87), destinationTxHash: '0x' + 'cc'.repeat(32) }
 // Browser history as it stood before the fifth real transfer was received.
-const seeded = realSuiRecords().map((r, n) => n === 4 ? { ...r, stage: 'ready_to_mint', destinationTx: undefined, checkedAt: Date.parse(REAL.transfers[4].sourceTime) + 60_000 } : r)
+// Sui -> Arc rows were saved without the Arc mint hash (as in the user's browser before it was recorded).
+const seeded = realSuiRecords().map((r, n) => n === 4 ? { ...r, stage: 'ready_to_mint', destinationTx: undefined, checkedAt: Date.parse(REAL.transfers[4].sourceTime) + 60_000 } : r.direction === 'sui-to-arc' ? { ...r, destinationTx: undefined } : r)
 try {
   await server.listen(); const base = `http://127.0.0.1:${server.httpServer.address().port}/__dashboard`
   browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
@@ -102,7 +103,7 @@ try {
     assert.equal(await rows().count(), 7)
     const order = await rows().evaluateAll(els => els.map(e => e.querySelector('p').innerText))
     assert.deepEqual(order, ['Arc → Sui · 0.1 USDC', 'Sui → Arc · 0.1 USDC', 'Sui → Arc · 0.1 USDC', 'Arc → Sui · 0.1 USDC', 'Arc → Sui · 0.1 USDC', 'Solana → Arc · 1.5 USDC', 'Ethereum → Arc · 2 USDC'])
-    for (const t of REAL.transfers.slice(0, 4)) { const r = rowFor(t.direction === 'arc-to-sui' ? t.source.toLowerCase() : t.source); assert.equal(await r.count(), 1, t.source); assert.ok((await r.innerText()).includes('Complete')); assert.ok(await r.locator(`a[href$="${t.destination}"]`).count() === 1, 'destination link ' + t.destination) }
+    for (const t of REAL.transfers.slice(0, 4)) { const r = rowFor(t.direction === 'arc-to-sui' ? t.source.toLowerCase() : t.source); assert.equal(await r.count(), 1, t.source); const text = await r.innerText(); assert.ok(text.includes('Complete')); if (t.direction === 'arc-to-sui') assert.equal(await r.locator(`a[href$="${t.destination}"]`).count(), 1, 'destination link ' + t.destination); else { assert.match(text, /Destination tx not found yet/); assert.equal(await r.getByRole('link', { name: /Destination/ }).count(), 0, 'no invented link') } }
     const pending = rowFor(REAL.transfers[4].source); assert.match(await pending.innerText(), /Ready to receive/); assert.match(await pending.innerText(), /Saved status in this browser/)
     const stat = l => page.getByLabel(`${l} completed`).innerText()
     assert.match(await stat('Arc → Sui'), /\b2$/); assert.match(await stat('Sui → Arc'), /\b2$/); assert.match(await stat('Ethereum → Arc'), /\b1$/); assert.match(await stat('Solana → Arc'), /\b1$/)
@@ -129,6 +130,19 @@ try {
     assert.equal(at, d, 'Activity shows exactly the Dashboard row')
     await page.getByText('No Arc wallet activity found.').waitFor()
     const s = await page.evaluate(() => window.dashboardUi.state); assert.deepEqual([s.signatures, s.broadcasts], [1, 1])
+  })
+  await test('older Sui -> Arc transfers get their real Arc mint links after a read-only re-check, shown the same in Bridge, Dashboard and Activity', async () => {
+    // The Bridge view re-checked them on its own once the followed transfer was complete (one read each).
+    await tab('bridge'); await page.waitForFunction(ids => { const rows = JSON.parse(localStorage.getItem('machina_mainnet_sui_transfers_v1') || '[]'); return ids.every(id => rows.find(r => r.sourceId === id)?.destinationTx) }, REAL.transfers.filter(x => x.direction === 'sui-to-arc').map(x => x.source), { timeout: 10_000 })
+    const s = await page.evaluate(() => window.dashboardUi.state); assert.deepEqual([s.signatures, s.broadcasts], [1, 1], 'the re-check sends nothing')
+    await page.getByText(/Transfer history/).click()
+    for (const t of REAL.transfers.filter(x => x.direction === 'sui-to-arc')) {
+      assert.equal(await page.locator(`li[aria-label="Transfer"] a[href="https://explorer.arc.io/tx/${t.destination}"]`).count(), 1, 'Bridge history ' + t.destination)
+      for (const view of ['dashboard', 'activity']) { await tab(view); const r = rowFor(t.source); await r.waitFor(); assert.equal(await r.locator(`a[href="https://explorer.arc.io/tx/${t.destination}"]`).count(), 1, `${view} ${t.destination}`); assert.equal(await r.locator(`a[href="https://suiscan.xyz/mainnet/tx/${t.source}"]`).count(), 1) }
+      await tab('bridge'); await page.getByText(/Transfer history/).click()
+    }
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('machina_mainnet_sui_transfers_v1')))
+    for (const t of REAL.transfers.filter(x => x.direction === 'sui-to-arc')) assert.equal(stored.find(r => r.sourceId === t.source).destinationTx, t.destination, 'recorded in the history')
   })
   await test('records survive a reload; a stored completion is shown as saved, not as verified now', async () => {
     await page.reload(); await page.waitForFunction(() => Boolean(window.dashboardUi)); await connectSlush(); await rows().first().waitFor()

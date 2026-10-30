@@ -11,7 +11,7 @@ import { cctpRecoveryClient, cctpWord, decodeCctpRecoveryMessage, readBoundCctpA
 import { createSuiMainnetReadPort, readSuiMainnetIdentity, readSuiBurnProof, readSuiNonceStatus, readCheckpointedSuiTransaction, type SuiMainnetReadPort, type SuiMainnetIdentity } from './mainnetSuiRead'
 import { buildSuiToArcBurn, buildArcToSuiMint, type SuiCctpV2Deployment } from './suiCctpTransactions'
 import { parseSuiBalance, validateSuiWalletAccount } from './suiBalances'
-import { assertSuiTestAmount, browserSuiWriteEnvironment, createSuiWriteController, SuiWriteNotRequested, SuiWriteSignatureRejected, type SuiArcExpected, type SuiWriteIntent, type SuiWritePort, type SuiWriteAttempt } from './mainnetSuiExecution'
+import { browserSuiWriteEnvironment, createSuiWriteController, SuiWriteNotRequested, SuiWriteSignatureRejected, type SuiArcExpected, type SuiWriteIntent, type SuiWritePort, type SuiWriteAttempt } from './mainnetSuiExecution'
 import { importSuiRecovery } from './mainnetSuiQueue'
 
 const arc = getMainnetCctpChain(5042)!
@@ -25,6 +25,8 @@ const quantity = (x: unknown, pending = false): bigint => {
 }
 // Official circlefin/evm-cctp-contracts src/v2/{MessageTransmitterV2,
 // BaseTokenMessenger}.sol. V2 MintAndWithdraw includes feeCollected.
+// TokenMessengerV2.localMinter() and TokenMinterV2.burnLimitsPerMessage(token): the per-message burn cap.
+const CCTP_BURN_LIMIT_ABI = parseAbi(['function localMinter() view returns (address)', 'function burnLimitsPerMessage(address token) view returns (uint256)'])
 const MINT_ABI = parseAbi([
   'event MessageReceived(address indexed caller,uint32 sourceDomain,bytes32 indexed nonce,bytes32 sender,uint32 indexed finalityThresholdExecuted,bytes messageBody)',
   'event MintAndWithdraw(address indexed mintRecipient,uint256 amount,address indexed mintToken,uint256 feeCollected)',
@@ -198,6 +200,11 @@ export function createSuiMainnetWritePort(wallets: SuiWriteWallets, deps: Depend
       if (balance < i.amount * 1000000000000n + BigInt(tx.gas) * BigInt(tx.maxFeePerGas)) throw new Error('Arc native USDC cannot cover both the token amount and maximum gas.')
       if (i.action === 'arc-burn' && allowance < i.amount) throw new Error('Exact token approval is required first. A burn will never add an implicit approval.')
       if (i.action === 'arc-approval' && allowance >= i.amount) throw new Error('Existing allowance already covers this amount. Do not request another approval.')
+      // CCTP protocol limit: TokenMinterV2.burnLimitsPerMessage(USDC) of the messenger's local minter, read at this snapshot.
+      const minter = await evm.readContract({ address: arc.tokenMessengerAddress, abi: CCTP_BURN_LIMIT_ABI, functionName: 'localMinter', blockNumber })
+      const limit = typeof minter === 'string' && /^0x[0-9a-f]{40}$/i.test(minter) && !/^0x0{40}$/i.test(minter) ? await evm.readContract({ address: minter as Hex, abi: CCTP_BURN_LIMIT_ABI, functionName: 'burnLimitsPerMessage', args: [arc.usdcAddress], blockNumber }) : undefined
+      if (typeof limit !== 'bigint' || limit <= 0n) throw new Error('The CCTP burn limit on Arc could not be read. Nothing was sent.')
+      if (i.amount > limit) throw new Error(`This amount is above the CCTP limit of ${formatUnits(limit, 6)} USDC per transfer on Arc. Nothing was sent.`)
     }
     if (i.action === 'arc-mint') {
       const m = decodeCctpRecoveryMessage(e.message!)
@@ -269,7 +276,6 @@ export function createSuiMainnetWritePort(wallets: SuiWriteWallets, deps: Depend
   return {
     async prepare(i) {
       ensure(i)
-      assertSuiTestAmount(i.amount)
       const port = read(), identity = await readSuiMainnetIdentity(port)
       const e: CacheEntry = { i: { ...i }, identity }
       if (i.action.endsWith('mint')) Object.assign(e, await sourceMessage(i, identity, port))
@@ -336,7 +342,6 @@ export function createSuiMainnetWritePort(wallets: SuiWriteWallets, deps: Depend
     },
     async sign(i, bytes, signal) {
       ensure(i)
-      assertSuiTestAmount(i.amount)
       if (i.arcMethod === 'wallet-send') throw new Error('A wallet-send review is never signed separately.')
       if (i.action.startsWith('sui-')) {
         const { account, feature } = suiAccount(i)
@@ -382,7 +387,6 @@ export function createSuiMainnetWritePort(wallets: SuiWriteWallets, deps: Depend
     // eth_sendTransaction: exactly one request with the reviewed fields. The wallet
     // may still sign/broadcast other fields; recover() is the only judge of that.
     async send(i, p) {
-      try { assertSuiTestAmount(i.amount) } catch (error) { throw new SuiWriteNotRequested((error as Error).message) }
       if (!(deps.allowWalletSend ?? MAINNET_ARC_WALLET_SEND_ENABLED)) throw new SuiWriteNotRequested('Wallet-sent Arc transactions are disabled.')
       if (!i.action.startsWith('arc-') || i.arcMethod !== 'wallet-send' || !p.arc) throw new SuiWriteNotRequested('This review is not a wallet-send review.')
       const t = parseTransaction(toHex(p.bytes) as TransactionSerialized), x = p.arc

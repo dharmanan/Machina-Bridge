@@ -38,9 +38,17 @@ export default function MainnetSuiBridge() {
     return { allowanceUnits: typeof a.data === 'bigint' ? a.data : undefined }
   }, [balance, allowance])
   const inspect = useCallback(async (input: SuiRecoveryInput) => {
-    try { return await controller.inspect(input, () => true, importSuiRecovery) }
+    // Candidate Arc mint hashes for Sui -> Arc: this browser's verified wallet step and the saved record.
+    // The recovery reader proves any candidate on chain before using it.
+    const hints: string[] = []
+    if (input.direction === 'sui-to-arc') {
+      try { const a = writer.saved(); if (a?.state === 'verified' && a.intent.action === 'arc-mint' && a.intent.sourceId === input.sourceId && a.digest) hints.push(a.digest) } catch { /* journal errors are shown by the flow */ }
+      const saved = readSuiRecoveryQueue().find(r => r.direction === 'sui-to-arc' && r.sourceId === input.sourceId)?.destinationTx
+      if (saved) hints.push(saved)
+    }
+    try { return await controller.inspect({ ...input, ...(hints.length ? { destinationHints: hints } : {}) }, () => true, importSuiRecovery) }
     catch (e) { throw new Error(displayError(e)) }
-  }, [controller])
+  }, [controller, writer])
   return <section aria-label="Sui Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
     <h2 className="text-xl font-semibold">Sui ↔ Arc</h2>
     <p className="mb-4 mt-1 text-xs leading-5 text-slate-500">{MAINNET_SUI_CCTP_BLOCKER}</p>

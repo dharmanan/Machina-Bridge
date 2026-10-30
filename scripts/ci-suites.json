@@ -64,6 +64,7 @@
    "verify-sui-cctp-foundation",
    "verify-sui-mainnet-recovery",
    "verify-sui-write-controller",
+   "verify-arc-mint-proof",
    "verify-bridge-history",
    "verify-borrow-source-gates"
   ],
@@ -156,7 +157,8 @@
   "verify-arc-intelligence-dashboard": "arc-intelligence",
   "verify-arc-intelligence-dashboard-completion": "arc-intelligence",
   "verify-bridge-history": "dashboard",
-  "verify-bridge-dashboard-ui": "dashboard"
+  "verify-bridge-dashboard-ui": "dashboard",
+  "verify-arc-mint-proof": "sui-bridge"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",

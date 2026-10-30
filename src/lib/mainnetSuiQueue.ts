@@ -36,7 +36,9 @@ export function readSuiRecoveryQueue(): SuiRecoveryRecord[] {
 export function importSuiRecovery(result: SuiRecoveryResult) {
   const records = readSuiRecoveryQueue(), id = suiTransferIdentity(result), old = records.find(r => r.id === id)
   const createdAt = old ? old.createdAt : result.checkedAt
-  const record: SuiRecoveryRecord = { ...result, id, ...(createdAt !== undefined ? { createdAt } : {}) }
+  // A destination hash verified earlier is kept when a later check could not re-find it (e.g. an RPC limit).
+  const destinationTx = result.destinationTx ?? (old?.stage === 'complete' && result.stage === 'complete' ? old.destinationTx : undefined)
+  const record: SuiRecoveryRecord = { ...result, id, ...(createdAt !== undefined ? { createdAt } : {}), ...(destinationTx !== undefined ? { destinationTx } : {}) }
   if (!valid(record)) throw new Error('Invalid Sui recovery record.')
   // Amounts are compared as USDC base units: '0.100000' (write path) and '0.1'
   // (recovery) are the same 100000 units; any real difference stays a conflict.

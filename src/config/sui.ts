@@ -19,15 +19,12 @@ export const SUI_NETWORKS = {
 
 export const SUI_CCTP_DOMAIN = 8
 export const ARC_CCTP_DOMAIN = 26
-// Controlled live test (user-approved 2026-10-29). Writes still require the
-// live package/state/nonce/linkage proofs, an explicit Review and Confirm, and
-// stay capped by MAINNET_SUI_CCTP_TEST_MAX_UNITS.
+// Mainnet writes (user-approved 2026-10-29; product cap removed 2026-10-30).
+// Every write still requires the live package/state/nonce/linkage proofs, an
+// exact simulation, the CCTP protocol limits, sufficient balances, an explicit
+// Review and Confirm, and the user's confirmation in the wallet.
 export const MAINNET_SUI_CCTP_WRITES_ENABLED: boolean = true
 // Separate gate for Arc eth_sendTransaction (wallet signs AND broadcasts;
-// fields are verified only after broadcast). Enabled for the same test phase.
+// fields are verified only after broadcast).
 export const MAINNET_ARC_WALLET_SEND_ENABLED: boolean = true
-// First live test phase: at most 0.1 USDC (6 decimals) per transaction, every
-// action including mints. Raising it needs separate user approval; it is never
-// raised automatically for fees or protocol minimums.
-export const MAINNET_SUI_CCTP_TEST_MAX_UNITS = 100_000n
-export const MAINNET_SUI_CCTP_BLOCKER = 'Live test: at most 0.1 USDC per transfer. Every wallet step needs your Review and your confirmation in the wallet.'
+export const MAINNET_SUI_CCTP_BLOCKER = 'Mainnet transfer with real USDC. Nothing is sent until you review it and confirm each step in your wallet.'

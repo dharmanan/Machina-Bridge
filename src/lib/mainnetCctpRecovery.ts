@@ -80,7 +80,7 @@ function BufferlessSolanaProgram() { return Array.from(new PublicKey(SOLANA_MAIN
 export function immutableMessageMatches(a: CctpBurnProof['fields'], b: CctpBurnProof['fields']) {
   return ['sourceDomain','destinationDomain','sender','recipient','destinationCaller','minFinality','burnToken','mintRecipient','amount','messageSender','maxFee'].every(k => String(a[k as keyof typeof a]).toLowerCase() === String(b[k as keyof typeof b]).toLowerCase())
 }
-export async function readBoundCctpAttestation(proof: Pick<CctpBurnProof, 'fields'> & {sourceTxHash:string}, fetcher: typeof fetch = fetch): Promise<{ status: 'pending' | 'complete'; message?: Hex; attestation?: Hex; eventNonce?: string }> {
+export async function readBoundCctpAttestation(proof: Pick<CctpBurnProof, 'fields'> & {sourceTxHash:string}, fetcher: typeof fetch = fetch): Promise<{ status: 'pending' | 'complete'; message?: Hex; attestation?: Hex; eventNonce?: string; destinationTxHint?: Hex }> {
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 10_000)
   try {
     const response = await fetcher(`${CIRCLE_MAINNET.irisApiBase}/v2/messages/${proof.fields.sourceDomain}?transactionHash=${encodeURIComponent(proof.sourceTxHash)}`, { headers: { Accept: 'application/json' }, signal: controller.signal })
@@ -102,7 +102,9 @@ export async function readBoundCctpAttestation(proof: Pick<CctpBurnProof, 'field
     if (v.status !== 'complete') return { status: 'pending' }
     if (!/^0x(?:[\da-f]{130})+$/i.test(v.attestation) || m.nonce === ZERO || m.executedFinality < m.minFinality || m.feeExecuted > m.maxFee || m.feeExecuted >= m.amount) throw new Error('Circle attestation, nonce, finality or fee is invalid.')
     if (v.eventNonce !== undefined && !same(String(v.eventNonce), m.nonce)) throw new Error('Circle event nonce does not match the signed message.')
-    return { status: 'complete', message: v.message, attestation: v.attestation, eventNonce: m.nonce }
+    // Circle's destinationMintTxHash is only a candidate; callers verify it on chain before use.
+    const hint = typeof v.destinationMintTxHash === 'string' && /^0x[\da-f]{64}$/i.test(v.destinationMintTxHash) ? v.destinationMintTxHash.toLowerCase() as Hex : undefined
+    return { status: 'complete', message: v.message, attestation: v.attestation, eventNonce: m.nonce, ...(hint ? { destinationTxHint: hint } : {}) }
   } finally { clearTimeout(timer) }
 }
 export async function inspectMainnetTransferRecovery(input: { sourceChainId: number; sourceTxHash: string; owner: string; sourceLogIndex?: number }, ports: { source?: any; destination?: any; fetcher?: typeof fetch } = {}) {
