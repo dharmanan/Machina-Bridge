@@ -65,6 +65,7 @@
    "verify-sui-mainnet-recovery",
    "verify-sui-write-controller",
    "verify-arc-mint-proof",
+   "verify-fee-display",
    "verify-bridge-history",
    "verify-borrow-source-gates"
   ],
@@ -158,7 +159,8 @@
   "verify-arc-intelligence-dashboard-completion": "arc-intelligence",
   "verify-bridge-history": "dashboard",
   "verify-bridge-dashboard-ui": "dashboard",
-  "verify-arc-mint-proof": "sui-bridge"
+  "verify-arc-mint-proof": "sui-bridge",
+  "verify-fee-display": "sui-bridge"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",
@@ -174,7 +176,8 @@
   "verify-mainnet-borrow-live-read": "Borrow (paused): live reads",
   "verify-mainnet-borrow-markets-onchain": "Borrow (paused): live reads",
   "verify-mainnet-borrow-target-live": "Borrow (paused): live reads",
-  "verify-borrow-adapter-119-isolated": "Borrow (paused): SDK isolation lab"
+  "verify-borrow-adapter-119-isolated": "Borrow (paused): SDK isolation lab",
+  "verify-sui-live-recovery": "live read-only Mainnet recovery through the real UI (NODE_USE_ENV_PROXY=1 node scripts/verify-sui-live-recovery.mjs)"
  },
  "patterns": [
   {

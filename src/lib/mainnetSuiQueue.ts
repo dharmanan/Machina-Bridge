@@ -12,7 +12,7 @@ export function suiTransferIdentity(r: Pick<SuiRecoveryResult, 'direction' | 'so
 function valid(r: any): r is SuiRecoveryRecord {
   try {
     if (!r || !['sui-to-arc','arc-to-sui'].includes(r.direction) || !['waiting_attestation','ready_to_mint','complete'].includes(r.stage) || !/^0x[0-9a-f]{64}$/i.test(r.suiOwner) || !/^0x[0-9a-f]{40}$/i.test(r.evmOwner) || !Number.isSafeInteger(r.sourceEventIndex) || r.sourceEventIndex < 0 || !Number.isSafeInteger(r.checkedAt) || r.checkedAt <= 0 || typeof r.amount !== 'string' || r.amount.length > 40 || !/^[0-9]+(?:\.[0-9]{1,6})?$/.test(r.amount) || !/[1-9]/.test(r.amount)) return false
-    if (r.createdAt !== undefined && (!Number.isSafeInteger(r.createdAt) || r.createdAt <= 0)) return false
+    if ([r.createdAt, r.sourceTime].some(t => t !== undefined && (!Number.isSafeInteger(t) || t <= 0))) return false
     if (/^0x0+$/i.test(r.suiOwner) || /^0x0+$/i.test(r.evmOwner) || parseUnits(r.amount, 6) > (1n << 64n) - 1n) return false
     if (r.stage !== 'waiting_attestation') {
       if (![r.feeUsdc,r.receivedUsdc].every(v => typeof v === 'string' && v.length < 40 && /^[0-9]+(?:\.[0-9]{1,6})?$/.test(v)) || parseUnits(r.receivedUsdc,6) <= 0n || parseUnits(r.receivedUsdc,6) + parseUnits(r.feeUsdc,6) !== parseUnits(r.amount,6)) return false
@@ -38,7 +38,8 @@ export function importSuiRecovery(result: SuiRecoveryResult) {
   const createdAt = old ? old.createdAt : result.checkedAt
   // A destination hash verified earlier is kept when a later check could not re-find it (e.g. an RPC limit).
   const destinationTx = result.destinationTx ?? (old?.stage === 'complete' && result.stage === 'complete' ? old.destinationTx : undefined)
-  const record: SuiRecoveryRecord = { ...result, id, ...(createdAt !== undefined ? { createdAt } : {}), ...(destinationTx !== undefined ? { destinationTx } : {}) }
+  const sourceTime = result.sourceTime ?? old?.sourceTime
+  const record: SuiRecoveryRecord = { ...result, id, ...(createdAt !== undefined ? { createdAt } : {}), ...(destinationTx !== undefined ? { destinationTx } : {}), ...(sourceTime !== undefined ? { sourceTime } : {}) }
   if (!valid(record)) throw new Error('Invalid Sui recovery record.')
   // Amounts are compared as USDC base units: '0.100000' (write path) and '0.1'
   // (recovery) are the same 100000 units; any real difference stays a conflict.

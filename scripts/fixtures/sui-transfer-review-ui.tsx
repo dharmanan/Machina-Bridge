@@ -27,7 +27,7 @@ const port: SuiWritePort = {
   async prepare(i) {
     state.prepares++; state.intents.push(i)
     if (state.holdPrepare) await new Promise<void>(r => { state.releasePrepare = r })
-    return { bytes: new TextEncoder().encode(JSON.stringify([i.action, String(i.amount), i.sourceId ?? '', i.arcMethod ?? ''])), digest: i.action.startsWith('sui-') ? digestOf(i) : undefined, binding: 'controlled', expiresAt: Date.now() + state.ttl, ...(i.arcMethod === 'wallet-send' ? { arc: { to: ('0x' + '33'.repeat(20)) as `0x${string}`, dataHash: ('0x' + '44'.repeat(32)) as `0x${string}`, nonce: 7, gas: 120_000n, maxFeePerGas: 30_000_000_000n, fromBlock: 100n } } : {}), estimatedGas: i.action.startsWith('sui-') ? 5_754_400n : 3_700_000_000_000_000n, maximumGas: i.action.startsWith('sui-') ? 50_000_000n : 4_400_000_000_000_000n, content: [`controlled ${i.action} bytes`] }
+    return { bytes: new TextEncoder().encode(JSON.stringify([i.action, String(i.amount), i.sourceId ?? '', i.arcMethod ?? ''])), digest: i.action.startsWith('sui-') ? digestOf(i) : undefined, binding: 'controlled', expiresAt: Date.now() + state.ttl, ...(i.arcMethod === 'wallet-send' ? { arc: { to: ('0x' + '33'.repeat(20)) as `0x${string}`, dataHash: ('0x' + '44'.repeat(32)) as `0x${string}`, nonce: 7, gas: 120_000n, maxFeePerGas: 30_000_000_000n, fromBlock: 100n } } : {}), estimatedGas: i.action.startsWith('sui-') ? 5_754_400n : 3_063_247_218_639_756n, maximumGas: i.action.startsWith('sui-') ? 50_000_000n : 4_442_913_771_384_000n, content: [`controlled ${i.action} bytes`] }
   },
   async recheck() {},
   async sign(_i, bytes) { state.signatures++; if (state.signUnsupported) throw new SuiWriteSignatureRejected('unsupported'); return { bytes, signature: 'CONTROLLED-NEVER-PERSIST' } },
@@ -64,7 +64,7 @@ async function inspect(input: SuiRecoveryInput): Promise<SuiRecoveryResult> {
   state.inspectCalls++
   if (state.inspectFail) throw new Error(state.inspectFail)
   const complete = state.stage === 'complete'
-  const r: SuiRecoveryResult = { ...input, amount: state.inspectAmount, maxFeeUnits: '0', sourceEventIndex: 6, stage: state.stage, ...(state.stage === 'waiting_attestation' ? {} : { feeUsdc: '0', receivedUsdc: state.inspectAmount }), ...(complete ? { destinationTx: input.direction === 'arc-to-sui' ? REAL.suiMint : ARC_MINT } : {}), checkedAt: Date.now() }
+  const r: SuiRecoveryResult = { ...input, sourceTime: Date.parse('2026-10-29T19:08:35Z'), amount: state.inspectAmount, maxFeeUnits: '0', sourceEventIndex: 6, stage: state.stage, ...(state.stage === 'waiting_attestation' ? {} : { feeUsdc: '0', receivedUsdc: state.inspectAmount }), ...(complete ? { destinationTx: input.direction === 'arc-to-sui' ? REAL.suiMint : ARC_MINT } : {}), checkedAt: Date.now() }
   importSuiRecovery(r); return r
 }
 let set: (v: Partial<typeof ctx>) => void = () => {}

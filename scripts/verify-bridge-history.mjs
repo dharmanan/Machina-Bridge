@@ -65,9 +65,16 @@ test('statuses are named the same way for every family; unknown outcomes are not
   const [evmMint] = buildBridgeHistory({ evm: [{ ...evm, stage: 'ready_to_mint', destinationTxHash: undefined }] })
   assert.deepEqual([evmMint.status, evmMint.statusLabel, evmMint.destinationUrl], ['action', 'Ready to receive', undefined])
 })
-test('records saved before start times existed show their last check time, labelled as such', () => {
-  const { createdAt, ...old } = sui[0]
+test('dates: the chain source time is "started"; a browser record time is "recorded"; a check time is never shown as a start', () => {
+  const real = suiHistoryItem(sui[0], new Map())
+  assert.deepEqual([real.timestampKind, new Date(real.timestamp).toISOString()], ['started', '2026-10-29T19:08:35.000Z'], 'Arc block time of 0x2cf8f5a5…')
+  const { sourceTime, ...recordedOnly } = sui[0]
+  const recorded = suiHistoryItem({ ...recordedOnly, createdAt: Date.parse('2026-10-30T09:00:00Z') }, new Map())
+  assert.deepEqual([recorded.timestampKind, recorded.timestamp], ['recorded', Date.parse('2026-10-30T09:00:00Z')], 'recovered on another device later: not presented as the start')
+  const { createdAt, ...old } = recordedOnly
   const row = suiHistoryItem(old, new Map())
   assert.equal(row.timestampKind, 'checked'); assert.equal(row.timestamp, old.checkedAt)
+  const [evmRecovered] = buildBridgeHistory({ evm: [{ ...evm, recovered: true }] }); assert.equal(evmRecovered.timestampKind, 'recorded')
+  const [evmStarted] = buildBridgeHistory({ evm: [{ ...evm, recovered: undefined }] }); assert.equal(evmStarted.timestampKind, 'started')
 })
 console.log(`RESULT ${count}/${count} unified bridge history groups PASS; 5 real Sui <-> Arc transfers, EVM and Solana rows; no network.`)

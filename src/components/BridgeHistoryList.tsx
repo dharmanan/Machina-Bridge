@@ -15,7 +15,7 @@ export default function BridgeHistoryList({ items, empty, limit = 30 }: { items:
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-sm font-semibold">{item.from} → {item.to} · {item.amount} USDC</p>
-          <p className="text-xs text-slate-500">{familyLabel[item.family]} bridge · {item.timestampKind === 'started' ? '' : 'last checked '}{new Date(item.timestamp).toLocaleString()}</p>
+          <p className="text-xs text-slate-500">{familyLabel[item.family]} bridge · {item.timestampKind === 'started' ? 'started ' : item.timestampKind === 'recorded' ? 'recorded in this browser ' : 'last checked '}{new Date(item.timestamp).toLocaleString()}</p>
           <p className="mt-1 text-[11px] text-slate-400">{item.verification === 'session' ? `Verified on chain at ${new Date(item.verifiedAt!).toLocaleTimeString()}` : 'Saved status in this browser · not re-checked now'}</p>
           {item.refund && <p className="mt-2 text-xs font-medium text-amber-700">Refundable deposit: {item.refund}</p>}
         </div>

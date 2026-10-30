@@ -49,7 +49,7 @@ const writer: SuiTransferWriter = { writesEnabled: true, walletSendEnabled: true
 async function inspect(input: SuiRecoveryInput): Promise<SuiRecoveryResult> {
   state.inspects++
   const t = REAL.transfers.find(x => x.source.toLowerCase() === input.sourceId.toLowerCase())!
-  const r: SuiRecoveryResult = { ...input, sourceId: input.direction === 'arc-to-sui' ? input.sourceId.toLowerCase() : input.sourceId, amount: '0.1', maxFeeUnits: '0', sourceEventIndex: t.eventIndex, stage: t === last ? state.stage : 'complete', feeUsdc: '0', receivedUsdc: '0.1', ...(t !== last || state.stage === 'complete' ? { destinationTx: t.destination } : {}), checkedAt: Date.now() }
+  const r: SuiRecoveryResult = { ...input, sourceTime: Date.parse(t.sourceTime), sourceId: input.direction === 'arc-to-sui' ? input.sourceId.toLowerCase() : input.sourceId, amount: '0.1', maxFeeUnits: '0', sourceEventIndex: t.eventIndex, stage: t === last ? state.stage : 'complete', feeUsdc: '0', receivedUsdc: '0.1', ...(t !== last || state.stage === 'complete' ? { destinationTx: t.destination } : {}), checkedAt: Date.now() }
   importSuiRecovery(r); return r
 }
 

@@ -40,6 +40,11 @@ function unitsOf(text: string | null | undefined, decimals: number) {
   if (typeof text !== 'string' || !/^[0-9]{1,30}(?:\.[0-9]+)?$/.test(text)) return undefined
   const [i, f = ''] = text.split('.'); return f.length > decimals ? undefined : parseUnits(`${i}.${f || '0'}`, decimals)
 }
+// The source time from the chain when known; otherwise when this browser recorded it. Never a check time.
+function whenRow(r: { sourceTime?: number; createdAt?: number }): [string, string] {
+  return r.sourceTime ? ['Started', new Date(r.sourceTime).toLocaleString()] : r.createdAt ? ['Recorded here', new Date(r.createdAt).toLocaleString()] : ['Started', 'not known yet']
+}
+const whenText = (r: { sourceTime?: number; createdAt?: number }) => { const [k, v] = whenRow(r); return `${k === 'Recorded here' ? 'Recorded in this browser' : k} ${v}` }
 function readDraft(): { direction: Direction; amount: string } | null {
   try { const d = JSON.parse(window.sessionStorage.getItem(DRAFT) ?? 'null'); return d && ['arc-to-sui', 'sui-to-arc'].includes(d.direction) && typeof d.amount === 'string' && d.amount.length < 24 ? d : null } catch { return null }
 }
@@ -186,12 +191,13 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
   // released after review) ends this flow; the form opens again.
   useEffect(() => { if (attempt && !step && (attempt.state === 'reverted' || attempt.state === 'reconciled')) { setFlow(null); setPhase('idle') } }, [attempt, step])
 
-  // Completed Sui -> Arc records saved before the Arc mint hash was recorded get one
-  // silent, read-only re-check per page session, one at a time, never during a wallet step.
+  // Completed records saved before the Arc mint hash or the chain start time were
+  // recorded get one silent, read-only re-check per page session, one at a time,
+  // never during a wallet step. It only reads; nothing is sent.
   const backfilled = useRef(new Set<string>())
   useEffect(() => {
     if (!ready || checking || open || step || (active && activeStage !== 'complete')) return
-    const r = mine.find(x => x.direction === 'sui-to-arc' && x.stage === 'complete' && !x.destinationTx && !backfilled.current.has(x.id))
+    const r = mine.find(x => x.stage === 'complete' && (!x.destinationTx || !x.sourceTime) && !backfilled.current.has(x.id))
     if (!r) return
     backfilled.current.add(r.id); setChecking(r.sourceId)
     inspect({ direction: r.direction, sourceId: r.sourceId, suiOwner: sui.address!, evmOwner: evm.address! })
@@ -250,15 +256,23 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
       <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold">{chainOf(r.direction, 'from')} → {chainOf(r.direction, 'to')} · {r.amount} USDC</span><span className={v.stage === 'complete' ? 'text-[#2F6E0C]' : 'text-amber-800'}>{stageTitle(v.stage, r.direction)}</span></div>
       <div className="flex flex-wrap gap-3"><a className="underline" href={sourceLink(r)} target="_blank" rel="noreferrer">Source transaction</a>{dest ? <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a> : v.stage === 'complete' && <span className="text-slate-500">Destination transaction not found yet</span>}
         <button type="button" className="font-semibold underline disabled:text-slate-400" disabled={!ready || Boolean(checking) || Boolean(step) || open} onClick={() => { setClosed(c => c.filter(x => x !== r.id)); setFlow(null); setActiveId(r.id); lastChecked.current = null; void check(r) }}>{checking === r.sourceId ? 'Checking…' : fresh[r.id] ? 'Check again' : 'Check status'}</button></div>
-      <p className="text-slate-400">{fresh[r.id] ? `Verified on chain at ${new Date(fresh[r.id].checkedAt).toLocaleTimeString()}` : `Saved status${r.createdAt ? ` · recorded ${new Date(r.createdAt).toLocaleString()}` : ''}; open it to check the chains again.`}</p>
+      <p className="text-slate-500">{whenText({ sourceTime: v.sourceTime ?? r.sourceTime, createdAt: r.createdAt })}</p>
+      <p className="text-slate-400">{fresh[r.id] ? `Verified on chain at ${new Date(fresh[r.id].checkedAt).toLocaleTimeString()}` : 'Saved status in this browser; check it to read the chains again.'}</p>
     </li> })}</ul>
+  </details>
+
+  // One recovery form for a transfer started elsewhere: paste its source transaction; the direction follows from its format.
+  const findReady = ready && !checking && !step && !open
+  const renderRecovery = (tracking: SuiRecoveryRecord | null) => <details className="rounded-2xl border border-slate-200 p-4 text-sm">
+    <summary className="cursor-pointer font-semibold">Recover a transfer from another device or browser</summary>
+    <p className="mt-2 text-xs leading-5 text-slate-500">Paste the source transaction of a transfer made with the wallets connected now. Machina reads the burn, Circle's message and the destination chain and adds the transfer to this browser's history. It sends nothing; if your USDC is still waiting, you confirm the receive step in your wallet. Machina does not scan wallet history, so transfers made elsewhere appear only after you add them here.</p>
+    <div className="mt-3 grid gap-2 sm:grid-cols-[auto_1fr_auto]">
+      <select aria-label="Transfer direction to find" value={findDirection} onChange={e => setFindDirection(e.target.value as Direction)} className="rounded-lg border border-slate-200 bg-white p-2 text-xs"><option value="arc-to-sui">Arc → Sui</option><option value="sui-to-arc">Sui → Arc</option></select>
+      <input aria-label="Source transaction to find" value={findHash} onChange={e => { const v = e.target.value; setFindHash(v); if (/^0x/i.test(v.trim())) setFindDirection('arc-to-sui'); else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v.trim())) setFindDirection('sui-to-arc') }} maxLength={66} autoComplete="off" spellCheck={false} placeholder="Arc hash (0x…) or Sui digest" className="min-w-0 rounded-lg border border-slate-200 p-2 font-mono text-xs" />
+      <button type="button" disabled={!findReady || !findHash.trim()} onClick={() => void check({ direction: findDirection, sourceId: findHash.trim() }).then(x => { if (x) { setFlow(null); setActiveId(x.id); setFindHash('') } })} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold disabled:text-slate-400">{checking && checking === findHash.trim() ? 'Checking…' : 'Find'}</button>
+    </div>
+    {!ready && <p className="mt-2 text-xs text-slate-500">Connect the wallets that made the transfer: MetaMask on Arc Mainnet and Slush on Sui Mainnet.</p>}
     {checkError?.source && checkError.source !== tracking?.sourceId && <p role="alert" className="mt-2 rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">{checkError.message}</p>}
-    <details className="mt-2 text-xs"><summary className="cursor-pointer text-slate-500">Find a transfer made on another device</summary>
-      <div className="mt-2 grid gap-2 sm:grid-cols-[auto_1fr_auto]">
-        <select aria-label="Transfer direction to find" value={findDirection} onChange={e => setFindDirection(e.target.value as Direction)} className="rounded-lg border border-slate-200 bg-white p-2"><option value="arc-to-sui">Arc → Sui</option><option value="sui-to-arc">Sui → Arc</option></select>
-        <input aria-label="Source transaction to find" value={findHash} onChange={e => setFindHash(e.target.value)} maxLength={66} autoComplete="off" spellCheck={false} placeholder={findDirection === 'arc-to-sui' ? 'Arc transaction hash (0x…)' : 'Sui transaction digest'} className="min-w-0 rounded-lg border border-slate-200 p-2 font-mono" />
-        <button type="button" disabled={!ready || !findHash.trim() || Boolean(checking) || Boolean(step) || open} onClick={() => void check({ direction: findDirection, sourceId: findHash.trim() }).then(x => { if (x) { setFlow(null); setActiveId(x.id); setFindHash('') } })} className="rounded-lg border border-slate-300 px-3 py-2 font-semibold disabled:text-slate-400">Find</button>
-      </div></details>
   </details>
 
   const lastFinal = attempt && !open && attempt.state !== 'verified' ? attempt : null
@@ -298,7 +312,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
         {receive && !justSent && <SuiStepReview key={receive.sourceId} bare writer={writer} action={tracking.direction === 'arc-to-sui' ? 'sui-mint' : 'arc-mint'} ready={ready} evmWallet={walletName} onPhase={setPhase} onAttempt={a => { setAttempt(a); setPhase('idle') }}
           base={{ suiOwner: sui.address!, evmOwner: evm.address!, amount: parseUnits(receive.amount, 6), maxCctpFee: BigInt(receive.maxFeeUnits!), sourceId: receive.sourceId }}
           explain={<p>Receive {receive.receivedUsdc ?? receive.amount} USDC in your {chainOf(tracking.direction, 'to')} wallet. Confirm in {tracking.direction === 'arc-to-sui' ? 'Slush' : walletName}; the {chainOf(tracking.direction, 'to')} network fee is paid there.</p>} />}
-        {!(receive && phase !== 'idle') && <Summary rows={[['Amount', `${tracking.amount} USDC`], ['Circle fee', v.feeUsdc !== undefined ? `${v.feeUsdc} USDC` : 'known after verification'], [stage === 'complete' ? 'You received' : 'You receive', v.receivedUsdc !== undefined ? `${v.receivedUsdc} USDC` : `≈ ${tracking.amount} USDC`], ['Started', tracking.createdAt ? new Date(tracking.createdAt).toLocaleString() : 'before this browser recorded start times']]} />}
+        {!(receive && phase !== 'idle') && <Summary rows={[['Amount', `${tracking.amount} USDC`], ['Circle fee', v.feeUsdc !== undefined ? `${v.feeUsdc} USDC` : 'known after verification'], [stage === 'complete' ? 'You received' : 'You receive', v.receivedUsdc !== undefined ? `${v.receivedUsdc} USDC` : `≈ ${tracking.amount} USDC`], whenRow({ sourceTime: v.sourceTime ?? tracking.sourceTime, createdAt: tracking.createdAt })]} />}
         {stage === 'complete' && <p className="text-xs text-slate-600">You received {v.receivedUsdc ?? tracking.amount} USDC{v.feeUsdc && v.feeUsdc !== '0' ? ` (Circle fee ${v.feeUsdc} USDC)` : ''}.</p>}
         <div className="flex flex-wrap gap-3 text-xs"><a className="underline" href={sourceLink(tracking)} target="_blank" rel="noreferrer">Source transaction</a>{dest ? <a className="underline" href={dest} target="_blank" rel="noreferrer">Destination transaction</a> : v.stage === 'complete' && <span className="text-slate-500">Destination transaction not found yet</span>}</div>
       </div>
@@ -346,6 +360,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
     {/* One panel for the whole transfer: same frame and reserved height in every phase; only its content changes. */}
     <section aria-label="Sui transfer panel" data-phase={panelPhase} className="flex min-h-[44rem] flex-col sm:min-h-[40rem] rounded-2xl border border-slate-200 p-4 text-sm">{panel}</section>
     {renderHistory(tracking)}
+    {renderRecovery(tracking)}
   </div>
 }
 function StepRow({ step }: { step: SuiFlowStep }) {

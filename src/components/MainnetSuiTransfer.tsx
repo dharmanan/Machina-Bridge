@@ -3,6 +3,7 @@ import { formatUnits } from 'viem'
 import type { SuiArcMethod, SuiWriteAction, SuiWriteAttempt, SuiWriteIntent, SuiWriteReconciliation, SuiWriteReview } from '../lib/mainnetSuiExecution'
 import type { SuiTransferWriter } from '../hooks/useSuiMainnetWrite'
 import { arcTx, suiTx } from '../lib/bridgeHistory'
+import { feeEstimate, feeLimit } from '../lib/feeDisplay'
 
 // Explicit network-fee ceilings. The prepared transaction must stay within them;
 // they are never raised automatically.
@@ -24,7 +25,9 @@ const methodLabels: Record<SuiArcMethod, string> = { 'sign-only': 'Sign only —
 export const arcExplorer = (hash: string) => arcTx(hash)!
 export const suiExplorer = (digest: string) => suiTx(digest)!
 const walletOf = (action: SuiWriteAction, evmWallet: string) => action.startsWith('sui-') ? 'Slush' : evmWallet
+// Exact (Technical details) and readable (review row) network fee text; the bigint values are unchanged.
 function gasText(action: SuiWriteAction, value: bigint) { return action.startsWith('sui-') ? `${formatUnits(value, 9)} SUI` : `${formatUnits(value, 18)} USDC` }
+function gasShort(action: SuiWriteAction, estimate: bigint, limit: bigint) { const [d, u] = action.startsWith('sui-') ? [9, 'SUI'] : [18, 'USDC']; return `${feeEstimate(estimate, d, u)} · max ${feeLimit(limit, d, u)}` }
 function message(error: unknown) { return error instanceof Error && error.message ? error.message : 'The operation could not be verified. Nothing further will be sent.' }
 
 export type SuiStepBase = { suiOwner: string; evmOwner: string; amount: bigint; maxCctpFee?: bigint; sourceId?: string }
@@ -117,7 +120,7 @@ export default function SuiStepReview({ writer, action, base, ready, evmWallet =
       <p className="text-sm font-semibold">Review · {actionLabels[review.intent.action]}</p>
       <Row k="Amount" v={`${formatUnits(review.intent.amount, 6)} USDC`} />
       {review.intent.action !== 'arc-approval' && <Row k="Maximum Circle fee" v={`${formatUnits(review.intent.maxCctpFee, 6)} USDC`} />}
-      <Row k="Network fee" v={`${gasText(review.intent.action, review.estimatedGas)} · limit ${gasText(review.intent.action, review.maximumGas)}`} />
+      <Row k="Network fee" v={gasShort(review.intent.action, review.estimatedGas, review.maximumGas)} />
       <Row k="Wallets" v={`Arc ${short(review.intent.evmOwner)} · Sui ${short(review.intent.suiOwner)}`} title={`Arc ${review.intent.evmOwner} · Sui ${review.intent.suiOwner}`} mono />
       {review.intent.action.startsWith('arc-') && review.intent.arcMethod === 'wallet-send' && <p className="rounded-lg bg-amber-50 p-2 text-amber-900">{wallet} signs and sends this itself. Machina then checks on chain that it matches this review; if not, new transfers stay locked and it is never shown as complete.</p>}
       <details><summary className="cursor-pointer font-medium text-slate-600">Technical details</summary>

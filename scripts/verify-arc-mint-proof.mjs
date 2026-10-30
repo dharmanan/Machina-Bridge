@@ -75,4 +75,12 @@ await test('recovery: a used Arc nonce stays complete; destinationTx is set only
   assert.equal(withHint.stage, 'complete'); assert.equal(withHint.destinationTx, undefined, 'a real mint of ANOTHER message is not accepted for this transfer')
   assert.equal('destinationHints' in withHint, false, 'hints are not stored in the record')
 })
+await test('Circle lookups use the canonical hash form: upper-case EVM hashes are lowered, Sui digests are kept exactly', async () => {
+  const { readBoundCctpAttestation, decodeCctpRecoveryMessage } = require('../src/lib/mainnetCctpRecovery.ts'), urls = []
+  const fetcher = async url => { urls.push(String(url)); return new Response(null, { status: 404 }) }
+  const fields = decodeCctpRecoveryMessage(A.message)
+  await readBoundCctpAttestation({ fields: { ...fields, sourceDomain: 26 }, sourceTxHash: '0x' + 'AB'.repeat(32) }, fetcher)
+  await readBoundCctpAttestation({ fields, sourceTxHash: A.source }, fetcher)
+  assert.ok(urls[0].endsWith('transactionHash=0x' + 'ab'.repeat(32)), urls[0]); assert.ok(urls[1].endsWith('transactionHash=' + A.source), urls[1])
+})
 console.log(`RESULT ${count}/${count} Arc mint proof groups PASS; real receipts and Circle messages of 2 Sui -> Arc transfers; no network.`)

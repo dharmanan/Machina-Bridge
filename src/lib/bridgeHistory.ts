@@ -15,9 +15,10 @@ export type BridgeHistoryItem = {
   from: string
   to: string
   amount: string
-  // When the transfer was first recorded here; 'checked' when only the last status check time is known.
+  // 'started': chain time of the source burn, or the time this browser started the transfer.
+  // 'recorded': when this browser first saw it (e.g. recovered later). 'checked': only the last check is known.
   timestamp: number
-  timestampKind: 'started' | 'checked'
+  timestampKind: 'started' | 'recorded' | 'checked'
   status: BridgeHistoryStatus
   statusLabel: string
   // 'session': independently re-read from the chains on this page since it was opened.
@@ -64,7 +65,7 @@ export const SUI_STAGE_LABELS: Record<SuiRecoveryResult['stage'], string> = { wa
 export function evmHistoryItem(r: MainnetTransferRecord): BridgeHistoryItem {
   return {
     key: `evm:${r.id}`, family: 'evm', from: networkName(r.sourceChainId), to: networkName(r.destinationChainId), amount: r.amount,
-    timestamp: r.createdAt, timestampKind: 'started',
+    timestamp: r.createdAt, timestampKind: r.recovered ? 'recorded' : 'started',
     status: r.stage === 'complete' ? 'complete' : r.stage === 'failed' ? 'failed' : r.stage === 'ready_to_mint' || r.stage === 'approval_required' ? 'action' : 'in_progress',
     statusLabel: EVM_LABELS[r.stage] ?? 'In progress', verification: 'saved',
     sourceId: r.sourceTxHash?.toLowerCase(), sourceEventIndex: r.sourceLogIndex,
@@ -90,7 +91,7 @@ export function suiHistoryItem(r: SuiRecoveryRecord, checks: ReadonlyMap<string,
   const stage = check?.stage ?? r.stage
   return {
     key: `sui:${r.id}`, family: 'sui', from: toSui ? 'Arc' : 'Sui', to: toSui ? 'Sui' : 'Arc', amount: r.amount,
-    timestamp: r.createdAt ?? r.checkedAt, timestampKind: r.createdAt ? 'started' : 'checked',
+    timestamp: r.sourceTime ?? r.createdAt ?? r.checkedAt, timestampKind: r.sourceTime ? 'started' : r.createdAt ? 'recorded' : 'checked',
     status: stage === 'complete' ? 'complete' : stage === 'ready_to_mint' ? 'action' : 'in_progress', statusLabel: SUI_STAGE_LABELS[stage],
     verification: check ? 'session' : 'saved', verifiedAt: check?.checkedAt,
     sourceId: toSui ? r.sourceId.toLowerCase() : r.sourceId, sourceEventIndex: r.sourceEventIndex,

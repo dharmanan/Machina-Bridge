@@ -83,7 +83,9 @@ export function immutableMessageMatches(a: CctpBurnProof['fields'], b: CctpBurnP
 export async function readBoundCctpAttestation(proof: Pick<CctpBurnProof, 'fields'> & {sourceTxHash:string}, fetcher: typeof fetch = fetch): Promise<{ status: 'pending' | 'complete'; message?: Hex; attestation?: Hex; eventNonce?: string; destinationTxHint?: Hex }> {
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 10_000)
   try {
-    const response = await fetcher(`${CIRCLE_MAINNET.irisApiBase}/v2/messages/${proof.fields.sourceDomain}?transactionHash=${encodeURIComponent(proof.sourceTxHash)}`, { headers: { Accept: 'application/json' }, signal: controller.signal })
+    // EVM hashes go to Circle in lower case (its index is case-sensitive); Sui base58 digests are case-sensitive and kept.
+    const sourceTx = /^0x/i.test(proof.sourceTxHash) ? proof.sourceTxHash.toLowerCase() : proof.sourceTxHash
+    const response = await fetcher(`${CIRCLE_MAINNET.irisApiBase}/v2/messages/${proof.fields.sourceDomain}?transactionHash=${encodeURIComponent(sourceTx)}`, { headers: { Accept: 'application/json' }, signal: controller.signal })
     if (response.status === 404) return { status: 'pending' }
     if (!response.ok) throw new Error(`Circle recovery API HTTP ${response.status}; no mint was requested.`)
     const reader = response.body?.getReader(); if (!reader) throw new Error('Circle recovery response is missing.')
