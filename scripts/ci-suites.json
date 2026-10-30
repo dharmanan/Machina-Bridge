@@ -99,6 +99,7 @@
    "verify-sui-transfer-review-ui",
    "verify-mainnet-earn-safety-ui",
    "verify-solana-bridge-ui",
+   "verify-mobile-menu-ui",
    "verify-app-shell-ui",
    "verify-bridge-dashboard-ui",
    "verify-sui-recovery-ui",
@@ -178,7 +179,8 @@
   "verify-swap-unified-ui-c": "swap",
   "verify-swap-unified-ui-d": "swap",
   "verify-swap-unified-ui-e": "swap",
-  "verify-solana-bridge-ui": "solana-bridge"
+  "verify-solana-bridge-ui": "solana-bridge",
+  "verify-mobile-menu-ui": "app-shell"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",

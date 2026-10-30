@@ -41,7 +41,8 @@ try {
   await test('desktop and mobile top bar and Sui bridge fit without horizontal overflow', async () => {
     await page.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet'))
     for (const [name, width, height] of [['desktop', 1280, 900], ['mobile', 390, 844]]) {
-      await page.setViewportSize({ width, height }); await page.goto(base); await page.getByLabel('Sui wallet').waitFor()
+      // Phones use the compact header and menu (verify-mobile-menu-ui); the desktop wallet chips exist only from md up.
+      await page.setViewportSize({ width, height }); await page.goto(base); await (name === 'desktop' ? page.getByLabel('Sui wallet').waitFor() : page.getByRole('button', { name: 'Open menu' }).waitFor())
       const notice = page.getByRole('button', { name: 'Continue on mobile' }); if (await notice.isVisible().catch(() => false)) await notice.click() // the app's own mobile notice
       await page.getByRole('button', { name: /^Sui/ }).first().click(); await page.getByRole('region', { name: 'Sui Mainnet bridge' }).waitFor()
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, name)

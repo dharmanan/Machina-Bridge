@@ -13,10 +13,11 @@ import { useSuiWallet } from './hooks/useSuiWallet'
 import { addChainToWallet, getEvmChainOptionsForNetwork, getSupportedEvmChain, getSupportedEvmChainName } from './lib/chains'
 import { logger } from './lib/logger'
 import { readStoredAppNetwork, storeAppNetwork, type AppNetwork } from './config/runtime'
-import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, AlertTriangle, X, TrendingUp, Activity as ActivityIcon } from 'lucide-react'
+import { Zap, GitBranch, BarChart3, Twitter, Github, ChevronDown, Droplets, TrendingUp, Activity as ActivityIcon } from 'lucide-react'
 import arcLogo from './assets/arc.png'
 import DesignedByFooter from './components/DesignedByFooter'
-import WalletBar from './components/WalletBar'
+import WalletBar, { phantomBrowseUrl, slushBrowseUrl } from './components/WalletBar'
+import MobileAppBar from './components/MobileAppBar'
 import './index.css'
 
 // Borrow is paused: its implementation remains in the repository, but no production
@@ -55,8 +56,6 @@ export default function App() {
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
   const [showLendingDropdown, setShowLendingDropdown] = useState(false)
   const [isMobileExperience, setIsMobileExperience] = useState(false)
-  const [hasDismissedMobileNotice, setHasDismissedMobileNotice] = useState(false)
-  const [mobileHelperMessage, setMobileHelperMessage] = useState<string | null>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const lendingDropdownRef = useRef<HTMLDivElement>(null)
 
@@ -174,112 +173,48 @@ export default function App() {
     }
   }
 
-  const handleOpenInMetaMaskBrowser = () => {
-    if (typeof window === 'undefined') {
-      return
-    }
-
-    const currentUrl = window.location.href
-    const metamaskUrl = `https://metamask.app.link/dapp/${currentUrl.replace(/^https?:\/\//, '')}`
-    setHasDismissedMobileNotice(true)
-    setMobileHelperMessage(null)
-    window.location.href = metamaskUrl
-  }
-
-  const handleCopyLinkForPhantomBrowser = async () => {
-    if (typeof window === 'undefined') {
-      return
-    }
-
-    const currentUrl = window.location.href
-
-    try {
-      if (window.navigator.clipboard?.writeText) {
-        await window.navigator.clipboard.writeText(currentUrl)
-        setMobileHelperMessage('Link copied. Open Phantom browser and paste this URL there.')
-        return
-      }
-    } catch (error) {
-      logger.warn('Unable to copy the mobile browser link for Phantom:', error)
-    }
-
-    window.prompt('Copy this URL into Phantom browser:', currentUrl)
-    setMobileHelperMessage('Open Phantom browser and paste the copied URL there.')
-  }
-
-  const showMobileNotice = isMobileExperience && !hasDismissedMobileNotice
+  const solanaWallet = { address: phantomSolanaAddress ?? null, connecting: isConnectingPhantomSolana, available: isPhantomInstalled, error: phantomSolanaError ?? null, connect: () => void handlePhantomAction(), disconnect: () => void handlePhantomAction() }
+  const suiWallet = { address: suiAddress, walletName: suiCurrentWalletName, connecting: isConnectingSuiWallet, available: isSuiWalletAvailable, supported: suiSupported, error: suiWalletError, connect: () => void handleSuiWalletAction(), disconnect: () => void handleSuiWalletAction() }
+  // Phones/tablets: Phantom is injected only inside its own app browser; Slush also offers its app browser.
+  const pageUrl = typeof window === 'undefined' ? '' : `${window.location.origin}${window.location.pathname}`
+  const phantomOpenUrl = isMobileExperience && !isPhantomInstalled && pageUrl ? phantomBrowseUrl(pageUrl, window.location.origin) : null
+  const slushOpenUrl = isMobileExperience && pageUrl ? slushBrowseUrl(pageUrl) : null
+  // MetaMask's in-app browser (its dapp universal link), which the old mobile notice offered.
+  const metaMaskOpenUrl = isMobileExperience && pageUrl ? `https://metamask.app.link/dapp/${pageUrl.replace(/^https?:\/\//, '')}` : null
+  const mobileNavItems = appNetwork === 'mainnet'
+    ? [
+        { id: 'bridge', label: 'Bridge', icon: <GitBranch size={18} /> },
+        { id: 'swap', label: 'Swap', icon: <Zap size={18} /> },
+        { id: 'earn', label: 'Earn', icon: <TrendingUp size={18} /> },
+        { id: 'dashboard', label: 'Dashboard', icon: <BarChart3 size={18} /> },
+        { id: 'activity', label: 'Activity', icon: <ActivityIcon size={18} /> },
+      ]
+    : tabs.map(tab => ({ id: tab.id, label: tab.label, icon: tab.icon }))
+  const mobileNavLinks = appNetwork === 'testnet'
+    ? [{ label: 'Lending · Arc Machina', href: 'https://arcmachina.xyz/' }, { label: 'Faucet', href: 'https://faucet.circle.com/', icon: <Droplets size={18} /> }]
+    : []
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900">
-      {showMobileNotice && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/70 px-4 py-6 backdrop-blur-sm">
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="mobile-warning-title"
-            className="relative w-full max-w-md rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_24px_80px_rgba(15,23,42,0.28)]"
-          >
-            <button
-              type="button"
-              onClick={() => setHasDismissedMobileNotice(true)}
-              className="absolute right-4 top-4 rounded-full border border-slate-200 p-2 text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
-              aria-label="Close mobile notice"
-            >
-              <X size={16} />
-            </button>
+      <MobileAppBar
+        logoSrc={arcLogo}
+        appNetwork={appNetwork}
+        evmNetworkName={selectedNetworkLabel}
+        phantomOpenUrl={phantomOpenUrl}
+        slushOpenUrl={slushOpenUrl}
+        metaMaskOpenUrl={metaMaskOpenUrl}
+        solana={solanaWallet}
+        sui={suiWallet}
+        activeTab={activeTab}
+        navItems={mobileNavItems}
+        navLinks={mobileNavLinks}
+        onSelectTab={(id) => setActiveTab(id as Tab)}
+        onNetworkChange={handleAppNetworkChange}
+        evmNetworks={networks.map((network) => ({ id: network.id, name: network.name }))}
+        evmChainId={isCurrentChainInSelectedProfile ? chainId : undefined}
+        onEvmNetworkSwitch={(id) => void handleNetworkSwitch(id)}
+      />
 
-            <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
-              <AlertTriangle size={22} />
-            </div>
-
-            <h2 id="mobile-warning-title" className="text-xl font-semibold tracking-tight text-slate-900">
-              Mobile notice
-            </h2>
-            <p className="mt-3 text-sm leading-6 text-slate-600">
-              This version is not optimized for mobile devices. Please use a desktop browser for the best experience.
-            </p>
-            <p className="mt-2 text-sm leading-6 text-slate-500">
-              You can continue on mobile, but wallet connections and transaction flows may not work as expected.
-            </p>
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-600">
-              Safari does not reliably switch back and forth with wallet apps on iPhone. MetaMask usually works best in its in-app browser. Use Phantom browser when you want the Solana-side Phantom connection to be detected more reliably.
-            </div>
-
-            <div className="mt-6 flex flex-col gap-3">
-              <button
-                type="button"
-                onClick={handleOpenInMetaMaskBrowser}
-                className="inline-flex w-full items-center justify-center rounded-2xl border border-[#2F6E0C]/20 bg-[#eef7e8] px-4 py-3 text-sm font-semibold text-[#2F6E0C] transition-colors hover:bg-[#e4f1db]"
-              >
-                Open In MetaMask Browser
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleCopyLinkForPhantomBrowser()}
-                className="inline-flex w-full items-center justify-center rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
-              >
-                Copy Link For Phantom Browser
-              </button>
-              {mobileHelperMessage && (
-                <p className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-xs leading-5 text-sky-900">
-                  {mobileHelperMessage}
-                </p>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  setHasDismissedMobileNotice(true)
-                  setMobileHelperMessage(null)
-                }}
-                className="inline-flex w-full items-center justify-center rounded-2xl bg-[#2F6E0C] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#25580A]"
-              >
-                Continue on mobile
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <header className="sticky top-0 z-50 border-b border-slate-200 bg-white/85 backdrop-blur-lg">
+      <header className="sticky top-0 z-50 hidden border-b border-slate-200 bg-white/85 backdrop-blur-lg md:block">
         <Container className="py-4">
           <div className="grid gap-4 lg:grid-cols-[minmax(380px,460px)_minmax(0,1fr)] lg:items-center lg:gap-8">
             <div className="flex items-start gap-4">
@@ -374,8 +309,9 @@ export default function App() {
               <WalletBar
                 appNetwork={appNetwork}
                 evmNetworkName={selectedNetworkLabel}
-                solana={{ address: phantomSolanaAddress ?? null, connecting: isConnectingPhantomSolana, available: isPhantomInstalled, error: phantomSolanaError ?? null, connect: () => void handlePhantomAction(), disconnect: () => void handlePhantomAction() }}
-                sui={{ address: suiAddress, walletName: suiCurrentWalletName, connecting: isConnectingSuiWallet, available: isSuiWalletAvailable, supported: suiSupported, error: suiWalletError, connect: () => void handleSuiWalletAction(), disconnect: () => void handleSuiWalletAction() }}
+                phantomOpenUrl={phantomOpenUrl}
+                solana={solanaWallet}
+                sui={suiWallet}
               />
             </div>
           </div>
@@ -383,7 +319,7 @@ export default function App() {
       </header>
 
       {appNetwork === 'testnet' && (
-        <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
+        <div className="hidden border-b border-slate-200 bg-[#f7f9f5]/70 md:block">
           <Container>
             <nav className="flex flex-wrap gap-2 py-4">
               {tabs.map((tab) => (
@@ -439,7 +375,7 @@ export default function App() {
       )}
 
       {appNetwork === 'mainnet' && (
-        <div className="border-b border-slate-200 bg-[#f7f9f5]/70">
+        <div className="hidden border-b border-slate-200 bg-[#f7f9f5]/70 md:block">
           <Container>
             <nav className="flex flex-wrap gap-2 py-4">
               {[
