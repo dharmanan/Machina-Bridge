@@ -41,7 +41,7 @@ rpc.state.owner = owner; rpc.state.block = 27_300_000n; rpc.state.gasPrice = 20_
 const FIRST_BLOCK = BigInt(real.eth_getTransactionReceipt.blockNumber)
 
 const server = await createServer({ configFile: false, root, define: { 'import.meta.env.VITE_SWAP_EXECUTION_MODE': JSON.stringify('open'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_ENABLED': JSON.stringify('true'), 'import.meta.env.VITE_UNISWAP_ARC_PILOT_WALLET': JSON.stringify(owner) },
-  cacheDir: `${root}.verification/vite-unified-ui`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
+  cacheDir: `${root}.verification/vite-unified-ui${process.env.MACHINA_SWAP_SHARD ? "-" + process.env.MACHINA_SWAP_SHARD : ""}`, server: { host: '127.0.0.1', port: 0 }, plugins: [{
     name: 'read-only-baseline-lifecycle-probe', enforce: 'pre', transform(code, id) {
       // TEST ONLY: a disposable signer replaces the canary address. Production policy has separate tests.
       if (id.split('?')[0] === `${root}src/config/swapExecution.ts`) return `import { swapExecutionConfig } from '../lib/swap/executionMode'; export const SWAP_EXECUTION = Object.freeze({ ...swapExecutionConfig('true', '${owner}', 'open'), canaryWallet: '${owner}' });`
@@ -81,7 +81,18 @@ await server.listen()
 const base = `http://127.0.0.1:${server.httpServer.address().port}`
 let browser, page, peer, count = 0
 const errors = [], methods = []
+// CI runs this suite as parallel shards (scripts/verify-swap-unified-ui-{a,b,c,d,e}.mjs). Groups are
+// numbered in the order they are declared; group 1 (setup) and the last group (traffic audit) run in
+// every shard, the others in exactly one. SWAP_GROUPS must match the declared groups, so a new group
+// cannot silently fall outside every shard.
+const SWAP_GROUPS = 63
+const SWAP_SHARDS = { a: [2, 18], b: [19, 22], c: [23, 26], d: [27, 49], e: [50, 62] }
+const shard = process.env.MACHINA_SWAP_SHARD
+if (shard !== undefined && !SWAP_SHARDS[shard]) throw new Error('Unknown swap shard ' + shard)
+let declared = 0
 async function test(name, fn) {
+  const ordinal = ++declared
+  if (shard && ordinal !== 1 && ordinal !== SWAP_GROUPS && (ordinal < SWAP_SHARDS[shard][0] || ordinal > SWAP_SHARDS[shard][1])) return
   if (process.env.MACHINA_INPUT_RANGE_ONLY === '1' && !/^(the mode chip|balance shortcuts|input range:|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_QUOTE_UX_ONLY === '1' && !/^(the mode chip|compact provider cards|quote UX:|no unapproved wallet)/.test(name)) return
   if (process.env.MACHINA_TAB_BASELINE_PROBE === '1' && !/^(the mode chip|real tabs: unsigned)/.test(name)) return
@@ -195,7 +206,8 @@ try {
     window.nativeTabEvents = []
     document.addEventListener('visibilitychange', event => window.nativeTabEvents.push({ state: document.visibilityState, trusted: event.isTrusted }))
   })
-  await page.goto(base + '/__swap_ui_test')
+  // First load only: a cold Vite dependency optimisation can exceed the 20 s step timeout when shards start together.
+  await page.goto(base + '/__swap_ui_test', { timeout: 120_000 })
   {
     const session = await context.newCDPSession(page), { targetInfo } = await session.send('Target.getTargetInfo')
     const created = context.waitForEvent('page')
@@ -219,7 +231,10 @@ try {
   const latest = page.getByRole('article', { name: 'Latest transaction' }), uniCard = page.getByRole('radio', { name: 'Uniswap quote' }), circleCard = page.getByRole('radio', { name: 'Circle Swap Kit quote' })
   const sends = () => page.evaluate(() => window.swapUiTest.state.sent.length)
   // A nudge to the status check. Once a result is final the Check status button is gone (nothing is left to check), and the automatic check may already have finished.
-  const recheck = async () => { try { await page.getByRole('button', { name: 'Check status' }).first().click({ timeout: 4000 }) } catch { /* settled already */ } }
+  // Re-reads the chain now when the app offers it; when no Check status button is shown the app is
+  // already polling (or settled), and the caller's next waitFor asserts the expected state. Never waits
+  // for a button that is not there (that cost a silent 4 s per call).
+  const recheck = async () => { const button = page.getByRole('button', { name: 'Check status' }).first(); if (await button.isVisible().catch(() => false)) await button.click({ timeout: 4000 }).catch(() => { /* settled meanwhile */ }) }
   const pick = async (from, to) => { await page.getByRole('combobox', { name: 'From token' }).selectOption(from); await page.getByRole('combobox', { name: 'To token' }).selectOption(to) }
   const quoted = async () => { await uniCard.getByText(/Minimum/).waitFor(); await circleCard.getByText(/Minimum/).waitFor() }
   // Runs the page's (fake) timers in small steps so each automatic status lookup can finish before the next timer is due.
@@ -1092,7 +1107,10 @@ try {
     assert.equal(methods.some(m => /send|sign|wallet_|personal/i.test(m)), false)
     const wallet = await page.evaluate(() => window.swapUiTest.state.requests.map(r => r.method)); assert.equal(wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).length, 0, wallet.filter(m => !/^(eth_(chainId|accounts|requestAccounts|getTransactionCount|sendTransaction|signTypedData_v4)|wallet_switchEthereumChain)$/.test(m)).join())
   })
-  console.log(`${count} Chromium unified Swap UI groups PASS. Controlled Arc RPC, Circle estimator and wallet; no real signature, approval or transaction.`)
+  assert.equal(declared, SWAP_GROUPS, 'update SWAP_GROUPS and SWAP_SHARDS when groups are added or removed')
+  const covered = Object.values(SWAP_SHARDS).flatMap(([from, to]) => Array.from({ length: to - from + 1 }, (_, i) => from + i)).sort((x, y) => x - y)
+  assert.deepEqual(covered, Array.from({ length: SWAP_GROUPS - 2 }, (_, i) => i + 2), 'every group runs in exactly one shard')
+  console.log(`${count} Chromium unified Swap UI groups PASS${shard ? ` (shard ${shard})` : ''}. Controlled Arc RPC, Circle estimator and wallet; no real signature, approval or transaction.`)
 } finally {
   // Close the peer explicitly on success and failure; browser close also releases the remaining pages/context.
   try { if (peer && !peer.isClosed()) { await peer.close(); assert.equal(peer.isClosed(), true) } }

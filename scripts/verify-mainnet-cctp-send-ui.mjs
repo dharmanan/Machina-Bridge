@@ -59,7 +59,7 @@ try {
     if (url.hostname === 'rpc.mainnet.arc.io' && req.method() === 'POST') {
       if (chain.rpcDown) return route.fulfill({ status: 503, body: 'down' })
       const body = req.postDataJSON(), many = Array.isArray(body)
-      if (chain.receiptDown && (many ? body : [body]).some(b => ['eth_getTransactionReceipt', 'eth_getTransactionByHash'].includes(b.method))) return route.fulfill({ status: 503, body: 'down' })
+      if (chain.receiptDown && (many ? body : [body]).some(b => ['eth_getTransactionReceipt', 'eth_getTransactionByHash'].includes(b.method))) { chain.calls.push('receipt-refused'); return route.fulfill({ status: 503, body: 'down' }) }
       try { const out = (many ? body : [body]).map(b => ({ jsonrpc: '2.0', id: b.id, result: answer(b) })); return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(many ? out : out[0]) }) }
       catch (e) { errors.push(e.message); return route.fulfill({ status: 500, body: e.message }) }
     }
@@ -72,6 +72,9 @@ try {
   const st = p => page.evaluate(p => Object.assign(window.cctpTest.state, p), p)
   const sends = () => page.evaluate(() => window.cctpTest.state.sends.length)
   const lastHash = () => page.evaluate(() => window.cctpTest.state.hashes.at(-1))
+  // One full recovery pass after this point: the loop has read the chain (allowance call for an approval,
+  // DepositForBurn logs for a burn) and applied its decision. Replaces fixed sleeps of 3-5 s.
+  const recoveryPass = async method => { const seen = chain.calls.filter(m => m === method).length; for (let i = 0; i < 400 && chain.calls.filter(m => m === method).length <= seen; i++) await page.waitForTimeout(25); assert.ok(chain.calls.filter(m => m === method).length > seen, 'the recovery loop ran'); await page.waitForTimeout(150) }
   const waitStage = (id, stage, ms = 15000) => page.waitForFunction(([id, stage]) => window.cctpTest.api.record(id)?.stage === stage, [id, stage], { timeout: ms })
   // Mines the next wallet send: the hash appears with the given receipt status.
   const mine = status => page.evaluate(() => window.cctpTest.state.hashes.length).then(async n => { for (let i = 0; i < 100 && (await page.evaluate(() => window.cctpTest.state.hashes.length)) === n; i++) await page.waitForTimeout(20) }).then(async () => { chain.receipts[await lastHash()] = status; chain.block += 2 })
@@ -117,7 +120,7 @@ try {
     await fresh(); let id = await api('plan', '1.5'); await st({ send: ['lost'] }); await api('approve', id, '1.5')
     chain.allowance = 1_500_000n; await waitStage(id, 'approved')
     await fresh(); id = await api('plan', '1.5'); await st({ send: ['lost'] }); await api('approve', id, '1.5')
-    await page.waitForTimeout(5000); assert.equal((await api('record', id)).stage, 'approving', 'nonce unchanged: still unknown')
+    await recoveryPass('eth_call'); assert.equal((await api('record', id)).stage, 'approving', 'nonce unchanged: still unknown')
     chain.nonce = { latest: 8, pending: 8 }; await waitStage(id, 'approval_required')
   })
   await test('lost burn hash: a matching DepositForBurn after the attempt is adopted; anything else (another amount, a moved nonce) keeps it locked', async () => {
@@ -126,9 +129,9 @@ try {
     await waitStage(id, 'waiting_attestation'); assert.equal((await api('record', id)).sourceTxHash, hash)
     await fresh(); id = await api('plan', '1.5', false); await st({ send: ['lost'] }); await api('burn', id, '1.5')
     chain.burns.push({ block: chain.block + 1, amount: 2_000_000n, hash: '0x' + 'ef'.repeat(32) }); chain.block += 3
-    await page.waitForTimeout(5000); assert.equal((await api('record', id)).stage, 'burning', 'a burn of another amount is not adopted; nonce unchanged keeps it locked')
+    await recoveryPass('eth_getLogs'); assert.equal((await api('record', id)).stage, 'burning', 'a burn of another amount is not adopted; nonce unchanged keeps it locked')
     // A moved nonce is not proof: the wallet may still broadcast the burn later. Only a matching burn releases the step.
-    chain.nonce = { latest: 9, pending: 9 }; chain.block += 3; await page.waitForTimeout(5000)
+    chain.nonce = { latest: 9, pending: 9 }; chain.block += 3; await recoveryPass('eth_getLogs')
     const r = await api('record', id); assert.equal(r.stage, 'burning'); assert.equal(r.sourceTxHash, undefined)
   })
   await test('no second burn while the first burn is unresolved (RPC timeout after the hash, or a lost hash): the wallet is never asked again until the source burn is proven', async () => {
@@ -140,7 +143,7 @@ try {
       const again = await api('burn', id, '1.5'); assert.ok(again.error, mode + ': a second burn of the same transfer is refused'); assert.equal(await sends(), 1, mode)
       const other = await page.evaluate(() => { try { window.cctpTest.api.plan('2', false); return 'created' } catch (e) { return e.message } })
       assert.match(other, /not confirmed/i, mode + ': no other transfer from this wallet either')
-      chain.nonce = { latest: 8, pending: 8 }; chain.block += 3; await page.waitForTimeout(3000)
+      chain.nonce = { latest: 8, pending: 8 }; chain.block += 3; await recoveryPass(mode === 'lost' ? 'eth_getLogs' : 'receipt-refused')
       assert.equal((await api('record', id)).stage, 'burning', mode + ': still locked after the nonce moved'); assert.equal(await sends(), 1)
       if (mode === 'receiptDown') { chain.receiptDown = false; chain.receipts[await lastHash()] = 'success'; await waitStage(id, 'waiting_attestation') }
     }

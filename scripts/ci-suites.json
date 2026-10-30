@@ -90,16 +90,21 @@
    "verify-earn-kit-real-provider"
   ],
   "browser": [
+   "verify-swap-unified-ui-a",
+   "verify-swap-unified-ui-d",
+   "verify-mainnet-cctp-send-ui",
+   "verify-swap-unified-ui-e",
+   "verify-swap-unified-ui-b",
+   "verify-swap-unified-ui-c",
    "verify-sui-transfer-review-ui",
-   "verify-swap-unified-ui",
-   "verify-sui-recovery-ui",
-   "verify-bridge-dashboard-ui",
+   "verify-mainnet-earn-safety-ui",
+   "verify-solana-bridge-ui",
    "verify-app-shell-ui",
+   "verify-bridge-dashboard-ui",
+   "verify-sui-recovery-ui",
    "verify-mainnet-transfer-recovery-ui",
    "verify-sui-write-browser",
-   "verify-sui-wallet-foundation-ui",
-   "verify-mainnet-cctp-send-ui",
-   "verify-mainnet-earn-safety-ui"
+   "verify-sui-wallet-foundation-ui"
   ],
   "legacy": [
    "verify-mainnet-borrow",
@@ -146,7 +151,6 @@
   "verify-wallet-activity-fixes": "activity",
   "verify-mainnet-solana-bridgekit": "solana-bridge",
   "verify-sui-transfer-review-ui": "sui-bridge",
-  "verify-swap-unified-ui": "swap",
   "verify-sui-recovery-ui": "sui-bridge",
   "verify-app-shell-ui": "app-shell",
   "verify-mainnet-transfer-recovery-ui": "evm-bridge",
@@ -168,7 +172,13 @@
   "verify-mainnet-cctp-send-ui": "evm-bridge",
   "verify-mainnet-earn-safety-ui": "earn",
   "verify-swap-execution-config": "swap",
-  "verify-earn-kit-real-provider": "earn"
+  "verify-earn-kit-real-provider": "earn",
+  "verify-swap-unified-ui-a": "swap",
+  "verify-swap-unified-ui-b": "swap",
+  "verify-swap-unified-ui-c": "swap",
+  "verify-swap-unified-ui-d": "swap",
+  "verify-swap-unified-ui-e": "swap",
+  "verify-solana-bridge-ui": "solana-bridge"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",
@@ -185,7 +195,8 @@
   "verify-mainnet-borrow-markets-onchain": "Borrow (paused): live reads",
   "verify-mainnet-borrow-target-live": "Borrow (paused): live reads",
   "verify-borrow-adapter-119-isolated": "Borrow (paused): SDK isolation lab",
-  "verify-sui-live-recovery": "live read-only Mainnet recovery through the real UI (NODE_USE_ENV_PROXY=1 node scripts/verify-sui-live-recovery.mjs)"
+  "verify-sui-live-recovery": "live read-only Mainnet recovery through the real UI (NODE_USE_ENV_PROXY=1 node scripts/verify-sui-live-recovery.mjs)",
+  "verify-swap-unified-ui": "full sequential run of all Swap UI groups; CI runs the same groups as shards verify-swap-unified-ui-{a..e} (coverage guard in the suite)"
  },
  "patterns": [
   {
