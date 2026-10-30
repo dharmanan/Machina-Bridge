@@ -132,8 +132,10 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
   const [nextCheckAt, setNextCheckAt] = useState<number | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const [findHash, setFindHash] = useState(''), [findDirection, setFindDirection] = useState<Direction>('arc-to-sui')
+  const findRef = useRef(findHash); findRef.current = findHash
   const ready = Boolean(evm.address && evm.onArc && sui.address && sui.ready)
   const owners = `${sui.address ?? ''}|${evm.address ?? ''}`.toLowerCase()
+  const ownersRef = useRef(owners); ownersRef.current = owners
   const mine = useMemo(() => records.filter(r => `${r.suiOwner}|${r.evmOwner}`.toLowerCase() === owners), [records, owners])
   const view = (r: SuiRecoveryRecord) => fresh[r.id] ?? r
 
@@ -152,12 +154,13 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
 
   const check = useCallback(async (r: { direction: Direction; sourceId: string; id?: string }) => {
     if (!sui.address || !evm.address) return null
+    const who = ownersRef.current
     setChecking(r.sourceId)
     try {
       const res = await inspect({ direction: r.direction, sourceId: r.sourceId, suiOwner: sui.address, evmOwner: evm.address })
       const id = suiTransferIdentity(res)
       setFresh(f => ({ ...f, [id]: res })); noteSuiSessionCheck(id, res); setCheckError(null); return { id, res }
-    } catch (e) { setCheckError({ source: r.sourceId, message: e instanceof Error ? e.message : 'The transfer status could not be verified. Nothing was sent.' }); return null }
+    } catch (e) { if (ownersRef.current !== who) return null; setCheckError({ source: r.sourceId, message: e instanceof Error ? e.message : 'The transfer status could not be verified. Nothing was sent.' }); return null }
     finally { setChecking(null) }
   }, [inspect, sui.address, evm.address])
 
@@ -165,6 +168,7 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
   // newest unfinished one for these wallets. Stored rows are never mint authority.
   const active = (activeId ? mine.find(r => r.id === activeId) : null) ?? mine.find(r => view(r).stage !== 'complete' && !closed.includes(r.id)) ?? null
   const activeStage = active ? view(active).stage : null
+  const activeRef = useRef(active?.id); activeRef.current = active?.id
   // Keep following an automatically picked transfer, so its completion is shown instead of the panel jumping back to the form.
   useEffect(() => { if (active && activeId !== active.id && !(activeId && mine.some(r => r.id === activeId))) setActiveId(active.id) }, [active?.id, activeId, mine])
   const activeFresh = active ? fresh[active.id] : undefined
@@ -269,7 +273,13 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
     <div className="mt-3 grid gap-2 sm:grid-cols-[auto_1fr_auto]">
       <select aria-label="Transfer direction to find" value={findDirection} onChange={e => setFindDirection(e.target.value as Direction)} className="rounded-lg border border-slate-200 bg-white p-2 text-xs"><option value="arc-to-sui">Arc → Sui</option><option value="sui-to-arc">Sui → Arc</option></select>
       <input aria-label="Source transaction to find" value={findHash} onChange={e => { const v = e.target.value; setFindHash(v); if (/^0x/i.test(v.trim())) setFindDirection('arc-to-sui'); else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v.trim())) setFindDirection('sui-to-arc') }} maxLength={66} autoComplete="off" spellCheck={false} placeholder="Arc hash (0x…) or Sui digest" className="min-w-0 rounded-lg border border-slate-200 p-2 font-mono text-xs" />
-      <button type="button" disabled={!findReady || !findHash.trim()} onClick={() => void check({ direction: findDirection, sourceId: findHash.trim() }).then(x => { if (x) { setFlow(null); setActiveId(x.id); setFindHash('') } })} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold disabled:text-slate-400">{checking && checking === findHash.trim() ? 'Checking…' : 'Find'}</button>
+      <button type="button" disabled={!findReady || !findHash.trim()} onClick={() => { const searched = findHash.trim(), who = owners; void check({ direction: findDirection, sourceId: searched }).then(x => {
+        // A late answer for other wallets or a since-edited hash never takes over the panel or touches newer input.
+        if (!x || ownersRef.current !== who) return
+        // Edited since: keep it in history only; do not let auto-follow move the panel to it in this session.
+        if (findRef.current.trim() !== searched) { setClosed(c => c.includes(x.id) || x.id === activeRef.current ? c : [...c, x.id]); return }
+        setFlow(null); setActiveId(x.id); setFindHash('')
+      }) }} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold disabled:text-slate-400">{checking && checking === findHash.trim() ? 'Checking…' : 'Find'}</button>
     </div>
     {!ready && <p className="mt-2 text-xs text-slate-500">Connect the wallets that made the transfer: MetaMask on Arc Mainnet and Slush on Sui Mainnet.</p>}
     {checkError?.source && checkError.source !== tracking?.sourceId && <p role="alert" className="mt-2 rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">{checkError.message}</p>}
