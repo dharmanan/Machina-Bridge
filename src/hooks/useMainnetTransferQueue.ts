@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPublicClient, fallback, http, parseUnits, type Hex } from 'viem'
 import { getMainnetCctpRoute } from '../config/mainnetCctp'
 import { inspectMainnetTransferRecovery } from '../lib/mainnetCctpRecovery'
+import { reconcileLostSend } from '../lib/mainnetCctpSendRecovery'
 import {
   listMainnetTransfers,
   subscribeMainnetTransferQueue,
@@ -23,6 +24,19 @@ async function recoverTransactionStage(record: MainnetTransferRecord) {
   const route = getMainnetCctpRoute(record.sourceChainId, record.destinationChainId)
   if (!route) return
 
+  // A step whose wallet request returned no hash: released or adopted only on chain evidence.
+  if ((record.stage === 'approving' && !record.approvalTxHash) || (record.stage === 'burning' && !record.sourceTxHash)) {
+    try {
+      const decision = await reconcileLostSend(record, makePublicClient(route.source.rpcUrls))
+      if (decision.kind === 'approved') transitionMainnetTransfer(record.id, 'approved', { lastError: undefined })
+      else if (decision.kind === 'approval_not_executed') transitionMainnetTransfer(record.id, 'approval_required', { lastError: 'The earlier approval request was not executed on chain. Review it again.' })
+      else if (decision.kind === 'burn_found') updateMainnetTransferRecord(record.id, { sourceTxHash: decision.hash, lastError: 'Transfer found on chain. Confirming it.' })
+    } catch {
+      // RPC trouble: the step stays locked.
+    }
+    return
+  }
+
   if (record.stage === 'approving' && record.approvalTxHash) {
     const client = makePublicClient(route.source.rpcUrls)
     try {
@@ -31,7 +45,8 @@ async function recoverTransactionStage(record: MainnetTransferRecord) {
         transitionMainnetTransfer(record.id, 'approved', { lastError: undefined })
       } else {
         transitionMainnetTransfer(record.id, 'approval_required', {
-          lastError: 'Approval transaction reverted.',
+          approvalTxHash: undefined,
+          lastError: `Approval ${record.approvalTxHash} reverted on chain. No allowance was set.`,
         })
       }
     } catch {
@@ -50,7 +65,7 @@ async function recoverTransactionStage(record: MainnetTransferRecord) {
         transitionMainnetTransfer(
           record.id,
           record.approvalTxHash ? 'approved' : 'ready',
-          { lastError: 'Burn transaction reverted.' },
+          { sourceTxHash: undefined, lastError: `Transfer ${record.sourceTxHash} reverted on chain. No USDC was sent.` },
         )
       }
     } catch {

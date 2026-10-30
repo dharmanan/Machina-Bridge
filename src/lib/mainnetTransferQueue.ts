@@ -37,6 +37,9 @@ export type MainnetTransferRecord = {
   destinationTxHash?: string
   attestationReadyAt?: number
   lastError?: string
+  // Evidence taken right before the last approval/burn wallet request (account nonce, block).
+  attemptNonce?: number
+  attemptBlock?: number
 }
 
 export type CreateMainnetTransferInput = {
@@ -106,6 +109,7 @@ export function isValidMainnetTransferRecord(value: unknown): value is MainnetTr
     && typeof r.approvalRequired === 'boolean'
     && [r.sourceTxHash, r.destinationTxHash, r.approvalTxHash].every(x => x === undefined || typeof x === 'string' && /^0x[0-9a-f]{64}$/i.test(x))
     && (r.sourceLogIndex === undefined || Number.isSafeInteger(r.sourceLogIndex) && r.sourceLogIndex >= 0)
+    && [r.attemptNonce, r.attemptBlock].every(x => x === undefined || Number.isSafeInteger(x) && x >= 0)
 }
 
 export function importRecoveredMainnetTransfer(input: CreateMainnetTransferInput & { sourceTxHash: string; sourceLogIndex: number; stage: 'waiting_attestation' | 'ready_to_mint' | 'complete' }): MainnetTransferRecord {

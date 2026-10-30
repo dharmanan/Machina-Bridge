@@ -7,20 +7,22 @@ import { ARC_ROUTER, sameAddress, validateArcRequest, type ArcRequest } from '..
 //         Amounts remain bounded by balances, contract types and the existing economic/transaction checks.
 //   pilot the earlier controlled pilot, kept only as an explicit fallback: exactly the approved wallet, native USDC -> EURC, at most
 //         0.1 USDC, Uniswap, Trading-API calldata. It is selected only by the exact build value VITE_SWAP_EXECUTION_MODE=pilot.
-// Explicit open restores the earlier Live Swap mode; absent mode remains approved-wallet canary.
+// src/config/swapExecution.ts maps an unset or legacy 'canary' build mode to 'open', so a production
+// build without VITE_SWAP_EXECUTION_MODE executes publicly (verify-swap-execution-config pins this).
 // The hard off switch and the guarded transaction lifecycle are preserved.
 export type SwapExecutionMode = 'off' | 'pilot' | 'open'
 export interface SwapExecutionConfig { enabled: boolean; mode: SwapExecutionMode; wallet: string; canaryWallet?: string }
 
 export function controlledSwapRelease(enabled?: string, wallet?: string, mode?: string): SwapExecutionConfig {
-  // Restore the previous explicit Live Swap opt-in. No implicit public access:
-  // the execution switch must be exactly 'true' and the mode exactly 'open'.
+  // 'open' grants public execution when the switch is unset or exactly 'true'.
+  // Called directly with an undefined mode this function returns the approved-wallet canary;
+  // the build config never does that (it passes 'open' for an unset mode).
   // Other preflight, minimum-output, fee-ceiling, approval and receipt checks remain in force.
   if (mode === 'open') return swapExecutionConfig(enabled, wallet, 'open')
   const approved = ARC_PILOT_APPROVED_WALLET
   if ((enabled !== undefined && enabled !== 'true') || mode === 'off' || (mode !== undefined && !['open', 'pilot', 'canary'].includes(mode))) return Object.freeze({ enabled: false, mode: 'off', wallet: '', canaryWallet: approved })
   const base = mode === 'pilot' ? swapExecutionConfig(enabled ?? 'true', wallet ?? approved, 'pilot') : swapExecutionConfig('true', approved, 'open')
-  // This source release grants no public execution, even if an old build variable says open.
+  // Reached only for pilot or an undefined/'canary' mode passed directly: approved wallet only.
   return Object.freeze({ ...base, canaryWallet: approved })
 }
 

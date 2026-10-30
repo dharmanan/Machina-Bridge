@@ -432,13 +432,20 @@ const earnActionsSource = readFileSync(
 assert.match(earnActionsSource, /getMainnetEarnVaultLabel\(vaultAddress\)/)
 assert.match(earnActionsSource, /getMainnetEarnVaultLabel\(reviewed\.vaultAddress\)/)
 assert.doesNotMatch(earnActionsSource, /GALAXY_ADDRESS|Gauntlet USDC Prime/)
-const withdrawalReviewSource = earnActionsSource.slice(
-  earnActionsSource.indexOf('const reviewWithdrawal'),
-  earnActionsSource.indexOf('const executeWithdrawal'),
-)
+// One review and one execute path serve both actions; the vault position is still read before the quote and before the withdrawal.
+const sliceBetween = (from, to) => {
+  const start = earnActionsSource.indexOf(from), end = earnActionsSource.indexOf(to, start)
+  assert.ok(start >= 0 && end > start, `${from} .. ${to}`)
+  return earnActionsSource.slice(start, end)
+}
+const withdrawalReviewSource = sliceBetween('const review = useCallback', 'const reportSettled')
+assert.ok(withdrawalReviewSource.indexOf('await readPosition()') >= 0)
 assert.ok(withdrawalReviewSource.indexOf('await readPosition()') < withdrawalReviewSource.indexOf('earnKit.getWithdrawalQuote'))
-const withdrawalExecutionSource = earnActionsSource.slice(earnActionsSource.indexOf('const executeWithdrawal'))
-assert.ok(withdrawalExecutionSource.indexOf('await readPosition()') < withdrawalExecutionSource.indexOf('earnKit.withdraw'))
+// The journaled send (runEarnOperation -> kit.withdraw, behaviour-tested in verify-earn-kit-real-provider) starts only after the fresh position read.
+const withdrawalExecutionSource = sliceBetween('const execute = useCallback', 'const checkStatus')
+assert.ok(withdrawalExecutionSource.indexOf('await readPosition()') >= 0)
+assert.ok(withdrawalExecutionSource.indexOf('await runEarnOperation(') > 0)
+assert.ok(withdrawalExecutionSource.indexOf('await readPosition()') < withdrawalExecutionSource.indexOf('await runEarnOperation('))
 const earnPreviewSource = readFileSync(
   fileURLToPath(new URL('../src/components/MainnetEarnPreview.tsx', import.meta.url)),
   'utf8',

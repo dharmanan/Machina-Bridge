@@ -11,7 +11,8 @@ export function badRequest(res, message) {
   return json(res, 400, { error: message });
 }
 
+// Internal causes (hosts, credentials, stack details) stay in the server log only.
 export function serverError(res, error) {
-  const message = error instanceof Error ? error.message : 'Unknown server error';
-  return json(res, 500, { error: message });
+  console.error('[api] internal error:', error instanceof Error ? error.message : error);
+  return json(res, 500, { error: 'Internal server error' });
 }

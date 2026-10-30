@@ -58,7 +58,7 @@ export async function findArcMintForMessage(client: any, input: { message: Hex; 
     }
     if (!verified.size) {
       // MessageReceived indexes the nonce, so each window asks for this message only.
-      let to = await client.getBlockNumber() as bigint
+      let to = await client.getBlockNumber({ cacheTime: 0 }) as bigint
       for (let n = 0; n < search.maxWindows && to >= 0n && !verified.size; n++) {
         const from = to >= search.windowBlocks - 1n ? to - search.windowBlocks + 1n : 0n
         // Raw eth_getLogs: the topic filter (event + nonce) is applied by the node.

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import {
   createPublicClient,
@@ -16,6 +16,18 @@ import {
 } from '../config/mainnetEarn'
 import { ARC_MAINNET_EVM_CHAIN_ID } from '../lib/chains'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
+import {
+  EARN_JOURNAL_KEY,
+  floorUsdcRaw,
+  openEarnRecordFor,
+  parseUsdcInput,
+  runEarnOperation,
+  settledEarnRecordsFor,
+  settleEarnRecord,
+  type EarnAction,
+  type EarnJournalRecord,
+  type EarnKitLike,
+} from '../lib/earnJournal'
 
 type EarnPosition = {
   currentBalance?: string
@@ -23,25 +35,16 @@ type EarnPosition = {
   vaultName?: string
 }
 
+// A review is bound to everything the wallet request will use; any change drops it.
 type EarnReviewedAction = {
-  kind: 'deposit' | 'withdraw'
+  kind: EarnAction
   vaultAddress: string
   amount: string
-  account?: string
+  amountRaw: bigint
+  account: string
+  chainId: number
+  reviewedAt: number
   quote: unknown
-}
-
-type EarnWriteResult = {
-  txHash?: string
-  explorerUrl?: string
-  amount?: string
-}
-
-type EarnActivityItem = {
-  kind: 'deposit' | 'withdraw'
-  amount: string
-  txHash: string
-  explorerUrl: string
 }
 
 const ERC20_BALANCE_ABI = parseAbi([
@@ -50,6 +53,8 @@ const ERC20_BALANCE_ABI = parseAbi([
 
 const earnKit = new EarnKit()
 const DEFAULT_AMOUNT = '0.1'
+const REVIEW_TTL_MS = 120_000
+const EXPLORER_BASE = MAINNET_NETWORKS.arc.explorerUrl?.replace(/\/$/, '')
 
 function shortAddress(value?: string) {
   if (!value) return ''
@@ -57,21 +62,34 @@ function shortAddress(value?: string) {
   return value.slice(0, 6) + '...' + value.slice(-4)
 }
 
-function validateAmount(value: string) {
-  if (!/^\d*\.?\d{0,6}$/.test(value)) return null
-
-  const numericAmount = Number(value)
-  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-    return null
-  }
-
-  return value
-}
-
 function isAllowedVault(address: string) {
   return MAINNET_EARN_SELECTED_VAULT_ADDRESSES.some(
     (vaultAddress) => vaultAddress.toLowerCase() === address.toLowerCase(),
   )
+}
+
+function arcClient() {
+  return createPublicClient({
+    transport: http(MAINNET_NETWORKS.arc.rpcUrls[0], {
+      timeout: 10_000,
+      retryCount: 0,
+    }),
+  })
+}
+
+function messageOf(cause: unknown, fallback: string) {
+  return cause instanceof Error && cause.message ? cause.message : fallback
+}
+
+// One Earn operation per wallet across every tab of this browser.
+async function withWalletLock<T>(account: string, run: () => Promise<T>) {
+  if (typeof navigator === 'undefined' || !navigator.locks) {
+    throw new Error('This browser cannot coordinate Earn transactions across tabs. Use a browser with Web Locks support.')
+  }
+  return navigator.locks.request('machina-earn:' + account.toLowerCase(), { ifAvailable: true }, async (lock) => {
+    if (!lock) throw new Error('Another tab is running an Earn operation for this wallet. Check again when it finishes.')
+    return run()
+  })
 }
 
 export default function MainnetEarnActions() {
@@ -93,35 +111,48 @@ export default function MainnetEarnActions() {
   const [position, setPosition] = useState<EarnPosition | null>(null)
   const [walletBalance, setWalletBalance] = useState<string | null>(null)
   const [walletBalanceLoading, setWalletBalanceLoading] = useState(false)
-  const [activity, setActivity] = useState<EarnActivityItem[]>([])
+  const [journalVersion, setJournalVersion] = useState(0)
+  const inFlight = useRef(false)
+
+  const refreshJournal = useCallback(() => setJournalVersion((v) => v + 1), [])
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === EARN_JOURNAL_KEY) refreshJournal()
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [refreshJournal])
+
+  const openRecord = useMemo(() => openEarnRecordFor(address), [address, journalVersion])
+  const activity = useMemo(() => settledEarnRecordsFor(address).slice(0, 5), [address, journalVersion])
+
+  // A wallet or network change drops the review.
+  useEffect(() => {
+    setReviewed((current) => current && (
+      current.account !== address?.toLowerCase()
+      || chainId !== ARC_MAINNET_EVM_CHAIN_ID
+    ) ? null : current)
+  }, [address, chainId])
 
   const loadWalletBalance = useCallback(async () => {
     if (!address) {
       setWalletBalance(null)
-      return
+      return null
     }
 
     setWalletBalanceLoading(true)
 
     try {
       const network = MAINNET_NETWORKS.arc
-      const client = createPublicClient({
-        transport: http(network.rpcUrls[0], {
-          timeout: 10_000,
-          retryCount: 0,
-        }),
-      })
-
-      const raw = await client.readContract({
+      const raw = await arcClient().readContract({
         address: network.usdcAddress,
         abi: ERC20_BALANCE_ABI,
         functionName: 'balanceOf',
         args: [address],
       })
 
-      const formatted = formatUnits(raw, 6)
-      setWalletBalance(formatted)
-      return formatted
+      setWalletBalance(formatUnits(raw, 6))
+      return raw
     } catch {
       setWalletBalance(null)
       return null
@@ -136,32 +167,7 @@ export default function MainnetEarnActions() {
     }
   }, [address, loadWalletBalance])
 
-  const addActivity = useCallback((
-    kind: 'deposit' | 'withdraw',
-    amount: string,
-    result: EarnWriteResult,
-  ) => {
-    if (!result.txHash) return
-
-    if (!/^0x[a-fA-F0-9]{64}$/.test(result.txHash)) return
-
-    const explorerBase = MAINNET_NETWORKS.arc.explorerUrl?.replace(/\/$/, '')
-    if (!explorerBase) return
-
-    const explorerUrl = explorerBase + '/tx/' + result.txHash
-
-    setActivity((current) => [
-      {
-        kind,
-        amount,
-        txHash: result.txHash as string,
-        explorerUrl,
-      },
-      ...current,
-    ])
-  }, [])
-
-  const getAdapter = useCallback(async () => {
+  const getWalletProvider = useCallback(async () => {
     if (!connector || !isConnected) {
       throw new Error('Connect your wallet first.')
     }
@@ -170,9 +176,13 @@ export default function MainnetEarnActions() {
       await switchChainAsync({ chainId: ARC_MAINNET_EVM_CHAIN_ID })
     }
 
-    const provider = await connector.getProvider() as EIP1193Provider
-    return createViemAdapterFromProvider({ provider })
+    return await connector.getProvider() as EIP1193Provider
   }, [chainId, connector, isConnected, switchChainAsync])
+
+  // Read-only SDK calls (quotes, position) use the wallet provider directly.
+  const getAdapter = useCallback(async () => (
+    createViemAdapterFromProvider({ provider: await getWalletProvider() })
+  ), [getWalletProvider])
 
   const readPosition = useCallback(async () => {
     const adapter = await getAdapter()
@@ -223,12 +233,13 @@ export default function MainnetEarnActions() {
     selectedVault,
   ])
 
-  const reviewDeposit = useCallback(async () => {
-    setBusy('depositQuote')
+  const review = useCallback(async (kind: EarnAction) => {
+    if (inFlight.current) return
+    setBusy(kind === 'deposit' ? 'depositQuote' : 'withdrawQuote')
     setError(null)
     try {
-      const validatedAmount = validateAmount(amount)
-      if (!validatedAmount) {
+      const amountRaw = parseUsdcInput(amount)
+      if (amountRaw === null || !address) {
         throw new Error('Enter a valid USDC amount using up to 6 decimal places.')
       }
 
@@ -236,93 +247,176 @@ export default function MainnetEarnActions() {
         throw new Error('This vault is not enabled for Machina Earn.')
       }
 
-      const currentWalletBalance = await loadWalletBalance()
+      if (openEarnRecordFor(address)) {
+        throw new Error('An earlier Earn operation from this wallet is not confirmed yet. Check its status first.')
+      }
 
-      if (
-        currentWalletBalance != null
-        && Number.isFinite(Number(currentWalletBalance))
-        && Number(validatedAmount) > Number(currentWalletBalance)
-      ) {
-        throw new Error('Amount exceeds your Arc USDC balance.')
+      if (kind === 'deposit') {
+        const balanceRaw = await loadWalletBalance()
+        if (balanceRaw != null && amountRaw > balanceRaw) {
+          throw new Error('Amount exceeds your Arc USDC balance.')
+        }
+      } else {
+        const positionRaw = floorUsdcRaw((await readPosition()).currentBalance ?? '0')
+        if (positionRaw === null || positionRaw <= 0n) {
+          throw new Error('No position is available to withdraw.')
+        }
+        if (amountRaw > positionRaw) {
+          throw new Error('Amount exceeds your current vault position.')
+        }
       }
 
       const adapter = await getAdapter()
-      const quote = await earnKit.getDepositQuote({
+      const quoteParams = {
         from: { adapter, chain: MAINNET_EARN_CHAIN },
         vaultAddress: selectedVault,
-        amount: validatedAmount,
-      } as never)
+        amount,
+      }
+      const quote = kind === 'deposit'
+        ? await earnKit.getDepositQuote(quoteParams as never)
+        : await earnKit.getWithdrawalQuote(quoteParams as never)
 
       setReviewed({
-        kind: 'deposit',
+        kind,
         vaultAddress: selectedVault,
-        amount: validatedAmount,
-        account: address,
+        amount,
+        amountRaw,
+        account: address.toLowerCase(),
+        chainId: ARC_MAINNET_EVM_CHAIN_ID,
+        reviewedAt: Date.now(),
         quote,
       })
     } catch (cause) {
       setReviewed(null)
-      setError(cause instanceof Error ? cause.message : 'Deposit quote failed.')
+      setError(messageOf(cause, kind === 'deposit' ? 'Deposit quote failed.' : 'Withdrawal quote failed.'))
     } finally {
       setBusy(null)
     }
-  }, [address, amount, getAdapter, loadWalletBalance, selectedVault])
+  }, [address, amount, getAdapter, loadWalletBalance, readPosition, selectedVault])
 
-  const executeDeposit = useCallback(async () => {
+  const reportSettled = useCallback((record: EarnJournalRecord, sdkError: unknown) => {
+    if (record.outcome === 'success') {
+      setError(null)
+    } else if (record.outcome === 'reverted') {
+      setError(record.lastError ?? 'The transaction reverted on chain. No funds moved.')
+    } else if (record.outcome === 'not_sent') {
+      setError(record.lastError ?? messageOf(sdkError, 'The operation stopped before anything was sent.'))
+    }
+  }, [])
+
+  const execute = useCallback(async () => {
+    if (inFlight.current) return
+    const current = reviewed
     if (
-      !reviewed
-      || reviewed.kind !== 'deposit'
-      || reviewed.vaultAddress !== selectedVault
-      || reviewed.account !== address
+      !current
+      || !address
+      || current.account !== address.toLowerCase()
+      || current.vaultAddress !== selectedVault
+      || current.amount !== amount
     ) {
-      setError('Review the current deposit quote first.')
+      setReviewed(null)
+      setError('Review the current quote first.')
+      return
+    }
+    if (chainId !== ARC_MAINNET_EVM_CHAIN_ID || Date.now() - current.reviewedAt > REVIEW_TTL_MS) {
+      setReviewed(null)
+      setError('The quote expired or the network changed. Review it again.')
       return
     }
 
-    setBusy('deposit')
+    inFlight.current = true
+    setBusy(current.kind)
     setError(null)
 
     try {
-      if (!isAllowedVault(selectedVault)) {
-        throw new Error('This vault is not enabled for Machina Earn.')
-      }
+      await withWalletLock(address, async () => {
+        if (openEarnRecordFor(address)) {
+          throw new Error('An earlier Earn operation from this wallet is not confirmed yet. Check its status first.')
+        }
+        if (!isAllowedVault(current.vaultAddress)) {
+          throw new Error('This vault is not enabled for Machina Earn.')
+        }
 
-      const currentWalletBalance = await loadWalletBalance()
-      if (
-        currentWalletBalance == null
-        || !Number.isFinite(Number(currentWalletBalance))
-        || Number(reviewed.amount) > Number(currentWalletBalance)
-      ) {
-        throw new Error('Your Arc USDC balance changed. Review the deposit again.')
-      }
+        if (current.kind === 'deposit') {
+          const balanceRaw = await loadWalletBalance()
+          if (balanceRaw == null || current.amountRaw > balanceRaw) {
+            throw new Error('Your Arc USDC balance changed. Review the deposit again.')
+          }
+        } else {
+          const positionRaw = floorUsdcRaw((await readPosition()).currentBalance ?? '0')
+          if (positionRaw === null || current.amountRaw > positionRaw) {
+            throw new Error('Your vault position changed. Review the withdrawal again.')
+          }
+        }
 
-      const adapter = await getAdapter()
-      const nextResult = await earnKit.deposit({
-        from: { adapter, chain: MAINNET_EARN_CHAIN },
-        vaultAddress: selectedVault,
-        amount: reviewed.amount,
-      } as never) as unknown as EarnWriteResult
-
-      addActivity('deposit', reviewed.amount, nextResult)
-      setReviewed(null)
-      await Promise.all([
-        readPosition(),
-        loadWalletBalance(),
-      ])
+        const walletProvider = await getWalletProvider()
+        // Attempt evidence, journal entry (written and read back before any wallet
+        // request), guarded provider, the SDK call and the settled outcome.
+        const { record: settled, sdkError } = await runEarnOperation({
+          kit: earnKit as unknown as EarnKitLike,
+          walletProvider: walletProvider as never,
+          client: arcClient(),
+          createAdapter: async (provider) => createViemAdapterFromProvider({ provider: provider as unknown as EIP1193Provider }),
+          chain: MAINNET_EARN_CHAIN,
+          account: address,
+          vault: current.vaultAddress,
+          action: current.kind,
+          amount: current.amount,
+          amountRaw: current.amountRaw,
+          onRecorded: () => {
+            refreshJournal()
+            setReviewed(null)
+          },
+        })
+        reportSettled(settled, sdkError)
+        if (settled.outcome === 'success') {
+          await Promise.allSettled([readPosition(), loadWalletBalance()])
+        }
+      })
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Deposit failed.')
+      setError(messageOf(cause, current.kind === 'deposit' ? 'Deposit failed.' : 'Withdrawal failed.'))
     } finally {
+      inFlight.current = false
       setBusy(null)
+      refreshJournal()
     }
   }, [
-    addActivity,
     address,
-    getAdapter,
+    amount,
+    chainId,
+    getWalletProvider,
     loadWalletBalance,
     readPosition,
+    refreshJournal,
+    reportSettled,
     reviewed,
     selectedVault,
   ])
+
+  // Read-only: settles an open operation only from chain evidence.
+  const checkStatus = useCallback(async () => {
+    if (inFlight.current || !address) return
+    inFlight.current = true
+    setBusy('status')
+    setError(null)
+    try {
+      await withWalletLock(address, async () => {
+        const open = openEarnRecordFor(address)
+        if (!open) return
+        const settled = await settleEarnRecord(open.id, arcClient())
+        reportSettled(settled, undefined)
+        if (settled.outcome === 'success') {
+          await Promise.allSettled([readPosition(), loadWalletBalance()])
+        }
+      })
+    } catch (cause) {
+      setError(messageOf(cause, 'Status check failed.'))
+    } finally {
+      inFlight.current = false
+      setBusy(null)
+      refreshJournal()
+    }
+  }, [address, loadWalletBalance, readPosition, refreshJournal, reportSettled])
 
   const checkPosition = useCallback(async () => {
     setBusy('position')
@@ -332,116 +426,13 @@ export default function MainnetEarnActions() {
       await readPosition()
     } catch (cause) {
       setPosition(null)
-      setError(cause instanceof Error ? cause.message : 'Position check failed.')
+      setError(messageOf(cause, 'Position check failed.'))
     } finally {
       setBusy(null)
     }
   }, [readPosition])
 
-  const reviewWithdrawal = useCallback(async () => {
-    setBusy('withdrawQuote')
-    setError(null)
-    try {
-      const requestedAmount = validateAmount(amount)
-      if (!requestedAmount) {
-        throw new Error('Enter a valid USDC amount using up to 6 decimal places.')
-      }
-
-      if (!isAllowedVault(selectedVault)) {
-        throw new Error('This vault is not enabled for Machina Earn.')
-      }
-
-      const currentPosition = await readPosition()
-      const positionBalance = Number(currentPosition.currentBalance ?? '0')
-
-      if (!Number.isFinite(positionBalance) || positionBalance <= 0) {
-        throw new Error('No position is available to withdraw.')
-      }
-
-      if (Number(requestedAmount) > positionBalance) {
-        throw new Error('Amount exceeds your current vault position.')
-      }
-
-      const validatedAmount = requestedAmount
-
-      const adapter = await getAdapter()
-      const quote = await earnKit.getWithdrawalQuote({
-        from: { adapter, chain: MAINNET_EARN_CHAIN },
-        vaultAddress: selectedVault,
-        amount: validatedAmount,
-      } as never)
-
-      setReviewed({
-        kind: 'withdraw',
-        vaultAddress: selectedVault,
-        amount: validatedAmount,
-        account: address,
-        quote,
-      })
-    } catch (cause) {
-      setReviewed(null)
-      setError(cause instanceof Error ? cause.message : 'Withdrawal quote failed.')
-    } finally {
-      setBusy(null)
-    }
-  }, [address, amount, getAdapter, readPosition, selectedVault])
-
-  const executeWithdrawal = useCallback(async () => {
-    if (
-      !reviewed
-      || reviewed.kind !== 'withdraw'
-      || reviewed.vaultAddress !== selectedVault
-      || reviewed.account !== address
-    ) {
-      setError('Review the current withdrawal quote first.')
-      return
-    }
-
-    setBusy('withdraw')
-    setError(null)
-
-    try {
-      if (!isAllowedVault(selectedVault)) {
-        throw new Error('This vault is not enabled for Machina Earn.')
-      }
-
-      const freshPosition = await readPosition()
-      const freshBalance = Number(freshPosition.currentBalance ?? '0')
-      if (
-        !Number.isFinite(freshBalance)
-        || freshBalance <= 0
-        || Number(reviewed.amount) > freshBalance
-      ) {
-        throw new Error('Your vault position changed. Review the withdrawal again.')
-      }
-
-      const adapter = await getAdapter()
-      const nextResult = await earnKit.withdraw({
-        from: { adapter, chain: MAINNET_EARN_CHAIN },
-        vaultAddress: selectedVault,
-        amount: reviewed.amount,
-      } as never) as unknown as EarnWriteResult
-
-      addActivity('withdraw', reviewed.amount, nextResult)
-      setReviewed(null)
-      await Promise.all([
-        readPosition(),
-        loadWalletBalance(),
-      ])
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Withdrawal failed.')
-    } finally {
-      setBusy(null)
-    }
-  }, [
-    addActivity,
-    address,
-    getAdapter,
-    loadWalletBalance,
-    readPosition,
-    reviewed,
-    selectedVault,
-  ])
+  const locked = busy !== null || Boolean(openRecord)
 
   return (
     <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -516,8 +507,8 @@ export default function MainnetEarnActions() {
       <div className="mt-4 grid gap-2 sm:grid-cols-3">
         <button
           type="button"
-          onClick={() => void reviewDeposit()}
-          disabled={!isConnected || busy !== null}
+          onClick={() => void review('deposit')}
+          disabled={!isConnected || locked}
           className="rounded-xl border border-sky-200 bg-white px-3 py-2 text-xs font-semibold text-sky-900 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy === 'depositQuote'
@@ -536,15 +527,49 @@ export default function MainnetEarnActions() {
 
         <button
           type="button"
-          onClick={() => void reviewWithdrawal()}
-          disabled={!isConnected || busy !== null}
+          onClick={() => void review('withdraw')}
+          disabled={!isConnected || locked}
           className="rounded-xl border border-sky-200 bg-white px-3 py-2 text-xs font-semibold text-sky-900 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy === 'withdrawQuote' ? 'Checking quote...' : 'Review withdrawal'}
         </button>
       </div>
 
-      {reviewed && (
+      {openRecord && (
+        <div
+          data-testid="earn-pending"
+          className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900"
+        >
+          <p className="font-semibold">
+            {openRecord.action === 'deposit' ? 'Deposit ' : 'Withdrawal '}
+            {openRecord.amount} USDC
+            {openRecord.outcome === 'sending' ? ' is in progress' : ': result not confirmed yet'}
+          </p>
+          <p className="mt-1 leading-5">
+            {openRecord.outcome === 'sending'
+              ? 'Waiting for the wallet and the Arc network. '
+              : (openRecord.lastError ? openRecord.lastError + ' ' : '')}
+            New Earn operations stay locked for this wallet until the result is confirmed on chain. Do not send it again.
+          </p>
+          {openRecord.executeHash && (
+            <p className="mt-1 break-all font-mono text-[11px]">
+              {EXPLORER_BASE
+                ? <a href={EXPLORER_BASE + '/tx/' + openRecord.executeHash} target="_blank" rel="noreferrer" className="underline">{openRecord.executeHash}</a>
+                : openRecord.executeHash}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => void checkStatus()}
+            disabled={busy !== null}
+            className="mt-2 rounded-xl border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-900 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy === 'status' ? 'Checking...' : 'Check status'}
+          </button>
+        </div>
+      )}
+
+      {reviewed && !openRecord && (
         <div className="mt-4 rounded-xl border border-sky-200 bg-white p-3">
           <p className="text-xs font-semibold text-slate-900">
             {reviewed.kind === 'deposit' ? 'Deposit ' : 'Withdraw '}
@@ -557,11 +582,7 @@ export default function MainnetEarnActions() {
           </p>
           <button
             type="button"
-            onClick={() => void (
-              reviewed.kind === 'deposit'
-                ? executeDeposit()
-                : executeWithdrawal()
-            )}
+            onClick={() => void execute()}
             disabled={busy !== null}
             className="mt-3 rounded-xl bg-sky-700 px-4 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -584,16 +605,16 @@ export default function MainnetEarnActions() {
         <div className="mt-3 space-y-2">
           {activity.map((item) => (
             <a
-              key={item.txHash}
-              href={item.explorerUrl}
+              key={item.id}
+              href={EXPLORER_BASE && item.executeHash ? EXPLORER_BASE + '/tx/' + item.executeHash : undefined}
               target="_blank"
               rel="noreferrer"
               className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900 hover:bg-emerald-100"
             >
               <span>
-                {item.kind === 'deposit' ? 'Deposit' : 'Withdrawal'} {item.amount} USDC confirmed
+                {item.action === 'deposit' ? 'Deposit' : 'Withdrawal'} {item.amount} USDC confirmed
               </span>
-              <span className="font-mono">{shortAddress(item.txHash)}</span>
+              <span className="font-mono">{shortAddress(item.executeHash)}</span>
             </a>
           ))}
         </div>

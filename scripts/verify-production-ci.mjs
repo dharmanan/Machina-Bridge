@@ -54,4 +54,23 @@ test('audit reporting retains known findings, rejects unknown roots, and fails o
     assert.notEqual(run({vulnerabilities:{},metadata:{vulnerabilities:{critical:0,high:0,total:0}}},1).status,0)
   } finally { rmSync(temp,{recursive:true,force:true}) }
 })
+test('Vercel installs exactly the lockfile with the same Node major as CI', () => {
+  const vercel = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const workflow = readFileSync(new URL('../.github/workflows/machina-production-verification.yml', import.meta.url), 'utf8')
+  assert.equal(vercel.installCommand, 'npm ci')
+  const ci = [...new Set([...workflow.matchAll(/node-version: '([^']+)'/g)].map(m => m[1]))]
+  assert.deepEqual(ci, ['24'], 'every CI job runs the same Node major')
+  assert.equal(pkg.engines?.node, ci[0] + '.x', 'Vercel reads engines.node for its runtime and build image')
+  assert.doesNotMatch(workflow, /^\s*- run: npm install\b/m)
+})
+const { serverError } = await import('../api/_lib/http.js')
+test('API 500 responses never echo internal error messages', () => {
+  let sent, status; const logged = []; const log = console.error; console.error = (...a) => logged.push(a)
+  const res = { status(s) { status = s; return this }, setHeader() { return this }, send(b) { sent = b; return this } }
+  try { serverError(res, new Error('connect ECONNREFUSED 10.0.0.7:6379 redis://default:secret@internal')) } finally { console.error = log }
+  assert.equal(status, 500); assert.deepEqual(JSON.parse(sent), { error: 'Internal server error' })
+  assert.doesNotMatch(sent, /ECONNREFUSED|secret|redis/)
+  assert.equal(logged.length, 1, 'the cause stays in the server log')
+})
 console.log(`RESULT ${count}/${count} CI gate regressions PASS; no live traffic or wallet calls`)

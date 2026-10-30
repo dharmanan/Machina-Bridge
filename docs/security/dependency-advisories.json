@@ -26,7 +26,7 @@
       "chain": "@circle-fin/{bridge-kit,swap-kit,earn-kit,adapter-viem-v2,adapter-solana,provider-*,borrow-*} pin zod 3.25.67 exactly; @reown/appkit-wallet uses zod 3.22.4; root zod 3.25.76; @wagmi/connectors (porto) already on 4.6.7",
       "status": "OPEN — no compatible fixed release",
       "reason": "No zod 3.x release fixes the advisory (latest 3.25.76). Circle SDKs, including the newest @circle-fin/bridge-kit 1.16.1, pin zod 3.25.67 exactly; forcing zod 4 would break their runtime schemas.",
-      "mitigation": "scripts/apply-zod-collection-backport.mjs patches the oversized-collection checks into all locked zod v3 copies (verified by scripts/verify-zod-collection-backport.mjs); Circle responses are size-bounded before parsing (scripts/verify-circle-response-limits.mjs). Porto keeps zod 4.6.7 via overrides.",
+      "mitigation": "scripts/apply-zod-collection-backport.mjs patches the oversized-collection checks into all locked zod v3 copies (verified by scripts/verify-zod-collection-backport.mjs); only Circle Borrow (/v1/borrowKit/) and Swap (/v1/stablecoinKits/) service responses are size/shape-bounded before SDK parsing (scripts/verify-circle-response-limits.mjs). Bridge Kit and Earn Kit (/v1/earnKit/) responses are NOT bounded and reach their SDK zod schemas unbounded; they come only from Circle's TLS origins, and constrained collections are covered by the backport. Machina's own Iris recovery read (readBoundCctpAttestation) is capped at 256 KiB / 64 messages; the other Iris fee/status reads use response.json() without a size cap. Porto keeps zod 4.6.7 via overrides.",
       "recheck": "npm view @circle-fin/bridge-kit dependencies.zod; npm view zod versions"
     },
     {

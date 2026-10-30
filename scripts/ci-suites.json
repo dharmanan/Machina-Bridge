@@ -67,7 +67,8 @@
    "verify-arc-mint-proof",
    "verify-fee-display",
    "verify-bridge-history",
-   "verify-borrow-source-gates"
+   "verify-borrow-source-gates",
+   "verify-swap-execution-config"
   ],
   "full": [
    "verify-release-dependency-security",
@@ -85,7 +86,8 @@
    "verify-swap-permit-single",
    "verify-swap-circle-execution",
    "verify-wallet-activity-fixes",
-   "verify-mainnet-solana-bridgekit"
+   "verify-mainnet-solana-bridgekit",
+   "verify-earn-kit-real-provider"
   ],
   "browser": [
    "verify-sui-transfer-review-ui",
@@ -95,7 +97,9 @@
    "verify-app-shell-ui",
    "verify-mainnet-transfer-recovery-ui",
    "verify-sui-write-browser",
-   "verify-sui-wallet-foundation-ui"
+   "verify-sui-wallet-foundation-ui",
+   "verify-mainnet-cctp-send-ui",
+   "verify-mainnet-earn-safety-ui"
   ],
   "legacy": [
    "verify-mainnet-borrow",
@@ -160,7 +164,11 @@
   "verify-bridge-history": "dashboard",
   "verify-bridge-dashboard-ui": "dashboard",
   "verify-arc-mint-proof": "sui-bridge",
-  "verify-fee-display": "sui-bridge"
+  "verify-fee-display": "sui-bridge",
+  "verify-mainnet-cctp-send-ui": "evm-bridge",
+  "verify-mainnet-earn-safety-ui": "earn",
+  "verify-swap-execution-config": "swap",
+  "verify-earn-kit-real-provider": "earn"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",

@@ -10,7 +10,7 @@ fallback. Whether the build executes at all is decided by one switch, `VITE_UNIS
 | Variable / constant | Effect |
 | --- | --- |
 | `VITE_UNISWAP_ARC_PILOT_ENABLED=true` | Execution switch (the kill switch of the build). Anything else: quotes only ("Preview only"). |
-| `VITE_SWAP_EXECUTION_MODE` | Unset or anything else: the **default, multi-direction mode** (every direction, both providers, any EOA wallet). The exact string `pilot` restores the earlier pilot. |
+| `VITE_SWAP_EXECUTION_MODE` | Unset, `open` or the legacy value `canary`: the **default, multi-direction mode** (every direction, both providers, any EOA wallet). The exact string `pilot` restores the earlier pilot; `off` disables execution; any other value (misspelled, padded, empty) also disables execution. |
 | `VITE_UNISWAP_ARC_PILOT_WALLET` | Only used by the explicit pilot; pinned to the approved address, a different value fails closed. |
 | `CIRCLE_SWAP_WRITES_ENABLED` (`src/lib/swap/circleSwap.ts`) | Circle's own source gate: `true`, because every condition below is enforced. A failed condition closes a single swap, never the gate for the others. |
 

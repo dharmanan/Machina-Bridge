@@ -26,6 +26,7 @@ import {
   MAINNET_RUNTIME_IMPLEMENTED,
 } from '../config/runtime'
 import { inspectMainnetTransferRecovery } from '../lib/mainnetCctpRecovery'
+import { assertNoUnresolvedSend, isWalletRejection, readSendAttempt } from '../lib/mainnetCctpSendRecovery'
 import { wagmiConfig } from '../lib/wagmi.config'
 import {
   fetchMainnetCctpAttestation,
@@ -232,6 +233,7 @@ export function useMainnetCctp() {
     if (!address) {
       throw new Error('Connect a wallet before creating a mainnet transfer plan.')
     }
+    assertNoUnresolvedSend(address, input.sourceChainId)
 
     return createMainnetTransferRecord({
       walletAddress: address,
@@ -321,10 +323,15 @@ export function useMainnetCctp() {
 
     if (typeof navigator === 'undefined' || !navigator.locks) throw new Error('This browser cannot safely coordinate destination minting. Use a browser with transaction locks before starting a mainnet transfer.')
 
+    const owner = address
+    // One approval or burn per wallet at a time, across tabs; the request is never queued behind another.
+    return navigator.locks.request(`machina-cctp-send:${owner.toLowerCase()}`, { ifAvailable: true }, async lock => {
+    if (!lock) throw new Error('Another tab is sending a transaction from this wallet. Nothing was sent here.')
     assertCanaryApprovalAllowed({
       ...input,
-      connectedAddress: address,
+      connectedAddress: owner,
     })
+    assertNoUnresolvedSend(owner, input.sourceChainId, input.transferId)
 
     const source = getMainnetCctpChain(input.sourceChainId)
 
@@ -337,23 +344,39 @@ export function useMainnetCctp() {
       transitionMainnetTransfer(input.transferId, 'approving', { lastError: undefined })
     }
 
-    let hash: Hex | undefined
+    let hash: Hex | undefined, settled = false
     try {
       const walletClient = await ensureWalletOnChain(input.sourceChainId)
       const call = prepareMainnetCctpApproval(input)
-      hash = await walletClient.sendTransaction({
-        account: address!,
-        to: call.to,
-        data: call.data,
-        value: call.value,
-      })
+      const publicClient = makePublicClient(source.rpcUrls)
+      const attempt = await readSendAttempt(publicClient, owner)
+      if (input.transferId) updateMainnetTransferRecord(input.transferId, { ...attempt, approvalTxHash: undefined })
+      try {
+        hash = await walletClient.sendTransaction({
+          account: owner,
+          to: call.to,
+          data: call.data,
+          value: call.value,
+        })
+      } catch (error) {
+        if (isWalletRejection(error)) throw error
+        // The wallet may have broadcast before failing: keep the step locked until the chain shows what happened.
+        settled = true
+        if (input.transferId) updateMainnetTransferRecord(input.transferId, { lastError: 'Your wallet did not confirm whether the approval was sent. Do not send it again; Machina is checking the chain.' })
+        throw error
+      }
 
       if (input.transferId) {
         updateMainnetTransferRecord(input.transferId, { approvalTxHash: hash })
       }
 
-      const publicClient = makePublicClient(source.rpcUrls)
-      await publicClient.waitForTransactionReceipt({ hash })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') {
+        // Final on chain: no allowance was set. The hash stays in the error as evidence.
+        settled = true
+        if (input.transferId) transitionMainnetTransfer(input.transferId, 'approval_required', { approvalTxHash: undefined, lastError: `Approval ${hash} reverted on chain. No allowance was set.` })
+        throw new Error(`Approval ${hash} reverted on chain. No allowance was set.`)
+      }
 
       if (input.transferId) {
         transitionMainnetTransfer(input.transferId, 'approved', {
@@ -366,11 +389,11 @@ export function useMainnetCctp() {
       return hash
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Mainnet USDC approval failed.'
-      if (input.transferId) {
+      if (input.transferId && !settled) {
         if (hash) {
           updateMainnetTransferRecord(input.transferId, {
             approvalTxHash: hash,
-            lastError: message,
+            lastError: 'Approval sent, result not confirmed yet. Do not send it again; Machina is checking the chain.',
           })
         } else {
           transitionMainnetTransfer(input.transferId, 'approval_required', { lastError: message })
@@ -379,6 +402,7 @@ export function useMainnetCctp() {
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
+    })
   }, [address, ensureWalletOnChain])
 
   const burn = useCallback(async (input: {
@@ -396,13 +420,17 @@ export function useMainnetCctp() {
     const recipient = input.recipient ?? address
     const destinationCaller = input.destinationCaller ?? address
 
+    const owner = address
+    return navigator.locks.request(`machina-cctp-send:${owner.toLowerCase()}`, { ifAvailable: true }, async lock => {
+    if (!lock) throw new Error('Another tab is sending a transaction from this wallet. Nothing was sent here.')
     assertCanaryBurnAllowed({
       quote: input.quote,
       transferId: input.transferId,
-      connectedAddress: address,
+      connectedAddress: owner,
       recipient,
       destinationCaller,
     })
+    assertNoUnresolvedSend(owner, input.quote.sourceChainId, input.transferId)
 
     const route = getMainnetCctpRoute(input.quote.sourceChainId, input.quote.destinationChainId)
     if (!route) {
@@ -411,11 +439,12 @@ export function useMainnetCctp() {
 
     setState((current) => ({ ...current, step: 'burning', error: null, isLoading: true }))
     const transferBeforeBurn = input.transferId ? getMainnetTransfer(input.transferId) : undefined
+    const previousStage = transferBeforeBurn?.approvalTxHash ? 'approved' : 'ready'
     if (input.transferId) {
       transitionMainnetTransfer(input.transferId, 'burning', { lastError: undefined })
     }
 
-    let hash: Hex | undefined
+    let hash: Hex | undefined, settled = false
     try {
       const walletClient = await ensureWalletOnChain(input.quote.sourceChainId)
       const call = prepareMainnetCctpBurn({
@@ -423,19 +452,35 @@ export function useMainnetCctp() {
         recipient,
         destinationCaller,
       })
-      hash = await walletClient.sendTransaction({
-        account: address,
-        to: call.to,
-        data: call.data,
-        value: call.value,
-      })
+      const publicClient = makePublicClient(route.source.rpcUrls)
+      const attempt = await readSendAttempt(publicClient, owner)
+      if (input.transferId) updateMainnetTransferRecord(input.transferId, { ...attempt, sourceTxHash: undefined })
+      try {
+        hash = await walletClient.sendTransaction({
+          account: owner,
+          to: call.to,
+          data: call.data,
+          value: call.value,
+        })
+      } catch (error) {
+        if (isWalletRejection(error)) throw error
+        // The wallet may have broadcast before failing: never offer a second burn until the chain shows what happened.
+        settled = true
+        if (input.transferId) updateMainnetTransferRecord(input.transferId, { lastError: 'Your wallet did not confirm whether the transfer was sent. Do not send it again; Machina is checking the chain.' })
+        throw error
+      }
 
       if (input.transferId) {
         updateMainnetTransferRecord(input.transferId, { sourceTxHash: hash })
       }
 
-      const publicClient = makePublicClient(route.source.rpcUrls)
-      await publicClient.waitForTransactionReceipt({ hash })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') {
+        // Final on chain: no USDC left the wallet. The hash stays in the error as evidence, not as a source burn.
+        settled = true
+        if (input.transferId) transitionMainnetTransfer(input.transferId, previousStage, { sourceTxHash: undefined, lastError: `Transfer ${hash} reverted on chain. No USDC was sent.` })
+        throw new Error(`Transfer ${hash} reverted on chain. No USDC was sent.`)
+      }
 
       if (input.transferId) {
         transitionMainnetTransfer(input.transferId, 'waiting_attestation', {
@@ -453,16 +498,16 @@ export function useMainnetCctp() {
       return hash
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Mainnet CCTP burn failed.'
-      if (input.transferId) {
+      if (input.transferId && !settled) {
         if (hash) {
           updateMainnetTransferRecord(input.transferId, {
             sourceTxHash: hash,
-            lastError: message,
+            lastError: 'Transfer sent, result not confirmed yet. Do not send it again; Machina is checking the chain.',
           })
         } else {
           transitionMainnetTransfer(
             input.transferId,
-            transferBeforeBurn?.approvalTxHash ? 'approved' : 'ready',
+            previousStage,
             { lastError: message },
           )
         }
@@ -470,6 +515,7 @@ export function useMainnetCctp() {
       setState((current) => ({ ...current, step: 'error', error: message, isLoading: false }))
       throw error
     }
+    })
   }, [address, ensureWalletOnChain])
 
   const getAttestation = useCallback(async (input: {
