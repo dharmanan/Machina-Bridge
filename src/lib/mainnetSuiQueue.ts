@@ -4,13 +4,15 @@ import { parseUnits } from 'viem'
 
 const KEY = 'machina_mainnet_sui_transfers_v1'
 const EVENT = 'machina:mainnet-sui-transfers'
-export type SuiRecoveryRecord = SuiRecoveryResult & { id: string }
+// createdAt: when this browser first recorded the transfer (absent on records saved before it existed).
+export type SuiRecoveryRecord = SuiRecoveryResult & { id: string; createdAt?: number }
 export function suiTransferIdentity(r: Pick<SuiRecoveryResult, 'direction' | 'sourceId' | 'sourceEventIndex'>) {
   return `${r.direction}:${r.direction === 'arc-to-sui' ? r.sourceId.toLowerCase() : r.sourceId}:${r.sourceEventIndex}`
 }
 function valid(r: any): r is SuiRecoveryRecord {
   try {
     if (!r || !['sui-to-arc','arc-to-sui'].includes(r.direction) || !['waiting_attestation','ready_to_mint','complete'].includes(r.stage) || !/^0x[0-9a-f]{64}$/i.test(r.suiOwner) || !/^0x[0-9a-f]{40}$/i.test(r.evmOwner) || !Number.isSafeInteger(r.sourceEventIndex) || r.sourceEventIndex < 0 || !Number.isSafeInteger(r.checkedAt) || r.checkedAt <= 0 || typeof r.amount !== 'string' || r.amount.length > 40 || !/^[0-9]+(?:\.[0-9]{1,6})?$/.test(r.amount) || !/[1-9]/.test(r.amount)) return false
+    if (r.createdAt !== undefined && (!Number.isSafeInteger(r.createdAt) || r.createdAt <= 0)) return false
     if (/^0x0+$/i.test(r.suiOwner) || /^0x0+$/i.test(r.evmOwner) || parseUnits(r.amount, 6) > (1n << 64n) - 1n) return false
     if (r.stage !== 'waiting_attestation') {
       if (![r.feeUsdc,r.receivedUsdc].every(v => typeof v === 'string' && v.length < 40 && /^[0-9]+(?:\.[0-9]{1,6})?$/.test(v)) || parseUnits(r.receivedUsdc,6) <= 0n || parseUnits(r.receivedUsdc,6) + parseUnits(r.feeUsdc,6) !== parseUnits(r.amount,6)) return false
@@ -32,9 +34,10 @@ export function readSuiRecoveryQueue(): SuiRecoveryRecord[] {
   } catch { return [] }
 }
 export function importSuiRecovery(result: SuiRecoveryResult) {
-  const record: SuiRecoveryRecord = { ...result, id: suiTransferIdentity(result) }
+  const records = readSuiRecoveryQueue(), id = suiTransferIdentity(result), old = records.find(r => r.id === id)
+  const createdAt = old ? old.createdAt : result.checkedAt
+  const record: SuiRecoveryRecord = { ...result, id, ...(createdAt !== undefined ? { createdAt } : {}) }
   if (!valid(record)) throw new Error('Invalid Sui recovery record.')
-  const records = readSuiRecoveryQueue(), old = records.find(r => r.id === record.id)
   // Amounts are compared as USDC base units: '0.100000' (write path) and '0.1'
   // (recovery) are the same 100000 units; any real difference stays a conflict.
   if (old && (old.evmOwner.toLowerCase() !== record.evmOwner.toLowerCase() || old.suiOwner.toLowerCase() !== record.suiOwner.toLowerCase() || parseUnits(old.amount, 6) !== parseUnits(record.amount, 6))) throw new Error('Stored Sui source identity belongs to a different transfer.')

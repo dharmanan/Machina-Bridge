@@ -21,8 +21,9 @@ export function displayError(error: unknown) {
 }
 
 // Wires the real wallets (wagmi, Mysten dApp Kit), the guarded writer and the
-// read-only recovery into the single Sui Bridge flow. The Dashboard shows history only.
-export default function MainnetSuiBridge({ compact = false }: { compact?: boolean }) {
+// read-only recovery into the single Sui Bridge flow. Dashboard and Activity read
+// the same history through useBridgeHistory; transfers are driven only from here.
+export default function MainnetSuiBridge() {
   const { address: evmOwner, chainId, connector } = useAccount()
   const sui = useSuiWallet('mainnet')
   const [records, setRecords] = useState<SuiRecoveryRecord[]>(readSuiRecoveryQueue)
@@ -40,15 +41,12 @@ export default function MainnetSuiBridge({ compact = false }: { compact?: boolea
     try { return await controller.inspect(input, () => true, importSuiRecovery) }
     catch (e) { throw new Error(displayError(e)) }
   }, [controller])
-  const flow = <SuiBridgeFlow compact={compact} writer={writer} records={records} inspect={inspect}
-    evm={{ address: evmOwner, walletName: connector?.name, onArc: chainId === 5042 }}
-    sui={{ address: sui.address ?? undefined, walletName: sui.currentWalletName ?? undefined, ready: sui.walletSupportsNetwork, usdc: sui.usdcBalance, gas: sui.suiBalance }}
-    arc={{ usdcUnits: typeof balance.data === 'bigint' ? balance.data : undefined, refresh }} />
-  return compact
-    ? <section aria-label="Sui transfers" className="mb-5 rounded-2xl border border-slate-200 bg-white p-4"><h3 className="mb-3 font-semibold">Sui ↔ Arc transfers</h3>{flow}</section>
-    : <section aria-label="Sui Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-      <h2 className="text-xl font-semibold">Sui ↔ Arc</h2>
-      <p className="mb-4 mt-1 text-xs leading-5 text-slate-500">{MAINNET_SUI_CCTP_BLOCKER}</p>
-      {flow}
-    </section>
+  return <section aria-label="Sui Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+    <h2 className="text-xl font-semibold">Sui ↔ Arc</h2>
+    <p className="mb-4 mt-1 text-xs leading-5 text-slate-500">{MAINNET_SUI_CCTP_BLOCKER}</p>
+    <SuiBridgeFlow writer={writer} records={records} inspect={inspect}
+      evm={{ address: evmOwner, walletName: connector?.name, onArc: chainId === 5042 }}
+      sui={{ address: sui.address ?? undefined, walletName: sui.currentWalletName ?? undefined, ready: sui.walletSupportsNetwork, usdc: sui.usdcBalance, gas: sui.suiBalance }}
+      arc={{ usdcUnits: typeof balance.data === 'bigint' ? balance.data : undefined, refresh }} />
+  </section>
 }

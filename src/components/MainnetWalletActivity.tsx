@@ -18,10 +18,18 @@ import {
   shortWalletAddress,
   type WalletActivity,
 } from '../lib/mainnetWalletActivity'
+import { usePhantomSolana } from '../hooks/usePhantomSolana'
+import { useSuiWallet } from '../hooks/useSuiWallet'
+import { useBridgeHistory } from '../hooks/useBridgeHistory'
+import BridgeHistoryList from './BridgeHistoryList'
 import { Card, Container } from './ui'
 
 export default function MainnetWalletActivity() {
   const { address } = useAccount()
+  const { address: phantomAddress } = usePhantomSolana()
+  const sui = useSuiWallet('mainnet')
+  // Same read-only list and statuses as the Dashboard.
+  const { items: bridgeHistory } = useBridgeHistory({ evm: address, solana: phantomAddress, sui: sui.address })
   const [walletActivity, setWalletActivity] = useState<WalletActivity[]>([])
   const [walletActivityLoading, setWalletActivityLoading] = useState(false)
   const [walletActivityError, setWalletActivityError] = useState<string | null>(null)
@@ -193,6 +201,14 @@ export default function MainnetWalletActivity() {
         <p className="mt-4 border-t border-slate-100 pt-3 text-[10px] text-slate-400">
           Activity data provided by Blockscout.
         </p>
+      </Card>
+
+      <Card className="mt-6">
+        <h2 className="text-lg font-semibold text-slate-900">Bridge transfers</h2>
+        <p className="mt-1 text-xs leading-5 text-slate-500">
+          EVM, Solana and Sui transfers recorded in this browser for the connected wallets. This is not a full chain history scan; transfers made elsewhere can be found from the Bridge view.
+        </p>
+        <BridgeHistoryList items={bridgeHistory} empty={address || phantomAddress || sui.address ? 'No bridge transfers recorded in this browser for these wallets.' : 'Connect a wallet in the top bar to see its bridge transfers.'} />
       </Card>
     </Container>
   )

@@ -18,8 +18,7 @@
    "coveredBy": "verify-app-shell-ui"
   },
   "dashboard": {
-   "status": "ACTIVE",
-   "coveredBy": "verify-app-shell-ui"
+   "status": "ACTIVE"
   },
   "activity": {
    "status": "ACTIVE"
@@ -65,6 +64,7 @@
    "verify-sui-cctp-foundation",
    "verify-sui-mainnet-recovery",
    "verify-sui-write-controller",
+   "verify-bridge-history",
    "verify-borrow-source-gates"
   ],
   "full": [
@@ -89,6 +89,7 @@
    "verify-sui-transfer-review-ui",
    "verify-swap-unified-ui",
    "verify-sui-recovery-ui",
+   "verify-bridge-dashboard-ui",
    "verify-app-shell-ui",
    "verify-mainnet-transfer-recovery-ui",
    "verify-sui-write-browser",
@@ -153,7 +154,9 @@
   "verify-borrow-sdk-integration": "borrow",
   "verify-borrow-operations-ui": "borrow",
   "verify-arc-intelligence-dashboard": "arc-intelligence",
-  "verify-arc-intelligence-dashboard-completion": "arc-intelligence"
+  "verify-arc-intelligence-dashboard-completion": "arc-intelligence",
+  "verify-bridge-history": "dashboard",
+  "verify-bridge-dashboard-ui": "dashboard"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",

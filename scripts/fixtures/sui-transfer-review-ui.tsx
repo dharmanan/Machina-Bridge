@@ -16,7 +16,7 @@ const REAL = { arcBurn: '0x2cf8f5a53f6c0deb8adeb527bd693e2977f7a403b4750da4a37c6
 const SUI_BURN = 'CYF6ajsTZgD2dyw2Xdz66bEm2owvhAxnTYNQ7hjFFxf5', ARC_MINT = '0x' + 'ab'.repeat(32), ARC_APPROVAL = '0x' + 'cd'.repeat(32)
 const params = new URLSearchParams(location.search), fast = params.get('poll') === 'fast'
 const state = {
-  prepares: 0, signatures: 0, broadcasts: 0, walletSends: 0, holdSend: false, signUnsupported: false, failBroadcast: false,
+  prepares: 0, signatures: 0, broadcasts: 0, walletSends: 0, holdSend: false, holdPrepare: false, releasePrepare: null as null | (() => void), releaseSend: null as null | (() => void), signUnsupported: false, failBroadcast: false,
   recoverTo: 'verified' as 'pending' | 'verified' | 'reverted' | 'mismatch', ttl: 100_000, locate: null as string | null,
   evidence: ['controlled mismatch evidence line'] as string[], evidenceFail: false, reconcileReads: 0,
   allowance: 0n, stage: 'waiting_attestation' as SuiRecoveryResult['stage'], inspectFail: '' as string, inspectCalls: 0,
@@ -26,6 +26,7 @@ const digestOf = (i: SuiWriteIntent) => i.action === 'sui-burn' ? SUI_BURN : i.a
 const port: SuiWritePort = {
   async prepare(i) {
     state.prepares++; state.intents.push(i)
+    if (state.holdPrepare) await new Promise<void>(r => { state.releasePrepare = r })
     return { bytes: new TextEncoder().encode(JSON.stringify([i.action, String(i.amount), i.sourceId ?? '', i.arcMethod ?? ''])), digest: i.action.startsWith('sui-') ? digestOf(i) : undefined, binding: 'controlled', expiresAt: Date.now() + state.ttl, ...(i.arcMethod === 'wallet-send' ? { arc: { to: ('0x' + '33'.repeat(20)) as `0x${string}`, dataHash: ('0x' + '44'.repeat(32)) as `0x${string}`, nonce: 7, gas: 120_000n, maxFeePerGas: 30_000_000_000n, fromBlock: 100n } } : {}), estimatedGas: i.action.startsWith('sui-') ? 5_754_400n : 3_700_000_000_000_000n, maximumGas: i.action.startsWith('sui-') ? 50_000_000n : 4_400_000_000_000_000n, content: [`controlled ${i.action} bytes`] }
   },
   async recheck() {},
@@ -41,7 +42,7 @@ const port: SuiWritePort = {
     }
     return state.recoverTo
   },
-  async send(i) { state.walletSends++; if (state.holdSend) await new Promise(() => {}); return digestOf(i) },
+  async send(i) { state.walletSends++; if (state.holdSend) await new Promise<void>(r => { state.releaseSend = r }); return digestOf(i) },
   async locate() { return state.locate },
   async reconcile(a) { state.reconcileReads++; if (state.evidenceFail) throw new Error('The mismatched receipt is not in the canonical chain served by this RPC. The transfer stays locked.'); const lines = [...state.evidence]; return { key: keccak256(stringToHex(JSON.stringify(lines))), digest: a.digest!, lines } },
 }
@@ -72,7 +73,7 @@ function App() {
   const [records, setRecords] = useState(readSuiRecoveryQueue)
   useEffect(() => subscribeSuiRecovery(() => setRecords(readSuiRecoveryQueue())), [])
   set = p => setC(old => { const n = { ...old, ...p }; Object.assign(ctx, n); return n })
-  return <div className="mx-auto max-w-xl p-4"><SuiBridgeFlow writer={params.get('gate') === 'production' ? lockedWriter : enabledWriter} records={records} inspect={inspect}
+  return <div className="mx-auto max-w-xl p-4"><header data-testid="above-panel" className="mb-4 rounded-xl bg-slate-900 p-3 text-sm font-semibold text-white">Machina Bridge · Sui ↔ Arc (layout reference)</header><SuiBridgeFlow writer={params.get('gate') === 'production' ? lockedWriter : enabledWriter} records={records} inspect={inspect}
     pollMs={fast ? { status: 300, attestation: 300 } : { status: 600_000, attestation: 600_000 }}
     evm={{ address: c.evmOwner, walletName: 'MetaMask', onArc: c.ready }} sui={{ address: c.suiOwner, walletName: 'Slush', ready: c.ready, usdc: '1', gas: '2' }}
     arc={{ usdcUnits: 1_000_000n, refresh: async () => ({ allowanceUnits: state.allowance }) }} /></div>

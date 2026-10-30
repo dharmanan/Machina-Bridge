@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { formatUnits } from 'viem'
 import type { SuiArcMethod, SuiWriteAction, SuiWriteAttempt, SuiWriteIntent, SuiWriteReconciliation, SuiWriteReview } from '../lib/mainnetSuiExecution'
 import type { SuiTransferWriter } from '../hooks/useSuiMainnetWrite'
+import { arcTx, suiTx } from '../lib/bridgeHistory'
 
 // Explicit network-fee ceilings. The prepared transaction must stay within them;
 // they are never raised automatically.
@@ -20,8 +21,8 @@ export const attemptLabels: Record<SuiWriteAttempt['state'], string> = {
 // A mismatch stays unresolved: nothing new may start until it is reconciled.
 export const unresolvedAttempt = (a: SuiWriteAttempt | null) => Boolean(a && !['verified', 'reverted', 'rejected', 'reconciled'].includes(a.state))
 const methodLabels: Record<SuiArcMethod, string> = { 'sign-only': 'Sign only — Machina broadcasts the exact reviewed transaction', 'wallet-send': 'Wallet signs and sends (works with MetaMask)' }
-export const arcExplorer = (hash: string) => `https://arcscan.app/tx/${hash}`
-export const suiExplorer = (digest: string) => `https://suiscan.xyz/mainnet/tx/${encodeURIComponent(digest)}`
+export const arcExplorer = (hash: string) => arcTx(hash)!
+export const suiExplorer = (digest: string) => suiTx(digest)!
 const walletOf = (action: SuiWriteAction, evmWallet: string) => action.startsWith('sui-') ? 'Slush' : evmWallet
 function gasText(action: SuiWriteAction, value: bigint) { return action.startsWith('sui-') ? `${formatUnits(value, 9)} SUI` : `${formatUnits(value, 18)} USDC` }
 function message(error: unknown) { return error instanceof Error && error.message ? error.message : 'The operation could not be verified. Nothing further will be sent.' }
@@ -36,12 +37,20 @@ export type SuiStepReviewProps = {
   // Preparation is read-only (simulation, no wallet prompt); it may start on its own.
   autoPrepare?: boolean
   explain?: ReactNode
+  // Inside the bridge panel: no own card frame or title (the panel's step list names the step).
+  bare?: boolean
+  // Shown next to the advanced options (e.g. the panel's Cancel link).
+  aside?: ReactNode
+  onPhase?(phase: SuiStepPhase): void
   onAttempt(attempt: SuiWriteAttempt | null): void
 }
+// What this step currently waits for: our read-only preparation, or the user.
+export type SuiStepPhase = 'idle' | 'preparing' | 'review' | 'expired' | 'confirming'
+const short = (v: string) => v.length > 14 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v
 
 // One wallet step: prepare (read-only) -> Review -> explicit Confirm. Nothing is
 // signed or sent without the user's click on the Review currently shown.
-export default function SuiStepReview({ writer, action, base, ready, evmWallet = 'your EVM wallet', autoPrepare = false, explain, onAttempt }: SuiStepReviewProps) {
+export default function SuiStepReview({ writer, action, base, ready, evmWallet = 'your EVM wallet', autoPrepare = false, explain, bare = false, aside, onPhase, onAttempt }: SuiStepReviewProps) {
   const arcStep = action.startsWith('arc-')
   // Explicit, reviewed choice; never switched by the app after a failure.
   const [method, setMethod] = useState<SuiArcMethod>(writer.walletSendEnabled ? 'wallet-send' : 'sign-only')
@@ -94,24 +103,25 @@ export default function SuiStepReview({ writer, action, base, ready, evmWallet =
   }
   const expired = review ? now >= review.expiresAt : false
   const wallet = walletOf(action, evmWallet)
+  const phase: SuiStepPhase = busy === 'confirm' ? 'confirming' : busy === 'prepare' ? 'preparing' : review ? (expired ? 'expired' : 'review') : 'idle'
+  const phaseRef = useRef(onPhase); phaseRef.current = onPhase
+  useEffect(() => { phaseRef.current?.(phase) }, [phase])
+  useEffect(() => () => phaseRef.current?.('idle'), [])
 
-  return <div className="space-y-3 rounded-2xl border border-slate-200 p-4 text-sm" aria-label="Transfer step">
-    <p className="font-semibold">{actionLabels[action]}</p>
-    {explain && <div className="text-xs leading-5 text-slate-600">{explain}</div>}
+  return <div className={bare ? 'space-y-3 text-sm' : 'space-y-3 rounded-2xl border border-slate-200 p-4 text-sm'} aria-label="Transfer step">
+    {!bare && <p className="font-semibold">{actionLabels[action]}</p>}
+    {explain && !bare && <div className="text-xs leading-5 text-slate-600">{explain}</div>}
     {!writer.writesEnabled && <p className="rounded-lg bg-slate-100 p-2 text-xs leading-5 text-slate-600">Sending is disabled on this deployment. Nothing can be signed or submitted here.</p>}
-    {!review && <button type="button" onClick={() => void prepare()} disabled={!writer.writesEnabled || !ready || !base || Boolean(busy)} className="w-full rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{!writer.writesEnabled ? 'Sui transfers locked' : busy === 'prepare' ? 'Preparing your review…' : `Review: ${actionLabels[action]}`}</button>}
-    {review && <section role="region" aria-label="Transaction review" className="space-y-1.5 rounded-xl bg-slate-50 p-3 text-xs leading-5 break-words">
+    {!review && busy !== 'confirm' && <button type="button" onClick={() => void prepare()} disabled={!writer.writesEnabled || !ready || !base || Boolean(busy)} className="w-full rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{!writer.writesEnabled ? 'Sui transfers locked' : busy === 'prepare' ? 'Preparing your review…' : `Review: ${actionLabels[action]}`}</button>}
+    {review && <section role="region" aria-label="Transaction review" className="space-y-1 rounded-xl bg-slate-50 p-3 text-xs leading-5 break-words">
       <p className="text-sm font-semibold">Review · {actionLabels[review.intent.action]}</p>
       <Row k="Amount" v={`${formatUnits(review.intent.amount, 6)} USDC`} />
       {review.intent.action !== 'arc-approval' && <Row k="Maximum Circle fee" v={`${formatUnits(review.intent.maxCctpFee, 6)} USDC`} />}
-      <Row k="Estimated network fee" v={gasText(review.intent.action, review.estimatedGas)} />
-      <Row k="Network fee limit" v={gasText(review.intent.action, review.maximumGas)} />
-      <Row k="Wallet to confirm" v={wallet} />
-      <Row k="Sui wallet" v={review.intent.suiOwner} mono />
-      <Row k="Arc wallet" v={review.intent.evmOwner} mono />
-      {review.intent.action.startsWith('arc-') && review.intent.arcMethod === 'wallet-send' && <p className="rounded-lg bg-amber-50 p-2 text-amber-900">{wallet} signs and sends this transaction itself. Machina checks on chain afterwards that it matches this review; if it does not, new transfers stay locked and it is never shown as complete.</p>}
+      <Row k="Network fee" v={`${gasText(review.intent.action, review.estimatedGas)} · limit ${gasText(review.intent.action, review.maximumGas)}`} />
+      <Row k="Wallets" v={`Arc ${short(review.intent.evmOwner)} · Sui ${short(review.intent.suiOwner)}`} title={`Arc ${review.intent.evmOwner} · Sui ${review.intent.suiOwner}`} mono />
+      {review.intent.action.startsWith('arc-') && review.intent.arcMethod === 'wallet-send' && <p className="rounded-lg bg-amber-50 p-2 text-amber-900">{wallet} signs and sends this itself. Machina then checks on chain that it matches this review; if not, new transfers stay locked and it is never shown as complete.</p>}
       <details><summary className="cursor-pointer font-medium text-slate-600">Technical details</summary>
-        <ul className="mt-1 list-disc pl-4 font-mono text-[11px]">{review.content.map((l, n) => <li key={n} className="break-all">{l}</li>)}</ul>
+        <ul className="mt-1 list-disc pl-4 font-mono text-[11px]"><li className="break-all">Wallet to confirm {wallet}</li><li className="break-all">Estimated network fee {gasText(review.intent.action, review.estimatedGas)} · limit {gasText(review.intent.action, review.maximumGas)}</li><li className="break-all">Sui wallet {review.intent.suiOwner}</li><li className="break-all">Arc wallet {review.intent.evmOwner}</li>{review.content.map((l, n) => <li key={n} className="break-all">{l}</li>)}</ul>
         <p className="mt-1 font-mono text-[11px] break-all">Commitment {review.commitment}{review.digest ? ` · digest ${review.digest}` : ''}</p>
         {review.intent.action.startsWith('arc-') && <p className="mt-1">Signing method: {methodLabels[review.intent.arcMethod ?? 'sign-only']}</p>}
       </details>
@@ -119,28 +129,32 @@ export default function SuiStepReview({ writer, action, base, ready, evmWallet =
       <button type="button" onClick={() => void confirm()} disabled={!writer.writesEnabled || expired || Boolean(busy)} className="mt-1 w-full rounded-xl bg-[#66D121] px-4 py-3 text-sm font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{writer.writesEnabled ? `Confirm in ${wallet}` : 'Confirm locked'}</button>
       {expired && <button type="button" onClick={() => void prepare()} disabled={Boolean(busy)} className="w-full text-center font-semibold underline">Review again</button>}
     </section>}
-    {busy === 'confirm' && <p role="status" className="text-xs">Confirm in {wallet}. Do not close this tab.</p>}
-    {arcStep && writer.walletSendEnabled && <details className="text-xs"><summary className="cursor-pointer text-slate-500">Advanced: signing method</summary>
+    {busy === 'confirm' && <p className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900">Waiting for your confirmation in {wallet}. If its window did not open, open {wallet} yourself. Do not close this tab.</p>}
+    {(aside || (arcStep && writer.walletSendEnabled)) && <div className="flex flex-wrap items-start gap-x-4 gap-y-1">{aside}
+      {arcStep && writer.walletSendEnabled && <details className="min-w-0 flex-1 text-xs"><summary className="cursor-pointer text-slate-500">Advanced: signing method</summary>
       <fieldset className="mt-2 space-y-1"><legend className="sr-only">Arc signing method</legend>
         {(['wallet-send', 'sign-only'] as const).map(m => <label key={m} className="flex items-start gap-1.5"><input type="radio" name={`arc-method-${action}`} className="mt-1" checked={method === m} onChange={() => setMethod(m)} /><span>{methodLabels[m]}</span></label>)}
         <p className="leading-5 text-slate-500">Sign only is stronger: the exact signed bytes are checked before anything is sent, but many wallets, including MetaMask, do not support it. Changing this cancels the current review.</p>
-      </fieldset></details>}
+      </fieldset></details>}</div>}
     {error && <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">{error}{arcStep && method === 'sign-only' && /cannot sign separately/.test(error) ? ' Choose "Wallet signs and sends" under Advanced and review again; nothing switches automatically.' : ''}</p>}
   </div>
 }
-function Row({ k, v, mono = false }: { k: string; v: string; mono?: boolean }) {
-  return <div className="flex flex-wrap justify-between gap-x-3"><span className="text-slate-500">{k}</span><span className={`min-w-0 break-all text-right ${mono ? 'font-mono text-[11px]' : 'font-medium'}`}>{v}</span></div>
+function Row({ k, v, mono = false, title }: { k: string; v: string; mono?: boolean; title?: string }) {
+  return <div className="flex flex-wrap justify-between gap-x-3"><span className="text-slate-500">{k}</span><span title={title} className={`min-w-0 break-all text-right ${mono ? 'font-mono text-[11px]' : 'font-medium'}`}>{v}</span></div>
 }
 
-export type SuiAttemptCardProps = { writer: SuiTransferWriter; attempt: SuiWriteAttempt; evmWallet?: string; pollMs?: number; onAttempt(attempt: SuiWriteAttempt | null): void }
+export type SuiAttemptCardProps = { writer: SuiTransferWriter; attempt: SuiWriteAttempt; evmWallet?: string; pollMs?: number; bare?: boolean; onChecking?(checking: boolean): void; onAttempt(attempt: SuiWriteAttempt | null): void }
 // The journaled wallet operation. Status checks are read-only and run on their
 // own while the outcome is open; nothing is ever re-sent from here.
-export function SuiAttemptCard({ writer, attempt, evmWallet = 'your EVM wallet', pollMs = 15_000, onAttempt }: SuiAttemptCardProps) {
+export function SuiAttemptCard({ writer, attempt, evmWallet = 'your EVM wallet', pollMs = 15_000, bare = false, onChecking, onAttempt }: SuiAttemptCardProps) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [evidence, setEvidence] = useState<SuiWriteReconciliation | null>(null)
   const open = unresolvedAttempt(attempt) && attempt.state !== 'mismatch'
   const running = useRef(false)
+  const checkingRef = useRef(onChecking); checkingRef.current = onChecking
+  useEffect(() => { checkingRef.current?.(busy) }, [busy])
+  useEffect(() => () => checkingRef.current?.(false), [])
   async function recover(silent = false) {
     if (running.current) return
     running.current = true; setBusy(true); if (!silent) setError(null)
@@ -162,8 +176,8 @@ export function SuiAttemptCard({ writer, attempt, evmWallet = 'your EVM wallet',
   }
   const wallet = walletOf(attempt.intent.action, evmWallet)
   const link = attempt.digest ? (attempt.intent.action.startsWith('sui-') ? suiExplorer(attempt.digest) : arcExplorer(attempt.digest)) : null
-  return <div role="status" aria-label="Wallet operation" className="space-y-2 rounded-2xl border border-slate-200 p-4 text-xs leading-5 break-words">
-    <p className="text-sm font-semibold">{actionLabels[attempt.intent.action]} · {formatUnits(attempt.intent.amount, 6)} USDC</p>
+  return <div role="status" aria-label="Wallet operation" className={bare ? 'space-y-2 text-xs leading-5 break-words' : 'space-y-2 rounded-2xl border border-slate-200 p-4 text-xs leading-5 break-words'}>
+    {!bare && <p className="text-sm font-semibold">{actionLabels[attempt.intent.action]} · {formatUnits(attempt.intent.amount, 6)} USDC</p>}
     <p className="font-medium">{attemptLabels[attempt.state]}</p>
     {(attempt.state === 'unknown' || attempt.state === 'sending' || attempt.state === 'signing') && <p>We could not confirm your {wallet} transaction yet. Do not send it again — its status is being checked.</p>}
     {(attempt.state === 'pending' || attempt.state === 'broadcasting') && <p>Waiting for the network to confirm it. This page checks on its own; you can leave it open.</p>}

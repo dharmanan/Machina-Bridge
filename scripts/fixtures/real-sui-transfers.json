@@ -1,0 +1,12 @@
+{
+  "$comment": "The five real Sui <-> Arc Mainnet transfers (0.1 USDC each) of the same Slush/MetaMask wallets. Each was re-read read-only on 2026-10-30: source burn (Arc logs / Sui events), Circle Iris V2 message (status complete, eventNonce, destinationMintTxHash) and destination nonce (Arc usedNonces / Sui used_nonces). Times are the source block/checkpoint times.",
+  "sui": "0xf0d9c71c894a249d7f406f45c98094e92de5d9f95d54c0c628adc51daa1ebeec",
+  "evm": "0xafbb6cc5c0a9c0eb1bff8db2ed807e83aab8e321",
+  "transfers": [
+    { "direction": "arc-to-sui", "source": "0x2cf8f5a53f6c0deb8adeb527bd693e2977f7a403b4750da4a37c6adb5f6eac37", "eventIndex": 6, "destination": "35MLrmr8g8ZD1tw2cY1JuKe3jJGRWaPQ7mnponw6ZPFK", "sourceTime": "2026-10-29T19:08:35Z", "destinationTime": "2026-10-29T20:16:28Z" },
+    { "direction": "arc-to-sui", "source": "0x91aaba82d47e8f5020deee21225300f7ca6327a1fc32343cfdfbf628a3f8a59e", "eventIndex": 11, "destination": "3xFgAhCtbokHE2mLP6vUTZofBfnNYbinEEwYQndrJL7p", "sourceTime": "2026-10-30T00:38:26Z", "destinationTime": "2026-10-30T00:39:21Z" },
+    { "direction": "sui-to-arc", "source": "8nmDq8Hj7kTSG5nZ7HHY7hxSzkTDKP7R7pLxP33khehb", "eventIndex": 2, "destination": "0x363bea9d7e221073e48268aaa50d3b8245115bf3fec28b41c6103b3cb3ed44e7", "sourceTime": "2026-10-30T00:41:01Z", "destinationTime": "2026-10-30T00:41:56Z" },
+    { "direction": "sui-to-arc", "source": "4u5Nd9c7HWwtWtRFDpEhoNWr5QpX5pc4T7axSXFcD6Qw", "eventIndex": 2, "destination": "0x4ef7796c41ca2c2470e862a12db388622a7e57957096b2eccba4f50155482add", "sourceTime": "2026-10-30T00:43:36Z", "destinationTime": "2026-10-30T00:44:39Z" },
+    { "direction": "arc-to-sui", "source": "0xe28f035c527e82358eeb3e0870dcf7e758c1072a3dec64bf160eae6094d494f0", "eventIndex": 6, "destination": "6VNJyRpVj9KsntCQrtGx61oPimas5pQvfuFZT5XB9TEB", "sourceTime": "2026-10-30T00:54:02Z", "destinationTime": "2026-10-30T00:55:24Z" }
+  ]
+}
