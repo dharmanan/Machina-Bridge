@@ -15,6 +15,7 @@ import {
   OPTIMISM_SEPOLIA_EVM_CHAIN,
   SEPOLIA_EVM_CHAIN,
 } from './chains'
+import { clearWalletConnectCheck, withWalletConnectStatus } from './walletConnectStatus'
 
 const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID?.trim() || '00000000000000000000000000000000'
 const hasWalletConnect = walletConnectProjectId !== '00000000000000000000000000000000'
@@ -27,12 +28,11 @@ const connectors = connectorsForWallets(
         metaMaskWallet,
         rabbyWallet,
         coinbaseWallet,
+        // A failed WalletConnect start is shown in the wallet UI instead of leaving a silent button.
+        ...(hasWalletConnect ? [(params: Parameters<typeof walletConnectWallet>[0]) => withWalletConnectStatus(walletConnectWallet(params))] : []),
         injectedWallet,
       ],
     },
-    // Kept apart from "MetaMask" above: on a phone without MetaMask's own browser, "MetaMask" uses the MetaMask
-    // connector, while this entry opens a WalletConnect pairing with any wallet app (a hand-off to another app).
-    ...(hasWalletConnect ? [{ groupName: 'Other wallets via WalletConnect', wallets: [walletConnectWallet] }] : []),
   ],
   {
     appName: 'Machina Bridge',
@@ -59,3 +59,7 @@ export const wagmiConfig = createConfig({
   },
   ssr: false,
 })
+
+// WalletConnect's start runs before wagmi reports 'connecting', so either status means another
+// attempt (or a finished one) replaced any pending WalletConnect notice.
+wagmiConfig.subscribe(state => state.status, status => { if (status === 'connecting' || status === 'connected') clearWalletConnectCheck() })

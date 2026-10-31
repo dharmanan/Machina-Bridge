@@ -101,6 +101,7 @@
    "verify-mainnet-earn-safety-ui",
    "verify-solana-bridge-ui",
    "verify-mobile-menu-ui",
+   "verify-walletconnect-mobile-ui",
    "verify-app-shell-ui",
    "verify-bridge-dashboard-ui",
    "verify-sui-recovery-ui",
@@ -182,6 +183,7 @@
   "verify-swap-unified-ui-e": "swap",
   "verify-solana-bridge-ui": "solana-bridge",
   "verify-mobile-menu-ui": "app-shell",
+  "verify-walletconnect-mobile-ui": "app-shell",
   "verify-arc-solana-burn-scan": "solana-bridge"
  },
  "manual": {
