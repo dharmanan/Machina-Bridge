@@ -11,6 +11,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import { parseUsdcAmountInput } from '../lib/usdcAmountInput'
+import SolanaArcRecoveryPanel from './SolanaArcRecoveryPanel'
 import { useOpenSolanaSendAttempt } from '../lib/solanaSendRuntime'
 import {
   listMainnetSolanaActivity,
@@ -731,6 +732,10 @@ export default function MainnetSolanaCanary() {
             </div>
             <p className="mt-2 text-xs text-slate-500">If the burn is eligible, you confirm the receive step in Phantom.</p>
           </details>
+        )}
+
+        {direction === 'solana-to-arc' && (
+          <SolanaArcRecoveryPanel evmAddress={evmAddress} phantomAddress={phantomAddress} busy={state.isLoading} />
         )}
       </div>
     </section>

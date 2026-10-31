@@ -17,7 +17,9 @@ const store = `import { useSyncExternalStore } from 'react'
 const T = window.solTest
 export const useT = () => useSyncExternalStore(l => { T.listeners.add(l); return () => T.listeners.delete(l) }, () => T.snapshot)`
 const wagmiMock = `import { useT } from '\\0sb-store'
-export function useAccount(){ const s = useT(); return { address: s.evm, isConnected: Boolean(s.evm), chainId: 5042, connector: s.evm ? { name: 'MetaMask' } : undefined } }`
+export function useAccount(){ const s = useT(); return { address: s.evm, isConnected: Boolean(s.evm), chainId: 5042, connector: s.evm ? { name: 'MetaMask' } : undefined } }
+const W = window.solTest.wallet = { transport: { request: async a => { window.solTest.calls.wallet.push(a.method); return null } }, account: { address: '${EVM}' }, sendTransaction: async () => { window.solTest.calls.wallet.push('sendTransaction'); throw new Error('test wallet never sends') } }
+export function useWalletClient(){ const s = useT(); return { data: s.evm ? W : undefined } }`
 const phantomMock = `import { useT } from '\\0sb-store'
 export function usePhantomSolana(){ const s = useT(); return { address: s.sol, isConnected: Boolean(s.sol), isConnecting: false, provider: s.sol ? {} : null, connect: async () => {}, disconnect: async () => {} } }`
 const cctpMock = `import { useT } from '\\0sb-store'
@@ -38,7 +40,7 @@ export function useMainnetSolanaCctp(){
 const reclaimMock = `export async function discoverMainnetSolanaRefunds(){ window.solTest.calls.refunds++; return [] }
 export async function loadMainnetSolanaRefundMetadata(){ return {} }
 export async function reclaimMainnetSolanaDeposit(){ throw new Error('not used') }`
-const boot = `<script>(() => { const T = window.solTest = { listeners: new Set(), calls: { runs: [], estimates: [], recover: [], refresh: 0, refunds: 0 } }
+const boot = `<script>(() => { const T = window.solTest = { listeners: new Set(), calls: { runs: [], estimates: [], recover: [], refresh: 0, refunds: 0, wallet: [] } }
   T.snapshot = { evm: '${EVM}', sol: '${SOL}', arcBalance: '0.453737', solanaBalance: '0.46088', fee: null, state: { isLoading: false, error: null, status: null, result: null } }
   T.set = p => { T.snapshot = { ...T.snapshot, ...p }; T.listeners.forEach(l => l()) } })()</script>`
 const server = await createServer({ root, configFile: false, cacheDir: '/tmp/machina-solana-bridge-ui', plugins: [react(), { name: 'solana-bridge-ui', enforce: 'pre',
@@ -154,6 +156,53 @@ try {
     await page.evaluate(() => localStorage.removeItem('machina_mainnet_solana_send_v1')); await open(); await page.getByLabel('Bridge amount').fill('0.25')
     assert.equal(await page.getByRole('alert', { name: 'Earlier Solana transfer not verified' }).count(), 0)
     assert.equal(await page.getByRole('button', { name: 'Review transfer' }).isDisabled(), false, 'Review available again once settled')
+  })
+  await test('Solana -> Arc recovery: a burn known after a reload is checked read-only; already received on Arc sends nothing; a missing receive needs review and wallet approval; another browser can paste the signature', async () => {
+    const { PublicKey } = require('@solana/web3.js')
+    const SIG = '3vZ7GhB8WFHp2TQ2qQ7fZx2iN1bVwQ3TGxHqCFeZ8p1b6mM2cRbQnXgMm9HcUe8dAqxpbLvW1jKaRm7nPq3Ttz4X'
+    const pk = k => Buffer.from(new PublicKey(k).toBytes()).toString('hex'), hx = x => x.replace(/^0x/, '').padStart(64, '0'), wd = (v, n = 32) => BigInt(v).toString(16).padStart(n * 2, '0')
+    const msg = '0x' + wd(1, 4) + wd(5, 4) + wd(26, 4) + '4e'.repeat(32) + pk('CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe') + hx('0x28b5a0e9c621a5badaa536219b3a228c8168cf5d') + '00'.repeat(32) + wd(1000, 4) + wd(1000, 4)
+      + wd(1, 4) + pk('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') + hx(EVM) + wd(100000) + pk(SOL) + wd(3) + wd(2) + wd(0)
+    let used = 1n
+    const rpc = route => { const b = JSON.parse(route.request().postData() || '{}'), block = { number: '0x64', hash: '0x' + 'aa'.repeat(32), parentHash: '0x' + 'bb'.repeat(32), timestamp: '0x1', gasLimit: '0x1', gasUsed: '0x0', transactions: [], logsBloom: '0x' + '00'.repeat(256), miner: '0x' + '00'.repeat(20), difficulty: '0x0', extraData: '0x', size: '0x1', nonce: '0x0000000000000000', sha3Uncles: '0x' + '00'.repeat(32), stateRoot: '0x' + '00'.repeat(32), receiptsRoot: '0x' + '00'.repeat(32), transactionsRoot: '0x' + '00'.repeat(32), uncles: [] }
+      const result = b.method === 'eth_chainId' ? '0x13b2' : b.method === 'eth_getBlockByNumber' ? block : b.method === 'eth_call' ? '0x' + wd(used) : null
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ jsonrpc: '2.0', id: b.id ?? 1, result }) }) }
+    await page.route('https://rpc.mainnet.arc.io/**', rpc)
+    await page.route('**/api/solana-rpc', route => { const b = JSON.parse(route.request().postData() || '{}')
+      const result = b.method === 'getSignatureStatuses' ? { value: [{ confirmationStatus: 'finalized', err: null }] } : b.method === 'getTransaction' ? { meta: { err: null, logMessages: ['Program CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe invoke [1]'] }, transaction: { message: { accountKeys: [SOL], header: { numRequiredSignatures: 1 } } } } : null
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ jsonrpc: '2.0', id: 1, result }) }) })
+    await page.route('https://iris-api.circle.com/**', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ messages: [{ status: 'complete', message: msg, attestation: '0x' + 'ab'.repeat(130), eventNonce: '0x' + '4e'.repeat(32) }] }) }))
+    // A burn this browser recorded (Activity, receive not verified), then a reload.
+    await open()
+    await page.evaluate(({ evm, sol, sig }) => { localStorage.removeItem('machina_mainnet_solana_send_v1'); localStorage.setItem('machina_mainnet_solana_transfers_v1', JSON.stringify([{ id: 'r1', evmWallet: evm, solanaWallet: sol, direction: 'solana-to-arc', amount: '0.1', sourceTxHash: sig, createdAt: Date.now() }])) }, { evm: EVM, sol: SOL, sig: SIG })
+    await open(); await page.getByRole('button', { name: 'Switch direction' }).click()
+    const item = page.getByLabel(/^Solana burn 3vZ7GhB8/); await item.waitFor()
+    await item.getByRole('button', { name: 'Check on chain' }).click()
+    await item.getByText(/Already received on Arc \(0\.099998 USDC\)\. Nothing more to do\./).waitFor({ timeout: 15000 })
+    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('machina_mainnet_solana_transfers_v1'))[0].status), 'complete', 'Activity marked complete from the used Arc nonce')
+    assert.equal(await item.getByRole('button', { name: 'Complete receive on Arc' }).count(), 0)
+    assert.deepEqual((await calls()).wallet, [], 'already received: no wallet request')
+    // Another browser: nothing saved; the signature is pasted. The receive is missing on Arc.
+    used = 0n
+    await page.evaluate(() => localStorage.clear()); await open(); await page.getByRole('button', { name: 'Switch direction' }).click()
+    await page.getByText('Recover a Solana → Arc transfer').click()
+    await page.getByLabel('Solana to Arc recovery source signature').fill(SIG)
+    await page.getByRole('button', { name: 'Check', exact: true }).click()
+    const pasted = page.getByLabel(/^Solana burn 3vZ7GhB8/); await pasted.getByText('Not received on Arc yet').waitFor({ timeout: 15000 })
+    const t = (await pasted.innerText()).replace(/\s+/g, ' ')
+    assert.match(t, /Burned on Solana 0\.1 USDC Circle fee 0\.000002 USDC You receive on Arc 0\.099998 USDC To 0xafbb6c…b8e321/)
+    const go = pasted.getByRole('button', { name: 'Complete receive on Arc' })
+    assert.equal(await go.isDisabled(), true, 'disabled until the review is confirmed')
+    await pasted.getByRole('checkbox').check(); assert.equal(await go.isDisabled(), false)
+    // The test wallet is not on Arc with the account: the request stops before anything is journaled or sent.
+    await go.click(); await pasted.getByRole('alert').waitFor({ timeout: 15000 })
+    assert.match(await pasted.getByRole('alert').innerText(), /Switch the EVM wallet to Arc Mainnet with the receiving account\. Nothing was requested\./)
+    assert.ok(!(await calls()).wallet.includes('sendTransaction'), 'no transaction was requested')
+    assert.equal(await page.evaluate(() => localStorage.getItem('machina_solana_arc_receive_v1')), null, 'nothing journaled')
+    assert.equal(await page.evaluate(() => localStorage.getItem('machina_mainnet_solana_send_v1')), null, 'recovery never creates a burn attempt')
+    assert.deepEqual((await calls()).runs, [], 'no transfer (burn) was started')
+    await page.unroute('https://rpc.mainnet.arc.io/**'); await page.unroute('**/api/solana-rpc'); await page.unroute('https://iris-api.circle.com/**')
+    await page.evaluate(() => localStorage.clear())
   })
   await test('fits a phone (390 px) without horizontal scrolling', async () => {
     await page.setViewportSize({ width: 390, height: 900 }); await open(); await page.getByLabel('Bridge amount').fill('0.25')

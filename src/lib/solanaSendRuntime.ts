@@ -20,7 +20,7 @@ const ARC_MAX_SPANS = 60 // ~42 h of Arc blocks; an older attempt cannot be prov
 
 const arcClient = () => createPublicClient({ transport: http(MAINNET_NETWORKS.arc.rpcUrls[0], { timeout: 15_000, retryCount: 1 }) })
 
-async function solanaRpc<T>(method: string, params: unknown[]): Promise<T> {
+export async function solanaRpc<T>(method: string, params: unknown[]): Promise<T> {
   const response = await fetch('/api/solana-rpc', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
   const payload = await response.json().catch(() => null)
   if (!response.ok || payload?.error) throw new Error(`Solana ${method} could not be read.`)
