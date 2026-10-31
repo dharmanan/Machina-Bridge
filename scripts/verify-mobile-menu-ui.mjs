@@ -23,16 +23,31 @@ const phantom = mode => `(() => { const listeners = {}; window.phantomTest = { c
     disconnect: async () => { window.phantomTest.calls.push('disconnect'); provider.publicKey = null },
     signTransaction: async () => { window.phantomTest.calls.push('sign'); throw new Error('no signing in tests') } }
   window.phantom = { solana: provider } })()`
+// The Slush app browser exposes its wallet through the Wallet Standard (not the web-wallet popup).
+const SUI_ADDR = '0x' + 'ab'.repeat(32)
+const injectedSlush = `(() => { window.slushTest = { connects: 0 }; const accounts = []; const listeners = []
+  const wallet = { version: '1.0.0', name: 'Slush', id: 'com.mystenlabs.suiwallet', icon: 'data:image/svg+xml;base64,PHN2Zy8+', chains: ['sui:mainnet', 'sui:testnet'],
+    get accounts() { return accounts.slice() },
+    features: {
+      'standard:connect': { version: '1.0.0', connect: async () => { window.slushTest.connects++; if (!accounts.length) accounts.push({ address: '${SUI_ADDR}', publicKey: new Uint8Array(32), chains: ['sui:mainnet'], features: ['sui:signTransaction'], label: 'Slush' }); listeners.forEach(f => f({ accounts: accounts.slice() })); return { accounts: accounts.slice() } } },
+      'standard:disconnect': { version: '1.0.0', disconnect: async () => { accounts.length = 0; listeners.forEach(f => f({ accounts: [] })) } },
+      'standard:events': { version: '1.0.0', on: (event, f) => { if (event === 'change') listeners.push(f); return () => {} } },
+      'sui:signTransaction': { version: '2.0.0', signTransaction: async () => { throw new Error('no signing in tests') } },
+      'sui:signTransactionBlock': { version: '1.0.0', signTransactionBlock: async () => { throw new Error('no signing in tests') } },
+      'sui:signPersonalMessage': { version: '1.0.0', signPersonalMessage: async () => { throw new Error('no signing in tests') } } } }
+  window.addEventListener('wallet-standard:app-ready', event => event.detail.register(wallet)) })()`
 let browser, count = 0; const errors = []
-async function test(name, fn) { await fn(); count++; console.log('PASS ' + name) }
+// MOBILE_MENU_ONLY=<regex> runs only the matching groups (targeted checks).
+async function test(name, fn) { if (process.env.MOBILE_MENU_ONLY && !new RegExp(process.env.MOBILE_MENU_ONLY).test(name)) return; await fn(); count++; console.log('PASS ' + name) }
 try {
   await server.listen(); const base = `http://127.0.0.1:${server.httpServer.address().port}/`
   browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
-  async function open({ width = 390, height = 844, mobile = true, phantomMode = null, network = 'mainnet' } = {}) {
+  async function open({ width = 390, height = 844, mobile = true, phantomMode = null, network = 'mainnet', slushInjected = false } = {}) {
     const context = await browser.newContext({ viewport: { width, height }, isMobile: mobile, hasTouch: mobile })
     const blocked = []
     await context.route('**/*', route => { const u = new URL(route.request().url()); if (u.hostname === '127.0.0.1') return route.continue(); blocked.push(u.href); return route.abort() })
     if (phantomMode) await context.addInitScript(phantom(phantomMode))
+    if (slushInjected) await context.addInitScript(injectedSlush)
     await context.addInitScript(n => { try { if (!sessionStorage.getItem('seeded')) { localStorage.setItem('machina_app_network', n); sessionStorage.setItem('seeded', '1') } } catch {} }, network)
     const page = await context.newPage(); page.on('pageerror', e => errors.push(`${width}: ${e.message}`))
     await page.goto(base, { timeout: 120_000 })
@@ -151,16 +166,36 @@ try {
     await context.close()
   })
 
-  await test('Sui uses the Slush web wallet popup: Connect opens it straight from the menu tap (not blocked); closing it shows the error under Sui; the Slush app link is official', async () => {
+  await test('Sui in Safari (only the Slush web wallet): Open in Slush is the main action with the official browse link; the web wallet stays secondary and explained; opening the app is not a connection', async () => {
     const { context, page, blocked } = await open()
-    await openMenu(page); const sui = row(page, 'Sui')
-    const url = new URL(page.url()); assert.equal(await sui.getByRole('link', { name: 'Use the Slush app instead' }).getAttribute('href'), `https://my.slush.app/browse/${url.origin}${url.pathname}`)
-    const popup = context.waitForEvent('page', { timeout: 15_000 }); await sui.getByRole('button', { name: 'Connect' }).click()
+    await openMenu(page); const sui = row(page, 'Sui'), url = new URL(page.url())
+    const open_ = sui.getByRole('link', { name: 'Open in Slush' })
+    assert.equal(await open_.getAttribute('href'), `https://my.slush.app/browse/${url.origin}${url.pathname}`)
+    assert.equal(await sui.getByRole('button', { name: 'Connect', exact: true }).count(), 0, 'Connect is not the main action')
+    const text = await sui.innerText()
+    assert.match(text, /Not connected/); assert.match(text, /Your EVM wallet is not connected there automatically/)
+    assert.match(text, /separate web session/); assert.match(text, /cannot hand over to the Slush app/)
+    // Only a real Sui address means connected: before (and after leaving for the app) the row stays not connected.
+    assert.equal(await sui.getByRole('button', { name: 'Disconnect' }).count(), 0)
+    const popup = context.waitForEvent('page', { timeout: 15_000 }); await sui.getByRole('button', { name: 'Use the Slush web wallet' }).click()
     const win = await popup
     for (let i = 0; i < 100 && !blocked.some(u => u.startsWith('https://my.slush.app/')); i++) await page.waitForTimeout(50)
-    assert.ok(blocked.some(u => u.startsWith('https://my.slush.app/')), 'the popup loads the Slush web wallet (my.slush.app)'); await win.close()
+    assert.ok(blocked.some(u => u.startsWith('https://my.slush.app/')), 'the secondary action opens the Slush web wallet'); await win.close()
     const alert = sui.getByRole('alert'); await alert.waitFor({ timeout: 15_000 }); assert.match(await alert.innerText(), /closed/i)
+    assert.match(await sui.innerText(), /Not connected/, 'a closed or handed-over window never reads as connected')
     await sui.getByRole('button', { name: 'Dismiss Sui wallet error' }).click(); assert.equal(await sui.getByRole('alert').count(), 0)
+    await context.close()
+  })
+
+  await test('Sui inside the Slush app browser (injected wallet): no Open in Slush; Connect is shown and only a returned Sui address turns the row connected; the EVM wallet is not assumed', async () => {
+    const { context, page } = await open({ slushInjected: true })
+    await openMenu(page); const sui = row(page, 'Sui')
+    assert.equal(await sui.getByRole('link', { name: 'Open in Slush' }).count(), 0)
+    assert.match(await sui.innerText(), /Not connected/)
+    await sui.getByRole('button', { name: 'Connect', exact: true }).click()
+    await sui.getByText(/Slush · 0xabab…abab/).waitFor({ timeout: 15_000 }); await sui.getByRole('button', { name: 'Disconnect' }).waitFor()
+    assert.equal(await page.evaluate(() => window.slushTest.connects), 1)
+    const evm = row(page, 'EVM'); assert.match(await evm.innerText(), /Not connected/); await evm.getByRole('button', { name: 'Connect' }).waitFor()
     await context.close()
   })
 

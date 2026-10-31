@@ -51,6 +51,7 @@ export default function App() {
     isConnected: isSuiWalletConnected,
     isConnecting: isConnectingSuiWallet,
     isWalletAvailable: isSuiWalletAvailable,
+    hasInjectedWallet: hasInjectedSuiWallet,
   } = useSuiWallet(appNetwork)
   const [activeTab, setActiveTab] = useState<Tab>(() => readStoredAppNetwork() === 'mainnet' ? 'bridge' : 'swap')
   const [showNetworkDropdown, setShowNetworkDropdown] = useState(false)
@@ -178,7 +179,8 @@ export default function App() {
   // Phones/tablets: Phantom is injected only inside its own app browser; Slush also offers its app browser.
   const pageUrl = typeof window === 'undefined' ? '' : `${window.location.origin}${window.location.pathname}`
   const phantomOpenUrl = isMobileExperience && !isPhantomInstalled && pageUrl ? phantomBrowseUrl(pageUrl, window.location.origin) : null
-  const slushOpenUrl = isMobileExperience && pageUrl ? slushBrowseUrl(pageUrl) : null
+  // Only when no app/extension wallet is injected: inside the Slush app browser the app wallet connects directly.
+  const slushOpenUrl = isMobileExperience && !hasInjectedSuiWallet && pageUrl ? slushBrowseUrl(pageUrl) : null
   // MetaMask's in-app browser (its dapp universal link), which the old mobile notice offered.
   const metaMaskOpenUrl = isMobileExperience && pageUrl ? `https://metamask.app.link/dapp/${pageUrl.replace(/^https?:\/\//, '')}` : null
   const mobileNavItems = appNetwork === 'mainnet'

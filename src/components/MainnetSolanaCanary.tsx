@@ -10,6 +10,7 @@ import {
 import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
+import { parseUsdcAmountInput } from '../lib/usdcAmountInput'
 import {
   listMainnetSolanaActivity,
   recordMainnetSolanaActivity,
@@ -99,9 +100,11 @@ export default function MainnetSolanaCanary() {
         }
       : null
 
-  const amountValid =
-    Number.isFinite(Number(amount))
-    && Number(amount) > 0
+  // One canonical amount ("0,1" -> "0.1") for the fee quote, the Review and the signed transfer.
+  const parsedAmount = parseUsdcAmountInput(amount)
+  const amountValid = 'value' in parsedAmount
+  const normalizedAmount = 'value' in parsedAmount ? parsedAmount.value : ''
+  const amountError = amount.trim() && 'error' in parsedAmount ? parsedAmount.error : null
 
   useEffect(() => {
     if (evmAddress) {
@@ -212,12 +215,12 @@ export default function MainnetSolanaCanary() {
     }
 
     const timer = window.setTimeout(() => {
-      void estimateCanary(direction, amount).catch(() => undefined)
+      void estimateCanary(direction, normalizedAmount).catch(() => undefined)
     }, 450)
 
     return () => window.clearTimeout(timer)
   }, [
-    amount,
+    normalizedAmount,
     amountValid,
     direction,
     estimateCanary,
@@ -246,7 +249,7 @@ export default function MainnetSolanaCanary() {
     bridgeStarted.current = true
     let result: { sourceTxHash?: string; destinationTxHash?: string } | null
     try {
-      result = await runCanary(direction, amount) as typeof result
+      result = await runCanary(direction, normalizedAmount) as typeof result
     } finally {
       bridgeStarted.current = false
     }
@@ -269,7 +272,7 @@ export default function MainnetSolanaCanary() {
       evmWallet: evmAddress,
       solanaWallet: phantomAddress,
       direction,
-      amount,
+      amount: normalizedAmount,
       sourceTxHash: result.sourceTxHash,
       destinationTxHash: result.destinationTxHash,
       refundableDepositSol,
@@ -371,6 +374,7 @@ export default function MainnetSolanaCanary() {
               <span className="text-sm text-slate-500">USDC</span>
             </div>
           </label>
+          {amountError && <p role="alert" className="text-xs text-amber-800">{amountError}</p>}
           <p className="flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
             <span>
               {sourceBalance != null ? `Balance: ${sourceBalance} USDC.` : sourceBalanceError ? `${fromChain} USDC balance could not be read.` : 'Balance not loaded yet.'} Real Mainnet USDC; every step is confirmed in your wallet.
@@ -510,7 +514,7 @@ export default function MainnetSolanaCanary() {
           )}
           {direction === 'arc-to-solana' && !state.isLoading && !pendingArcToSolanaTx && pendingArcToSolanaError && (
             <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">
-              Pending transfer check failed: {pendingArcToSolanaError}
+              {pendingArcToSolanaError}
             </p>
           )}
 
@@ -518,11 +522,11 @@ export default function MainnetSolanaCanary() {
             {notReady && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{notReady}</p>}
             {reviewing && canRun ? (
               <div aria-label="Review Solana transfer" className="space-y-3 rounded-xl border border-slate-200 p-3">
-                <p className="font-semibold">Review {fromChain} → {toChain} · {amount} USDC</p>
+                <p className="font-semibold">Review {fromChain} → {toChain} · {normalizedAmount} USDC</p>
                 <dl className="space-y-1 rounded-xl bg-slate-50 p-3 text-xs">
                   <Line k="From" v={`${fromChain} Mainnet · ${(direction === 'arc-to-solana' ? evmLabel : solanaLabel) ?? '—'}`} />
                   <Line k="To" v={`${toChain} Mainnet · ${(direction === 'arc-to-solana' ? solanaLabel : evmLabel) ?? '—'}`} />
-                  <Line k="Amount" v={`${amount} USDC`} />
+                  <Line k="Amount" v={`${normalizedAmount} USDC`} />
                   <Line k="Circle fee" v={feeEstimate ? `${feeEstimate.bridgeFee} USDC` : 'checked again before signing'} />
                   <Line k="You receive" v={feeEstimate ? `≈ ${feeEstimate.receiveAmount} USDC` : 'checked again before signing'} />
                 </dl>

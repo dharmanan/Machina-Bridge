@@ -12,6 +12,8 @@ import { SuiGrpcClient } from '@mysten/sui/grpc'
 import { SUI_NETWORKS, type SuiNetwork } from '../config/sui'
 import { readSuiWalletBalances, validateSuiWalletAccount } from '../lib/suiBalances'
 
+const SLUSH_WEB_WALLET_ID = 'com.mystenlabs.suiwallet.web'
+
 const suiClients = {
   mainnet: new SuiGrpcClient({ network: 'mainnet', baseUrl: SUI_NETWORKS.mainnet.url, timeout: 10_000 }),
   testnet: new SuiGrpcClient({ network: 'testnet', baseUrl: SUI_NETWORKS.testnet.url, timeout: 10_000 }),
@@ -92,6 +94,9 @@ export function useSuiWallet(requestedNetwork?: SuiNetwork) {
     isConnecting: currentWalletState.isConnecting || connectWallet.isPending,
     isLoadingBalance,
     isWalletAvailable: wallets.length > 0,
+    // A Sui wallet injected through the Wallet Standard (Slush app browser, extension), as opposed to
+    // the Slush web wallet popup that dApp Kit registers itself (id com.mystenlabs.suiwallet.web).
+    hasInjectedWallet: wallets.some((wallet) => (wallet as { id?: string }).id !== SLUSH_WEB_WALLET_ID),
     network,
     walletSupportsNetwork: Boolean(suiAddress) && !accountError,
     balanceError: accountError ?? (balanceError ? 'Sui balance or network verification is unavailable. No transfer is allowed.' : null),

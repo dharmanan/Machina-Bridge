@@ -34,7 +34,11 @@ export type CctpBurnProof = {
   sourceMessage: Hex; fields: ReturnType<typeof decodeCctpRecoveryMessage>
 }
 // Injected ports are test-only read clients; production always uses configured mainnet RPCs.
-export async function readCctpBurnProof(input: { sourceChainId: number; sourceTxHash: string; owner?: string; sourceLogIndex?: number; mintRecipients?: readonly string[]; suiDestinationMessenger?: Hex }, client: any = undefined): Promise<CctpBurnProof> {
+// Circle Bridge Kit sends EVM burns through its bridge contract (kitContracts.bridge,
+// BRIDGE_CONTRACT_EVM_MAINNET in @circle-fin/bridge-kit), so the TokenMessenger records the
+// contract as depositor and MessageSent's messageSender, while the user's wallet is tx.from.
+export const CIRCLE_KIT_BRIDGE_CONTRACT = '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0'
+export async function readCctpBurnProof(input: { sourceChainId: number; sourceTxHash: string; owner?: string; sourceLogIndex?: number; mintRecipients?: readonly string[]; suiDestinationMessenger?: Hex; allowCircleKitBridge?: boolean }, client: any = undefined): Promise<CctpBurnProof> {
   assertSourceHash(input.sourceTxHash)
   const source = getMainnetCctpChain(input.sourceChainId)
   if (!source || (input.owner !== undefined && !isAddress(input.owner))) throw new Error('Unsupported source chain or invalid connected wallet.')
@@ -53,7 +57,12 @@ export async function readCctpBurnProof(input: { sourceChainId: number; sourceTx
       if (decoded.eventName === 'MessageSent' && same(log.address, source.messageTransmitterAddress)) messages.push(decoded.args.message)
     } catch { /* Unrelated receipt logs are not CCTP evidence. */ }
   }
-  const candidates = deposits.filter(d => same(d.depositor, tx.from) && (!input.owner || same(d.depositor, input.owner)) && same(d.burnToken, source.usdcAddress) && d.amount > 0n && (!input.mintRecipients || input.mintRecipients.some(a => same(a, d.mintRecipient))) && (input.sourceLogIndex === undefined || d.logIndex === input.sourceLogIndex))
+  // The burn belongs to the wallet that sent the transaction and deposited directly. Only the
+  // Arc -> Solana recovery opts in to Circle's bridge contract as depositor, and then only when the
+  // connected wallet sent this transaction to exactly that contract. EVM and Sui recovery never do.
+  const viaKit = (d: any) => input.allowCircleKitBridge === true && input.owner !== undefined && source.chainId === 5042 && d.destinationDomain === 5
+    && same(d.depositor, CIRCLE_KIT_BRIDGE_CONTRACT) && same(tx.to ?? '', CIRCLE_KIT_BRIDGE_CONTRACT) && same(tx.from, input.owner)
+  const candidates = deposits.filter(d => (same(d.depositor, tx.from) || viaKit(d)) && (!input.owner || same(tx.from, input.owner)) && same(d.burnToken, source.usdcAddress) && d.amount > 0n && (!input.mintRecipients || input.mintRecipients.some(a => same(a, d.mintRecipient))) && (input.sourceLogIndex === undefined || d.logIndex === input.sourceLogIndex))
   if (candidates.length !== 1) throw new Error('No unique USDC DepositForBurn matches the source wallet and selected transfer. Recovery is blocked.')
   const d = candidates[0]
   const matched = messages.filter(raw => {
@@ -72,7 +81,7 @@ export async function readCctpBurnProof(input: { sourceChainId: number; sourceTx
   // requires a non-null allowlisted destinationChainId and cannot use this.
   const suiDestination = fields.destinationDomain === 8 && input.suiDestinationMessenger && same(fields.recipient, input.suiDestinationMessenger)
   if (!destination && !solanaDestination && !suiDestination) throw new Error('Unsupported destination domain or TokenMessenger.')
-  return { sourceChainId: source.chainId, destinationChainId: destination?.chainId ?? null, sourceTxHash: input.sourceTxHash, sourceLogIndex: d.logIndex, owner: getAddress(d.depositor), amount: formatUnits(fields.amount, 6), mode: fields.minFinality === 1000 ? 'fast' : 'standard', sourceBlockNumber: receipt.blockNumber, sourceBlockHash: receipt.blockHash, sourceMessage: matched[0], fields }
+  return { sourceChainId: source.chainId, destinationChainId: destination?.chainId ?? null, sourceTxHash: input.sourceTxHash, sourceLogIndex: d.logIndex, owner: getAddress(tx.from), amount: formatUnits(fields.amount, 6), mode: fields.minFinality === 1000 ? 'fast' : 'standard', sourceBlockNumber: receipt.blockNumber, sourceBlockHash: receipt.blockHash, sourceMessage: matched[0], fields }
 }
 // Solana program's base58 bytes, derived by the same PublicKey implementation used by the existing bridge.
 import { PublicKey } from '@solana/web3.js'

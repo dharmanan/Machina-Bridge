@@ -16,6 +16,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { MAINNET_CONFIG } from '../config/mainnet'
 import { readCctpBurnProof, readBoundCctpAttestation } from '../lib/mainnetCctpRecovery'
+import { classifyArcSolanaBurn, keyedSingleFlight } from '../lib/arcSolanaBurnScan'
 import { readSolanaCctpMessageUsed, SolanaNoncePendingError } from '../lib/mainnetSolanaRecovery'
 import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
@@ -584,7 +585,8 @@ export function useMainnetSolanaCctp(
   const [feeEstimate, setFeeEstimate] = useState<MainnetSolanaFeeEstimate | null>(null)
   const [feeEstimateError, setFeeEstimateError] = useState<string | null>(null)
   const [isEstimatingFees, setIsEstimatingFees] = useState(false)
-  const pendingScanRef = useRef<Promise<Hex | null> | null>(null)
+  // One in-flight recent-burn scan per wallet pair (a scan for other wallets is never reused).
+  const pendingScan = useRef(keyedSingleFlight<Hex | null>())
 
   const kitSupport = useMemo(() => {
     try {
@@ -706,10 +708,12 @@ export function useMainnetSolanaCctp(
 
   const findPendingArcToSolanaBurn = useCallback(async () => {
     if (!evmAddress || !phantomAddress) return null
-    if (pendingScanRef.current) return pendingScanRef.current
+    const scanKey = `${evmAddress.toLowerCase()}|${phantomAddress}`
+    // A result for wallets that are no longer connected never touches the screen.
+    const current = () => recoveryContext.current === scanKey
 
     const scan = async () => {
-      setPendingArcToSolanaError(null)
+      if (current()) setPendingArcToSolanaError(null)
 
       try {
         const arc = MAINNET_NETWORKS.arc
@@ -734,6 +738,7 @@ export function useMainnetSolanaCctp(
           }
         })()
 
+        let unverified: Hex | undefined
         const chunkSize = 500n
         const maxChunks = 8
         let checkedCandidates = 0
@@ -784,38 +789,36 @@ export function useMainnetSolanaCctp(
             if (!txHash) continue
 
             const tx = await client.getTransaction({ hash: txHash })
-            if (tx.from.toLowerCase() !== evmAddress.toLowerCase()) {
+            if (tx.from.toLowerCase() !== evmAddress.toLowerCase() || recovered.has(txHash.toLowerCase())) {
               continue
             }
 
-            try {
-              const attestation = await fetchMainnetCctpAttestation({
-                sourceChainId: ARC_MAINNET_EVM_CHAIN_ID,
-                transactionHash: txHash,
-              })
-
-              if (
-                attestation.status === 'complete'
-                && attestation.message
-                && await isSolanaCctpMessageAlreadyMinted(attestation.message)
-              ) {
-                recovered.add(txHash.toLowerCase())
-
-                try {
-                  window.localStorage.setItem(
-                    RECOVERED_ARC_SOLANA_TXS_KEY,
-                    JSON.stringify(Array.from(recovered)),
-                  )
-                } catch {
-                  // On-chain nonce proof is authoritative; local persistence is best-effort.
-                }
-
-                continue
+            // Mint-ready only with the full CCTP evidence; see classifyArcSolanaBurn.
+            const verdict = await classifyArcSolanaBurn(ownerHex, {
+              proof: () => readCctpBurnProof({ sourceChainId: ARC_MAINNET_EVM_CHAIN_ID, sourceTxHash: txHash, owner: evmAddress, mintRecipients: [ownerHex, ataHex], allowCircleKitBridge: true }),
+              attestation: (proof) => readBoundCctpAttestation(proof as Parameters<typeof readBoundCctpAttestation>[0]),
+              nonceUsed: isSolanaCctpMessageAlreadyMinted,
+            })
+            if (verdict.kind === 'not_ours') continue
+            if (verdict.kind === 'complete') {
+              recovered.add(txHash.toLowerCase())
+              try {
+                window.localStorage.setItem(RECOVERED_ARC_SOLANA_TXS_KEY, JSON.stringify(Array.from(recovered)))
+              } catch {
+                // On-chain nonce proof is authoritative; local persistence is best-effort.
               }
-            } catch {
-              // If completion cannot be proven, keep the burn recoverable.
+              if (!readMainnetSolanaActivity().some(x => x.direction === 'arc-to-solana' && x.sourceTxHash?.toLowerCase() === txHash.toLowerCase())) {
+                recordMainnetSolanaActivity({ evmWallet: evmAddress, solanaWallet: phantomAddress, direction: 'arc-to-solana', amount: verdict.amount, sourceTxHash: txHash, status: 'complete' })
+              }
+              continue
+            }
+            if (verdict.kind !== 'mint_ready') {
+              // Not proven either way (Circle still attesting, nonce settling, RPC trouble): never shown as pending.
+              unverified ??= txHash
+              continue
             }
 
+            if (!current()) return null
             setPendingArcToSolanaTx(txHash)
             return txHash
           }
@@ -824,21 +827,17 @@ export function useMainnetSolanaCctp(
           await delay(650)
         }
 
+        if (!current()) return null
         setPendingArcToSolanaTx(null)
+        if (unverified) setPendingArcToSolanaError(`A recent Arc → Solana transfer (${unverified.slice(0, 10)}…${unverified.slice(-6)}) is not verified yet: Circle may still be attesting it or Solana is confirming it. Nothing is sent; it is checked again automatically.`)
         return null
       } catch {
-        setPendingArcToSolanaError('Pending burn scan temporarily failed.')
+        if (current()) setPendingArcToSolanaError('The recent transfer check could not read the network. Nothing is sent; it is checked again automatically.')
         throw new Error('Pending Arc to Solana burn scan failed.')
       }
     }
 
-    const promise = scan()
-    pendingScanRef.current = promise
-    try {
-      return await promise
-    } finally {
-      pendingScanRef.current = null
-    }
+    return pendingScan.current(scanKey, scan)
   }, [evmAddress, phantomAddress])
 
   const recoverPendingArcToSolana = useCallback(async (sourceTxHashOverride?: Hex) => {
@@ -870,7 +869,7 @@ export function useMainnetSolanaCctp(
       })
 
       const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
-      const proof = await readCctpBurnProof({sourceChainId:ARC_MAINNET_EVM_CHAIN_ID,sourceTxHash,owner:evmAddress,mintRecipients:[ownerHex,ataHex]})
+      const proof = await readCctpBurnProof({sourceChainId:ARC_MAINNET_EVM_CHAIN_ID,sourceTxHash,owner:evmAddress,mintRecipients:[ownerHex,ataHex],allowCircleKitBridge:true})
       if (proof.fields.destinationDomain !== 5 || !['0x'+'00'.repeat(32),ownerHex.toLowerCase()].includes(proof.fields.destinationCaller)) throw new Error('This burn does not authorize the connected Phantom destination.')
       const attestation = await readBoundCctpAttestation(proof)
       if (attestation.status !== 'complete' || !attestation.message || !attestation.attestation) throw new Error('Source burn verified, but Circle attestation is still pending. No mint was requested.')
@@ -994,6 +993,8 @@ export function useMainnetSolanaCctp(
     setFeeEstimateError(null)
 
     try {
+      // Only the canonical decimal from parseUsdcAmountInput reaches a quote or a signature.
+      if (!/^\d+(\.\d{1,6})?$/.test(amount)) throw new Error('Enter a valid USDC amount (up to 6 decimals).')
       const amountRaw = parseUnits(amount, 6)
       if (amountRaw <= 0n) {
         throw new Error('Transfer amount must be greater than 0 USDC.')
@@ -1124,6 +1125,8 @@ export function useMainnetSolanaCctp(
         throw new Error(`${direction} route is read-only.`)
       }
 
+      // Only the canonical decimal from parseUsdcAmountInput reaches a quote or a signature.
+      if (!/^\d+(\.\d{1,6})?$/.test(amount)) throw new Error('Enter a valid USDC amount (up to 6 decimals).')
       const amountRaw = parseUnits(amount, 6)
       if (amountRaw <= 0n) {
         throw new Error('Transfer amount must be greater than 0 USDC.')

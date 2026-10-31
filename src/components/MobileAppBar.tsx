@@ -144,8 +144,14 @@ function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNe
       <WalletRow family="Sui" walletName={sui.walletName ?? 'Slush'} address={sui.address} error={sui.error}
         detail={sui.address ? (sui.supported ? (appNetwork === 'mainnet' ? 'Sui Mainnet' : 'Sui Testnet') : `Switch Slush to Sui ${appNetwork === 'mainnet' ? 'Mainnet' : 'Testnet'}`) : 'Not connected'}
         warning={Boolean(sui.address && !sui.supported)}
-        action={sui.address ? { label: 'Disconnect', onClick: sui.disconnect, busy: sui.connecting } : { label: sui.available ? 'Connect' : 'Install', onClick: sui.connect, busy: sui.connecting, disabled: !sui.available }}
-        note={!sui.address && sui.available && slushOpenUrl ? <>Connect opens the Slush web wallet in a new window. <a className="underline" href={slushOpenUrl}>Use the Slush app instead</a>.</> : null} />
+        action={sui.address ? { label: 'Disconnect', onClick: sui.disconnect, busy: sui.connecting }
+          : slushOpenUrl ? { label: 'Open in Slush', href: slushOpenUrl }
+            : { label: sui.available ? 'Connect' : 'Install', onClick: sui.connect, busy: sui.connecting, disabled: !sui.available }}
+        note={!sui.address && slushOpenUrl ? <>
+          Open in Slush loads Machina inside the Slush app, where your app wallet connects. Your EVM wallet is not connected there automatically.
+          <span className="mt-1.5 block">Or use the Slush web wallet: a separate web session in a new window, signed in with Google, Apple, Facebook or Twitch. It cannot hand over to the Slush app.</span>
+          {sui.available && <button type="button" onClick={sui.connect} disabled={sui.connecting} className="mt-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 disabled:opacity-50">{sui.connecting ? 'Waiting for the web wallet…' : 'Use the Slush web wallet'}</button>}
+        </> : null} />
     </Section>
 
     <Section title="Network">

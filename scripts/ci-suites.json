@@ -68,7 +68,8 @@
    "verify-fee-display",
    "verify-bridge-history",
    "verify-borrow-source-gates",
-   "verify-swap-execution-config"
+   "verify-swap-execution-config",
+   "verify-arc-solana-burn-scan"
   ],
   "full": [
    "verify-release-dependency-security",
@@ -180,7 +181,8 @@
   "verify-swap-unified-ui-d": "swap",
   "verify-swap-unified-ui-e": "swap",
   "verify-solana-bridge-ui": "solana-bridge",
-  "verify-mobile-menu-ui": "app-shell"
+  "verify-mobile-menu-ui": "app-shell",
+  "verify-arc-solana-burn-scan": "solana-bridge"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",
