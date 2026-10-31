@@ -1,6 +1,6 @@
 import { fallback, http } from 'viem'
-import { createConfig } from 'wagmi'
-import { connectorsForWallets } from '@rainbow-me/rainbowkit'
+import { createConfig, createConnector, type CreateConnectorFn } from 'wagmi'
+import { connectorsForWallets, type Wallet } from '@rainbow-me/rainbowkit'
 import { coinbaseWallet, injectedWallet, metaMaskWallet, rabbyWallet, walletConnectWallet } from '@rainbow-me/rainbowkit/wallets'
 import {
   MAINNET_SUPPORTED_EVM_CHAINS,
@@ -32,7 +32,39 @@ function isGenuineMetaMask(provider: unknown) {
   const flags = provider as Record<string, unknown>
   return flags.isMetaMask === true && !Object.keys(flags).some(key => key !== 'isMetaMask' && /^is[A-Z]/.test(key) && flags[key] === true)
 }
-const browserWallet = () => ({
+// wagmi lets an idle injected connector take over the connection: on the wallet's connect or
+// accountsChanged event it reports a connect and becomes current (meant for connecting from the
+// wallet's own UI). RainbowKit's injected options share window.ethereum (Rabby falls back to it
+// when Rabby is not installed), so MetaMask's late event moved the connection to "Browser Wallet"
+// or "Rabby Wallet". While another connector holds the connection, an idle one ignores them.
+function keepConnection(wallet: Wallet): Wallet {
+  return {
+    ...wallet,
+    createConnector: details => {
+      const make = wallet.createConnector(details)
+      return createConnector(config => {
+        const inner = make(config) as ReturnType<CreateConnectorFn> & {
+          onConnect(info: { chainId: string }): void
+          onAccountsChanged(accounts: string[]): void
+        }
+        const heldByOther = (uid: string) => { const current = wagmiConfig.state.current; return Boolean(current && current !== uid) }
+        return {
+          ...inner,
+          onConnect(info: { chainId: string }) {
+            if (heldByOther((this as unknown as { uid: string }).uid)) return
+            return inner.onConnect.call(this, info)
+          },
+          onAccountsChanged(accounts: string[]) {
+            if (accounts.length > 0 && heldByOther((this as unknown as { uid: string }).uid)) return
+            return inner.onAccountsChanged.call(this, accounts)
+          },
+        } as ReturnType<CreateConnectorFn>
+      })
+    },
+  }
+}
+const rabby = () => keepConnection(rabbyWallet())
+const browserWallet = () => keepConnection({
   ...injectedWallet(),
   hidden: () => typeof window !== 'undefined' && isGenuineMetaMask(window.ethereum),
 })
@@ -43,7 +75,7 @@ const connectors = connectorsForWallets(
       groupName: 'Recommended',
       wallets: [
         metaMaskWallet,
-        rabbyWallet,
+        rabby,
         coinbaseWallet,
         ...(hasWalletConnect ? [walletConnectWallet] : []),
         browserWallet,

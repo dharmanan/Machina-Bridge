@@ -67,6 +67,28 @@ try {
       await desk.close()
     }
   })
+  await test('EVM: the connected wallet keeps the connection; an idle option on the same browser provider (Rabby falls back to window.ethereum) does not take it over on the wallet\'s accountsChanged event', async () => {
+    const desk = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+    await desk.route('**/*', route => { const u = new URL(route.request().url()); if (u.hostname === '127.0.0.1') return route.continue(); external.push(u.hostname); return route.abort() })
+    // A non-MetaMask browser wallet (so "Browser Wallet" is offered) that approves eth_requestAccounts and can emit events.
+    await desk.addInitScript(() => {
+      const listeners = {}, account = '0x' + 'ab'.repeat(20); let approved = false
+      window.ethereum = {
+        request: async ({ method }) => method === 'eth_requestAccounts' ? (approved = true, [account]) : method === 'eth_accounts' ? (approved ? [account] : []) : method === 'eth_chainId' ? '0x13b2' : method === 'wallet_requestPermissions' ? [{ parentCapability: 'eth_accounts' }] : method === 'wallet_getPermissions' ? [] : null,
+        on(e, f) { (listeners[e] ||= []).push(f) }, removeListener(e, f) { listeners[e] = (listeners[e] || []).filter(x => x !== f) },
+      }
+      window.emitWallet = (e, v) => (listeners[e] || []).slice().forEach(f => f(v))
+    })
+    const p = await desk.newPage(); await p.goto(base); await p.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet')); await p.goto(base)
+    const chip = p.getByLabel('EVM wallet')
+    await chip.getByRole('button').click(); await p.getByRole('dialog').last().waitFor(); await p.getByTestId('rk-wallet-option-injected').click()
+    await chip.getByText(/^Browser Wallet · 0xabab/i).waitFor({ timeout: 20000 })
+    // The wallet re-announces its accounts (as MetaMask does after connecting); every idle option on this provider hears it.
+    await p.evaluate(() => window.emitWallet('accountsChanged', ['0x' + 'ab'.repeat(20)])); await p.waitForTimeout(1500)
+    assert.match(await chip.innerText(), /Browser Wallet · 0xabab/i, 'the connected option keeps the connection')
+    assert.doesNotMatch(await chip.innerText(), /Rabby/)
+    await desk.close()
+  })
   await test('iPhone browser without an EVM wallet (e.g. the Slush app browser): Sui Bridge recommends a desktop browser instead of the WalletConnect hand-off; with an injected EVM wallet it asks to connect as usual', async () => {
     for (const injected of [false, true]) {
       const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148' })
