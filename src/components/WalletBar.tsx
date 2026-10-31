@@ -3,7 +3,6 @@ import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { useAccount } from 'wagmi'
 import { X } from 'lucide-react'
 import type { AppNetwork } from '../config/runtime'
-import { useWalletConnectError } from '../lib/walletConnectStatus'
 
 export const shortAddress = (v?: string | null) => !v ? '' : v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v
 
@@ -19,17 +18,15 @@ export function slushBrowseUrl(href: string) {
   return `https://my.slush.app/browse/${href}`
 }
 
-// A wallet error stays visible until the user closes it; a different, newer error shows again,
-// and so does the same error from a new attempt (errorKey).
+// A wallet error stays visible until the user closes it; a different, newer error shows again.
 // Dismissals are kept per wallet for the page session, so reopening the mobile menu or
 // switching between the mobile and desktop bars does not bring a closed error back.
 const dismissedErrors = new Map<string, string>()
-export function useDismissibleError(family: string, error: string | null, errorKey: string | number = '') {
+export function useDismissibleError(family: string, error: string | null) {
   const [, rerender] = useState(0)
-  const key = `${errorKey}|${error}`
   return {
-    visible: error && dismissedErrors.get(family) !== key ? error : null,
-    dismiss: () => { if (error) dismissedErrors.set(family, key); rerender(n => n + 1) },
+    visible: error && dismissedErrors.get(family) !== error ? error : null,
+    dismiss: () => { if (error) dismissedErrors.set(family, error); rerender(n => n + 1) },
   }
 }
 
@@ -47,7 +44,6 @@ type ChipProps = {
   network: string
   warning?: string | null
   error?: string | null
-  errorKey?: number
   busy?: boolean
   disabled?: boolean
   connectLabel?: string
@@ -57,9 +53,9 @@ type ChipProps = {
 }
 // One wallet: name, short address, network and status, with its own connect /
 // disconnect that never touches the other wallets. Its error shows under it.
-function WalletChip({ family, walletName, address, network, warning, error, errorKey, busy, disabled, connectLabel = 'Connect', openUrl, onConnect, onDisconnect }: ChipProps) {
+function WalletChip({ family, walletName, address, network, warning, error, busy, disabled, connectLabel = 'Connect', openUrl, onConnect, onDisconnect }: ChipProps) {
   const connected = Boolean(address)
-  const shownError = useDismissibleError(family, error ?? null, errorKey)
+  const shownError = useDismissibleError(family, error ?? null)
   return <div className="min-w-0">
     <div aria-label={`${family} wallet`} className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 shadow-sm">
       <span aria-hidden className={`h-2 w-2 flex-shrink-0 rounded-full ${warning ? 'bg-amber-500' : connected ? 'bg-green-500' : 'bg-slate-300'}`} />
@@ -90,13 +86,12 @@ export type WalletBarProps = {
 // side by side on Mainnet and Testnet. No provider is created here.
 export default function WalletBar({ appNetwork, evmNetworkName, phantomOpenUrl, solana, sui }: WalletBarProps) {
   const { connector } = useAccount()
-  const walletConnectError = useWalletConnectError()
   return <div className="flex min-w-0 flex-col gap-1.5 lg:items-end">
     <div className="grid w-full grid-cols-1 items-start gap-2 sm:grid-cols-3 lg:w-auto">
       <ConnectButton.Custom>{({ account, chain, mounted, openConnectModal, openAccountModal, openChainModal }) => {
         const ready = mounted && account && chain
         return <WalletChip family="EVM" walletName={connector?.name ?? null} address={ready ? account.address : null}
-          network={evmNetworkName} warning={ready && chain.unsupported ? 'Wrong network · switch above' : null} error={ready ? null : walletConnectError?.message} errorKey={walletConnectError?.attempt}
+          network={evmNetworkName} warning={ready && chain.unsupported ? 'Wrong network · switch above' : null}
           onConnect={openConnectModal} onDisconnect={chain?.unsupported ? openChainModal : openAccountModal} />
       }}</ConnectButton.Custom>
       <WalletChip family="Solana" walletName="Phantom" address={solana.address} network={appNetwork === 'mainnet' ? 'Solana Mainnet' : 'Solana Devnet'} error={solana.error}

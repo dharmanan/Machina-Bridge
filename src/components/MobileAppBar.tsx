@@ -4,7 +4,6 @@ import { useAccount } from 'wagmi'
 import { Check, ExternalLink, Github, Menu, Twitter, Wallet, X } from 'lucide-react'
 import type { AppNetwork } from '../config/runtime'
 import { shortAddress, useDismissibleError, WalletError, type WalletBarProps } from './WalletBar'
-import { useWalletConnectError } from '../lib/walletConnectStatus'
 
 export type MobileNavItem = { id: string; label: string; icon: ReactNode }
 export type MobileNavLink = { label: string; href: string; icon?: ReactNode }
@@ -29,10 +28,6 @@ type MobileAppBarProps = WalletBarProps & {
 export default function MobileAppBar(props: MobileAppBarProps) {
   const { appNetwork, logoSrc } = props
   const [open, setOpen] = useState(false)
-  // The menu closes before RainbowKit opens, so a WalletConnect failure is also shown below the bar.
-  const { isConnected: evmConnected } = useAccount()
-  const walletConnectFailure = useWalletConnectError()
-  const walletConnectError = useDismissibleError('EVM', evmConnected ? null : walletConnectFailure?.message ?? null, walletConnectFailure?.attempt)
   const trigger = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
   const close = useCallback((restoreFocus = true) => {
@@ -79,7 +74,6 @@ export default function MobileAppBar(props: MobileAppBarProps) {
         </div>
       </div>
     </header>
-    {walletConnectError.visible && !open && <div className="px-4 pt-2"><WalletError family="EVM" message={walletConnectError.visible} onDismiss={walletConnectError.dismiss} /></div>}
 
     {open && <div className="fixed inset-0 z-[70]">
       <div aria-hidden data-menu-backdrop onClick={() => close()} className="absolute inset-0 bg-slate-950/40" />
@@ -107,7 +101,6 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNetworkChange, evmNetworks, evmChainId, onEvmNetworkSwitch, evmNetworkName, phantomOpenUrl, slushOpenUrl, metaMaskOpenUrl, solana, sui, close }: MobileAppBarProps & { close(restoreFocus?: boolean): void }) {
   const { connector, isConnected: evmConnected } = useAccount()
-  const walletConnectError = useWalletConnectError()
   return <>
     <Section title="Navigation">
       <ul>
@@ -138,7 +131,7 @@ function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNe
         // RainbowKit opens its own dialog: close the menu first so nothing sits above it or holds focus.
         const open = (fn?: () => void) => { close(false); fn?.() }
         return <WalletRow family="EVM" walletName={ready ? connector?.name ?? 'EVM wallet' : 'MetaMask or another EVM wallet'} address={ready ? account.address : null}
-          detail={ready ? (chain.unsupported ? 'Wrong network · choose one below' : evmNetworkName) : 'Not connected'} warning={Boolean(ready && chain.unsupported)} error={ready ? null : walletConnectError?.message} errorKey={walletConnectError?.attempt}
+          detail={ready ? (chain.unsupported ? 'Wrong network · choose one below' : evmNetworkName) : 'Not connected'} warning={Boolean(ready && chain.unsupported)}
           action={ready ? { label: 'Disconnect', onClick: () => open(chain.unsupported ? openChainModal : openAccountModal) } : { label: 'Connect', onClick: () => open(openConnectModal) }}
           note={!ready && metaMaskOpenUrl ? <>MetaMask works most reliably in its own browser. <a className="underline" href={metaMaskOpenUrl}>Open in MetaMask</a>.</> : null} />
       }}</ConnectButton.Custom>
@@ -191,8 +184,8 @@ function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNe
 }
 
 type RowAction = { label: string; onClick?: () => void; href?: string; busy?: boolean; disabled?: boolean }
-function WalletRow({ family, walletName, address, detail, warning, error, errorKey, action, note }: { family: string; walletName: string; address: string | null; detail: string; warning?: boolean; error?: string | null; errorKey?: number; action: RowAction; note?: ReactNode }) {
-  const shownError = useDismissibleError(family, error ?? null, errorKey)
+function WalletRow({ family, walletName, address, detail, warning, error, action, note }: { family: string; walletName: string; address: string | null; detail: string; warning?: boolean; error?: string | null; action: RowAction; note?: ReactNode }) {
+  const shownError = useDismissibleError(family, error ?? null)
   const connected = Boolean(address)
   const button = 'flex-shrink-0 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-50'
   return <div aria-label={`${family} wallet`} className="py-2">
