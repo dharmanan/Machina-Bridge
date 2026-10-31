@@ -1,4 +1,4 @@
-// Chromium: the phone header and its right-side menu (navigation, wallets, network,
+// Chromium: the phone header with its fixed section tabs and its right-side menu (wallets, network,
 // links) on the REAL application entry, at 320/375/390/430 px, and the unchanged
 // desktop header at 1280 px. Phantom is injected per scenario; every non-local request
 // is aborted. No real wallet, signature or transaction.
@@ -60,15 +60,24 @@ try {
   const trigger = page => page.getByRole('button', { name: 'Open menu' })
   const openMenu = async page => { await trigger(page).click(); await menu(page).waitFor() }
   const row = (page, family) => menu(page).getByLabel(`${family} wallet`, { exact: true })
+  const sections = page => page.getByRole('navigation', { name: 'Sections' })
 
-  for (const width of [320, 375, 390, 430]) await test(`${width} px: one compact header row (logo, name, network, menu); the product tab row is hidden; no horizontal scroll; the menu opens from the right and closes without covering the page`, async () => {
+  for (const width of [320, 375, 390, 430]) await test(`${width} px: one compact header row (logo, name, network, menu) with a small fixed section-tab strip under it; no horizontal page scroll; the menu opens from the right and closes without covering the page`, async () => {
     const { context, page } = await open({ width })
     const bar = page.getByRole('banner', { name: 'Machina Bridge' }), box = await bar.boundingBox()
-    assert.ok(box.height <= 64, `header height ${box.height}`)
-    for (const el of [bar.getByRole('heading', { name: 'Machina Bridge' }), bar.getByLabel('Network: Mainnet'), trigger(page)]) {
-      const b = await el.boundingBox(); assert.ok(b && b.y >= box.y && b.y + b.height <= box.y + box.height, 'on the single header row')
+    assert.ok(box.height <= 100, `header height ${box.height}`)
+    const heading = await bar.getByRole('heading', { name: 'Machina Bridge' }).boundingBox()
+    for (const el of [bar.getByLabel('Network: Mainnet'), trigger(page)]) {
+      const b = await el.boundingBox(); assert.ok(b && b.y < heading.y + heading.height && b.y + b.height > heading.y, 'logo, name, network and menu share the top row')
     }
-    for (const tab of ['Swap', 'Earn', 'Dashboard', 'Activity']) assert.equal(await page.getByRole('button', { name: tab, exact: true }).count(), 0, `${tab} tab row hidden on phones`)
+    // Section tabs: small, all five reachable, under the top row; the desktop tab row stays hidden.
+    const strip = sections(page), s = await strip.boundingBox()
+    assert.ok(s.y >= heading.y + heading.height && s.height <= 36, `tab strip under the top row and compact (${s.height}px)`)
+    const labels = await strip.getByRole('button').allInnerTexts(); assert.deepEqual(labels, ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity'])
+    assert.equal(await strip.getByRole('button', { name: 'Bridge' }).getAttribute('aria-current'), 'page')
+    const fontPx = await strip.getByRole('button', { name: 'Swap' }).evaluate(el => parseFloat(getComputedStyle(el).fontSize)); assert.ok(fontPx <= 12, `small labels (${fontPx}px)`)
+    if (width >= 375) assert.ok(await strip.evaluate(el => el.scrollWidth <= el.clientWidth), 'all five tabs fit without scrolling')
+    for (const tab of ['Swap', 'Earn', 'Dashboard', 'Activity']) assert.equal(await page.getByRole('button', { name: tab, exact: true }).count(), 1, `${tab}: only the phone strip is shown (desktop tab row hidden)`)
     for (const family of ['EVM', 'Solana', 'Sui']) assert.equal(await page.getByLabel(`${family} wallet`, { exact: true }).first().isVisible(), false, 'desktop wallet chips hidden on phones')
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
     assert.equal(await trigger(page).getAttribute('aria-expanded'), 'false'); assert.equal(await menu(page).count(), 0, 'closed menu is not rendered')
@@ -77,7 +86,8 @@ try {
     const m = await menu(page).boundingBox()
     assert.ok(Math.abs(m.x + m.width - width) <= 1, 'anchored to the right edge'); assert.ok(m.width < width, 'narrower than the screen'); assert.ok(m.width <= 352)
     assert.equal(await trigger(page).getAttribute('aria-expanded'), 'true'); assert.equal(await menu(page).getAttribute('aria-modal'), 'true')
-    for (const section of ['Navigation', 'Wallets', 'Network', 'Links']) await menu(page).getByRole('region', { name: section }).waitFor()
+    for (const section of ['Wallets', 'Network', 'Links']) await menu(page).getByRole('region', { name: section }).waitFor()
+    assert.equal(await menu(page).getByRole('region', { name: 'Navigation' }).count(), 0, 'sections moved out of the menu (Mainnet has no extra links)')
     await menu(page).getByRole('link', { name: 'GitHub' }).scrollIntoViewIfNeeded(); assert.ok(await menu(page).getByRole('link', { name: 'GitHub' }).isVisible(), 'last section reachable by scrolling')
     assert.equal(await menu(page).getByRole('link', { name: 'GitHub' }).getAttribute('href'), 'https://github.com/dharmanan/Machina-Bridge')
     assert.equal(await menu(page).getByRole('link', { name: 'X' }).getAttribute('href'), 'https://x.com/KohenEric')
@@ -100,15 +110,20 @@ try {
     await context.close()
   })
 
-  await test('navigation: every tab is reachable from the menu, the menu closes on selection and marks the current page', async () => {
+  await test('navigation: every section opens from the tab strip, which marks the current page and stays at the top while the page scrolls', async () => {
     const { context, page } = await open()
     for (const tab of ['Swap', 'Earn', 'Dashboard', 'Activity', 'Bridge']) {
       const before = errors.length
-      await openMenu(page); await menu(page).getByRole('button', { name: tab }).click(); await menu(page).waitFor({ state: 'detached' })
-      await page.waitForTimeout(300); assert.deepEqual(errors.slice(before), [], tab)
-      await openMenu(page); assert.equal(await menu(page).getByRole('button', { name: tab }).getAttribute('aria-current'), 'page', tab)
-      await page.keyboard.press('Escape'); await menu(page).waitFor({ state: 'detached' })
+      await sections(page).getByRole('button', { name: tab }).click(); await page.waitForTimeout(300); assert.deepEqual(errors.slice(before), [], tab)
+      assert.equal(await sections(page).getByRole('button', { name: tab }).getAttribute('aria-current'), 'page', tab)
+      assert.equal(await sections(page).locator('[aria-current="page"]').count(), 1, `${tab}: one current tab`)
     }
+    await page.evaluate(() => window.scrollTo(0, 900)); await page.waitForTimeout(300)
+    assert.ok(await page.evaluate(() => scrollY) > 300, 'the page scrolled')
+    const bar = await page.getByRole('banner', { name: 'Machina Bridge' }).boundingBox(), strip = await sections(page).boundingBox()
+    assert.ok(Math.abs(bar.y) <= 1 && strip.y < bar.y + bar.height, 'header and tabs stay at the top while scrolling')
+    await sections(page).getByRole('button', { name: 'Swap' }).click(); await page.waitForTimeout(300)
+    assert.equal(await sections(page).getByRole('button', { name: 'Swap' }).getAttribute('aria-current'), 'page', 'tabs work while scrolled')
     await context.close()
   })
 
@@ -212,13 +227,13 @@ try {
     await openMenu(page); await menu(page).getByRole('button', { name: 'Testnet' }).click()
     await page.getByLabel('Network: Testnet').waitFor()
     assert.equal(await menu(page).getByRole('button', { name: 'Testnet' }).getAttribute('aria-pressed'), 'true')
+    assert.deepEqual(await sections(page).getByRole('button').allInnerTexts(), ['Swap', 'Bridge', 'Dashboard'], 'testnet sections in the strip')
     const nav = menu(page).getByRole('region', { name: 'Navigation' })
-    for (const tab of ['Swap', 'Bridge', 'Dashboard']) await nav.getByRole('button', { name: tab }).waitFor()
-    assert.equal(await nav.getByRole('button', { name: 'Earn' }).count(), 0)
     assert.equal(await nav.getByRole('link', { name: /Arc Machina/ }).getAttribute('href'), 'https://arcmachina.xyz/')
     assert.equal(await nav.getByRole('link', { name: /Faucet/ }).getAttribute('href'), 'https://faucet.circle.com/')
     await menu(page).getByRole('button', { name: 'Mainnet' }).click(); await page.getByLabel('Network: Mainnet').waitFor()
-    for (const tab of ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity']) await nav.getByRole('button', { name: tab }).waitFor()
+    assert.deepEqual(await sections(page).getByRole('button').allInnerTexts(), ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity'], 'mainnet sections in the strip')
+    assert.equal(await menu(page).getByRole('region', { name: 'Navigation' }).count(), 0, 'no testnet links on Mainnet')
     await context.close()
   })
 
@@ -234,7 +249,7 @@ try {
     const snapshot = () => page.evaluate(() => Object.fromEntries(['machina.earn.journal.v1', 'machina_mainnet_transfers_v1', 'machina_mainnet_sui_transfers_v1'].map(k => [k, localStorage.getItem(k)])))
     const locks = () => page.evaluate(async () => { const q = await navigator.locks.query(); return { held: q.held.map(l => l.name), pending: q.pending.map(l => l.name) } })
     await page.waitForTimeout(800); const before = await snapshot(), locksBefore = await locks()
-    for (const tab of ['Earn', 'Swap', 'Dashboard', 'Activity', 'Bridge', 'Earn']) { await openMenu(page); await menu(page).getByRole('button', { name: tab }).click(); await menu(page).waitFor({ state: 'detached' }); await page.waitForTimeout(250) }
+    for (const tab of ['Earn', 'Swap', 'Dashboard', 'Activity', 'Bridge', 'Earn']) { await sections(page).getByRole('button', { name: tab }).click(); await page.waitForTimeout(250) }
     await openMenu(page); await page.keyboard.press('Escape')
     assert.deepEqual(await snapshot(), before, 'journal, EVM and Sui transfer records unchanged by navigation')
     assert.deepEqual(await locks(), locksBefore, 'no lock taken or released by navigation')

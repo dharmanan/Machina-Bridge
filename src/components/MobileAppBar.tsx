@@ -26,7 +26,7 @@ type MobileAppBarProps = WalletBarProps & {
 // wallets, network and links. Desktop keeps its own header. The menu is not rendered
 // while closed, so it never covers the page.
 export default function MobileAppBar(props: MobileAppBarProps) {
-  const { appNetwork, logoSrc } = props
+  const { appNetwork, logoSrc, navItems, activeTab, onSelectTab } = props
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
@@ -55,8 +55,9 @@ export default function MobileAppBar(props: MobileAppBarProps) {
     return () => { document.removeEventListener('keydown', onKey); document.body.style.overflow = previousOverflow }
   }, [open, close])
 
-  return <div className="md:hidden">
-    <header aria-label="Machina Bridge" className="sticky top-0 z-50 border-b border-slate-200 bg-white/90 backdrop-blur-lg">
+  // The wrapper is the sticky element (a sticky header inside a header-sized wrapper would scroll away).
+  return <div className="sticky top-0 z-50 md:hidden">
+    <header aria-label="Machina Bridge" className="border-b border-slate-200 bg-white/90 backdrop-blur-lg">
       <div className="flex h-14 items-center justify-between gap-2 px-4">
         <div className="flex min-w-0 items-center gap-2">
           <img src={logoSrc} alt="" className="h-8 w-8 flex-shrink-0 rounded-xl border border-slate-200 bg-white p-0.5" />
@@ -73,6 +74,13 @@ export default function MobileAppBar(props: MobileAppBarProps) {
           </button>
         </div>
       </div>
+      {/* Product sections stay visible under the bar: small text pills sharing the width, scrolling sideways only if they do not fit. */}
+      <nav aria-label="Sections" className="flex gap-1 overflow-x-auto px-3 pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        {navItems.map(item => <button key={item.id} type="button" aria-current={activeTab === item.id ? 'page' : undefined} onClick={() => onSelectTab(item.id)}
+          className={`flex-1 flex-shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-center text-xs font-semibold ${activeTab === item.id ? 'bg-[#eef7e8] text-[#2F6E0C] ring-1 ring-[#66D121]/35' : 'text-slate-600 hover:bg-slate-50'}`}>
+          {item.label}
+        </button>)}
+      </nav>
     </header>
 
     {open && <div className="fixed inset-0 z-[70]">
@@ -102,16 +110,8 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNetworkChange, evmNetworks, evmChainId, onEvmNetworkSwitch, evmNetworkName, phantomOpenUrl, slushOpenUrl, metaMaskOpenUrl, solana, sui, close }: MobileAppBarProps & { close(restoreFocus?: boolean): void }) {
   const { connector, isConnected: evmConnected } = useAccount()
   return <>
-    <Section title="Navigation">
+    {navLinks.length > 0 && <Section title="Navigation">
       <ul>
-        {navItems.map(item => <li key={item.id}>
-          <button type="button" aria-current={activeTab === item.id ? 'page' : undefined} onClick={() => { onSelectTab(item.id); close() }}
-            className={`flex w-full items-center gap-3 rounded-xl px-2 py-2.5 text-left text-sm ${activeTab === item.id ? 'bg-[#eef7e8] font-semibold text-[#2F6E0C]' : 'text-slate-700 hover:bg-slate-50'}`}>
-            <span aria-hidden className="flex-shrink-0">{item.icon}</span>
-            <span className="flex-1">{item.label}</span>
-            {activeTab === item.id && <Check size={16} aria-hidden />}
-          </button>
-        </li>)}
         {navLinks.map(link => <li key={link.href}>
           <a href={link.href} target="_blank" rel="noopener noreferrer" onClick={() => close(false)} className="flex w-full items-center gap-3 rounded-xl px-2 py-2.5 text-sm text-slate-700 hover:bg-slate-50">
             <span aria-hidden className="flex-shrink-0">{link.icon ?? <ExternalLink size={18} />}</span>
@@ -120,7 +120,7 @@ function MenuBody({ appNetwork, activeTab, navItems, navLinks, onSelectTab, onNe
           </a>
         </li>)}
       </ul>
-    </Section>
+    </Section>}
 
     <Section title="Wallets">
       {(metaMaskOpenUrl || phantomOpenUrl || slushOpenUrl) && <p className="mb-1 text-[11px] leading-4 text-slate-500">

@@ -89,6 +89,25 @@ try {
     assert.doesNotMatch(await chip.innerText(), /Rabby/)
     await desk.close()
   })
+  await test('EVM amount: on a phone the field accepts "0,1" (comma keypad) as exactly 0.1 USDC and refuses ambiguous or over-precise input; desktop keeps its number field unchanged', async () => {
+    const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, locale: 'tr-TR', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148' })
+    await phone.route('**/*', route => { const u = new URL(route.request().url()); if (u.hostname === '127.0.0.1') return route.continue(); external.push(u.hostname); return route.abort() })
+    const p = await phone.newPage(); await p.goto(base); await p.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet')); await p.goto(base)
+    const field = p.locator('#mainnet-preview-amount'); await field.waitFor()
+    assert.equal(await field.evaluate(el => `${el.type}/${el.inputMode}`), 'text/decimal')
+    const sent = async () => (await p.locator('body').innerText()).match(/You send\s+([^\n]+)/)?.[1]
+    for (const [typed, expected, error] of [['0,1', '0.1 USDC', null], ['0.1', '0.1 USDC', null], ['1,500', '0 USDC', /ambiguous/], ['0,1234567', '0 USDC', /at most 6 decimals/]]) {
+      await field.fill(''); await field.pressSequentially(typed); await p.waitForTimeout(300)
+      assert.equal(await sent(), expected, typed)
+      const shown = await p.locator('#mainnet-preview-amount ~ p').allInnerTexts()
+      if (error) assert.match(shown.join(' '), error, typed); else assert.deepEqual(shown, [], typed)
+    }
+    await phone.close()
+    await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base)
+    const desk = page.locator('#mainnet-preview-amount'); await desk.waitFor()
+    assert.equal(await desk.evaluate(el => `${el.type}/${el.min}/${el.step}`), 'number/0/0.01', 'desktop field unchanged')
+    await desk.fill('1.5'); await page.waitForTimeout(300); assert.match(await page.locator('body').innerText(), /You send\s+1\.5 USDC/)
+  })
   await test('iPhone browser without an EVM wallet (e.g. the Slush app browser): Sui Bridge recommends a desktop browser instead of the WalletConnect hand-off; with an injected EVM wallet it asks to connect as usual', async () => {
     for (const injected of [false, true]) {
       const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148' })

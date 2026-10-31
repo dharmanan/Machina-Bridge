@@ -22,6 +22,7 @@ import { useMainnetCctp } from '../hooks/useMainnetCctp'
 import { useMainnetTransferQueue } from '../hooks/useMainnetTransferQueue'
 import MainnetSolanaCanary from './MainnetSolanaCanary'
 import MainnetSuiBridge from './MainnetSuiBridge'
+import { parseUsdcAmountInput } from '../lib/usdcAmountInput'
 import type { MainnetTransferStage } from '../lib/mainnetTransferQueue'
 import type { MainnetCctpQuote } from '../lib/mainnetCctpTransfer'
 import {
@@ -169,7 +170,11 @@ export default function MainnetPreviewGate() {
   const [selectedTransferId, setSelectedTransferId] = useState<string | null>(null)
   const [source, setSource] = useState<RouteEndpoint>('arc')
   const [destination, setDestination] = useState<RouteEndpoint>('base')
-  const [amount, setAmount] = useState('')
+  const [amountInput, setAmountInput] = useState('')
+  // Phones and tablets: their decimal keypad in many locales has only a comma, which a number
+  // field drops ("0,1" -> empty). There the field is text and "0,1" / "0.1" give one canonical
+  // amount. Desktop keeps its number field and validation unchanged.
+  const [touchAmountInput] = useState(() => typeof window !== 'undefined' && Boolean(window.matchMedia?.('(pointer: coarse)').matches))
   const [quoteResult, setQuoteResult] = useState<MainnetCctpQuote | null>(null)
   const [simulation, setSimulation] = useState<MainnetCctpSourceSimulation | null>(null)
   const [destinationGas, setDestinationGas] = useState<MainnetCctpDestinationGasProbe | null>(null)
@@ -190,7 +195,11 @@ export default function MainnetPreviewGate() {
   const destinationChainId = destinationNetwork.chainId
   const selectedMode = getDefaultMainnetCctpTransferMode(sourceChainId)
   const transferModeLabel = selectedMode === 'fast' ? 'Fast' : 'Standard'
-  const hasValidAmount = Boolean(amount) && Number.isFinite(Number(amount)) && Number(amount) > 0
+  // On touch devices one canonical amount ("0,1" -> "0.1") feeds the quote, the Review and the signed transfer.
+  const parsedAmount = parseUsdcAmountInput(amountInput)
+  const amount = touchAmountInput ? ('value' in parsedAmount ? parsedAmount.value : '') : amountInput
+  const amountError = touchAmountInput && amountInput.trim() && 'error' in parsedAmount ? parsedAmount.error : null
+  const hasValidAmount = touchAmountInput ? Boolean(amount) : Boolean(amount) && Number.isFinite(Number(amount)) && Number(amount) > 0
 
   useEffect(() => {
     let cancelled = false
@@ -469,7 +478,7 @@ export default function MainnetPreviewGate() {
     const keyFor = (chainId: number) => Object.entries(MAINNET_NETWORKS).find(([,n])=>n.chainId===chainId)?.[0] as RouteEndpoint | undefined
     const from = keyFor(transfer.sourceChainId), to = keyFor(transfer.destinationChainId)
     if (!from || !to) return
-    setSource(from); setDestination(to); setAmount(transfer.amount); setSelectedTransferId(transfer.id)
+    setSource(from); setDestination(to); setAmountInput(transfer.amount); setSelectedTransferId(transfer.id)
     setIsActivityOpen(false); setIsTrackerOpen(true)
   }
 
@@ -867,15 +876,14 @@ export default function MainnetPreviewGate() {
             </label>
             <input
               id="mainnet-preview-amount"
-              type="number"
-              min="0"
-              step="0.01"
+              {...(touchAmountInput ? { type: 'text', autoComplete: 'off' } : { type: 'number', min: '0', step: '0.01' })}
               inputMode="decimal"
-              value={amount}
-              onChange={(event) => { setSelectedTransferId(null); setAmount(event.target.value) }}
+              value={amountInput}
+              onChange={(event) => { setSelectedTransferId(null); setAmountInput(event.target.value) }}
               placeholder="0.00"
               className="mt-2 h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-base text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-[#66D121]"
             />
+            {amountError && <p className="mt-2 text-xs text-amber-800">{amountError}</p>}
           </div>
 
           <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
