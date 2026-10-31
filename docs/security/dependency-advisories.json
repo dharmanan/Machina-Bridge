@@ -1,7 +1,39 @@
 {
   "$comment": "Reviewed status of the open GitHub Dependabot advisories. Every claim names how it can be re-checked. Raw npm audit output stays unsuppressed in CI (raw-production-audit artifact).",
-  "reviewed": "2026-10-29",
+  "reviewed": "2026-10-31",
   "advisories": [
+    {
+      "id": "GHSA-g3hv-75wg-m249",
+      "package": "minimatch",
+      "severity": "moderate",
+      "range": "<11.0.1",
+      "chain": "dev only: eslint@10.8.0, @eslint/config-array@0.23.5 and @typescript-eslint/typescript-estree@8.65.0 -> minimatch@10.2.6 (npm ls minimatch --omit=dev is empty)",
+      "status": "FIXED (scoped override, outside the parents' declared ^10 range)",
+      "fix": "overrides for eslint, @eslint/config-array and @typescript-eslint/typescript-estree only: minimatch 11.0.3 (adds @isaacs/nonrecursive-glob-match 1.0.3). Not applied to the whole tree. No upstream release moves to minimatch 11: eslint 10.14.0, @eslint/config-array 0.23.5 and @typescript-eslint/typescript-estree 8.72.1 still declare ^10.",
+      "evidence": [
+        "API used by the three parents (new Minimatch(pattern, {dot, flipNegate}).match(path, partial) and minimatch(path, pattern, {dot})) exists unchanged in 11.0.3",
+        "differential check, 10.2.6 vs 11.0.3: 68,856 cases (every tracked file plus edge paths x 19 ESLint-style patterns x dot/flipNegate x partial) gave identical results",
+        "npm run lint before/after: same 520 files, same results; an injected error, a dot file and an ignored dist/ file behave the same on both versions",
+        "fresh npm ci, npm ls --all, the repository postinstall (viem tsconfig, Zod backport 69/69) and npm run build pass",
+        "npm audit (full and --omit=dev) no longer lists minimatch; scripts/report-dependency-audit.mjs assessed set unchanged (zod, elliptic only)"
+      ],
+      "risk": "minimatch 11 replaces the matching engine; 11.0.0-11.0.3 and @isaacs/nonrecursive-glob-match were published 2026-10-26..28. The override affects only lint tooling, not the production bundle. Remove it when ESLint and typescript-eslint declare minimatch ^11.",
+      "recheck": "npm ls minimatch --all; npm view eslint dependencies.minimatch; npm view @typescript-eslint/typescript-estree dependencies.minimatch"
+    },
+    {
+      "id": "GHSA-mrwp-f3q8-3g9p",
+      "package": "follow-redirects",
+      "range": ">=1.16.0 <=1.16.1",
+      "chain": "wagmi -> @wagmi/connectors -> @base-org/account -> @coinbase/cdp-sdk -> axios@1.20.0 (override) -> follow-redirects; also solc -> follow-redirects (pinned by package.json overrides)",
+      "status": "FIXED",
+      "fix": "overrides.follow-redirects 1.16.1 -> 1.16.2; lockfile resolves 1.16.2 (only the follow-redirects version/resolved/integrity lines changed)",
+      "evidence": [
+        "npm ls follow-redirects --all: every path resolves 1.16.2; no 1.16.1 copy remains in node_modules",
+        "npm audit --omit=dev and npm audit no longer list follow-redirects or GHSA-mrwp-f3q8-3g9p",
+        "scripts/report-dependency-audit.mjs assessed set unchanged (zod, elliptic only)"
+      ],
+      "recheck": "npm ls follow-redirects --all; npm audit --json | grep -c GHSA-mrwp-f3q8-3g9p"
+    },
     {
       "dependabot": 162,
       "id": "GHSA-qr28-fpjm-wq7f",

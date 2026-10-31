@@ -99,6 +99,17 @@ advisory check, not proof that all application or infrastructure code is secure.
 - [PR #52](https://github.com/dharmanan/Machina-Bridge/pull/52): reviewed the
   `follow-redirects` 1.16.0 → 1.16.1 lockfile change. Applied 1.16.1 with a root
   override so fresh resolutions preserve the fix.
+- 2026-10-31: [GHSA-mrwp-f3q8-3g9p](https://github.com/advisories/GHSA-mrwp-f3q8-3g9p)
+  (`follow-redirects` >=1.16.0 <=1.16.1). Raised the root override to 1.16.2;
+  the lockfile change is limited to that package. The audit reporter's assessed
+  set (Zod, elliptic) is unchanged.
+- 2026-10-31: [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249)
+  (`minimatch` <11.0.1, dev-only lint tooling). No ESLint or typescript-eslint
+  release accepts minimatch 11 yet, so minimatch 11.0.3 is overridden only under
+  `eslint`, `@eslint/config-array` and `@typescript-eslint/typescript-estree`.
+  Compatibility evidence: identical results for 68,856 differential glob cases and
+  an identical `npm run lint` result; fresh `npm ci`, postinstall and build pass.
+  Remove the override once those packages declare minimatch ^11.
 - [PR #53](https://github.com/dharmanan/Machina-Bridge/pull/53): reviewed the
   Vite 8.0.16 → 8.3.5 manifest/lockfile update, including required build-tool
   dependencies. Applied the same Vite release within major version 8.
