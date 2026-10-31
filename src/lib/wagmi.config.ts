@@ -21,6 +21,22 @@ import { readStoredAppNetwork } from '../config/runtime'
 const walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID?.trim() || '00000000000000000000000000000000'
 const hasWalletConnect = walletConnectProjectId !== '00000000000000000000000000000000'
 
+// "Browser Wallet" connects the same window.ethereum as the MetaMask option. When that provider is
+// MetaMask, the idle Browser Wallet connector takes over the connection on MetaMask's late
+// accountsChanged event (wagmi treats it as a connect from the wallet), so the bar shows
+// "Browser Wallet". MetaMask keeps its own option; Browser Wallet stays for other injected wallets.
+// Many wallets (Rabby, Brave, OKX, Phantom...) also set isMetaMask but add their own isXxx flag, so
+// only a provider whose sole wallet flag is isMetaMask counts as MetaMask here.
+function isGenuineMetaMask(provider: unknown) {
+  if (!provider || typeof provider !== 'object') return false
+  const flags = provider as Record<string, unknown>
+  return flags.isMetaMask === true && !Object.keys(flags).some(key => key !== 'isMetaMask' && /^is[A-Z]/.test(key) && flags[key] === true)
+}
+const browserWallet = () => ({
+  ...injectedWallet(),
+  hidden: () => typeof window !== 'undefined' && isGenuineMetaMask(window.ethereum),
+})
+
 const connectors = connectorsForWallets(
   [
     {
@@ -30,7 +46,7 @@ const connectors = connectorsForWallets(
         rabbyWallet,
         coinbaseWallet,
         ...(hasWalletConnect ? [walletConnectWallet] : []),
-        injectedWallet,
+        browserWallet,
       ],
     },
   ],

@@ -54,6 +54,19 @@ try {
     }
     await page.setViewportSize({ width: 1280, height: 900 })
   })
+  await test('EVM connect list: when the browser wallet is MetaMask, only the MetaMask option is offered (no second "Browser Wallet" on the same provider); Rabby, other injected wallets and no wallet keep "Browser Wallet"; Rabby and Coinbase options stay', async () => {
+    for (const [name, provider] of [['MetaMask', { isMetaMask: true }], ['Rabby (also sets isMetaMask)', { isMetaMask: true, isRabby: true }], ['other wallet', { isMetaMask: false }], ['none', null]]) {
+      const desk = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      await desk.route('**/*', route => { const u = new URL(route.request().url()); if (u.hostname === '127.0.0.1') return route.continue(); external.push(u.hostname); return route.abort() })
+      if (provider) await desk.addInitScript(flags => { window.ethereum = { ...flags, request: async ({ method }) => method === 'eth_accounts' ? [] : method === 'eth_chainId' ? '0x1' : null, on() {}, removeListener() {} } }, provider)
+      const p = await desk.newPage(); await p.goto(base); await p.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet')); await p.goto(base)
+      await p.getByLabel('EVM wallet').getByRole('button').click(); const list = p.getByRole('dialog').last(); await list.waitFor(); await p.waitForTimeout(500)
+      assert.equal(await p.getByTestId('rk-wallet-option-metaMask').count(), 1, `${name}: MetaMask offered`)
+      for (const id of ['rabby', 'coinbase']) assert.equal(await p.getByTestId(`rk-wallet-option-${id}`).count(), 1, `${name}: ${id} offered`)
+      assert.equal(await p.getByTestId('rk-wallet-option-injected').count(), name === 'MetaMask' ? 0 : 1, `${name}: Browser Wallet ${name === 'MetaMask' ? 'hidden' : 'kept'}`)
+      await desk.close()
+    }
+  })
   await test('iPhone browser without an EVM wallet (e.g. the Slush app browser): Sui Bridge recommends a desktop browser instead of the WalletConnect hand-off; with an injected EVM wallet it asks to connect as usual', async () => {
     for (const injected of [false, true]) {
       const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148' })
