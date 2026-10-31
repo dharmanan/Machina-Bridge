@@ -331,7 +331,7 @@ export default function MainnetSolanaCanary() {
   }
 
   return (
-    <section aria-label="Solana Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+    <section aria-label="Solana Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-4 shadow-[0_16px_45px_rgba(15,23,42,0.08)] sm:p-6">
       <h2 className="text-xl font-semibold">Solana ↔ Arc</h2>
       <p className="mb-4 mt-1 text-xs leading-5 text-slate-500">
         Mainnet transfer with real USDC. Nothing is sent until you review it and confirm each step in your wallet.

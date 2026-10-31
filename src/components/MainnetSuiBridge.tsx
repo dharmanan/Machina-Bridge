@@ -9,6 +9,13 @@ import { importSuiRecovery, readSuiRecoveryQueue, subscribeSuiRecovery, type Sui
 import SuiBridgeFlow from './SuiBridgeFlow'
 
 const arc = getMainnetCctpChain(5042)!
+// A phone or tablet browser without an injected EVM provider (the Slush app browser, Safari): MetaMask is reachable
+// only through a WalletConnect hand-off to another app, which is not dependable there.
+function isPhoneWithoutEvmWallet() {
+  if (typeof window === 'undefined') return false
+  const phone = /Android|iPhone|iPad|iPod/i.test(window.navigator.userAgent || '') || window.matchMedia?.('(pointer: coarse)').matches
+  return Boolean(phone) && typeof window.ethereum?.request !== 'function'
+}
 export function displayError(error: unknown) {
   const message = error instanceof Error ? error.message : ''
   // Only our bounded, non-sensitive validation messages are presented. Raw
@@ -26,6 +33,7 @@ export function displayError(error: unknown) {
 export default function MainnetSuiBridge() {
   const { address: evmOwner, chainId, connector } = useAccount()
   const sui = useSuiWallet('mainnet')
+  const [phoneWithoutEvm] = useState(isPhoneWithoutEvmWallet)
   const [records, setRecords] = useState<SuiRecoveryRecord[]>(readSuiRecoveryQueue)
   useEffect(() => subscribeSuiRecovery(() => setRecords(readSuiRecoveryQueue())), [])
   const controller = useMemo(() => createSuiRecoveryController(), [])
@@ -49,11 +57,11 @@ export default function MainnetSuiBridge() {
     try { return await controller.inspect({ ...input, ...(hints.length ? { destinationHints: hints } : {}) }, () => true, importSuiRecovery) }
     catch (e) { throw new Error(displayError(e)) }
   }, [controller, writer])
-  return <section aria-label="Sui Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+  return <section aria-label="Sui Mainnet bridge" className="rounded-3xl border border-slate-200 bg-white p-4 shadow-[0_16px_45px_rgba(15,23,42,0.08)] sm:p-6">
     <h2 className="text-xl font-semibold">Sui ↔ Arc</h2>
     <p className="mb-4 mt-1 text-xs leading-5 text-slate-500">{MAINNET_SUI_CCTP_BLOCKER}</p>
     <SuiBridgeFlow writer={writer} records={records} inspect={inspect}
-      evm={{ address: evmOwner, walletName: connector?.name, onArc: chainId === 5042 }}
+      evm={{ address: evmOwner, walletName: connector?.name, onArc: chainId === 5042, desktopHint: !evmOwner && phoneWithoutEvm }}
       sui={{ address: sui.address ?? undefined, walletName: sui.currentWalletName ?? undefined, ready: sui.walletSupportsNetwork, usdc: sui.usdcBalance, gas: sui.suiBalance }}
       arc={{ usdcUnits: typeof balance.data === 'bigint' ? balance.data : undefined, refresh }} />
   </section>

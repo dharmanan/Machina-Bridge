@@ -27,10 +27,12 @@ const connectors = connectorsForWallets(
         metaMaskWallet,
         rabbyWallet,
         coinbaseWallet,
-        ...(hasWalletConnect ? [walletConnectWallet] : []),
         injectedWallet,
       ],
     },
+    // Kept apart from "MetaMask" above: on a phone without MetaMask's own browser, "MetaMask" uses the MetaMask
+    // connector, while this entry opens a WalletConnect pairing with any wallet app (a hand-off to another app).
+    ...(hasWalletConnect ? [{ groupName: 'Other wallets via WalletConnect', wallets: [walletConnectWallet] }] : []),
   ],
   {
     appName: 'Machina Bridge',

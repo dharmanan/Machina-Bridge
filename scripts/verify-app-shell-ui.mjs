@@ -34,6 +34,40 @@ try {
   await test('the EVM bridge view keeps its own Recover Transfer panel', async () => {
     await page.goto(base); await page.getByText('Recover Transfer', { exact: true }).waitFor()
   })
+  await test('EVM recovery sits inside the EVM bridge card, below the form; the Solana view has only its own Solana recovery', async () => {
+    await page.goto(base); const recovery = page.locator('details', { hasText: 'Recover Transfer' }); await recovery.waitFor()
+    const placement = await recovery.evaluate(el => { const card = el.closest('.rounded-3xl'), button = [...card.querySelectorAll('button')].find(b => /Bridge|Connect|Review|Unlock|locked/i.test(b.textContent) && b.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING); return { inCard: Boolean(card && card.textContent.includes('Bridge USDC')), afterAction: Boolean(button) } })
+    assert.deepEqual(placement, { inCard: true, afterAction: true })
+    await page.getByRole('button', { name: 'Solana Bridge' }).click(); await page.getByRole('region', { name: 'Solana Mainnet bridge' }).waitFor()
+    assert.equal(await page.getByText('Recover Transfer', { exact: true }).count(), 0)
+    await page.getByText('Recover an older Arc → Solana transfer').waitFor()
+  })
+  await test('desktop and mobile: EVM, Solana and Sui bridge cards share the same position, width, padding and frame', async () => {
+    for (const [name, width, height] of [['desktop', 1280, 900], ['mobile', 390, 844]]) {
+      await page.setViewportSize({ width, height }); await page.goto(base)
+      const frame = loc => loc.evaluate(el => { const r = el.getBoundingClientRect(), s = getComputedStyle(el); return { x: Math.round(r.x), w: Math.round(r.width), pad: s.paddingLeft, radius: s.borderTopLeftRadius, shadow: s.boxShadow } })
+      const evmCard = page.getByText('Bridge USDC').first().locator('xpath=ancestor::div[contains(@class,"rounded-3xl")][1]'); await evmCard.waitFor()
+      const evm = await frame(evmCard)
+      await page.getByRole('button', { name: 'Solana Bridge' }).click(); const sol = await frame(page.getByRole('region', { name: 'Solana Mainnet bridge' }))
+      await page.getByRole('button', { name: 'Sui Bridge' }).click(); const sui = await frame(page.getByRole('region', { name: 'Sui Mainnet bridge' }))
+      assert.deepEqual(sol, evm, `${name} Solana card`); assert.deepEqual(sui, evm, `${name} Sui card`)
+    }
+    await page.setViewportSize({ width: 1280, height: 900 })
+  })
+  await test('iPhone browser without an EVM wallet (e.g. the Slush app browser): Sui Bridge recommends a desktop browser instead of the WalletConnect hand-off; with an injected EVM wallet it asks to connect as usual', async () => {
+    for (const injected of [false, true]) {
+      const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148' })
+      await phone.route('**/*', route => { const u = new URL(route.request().url()); if (u.hostname === '127.0.0.1') return route.continue(); external.push(u.hostname); return route.abort() })
+      if (injected) await phone.addInitScript(() => { window.ethereum = { request: async ({ method }) => method === 'eth_accounts' || method === 'eth_requestAccounts' ? [] : method === 'eth_chainId' ? '0x1' : null, on() {}, removeListener() {} } })
+      const p = await phone.newPage(); const errs = []; p.on('pageerror', e => errs.push(e.message))
+      await p.goto(base); await p.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet')); await p.goto(base)
+      await p.getByRole('button', { name: 'Sui Bridge' }).click(); const bridge = p.getByRole('region', { name: 'Sui Mainnet bridge' }); await bridge.waitFor()
+      const hint = bridge.getByText(/This phone browser has no built-in EVM wallet\..*Use a desktop browser with the MetaMask and Slush extensions\./)
+      if (injected) { await bridge.getByText('Connect your EVM wallet (Arc) in the top bar.').waitFor(); assert.equal(await hint.count(), 0) }
+      else { await hint.waitFor(); assert.equal(await bridge.getByText('Connect your EVM wallet (Arc) in the top bar.').count(), 0); await p.screenshot({ path: `${out}/sui-phone-desktop-hint.png`, fullPage: true }) }
+      assert.deepEqual(errs, []); await phone.close()
+    }
+  })
   for (const [network, tabs] of [['mainnet', ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity']], ['testnet', ['Swap', 'Bridge', 'Dashboard']]]) await test(`${network}: every product tab opens without an uncaught page error (smoke: ${tabs.join(', ')})`, async () => {
     await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base); await page.evaluate(n => localStorage.setItem('machina_app_network', n), network); await page.goto(base)
     for (const tab of tabs) { const before = pageErrors.length; await page.getByRole('button', { name: tab, exact: true }).first().click(); await page.waitForTimeout(400); assert.ok(await page.locator('main, #root').first().innerText().then(t => t.length > 40), `${network} ${tab} rendered`); assert.deepEqual(pageErrors.slice(before), [], `${network} ${tab}`) }

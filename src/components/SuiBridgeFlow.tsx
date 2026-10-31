@@ -12,7 +12,9 @@ type Direction = SuiRecoveryInput['direction']
 type Stage = SuiRecoveryResult['stage']
 export type SuiBridgeFlowProps = {
   writer: SuiTransferWriter
-  evm: { address?: string; walletName?: string; onArc: boolean }
+  // desktopHint: a phone browser with no injected EVM wallet (e.g. the Slush app browser), where MetaMask can only be
+  // reached through WalletConnect and that hand-off is not dependable.
+  evm: { address?: string; walletName?: string; onArc: boolean; desktopHint?: boolean }
   sui: { address?: string; walletName?: string; ready: boolean; usdc?: string | null; gas?: string | null }
   arc: { usdcUnits?: bigint; refresh(): Promise<{ allowanceUnits?: bigint }> }
   records: SuiRecoveryRecord[]
@@ -360,15 +362,16 @@ export default function SuiBridgeFlow({ writer, evm, sui, arc, records, inspect,
       <div className="mt-auto space-y-2">
         {lastFinal && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">Last wallet step: {attemptLabels[lastFinal.state]}.</p>}
         {errorFor(null) && <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">{errorFor(null)}</p>}
-        {!ready && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{!evm.address ? 'Connect your EVM wallet (Arc) in the top bar.' : !evm.onArc ? 'Switch your EVM wallet to Arc Mainnet in the top bar.' : !sui.address ? 'Connect Slush (Sui) in the top bar.' : 'Use a Slush account on Sui Mainnet.'}</p>}
+        {!ready && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{!evm.address ? (evm.desktopHint ? 'This phone browser has no built-in EVM wallet. Sui ↔ Arc needs MetaMask and Slush connected in the same browser, and connecting MetaMask from here through WalletConnect is not reliable in wallet app browsers. Use a desktop browser with the MetaMask and Slush extensions.' : 'Connect your EVM wallet (Arc) in the top bar.') : !evm.onArc ? 'Switch your EVM wallet to Arc Mainnet in the top bar.' : !sui.address ? 'Connect Slush (Sui) in the top bar.' : 'Use a Slush account on Sui Mainnet.'}</p>}
         <button type="button" onClick={() => void startReview()} disabled={!ready || !units || Boolean(amountError) || !writer.writesEnabled || starting} className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{starting && <Loader2 size={16} className="animate-spin" aria-hidden />}{!writer.writesEnabled ? 'Sui transfers locked' : starting ? 'Checking your allowance…' : 'Review transfer'}</button>
       </div>
     </div>
   }
 
   return <div className="space-y-4">
-    {/* One panel for the whole transfer: same frame and reserved height in every phase; only its content changes. */}
-    <section aria-label="Sui transfer panel" data-phase={panelPhase} className="flex min-h-[44rem] flex-col sm:min-h-[40rem] rounded-2xl border border-slate-200 p-4 text-sm">{panel}</section>
+    {/* One panel for the whole transfer: same frame in every phase. The reserved height fits the form and every
+        progress/waiting step; only a wallet Review sheet may extend it downward (nothing above moves). */}
+    <section aria-label="Sui transfer panel" data-phase={panelPhase} className="flex min-h-[37rem] flex-col sm:min-h-[34rem] rounded-2xl border border-slate-200 p-4 text-sm">{panel}</section>
     {renderHistory(tracking)}
     {renderRecovery(tracking)}
   </div>

@@ -548,7 +548,7 @@ export default function MainnetDashboard() {
         <Card>
           <h3 className="text-lg font-semibold">Bridge Activity</h3>
           <p className="mt-1 text-xs text-slate-500">
-            EVM, Solana and Sui transfers recorded in this browser for the connected wallets, newest first. This is not a full chain history scan.
+            EVM, Solana and Sui transfers recorded in this browser for the connected wallets, newest first. This is not a full chain history scan: transfers made on another device or browser do not appear here until you recover them below.
           </p>
           <BridgeHistoryList items={bridgeHistory} empty="No mainnet bridge activity yet." />
         </Card>
@@ -556,7 +556,7 @@ export default function MainnetDashboard() {
         <Card>
           <h3 className="text-lg font-semibold">Recover a transfer</h3>
           <p className="mt-1 text-xs leading-5 text-slate-500">
-            EVM routes can be recovered here from the source transaction. Sui ↔ Arc transfers are found in Bridge → Sui Bridge → Transfer history → “Find a transfer made on another device”; Solana transfers in Bridge → Solana.
+            EVM routes can be recovered here from the source transaction. Sui ↔ Arc transfers are found in Bridge → Sui Bridge → “Recover a transfer from another device or browser”; Arc → Solana transfers in Bridge → Solana Bridge → “Recover an older Arc → Solana transfer”.
           </p>
           <MainnetTransferRecovery />
         </Card>

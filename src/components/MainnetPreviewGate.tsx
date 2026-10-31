@@ -991,6 +991,8 @@ export default function MainnetPreviewGate() {
             {mainActionLabel}
           </button>
 
+          {/* Generic EVM recovery belongs to the EVM route only; Solana and Sui keep their own recovery. */}
+          <MainnetTransferRecovery />
         </div>
       </div>
       ) : (
@@ -1162,9 +1164,6 @@ export default function MainnetPreviewGate() {
           </div>
         </div>
       )}
-
-      {/* Sui has its own single transfer history; the EVM/Solana recovery stays for those routes. */}
-      {bridgeView !== 'sui' && <MainnetTransferRecovery />}
 
       {isActivityOpen && (
         <div
