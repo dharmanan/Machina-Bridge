@@ -11,6 +11,7 @@ import { MAINNET_SOLANA_CCTP_CANARY_ENABLED } from '../config/runtime'
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import { parseUsdcAmountInput } from '../lib/usdcAmountInput'
+import { useOpenSolanaSendAttempt } from '../lib/solanaSendRuntime'
 import {
   listMainnetSolanaActivity,
   recordMainnetSolanaActivity,
@@ -74,6 +75,17 @@ export default function MainnetSolanaCanary() {
     recoverPendingArcToSolana,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
+  // An earlier burn with an unverified outcome blocks new transfers for these wallets (any tab).
+  const sendBlock = useOpenSolanaSendAttempt(evmAddress, phantomAddress)
+  const [sendBlockMessage, setSendBlockMessage] = useState<string | null>(null)
+  const [reviewConfirmed, setReviewConfirmed] = useState(false)
+  const checkSendBlock = sendBlock.check
+  const sendBlockId = sendBlock.open?.id
+  useEffect(() => {
+    if (!sendBlockId || state.isLoading) { setSendBlockMessage(null); return }
+    // Settle it from chain evidence on load; read-only, nothing is sent.
+    void checkSendBlock().then(v => setSendBlockMessage(v ? (v.kind === 'unknown' ? v.reason : null) : null)).catch(() => undefined)
+  }, [sendBlockId, state.isLoading])
 
   const [direction, setDirection] =
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
@@ -240,6 +252,7 @@ export default function MainnetSolanaCanary() {
     && routeWriteEnabled
     && amountValid
     && !state.isLoading
+    && !sendBlock.open
 
   // One transfer at a time: a second click in the same tick (before React re-renders the
   // disabled button) must not start a second transfer. runCanary itself has no in-flight guard.
@@ -247,7 +260,7 @@ export default function MainnetSolanaCanary() {
   const handleBridge = async () => {
     if (bridgeStarted.current) return
     bridgeStarted.current = true
-    let result: { sourceTxHash?: string; destinationTxHash?: string } | null
+    let result: { sourceTxHash?: string; destinationTxHash?: string; destinationVerified?: boolean } | null
     try {
       result = await runCanary(direction, normalizedAmount) as typeof result
     } finally {
@@ -275,6 +288,8 @@ export default function MainnetSolanaCanary() {
       amount: normalizedAmount,
       sourceTxHash: result.sourceTxHash,
       destinationTxHash: result.destinationTxHash,
+      // Complete only when the receive was verified on chain; otherwise it stays "not rechecked".
+      ...(result.destinationVerified === true ? { status: 'complete' as const } : {}),
       refundableDepositSol,
       refundAvailableAt,
       refundStatus: direction === 'solana-to-arc' ? 'pending' : undefined,
@@ -520,6 +535,39 @@ export default function MainnetSolanaCanary() {
 
           <div className="mt-auto space-y-2">
             {notReady && <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{notReady}</p>}
+            {sendBlock.open && !state.isLoading && (
+              <div role="alert" aria-label="Earlier Solana transfer not verified" className="space-y-2 rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">
+                <p>
+                  An earlier {sendBlock.open.direction === 'arc-to-solana' ? 'Arc → Solana' : 'Solana → Arc'} transfer of {sendBlock.open.amount} USDC
+                  {sendBlock.open.createdAt ? ` (started ${new Date(sendBlock.open.createdAt).toLocaleTimeString()})` : ''} has no verified outcome.
+                  New transfers stay locked until it is checked on chain, so nothing is sent twice.
+                </p>
+                {(sendBlockMessage ?? sendBlock.open.note) && <p>{sendBlockMessage ?? sendBlock.open.note}</p>}
+                <button type="button" disabled={sendBlock.checking} onClick={() => void sendBlock.check().then(v => setSendBlockMessage(v?.kind === 'unknown' ? v.reason : null)).catch(() => undefined)}
+                  className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-semibold disabled:opacity-50">
+                  {sendBlock.checking ? 'Checking…' : 'Check on chain'}
+                </button>
+                {/* Manual review, only after a completed check could not settle it: time alone never unlocks. */}
+                {sendBlockMessage && !/could not be read/.test(sendBlockMessage) && (
+                  <details className="rounded-lg border border-amber-200 bg-white p-2">
+                    <summary className="cursor-pointer font-semibold">I checked my wallets: unlock manually</summary>
+                    <p className="mt-2">
+                      Open {sendBlock.open.direction === 'arc-to-solana' ? 'your EVM wallet' : 'Phantom'} and look for a pending or unconfirmed request from Machina. If you find one, reject it there first.
+                      If an old request is approved later, a second transfer is sent.
+                    </p>
+                    <label className="mt-2 flex items-start gap-2">
+                      <input type="checkbox" checked={reviewConfirmed} onChange={e => setReviewConfirmed(e.target.checked)} className="mt-0.5" />
+                      <span>My wallet shows no pending Machina request, and I understand that approving an old one later sends a second transfer.</span>
+                    </label>
+                    <button type="button" disabled={!reviewConfirmed || sendBlock.checking}
+                      onClick={() => void sendBlock.releaseAfterReview().then(v => { setReviewConfirmed(false); setSendBlockMessage(v?.kind === 'unknown' ? v.reason : null) }).catch(e => setSendBlockMessage(e instanceof Error ? e.message : 'The transfer could not be unlocked.'))}
+                      className="mt-2 rounded-lg border border-amber-300 px-3 py-1.5 font-semibold disabled:opacity-50">
+                      Unlock new transfers
+                    </button>
+                  </details>
+                )}
+              </div>
+            )}
             {reviewing && canRun ? (
               <div aria-label="Review Solana transfer" className="space-y-3 rounded-xl border border-slate-200 p-3">
                 <p className="font-semibold">Review {fromChain} → {toChain} · {normalizedAmount} USDC</p>

@@ -21,6 +21,8 @@ import { readSolanaCctpMessageUsed, SolanaNoncePendingError } from '../lib/mainn
 import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
+import { destinationEvidence, withSolanaSendGuard } from '../lib/solanaSendRuntime'
+import { solanaTransferOutcomeStatus, verifyTransferDestinationWithRetry } from '../lib/solanaSendGuard'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
 
@@ -1140,138 +1142,152 @@ export function useMainnetSolanaCctp(
         throw new Error('Connect Phantom on Solana mainnet first.')
       }
 
-      const kit = new BridgeKit()
-      const { solana, arc } = resolveChains(kit)
-      const solanaBridgeChain = {
-        ...(solana as any),
-        rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
-      } as BridgeKitChain
+      // One transfer per wallet across tabs, recorded before any wallet request; an earlier burn
+      // with an unknown outcome blocks a new one until chain evidence settles it.
+      return await withSolanaSendGuard({ direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress }, async guard => {
+        const kit = new BridgeKit()
+        const { solana, arc } = resolveChains(kit)
+        const solanaBridgeChain = {
+          ...(solana as any),
+          rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
+        } as BridgeKitChain
 
-      const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
-        capabilities: {
-          addressContext: 'user-controlled',
-          supportedChains: [solanaBridgeChain],
-        },
-      })
-      const evmAdapter = await createEvmAdapterFromProvider({
-        provider: createStrictEvmProvider(walletClient as WalletClientLike),
-      })
+        const solanaAdapter = await createSolanaAdapterFromProvider({
+          provider: guard.solana(createStrictSolanaProvider(phantomProvider)),
+          capabilities: {
+            addressContext: 'user-controlled',
+            supportedChains: [solanaBridgeChain],
+          },
+        })
+        const evmAdapter = await createEvmAdapterFromProvider({
+          provider: guard.evm(createStrictEvmProvider(walletClient as WalletClientLike)),
+        })
 
-      const request = async (args: { method: string; params?: unknown[] }) =>
-        walletClient.transport.request(args as never)
+        const request = async (args: { method: string; params?: unknown[] }) =>
+          walletClient.transport.request(args as never)
 
-      await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
+        await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
 
-      const [arcBalanceBefore, solanaBalanceBefore] = await Promise.all([
-        refreshArcBalance().catch(() => null),
-        refreshSolanaBalance().catch(() => null),
-      ])
+        const [arcBalanceBefore, solanaBalanceBefore] = await Promise.all([
+          refreshArcBalance().catch(() => null),
+          refreshSolanaBalance().catch(() => null),
+        ])
 
-      setState((previous) => ({
-        ...previous,
-        status: direction === 'solana-to-arc'
-          ? 'Confirm the Solana mainnet CCTP transfer in Phantom.'
-          : 'Confirm the Arc mainnet CCTP transfer in your EVM wallet.',
-      }))
+        setState((previous) => ({
+          ...previous,
+          status: direction === 'solana-to-arc'
+            ? 'Confirm the Solana mainnet CCTP transfer in Phantom.'
+            : 'Confirm the Arc mainnet CCTP transfer in your EVM wallet.',
+        }))
 
-      const result = direction === 'solana-to-arc'
-        ? await kit.bridge({
-            from: { adapter: solanaAdapter, chain: solanaBridgeChain },
-            to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
-            amount,
-          } as any)
-        : await kit.bridge({
-            from: { adapter: evmAdapter, chain: arc },
-            to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
-            amount,
-          } as any)
+        const result = direction === 'solana-to-arc'
+          ? await kit.bridge({
+              from: { adapter: solanaAdapter, chain: solanaBridgeChain },
+              to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
+              amount,
+            } as any)
+          : await kit.bridge({
+              from: { adapter: evmAdapter, chain: arc },
+              to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
+              amount,
+            } as any)
 
-      let finalResult = result as any
+        let finalResult = result as any
 
-      if (finalResult?.state === 'error') {
-        if (direction === 'arc-to-solana') {
+        if (finalResult?.state === 'error') {
+          if (direction === 'arc-to-solana') {
+            setState({
+              isLoading: true,
+              error: null,
+              status: 'Arc burn completed. Recovering the fee-adjusted Solana mint...',
+              result: finalResult,
+            })
+
+            let sourceTxHash: Hex | null = null
+            const sourceDeadline = Date.now() + 30_000
+
+            while (!sourceTxHash && Date.now() < sourceDeadline) {
+              sourceTxHash = await findPendingArcToSolanaBurn()
+              if (!sourceTxHash) {
+                await delay(1_500)
+              }
+            }
+
+            if (!sourceTxHash) {
+              const errorMessage = getBridgeKitErrorMessage(finalResult)
+              setState({
+                isLoading: false,
+                error: errorMessage,
+                status: null,
+                result: finalResult,
+              })
+              return finalResult
+            }
+
+            return await recoverPendingArcToSolana(sourceTxHash)
+          }
+
           setState({
             isLoading: true,
             error: null,
-            status: 'Arc burn completed. Recovering the fee-adjusted Solana mint...',
+            status: 'Bridge source step completed. Resuming the failed destination step...',
             result: finalResult,
           })
 
-          let sourceTxHash: Hex | null = null
-          const sourceDeadline = Date.now() + 30_000
+          finalResult = await kit.retry(finalResult, {
+            from: solanaAdapter,
+            to: evmAdapter,
+          } as any)
+        }
 
-          while (!sourceTxHash && Date.now() < sourceDeadline) {
-            sourceTxHash = await findPendingArcToSolanaBurn()
-            if (!sourceTxHash) {
-              await delay(1_500)
-            }
-          }
+        if (finalResult?.state === 'error') {
+          const errorMessage = getBridgeKitErrorMessage(finalResult)
+          setState({
+            isLoading: false,
+            error: errorMessage,
+            status: null,
+            result: finalResult,
+          })
+          return finalResult
+        }
 
-          if (!sourceTxHash) {
-            const errorMessage = getBridgeKitErrorMessage(finalResult)
-            setState({
-              isLoading: false,
-              error: errorMessage,
-              status: null,
-              result: finalResult,
-            })
-            return finalResult
-          }
-
-          return await recoverPendingArcToSolana(sourceTxHash)
+        const txHashes = getBridgeResultTxHashes(finalResult)
+        // "Completed" only with the receive proven on the destination chain; otherwise pending.
+        setState({ isLoading: true, error: null, status: 'Verifying the receive on the destination chain...', result: finalResult })
+        const { ownerHex: solOwnerHex, ataHex: solAtaHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
+        const destination = await verifyTransferDestinationWithRetry(
+          { direction, ...txHashes, evmWallet: evmAddress, solanaWallet: phantomAddress, amountRaw: parseUnits(amount, 6), solanaRecipients: [solOwnerHex, solAtaHex] },
+          destinationEvidence({ evmWallet: evmAddress, solanaRecipients: [solOwnerHex, solAtaHex], solanaRead: solanaReadRpc }),
+        )
+        const destinationVerified = destination.verified
+        const [arcBalanceAfter, solanaBalanceAfter] = await Promise.all([
+          refreshArcBalance().catch(() => null),
+          refreshSolanaBalance().catch(() => null),
+        ])
+        const actualUsdcCost = computeActualUsdcCost(
+          arcBalanceBefore,
+          solanaBalanceBefore,
+          arcBalanceAfter,
+          solanaBalanceAfter,
+        )
+        const normalizedResult = {
+          ...finalResult,
+          ...txHashes,
+          direction,
+          actualUsdcCost,
+          destinationVerified,
+          ...(destination.verified ? {} : { destinationPendingReason: destination.reason }),
         }
 
         setState({
-          isLoading: true,
-          error: null,
-          status: 'Bridge source step completed. Resuming the failed destination step...',
-          result: finalResult,
-        })
-
-        finalResult = await kit.retry(finalResult, {
-          from: solanaAdapter,
-          to: evmAdapter,
-        } as any)
-      }
-
-      if (finalResult?.state === 'error') {
-        const errorMessage = getBridgeKitErrorMessage(finalResult)
-        setState({
           isLoading: false,
-          error: errorMessage,
-          status: null,
-          result: finalResult,
+          error: null,
+          status: solanaTransferOutcomeStatus({ ...txHashes, destinationVerified }),
+          result: normalizedResult,
         })
-        return finalResult
-      }
 
-      const txHashes = getBridgeResultTxHashes(finalResult)
-      const [arcBalanceAfter, solanaBalanceAfter] = await Promise.all([
-        refreshArcBalance().catch(() => null),
-        refreshSolanaBalance().catch(() => null),
-      ])
-      const actualUsdcCost = computeActualUsdcCost(
-        arcBalanceBefore,
-        solanaBalanceBefore,
-        arcBalanceAfter,
-        solanaBalanceAfter,
-      )
-      const normalizedResult = {
-        ...finalResult,
-        ...txHashes,
-        direction,
-        actualUsdcCost,
-      }
-
-      setState({
-        isLoading: false,
-        error: null,
-        status: 'Solana mainnet transfer completed.',
-        result: normalizedResult,
+        return normalizedResult
       })
-
-      return normalizedResult
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
       setState({

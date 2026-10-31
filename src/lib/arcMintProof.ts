@@ -23,10 +23,11 @@ export const ARC_MINT_SEARCH = Object.freeze({ windowBlocks: 10_000n, maxWindows
 export type ArcMintLookup = { txHash?: Hex; status: 'verified' | 'not_found' | 'unavailable'; checked: number }
 
 // Verifies one candidate; returns false for anything that is not this exact mint.
-export async function verifyArcMintTx(client: any, hash: string, message: Hex, evmOwner: string): Promise<boolean> {
+// sourceDomain defaults to Sui (8); the Solana bridge passes 5 for its receive check.
+export async function verifyArcMintTx(client: any, hash: string, message: Hex, evmOwner: string, sourceDomain: 5 | 8 = 8): Promise<boolean> {
   if (!HASH.test(hash)) return false
   const arc = getMainnetCctpChain(5042)!, m = decodeCctpRecoveryMessage(message)
-  if (m.sourceDomain !== 8 || m.destinationDomain !== 26) return false
+  if (m.sourceDomain !== sourceDomain || m.destinationDomain !== 26) return false
   const receipt = await client.getTransactionReceipt({ hash: hash as Hex }).catch((e: any) => { if (/not found|could not be found/i.test(String(e?.message ?? e))) return null; throw e })
   if (!receipt || receipt.status !== 'success' || !same(receipt.transactionHash, hash) || typeof receipt.blockNumber !== 'bigint' || !receipt.blockHash) return false
   const block = await client.getBlock({ blockNumber: receipt.blockNumber })
@@ -36,7 +37,7 @@ export async function verifyArcMintTx(client: any, hash: string, message: Hex, e
   const matches = received.filter((l: any) => {
     try {
       const e = decodeEventLog({ abi: ARC_MINT_EVENTS_ABI, eventName: 'MessageReceived', data: l.data, topics: l.topics }).args as any
-      return e.sourceDomain === 8 && same(e.nonce, m.nonce) && same(e.sender, m.sender) && e.finalityThresholdExecuted === m.executedFinality && same(e.messageBody, body)
+      return e.sourceDomain === sourceDomain && same(e.nonce, m.nonce) && same(e.sender, m.sender) && e.finalityThresholdExecuted === m.executedFinality && same(e.messageBody, body)
     } catch { return false }
   })
   if (matches.length !== 1) return false
