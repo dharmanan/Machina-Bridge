@@ -74,6 +74,8 @@ export default function MainnetSolanaCanary() {
     estimateCanary,
     findPendingArcToSolanaBurn,
     recoverPendingArcToSolana,
+    arcSolanaReceiveReview,
+    confirmArcSolanaReceiveRelease,
     runCanary,
   } = useMainnetSolanaCctp(provider, phantomAddress)
   // An earlier burn with an unverified outcome blocks new transfers for these wallets (any tab).
@@ -92,6 +94,8 @@ export default function MainnetSolanaCanary() {
     useState<MainnetSolanaCanaryDirection>('arc-to-solana')
   const [amount, setAmount] = useState('')
   const [recoveryHash, setRecoveryHash] = useState('')
+  const [receiveRiskAccepted, setReceiveRiskAccepted] = useState(false)
+  const [receiveReviewError, setReceiveReviewError] = useState<string | null>(null)
   const [costDetailsOpen, setCostDetailsOpen] = useState(false)
   const [reviewing, setReviewing] = useState(false)
   const [refundPanelOpen, setRefundPanelOpen] = useState(false)
@@ -731,6 +735,27 @@ export default function MainnetSolanaCanary() {
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-500">If the burn is eligible, you confirm the receive step in Phantom.</p>
+            {arcSolanaReceiveReview && (
+              <div role="alert" aria-label="Earlier Solana receive needs review" className="mt-3 space-y-2 rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-900">
+                <p className="font-semibold">An earlier receive request has no saved signature</p>
+                <p>It was made before Machina saved receive evidence, so it cannot be checked automatically. These independent chain checks were run:</p>
+                <ul className="space-y-0.5">
+                  {arcSolanaReceiveReview.checks.map(c => <li key={c.label}>{c.ok ? '✓' : '✗'} {c.label}</li>)}
+                </ul>
+                {arcSolanaReceiveReview.eligible ? (
+                  <>
+                    <p>Risk: if an old Phantom window from that request is still open and you approve it, a second receive is sent. It cannot mint twice (the nonce is consumed by the first), but it can cost a Solana network fee. Close any open Phantom request first.</p>
+                    <label className="flex items-start gap-2"><input type="checkbox" checked={receiveRiskAccepted} onChange={e => setReceiveRiskAccepted(e.target.checked)} />
+                      <span>I closed any open Phantom request and understand the risk.</span></label>
+                    <button type="button" className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-semibold disabled:opacity-50" disabled={!receiveRiskAccepted || state.isLoading}
+                      onClick={() => { setReceiveReviewError(null); void confirmArcSolanaReceiveRelease(receiveRiskAccepted).then(() => setReceiveRiskAccepted(false)).catch(e => setReceiveReviewError(e instanceof Error ? e.message : 'The checks did not pass.')) }}>
+                      Unlock this receive
+                    </button>
+                  </>
+                ) : <p>Not every check passed, so the earlier request stays locked. Check again later; nothing was sent.</p>}
+                {receiveReviewError && <p>{receiveReviewError}</p>}
+              </div>
+            )}
           </details>
         )}
 

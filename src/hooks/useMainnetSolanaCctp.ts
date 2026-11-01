@@ -21,7 +21,11 @@ import { readSolanaCctpMessageUsed, SolanaNoncePendingError } from '../lib/mainn
 import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
-import { destinationEvidence, withSolanaSendGuard } from '../lib/solanaSendRuntime'
+import { destinationEvidence, solanaRpc, withSolanaSendGuard } from '../lib/solanaSendRuntime'
+import {
+  LegacyReceiveReviewRequired, ReceiveLockedError, classifyFailedAttempt, createReceiveEvidenceSigner, openReceiveAttempt,
+  releaseLegacyReceiveAfterReview, reviewLegacyReceive, updateReceiveEntry, type LegacyReview, type ReceiveReads,
+} from '../lib/arcSolanaReceiveEvidence'
 import { solanaTransferOutcomeStatus, verifyTransferDestinationWithRetry } from '../lib/solanaSendGuard'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
@@ -171,6 +175,30 @@ async function readSolanaUsdcRawBalance(ownerAddress: string) {
 
 async function isSolanaCctpMessageAlreadyMinted(messageHex: string) {
   return readSolanaCctpMessageUsed(messageHex, solanaReadRpc)
+}
+
+// HTTP-only chain evidence for the Arc -> Solana receive (no WebSocket needed). Reader A is the
+// browser RPC list used above; reader B is the server proxy with its own provider order. Every
+// read failure throws, which keeps an unclear receive locked.
+const arcSolanaReceiveReads: ReceiveReads = {
+  nonceUsedA: message => isSolanaCctpMessageAlreadyMinted(message),
+  nonceUsedB: message => readSolanaCctpMessageUsed(message, (method, params) => solanaRpc(method, params)),
+  async signatureStatus(signature) {
+    const r = await solanaRpc<{ value?: Array<{ err: unknown; confirmationStatus?: string | null } | null> }>('getSignatureStatuses', [[signature], { searchTransactionHistory: true }])
+    if (!r || !Array.isArray(r.value)) throw new Error('Solana signature status is unavailable.')
+    const v = r.value[0]
+    return v ? { found: true, err: v.err ?? null, confirmationStatus: v.confirmationStatus ?? null } : { found: false }
+  },
+  async blockhashValid(blockhash) {
+    const r = await solanaRpc<{ value?: unknown }>('isBlockhashValid', [blockhash, { commitment: 'processed' }])
+    if (typeof r?.value !== 'boolean') throw new Error('Solana blockhash validity is unavailable.')
+    return r.value
+  },
+  async signaturesTouching(address) {
+    const r = await solanaRpc<unknown[]>('getSignaturesForAddress', [address, { limit: 5 }])
+    if (!Array.isArray(r)) throw new Error('Solana signature history is unavailable.')
+    return r.length
+  },
 }
 
 async function waitForSolanaUsdcCredit(
@@ -842,6 +870,8 @@ export function useMainnetSolanaCctp(
     return pendingScan.current(scanKey, scan)
   }, [evmAddress, phantomAddress])
 
+  // An older pending/unknown receive record without a saved signature: shown for manual review.
+  const [arcSolanaReceiveReview, setArcSolanaReceiveReview] = useState<(LegacyReview & { message: string; owner: string }) | null>(null)
   const recoverPendingArcToSolana = useCallback(async (sourceTxHashOverride?: Hex) => {
     const sourceTxHash =
       sourceTxHashOverride
@@ -882,7 +912,25 @@ export function useMainnetSolanaCctp(
         setState({isLoading:false,error:null,status:'Destination nonce proves this burn was already received. No second mint was requested.',result:{sourceTxHash,recovered:true}})
         return {sourceTxHash,recovered:true}
       }
-      if (prior && ['pending','unknown'].includes(prior.status ?? '')) throw new Error('A prior wallet submission may still be pending. Its absence from one RPC is not permission to send again.')
+      // The receive journal decides from chain evidence (nonce, signature, blockhash) whether an earlier
+      // attempt could still land; an older record without that evidence needs the manual review.
+      let gate
+      try {
+        gate = await openReceiveAttempt({ sourceTxHash, owner: phantomAddress, message: attestation.message, legacyActivityStatus: prior?.status }, arcSolanaReceiveReads)
+      } catch (error) {
+        if (error instanceof LegacyReceiveReviewRequired) {
+          const review = await reviewLegacyReceive(sourceTxHash, attestation.message, arcSolanaReceiveReads)
+          setArcSolanaReceiveReview({ ...review, message: attestation.message, owner: phantomAddress })
+        }
+        throw error
+      }
+      if (gate.kind === 'already-received') {
+        recordMainnetSolanaActivity({evmWallet:evmAddress,solanaWallet:phantomAddress,direction:'arc-to-solana',amount:proof.amount,sourceTxHash,status:'complete'})
+        setArcSolanaReceiveReview(null)
+        setState({isLoading:false,error:null,status:'Destination nonce proves this burn was already received. No second mint was requested.',result:{sourceTxHash,recovered:true}})
+        return {sourceTxHash,recovered:true}
+      }
+      const receiveEntryId = gate.entryId
 
       const kit = new BridgeKit()
       const { solana, arc } = resolveChains(kit)
@@ -891,7 +939,8 @@ export function useMainnetSolanaCctp(
         rpcEndpoints: ['https://solana-rpc.publicnode.com'],
       } as BridgeKitChain
       const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
+        // The wallet request time, blockhash and signed signature are journaled before the SDK broadcasts.
+        provider: createStrictSolanaProvider(createReceiveEvidenceSigner(phantomProvider, receiveEntryId) as unknown as PhantomSolanaProvider),
         capabilities: {
           addressContext: 'user-controlled',
           supportedChains: [solanaBridgeChain],
@@ -918,9 +967,13 @@ export function useMainnetSolanaCctp(
       if (!readMainnetSolanaActivity().some(x=>x.id===attempt.id && x.status==='pending')) throw new Error('Recovery record could not be persisted. No wallet request is allowed.')
       let destinationTxHash: string
       try { destinationTxHash = await action.execute() } catch(e) {
-        updateMainnetSolanaActivity(attempt.id,{status:(e as {code?:number})?.code===4001?'failed':'unknown'})
+        // Only a refusal before the wallet or an explicit wallet rejection counts as "not sent";
+        // any other SDK/RPC error stays unknown until chain evidence settles it.
+        const settled = classifyFailedAttempt(receiveEntryId, e)
+        updateMainnetSolanaActivity(attempt.id,{status:settled.phase==='failed'?'failed':'unknown'})
         throw e
       }
+      updateReceiveEntry(receiveEntryId, { phase: 'sent' })
       updateMainnetSolanaActivity(attempt.id,{destinationTxHash,status:'pending'})
       const deadline = Date.now()+60_000
       let confirmed = false
@@ -936,6 +989,8 @@ export function useMainnetSolanaCctp(
       }
       if (!confirmed) throw new Error('Destination transaction outcome is not yet independently verified. Do not send again.')
       updateMainnetSolanaActivity(attempt.id,{status:'complete'})
+      updateReceiveEntry(receiveEntryId, { phase: 'complete' })
+      setArcSolanaReceiveReview(null)
 
       try {
         const raw = window.localStorage.getItem(RECOVERED_ARC_SOLANA_TXS_KEY)
@@ -1309,6 +1364,20 @@ export function useMainnetSolanaCctp(
     walletClient,
   ])
 
+  // Manual unlock of an older receive record after the independent chain checks passed and the user
+  // confirmed the risk warning. Takes the same per-burn lock; every check is re-run first.
+  const confirmArcSolanaReceiveRelease = useCallback(async (userConfirmed: boolean) => {
+    const review = arcSolanaReceiveReview
+    if (!review || !navigator.locks) throw new Error('There is no receive to review.')
+    return navigator.locks.request(`machina-arc-solana-recovery:${review.sourceTxHash}`, { ifAvailable: true }, async lock => {
+      if (!lock) throw new ReceiveLockedError('Another tab is processing this burn.')
+      const fresh = await releaseLegacyReceiveAfterReview(review.sourceTxHash, review.owner, review.message, userConfirmed, arcSolanaReceiveReads)
+      setArcSolanaReceiveReview(null)
+      setState(s => ({ ...s, isLoading: false, error: null, status: 'The earlier receive request was unlocked after the chain checks. Start the receive again; it is checked once more before your wallet opens.' }))
+      return fresh
+    })
+  }, [arcSolanaReceiveReview])
+
   return {
     state,
     kitSupport,
@@ -1326,6 +1395,8 @@ export function useMainnetSolanaCctp(
     estimateCanary,
     findPendingArcToSolanaBurn,
     recoverPendingArcToSolana,
+    arcSolanaReceiveReview,
+    confirmArcSolanaReceiveRelease,
     runCanary,
   }
 }

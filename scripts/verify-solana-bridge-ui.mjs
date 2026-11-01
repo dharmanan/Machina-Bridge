@@ -34,13 +34,14 @@ export function useMainnetSolanaCctp(){
     feeEstimate: s.fee, feeEstimateError: null, isEstimatingFees: false,
     estimateCanary: async (direction, amount) => { T.calls.estimates.push([direction, amount]); T.set({ fee: { bridgeFee: '0', receiveAmount: amount, gasFees: [{ name: 'Mint', token: direction === 'arc-to-solana' ? 'SOL' : 'USDC', amount: direction === 'arc-to-solana' ? '0.00001' : '0.01' }], solanaEventRentSol: direction === 'solana-to-arc' ? '0.0031' : null, solanaEventRentRefundableAfterDays: direction === 'solana-to-arc' ? 5 : null } }) },
     findPendingArcToSolanaBurn: async () => null, recoverPendingArcToSolana: async hash => { T.calls.recover.push(hash ?? null) },
+    arcSolanaReceiveReview: s.review ?? null, confirmArcSolanaReceiveRelease: async ok => { T.calls.release.push(ok); T.set({ review: null }) },
     runCanary: async (direction, amount) => { T.calls.runs.push([direction, amount]); return null },
   }
 }`
 const reclaimMock = `export async function discoverMainnetSolanaRefunds(){ window.solTest.calls.refunds++; return [] }
 export async function loadMainnetSolanaRefundMetadata(){ return {} }
 export async function reclaimMainnetSolanaDeposit(){ throw new Error('not used') }`
-const boot = `<script>(() => { const T = window.solTest = { listeners: new Set(), calls: { runs: [], estimates: [], recover: [], refresh: 0, refunds: 0, wallet: [] } }
+const boot = `<script>(() => { const T = window.solTest = { listeners: new Set(), calls: { runs: [], estimates: [], recover: [], refresh: 0, refunds: 0, wallet: [], release: [] } }
   T.snapshot = { evm: '${EVM}', sol: '${SOL}', arcBalance: '0.453737', solanaBalance: '0.46088', fee: null, state: { isLoading: false, error: null, status: null, result: null } }
   T.set = p => { T.snapshot = { ...T.snapshot, ...p }; T.listeners.forEach(l => l()) } })()</script>`
 const server = await createServer({ root, configFile: false, cacheDir: '/tmp/machina-solana-bridge-ui', plugins: [react(), { name: 'solana-bridge-ui', enforce: 'pre',
@@ -203,6 +204,26 @@ try {
     assert.deepEqual((await calls()).runs, [], 'no transfer (burn) was started')
     await page.unroute('https://rpc.mainnet.arc.io/**'); await page.unroute('**/api/solana-rpc'); await page.unroute('https://iris-api.circle.com/**')
     await page.evaluate(() => localStorage.clear())
+  })
+  await test('an older Arc -> Solana receive without saved evidence: the chain checks and a risk warning are shown; unlocking needs the explicit confirmation; failed checks offer no unlock; nothing is sent', async () => {
+    const checks = [{ label: 'Nonce unused on Solana (reader A, confirmed and finalized)', ok: true }, { label: 'Nonce unused on Solana (reader B, confirmed and finalized)', ok: true }, { label: 'No receive transaction ever touched the nonce account', ok: true }, { label: 'No active wallet request for this burn in this browser', ok: true }]
+    await open(); await page.getByText('Recover an older Arc → Solana transfer').click()
+    await set({ review: { sourceTxHash: '0x22e768dd', eligible: true, checks, reviewedAt: Date.now(), message: '0x', owner: SOL } })
+    const box = page.getByRole('alert', { name: 'Earlier Solana receive needs review' }); await box.waitFor()
+    const t = (await box.innerText()).replace(/\s+/g, ' ')
+    assert.match(t, /no saved signature/); assert.match(t, /✓ Nonce unused on Solana \(reader A/); assert.match(t, /✓ No active wallet request/)
+    assert.match(t, /It cannot mint twice .* but it can cost a Solana network fee/)
+    const unlock = box.getByRole('button', { name: 'Unlock this receive' })
+    assert.equal(await unlock.isDisabled(), true, 'disabled until the risk is confirmed')
+    await box.getByRole('checkbox').check(); await unlock.click()
+    await box.waitFor({ state: 'detached', timeout: 15000 })
+    assert.deepEqual((await calls()).release, [true]); assert.deepEqual((await calls()).runs, [], 'unlocking sends nothing')
+    await set({ review: { sourceTxHash: '0x22e768dd', eligible: false, checks: [checks[0], { ...checks[2], ok: false }], reviewedAt: Date.now(), message: '0x', owner: SOL } })
+    const bad = page.getByRole('alert', { name: 'Earlier Solana receive needs review' }); await bad.waitFor()
+    assert.match(await bad.innerText(), /✗ No receive transaction ever touched the nonce account/)
+    assert.match(await bad.innerText(), /Not every check passed, so the earlier request stays locked/)
+    assert.equal(await bad.getByRole('button', { name: 'Unlock this receive' }).count(), 0)
+    await set({ review: null })
   })
   await test('fits a phone (390 px) without horizontal scrolling', async () => {
     await page.setViewportSize({ width: 390, height: 900 }); await open(); await page.getByLabel('Bridge amount').fill('0.25')
