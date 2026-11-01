@@ -1,9 +1,10 @@
+import { assertSolanaFeeEstimate, solanaFeeEstimateIssue, validateSolanaSdkFees, type SolanaFeeBinding } from '../lib/solanaFeeEstimate'
 import { SOLANA_BRIDGE_SDK_RPC, solanaSourceFailure, type SolanaSourceStage } from '../lib/solanaBridgeConnection'
 import { createEvmBridgePolicyProvider } from '../lib/solanaBridgeEvmPolicy'
 import { readSolanaSendAttempts } from '../lib/solanaSendGuard'
 import { inspectSolanaToArcRecovery } from '../lib/solanaArcRecovery'
 import { solanaArcRecoveryPorts } from './useSolanaArcRecovery'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit, type EstimateResult } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
@@ -298,6 +299,7 @@ export type MainnetSolanaCanaryState = {
 }
 
 export type MainnetSolanaFeeEstimate = {
+  binding?: SolanaFeeBinding
   amount: string
   bridgeFee: string
   networkFeeUsdc: string
@@ -584,6 +586,20 @@ export function useMainnetSolanaCctp(
   const [feeEstimate, setFeeEstimate] = useState<MainnetSolanaFeeEstimate | null>(null)
   const [feeEstimateError, setFeeEstimateError] = useState<string | null>(null)
   const [isEstimatingFees, setIsEstimatingFees] = useState(false)
+  const feeQuote = useRef<MainnetSolanaFeeEstimate | null>(null)
+  const feeRequest = useRef(0)
+  const g1Live = useRef({ evmAddress, phantomAddress, walletClient, phantomProvider })
+  if (g1Live.current.evmAddress !== evmAddress || g1Live.current.phantomAddress !== phantomAddress
+    || g1Live.current.walletClient !== walletClient || g1Live.current.phantomProvider !== phantomProvider) {
+    // Invalidate synchronously, including disconnect/reconnect of the same account.
+    feeQuote.current = null
+    feeRequest.current++
+  }
+  g1Live.current = { evmAddress, phantomAddress, walletClient, phantomProvider }
+  useEffect(() => { setFeeEstimate(null); setIsEstimatingFees(false) }, [evmAddress, phantomAddress, walletClient, phantomProvider])
+  const feeEstimateIssue = useCallback((direction: MainnetSolanaCanaryDirection, amount: string) =>
+    solanaFeeEstimateIssue(feeQuote.current, { direction, amount, evmWallet: g1Live.current.evmAddress, solanaWallet: g1Live.current.phantomAddress }), [])
+
   // One in-flight recent-burn scan per wallet pair (a scan for other wallets is never reused).
   const pendingScan = useRef(keyedSingleFlight<Hex | null>())
 
@@ -1015,6 +1031,10 @@ export function useMainnetSolanaCctp(
     direction: MainnetSolanaCanaryDirection,
     amount: string,
   ) => {
+    const requestId = ++feeRequest.current
+    const startedAt = Date.now()
+    feeQuote.current = null
+    if (direction === 'solana-to-arc') setFeeEstimate(null)
     setIsEstimatingFees(true)
     setFeeEstimateError(null)
 
@@ -1064,7 +1084,9 @@ export function useMainnetSolanaCctp(
             amount,
           } as any)
 
+      if (direction === 'solana-to-arc') validateSolanaSdkFees(estimate)
       const normalized = normalizeSolanaFeeEstimate(estimate, amount)
+      normalized.binding = { direction, evmWallet: evmAddress, solanaWallet: phantomAddress, checkedAt: startedAt }
 
       if (direction === 'solana-to-arc') {
         // Circle CCTP V2 stores the source MessageSent event in a temporary
@@ -1112,17 +1134,24 @@ export function useMainnetSolanaCctp(
         }
       }
 
+      if (requestId !== feeRequest.current || g1Live.current.evmAddress !== evmAddress || g1Live.current.phantomAddress !== phantomAddress
+        || g1Live.current.walletClient !== walletClient || g1Live.current.phantomProvider !== phantomProvider) throw new Error('The fee request changed. Recalculate fees.')
+      if (direction === 'solana-to-arc') assertSolanaFeeEstimate(normalized, { direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress })
+      feeQuote.current = normalized
       setFeeEstimate(normalized)
       return normalized
     } catch (error) {
       const message = error instanceof Error
         ? error.message
         : 'Fee estimate is unavailable.'
-      setFeeEstimate(null)
-      setFeeEstimateError(message)
+      if (requestId === feeRequest.current) {
+        feeQuote.current = null
+        setFeeEstimate(null)
+        setFeeEstimateError(message)
+      }
       throw error
     } finally {
-      setIsEstimatingFees(false)
+      if (requestId === feeRequest.current) setIsEstimatingFees(false)
     }
   }, [
     evmAddress,
@@ -1131,7 +1160,6 @@ export function useMainnetSolanaCctp(
     walletClient,
   ])
 
-  const g1Live = useRef({ evmAddress, phantomAddress, walletClient }); g1Live.current = { evmAddress, phantomAddress, walletClient }
 
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
@@ -1139,6 +1167,7 @@ export function useMainnetSolanaCctp(
   ) => {
     let sourceStage: SolanaSourceStage = 'preparing'
     let sourceExecutionStarted = false
+    let sourceFeeError: string | null = null
     if (direction === 'arc-to-solana') {
       setPendingArcToSolanaTx(null)
       setPendingArcToSolanaError(null)
@@ -1170,11 +1199,27 @@ export function useMainnetSolanaCctp(
         throw new Error('Connect Phantom on Solana mainnet first.')
       }
 
+      // Authorize the reviewed fee BEFORE B1 creates a journal or any adapter/wallet call.
+      const approvedFee = direction === 'solana-to-arc' ? feeQuote.current : null
+      const checkFee = () => {
+        if (direction !== 'solana-to-arc') return
+        sourceFeeError = feeQuote.current !== approvedFee
+          ? 'The fee estimate changed. Recalculate fees and review again.'
+          : solanaFeeEstimateIssue(approvedFee, { direction, amount, evmWallet: g1Live.current.evmAddress, solanaWallet: g1Live.current.phantomAddress })
+        if (sourceFeeError) throw new Error(sourceFeeError)
+      }
+      checkFee()
+      const approvedMaxFee = direction === 'solana-to-arc'
+        ? assertSolanaFeeEstimate(approvedFee, { direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress })
+        : feeEstimate?.amount === amount ? parseUnits(feeEstimate.bridgeFee, 6) : 0n
+
       // One transfer per wallet across tabs, recorded before any wallet request; an earlier burn
       // with an unknown outcome blocks a new one until chain evidence settles it.
       return await withSolanaSendGuard({ direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress,
         onSourceStage: stage => { sourceStage = stage },
+        beforePrepare: checkFee,
       }, async guard => {
+        checkFee()
         sourceExecutionStarted = true
         const solanaPolicy = solanaTxExpectation(direction, amount, evmAddress, phantomAddress)
         const kit = new BridgeKit()
@@ -1185,7 +1230,7 @@ export function useMainnetSolanaCctp(
         } as BridgeKitChain
 
         const solanaAdapter = await createSolanaAdapterFromProvider({
-          provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy)),
+          provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => { checkFee(); assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy) }),
           capabilities: {
             addressContext: 'user-controlled',
             supportedChains: [solanaBridgeChain],
@@ -1197,9 +1242,10 @@ export function useMainnetSolanaCctp(
         const request = async (args: { method: string; params?: unknown[] }) =>
           walletClient.transport.request(args as never)
 
+        checkFee()
         await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
 
-        const maxFee = feeEstimate?.amount === amount ? parseUnits(feeEstimate.bridgeFee, 6) : 0n
+        const maxFee = approvedMaxFee
         const evmAdapter = await createEvmAdapterFromProvider({
           provider: createEvmBridgePolicyProvider(guard.evm(raw), {
             mode: direction === 'arc-to-solana' ? 'burn' : 'receive', owner: evmAddress, solanaOwner: phantomAddress, amount: amountRaw, maxFee, finality: 1000, current,
@@ -1225,6 +1271,7 @@ export function useMainnetSolanaCctp(
             : 'Confirm the Arc mainnet CCTP transfer in your EVM wallet.',
         }))
 
+        checkFee()
         const result = direction === 'solana-to-arc'
           ? await kit.bridge({
               from: { adapter: solanaAdapter, chain: solanaBridgeChain },
@@ -1284,7 +1331,7 @@ export function useMainnetSolanaCctp(
             setState({ isLoading: false, error: null, status: 'The Solana burn is verified. Arc receive is not yet verified; use Activity to recover this existing burn. Do not send again.', result: pendingResult })
             return pendingResult
           }
-          setState({ isLoading: false, error: solanaSourceFailure(sourceStage), status: null, result: finalResult })
+          setState({ isLoading: false, error: sourceFeeError ?? solanaSourceFailure(sourceStage), status: null, result: finalResult })
           return finalResult
         }
 
@@ -1337,9 +1384,9 @@ export function useMainnetSolanaCctp(
         return normalizedResult
       })
     } catch (error) {
-      const message = direction === 'solana-to-arc' && sourceExecutionStarted
+      const message = sourceFeeError ?? (direction === 'solana-to-arc' && sourceExecutionStarted
         ? solanaSourceFailure(sourceStage)
-        : error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
+        : error instanceof Error ? error.message : 'Solana mainnet transfer failed.')
       setState({
         isLoading: false,
         error: message,
@@ -1387,6 +1434,7 @@ export function useMainnetSolanaCctp(
     pendingArcToSolanaError,
     feeEstimate,
     feeEstimateError,
+    feeEstimateIssue,
     isEstimatingFees,
     estimateCanary,
     findPendingArcToSolanaBurn,

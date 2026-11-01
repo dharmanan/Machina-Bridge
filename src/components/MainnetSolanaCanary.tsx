@@ -68,8 +68,9 @@ export default function MainnetSolanaCanary() {
     refreshSolanaBalance,
     pendingArcToSolanaTx,
     pendingArcToSolanaError,
-    feeEstimate,
+    feeEstimate: rawFeeEstimate,
     feeEstimateError,
+    feeEstimateIssue,
     isEstimatingFees,
     estimateCanary,
     findPendingArcToSolanaBurn,
@@ -122,6 +123,15 @@ export default function MainnetSolanaCanary() {
   const amountValid = 'value' in parsedAmount
   const normalizedAmount = 'value' in parsedAmount ? parsedAmount.value : ''
   const amountError = amount.trim() && 'error' in parsedAmount ? parsedAmount.error : null
+  const [, setFeeClock] = useState(0)
+  useEffect(() => {
+    if (direction !== 'solana-to-arc') return
+    const timer = window.setInterval(() => setFeeClock(n => n + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [direction])
+  const feeIssue = direction === 'solana-to-arc' ? feeEstimateIssue(direction, normalizedAmount) : null
+  const feeEstimate = feeIssue ? null : rawFeeEstimate
+
 
   useEffect(() => {
     if (evmAddress) {
@@ -258,6 +268,7 @@ export default function MainnetSolanaCanary() {
     && amountValid
     && !state.isLoading
     && !sendBlock.open
+    && !feeIssue
 
   // One transfer at a time: a second click in the same tick (before React re-renders the
   // disabled button) must not start a second transfer. runCanary itself has no in-flight guard.
@@ -331,7 +342,7 @@ export default function MainnetSolanaCanary() {
   // A Review is bound to the direction and amount it shows; any edit drops it.
   useEffect(() => {
     setReviewing(false)
-  }, [amount, direction])
+  }, [amount, direction, evmAddress, phantomAddress])
 
   const notReady = !kitSupport.ready
     ? 'The bridge is unavailable right now.'
@@ -346,6 +357,7 @@ export default function MainnetSolanaCanary() {
             : null
 
   const confirm = () => {
+    if (!canRun || (direction === 'solana-to-arc' && feeEstimateIssue(direction, normalizedAmount))) return
     setReviewing(false)
     void handleBridge().catch(() => undefined)
   }
@@ -441,6 +453,17 @@ export default function MainnetSolanaCanary() {
                     ? 'Enter an amount to calculate the current bridge and network fees.'
                     : 'Calculating current bridge and network fees…'}
             </p>
+          )}
+
+          {direction === 'solana-to-arc' && feeIssue && amountValid && evmConnected && phantomConnected && !state.isLoading && (
+            <div role="alert" aria-label="Solana fee estimate required" className="space-y-2 text-xs leading-5 text-amber-800">
+              <p>{feeEstimateError ? 'Fee calculation failed. Recalculate fees before starting this transfer.' : feeIssue}</p>
+              <button type="button" disabled={isEstimatingFees}
+                onClick={() => { setReviewing(false); void estimateCanary(direction, normalizedAmount).catch(() => undefined) }}
+                className="font-semibold underline disabled:opacity-50">
+                {isEstimatingFees ? 'Calculating fees…' : 'Recalculate fees'}
+              </button>
+            </div>
           )}
 
           {direction === 'solana-to-arc' && feeEstimate?.solanaEventRentSol && (
@@ -590,6 +613,7 @@ export default function MainnetSolanaCanary() {
                   <button
                     type="button"
                     onClick={confirm}
+                    disabled={!canRun}
                     className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950"
                   >
                     <Wallet size={16} />
@@ -604,7 +628,7 @@ export default function MainnetSolanaCanary() {
               <button
                 type="button"
                 disabled={!canRun}
-                onClick={() => setReviewing(true)}
+                onClick={() => { if (canRun && (direction !== 'solana-to-arc' || !feeEstimateIssue(direction, normalizedAmount))) setReviewing(true) }}
                 className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[#66D121] px-4 py-3 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
               >
                 {state.isLoading ? <Loader2 size={16} className="animate-spin" aria-hidden /> : !canRun && <LockKeyhole size={16} />}
