@@ -144,7 +144,7 @@ type SolanaSign = { signTransaction?: (tx: unknown) => Promise<unknown>; signAll
 // Runs one transfer with the wallet locks held and the attempt persisted before any wallet request.
 // The wrapped providers record the burn request and its outcome as it happens.
 export async function withSolanaSendGuard<T>(
-  input: { direction: SolanaSendDirection; amount: string; evmWallet: string; solanaWallet: string; onSourceStage?: (stage: SolanaSourceStage) => void },
+  input: { direction: SolanaSendDirection; amount: string; evmWallet: string; solanaWallet: string; onSourceStage?: (stage: SolanaSourceStage) => void; beforePrepare?: () => void },
   run: (guard: { evm<P extends object>(p: P): P; solana<P extends object>(p: P, validate?: (tx: unknown) => void): P }) => Promise<T>,
   evidence: SolanaSendEvidence = solanaSendEvidence,
 ): Promise<T> {
@@ -162,7 +162,8 @@ export async function withSolanaSendGuard<T>(
         if (verdict.kind === 'burned') throw new Error(`An earlier transfer (${shortRef(open)}) has its burn on chain; receiving it is not verified yet. It is in your activity: check it there before starting another transfer.`)
       }
       const arcBlockBefore = input.direction === 'arc-to-solana' ? String(await evidence.arcLatestBlock()) : undefined
-      const { onSourceStage, ...intent } = input
+      const { onSourceStage, beforePrepare, ...intent } = input
+      beforePrepare?.() // fee authorization runs with both locks held, before the journal exists
       const attempt = createSolanaSendAttempt({ ...intent, arcBlockBefore })
       // Shared across every provider wrapper in this execution, including SDK-internal retries.
       let solanaBurnRequested = false

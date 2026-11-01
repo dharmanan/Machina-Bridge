@@ -23,6 +23,7 @@ export function useWalletClient(){ const s = useT(); return { data: s.evm ? W : 
 const phantomMock = `import { useT } from '\\0sb-store'
 export function usePhantomSolana(){ const s = useT(); return { address: s.sol, isConnected: Boolean(s.sol), isConnecting: false, provider: s.sol ? {} : null, connect: async () => {}, disconnect: async () => {} } }`
 const cctpMock = `import { useT } from '\\0sb-store'
+import { solanaFeeEstimateIssue } from '/src/lib/solanaFeeEstimate.ts'
 const T = window.solTest
 export function useMainnetSolanaCctp(){
   const s = useT()
@@ -31,8 +32,9 @@ export function useMainnetSolanaCctp(){
     arcBalance: s.arcBalance, arcBalanceError: null, refreshArcBalance: async () => { T.calls.refresh++ },
     solanaBalance: s.solanaBalance, solanaBalanceError: null, refreshSolanaBalance: async () => { T.calls.refresh++ },
     pendingArcToSolanaTx: null, pendingArcToSolanaError: null,
-    feeEstimate: s.fee, feeEstimateError: null, isEstimatingFees: false,
-    estimateCanary: async (direction, amount) => { T.calls.estimates.push([direction, amount]); T.set({ fee: { bridgeFee: '0', receiveAmount: amount, gasFees: [{ name: 'Mint', token: direction === 'arc-to-solana' ? 'SOL' : 'USDC', amount: direction === 'arc-to-solana' ? '0.00001' : '0.01' }], solanaEventRentSol: direction === 'solana-to-arc' ? '0.0031' : null, solanaEventRentRefundableAfterDays: direction === 'solana-to-arc' ? 5 : null } }) },
+    feeEstimate: s.fee, feeEstimateError: s.feeError ?? null, isEstimatingFees: Boolean(s.feeLoading),
+    feeEstimateIssue: (direction, amount) => solanaFeeEstimateIssue(s.fee, { direction, amount, evmWallet: s.evm, solanaWallet: s.sol }),
+    estimateCanary: async (direction, amount) => { T.calls.estimates.push([direction, amount]); if (s.pauseFees) return; if (s.failFees) { T.set({ fee: null, feeError: 'controlled fee failure' }); throw new Error('controlled fee failure') }; T.set({ fee: { amount, binding: { direction, evmWallet: s.evm, solanaWallet: s.sol, checkedAt: Date.now() }, bridgeFee: '0', receiveAmount: amount, gasFees: [{ name: 'Mint', token: direction === 'arc-to-solana' ? 'SOL' : 'USDC', amount: direction === 'arc-to-solana' ? '0.00001' : '0.01' }], solanaEventRentSol: direction === 'solana-to-arc' ? '0.0031' : null, solanaEventRentRefundableAfterDays: direction === 'solana-to-arc' ? 5 : null } }) },
     findPendingArcToSolanaBurn: async () => null, recoverPendingArcToSolana: async hash => { T.calls.recover.push(hash ?? null) },
     arcSolanaReceiveReview: s.review ?? null, confirmArcSolanaReceiveRelease: async ok => { T.calls.release.push(ok); T.set({ review: null }) },
     runCanary: async (direction, amount) => { T.calls.runs.push([direction, amount]); return null },
@@ -48,8 +50,9 @@ const server = await createServer({ root, configFile: false, cacheDir: '/tmp/mac
   resolveId(id) { if (id === '\0sb-store') return id; if (id === 'wagmi') return '\0sb-wagmi'; if (id.endsWith('/hooks/usePhantomSolana')) return '\0sb-phantom'; if (id.endsWith('/hooks/useMainnetSolanaCctp')) return '\0sb-cctp'; if (id.endsWith('/lib/mainnetSolanaReclaim')) return '\0sb-reclaim' },
   load(id) { return { '\0sb-store': store, '\0sb-wagmi': wagmiMock, '\0sb-phantom': phantomMock, '\0sb-cctp': cctpMock, '\0sb-reclaim': reclaimMock }[id] },
   configureServer(s) { s.middlewares.use('/__solana', async (_q, res) => { res.setHeader('Content-Type', 'text/html'); res.end(await s.transformIndexHtml('/__solana', `<!doctype html><html><head><link rel="stylesheet" href="/src/index.css"></head><body><div id="root"></div>${boot}<script type="module" src="/scripts/fixtures/solana-bridge-ui.tsx"></script></body></html>`)) }) } }], server: { host: '127.0.0.1', port: 0 } })
+const feeOnly = process.env.MACHINA_SOLANA_FEES_ONLY === '1'
 let browser, page, count = 0; const errors = []
-async function test(name, fn) { try { await fn() } catch (e) { console.log('PAGE:', (await page?.locator('body').innerText().catch(() => ''))?.slice(0, 1500)); throw e } count++; console.log('PASS ' + name) }
+async function test(name, fn) { if (feeOnly && !name.startsWith('[fee]')) return; try { await fn() } catch (e) { console.log('PAGE:', (await page?.locator('body').innerText().catch(() => ''))?.slice(0, 1500)); throw e } count++; console.log('PASS ' + name) }
 try {
   await server.listen(); const base = `http://127.0.0.1:${server.httpServer.address().port}/__solana`
   browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
@@ -229,6 +232,44 @@ try {
     await page.setViewportSize({ width: 390, height: 900 }); await open(); await page.getByLabel('Bridge amount').fill('0.25')
     await page.getByRole('button', { name: 'Review transfer' }).click(); await reviewBox().waitFor()
     await shot('solana-review-mobile'); assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
+  })
+  const fee = (patch = {}) => ({ amount: '0.1', bridgeFee: '0', receiveAmount: '0.1', gasFees: [], binding: { direction: 'solana-to-arc', evmWallet: EVM, solanaWallet: SOL, checkedAt: Date.now() - 100 }, ...patch })
+  const sourceForm = async () => { await open(); await set({ pauseFees: true }); await page.getByRole('button', { name: 'Switch direction' }).click(); await page.getByLabel('Bridge amount').fill('0.1'); await page.waitForTimeout(500) }
+  const reviewButton = () => page.getByRole('button', { name: 'Review transfer', exact: true })
+  await test('[fee] no quote: Review is disabled and Recalculate fees gives an explicit recovery path', async () => {
+    await sourceForm(); assert.equal(await reviewButton().isDisabled(), true)
+    await page.getByRole('alert', { name: 'Solana fee estimate required' }).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Recalculate fees', exact: true }).isEnabled(), true)
+    assert.deepEqual((await calls()).runs, [])
+  })
+  await test('[fee] successful recalculation, including zero fee, enables Review and Confirm but never auto-starts', async () => {
+    await sourceForm(); await set({ pauseFees: false }); await page.getByRole('button', { name: 'Recalculate fees', exact: true }).click()
+    await reviewButton().click(); await reviewBox().waitFor(); assert.equal(await page.getByRole('button', { name: 'Confirm and start transfer' }).isEnabled(), true)
+    assert.deepEqual((await calls()).runs, []); assert.match(await reviewBox().innerText(), /Circle fee\s+0 USDC/)
+  })
+  await test('[fee] changed amount, direction and wallet binding keep Review disabled', async () => {
+    await sourceForm()
+    for (const binding of [ { ...fee().binding, direction: 'arc-to-solana' }, { ...fee().binding, evmWallet: '0x' + '11'.repeat(20) }, { ...fee().binding, solanaWallet: EVM } ]) {
+      await set({ fee: fee({ binding }) }); assert.equal(await reviewButton().isDisabled(), true)
+    }
+    await set({ fee: fee() }); assert.equal(await reviewButton().isEnabled(), true)
+    await page.getByLabel('Bridge amount').fill('0.2'); assert.equal(await reviewButton().isDisabled(), true)
+    assert.deepEqual((await calls()).runs, [])
+  })
+  await test('[fee] expiry removes Confirm, blocks Review and allows a fresh manual calculation without sending', async () => {
+    await sourceForm(); await set({ fee: fee() }); await reviewButton().click(); await reviewBox().waitFor()
+    await set({ fee: fee({ binding: { ...fee().binding, checkedAt: Date.now() - 61000 } }) })
+    await page.getByRole('button', { name: 'Confirm and start transfer' }).waitFor({ state: 'detached' })
+    assert.equal(await reviewButton().isDisabled(), true); assert.match(await page.getByRole('alert', { name: 'Solana fee estimate required' }).innerText(), /expired/)
+    await set({ pauseFees: false }); await page.getByRole('button', { name: 'Recalculate fees', exact: true }).click()
+    assert.equal(await reviewButton().isEnabled(), true); assert.deepEqual((await calls()).runs, [])
+  })
+  await test('[fee] failed and in-progress fee calculations never enable a transfer or leak provider errors', async () => {
+    await sourceForm(); await set({ pauseFees: false, failFees: true }); await page.getByRole('button', { name: 'Recalculate fees', exact: true }).click()
+    assert.equal(await reviewButton().isDisabled(), true); assert.match(await page.getByRole('alert', { name: 'Solana fee estimate required' }).innerText(), /Fee calculation failed/)
+    assert.doesNotMatch(await text(), /controlled fee failure/)
+    await set({ feeLoading: true }); assert.equal(await page.getByRole('button', { name: 'Calculating fees…', exact: true }).isDisabled(), true)
+    assert.deepEqual((await calls()).runs, []); assert.deepEqual((await calls()).wallet, [])
   })
   assert.deepEqual(errors, [], 'no page errors')
   console.log(`RESULT ${count}/${count} Solana Bridge UI groups PASS; real component, controlled wallets and CCTP hook; no network.`)

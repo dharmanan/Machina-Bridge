@@ -146,7 +146,7 @@ const fakeKit = class {
   async retry() { retryCalls++; throw new Error('retry must never run') }
 }
 Module._load = function (name, ...rest) {
-  if (name === 'react') return { useCallback: f => f, useMemo: f => f(), useRef: x => ({ current: x }), useState: initial => { let v = initial; return [v, next => { v = typeof next === 'function' ? next(v) : next; if (v && typeof v === 'object' && 'isLoading' in v) latestState = v }] } }
+  if (name === 'react') return { useCallback: f => f, useEffect: () => {}, useMemo: f => f(), useRef: x => ({ current: x === null ? { amount: '0.1', bridgeFee: '0', binding: { direction: 'solana-to-arc', evmWallet: evm, solanaWallet: owner, checkedAt: Date.now() } } : x }), useState: initial => { let v = initial; return [v, next => { v = typeof next === 'function' ? next(v) : next; if (v && typeof v === 'object' && 'isLoading' in v) latestState = v }] } }
   if (name === 'wagmi') return { useAccount: () => ({ address: evm }), useWalletClient: () => ({ data: walletClient }) }
   if (name === '@circle-fin/bridge-kit') return { BridgeKit: fakeKit }
   if (name === '@circle-fin/adapter-solana') return { createSolanaAdapterFromProvider: async opts => opts }
