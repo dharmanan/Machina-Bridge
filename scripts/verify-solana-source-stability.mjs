@@ -3,14 +3,14 @@
 import assert from 'node:assert/strict'
 import { createRequire, Module } from 'node:module'
 import { readFileSync } from 'node:fs'
-import { PublicKey, VersionedTransaction } from '@solana/web3.js'
+import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js'
 import { BridgeKit } from '@circle-fin/bridge-kit'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
 const require = createRequire(import.meta.url), ts = require('typescript')
 require.extensions['.ts'] = (m, f) => m._compile(ts.transpileModule(readFileSync(f, 'utf8').replaceAll('import.meta.env', '({})'), { fileName: f, compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true, jsx: ts.JsxEmit.ReactJSX } }).outputText, f)
 const store = new Map()
 globalThis.localStorage = { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) }
-globalThis.window = { localStorage, dispatchEvent() {}, addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout }
+globalThis.window = { location: { origin: 'https://machina.test' }, localStorage, dispatchEvent() {}, addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout }
 // Any accidental fetch fails locally; specific read-only scanner tests replace this temporarily.
 globalThis.fetch = async () => { throw new Error('Network forbidden in controlled regression') }
 const G = require('../src/lib/solanaSendGuard.ts'), R = require('../src/lib/solanaSendRuntime.ts')
@@ -119,6 +119,60 @@ await test('installed adapter creates the same HTTP/WSS endpoint pair used by su
   assert.equal(connection._rpcWsEndpoint, 'wss://solana-rpc.publicnode.com')
   assert.equal(typeof connection.confirmTransaction, 'function')
 })
+await test('real adapter confirmation probe reproduces old same-origin WSS mistake and uses provider WSS with the fixed connection', async () => {
+  const previous = globalThis.WebSocket, probes = []
+  // Only the socket transport is controlled: run the installed adapter's actual
+  // confirmation/capability code, without opening any real socket or signing.
+  globalThis.WebSocket = class {
+    constructor(url) { probes.push(url); queueMicrotask(() => this.onopen?.()) }
+    send(raw) { const request = JSON.parse(raw); assert.equal(request.method, 'signatureSubscribe'); queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', id: request.id, result: 1 }) })) }
+    close() {}
+  }
+  try {
+    const old = new Connection('https://machina.test/api/solana-rpc', { wsEndpoint: 'wss://solana-rpc.publicnode.com' })
+    const fixed = C.createSolanaBridgeConnection(window.location.origin)
+    for (const connection of [old, fixed]) {
+      const adapter = await createSolanaAdapterFromProvider({ connection, provider: { connect: async () => assert.fail('no connect'), disconnect: async () => {}, isConnected: true, publicKey: new PublicKey(owner), signTransaction: async () => assert.fail('no signing') }, capabilities: { addressContext: 'user-controlled', supportedChains: [solana] } })
+      assert.equal(adapter.getConnection(solana), connection, 'SDK must retain the explicit Connection instance')
+      assert.equal(adapter.getConnection(solana)._rpcWsEndpoint, 'wss://solana-rpc.publicnode.com')
+      let confirmations = 0
+      connection.confirmTransaction = async (params, commitment) => {
+        confirmations++; assert.equal(params.signature, real.burn.signature); assert.equal(commitment, 'confirmed')
+        return { context: { slot: 1 }, value: { err: null } }
+      }
+      assert.equal(await adapter.confirmAndValidate(connection, real.burn.signature, tx().message.recentBlockhash, 999), real.burn.signature)
+      assert.equal(confirmations, 1)
+    }
+    assert.deepEqual(probes, ['wss://machina.test/api/solana-rpc', 'wss://solana-rpc.publicnode.com'])
+  } finally { globalThis.WebSocket = previous }
+})
+await test('real adapter Connection routes HTTP reads through proxy and stops serialized broadcast at a local transport boundary', async () => {
+  const previous = globalThis.fetch, calls = []
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, 'https://machina.test/api/solana-rpc')
+    const request = JSON.parse(init.body); calls.push(request.method)
+    if (request.method === 'sendTransaction') {
+      assert.equal(request.params[1].maxRetries, 0)
+      assert.equal(request.params[1].skipPreflight, true)
+      throw new Error('LOCAL_BROADCAST_STOP') // no packet leaves this process
+    }
+    assert.equal(request.method, 'getLatestBlockhash')
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { context: { slot: 1 }, value: { blockhash: tx().message.recentBlockhash, lastValidBlockHeight: 999 } } }), { status: 200 })
+  }
+  try {
+    const connection = C.createSolanaBridgeConnection(window.location.origin)
+    const adapter = await createSolanaAdapterFromProvider({ connection, provider: { connect: async () => assert.fail('no connect'), disconnect: async () => {}, isConnected: true, publicKey: new PublicKey(owner), signTransaction: async () => assert.fail('no wallet signatures') }, capabilities: { addressContext: 'user-controlled', supportedChains: [solana] } })
+    assert.equal(adapter.getConnection(solana), connection)
+    assert.equal((await adapter.getConnection(solana).getLatestBlockhash()).lastValidBlockHeight, 999)
+    // Reuse immutable historical fixture bytes. The controlled signer returns
+    // them unchanged; it generates no signature. The actual web3 transport
+    // serializes the SDK send but its fetch port always refuses publication.
+    const historical = tx(), original = Buffer.from(historical.serialize())
+    await assert.rejects(adapter.sendWithProviderSigner(connection, { publicKey: new PublicKey(owner), isProviderSigner: true, signTransaction: async t => t }, historical, [], historical.message.recentBlockhash, 999), /LOCAL_BROADCAST_STOP/)
+    assert.deepEqual(Buffer.from(historical.serialize()), original)
+    assert.deepEqual(calls, ['getLatestBlockhash', 'sendTransaction'])
+  } finally { globalThis.fetch = previous }
+})
 await test('real installed SDK execute: simulation → wallet → broadcast → confirmation; no real send; failures do not repeat wallet request', async () => {
   const adapter = await createSolanaAdapterFromProvider({ provider: { connect: async () => {}, disconnect: async () => {}, isConnected: true, publicKey: new PublicKey(owner), signTransaction: async t => t }, capabilities: { addressContext: 'user-controlled', supportedChains: [solana] } })
   for (const failure of [null, 'broadcast', 'confirmation']) {
@@ -149,7 +203,12 @@ Module._load = function (name, ...rest) {
   if (name === 'react') return { useCallback: f => f, useEffect: () => {}, useMemo: f => f(), useRef: x => ({ current: x === null ? { amount: '0.1', bridgeFee: '0', binding: { direction: 'solana-to-arc', evmWallet: evm, solanaWallet: owner, checkedAt: Date.now() } } : x }), useState: initial => { let v = initial; return [v, next => { v = typeof next === 'function' ? next(v) : next; if (v && typeof v === 'object' && 'isLoading' in v) latestState = v }] } }
   if (name === 'wagmi') return { useAccount: () => ({ address: evm }), useWalletClient: () => ({ data: walletClient }) }
   if (name === '@circle-fin/bridge-kit') return { BridgeKit: fakeKit }
-  if (name === '@circle-fin/adapter-solana') return { createSolanaAdapterFromProvider: async opts => opts }
+  if (name === '@circle-fin/adapter-solana') return { createSolanaAdapterFromProvider: async opts => {
+    assert.equal(opts.connection.rpcEndpoint, C.SOLANA_BRIDGE_SDK_RPC)
+    assert.equal(opts.connection._rpcWsEndpoint, 'wss://solana-rpc.publicnode.com')
+    assert.equal(opts.capabilities.supportedChains[0].rpcEndpoints[0], opts.connection.rpcEndpoint)
+    return opts
+  } }
   if (name === '@circle-fin/adapter-viem-v2') return { createAdapterFromProvider: async opts => opts }
   if (name === 'viem') return { ...viem, createPublicClient: () => ({ readContract: async () => 1000000n }) }
   return originalLoad.call(this, name, ...rest)

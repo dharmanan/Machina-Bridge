@@ -26,7 +26,7 @@ await test('invalid fee data never normalizes into zero; SDK empty successful fe
 })
 const journal=new Map()
 globalThis.localStorage={getItem:k=>journal.get(k)??null,setItem:(k,v)=>journal.set(k,v)}
-globalThis.window={localStorage,dispatchEvent(){},addEventListener(){},removeEventListener(){},setTimeout,clearTimeout}
+globalThis.window={location:{origin:'https://machina.test'},localStorage,dispatchEvent(){},addEventListener(){},removeEventListener(){},setTimeout,clearTimeout}
 const R=require('../src/lib/solanaSendRuntime.ts'),G=require('../src/lib/solanaSendGuard.ts')
 Object.assign(R.solanaSendEvidence,{arcLatestBlock:async()=>1n,arcBurnsSince:async()=>[],arcReceipt:async()=>null,arcNothingPending:async()=>true,solanaSignatureStatus:async()=>({found:false}),solanaBlockhashValid:async()=>true,solanaBurnsSince:async()=>[]})
 const realViem=require('viem'),originalLoad=Module._load
@@ -39,7 +39,7 @@ Module._load=function(name,...args){
  if(name==='react')return React
  if(name==='wagmi')return {useAccount:()=>({address:evm}),useWalletClient:()=>({data:wallet})}
  if(name==='@circle-fin/bridge-kit')return {BridgeKit:class{getSupportedChains(){return chains}async estimate(){return estimateTask()}async bridge(args){bridgeConfig=args.config;return bridgeTask?bridgeTask(args):{state:'success'}}}}
- if(name==='@circle-fin/adapter-solana')return {createSolanaAdapterFromProvider:async opts=>{adapters++;return opts}}
+ if(name==='@circle-fin/adapter-solana')return {createSolanaAdapterFromProvider:async opts=>{adapters++;if(opts.connection){assert.equal(opts.connection.rpcEndpoint,'https://solana-rpc.publicnode.com');assert.equal(opts.connection._rpcWsEndpoint,'wss://solana-rpc.publicnode.com')}return opts}}
  if(name==='@circle-fin/adapter-viem-v2')return {createAdapterFromProvider:async opts=>{adapters++;return opts}}
  if(name==='viem')return {...realViem,createPublicClient:()=>({readContract:async()=>1000000n})}
  return originalLoad.call(this,name,...args)

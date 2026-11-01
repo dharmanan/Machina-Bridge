@@ -1,5 +1,5 @@
 import { assertSolanaFeeEstimate, solanaFeeEstimateIssue, validateSolanaSdkFees, type SolanaFeeBinding } from '../lib/solanaFeeEstimate'
-import { SOLANA_BRIDGE_SDK_RPC, solanaSourceFailure, type SolanaSourceStage } from '../lib/solanaBridgeConnection'
+import { SOLANA_BRIDGE_SDK_RPC, createSolanaBridgeConnection, solanaSourceFailure, type SolanaSourceStage } from '../lib/solanaBridgeConnection'
 import { createEvmBridgePolicyProvider } from '../lib/solanaBridgeEvmPolicy'
 import { readSolanaSendAttempts } from '../lib/solanaSendGuard'
 import { inspectSolanaToArcRecovery } from '../lib/solanaArcRecovery'
@@ -9,7 +9,7 @@ import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit, type EstimateResult } from '@circle-fin/bridge-kit'
 import { createAdapterFromProvider as createEvmAdapterFromProvider } from '@circle-fin/adapter-viem-v2'
 import { createSolanaAdapterFromProvider } from '@circle-fin/adapter-solana'
-import { Connection, PublicKey } from '@solana/web3.js'
+import { PublicKey } from '@solana/web3.js'
 import { createPublicClient, decodeEventLog, formatUnits, http, parseAbi, parseAbiItem, parseUnits, type Hex } from 'viem'
 import { ARC_MAINNET_EVM_CHAIN, ARC_MAINNET_EVM_CHAIN_ID, addChainToWallet } from '../lib/chains'
 import { deriveSolanaUsdcAta } from '../lib/solana'
@@ -1235,20 +1235,16 @@ export function useMainnetSolanaCctp(
         const solanaPolicy = solanaTxExpectation(direction, amount, evmAddress, phantomAddress)
         const kit = new BridgeKit()
         const { solana, arc } = resolveChains(kit)
-        // Balance and pre-sign reads use the same-origin RPC with provider fallback.
-        // Confirmation retains a real WebSocket endpoint; /api/solana-rpc is HTTP-only.
-        const sdkHttpRpc = `${window.location.origin}/api/solana-rpc`
+        // SDK capability probes derive WSS from rpcEndpoint, not wsEndpoint.
+        // The connection's fetch port sends HTTP to our same-origin proxy.
         const solanaBridgeChain = {
           ...(solana as any),
-          rpcEndpoints: [sdkHttpRpc],
+          rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
         } as BridgeKitChain
 
         preparationStep = 'solana-adapter'
         const solanaAdapter = await createSolanaAdapterFromProvider({
-          connection: new Connection(sdkHttpRpc, {
-            commitment: 'confirmed',
-            wsEndpoint: SOLANA_BRIDGE_SDK_RPC.replace(/^https:/, 'wss:'),
-          }),
+          connection: createSolanaBridgeConnection(window.location.origin),
           provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => { checkFee(); assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy) }),
           capabilities: {
             addressContext: 'user-controlled',

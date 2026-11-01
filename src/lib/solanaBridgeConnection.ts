@@ -1,8 +1,19 @@
-// The installed Solana adapter signs, broadcasts, then uses web3.js confirmTransaction,
-// which requires signatureSubscribe over WebSocket. Our POST-only /api/solana-rpc
-// cannot serve that subscription. Use the same existing endpoint as receive recovery;
-// the evidence readers deliberately continue to use the HTTP proxy independently.
+import { Connection } from '@solana/web3.js'
+
+// Adapter 1.7.3 probes WebSocket support by converting connection.rpcEndpoint,
+// independently of web3.js's wsEndpoint. Keep both endpoint identities on the
+// existing RPC provider, and route HTTP through the same-origin proxy via the
+// supported fetch transport. Neither probe nor confirmation may use the HTTP API.
 export const SOLANA_BRIDGE_SDK_RPC = 'https://solana-rpc.publicnode.com'
+
+export function createSolanaBridgeConnection(origin: string): Connection {
+  const proxy = new URL('/api/solana-rpc', origin).href
+  return new Connection(SOLANA_BRIDGE_SDK_RPC, {
+    commitment: 'confirmed',
+    wsEndpoint: SOLANA_BRIDGE_SDK_RPC.replace(/^https:/, 'wss:'),
+    fetch: (_input, init) => fetch(proxy, init),
+  })
+}
 
 export type SolanaSourceStage = 'preparing' | 'preparation-failed' | 'policy-blocked' | 'wallet-requested'
   | 'wallet-rejected' | 'wallet-unknown' | 'wallet-signed' | 'repeat-blocked'

@@ -41,6 +41,7 @@ jobs:
           npx tsc --noEmit
           node scripts/run-suites.mjs fast
   source-regressions:
+    needs: fast-checks
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -100,6 +101,7 @@ jobs:
           path: npm-audit-*.json
 
   browser-regressions:
+    needs: fast-checks
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release-check]')) || (github.event_name == 'workflow_dispatch' && inputs.full_release)
     runs-on: ubuntu-latest
     timeout-minutes: 40

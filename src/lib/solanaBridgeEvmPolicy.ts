@@ -49,6 +49,22 @@ export function createEvmBridgePolicyProvider<P extends {request(args:any):Promi
  const p={...context}; let burnForwarded=false,approvalForwarded=false,receiveForwarded=false
  return {...provider,request:async(input:any)=>{
   const args=structuredClone(input)
+  // The installed EVM adapter selects its chain again during execute(). This is
+  // not a transaction authorization: only the reviewed Arc network is allowed,
+  // with the same live owner before and after the switch. Keep it outside B1's
+  // burn signing path, and never permit network management during an estimate.
+  if(args.method==='wallet_switchEthereumChain'){
+   if(!p.current()||p.mode==='read')fail('network switch context')
+   if(Object.keys(args).some(k=>!['method','params'].includes(k))||!Array.isArray(args.params)||args.params.length!==1)fail('network switch parameters')
+   const target=args.params[0]
+   if(!target||typeof target!=='object'||Object.keys(target).length!==1||target.chainId!=='0x13b2')fail('network switch target')
+   const before=await provider.request({method:'eth_accounts'})
+   if(!Array.isArray(before)||!same(before[0],p.owner)||!p.current())fail('network switch identity')
+   const result=await provider.request(structuredClone(args))
+   const chain=await provider.request({method:'eth_chainId'}),accounts=await provider.request({method:'eth_accounts'})
+   if(chain!=='0x13b2'&&chain!==5042||!Array.isArray(accounts)||!same(accounts[0],p.owner)||!p.current())fail('network switch result')
+   return result
+  }
   if(reads.has(args.method))return provider.request(args)
   if(!p.current()||p.mode==='read')fail('read-only/context')
   let calls:any[],batch=false

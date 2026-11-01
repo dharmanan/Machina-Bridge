@@ -38,6 +38,19 @@ test('CI records the real audit, reports known risks, preserves JSON and runs fu
   assert.match(workflow, /refs\/heads\/main/)
   assert.match(workflow, /pull_request:\n\s+branches: \[main\]/)
   assert.doesNotMatch(workflow, /continue-on-error|npm audit[^\n]*\|\|\s*true/)
+  // A failing fast security gate must not spend several more minutes running
+  // heavyweight source/browser checks. A successful release still runs both.
+  for (const job of ['source-regressions', 'browser-regressions']) {
+    const block = workflow.split(`\n  ${job}:\n`)[1]?.split(/\n  [\w-]+:\n/)[0]
+    assert.ok(block, `missing release job: ${job}`)
+    assert.match(block, /^    needs: fast-checks$/m)
+    assert.doesNotMatch(block, /^    (?:if:.*always\(\)|continue-on-error:)/m)
+    assert.match(block, /github.event_name == 'pull_request'/)
+    assert.match(block, /contains\(github.event.head_commit.message, '\[release-check\]'\)/)
+  }
+  const audit = workflow.split('\n  security-audit:\n')[1]?.split(/\n  [\w-]+:\n/)[0]
+  assert.ok(audit)
+  assert.doesNotMatch(audit, /^    (?:needs|if):/m, 'raw audit evidence runs even when fast checks fail')
 })
 test('audit reporting retains known findings, rejects unknown roots, and fails on incomplete evidence', () => {
   const temp = mkdtempSync(join(tmpdir(), 'machina-audit-report-')), env = { ...process.env }; delete env.GITHUB_STEP_SUMMARY
