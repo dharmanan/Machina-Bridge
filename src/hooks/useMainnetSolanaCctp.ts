@@ -1168,6 +1168,17 @@ export function useMainnetSolanaCctp(
     let sourceStage: SolanaSourceStage = 'preparing'
     let sourceExecutionStarted = false
     let sourceFeeError: string | null = null
+    let preparationStep: 'solana-adapter' | 'arc-network' | 'evm-adapter' | 'bridge-kit' = 'solana-adapter'
+    const safePreWalletFailure = (cause?: unknown) => {
+      if (sourceFeeError) return sourceFeeError
+      if (sourceStage !== 'preparing') return solanaSourceFailure(sourceStage)
+      const errorName = cause && typeof cause === 'object' ? (cause as { name?: unknown }).name : undefined
+      const safeType = errorName === 'EvmBridgePolicyError' ? 'EVM_POLICY'
+        : errorName === 'SolanaTxPolicyError' ? 'SOLANA_POLICY'
+        : errorName === 'UserRejectedRequestError' ? 'WALLET_REJECTION'
+        : 'UNCLASSIFIED'
+      return `Solana transfer stopped before Phantom signing [${preparationStep.toUpperCase()}/${safeType}]. No automatic retry was made.`
+    }
     if (direction === 'arc-to-solana') {
       setPendingArcToSolanaTx(null)
       setPendingArcToSolanaError(null)
@@ -1229,6 +1240,7 @@ export function useMainnetSolanaCctp(
           rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
         } as BridgeKitChain
 
+        preparationStep = 'solana-adapter'
         const solanaAdapter = await createSolanaAdapterFromProvider({
           provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => { checkFee(); assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy) }),
           capabilities: {
@@ -1243,9 +1255,11 @@ export function useMainnetSolanaCctp(
           walletClient.transport.request(args as never)
 
         checkFee()
+        preparationStep = 'arc-network'
         await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
 
         const maxFee = approvedMaxFee
+        preparationStep = 'evm-adapter'
         const evmAdapter = await createEvmAdapterFromProvider({
           provider: createEvmBridgePolicyProvider(guard.evm(raw), {
             mode: direction === 'arc-to-solana' ? 'burn' : 'receive', owner: evmAddress, solanaOwner: phantomAddress, amount: amountRaw, maxFee, finality: 1000, current,
@@ -1272,6 +1286,7 @@ export function useMainnetSolanaCctp(
         }))
 
         checkFee()
+        preparationStep = 'bridge-kit'
         const result = direction === 'solana-to-arc'
           ? await kit.bridge({
               from: { adapter: solanaAdapter, chain: solanaBridgeChain },
@@ -1331,7 +1346,7 @@ export function useMainnetSolanaCctp(
             setState({ isLoading: false, error: null, status: 'The Solana burn is verified. Arc receive is not yet verified; use Activity to recover this existing burn. Do not send again.', result: pendingResult })
             return pendingResult
           }
-          setState({ isLoading: false, error: sourceFeeError ?? solanaSourceFailure(sourceStage), status: null, result: finalResult })
+          setState({ isLoading: false, error: safePreWalletFailure(finalResult?.error), status: null, result: finalResult })
           return finalResult
         }
 
@@ -1384,9 +1399,9 @@ export function useMainnetSolanaCctp(
         return normalizedResult
       })
     } catch (error) {
-      const message = sourceFeeError ?? (direction === 'solana-to-arc' && sourceExecutionStarted
-        ? solanaSourceFailure(sourceStage)
-        : error instanceof Error ? error.message : 'Solana mainnet transfer failed.')
+      const message = direction === 'solana-to-arc' && sourceExecutionStarted
+        ? safePreWalletFailure(error)
+        : error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
       setState({
         isLoading: false,
         error: message,
