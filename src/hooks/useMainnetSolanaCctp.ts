@@ -22,6 +22,7 @@ import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSo
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import { destinationEvidence, withSolanaSendGuard } from '../lib/solanaSendRuntime'
+import { assertSolanaBridgeTransaction, createStrictSolanaProvider, type SolanaTxExpectation } from '../lib/solanaBridgeTxPolicy'
 import { solanaTransferOutcomeStatus, verifyTransferDestinationWithRetry } from '../lib/solanaSendGuard'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
@@ -387,50 +388,13 @@ function normalizeSolanaFeeEstimate(
   }
 }
 
-function getSolanaAddress(provider: PhantomSolanaProvider) {
-  const key = provider.publicKey
-  if (!key) return null
-  return typeof key.toBase58 === 'function' ? key.toBase58() : key.toString()
-}
-
-function createStrictSolanaProvider(
-  provider: PhantomSolanaProvider,
-): Parameters<typeof createSolanaAdapterFromProvider>[0]['provider'] {
-  const signOne = async (transaction: unknown) => {
-    if (!provider.signTransaction) {
-      throw new Error('Connected Solana wallet cannot sign transactions.')
-    }
-    return provider.signTransaction(transaction)
-  }
-
-  return {
-    get isConnected() {
-      return Boolean(provider.isConnected)
-    },
-    get publicKey() {
-      const address = getSolanaAddress(provider)
-      return address ? { toString: () => address } : undefined
-    },
-    connect: async () => {
-      const result = await provider.connect()
-      const key = result.publicKey
-      const address = key
-        ? (typeof key.toBase58 === 'function' ? key.toBase58() : key.toString())
-        : getSolanaAddress(provider)
-
-      if (!address) throw new Error('Solana wallet did not return an address.')
-      return { publicKey: { toString: () => address } }
-    },
-    disconnect: async () => provider.disconnect(),
-    signTransaction: signOne,
-    signAllTransactions: async (transactions: unknown[]) =>
-      provider.signAllTransactions
-        ? provider.signAllTransactions(transactions)
-        : Promise.all(transactions.map(signOne)),
-    signMessage: provider.signMessage
-      ? async (message: Uint8Array) => provider.signMessage!(message) as Promise<{ signature: Uint8Array }>
-      : undefined,
-  }
+// Bridge Kit's Solana signer checks every transaction against Machina's own transfer context before
+// Phantom sees it (src/lib/solanaBridgeTxPolicy.ts); the expectation never comes from the SDK or RPC.
+function solanaTxExpectation(direction: MainnetSolanaCanaryDirection, amount: string, evmAddress: string, phantomAddress: string): SolanaTxExpectation {
+  const amountRaw = parseUnits(amount, 6)
+  return direction === 'solana-to-arc'
+    ? { kind: 'burn', owner: phantomAddress, amountRaw, evmRecipient: evmAddress }
+    : { kind: 'receive', owner: phantomAddress, amountRaw }
 }
 
 function createStrictEvmProvider(
@@ -891,7 +855,8 @@ export function useMainnetSolanaCctp(
         rpcEndpoints: ['https://solana-rpc.publicnode.com'],
       } as BridgeKitChain
       const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
+        // Recovery receive: bound to the Circle-attested message verified against the Arc burn above.
+        provider: createStrictSolanaProvider(phantomProvider, { kind: 'receive', owner: phantomAddress, amountRaw: proof.fields.amount, exactMessage: attestation.message }),
         capabilities: {
           addressContext: 'user-controlled',
           supportedChains: [solanaBridgeChain],
@@ -1018,7 +983,7 @@ export function useMainnetSolanaCctp(
       } as BridgeKitChain
 
       const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider),
+        provider: createStrictSolanaProvider(phantomProvider, solanaTxExpectation(direction, amount, evmAddress, phantomAddress)),
         capabilities: {
           addressContext: 'user-controlled',
           supportedChains: [solanaBridgeChain],
@@ -1145,6 +1110,7 @@ export function useMainnetSolanaCctp(
       // One transfer per wallet across tabs, recorded before any wallet request; an earlier burn
       // with an unknown outcome blocks a new one until chain evidence settles it.
       return await withSolanaSendGuard({ direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress }, async guard => {
+        const solanaPolicy = solanaTxExpectation(direction, amount, evmAddress, phantomAddress)
         const kit = new BridgeKit()
         const { solana, arc } = resolveChains(kit)
         const solanaBridgeChain = {
@@ -1153,7 +1119,7 @@ export function useMainnetSolanaCctp(
         } as BridgeKitChain
 
         const solanaAdapter = await createSolanaAdapterFromProvider({
-          provider: guard.solana(createStrictSolanaProvider(phantomProvider)),
+          provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => assertSolanaBridgeTransaction(tx, solanaPolicy)),
           capabilities: {
             addressContext: 'user-controlled',
             supportedChains: [solanaBridgeChain],
