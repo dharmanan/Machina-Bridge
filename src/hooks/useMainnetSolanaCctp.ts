@@ -1,3 +1,4 @@
+import { SOLANA_BRIDGE_SDK_RPC, solanaSourceFailure, type SolanaSourceStage } from '../lib/solanaBridgeConnection'
 import { createEvmBridgePolicyProvider } from '../lib/solanaBridgeEvmPolicy'
 import { readSolanaSendAttempts } from '../lib/solanaSendGuard'
 import { inspectSolanaToArcRecovery } from '../lib/solanaArcRecovery'
@@ -25,7 +26,7 @@ import { readSolanaCctpMessageUsed, SolanaNoncePendingError } from '../lib/mainn
 import { recordMainnetSolanaActivity, readMainnetSolanaActivity, updateMainnetSolanaActivity } from '../lib/mainnetSolanaActivity'
 import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
-import { destinationEvidence, solanaRpc, withSolanaSendGuard } from '../lib/solanaSendRuntime'
+import { destinationEvidence, settleSolanaSendAttempt, solanaRpc, withSolanaSendGuard } from '../lib/solanaSendRuntime'
 import {
   LegacyReceiveReviewRequired, ReceiveLockedError, classifyFailedAttempt, createReceiveEvidenceSigner, openReceiveAttempt,
   releaseLegacyReceiveAfterReview, reviewLegacyReceive, updateReceiveEntry, type LegacyReview, type ReceiveReads,
@@ -904,7 +905,7 @@ export function useMainnetSolanaCctp(
       const { solana, arc } = resolveChains(kit)
       const solanaBridgeChain = {
         ...(solana as any),
-        rpcEndpoints: ['https://solana-rpc.publicnode.com'],
+        rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
       } as BridgeKitChain
       const solanaAdapter = await createSolanaAdapterFromProvider({
         // G2 validates before the evidence signer records any wallet request.
@@ -1037,7 +1038,7 @@ export function useMainnetSolanaCctp(
       const { solana, arc } = resolveChains(kit)
       const solanaBridgeChain = {
         ...(solana as any),
-        rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
+        rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
       } as BridgeKitChain
 
       const solanaAdapter = await createSolanaAdapterFromProvider({
@@ -1136,6 +1137,8 @@ export function useMainnetSolanaCctp(
     direction: MainnetSolanaCanaryDirection,
     amount: string,
   ) => {
+    let sourceStage: SolanaSourceStage = 'preparing'
+    let sourceExecutionStarted = false
     if (direction === 'arc-to-solana') {
       setPendingArcToSolanaTx(null)
       setPendingArcToSolanaError(null)
@@ -1169,13 +1172,16 @@ export function useMainnetSolanaCctp(
 
       // One transfer per wallet across tabs, recorded before any wallet request; an earlier burn
       // with an unknown outcome blocks a new one until chain evidence settles it.
-      return await withSolanaSendGuard({ direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress }, async guard => {
+      return await withSolanaSendGuard({ direction, amount, evmWallet: evmAddress, solanaWallet: phantomAddress,
+        onSourceStage: stage => { sourceStage = stage },
+      }, async guard => {
+        sourceExecutionStarted = true
         const solanaPolicy = solanaTxExpectation(direction, amount, evmAddress, phantomAddress)
         const kit = new BridgeKit()
         const { solana, arc } = resolveChains(kit)
         const solanaBridgeChain = {
           ...(solana as any),
-          rpcEndpoints: [`${window.location.origin}/api/solana-rpc`],
+          rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
         } as BridgeKitChain
 
         const solanaAdapter = await createSolanaAdapterFromProvider({
@@ -1233,7 +1239,7 @@ export function useMainnetSolanaCctp(
               config: { maxFee: formatUnits(maxFee, 6) },
             } as any)
 
-        let finalResult = result as any
+        const finalResult = result as any
 
         if (finalResult?.state === 'error') {
           if (direction === 'arc-to-solana') {
@@ -1268,17 +1274,18 @@ export function useMainnetSolanaCctp(
             return await recoverPendingArcToSolana(sourceTxHash)
           }
 
-          setState({
-            isLoading: true,
-            error: null,
-            status: 'Bridge source step completed. Resuming the failed destination step...',
-            result: finalResult,
-          })
-
-          finalResult = await kit.retry(finalResult, {
-            from: solanaAdapter,
-            to: evmAdapter,
-          } as any)
+          // Never retry a Solana source error: provider-cctp-v2 can restart the burn.
+          // B1 retains the signature/unknown request; Activity's independent source proof
+          // is required before a destination-only recovery can ask for a wallet action.
+          const attempt = readSolanaSendAttempts().find(a => a.id === attemptId)
+          const settled = attempt ? await settleSolanaSendAttempt(attempt) : null
+          if (settled?.verdict.kind === 'burned') {
+            const pendingResult = { ...finalResult, direction, sourceTxHash: settled.verdict.txHash, destinationVerified: false }
+            setState({ isLoading: false, error: null, status: 'The Solana burn is verified. Arc receive is not yet verified; use Activity to recover this existing burn. Do not send again.', result: pendingResult })
+            return pendingResult
+          }
+          setState({ isLoading: false, error: solanaSourceFailure(sourceStage), status: null, result: finalResult })
+          return finalResult
         }
 
         if (finalResult?.state === 'error') {
@@ -1330,14 +1337,16 @@ export function useMainnetSolanaCctp(
         return normalizedResult
       })
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
+      const message = direction === 'solana-to-arc' && sourceExecutionStarted
+        ? solanaSourceFailure(sourceStage)
+        : error instanceof Error ? error.message : 'Solana mainnet transfer failed.'
       setState({
         isLoading: false,
         error: message,
         status: null,
         result: null,
       })
-      throw error
+      throw new Error(message)
     }
   }, [
     evmAddress,
