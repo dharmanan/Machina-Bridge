@@ -73,6 +73,8 @@
    "verify-solana-send-guard",
    "verify-solana-receive-verification",
    "verify-solana-arc-recovery",
+   "verify-arc-solana-receive-evidence",
+   "verify-solana-evm-policy",
    "verify-solana-bridge-tx-policy"
   ],
   "full": [
@@ -190,6 +192,8 @@
   "verify-solana-send-guard": "solana-bridge",
   "verify-solana-receive-verification": "solana-bridge",
   "verify-solana-arc-recovery": "solana-bridge",
+  "verify-arc-solana-receive-evidence": "solana-bridge",
+  "verify-solana-evm-policy": "solana-bridge",
   "verify-solana-bridge-tx-policy": "solana-bridge"
  },
  "manual": {

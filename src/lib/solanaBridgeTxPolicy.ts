@@ -223,6 +223,15 @@ export function assertSolanaBridgeTransaction(tx: unknown, expected: SolanaTxExp
   else deny('expectation', 'Unknown transaction kind.')
 }
 
+// Shared by the B1 pre-journal validator and the strict provider: even a
+// changed account or missing signing capability must fail before B1 signing.
+export function assertSolanaBridgeSigningRequest(provider: PhantomSolanaProvider, transaction: unknown, expected: SolanaTxExpectation) {
+  const key = provider.publicKey
+  const address = key ? (typeof key.toBase58 === 'function' ? key.toBase58() : key.toString()) : null
+  if (!provider.signTransaction || address !== expected.owner) throw new SolanaTxPolicyError('wallet', 'The connected Phantom wallet changed or cannot sign transactions.')
+  assertSolanaBridgeTransaction(transaction, expected)
+}
+
 // The Phantom provider handed to Bridge Kit: every transaction is checked before Phantom sees it.
 // Only `signTransaction` is exposed; the CCTP path does not use signMessage or signAllTransactions.
 export function createStrictSolanaProvider(provider: PhantomSolanaProvider, expected: SolanaTxExpectation) {
@@ -239,10 +248,8 @@ export function createStrictSolanaProvider(provider: PhantomSolanaProvider, expe
     },
     disconnect: async () => provider.disconnect(),
     signTransaction: async (transaction: unknown) => {
-      if (!provider.signTransaction) throw new Error('Connected Solana wallet cannot sign transactions.')
-      if (address() !== expected.owner) throw new SolanaTxPolicyError('wallet', 'The connected Phantom wallet changed.')
-      assertSolanaBridgeTransaction(transaction, expected)
-      return provider.signTransaction(transaction)
+      assertSolanaBridgeSigningRequest(provider, transaction, expected)
+      return provider.signTransaction!(transaction)
     },
   }
 }

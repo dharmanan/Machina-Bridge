@@ -209,4 +209,51 @@ await test('B1: a policy refusal before the wallet releases the attempt (no unkn
   const latest = G.readSolanaSendAttempts()[0]
   assert.ok(latest.solanaSignature && latest.solanaBlockhash, 'signature and blockhash journaled'); assert.equal(latest.phase, 'burned')
 })
+const E = require('../src/lib/arcSolanaReceiveEvidence.ts')
+const sourceHash = '0x' + '54'.repeat(32)
+function recoverySigner(wallet) {
+  const entry = E.createReceiveEntry(sourceHash, RECV.owner)
+  return { entry, provider: P.createStrictSolanaProvider(E.createReceiveEvidenceSigner(wallet, entry.id), { ...RECV, exactMessage: receiveMessage(realReceive()) }) }
+}
+await test('combined recovery: G2 refusal before evidence signer leaves no wallet request/signature and classifies pre-wallet, not unknown', async () => {
+  const wallet = phantom(RECV.owner), { entry, provider } = recoverySigner(wallet)
+  const bad = editReceive(ixs => { ixs[recvIx(ixs)] = new TransactionInstruction({ programId: ATTACKER, keys: ixs[recvIx(ixs)].keys, data: ixs[recvIx(ixs)].data }); return ixs })
+  let rejected
+  try { await provider.signTransaction(bad) } catch(e) { rejected=e }
+  assert.ok(rejected instanceof P.SolanaTxPolicyError)
+  const wrapped = Object.assign(new Error('SDK wrapped refusal'), {name:'KitError',cause:rejected})
+  const record = E.classifyFailedAttempt(entry.id, wrapped)
+  assert.equal(record.phase, 'failed'); assert.equal(record.failure, 'pre-wallet')
+  assert.equal(record.walletRequestedAt, undefined); assert.equal(record.signature, undefined); assert.deepEqual(wallet.calls, [])
+})
+await test('combined recovery: valid real receive keeps request timestamp/blockhash and signed signature durable before SDK gets it', async () => {
+  const wallet=phantom(RECV.owner),{entry,provider}=recoverySigner(wallet)
+  const result=await provider.signTransaction(realReceive())
+  const record=E.readReceiveEntries().find(x=>x.id===entry.id)
+  assert.equal(record.phase,'signed');assert.ok(record.walletRequestedAt&&record.receiveRequestedAt&&record.requestedBlockhash&&record.signature)
+  assert.equal(record.signed[0].signature, G.solanaSignatureOf(result).signature);assert.equal(record.signed[0].blockhash,record.requestedBlockhash)
+  assert.deepEqual(wallet.calls,['signTransaction'])
+})
+await test('combined recovery: explicit Phantom rejection stays user-rejected; unexpected wallet failure stays unknown', async () => {
+  for(const reject of [true,false]) {
+    store.clear();const wallet=phantom(RECV.owner);wallet.signTransaction=async()=>{wallet.calls.push('signTransaction');throw Object.assign(new Error(reject?'User rejected':'RPC unavailable'), reject?{code:4001}:{})}
+    const {entry,provider}=recoverySigner(wallet);let error;try{await provider.signTransaction(realReceive())}catch(e){error=e}
+    const record=E.classifyFailedAttempt(entry.id,Object.assign(new Error('SDK error'),{cause:error}))
+    assert.equal(record.phase,reject?'failed':'unknown');if(reject)assert.equal(record.failure,'user-rejected')
+    assert.equal(wallet.calls.length,1)
+  }
+})
+await test('merged hook keeps G2 outside recovery evidence signer and G1 outside B1; current recovery classifier retained',()=>{
+ const src=readFileSync(new URL('../src/hooks/useMainnetSolanaCctp.ts',import.meta.url),'utf8')
+ assert.match(src,/createStrictSolanaProvider\(createReceiveEvidenceSigner\(phantomProvider, receiveEntryId\)/)
+ assert.match(src,/exactMessage: attestation.message/)
+ assert.match(src,/classifyFailedAttempt\(receiveEntryId, e\)/)
+ assert.match(src,/createEvmBridgePolicyProvider\(guard.evm\(raw\)/)
+ assert.match(src,/guard.solana\(createStrictSolanaProvider\(phantomProvider, solanaPolicy\), tx => assertSolanaBridgeSigningRequest\(phantomProvider, tx, solanaPolicy\)\)/)
+})
+await test('combined B1: changed Phantom account is refused before signing journal, not unknown',async()=>{
+ const wallet=phantom(FX.burn.owner);wallet.publicKey=ATTACKER
+ await assert.rejects(withSolanaSendGuard(sendInput,async guard=>guard.solana(P.createStrictSolanaProvider(wallet,BURN),tx=>P.assertSolanaBridgeSigningRequest(wallet,tx,BURN)).signTransaction(realBurn()),evidence()),e=>e instanceof P.SolanaTxPolicyError&&e.code==='wallet')
+ assert.deepEqual(wallet.calls,[]);const record=G.readSolanaSendAttempts()[0];assert.equal(record.phase,'released');assert.equal(record.signingAt,undefined)
+})
 console.log(`RESULT ${count}/${count} Solana Bridge transaction-policy groups PASS; real mainnet transactions and IDLs as fixtures, falsified IDL via Anchor Program.at; no network, wallet or signature.`)
