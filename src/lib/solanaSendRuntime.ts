@@ -142,7 +142,7 @@ type SolanaSign = { signTransaction?: (tx: unknown) => Promise<unknown>; signAll
 // The wrapped providers record the burn request and its outcome as it happens.
 export async function withSolanaSendGuard<T>(
   input: { direction: SolanaSendDirection; amount: string; evmWallet: string; solanaWallet: string },
-  run: (guard: { evm<P extends object>(p: P): P; solana<P extends object>(p: P): P }) => Promise<T>,
+  run: (guard: { evm<P extends object>(p: P): P; solana<P extends object>(p: P, validate?: (tx: unknown) => void): P }) => Promise<T>,
   evidence: SolanaSendEvidence = solanaSendEvidence,
 ): Promise<T> {
   const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
@@ -188,10 +188,13 @@ export async function withSolanaSendGuard<T>(
             return result
           } } as P
         },
-        solana<P extends object>(target: P): P {
+        solana<P extends object>(target: P, validate?: (tx: unknown) => void): P {
           if (input.direction !== 'solana-to-arc') return target
           const provider = target as P & SolanaSign
           const signed = async <R>(unsigned: unknown, sign: () => Promise<R>, first: (r: R) => unknown): Promise<R> => {
+            // A transaction refused by the pre-sign policy never reaches the wallet: it is checked before
+            // the attempt is marked as signing, so the attempt stays "prepared" and is released, not locked.
+            validate?.(unsigned)
             // The blockhash of the transaction handed to the wallet is saved first: once it has expired,
             // that transaction can never land, even if the wallet answer was lost.
             const requested = solanaSignatureOf(unsigned).blockhash
@@ -205,7 +208,7 @@ export async function withSolanaSendGuard<T>(
           }
           return { ...provider,
             signTransaction: (tx: unknown) => signed(tx, () => provider.signTransaction!(tx), r => r),
-            ...(provider.signAllTransactions ? { signAllTransactions: (txs: unknown[]) => signed(txs[0], () => provider.signAllTransactions!(txs), r => r[0]) } : {}),
+            ...(provider.signAllTransactions ? { signAllTransactions: (txs: unknown[]) => { txs.forEach(tx => validate?.(tx)); return signed(txs[0], () => provider.signAllTransactions!(txs), r => r[0]) } } : {}),
           } as P
         },
       }

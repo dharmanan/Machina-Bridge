@@ -74,7 +74,8 @@
    "verify-solana-receive-verification",
    "verify-solana-arc-recovery",
    "verify-arc-solana-receive-evidence",
-   "verify-solana-evm-policy"
+   "verify-solana-evm-policy",
+   "verify-solana-bridge-tx-policy"
   ],
   "full": [
    "verify-release-dependency-security",
@@ -192,7 +193,8 @@
   "verify-solana-receive-verification": "solana-bridge",
   "verify-solana-arc-recovery": "solana-bridge",
   "verify-arc-solana-receive-evidence": "solana-bridge",
-  "verify-solana-evm-policy": "solana-bridge"
+  "verify-solana-evm-policy": "solana-bridge",
+  "verify-solana-bridge-tx-policy": "solana-bridge"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",
