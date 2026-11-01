@@ -1,3 +1,5 @@
+import { isSolanaArcBurn } from './solanaSourceBurn'
+import { type SolanaSourceStage } from './solanaBridgeConnection'
 import { useCallback, useEffect, useState } from 'react'
 import { createPublicClient, http, parseAbiItem, type Hex } from 'viem'
 import { MAINNET_CONFIG } from '../config/mainnet'
@@ -108,9 +110,10 @@ export const solanaSendEvidence: SolanaSendEvidence = {
     const burns: string[] = []
     for (const s of signatures ?? []) {
       if (s.err != null || !s.blockTime || s.blockTime * 1000 < sinceMs) continue
-      const tx = await solanaRpc<{ transaction?: { message?: { accountKeys?: unknown[] } }; meta?: { loadedAddresses?: { writable?: string[]; readonly?: string[] } } } | null>('getTransaction', [s.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }])
-      const keys = [...(tx?.transaction?.message?.accountKeys ?? []).map(k => typeof k === 'string' ? k : (k as { pubkey?: string })?.pubkey), ...(tx?.meta?.loadedAddresses?.writable ?? []), ...(tx?.meta?.loadedAddresses?.readonly ?? [])]
-      if (keys.includes(SOLANA_MAINNET_CCTP.tokenMessengerMinterProgram)) burns.push(s.signature)
+      const tx = await solanaRpc<unknown>('getTransaction', [s.signature, { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }])
+      // A missing response is not evidence of absence. Keep B1 locked on read/indexing failures.
+      if (!tx) throw new Error('Solana source transaction evidence is unavailable.')
+      if (isSolanaArcBurn(tx, solanaWallet, s.signature)) burns.push(s.signature)
     }
     return burns
   },
@@ -141,7 +144,7 @@ type SolanaSign = { signTransaction?: (tx: unknown) => Promise<unknown>; signAll
 // Runs one transfer with the wallet locks held and the attempt persisted before any wallet request.
 // The wrapped providers record the burn request and its outcome as it happens.
 export async function withSolanaSendGuard<T>(
-  input: { direction: SolanaSendDirection; amount: string; evmWallet: string; solanaWallet: string },
+  input: { direction: SolanaSendDirection; amount: string; evmWallet: string; solanaWallet: string; onSourceStage?: (stage: SolanaSourceStage) => void },
   run: (guard: { evm<P extends object>(p: P): P; solana<P extends object>(p: P, validate?: (tx: unknown) => void): P }) => Promise<T>,
   evidence: SolanaSendEvidence = solanaSendEvidence,
 ): Promise<T> {
@@ -159,7 +162,11 @@ export async function withSolanaSendGuard<T>(
         if (verdict.kind === 'burned') throw new Error(`An earlier transfer (${shortRef(open)}) has its burn on chain; receiving it is not verified yet. It is in your activity: check it there before starting another transfer.`)
       }
       const arcBlockBefore = input.direction === 'arc-to-solana' ? String(await evidence.arcLatestBlock()) : undefined
-      const attempt = createSolanaSendAttempt({ ...input, arcBlockBefore })
+      const { onSourceStage, ...intent } = input
+      const attempt = createSolanaSendAttempt({ ...intent, arcBlockBefore })
+      // Shared across every provider wrapper in this execution, including SDK-internal retries.
+      let solanaBurnRequested = false
+      const sourceStage = (stage: SolanaSourceStage) => { try { onSourceStage?.(stage) } catch { /* diagnostics cannot change sending or settlement */ } }
       const isBurnTarget = (to: unknown) => typeof to === 'string' && [MAINNET_CONFIG.arcCctpTokenMessengerAddress, CIRCLE_KIT_BRIDGE_CONTRACT].some(a => a.toLowerCase() === to.toLowerCase())
       const failed = (error: unknown) => {
         try {
@@ -194,21 +201,34 @@ export async function withSolanaSendGuard<T>(
           const signed = async <R>(unsigned: unknown, sign: () => Promise<R>, first: (r: R) => unknown): Promise<R> => {
             // A transaction refused by the pre-sign policy never reaches the wallet: it is checked before
             // the attempt is marked as signing, so the attempt stays "prepared" and is released, not locked.
-            validate?.(unsigned)
+            if (solanaBurnRequested) {
+              sourceStage('repeat-blocked')
+              throw new Error('A Solana burn was already requested in this transfer. No second wallet signature is allowed; check Activity for its outcome.')
+            }
+            try { validate?.(unsigned) } catch (error) {
+              sourceStage(error instanceof Error && error.name === 'SolanaTxPolicyError' ? 'policy-blocked' : 'preparation-failed')
+              throw error
+            }
             // The blockhash of the transaction handed to the wallet is saved first: once it has expired,
             // that transaction can never land, even if the wallet answer was lost.
             const requested = solanaSignatureOf(unsigned).blockhash
             updateSolanaSendAttempt(attempt.id, { phase: 'signing', signingAt: Date.now(), ...(requested ? { solanaBlockhash: requested } : {}) })
+            solanaBurnRequested = true
+            sourceStage('wallet-requested')
             let result: R
-            try { result = await sign() } catch (error) { failed(error); throw error }
+            try { result = await sign() } catch (error) {
+              sourceStage(isUserRejection(error) ? 'wallet-rejected' : 'wallet-unknown')
+              failed(error); throw error
+            }
             const { signature, blockhash } = solanaSignatureOf(first(result))
             // Saved before the signed burn is handed back for sending; if this throws, nothing is sent.
             if (signature) updateSolanaSendAttempt(attempt.id, { phase: 'signed', solanaSignature: signature, ...(blockhash ? { solanaBlockhash: blockhash } : {}) })
+            sourceStage('wallet-signed')
             return result
           }
           return { ...provider,
             signTransaction: (tx: unknown) => signed(tx, () => provider.signTransaction!(tx), r => r),
-            ...(provider.signAllTransactions ? { signAllTransactions: (txs: unknown[]) => { txs.forEach(tx => validate?.(tx)); return signed(txs[0], () => provider.signAllTransactions!(txs), r => r[0]) } } : {}),
+            ...(provider.signAllTransactions ? { signAllTransactions: (txs: unknown[]) => { if (txs.length !== 1) throw new Error('Exactly one Solana burn transaction may be requested.'); return signed(txs[0], () => provider.signAllTransactions!(txs), r => r[0]) } } : {}),
           } as P
         },
       }
