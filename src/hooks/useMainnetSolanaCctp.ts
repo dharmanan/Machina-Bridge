@@ -1,3 +1,7 @@
+import { createEvmBridgePolicyProvider } from '../lib/solanaBridgeEvmPolicy'
+import { readSolanaSendAttempts } from '../lib/solanaSendGuard'
+import { inspectSolanaToArcRecovery } from '../lib/solanaArcRecovery'
+import { solanaArcRecoveryPorts } from './useSolanaArcRecovery'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useAccount, useWalletClient } from 'wagmi'
 import { BridgeKit, type EstimateResult } from '@circle-fin/bridge-kit'
@@ -1080,7 +1084,7 @@ export function useMainnetSolanaCctp(
         },
       })
       const evmAdapter = await createEvmAdapterFromProvider({
-        provider: createStrictEvmProvider(walletClient as WalletClientLike),
+        provider: createEvmBridgePolicyProvider(createStrictEvmProvider(walletClient as WalletClientLike), { mode: 'read', owner: evmAddress, solanaOwner: phantomAddress, amount: amountRaw, maxFee: 0n, finality: 1000, current: () => true }),
       })
 
       const estimate = direction === 'solana-to-arc'
@@ -1162,6 +1166,8 @@ export function useMainnetSolanaCctp(
     walletClient,
   ])
 
+  const g1Live = useRef({ evmAddress, phantomAddress, walletClient }); g1Live.current = { evmAddress, phantomAddress, walletClient }
+
   const runCanary = useCallback(async (
     direction: MainnetSolanaCanaryDirection,
     amount: string,
@@ -1214,14 +1220,27 @@ export function useMainnetSolanaCctp(
             supportedChains: [solanaBridgeChain],
           },
         })
-        const evmAdapter = await createEvmAdapterFromProvider({
-          provider: guard.evm(createStrictEvmProvider(walletClient as WalletClientLike)),
-        })
-
+        const attemptId = readSolanaSendAttempts().find(a => a.direction === direction && a.evmWallet.toLowerCase() === evmAddress.toLowerCase() && a.solanaWallet === phantomAddress && a.phase === 'prepared')?.id
+        const current = () => g1Live.current.evmAddress === evmAddress && g1Live.current.phantomAddress === phantomAddress && g1Live.current.walletClient === walletClient
+        const raw = createStrictEvmProvider(walletClient as WalletClientLike)
         const request = async (args: { method: string; params?: unknown[] }) =>
           walletClient.transport.request(args as never)
 
         await addChainToWallet(ARC_MAINNET_EVM_CHAIN, request)
+
+        const maxFee = feeEstimate?.amount === amount ? parseUnits(feeEstimate.bridgeFee, 6) : 0n
+        const evmAdapter = await createEvmAdapterFromProvider({
+          provider: createEvmBridgePolicyProvider(guard.evm(raw), {
+            mode: direction === 'arc-to-solana' ? 'burn' : 'receive', owner: evmAddress, solanaOwner: phantomAddress, amount: amountRaw, maxFee, finality: 1000, current,
+            receive: async () => {
+              const candidates = readSolanaSendAttempts().filter(a => a.id === attemptId && a.direction === 'solana-to-arc' && a.evmWallet.toLowerCase() === evmAddress.toLowerCase() && a.solanaWallet === phantomAddress && a.amount === amount && a.solanaSignature)
+              if (candidates.length !== 1) throw new Error('No unique current Solana burn proof for the Arc receive.')
+              const proof = await inspectSolanaToArcRecovery({ signature: candidates[0].solanaSignature!, solanaOwner: phantomAddress, evmOwner: evmAddress }, solanaArcRecoveryPorts())
+              if (proof.stage !== 'ready_to_mint' || !proof.message || !proof.attestation || parseUnits(proof.amount, 6) !== amountRaw || parseUnits(proof.feeUsdc ?? '0', 6) > maxFee) throw new Error('Arc receive proof unavailable.')
+              return { message: proof.message, attestation: proof.attestation }
+            },
+          }),
+        })
 
         const [arcBalanceBefore, solanaBalanceBefore] = await Promise.all([
           refreshArcBalance().catch(() => null),
@@ -1240,11 +1259,13 @@ export function useMainnetSolanaCctp(
               from: { adapter: solanaAdapter, chain: solanaBridgeChain },
               to: { adapter: evmAdapter, chain: arc, recipientAddress: evmAddress },
               amount,
+              config: { maxFee: formatUnits(maxFee, 6) },
             } as any)
           : await kit.bridge({
               from: { adapter: evmAdapter, chain: arc },
               to: { adapter: solanaAdapter, chain: solanaBridgeChain, recipientAddress: phantomAddress },
               amount,
+              config: { maxFee: formatUnits(maxFee, 6) },
             } as any)
 
         let finalResult = result as any
@@ -1358,6 +1379,7 @@ export function useMainnetSolanaCctp(
     phantomAddress,
     phantomProvider,
     findPendingArcToSolanaBurn,
+    feeEstimate,
     recoverPendingArcToSolana,
     refreshArcBalance,
     refreshSolanaBalance,
