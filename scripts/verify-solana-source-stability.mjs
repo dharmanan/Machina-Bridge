@@ -151,6 +151,10 @@ await test('real adapter Connection routes HTTP reads through proxy and stops se
   globalThis.fetch = async (url, init) => {
     assert.equal(url, 'https://machina.test/api/solana-rpc')
     const request = JSON.parse(init.body); calls.push(request.method)
+    if (request.method === 'isBlockhashValid') {
+      assert.equal(request.params[0], tx().message.recentBlockhash)
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { context: { slot: 1 }, value: true } }), { status: 200 })
+    }
     if (request.method === 'sendTransaction') {
       assert.equal(request.params[1].maxRetries, 0)
       assert.equal(request.params[1].skipPreflight, true)
@@ -170,7 +174,24 @@ await test('real adapter Connection routes HTTP reads through proxy and stops se
     const historical = tx(), original = Buffer.from(historical.serialize())
     await assert.rejects(adapter.sendWithProviderSigner(connection, { publicKey: new PublicKey(owner), isProviderSigner: true, signTransaction: async t => t }, historical, [], historical.message.recentBlockhash, 999), /LOCAL_BROADCAST_STOP/)
     assert.deepEqual(Buffer.from(historical.serialize()), original)
-    assert.deepEqual(calls, ['getLatestBlockhash', 'sendTransaction'])
+    assert.deepEqual(calls, ['getLatestBlockhash', 'isBlockhashValid', 'sendTransaction'])
+  } finally { globalThis.fetch = previous }
+})
+await test('expired signed blockhash or failed expiry read never reaches broadcast and never refreshes signed bytes', async () => {
+  const previous = globalThis.fetch
+  try {
+    for (const unreadable of [false, true]) {
+      const methods = [], bytes = Buffer.from(real.burn.base64, 'base64'), copy = Buffer.from(bytes)
+      globalThis.fetch = async (_url, init) => {
+        const q = JSON.parse(init.body); methods.push(q.method)
+        assert.equal(q.method, 'isBlockhashValid')
+        if (unreadable) throw new Error('controlled read failure')
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: q.id, result: { context: { slot: 1 }, value: false } }))
+      }
+      const connection = C.createSolanaBridgeConnection(window.location.origin)
+      await assert.rejects(connection.sendRawTransaction(bytes, { maxRetries: 0 }), unreadable ? /controlled read failure/ : /expired before broadcast/)
+      assert.deepEqual(methods, ['isBlockhashValid']); assert.deepEqual(bytes, copy)
+    }
   } finally { globalThis.fetch = previous }
 })
 await test('real installed SDK execute: simulation → wallet → broadcast → confirmation; no real send; failures do not repeat wallet request', async () => {

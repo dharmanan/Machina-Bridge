@@ -253,3 +253,13 @@ export function createStrictSolanaProvider(provider: PhantomSolanaProvider, expe
     },
   }
 }
+
+// SDK estimate/prepare can execute an ATA-only fallback when a combined mint
+// would be too large. A read-only quote must never delegate that to a wallet.
+export function createReadOnlySolanaProvider(provider: PhantomSolanaProvider, expected: SolanaTxExpectation) {
+  return { ...createStrictSolanaProvider(provider, expected), connect: async (): Promise<never> => {
+    throw new Error('Connect the wallet before estimating. A fee estimate cannot request wallet access.')
+  }, signTransaction: async (_transaction: unknown): Promise<never> => {
+    throw new Error('This fee estimate requires a separate USDC account setup. No wallet request is allowed while estimating.')
+  } }
+}

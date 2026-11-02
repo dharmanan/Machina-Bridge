@@ -38,7 +38,7 @@ const React={useCallback:f=>f,useMemo:f=>f(),useRef:initial=>{const i=ri++;retur
 Module._load=function(name,...args){
  if(name==='react')return React
  if(name==='wagmi')return {useAccount:()=>({address:evm}),useWalletClient:()=>({data:wallet})}
- if(name==='@circle-fin/bridge-kit')return {BridgeKit:class{getSupportedChains(){return chains}async estimate(){return estimateTask()}async bridge(args){bridgeConfig=args.config;return bridgeTask?bridgeTask(args):{state:'success'}}}}
+ if(name==='@circle-fin/bridge-kit')return {BridgeKit:class{getSupportedChains(){return chains}async estimate(args){return estimateTask(args)}async bridge(args){bridgeConfig=args.config;return bridgeTask?bridgeTask(args):{state:'success'}}}}
  if(name==='@circle-fin/adapter-solana')return {createSolanaAdapterFromProvider:async opts=>{adapters++;if(opts.connection){assert.equal(opts.connection.rpcEndpoint,'https://solana-rpc.publicnode.com');assert.equal(opts.connection._rpcWsEndpoint,'wss://solana-rpc.publicnode.com')}return opts}}
  if(name==='@circle-fin/adapter-viem-v2')return {createAdapterFromProvider:async opts=>{adapters++;return opts}}
  if(name==='viem')return {...realViem,createPublicClient:()=>({readContract:async()=>1000000n})}
@@ -88,4 +88,16 @@ await test('fee expiry detected before the burn request remains an actionable fe
  try{await h.runCanary('solana-to-arc','0.1');assert.match(latestState.error,/fee estimate expired.*Recalculate/i);assert.equal(G.readSolanaSendAttempts()[0].signingAt,undefined);assert.equal(G.readSolanaSendAttempts()[0].phase,'released')}finally{Date.now=now}
 })
 await test('Arc → Solana retains its existing path without imposing the source-Solana quote requirement',async()=>{reset();await render().runCanary('arc-to-solana','0.1');assert.equal(bridgeConfig.maxFee,'0')})
+await test('Arc receipt succeeded but burn proof is unreadable: retain hash, do not claim a verified burn or start recovery',async()=>{
+ reset();const hash='0x'+'12'.repeat(32)
+ R.solanaSendEvidence.arcReceipt=async()=> 'success'
+ bridgeTask=async()=>{G.updateSolanaSendAttempt(G.readSolanaSendAttempts()[0].id,{phase:'sent',burnTxHash:hash});return{state:'error',steps:[{name:'burn',state:'success',txHash:hash},{name:'mint',state:'error'}]}}
+ try{const result=await render().runCanary('arc-to-solana','0.1');assert.equal(result.sourceTxHash,hash);assert.equal(result.destinationVerified,false);assert.equal(result.sourceBurnVerified,false);assert.match(latestState.status,/source outcome is not yet verified/);assert.equal(G.readSolanaSendAttempts()[0].phase,'burned')}
+ finally{R.solanaSendEvidence.arcReceipt=async()=>null}
+})
+await test('SDK estimate attempts an ATA setup: the actual read-only provider stops it before the wallet',async()=>{
+ reset();estimateTask=async args=>{await args.to.adapter.provider.signTransaction({});assert.fail('a quote cannot continue through a wallet request')}
+ await assert.rejects(render().estimateCanary('arc-to-solana','0.1'),/No wallet request is allowed while estimating/)
+ assert.equal(G.readSolanaSendAttempts().length,0)
+})
 console.log(`RESULT ${count}/${count} Solana fee authorization groups PASS; controlled SDK/wallet/read ports; no simulation or real signatures/sends.`)

@@ -138,6 +138,45 @@ export function createReceiveEvidenceSigner<P extends Signer>(provider: P, entry
   }
 }
 
+// Normal SDK mint and explicit recovery share the same B2 journal. The caller
+// holds the wallet locks throughout the SDK run (including ATA preparation).
+export function createBoundReceiveSigner<P extends Signer>(provider: P, input: {
+  prepare(): Promise<{ sourceTxHash: string; owner: string; message: string }>
+  validate(tx: unknown, message: string): void
+  reads: ReceiveReads
+}) {
+  let entryId: string | undefined, bound: string | undefined, ataRequested = false, receiveRequested = false, inFlight = false, stopped = false
+  return {
+    get isConnected() { return Boolean(provider.isConnected) },
+    get publicKey() { return provider.publicKey },
+    connect: () => provider.connect(), disconnect: () => provider.disconnect(),
+    entryId: () => entryId,
+    fail(error: unknown) { stopped = true; if (entryId) classifyFailedAttempt(entryId, error) },
+    async signTransaction(tx: unknown) {
+      if (stopped) throw new Error('The earlier destination request did not complete. Check Activity; no second wallet request is allowed.')
+      if (inFlight) throw new Error('A destination wallet request is already being prepared. No second request is allowed.')
+      inFlight = true
+      try {
+        const proof = await input.prepare()
+        input.validate(tx, proof.message) // G2 must precede every B2 wallet-request record.
+        const binding = `${proof.sourceTxHash.toLowerCase()}:${proof.owner}:${proof.message}`
+        if (bound && bound !== binding) throw new Error('The source burn or attestation changed; no receive is allowed.')
+        const receive = isReceiveTx(tx)
+        if (receiveRequested || !receive && ataRequested) throw new Error('A destination wallet request was already made. Check Activity before trying again.')
+        if (!entryId) {
+          const gate = await openReceiveAttempt({ sourceTxHash: proof.sourceTxHash, owner: proof.owner, message: proof.message }, input.reads)
+          if (gate.kind !== 'go') throw new Error('The destination nonce is already consumed. No second mint is allowed.')
+          entryId = gate.entryId; bound = binding
+        }
+        if (receive) receiveRequested = true
+        else ataRequested = true
+        try { return await createReceiveEvidenceSigner(provider, entryId).signTransaction(tx) }
+        catch (error) { stopped = true; throw error }
+      } finally { inFlight = false }
+    },
+  }
+}
+
 // After the SDK call failed: a refusal before the wallet or an explicit wallet rejection sent nothing.
 // Every other error stays "unknown" and is settled only by chain evidence.
 export function classifyFailedAttempt(entryId: string, error: unknown, now = Date.now()) {

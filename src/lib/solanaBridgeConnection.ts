@@ -1,4 +1,4 @@
-import { Connection } from '@solana/web3.js'
+import { Connection, VersionedTransaction } from '@solana/web3.js'
 
 // Adapter 1.7.3 probes WebSocket support by converting connection.rpcEndpoint,
 // independently of web3.js's wsEndpoint. Keep both endpoint identities on the
@@ -8,11 +8,21 @@ export const SOLANA_BRIDGE_SDK_RPC = 'https://solana-rpc.publicnode.com'
 
 export function createSolanaBridgeConnection(origin: string): Connection {
   const proxy = new URL('/api/solana-rpc', origin).href
-  return new Connection(SOLANA_BRIDGE_SDK_RPC, {
+  const connection = new Connection(SOLANA_BRIDGE_SDK_RPC, {
     commitment: 'confirmed',
     wsEndpoint: SOLANA_BRIDGE_SDK_RPC.replace(/^https:/, 'wss:'),
     fetch: (_input, init) => fetch(proxy, init),
   })
+  const send = connection.sendRawTransaction.bind(connection)
+  connection.sendRawTransaction = async (bytes, options) => {
+    // The wallet may have taken longer than the recent blockhash's lifetime.
+    // Never rewrite signed bytes or ask for another signature automatically.
+    const tx = VersionedTransaction.deserialize(Uint8Array.from(bytes))
+    const valid = await connection.isBlockhashValid(tx.message.recentBlockhash, { commitment: 'confirmed' })
+    if (!valid.value) throw new Error('The signed Solana transaction expired before broadcast. Check Activity before preparing another request.')
+    return send(bytes, options)
+  }
+  return connection
 }
 
 export type SolanaSourceStage = 'preparing' | 'preparation-failed' | 'policy-blocked' | 'wallet-requested'

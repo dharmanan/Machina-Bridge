@@ -249,7 +249,10 @@ await test('merged hook keeps G2 outside recovery evidence signer and G1 outside
  assert.match(src,/exactMessage: attestation.message/)
  assert.match(src,/classifyFailedAttempt\(receiveEntryId, e\)/)
  assert.match(src,/createEvmBridgePolicyProvider\(guard.evm\(raw\)/)
- assert.match(src,/guard\.solana\(createStrictSolanaProvider\(phantomProvider,\s*solanaPolicy\),\s*tx\s*=>\s*\{\s*checkFee\(\);\s*assertSolanaBridgeSigningRequest\(phantomProvider,\s*tx,\s*solanaPolicy\)\s*\}\)/, 'guard.solana must wrap the strict provider and check fees before G2 validates the wallet request')
+ assert.ok(src.includes('const signingProvider = normalReceive ? normalReceive as unknown as PhantomSolanaProvider : phantomProvider'))
+ assert.ok(src.includes('normalReceive = createBoundReceiveSigner(phantomProvider,'))
+ assert.ok(src.includes("exactMessage: message"))
+ assert.match(src,/guard\.solana\(createStrictSolanaProvider\(signingProvider,\s*solanaPolicy\),\s*tx\s*=>\s*\{\s*checkFee\(\);\s*assertSolanaBridgeSigningRequest\(phantomProvider,\s*tx,\s*solanaPolicy\)\s*\}\)/, 'guard.solana must wrap the strict provider and check fees before G2 validates the wallet request')
 })
 await test('combined B1: changed Phantom account is refused before signing journal, not unknown',async()=>{
  const wallet=phantom(FX.burn.owner);wallet.publicKey=ATTACKER

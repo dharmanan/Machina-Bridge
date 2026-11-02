@@ -29,10 +29,10 @@ import { fetchMainnetCctpAttestation } from '../lib/mainnetCctpTransfer'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import { destinationEvidence, settleSolanaSendAttempt, solanaRpc, withSolanaSendGuard } from '../lib/solanaSendRuntime'
 import {
-  LegacyReceiveReviewRequired, ReceiveLockedError, classifyFailedAttempt, createReceiveEvidenceSigner, openReceiveAttempt,
+  LegacyReceiveReviewRequired, ReceiveLockedError, classifyFailedAttempt, createBoundReceiveSigner, createReceiveEvidenceSigner, openReceiveAttempt,
   releaseLegacyReceiveAfterReview, reviewLegacyReceive, updateReceiveEntry, type LegacyReview, type ReceiveReads,
 } from '../lib/arcSolanaReceiveEvidence'
-import { assertSolanaBridgeSigningRequest, createStrictSolanaProvider, type SolanaTxExpectation } from '../lib/solanaBridgeTxPolicy'
+import { assertSolanaBridgeSigningRequest, createReadOnlySolanaProvider, createStrictSolanaProvider, type SolanaTxExpectation } from '../lib/solanaBridgeTxPolicy'
 import { solanaTransferOutcomeStatus, verifyTransferDestinationWithRetry } from '../lib/solanaSendGuard'
 
 type BridgeKitChain = ReturnType<BridgeKit['getSupportedChains']>[number]
@@ -867,6 +867,12 @@ export function useMainnetSolanaCctp(
     if (!isMainnetSolanaCanaryWriteEnabled('arc-to-solana')) throw new Error('Arc to Solana receive is switched off.')
     if (!navigator.locks) throw new Error('A safe browser transaction lock is required for recovery.')
     const expectedContext = recoveryContext.current
+    // Normal SDK mint holds these same wallet locks through ATA + receive.
+    // Recovery must not race a still-running normal transfer in another tab.
+    return navigator.locks.request(`machina-solana-send:evm:${evmAddress.toLowerCase()}`, {ifAvailable:true}, async evmLock=>{
+    if (!evmLock) throw new Error('A transfer is still running for these wallets. Check Activity before recovery.')
+    return navigator.locks.request(`machina-solana-send:sol:${phantomAddress}`, {ifAvailable:true}, async solLock=>{
+    if (!solLock) throw new Error('A transfer is still running for these wallets. Check Activity before recovery.')
     return navigator.locks.request(`machina-arc-solana-recovery:${sourceTxHash}`, {ifAvailable:true}, async lock=>{
     if (!lock) throw new Error('Another tab is processing this burn; no second mint was requested.')
 
@@ -924,6 +930,7 @@ export function useMainnetSolanaCctp(
         rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
       } as BridgeKitChain
       const solanaAdapter = await createSolanaAdapterFromProvider({
+        connection: createSolanaBridgeConnection(window.location.origin),
         // G2 validates before the evidence signer records any wallet request.
         provider: createStrictSolanaProvider(createReceiveEvidenceSigner(phantomProvider, receiveEntryId) as unknown as PhantomSolanaProvider, { kind: 'receive', owner: phantomAddress, amountRaw: proof.fields.amount, exactMessage: attestation.message }),
         capabilities: {
@@ -1017,6 +1024,8 @@ export function useMainnetSolanaCctp(
       throw error
     }
     })
+    })
+    })
   }, [
     evmAddress,
     findPendingArcToSolanaBurn,
@@ -1062,7 +1071,8 @@ export function useMainnetSolanaCctp(
       } as BridgeKitChain
 
       const solanaAdapter = await createSolanaAdapterFromProvider({
-        provider: createStrictSolanaProvider(phantomProvider, solanaTxExpectation(direction, amount, evmAddress, phantomAddress)),
+        connection: createSolanaBridgeConnection(window.location.origin),
+        provider: createReadOnlySolanaProvider(phantomProvider, solanaTxExpectation(direction, amount, evmAddress, phantomAddress)),
         capabilities: {
           addressContext: 'user-controlled',
           supportedChains: [solanaBridgeChain],
@@ -1168,6 +1178,7 @@ export function useMainnetSolanaCctp(
     let sourceStage: SolanaSourceStage = 'preparing'
     let sourceExecutionStarted = false
     let sourceFeeError: string | null = null
+    let normalReceive: ReturnType<typeof createBoundReceiveSigner<PhantomSolanaProvider>> | undefined
     let preparationStep: 'solana-adapter' | 'arc-network' | 'evm-adapter' | 'bridge-kit' = 'solana-adapter'
     const safePreWalletFailure = (cause?: unknown) => {
       if (sourceFeeError) return sourceFeeError
@@ -1242,17 +1253,36 @@ export function useMainnetSolanaCctp(
           rpcEndpoints: [SOLANA_BRIDGE_SDK_RPC],
         } as BridgeKitChain
 
+        const attemptId = readSolanaSendAttempts().find(a => a.direction === direction && a.evmWallet.toLowerCase() === evmAddress.toLowerCase() && a.solanaWallet === phantomAddress && a.phase === 'prepared')?.id
+        const current = () => g1Live.current.evmAddress === evmAddress && g1Live.current.phantomAddress === phantomAddress && g1Live.current.walletClient === walletClient
+        if (direction === 'arc-to-solana') {
+          normalReceive = createBoundReceiveSigner(phantomProvider, {
+            reads: arcSolanaReceiveReads,
+            prepare: async () => {
+              if (!current()) throw new Error('The connected wallets changed. No receive was requested.')
+              const source = readSolanaSendAttempts().find(a => a.id === attemptId)?.burnTxHash
+              if (!source) throw new Error('The current Arc burn has no transaction proof. Check Activity before receiving.')
+              const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
+              const proof = await readCctpBurnProof({ sourceChainId: ARC_MAINNET_EVM_CHAIN_ID, sourceTxHash: source as Hex, owner: evmAddress, mintRecipients: [ownerHex, ataHex], allowCircleKitBridge: true })
+              if (proof.fields.amount !== amountRaw || proof.fields.maxFee > approvedMaxFee || proof.fields.destinationDomain !== 5) throw new Error('The source burn differs from this transfer. No receive was requested.')
+              const attestation = await readBoundCctpAttestation(proof)
+              if (!current() || attestation.status !== 'complete' || !attestation.message) throw new Error('The bound Circle attestation is not ready. Recover this burn from Activity.')
+              return { sourceTxHash: source, owner: phantomAddress, message: attestation.message }
+            },
+            validate: (tx, message) => assertSolanaBridgeSigningRequest(phantomProvider, tx, { kind: 'receive', owner: phantomAddress, amountRaw, exactMessage: message }),
+          })
+        }
+
         preparationStep = 'solana-adapter'
+        const signingProvider = normalReceive ? normalReceive as unknown as PhantomSolanaProvider : phantomProvider
         const solanaAdapter = await createSolanaAdapterFromProvider({
           connection: createSolanaBridgeConnection(window.location.origin),
-          provider: guard.solana(createStrictSolanaProvider(phantomProvider, solanaPolicy), tx => { checkFee(); assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy) }),
+          provider: guard.solana(createStrictSolanaProvider(signingProvider, solanaPolicy), tx => { checkFee(); assertSolanaBridgeSigningRequest(phantomProvider, tx, solanaPolicy) }),
           capabilities: {
             addressContext: 'user-controlled',
             supportedChains: [solanaBridgeChain],
           },
         })
-        const attemptId = readSolanaSendAttempts().find(a => a.direction === direction && a.evmWallet.toLowerCase() === evmAddress.toLowerCase() && a.solanaWallet === phantomAddress && a.phase === 'prepared')?.id
-        const current = () => g1Live.current.evmAddress === evmAddress && g1Live.current.phantomAddress === phantomAddress && g1Live.current.walletClient === walletClient
         const raw = createStrictEvmProvider(walletClient as WalletClientLike)
         const request = async (args: { method: string; params?: unknown[] }) =>
           walletClient.transport.request(args as never)
@@ -1308,35 +1338,24 @@ export function useMainnetSolanaCctp(
 
         if (finalResult?.state === 'error') {
           if (direction === 'arc-to-solana') {
-            setState({
-              isLoading: true,
-              error: null,
-              status: 'Arc burn completed. Recovering the fee-adjusted Solana mint...',
-              result: finalResult,
-            })
-
+            normalReceive?.fail(finalResult.error)
+            const attempt = readSolanaSendAttempts().find(a => a.id === attemptId)
+            const settled = attempt ? await settleSolanaSendAttempt(attempt) : null
+            const candidate = settled?.verdict.kind === 'burned' ? settled.verdict.txHash as Hex : null
             let sourceTxHash: Hex | null = null
-            const sourceDeadline = Date.now() + 30_000
-
-            while (!sourceTxHash && Date.now() < sourceDeadline) {
-              sourceTxHash = await findPendingArcToSolanaBurn()
-              if (!sourceTxHash) {
-                await delay(1_500)
-              }
+            if (candidate) {
+              try {
+                const { ownerHex, ataHex } = deriveSolanaUsdcAta(phantomAddress, 'mainnet')
+                const proof = await readCctpBurnProof({ sourceChainId: ARC_MAINNET_EVM_CHAIN_ID, sourceTxHash: candidate, owner: evmAddress, mintRecipients: [ownerHex, ataHex], allowCircleKitBridge: true })
+                if (proof.fields.amount === amountRaw && proof.fields.destinationDomain === 5 && proof.fields.maxFee <= approvedMaxFee) sourceTxHash = candidate
+              } catch { /* A successful receipt alone is not proof of the reviewed CCTP burn. */ }
             }
-
-            if (!sourceTxHash) {
-              const errorMessage = getBridgeKitErrorMessage(finalResult)
-              setState({
-                isLoading: false,
-                error: errorMessage,
-                status: null,
-                result: finalResult,
-              })
-              return finalResult
-            }
-
-            return await recoverPendingArcToSolana(sourceTxHash)
+            if (sourceTxHash) setPendingArcToSolanaTx(sourceTxHash)
+            // Never automatically ask Phantom again after a refusal, expiry or
+            // uncertain mint. Recovery is an explicit, evidence-gated action.
+            const pending = { ...finalResult, direction, ...(candidate ? { sourceTxHash: candidate } : {}), sourceBurnVerified: Boolean(sourceTxHash), destinationVerified: false }
+            setState({ isLoading: false, error: sourceTxHash ? null : getBridgeKitErrorMessage(finalResult), status: sourceTxHash ? 'The Arc burn is verified. Solana receive is not verified. Use Activity to recover this existing burn; no second wallet request was made.' : 'The source outcome is not yet verified. Check Activity before trying again.', result: pending })
+            return pending
           }
 
           // Never retry a Solana source error: provider-cctp-v2 can restart the burn.
@@ -1373,6 +1392,8 @@ export function useMainnetSolanaCctp(
           destinationEvidence({ evmWallet: evmAddress, solanaRecipients: [solOwnerHex, solAtaHex], solanaRead: solanaReadRpc }),
         )
         const destinationVerified = destination.verified
+        const receiveEntryId = normalReceive?.entryId()
+        if (receiveEntryId && destinationVerified) updateReceiveEntry(receiveEntryId, { phase: 'complete' })
         const [arcBalanceAfter, solanaBalanceAfter] = await Promise.all([
           refreshArcBalance().catch(() => null),
           refreshSolanaBalance().catch(() => null),
@@ -1402,6 +1423,7 @@ export function useMainnetSolanaCctp(
         return normalizedResult
       })
     } catch (error) {
+      try { normalReceive?.fail(error) } catch { /* preserve the existing blocking journal */ }
       const message = direction === 'solana-to-arc' && sourceExecutionStarted
         ? safePreWalletFailure(error)
         : error instanceof Error ? error.message : 'Solana mainnet transfer failed.'

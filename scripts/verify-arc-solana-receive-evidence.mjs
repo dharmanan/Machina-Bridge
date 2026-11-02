@@ -220,4 +220,53 @@ await test('the hook wires the gate, the evidence signer and the classifier into
   assert.ok(connection.includes("SOLANA_BRIDGE_SDK_RPC = 'https://solana-rpc.publicnode.com'"), 'the successful recovery endpoint is preserved')
   assert.ok(src.includes('machina-arc-solana-recovery:${review.sourceTxHash}'), 'manual unlock takes the same per-burn lock')
 })
+await test('normal SDK receive session journals ATA then mint and blocks concurrent or repeated wallet requests', async () => {
+  const c = chain(), w = phantom()
+  const session = E.createBoundReceiveSigner(w, { reads: c.reads_, prepare: async () => ({sourceTxHash: FX.sourceTxHash, owner: FX.owner, message: FX.message}), validate: (_t, m) => assert.equal(m, FX.message) })
+  await session.signTransaction(ataOnlyTx())
+  assert.equal(latest().signed.length, 1); assert.equal(latest().receiveRequestedAt, undefined)
+  const first = session.signTransaction(receiveTx())
+  await assert.rejects(session.signTransaction(receiveTx()), /already being prepared/)
+  await first
+  assert.equal(latest().signed.length, 2); assert.ok(latest().signature)
+  await assert.rejects(session.signTransaction(receiveTx()), /already made/)
+  assert.equal(w.calls.length, 2)
+})
+await test('normal receive policy refusal and consumed nonce never create a wallet request', async () => {
+  const c = chain(), w = phantom()
+  const prepare = async () => ({sourceTxHash: FX.sourceTxHash, owner: FX.owner, message: FX.message})
+  const invalid = E.createBoundReceiveSigner(w, { reads:c.reads_, prepare, validate: () => {throw new Error('controlled G2 refusal')} })
+  await assert.rejects(invalid.signTransaction(receiveTx()), /G2 refusal/)
+  assert.equal(E.readReceiveEntries().length, 0); assert.equal(w.calls.length, 0)
+  c.nonceA = c.nonceB = true
+  const consumed = E.createBoundReceiveSigner(w, { reads:c.reads_, prepare, validate:()=>{} })
+  await assert.rejects(consumed.signTransaction(receiveTx()), /already consumed/)
+  assert.equal(w.calls.length, 0)
+})
+await test('normal session unknown signature stays locked and stops all subsequent wallet requests', async () => {
+  const c = chain(), w = phantom('error')
+  let message = FX.message
+  const session = E.createBoundReceiveSigner(w, { reads:c.reads_, prepare:async()=>({sourceTxHash:FX.sourceTxHash,owner:FX.owner,message}), validate:()=>{} })
+  await assert.rejects(session.signTransaction(receiveTx()))
+  session.fail(new Error('controlled SDK error'))
+  assert.equal(latest().phase, 'unknown')
+  await assert.rejects(E.openReceiveAttempt({sourceTxHash:FX.sourceTxHash,owner:FX.owner,message:FX.message},c.reads_), err=>err instanceof E.ReceiveLockedError)
+  message += '00'
+  await assert.rejects(session.signTransaction(receiveTx()), /earlier destination request/)
+  assert.equal(w.calls.length, 1)
+})
+await test('an ATA-only wallet failure cannot fall through to a second Phantom mint request', async () => {
+  const c=chain(),w=phantom('error')
+  const session=E.createBoundReceiveSigner(w,{reads:c.reads_,prepare:async()=>({sourceTxHash:FX.sourceTxHash,owner:FX.owner,message:FX.message}),validate:()=>{}})
+  await assert.rejects(session.signTransaction(ataOnlyTx()))
+  await assert.rejects(session.signTransaction(receiveTx()),/earlier destination request/)
+  assert.equal(w.calls.length,1);assert.equal(latest().receiveRequestedAt,undefined)
+})
+await test('source proof changes between successful ATA setup and mint are refused before a second signature', async () => {
+  const c=chain(),w=phantom();let message=FX.message
+  const session=E.createBoundReceiveSigner(w,{reads:c.reads_,prepare:async()=>({sourceTxHash:FX.sourceTxHash,owner:FX.owner,message}),validate:()=>{}})
+  await session.signTransaction(ataOnlyTx());message+='00'
+  await assert.rejects(session.signTransaction(receiveTx()),/source burn or attestation changed/)
+  assert.equal(w.calls.length,1)
+})
 console.log(`RESULT ${count}/${count} Arc -> Solana receive-evidence groups PASS; real pending message of 0x22e768dd…, fake Phantom/SDK and controlled chain reads; no new burn, network, signature or transaction.`)
