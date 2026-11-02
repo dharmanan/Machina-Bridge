@@ -294,6 +294,27 @@ export default function MainnetEarnActions() {
     }
   }, [address, amount, getAdapter, loadWalletBalance, readPosition, selectedVault])
 
+  // MAX only fills the Amount field from the current vault position.
+  // No approval, deposit, withdrawal, or wallet signature is requested here.
+  const fillMaxWithdrawal = useCallback(async () => {
+    if (!address || chainId !== ARC_MAINNET_EVM_CHAIN_ID || busy !== null || inFlight.current || openRecord) return
+    setBusy('withdrawMax')
+    setReviewed(null)
+    setError(null)
+    try {
+      const fresh = await readPosition()
+      const available = floorUsdcRaw(fresh.currentBalance)
+      if (available === null || available <= 0n) {
+        throw new Error('No available vault position for withdrawal.')
+      }
+      setAmount(formatUnits(available, 6))
+    } catch (cause) {
+      setError(messageOf(cause, 'Could not read the maximum withdrawal amount.'))
+    } finally {
+      setBusy(null)
+    }
+  }, [address, busy, chainId, openRecord, readPosition])
+
   const reportSettled = useCallback((record: EarnJournalRecord, sdkError: unknown) => {
     if (record.outcome === 'success') {
       setError(null)
@@ -448,6 +469,7 @@ export default function MainnetEarnActions() {
           Vault
           <select
             value={selectedVault}
+            disabled={busy !== null}
             onChange={(event) => {
               setSelectedVault(event.target.value)
               setReviewed(null)
@@ -464,24 +486,32 @@ export default function MainnetEarnActions() {
           </select>
         </label>
 
-        <label className="text-xs font-medium text-slate-600">
-          Amount
-          <div className="mt-1 flex h-10 items-center rounded-xl border border-slate-200 bg-white px-3">
-            <input
-              type="text"
-              inputMode="decimal"
-              value={amount}
-              onChange={(event) => {
-                setAmount(event.target.value)
-                setReviewed(null)
-                setError(null)
-              }}
-              className="min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none"
-              aria-label="Earn amount"
-            />
-            <span className="ml-2 text-xs font-semibold text-slate-500">USDC</span>
+        <div>
+          <label className="text-xs font-medium text-slate-600">
+            Amount
+            <div className="mt-1 flex h-10 items-center rounded-xl border border-slate-200 bg-white px-3">
+              <input
+                type="text"
+                inputMode="decimal"
+                value={amount}
+                onChange={(event) => {
+                  setAmount(event.target.value)
+                  setReviewed(null)
+                  setError(null)
+                }}
+                className="min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none"
+                aria-label="Earn amount"
+              />
+              <span className="ml-2 text-xs font-semibold text-slate-500">USDC</span>
+            </div>
+          </label>
+          <div className="mt-1 flex justify-end">
+            <button type="button" onClick={() => void fillMaxWithdrawal()}
+              disabled={!isConnected || chainId !== ARC_MAINNET_EVM_CHAIN_ID || locked}
+              className="rounded-md border border-sky-200 bg-white px-3 py-1 text-xs font-semibold text-sky-900 disabled:opacity-50"
+              aria-label="MAX Earn withdrawal amount">MAX</button>
           </div>
-        </label>
+        </div>
 
         <div className="rounded-xl border border-sky-100 bg-white px-3 py-2">
           <p className="text-[11px] text-slate-500">Wallet</p>
