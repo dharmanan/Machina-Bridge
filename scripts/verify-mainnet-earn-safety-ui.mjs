@@ -156,6 +156,18 @@ try {
     const [j] = await journal(); assert.equal(j.outcome, 'success'); assert.equal(j.action, 'deposit'); assert.equal(j.account, OWNER); assert.equal(j.chainId, 5042); assert.equal(j.vault, VAULT_A.toLowerCase()); assert.equal(j.amountRaw, '250000'); assert.equal(j.executeHash, h); assert.deepEqual([j.evidence?.usdc, j.evidence?.shares], [true, true], 'exact USDC movement and vault share movement in the execute receipt')
     assert.equal(await pendingPanel().count(), 0)
   })
+  await test('MAX fills the fresh vault position to six USDC decimals without a wallet request', async () => {
+    await fresh(); await st(page, { position: '0.099999999999999999' })
+    await setAmount('0.05')
+    await btn('MAX').click()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Earn amount"]')?.value === '0.099999')
+    assert.equal(await sends(), 0, 'MAX must not approve or execute')
+    assert.equal(await W(page, () => window.earnTest.state.sdkCalls.length), 0, 'MAX must not call the Earn SDK write path')
+    assert.equal((await journal()).length, 0, 'MAX must not create a journaled transfer')
+    await btn('Review withdrawal').click()
+    await btn('Withdraw 0.099999 USDC').waitFor()
+    assert.equal(await sends(), 0, 'review must not send anything')
+  })
   await test('a successful withdrawal is verified the same way', async () => {
     await fresh(); await st(page, { position: '1.5' }); await setAmount('0.4'); await btn('Review withdrawal').click(); await btn('Withdraw 0.4 USDC').click(); await waitHashes(1)
     const [h] = await hashes(); await mine(h, 'success', withdrawn(raw('0.4'))); await waitText(/Withdrawal 0\.4 USDC confirmed/)
