@@ -47,8 +47,8 @@ async function run(op, params){
   return { kind: 'same-chain', txHash: h, explorerUrl: 'https://arcscan.app/tx/' + h, vaultAddress: params.vaultAddress, amount: params.amount }
 }
 export class EarnKit {
-  async getDepositQuote(p){ W.state.quotes.push(['deposit', p.vaultAddress, p.amount]); return { amount: p.amount } }
-  async getWithdrawalQuote(p){ W.state.quotes.push(['withdraw', p.vaultAddress, p.amount]); return { amount: p.amount } }
+  async getDepositQuote(p){ W.state.quotes.push(['deposit', p.vaultAddress, p.amount]); return { amount: p.amount, ...(W.state.quoteOverride ?? {}) } }
+  async getWithdrawalQuote(p){ W.state.quotes.push(['withdraw', p.vaultAddress, p.amount]); return { amount: p.amount, ...(W.state.quoteOverride ?? {}) } }
   async getPosition(){ return { currentBalance: W.state.position } }
   deposit(p){ return run('deposit', p) }
   withdraw(p){ return run('withdraw', p) }
@@ -167,6 +167,27 @@ try {
     await btn('Review withdrawal').click()
     await btn('Withdraw 0.099999 USDC').waitFor()
     assert.equal(await sends(), 0, 'review must not send anything')
+  })
+  await test('B3 fee display and MAX coexist without triggering an Earn wallet transaction', async () => {
+    await fresh()
+    await st(page, { quoteOverride: { fees: [{ type: 'circle', amount: '0.00004', symbol: 'USDC' }], expectedShares: { amount: '0.1983', symbol: 'vault-shares' } } })
+    await reviewDeposit('0.2')
+    const depositFee = await page.locator('[data-testid="earn-fee-disclosure"]').innerText()
+    assert.match(depositFee, /Circle service fee: 0\.00004 USDC/)
+    assert.match(depositFee, /Estimated vault shares: 0\.1983/)
+    assert.equal(await sends(), 0, 'fee review must not request wallet send')
+    await fresh()
+    await st(page, { position: '0.099999999999999999', quoteOverride: { fees: [] } })
+    await btn('MAX').click()
+    await page.waitForFunction(() => document.querySelector('input[aria-label="Earn amount"]')?.value === '0.099999')
+    await btn('Review withdrawal').click()
+    await btn('Withdraw 0.099999 USDC').waitFor()
+    const withdrawalFee = await page.locator('[data-testid="earn-fee-disclosure"]').innerText()
+    assert.match(withdrawalFee, /Circle service fee: not listed in this quote/)
+    assert.match(withdrawalFee, /Quote amount: 0\.099999 USDC/)
+    assert.match(withdrawalFee, /Machina fee: 0 USDC/)
+    assert.equal(await sends(), 0, 'MAX plus fee review must not request wallet send')
+    assert.equal((await journal()).length, 0, 'review must not create an Earn journal')
   })
   await test('a successful withdrawal is verified the same way', async () => {
     await fresh(); await st(page, { position: '1.5' }); await setAmount('0.4'); await btn('Review withdrawal').click(); await btn('Withdraw 0.4 USDC').click(); await waitHashes(1)

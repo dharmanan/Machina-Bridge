@@ -28,6 +28,7 @@ import {
   type EarnJournalRecord,
   type EarnKitLike,
 } from '../lib/earnJournal'
+import { summarizeEarnQuoteFees } from '../lib/earnFeeDisclosure'
 
 type EarnPosition = {
   currentBalance?: string
@@ -454,6 +455,7 @@ export default function MainnetEarnActions() {
   }, [readPosition])
 
   const locked = busy !== null || Boolean(openRecord)
+  const feeSummary = reviewed ? summarizeEarnQuoteFees(reviewed.quote) : null
 
   return (
     <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -607,9 +609,29 @@ export default function MainnetEarnActions() {
             {reviewed.kind === 'deposit' ? ' into ' : ' from '}
             {getMainnetEarnVaultLabel(reviewed.vaultAddress)}
           </p>
-          <p className="mt-1 text-[11px] leading-5 text-slate-500">
-            Quote received. Your wallet will show the transaction and network fee before you sign.
-          </p>
+          <div data-testid="earn-fee-disclosure" className="mt-3 space-y-1.5 rounded-xl bg-slate-50 p-3 text-xs text-slate-700">
+            {feeSummary?.state === 'reported' ? (
+              <>
+                {feeSummary.circleFees.length ? feeSummary.circleFees.map((fee, index) => (
+                  <p key={'circle-' + index}>Circle service fee: <strong>{fee.amount} {fee.symbol}</strong></p>
+                )) : <p>Circle service fee: not listed in this quote. No zero-fee guarantee; confirm actual charges before signing.</p>}
+                {feeSummary.otherFees.map((fee, index) => (
+                  <p key={'other-' + index}>{fee.label}: <strong>{fee.amount} {fee.symbol}</strong></p>
+                ))}
+              </>
+            ) : <p className="font-medium text-amber-800">
+              {feeSummary?.state === 'invalid'
+                ? 'Fee breakdown returned by Circle is invalid. Fees cannot be verified.'
+                : 'Circle did not provide a fee breakdown in this quote. Fees are unknown, not zero.'}
+            </p>}
+            {reviewed.kind === 'deposit' && feeSummary?.expectedShares && (
+              <p>Estimated vault shares: <strong>{feeSummary.expectedShares}</strong></p>
+            )}
+            <p className="text-[11px] text-slate-500">
+              Quote amount: {reviewed.amount} USDC. Net USDC after fees is not separately specified by this quote.
+              Network transaction fees are shown by your wallet before signing. Machina fee: 0 USDC.
+            </p>
+          </div>
           <button
             type="button"
             onClick={() => void execute()}
