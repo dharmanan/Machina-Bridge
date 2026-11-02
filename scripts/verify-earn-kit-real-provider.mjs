@@ -26,6 +26,7 @@ const ERC20 = v.parseAbi(['function approve(address spender,uint256 amount)', 'f
 const VAULT_EVENTS = v.parseAbi(['event Deposit(address indexed sender,address indexed owner,uint256 assets,uint256 shares)', 'event Withdraw(address indexed sender,address indexed receiver,address indexed owner,uint256 assets,uint256 shares)'])
 const EXEC = v.parseAbi(['function execute(((address target,bytes data,uint256 value,address tokenIn,uint256 amountToApprove,address tokenOut,uint256 minTokenOut)[] instructions,(address token,address beneficiary)[] tokens,uint256 execId,uint256 deadline,bytes metadata) params,(uint8 permitType,address token,uint256 amount,bytes permitCalldata)[] tokenInputs,bytes signature)'])
 const INNER = v.parseAbi(['function deposit(uint256 assets,address receiver)', 'function withdraw(uint256 assets,address receiver,address owner)', 'function redeem(uint256 shares,address receiver,address owner)', 'function claim(address[] users,address[] tokens,uint256[] amounts,bytes32[][] proofs)'])
+const PREVIEW = v.parseAbi(['function previewWithdraw(uint256 assets) view returns (uint256)', 'function previewRedeem(uint256 shares) view returns (uint256)'])
 const raw = s => v.parseUnits(s, 6), hexn = n => '0x' + BigInt(n).toString(16), lc = a => a.toLowerCase()
 
 // ---------- controlled Arc chain ----------
@@ -55,7 +56,7 @@ function mine(hash) {
         logs.push(log(USDC, { ...T, data: [amount] }, { from: tx.from, to: ADAPTER }, hash), log(vault, { ...T, data: [shares] }, { from: v.zeroAddress, to: ADAPTER }, hash),
           log(vault, { abi: VAULT_EVENTS, name: 'Deposit', data: [amount, shares] }, { sender: ADAPTER, owner: ADAPTER }, hash), log(vault, { ...T, data: [shares] }, { from: ADAPTER, to: tx.from }, hash))
       } else {
-        const assets = inner.args[0]
+        const assets = inner.functionName === 'redeem' ? inner.args[0] / 10n ** 12n : inner.args[0]
         logs.push(log(vault, { ...T, data: [inputs[0].amount] }, { from: tx.from, to: ADAPTER }, hash), log(USDC, { ...T, data: [assets] }, { from: vault, to: ADAPTER }, hash),
           log(vault, { abi: VAULT_EVENTS, name: 'Withdraw', data: [assets, shares] }, { sender: ADAPTER, receiver: ADAPTER, owner: ADAPTER }, hash), log(USDC, { ...T, data: [assets] }, { from: ADAPTER, to: tx.from }, hash))
       }
@@ -83,6 +84,15 @@ function rpc(method, params = []) {
     case 'eth_getTransactionCount': return hexn(params[1] === 'pending' ? chain.pending : chain.nonce)
     case 'eth_call': {
       const { to, data } = params[0]
+      if ([VAULT_A, VAULT_B].some(vault => lc(vault) === lc(to))) {
+        try {
+          const preview = v.decodeFunctionData({ abi: PREVIEW, data })
+          if (preview.functionName === 'previewWithdraw')
+            return v.encodeAbiParameters([{ type: 'uint256' }], [preview.args[0] * 10n ** 12n])
+          if (preview.functionName === 'previewRedeem')
+            return v.encodeAbiParameters([{ type: 'uint256' }], [preview.args[0] / 10n ** 12n])
+        } catch { /* Existing unrelated vault reads. */ }
+      }
       // Pre-send simulations of approve / increaseAllowance / Adapter.execute succeed (a revert, when modelled, happens on chain).
       if (lc(to) === lc(ADAPTER)) return '0x'
       if (['0x095ea7b3', '0x39509351'].includes(data.slice(0, 10))) return v.encodeAbiParameters([{ type: 'bool' }], [true])
@@ -187,6 +197,22 @@ await test('withdraw needing a share approval: vault approve(adapter) then ONE e
   assert.equal(record.outcome, 'success'); assert.deepEqual(record.requests.map(r => r.kind), ['approve', 'execute'])
 })
 
+await test('share-based redeem is bounded by independently read vault shares and USDC preview', async () => {
+  fresh(); api.params = b => withdrawParams({ amount: v.parseUnits(b.amount, 6), shares: 4n * 10n ** 17n, fn: 'redeem' })
+  const { record, sdkError } = await run('withdraw', '0.4')
+  assert.equal(sdkError, undefined, String(sdkError?.message))
+  assert.deepEqual(sentKinds(), ['approve', 'execute'])
+  assert.equal(record.outcome, 'success')
+  assert.equal(record.redeemShareLimitRaw, '402000000000000001')
+})
+await test('over-consuming shares for share-based redeem is blocked after approval, before execute', async () => {
+  fresh(); api.params = b => withdrawParams({ amount: v.parseUnits(b.amount, 6), shares: 2n * 10n ** 18n, fn: 'redeem' })
+  const { record } = await run('withdraw', '0.4')
+  assert.equal(record.outcome, 'not_sent')
+  assert.deepEqual(sentKinds(), ['approve'])
+  assert.equal(record.executeHash, undefined)
+})
+
 // ---------- ground truth: real Arc mainnet Earn transactions ----------
 const realRecord = (e, overrides = {}) => {
   const d = v.decodeFunctionData({ abi: EXEC, data: e.input }), ins = d.args[0].instructions[0], inner = v.decodeFunctionData({ abi: INNER, data: ins.data })
@@ -260,7 +286,7 @@ for (const [label, action, params, expectApprovalSent] of [
   ['the vault deposit credited to another receiver', 'deposit', a => depositParams({ amount: a, receiver: ATTACKER }), true],
   ['an extra instruction', 'deposit', a => depositParams({ amount: a, extra: [depositParams({ amount: 1n, vault: VAULT_B }).instructions[0]] }), true],
   ['a withdrawal of less than reviewed', 'withdraw', a => withdrawParams({ amount: a - 1n }), true],
-  ['a redeem instead of the reviewed withdraw', 'withdraw', a => withdrawParams({ amount: a, fn: 'redeem' }), true],
+  ['a redeem spending too many shares', 'withdraw', a => withdrawParams({ amount: a, fn: 'redeem', shares: 3n * 10n ** 18n }), true],
   ['withdrawn USDC routed to another beneficiary', 'withdraw', a => withdrawParams({ amount: a, beneficiary: ATTACKER }), true],
 ]) await test(`tampered Circle response (${label}) through the real SDK: the execute never reaches the wallet; nothing was sent`, async () => {
   fresh(); api.params = b => params(v.parseUnits(b.amount, 6))

@@ -36,7 +36,8 @@ const KEEP_SETTLED = 30
 
 const APPROVAL_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function increaseAllowance(address spender,uint256 addedValue)'])
 const EXECUTE_ABI = parseAbi(['function execute(((address target,bytes data,uint256 value,address tokenIn,uint256 amountToApprove,address tokenOut,uint256 minTokenOut)[] instructions,(address token,address beneficiary)[] tokens,uint256 execId,uint256 deadline,bytes metadata) params,(uint8 permitType,address token,uint256 amount,bytes permitCalldata)[] tokenInputs,bytes signature)'])
-const INSTRUCTION_ABI = parseAbi(['function deposit(uint256 assets,address receiver)', 'function withdraw(uint256 assets,address receiver,address owner)'])
+const INSTRUCTION_ABI = parseAbi(['function deposit(uint256 assets,address receiver)', 'function withdraw(uint256 assets,address receiver,address owner)', 'function redeem(uint256 shares,address receiver,address owner)'])
+const WITHDRAW_PREVIEW_ABI = parseAbi(['function previewWithdraw(uint256 assets) view returns (uint256)', 'function previewRedeem(uint256 shares) view returns (uint256)'])
 const TRANSFER_ABI = parseAbi(['event Transfer(address indexed from,address indexed to,uint256 value)'])
 const BALANCE_ABI = parseAbi(['function balanceOf(address account) view returns (uint256)'])
 
@@ -53,6 +54,8 @@ export type EarnJournalRecord = {
   amountRaw: string
   // withdraw only: vault shares held at the attempt (bounds the share approval and pull)
   shareBalanceRaw?: string
+  // Independently previewed share ceiling for a specific redeem, frozen before signing.
+  redeemShareLimitRaw?: string
   createdAt: number
   updatedAt: number
   attemptNonce: number
@@ -73,6 +76,7 @@ const isRecord = (r: any): r is EarnJournalRecord => Boolean(r) && typeof r.id =
   && typeof r.vault === 'string' && (r.action === 'deposit' || r.action === 'withdraw') && /^\d+$/.test(r.amountRaw) && Array.isArray(r.requests)
   && ['sending', 'unknown', 'success', 'reverted', 'not_sent'].includes(r.outcome) && Number.isSafeInteger(r.attemptNonce) && Number.isSafeInteger(r.attemptBlock)
   && (r.executeHash === undefined || HASH.test(r.executeHash)) && (r.shareBalanceRaw === undefined || /^\d+$/.test(r.shareBalanceRaw))
+  && (r.redeemShareLimitRaw === undefined || /^\d+$/.test(r.redeemShareLimitRaw))
 
 export function readEarnJournal(): EarnJournalRecord[] {
   try {
@@ -186,7 +190,7 @@ class EarnRequestMismatch extends Error {
 // Adapter.execute calldata must be exactly the reviewed operation: one vault
 // instruction on the reviewed vault for the reviewed amount, tokens pulled only
 // from this wallet's reviewed asset, and every output token returned to this wallet.
-export function assertEarnExecuteMatches(record: Pick<EarnJournalRecord, 'account' | 'vault' | 'action' | 'amountRaw' | 'shareBalanceRaw'>, data: unknown) {
+export function assertEarnExecuteMatches(record: Pick<EarnJournalRecord, 'account' | 'vault' | 'action' | 'amountRaw' | 'shareBalanceRaw' | 'redeemShareLimitRaw'>, data: unknown) {
   let decoded
   try {
     decoded = decodeFunctionData({ abi: EXECUTE_ABI, data: data as Hex })
@@ -207,14 +211,28 @@ export function assertEarnExecuteMatches(record: Pick<EarnJournalRecord, 'accoun
     throw new EarnRequestMismatch('vault call')
   }
   const forUs = (address: string) => lc(address) === EARN_ADAPTER || lc(address) === account
+  let redeemShares: bigint | undefined
   if (record.action === 'deposit') {
     if (inner.functionName !== 'deposit') throw new EarnRequestMismatch('vault call')
     const [assets, receiver] = inner.args
     if (assets !== amount || !forUs(receiver) || instruction.amountToApprove !== amount) throw new EarnRequestMismatch('amount')
   } else {
-    if (inner.functionName !== 'withdraw') throw new EarnRequestMismatch('vault call')
-    const [assets, receiver, owner] = inner.args
-    if (assets !== amount || !forUs(receiver) || !forUs(owner) || instruction.minTokenOut > amount) throw new EarnRequestMismatch('amount')
+    if (inner.functionName === 'withdraw') {
+      const [assets, receiver, owner] = inner.args
+      if (assets !== amount || !forUs(receiver) || !forUs(owner) || instruction.minTokenOut > amount) throw new EarnRequestMismatch('amount')
+    } else if (inner.functionName === 'redeem') {
+      const [shares, receiver, owner] = inner.args
+      const limit = BigInt(record.redeemShareLimitRaw ?? '0')
+      const minOutput = (amount * 995n) / 1000n
+      if (!forUs(receiver) || !forUs(owner) || !limit || shares <= 0n || shares > limit
+        || shares !== instruction.amountToApprove || instruction.minTokenOut < minOutput
+        || instruction.minTokenOut <= 0n || instruction.minTokenOut > amount) {
+        throw new EarnRequestMismatch('redeem shares or minimum USDC')
+      }
+      redeemShares = shares
+    } else {
+      throw new EarnRequestMismatch('vault call')
+    }
   }
   // What the adapter pulls from the wallet: the reviewed USDC amount, or at most the shares held.
   if (!tokenInputs.length) throw new EarnRequestMismatch('token inputs')
@@ -225,13 +243,14 @@ export function assertEarnExecuteMatches(record: Pick<EarnJournalRecord, 'accoun
   }
   const pullLimit = record.action === 'deposit' ? amount : BigInt(record.shareBalanceRaw ?? '0')
   if (record.action === 'deposit' ? pulled !== pullLimit : pulled === 0n || pulled > pullLimit) throw new EarnRequestMismatch('token inputs')
+  if (redeemShares !== undefined && pulled !== redeemShares) throw new EarnRequestMismatch('redeem input shares')
   // Every token the adapter hands out (shares, refunds) goes to this wallet.
   const tokens = params.tokens.map(t => [lc(t.token), lc(t.beneficiary)])
   if (!tokens.length || tokens.some(([, beneficiary]) => beneficiary !== account) || !tokens.some(([t]) => t === output) || !tokens.some(([t]) => t === asset)) throw new EarnRequestMismatch('beneficiary')
 }
 
 // Which reviewed step a wallet request is. Anything else never reaches the wallet.
-export function classifyEarnRequest(record: Pick<EarnJournalRecord, 'account' | 'vault' | 'action' | 'amountRaw' | 'shareBalanceRaw'>, tx: any): 'approve' | 'execute' {
+export function classifyEarnRequest(record: Pick<EarnJournalRecord, 'account' | 'vault' | 'action' | 'amountRaw' | 'shareBalanceRaw' | 'redeemShareLimitRaw'>, tx: any): 'approve' | 'execute' {
   if (lc(tx?.from) !== record.account) throw new Error('The transaction was prepared for another wallet account. Nothing was sent.')
   if (tx.chainId !== undefined && Number(tx.chainId) !== EARN_CHAIN_ID) throw new Error('The transaction was prepared for another network. Nothing was sent.')
   if (tx.value !== undefined && BigInt(tx.value) !== 0n) throw new EarnRequestMismatch('value')
@@ -256,9 +275,40 @@ export function classifyEarnRequest(record: Pick<EarnJournalRecord, 'account' | 
 
 type Eip1193 = { request: (args: { method: string; params?: any }) => Promise<any> }
 
+// Share-first redemption is a separate, strictly bounded path.
+function isRedeemExecute(record: EarnJournalRecord, tx: any): boolean {
+  if (record.action !== 'withdraw' || lc(tx?.to) !== EARN_ADAPTER) return false
+  try {
+    const outer = decodeFunctionData({ abi: EXECUTE_ABI, data: tx.data })
+    if (outer.functionName !== 'execute' || outer.args[0].instructions.length !== 1) return false
+    return decodeFunctionData({ abi: INSTRUCTION_ABI, data: outer.args[0].instructions[0].data }).functionName === 'redeem'
+  } catch { return false }
+}
+
+// Reject when independent onchain vault previews do not match the reviewed USDC
+// or share allowance. 0.5% max drift, never above the wallet's held shares.
+async function independentRedeemCap(record: EarnJournalRecord, client: any, tx: any): Promise<string> {
+  const outer = decodeFunctionData({ abi: EXECUTE_ABI, data: tx.data })
+  const inner = decodeFunctionData({ abi: INSTRUCTION_ABI, data: outer.args[0].instructions[0].data })
+  if (inner.functionName !== 'redeem') throw new Error('Not redeem')
+  const shares = inner.args[0]
+  if (shares <= 0n) throw new Error('Invalid redeem shares')
+  const [required, assets] = await Promise.all([
+    client.readContract({ address: record.vault, abi: WITHDRAW_PREVIEW_ABI, functionName: 'previewWithdraw', args: [BigInt(record.amountRaw)] }),
+    client.readContract({ address: record.vault, abi: WITHDRAW_PREVIEW_ABI, functionName: 'previewRedeem', args: [shares] }),
+  ])
+  const floor = (BigInt(record.amountRaw) * 995n) / 1000n
+  if (typeof required !== 'bigint' || required <= 0n || typeof assets !== 'bigint' || assets < floor) throw new Error('Vault preview mismatch')
+  const owned = BigInt(record.shareBalanceRaw ?? '0')
+  const withDrift = (required * 1005n + 999n) / 1000n + 1n
+  const cap = withDrift < owned ? withDrift : owned
+  if (!cap || shares > cap) throw new Error('Excessive redeem shares')
+  return cap.toString()
+}
+
 // Wallet provider for one journaled operation: at most one approval followed by
 // exactly one execute, each matching the review, each journaled before it is sent.
-export function guardEarnProvider(provider: Eip1193, recordId: string): Eip1193 {
+export function guardEarnProvider(provider: Eip1193, recordId: string, client?: any): Eip1193 {
   const refuse = (reason: string): never => {
     try {
       patchEarnRecord(recordId, r => r.outcome === 'sending' ? { ...r, lastError: reason } : r)
@@ -272,10 +322,16 @@ export function guardEarnProvider(provider: Eip1193, recordId: string): Eip1193 
       }
       if (args.method !== 'eth_sendTransaction') return provider.request(args)
       const tx = args.params?.[0] ?? {}
-      const record = getEarnRecord(recordId)
+      let record = getEarnRecord(recordId)
       if (!record || record.outcome !== 'sending') return refuse('This Earn operation is no longer active. Nothing was sent.')
       let kind: 'approve' | 'execute'
       try {
+        if (isRedeemExecute(record, tx)) {
+          if (!client) throw new Error('Independent vault preview unavailable. Nothing was sent.')
+          const redeemShareLimitRaw = await independentRedeemCap(record, client, tx)
+          // Save before a signature, so a reload/recovery uses the exact cap.
+          record = saveEarnRecord({ ...record, redeemShareLimitRaw })
+        }
         kind = classifyEarnRequest(record, tx)
       } catch (error) {
         return refuse(error instanceof Error ? error.message : 'The wallet request does not match the reviewed Earn operation. Nothing was sent.')
@@ -326,7 +382,9 @@ function vaultMovementProven(record: EarnJournalRecord, logs: any[]) {
   const amount = BigInt(record.amountRaw), usdc = transfers(logs, ARC_USDC), shares = transfers(logs, record.vault)
   return record.action === 'deposit'
     ? usdc.some(t => t.from === record.account && t.to === EARN_ADAPTER && t.value === amount) && shares.some(t => t.to === record.account && t.value > 0n)
-    : usdc.some(t => t.from === EARN_ADAPTER && t.to === record.account && t.value === amount) && shares.some(t => t.from === record.account && t.to === EARN_ADAPTER && t.value > 0n)
+    : usdc.some(t => t.from === EARN_ADAPTER && t.to === record.account
+      && (record.redeemShareLimitRaw ? t.value >= (amount * 995n) / 1000n : t.value === amount))
+      && shares.some(t => t.from === record.account && t.to === EARN_ADAPTER && t.value > 0n)
 }
 
 type Settled = Pick<EarnJournalRecord, 'outcome' | 'executeHash' | 'evidence' | 'lastError'>
@@ -444,7 +502,7 @@ export async function runEarnOperation(input: {
   let sdkTxHash: string | undefined
   let sdkError: unknown
   try {
-    const adapter = await input.createAdapter(guardEarnProvider(input.walletProvider, record.id))
+    const adapter = await input.createAdapter(guardEarnProvider(input.walletProvider, record.id, client))
     const params = {
       from: { adapter, chain: input.chain },
       vaultAddress: vault,
