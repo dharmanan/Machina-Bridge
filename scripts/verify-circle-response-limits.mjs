@@ -9,7 +9,7 @@ let count = 0
 async function test(name, fn) { await fn(); count++; console.log('PASS ' + name) }
 await test('only the exact Circle Borrow/Swap origin and service paths are guarded', () => {
   for (const path of ['/v1/borrowKit/markets', '/v1/stablecoinKits/quote', '/v1/stablecoinKits/swap']) assert.equal(isCircleGuardedRequest('https://api.circle.com' + path), true)
-  for (const u of ['https://api.circle.com.attacker.invalid/v1/borrowKit/x', 'http://api.circle.com/v1/borrowKit/x', 'https://api.circle.com/v1/earnKit/quote', 'https://api.circle.com/v1/cctp/x', '/api/borrow-markets']) assert.equal(isCircleGuardedRequest(u), false)
+  for (const u of ['https://api.circle.com.attacker.invalid/v1/borrowKit/x', 'http://api.circle.com/v1/borrowKit/x', 'https://api.circle.com/v1/cctp/x', '/api/borrow-markets']) assert.equal(isCircleGuardedRequest(u), false)
 })
 await test('valid economic JSON bytes, status, headers and errors are preserved without reserialization', async () => {
   const json = '{"amount":"1000000000000000000000000000000000","data":"0x1234","gas":52000}'

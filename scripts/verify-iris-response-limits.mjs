@@ -39,13 +39,13 @@ function jsonOfSize(n) {
 const slowStream = () => { let cancelled = false; return { cancelled: () => cancelled, stream: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"messages":[')) }, pull() { return new Promise(() => {}) }, cancel() { cancelled = true } }) } }
 
 // ------------------------------------------------------------------ scope
-await test('only https://iris-api.circle.com/v2/messages/ joins the guard; Earn, fee quote, reattest, sandbox and RPC pass through', async () => {
+await test('Iris messages and Earn service use separately scoped profiles; fee quote, reattest, sandbox and RPC pass through', async () => {
   for (const u of [IRIS, 'https://iris-api.circle.com/v2/messages/5?transactionHash=x', 'https://iris-api.circle.com/v2/messages/8?transactionHash=x',
     'https://api.circle.com/v1/stablecoinKits/quote', 'https://api.circle.com/v1/borrowKit/markets']) assert.equal(L.isCircleGuardedRequest(u), true, u)
+  for (const u of ['https://api.circle.com/v1/earnKit/vaults/explore?chain=ARC', 'https://api.circle.com/v1/earnKit/deposit/quote']) assert.equal(L.isCircleGuardedRequest(u), true, u)
   const untouched = ['https://iris-api.circle.com/v2/burn/USDC/fees/26/5', 'https://iris-api.circle.com/v2/reattest/0xabc', 'https://iris-api.circle.com/v2/quote/burn/usdc/26/5',
     'https://iris-api.circle.com/v2/messages', 'https://iris-api.circle.com/v2/messagesX/5', 'https://iris-api-sandbox.circle.com/v2/messages/26?transactionHash=x',
-    'http://iris-api.circle.com/v2/messages/26', 'https://iris-api.circle.com.attacker.invalid/v2/messages/26', 'https://api.circle.com/v1/earnKit/vaults/explore?chain=ARC',
-    'https://api.circle.com/v1/earnKit/deposit/quote', 'https://api.circle.com/v2/messages/26', '/api/solana-rpc', 'https://rpc.mainnet.arc.io']
+    'http://iris-api.circle.com/v2/messages/26', 'https://iris-api.circle.com.attacker.invalid/v2/messages/26', 'https://api.circle.com/v2/messages/26', '/api/solana-rpc', 'https://rpc.mainnet.arc.io']
   for (const u of untouched) {
     assert.equal(L.isCircleGuardedRequest(u), false, u)
     const original = new Response('<html>not json</html>', { status: 503 }), init = { method: 'POST', body: '{"x":1}', headers: { a: 'b' } }

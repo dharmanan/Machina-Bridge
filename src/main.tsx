@@ -16,8 +16,8 @@ const globalScope = globalThis as typeof globalThis & {
 globalScope.Buffer ??= Buffer
 globalScope.global ??= globalThis
 
-// Once, before any render: bounds Circle Borrow/Swap service bodies and Iris /v2/messages/ reads.
-// Every other request (Earn, RPC, wallets, other Circle paths) passes through unchanged.
+// Once, before any render: bounds Circle Borrow/Swap/Earn service bodies and Iris /v2/messages/ reads.
+// RPC, wallets and unrelated Circle paths pass through unchanged.
 installCircleResponseLimits()
 
 const root = createRoot(document.getElementById('root')!)
