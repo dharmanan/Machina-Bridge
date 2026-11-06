@@ -81,6 +81,7 @@
    "verify-solana-fee-estimate",
    "verify-solana-rpc-proxy-security",
    "verify-iris-response-limits",
+   "verify-circle-telemetry-disabled",
    "verify-earn-response-limits",
    "verify-earn-fee-disclosure"
   ],
@@ -208,6 +209,7 @@
   "verify-solana-fee-estimate": "solana-bridge",
   "verify-solana-rpc-proxy-security": "security",
   "verify-iris-response-limits": "security",
+  "verify-circle-telemetry-disabled": "security",
   "verify-earn-response-limits": "security"
  },
  "manual": {

@@ -52,7 +52,7 @@ type SupportedChain = {
   isTestnet?: boolean
 }
 
-const earnKit = new EarnKit()
+const earnKit = new EarnKit({ disableAnalytics: true, disableErrorReporting: true })
 const ARC_MAINNET_CHAIN_ID = 5042
 const MORPHO_GRAPHQL_ENDPOINT = 'https://api.morpho.org/graphql'
 

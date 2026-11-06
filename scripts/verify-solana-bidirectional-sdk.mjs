@@ -80,8 +80,12 @@ function evmRpc(method,params){
  if(method==='eth_getBlockByNumber')return{number:'0x10',hash:'0x'+'12'.repeat(32),timestamp:'0x1',baseFeePerGas:'0x1',gasLimit:'0x1000000',gasUsed:'0x1000',transactions:[],parentHash:'0x'+'00'.repeat(32),sha3Uncles:'0x'+'00'.repeat(32),logsBloom:'0x'+'00'.repeat(256),transactionsRoot:'0x'+'00'.repeat(32),stateRoot:'0x'+'00'.repeat(32),receiptsRoot:'0x'+'00'.repeat(32),miner:evm,difficulty:'0x0',totalDifficulty:'0x0',extraData:'0x',size:'0x1',nonce:'0x0000000000000000',mixHash:'0x'+'00'.repeat(32),uncles:[]}
  throw Error('UNHANDLED_EVM_RPC '+method)
 }
+const PRODUCTION_BRIDGE_KIT_OPTIONS={disableErrorReporting:true}
 globalThis.fetch=async(url,init)=>{
- const u=String(url);s.calls.push(u.includes('iris-api')?'circle':JSON.parse(init.body).method)
+ const u=String(url)
+ // F5: Circle SDK telemetry is recorded separately; it is not an operational Circle API call.
+ if(u.endsWith('/v1/stablecoinKits/logs')){s.telemetry.push(JSON.parse(init.body));return new Response('{}',{status:200})}
+ s.calls.push(u.includes('iris-api')?'circle':JSON.parse(init.body).method)
  if(u.includes('iris-api.circle.com')&&u.includes('/fees/'))return new Response(JSON.stringify([{finalityThreshold:1000,minimumFee:'0.3'},{finalityThreshold:2000,minimumFee:'0'}]),{status:200})
  if(u.includes('iris-api.circle.com')){assert.ok(!init?.method||init.method==='GET','no re-attestation POST');return new Response(JSON.stringify(s.badAttestation?{messages:[{...s.attestation,message:null}]}:{messages:[s.attestation]}),{status:200})}
  const q=JSON.parse(init.body);const run=x=>({jsonrpc:'2.0',id:x.id,result:x.method.startsWith('eth_')?evmRpc(x.method,x.params):solRpc(x.method,x.params)})
@@ -92,10 +96,11 @@ globalThis.window={location:{origin:'https://fixture.invalid'},localStorage,disp
 globalThis.WebSocket=class{constructor(url){queueMicrotask(()=>url.includes('working.fixture')?this.onerror?.():this.onopen?.())}send(raw){const q=JSON.parse(raw);queueMicrotask(()=>this.onmessage?.({data:JSON.stringify({id:q.id,result:1})}))}close(){}}
 async function scenario(direction,options={}){
  store.clear()
- s={direction,calls:[],evmPackets:0,solPackets:0,solAttempts:0,wallets:0,ataExists:!options.missingAta,attestation:attestation(direction),...options}
+ s={direction,calls:[],telemetry:[],evmPackets:0,solPackets:0,solAttempts:0,wallets:0,ataExists:!options.missingAta,attestation:attestation(direction),...options}
  if(options.wrongAttestation)s.attestation.decodedMessage.decodedMessageBody.amount='999999'
  if(options.tamperedMessage){const b=Buffer.from(s.attestation.message.slice(2),'hex');b[184]^=1;s.attestation.message='0x'+b.toString('hex')}
- const kit=new BridgeKit({disableErrorReporting:true});const chains=kit.getSupportedChains()
+ // Production options (src/hooks: useBridgeKit, useMainnetSolanaCctp, useSolanaBridge); kitConfig only for the F5 baseline.
+ const kit=new BridgeKit(options.kitConfig??PRODUCTION_BRIDGE_KIT_OPTIONS);const chains=kit.getSupportedChains()
  const sol={...chains.find(x=>x.name==='Solana'),rpcEndpoints:['https://sol.fixture.invalid']},arc={...chains.find(x=>x.chainId===5042),rpcEndpoints:['https://arc.fixture.invalid']}
  const expected=direction==='solana-to-arc'?{kind:'burn',owner,amountRaw:100000n,evmRecipient:evm,maxFeeRaw:3n}:{kind:'receive',owner,amountRaw:100000n,exactMessage:s.attestation.message}
  const connection=options.legacy?new Connection('https://working.fixture.invalid/api/solana-rpc',{commitment:'confirmed',fetch:(...a)=>globalThis.fetch(...a)}):C.createSolanaBridgeConnection(window.location.origin)
@@ -121,7 +126,7 @@ async function scenario(direction,options={}){
   solana.options.signer.signTransaction=t=>P.createReadOnlySolanaProvider(phantom,expected).signTransaction(t)
   const quote=await kit.estimate({...args,amount:'0.1',config:{maxFee:'0.000003'}})
   assert.equal(s.wallets,0);assert.equal(s.solPackets,0);assert.equal(s.evmPackets,0)
-  assert.ok(quote);console.log('PASS real SDK estimate missing ATA never requests wallet access or signature');return
+  assert.ok(quote);await new Promise(r=>setTimeout(r,0));assert.deepEqual(s.telemetry,[],'F5: production BridgeKit options send no Circle SDK telemetry');console.log('PASS real SDK estimate missing ATA never requests wallet access or signature');return
  }
  const result=await kit.bridge({...args,amount:'0.1',...(options.legacy?{}:{config:{maxFee:'0.000003'}})})
 
@@ -151,6 +156,9 @@ async function scenario(direction,options={}){
  if(options.reject||options.securityBlocked||options.broadcastFail||options.expireAfterWallet||options.confirmationFail)assert.ok(before.wallets<=1,'no automatic second wallet request')
  if(options.missingAta&&!options.expectedError)assert.ok(s.wallets<=2,'only ATA then receive')
  assert.equal(locks.size,2,'B1 retains both locks through the whole SDK run')
+ await new Promise(r=>setTimeout(r,0))
+ if(options.expectTelemetry)assert.ok(s.telemetry.length>0&&s.telemetry.every(t=>t.sdkName==='bridge-kit'&&t.errorDetails),'F5 baseline: the default BridgeKit reports this error state')
+ else assert.deepEqual(s.telemetry,[],'F5: production BridgeKit options send no Circle SDK telemetry')
  console.log(`PASS real SDK ${direction} ${options.name??'complete lifecycle'}: ${result.state}, ${result.steps.map(x=>x.name+':'+x.state).join(', ')}; controlled wallet=${s.wallets}, EVM=${s.evmPackets}, Solana=${s.solPackets}`)
  return {result,before,state:s}
  },evidence)
@@ -170,9 +178,16 @@ const cases=[
  ['arc-to-solana',{name:'ATA wallet blocked, external ATA race cannot cause another prompt',missingAta:true,securityBlocked:true,ataRace:true,expectedError:true}],
  ['arc-to-solana',{name:'attestation amount mismatch',wrongAttestation:true,expectedError:true}],
  ['arc-to-solana',{name:'raw message recipient differs from decoded API fields',tamperedMessage:true,expectedError:true}],
+ // F5 baselines: the same error states with the DEFAULT BridgeKit options report to Circle; results and evidence are identical.
+ ['solana-to-arc',{name:'F5 baseline: default BridgeKit, wallet rejection',reject:true,expectedError:true,kitConfig:{},expectTelemetry:true}],
+ ['arc-to-solana',{name:'F5 baseline: default BridgeKit, attestation amount mismatch',wrongAttestation:true,expectedError:true,kitConfig:{},expectTelemetry:true}],
 ]
-for(const[direction,options]of cases)await scenario(direction,options)
+const outcomes=new Map()
+for(const[direction,options]of cases){const r=await scenario(direction,options);if(r?.result)outcomes.set(options.name??direction,{state:r.result.state,steps:r.result.steps.map(x=>x.name+':'+x.state),wallets:r.state.wallets,evm:r.state.evmPackets,sol:r.state.solPackets,calls:r.state.calls})}
 assert.equal(locks.size,0)
+// F5: disabling Circle SDK telemetry changes neither the SDK result, the steps, wallet/broadcast counts nor operational calls.
+for(const[base,name]of[['wallet rejection','F5 baseline: default BridgeKit, wallet rejection'],['attestation amount mismatch','F5 baseline: default BridgeKit, attestation amount mismatch']])assert.deepEqual(outcomes.get(name),outcomes.get(base),base)
+console.log('PASS F5: production and default BridgeKit options give identical results, steps, wallet/broadcast counts and Circle/RPC calls for the same error states')
 // F4-B1: the same real SDK lifecycles again with the app's startup Circle response guard installed over the
 // controlled transport (Iris /v2/messages/ reads become byte/time bounded; everything else passes through).
 const CRL=require('../src/lib/circleResponseLimits.ts'),unguarded=globalThis.fetch
