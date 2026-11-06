@@ -80,6 +80,7 @@
    "verify-solana-bidirectional-sdk",
    "verify-solana-fee-estimate",
    "verify-solana-rpc-proxy-security",
+   "verify-iris-response-limits",
    "verify-earn-fee-disclosure"
   ],
   "full": [
@@ -204,7 +205,8 @@
   "verify-solana-source-stability": "solana-bridge",
   "verify-solana-bidirectional-sdk": "solana-bridge",
   "verify-solana-fee-estimate": "solana-bridge",
-  "verify-solana-rpc-proxy-security": "security"
+  "verify-solana-rpc-proxy-security": "security",
+  "verify-iris-response-limits": "security"
  },
  "manual": {
   "verify-mainnet-cctp-production": "live Mainnet reads (npm run verify:mainnet-cctp)",

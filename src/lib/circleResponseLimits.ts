@@ -1,38 +1,54 @@
 // Permanent, origin/path-scoped guard, never a temporary fetch replacement around an awaited SDK call.
-// Only Borrow/Swap service bodies are bounded. Bridge/Earn, wallet RPC and all other fetches pass through unchanged.
+// Bounded: Borrow/Swap service bodies and Circle Iris CCTP message reads (`/v2/messages/` only).
+// Earn, Iris fee quotes and reattestation, wallet RPC and all other fetches pass through unchanged.
 export const CIRCLE_RESPONSE_LIMITS = Object.freeze({ bytes: 256 * 1024, nodes: 8192, depth: 32, width: 256, string: 128 * 1024, timeoutMs: 8000 })
+// Iris messages: a real Mainnet response is ~1.3 KB per message; app recovery already caps it at 256 KiB/10 s.
+// BridgeKit polling passes its own 2 s abort signal, which still wins for SDK calls. Non-2xx bodies keep their
+// bytes, status and headers unparsed (404/429/5xx handling stays with the caller and the SDK retry policy).
+export const IRIS_MESSAGES_RESPONSE_LIMITS = Object.freeze({ bytes: 256 * 1024, nodes: 8192, depth: 32, width: 256, string: 128 * 1024, timeoutMs: 10_000 })
+type CircleResponseLimits = Readonly<Record<'bytes' | 'nodes' | 'depth' | 'width' | 'string' | 'timeoutMs', number>>
+type GuardProfile = { limits: CircleResponseLimits; validateErrorBodies: boolean }
+const SERVICE_PROFILE: GuardProfile = { limits: CIRCLE_RESPONSE_LIMITS, validateErrorBodies: true }
+const IRIS_MESSAGES_PROFILE: GuardProfile = { limits: IRIS_MESSAGES_RESPONSE_LIMITS, validateErrorBodies: false }
 export class CircleResponseLimitError extends Error {
   constructor(readonly code: 'body_size' | 'json_shape' | 'timeout' | 'invalid_json') { super(`Circle service response unavailable (${code}).`); this.name = 'CircleResponseLimitError' }
 }
 const guarded = new WeakSet<typeof fetch>()
-export function isCircleGuardedRequest(input: RequestInfo | URL): boolean {
+function guardProfile(input: RequestInfo | URL): GuardProfile | null {
   try {
     const url = new URL(input instanceof Request ? input.url : String(input))
-    return url.origin === 'https://api.circle.com' && (url.pathname.startsWith('/v1/borrowKit/') || url.pathname.startsWith('/v1/stablecoinKits/'))
-  } catch { return false }
+    if (url.origin === 'https://api.circle.com' && (url.pathname.startsWith('/v1/borrowKit/') || url.pathname.startsWith('/v1/stablecoinKits/'))) return SERVICE_PROFILE
+    if (url.origin === 'https://iris-api.circle.com' && url.pathname.startsWith('/v2/messages/')) return IRIS_MESSAGES_PROFILE
+    return null
+  } catch { return null }
 }
-export function assertBoundedCircleJson(text: string): void {
+export function isCircleGuardedRequest(input: RequestInfo | URL): boolean {
+  return guardProfile(input) !== null
+}
+export function assertBoundedCircleJson(text: string, limits: CircleResponseLimits = CIRCLE_RESPONSE_LIMITS): void {
   let data: unknown
   try { data = JSON.parse(text) } catch { throw new CircleResponseLimitError('invalid_json') }
   const pending: { value: unknown; depth: number }[] = [{ value: data, depth: 0 }]
   let nodes = 0
   while (pending.length) {
     const { value, depth } = pending.pop()!
-    if (++nodes > CIRCLE_RESPONSE_LIMITS.nodes || depth > CIRCLE_RESPONSE_LIMITS.depth) throw new CircleResponseLimitError('json_shape')
-    if (typeof value === 'string' && value.length > CIRCLE_RESPONSE_LIMITS.string) throw new CircleResponseLimitError('json_shape')
+    if (++nodes > limits.nodes || depth > limits.depth) throw new CircleResponseLimitError('json_shape')
+    if (typeof value === 'string' && value.length > limits.string) throw new CircleResponseLimitError('json_shape')
     if (!value || typeof value !== 'object') continue
-    if (Array.isArray(value) && value.length > CIRCLE_RESPONSE_LIMITS.width) throw new CircleResponseLimitError('json_shape')
+    if (Array.isArray(value) && value.length > limits.width) throw new CircleResponseLimitError('json_shape')
     const keys = Object.keys(value)
-    if (keys.length > CIRCLE_RESPONSE_LIMITS.width) throw new CircleResponseLimitError('json_shape')
+    if (keys.length > limits.width) throw new CircleResponseLimitError('json_shape')
     for (const key of keys) {
-      if (key.length > CIRCLE_RESPONSE_LIMITS.string) throw new CircleResponseLimitError('json_shape')
+      if (key.length > limits.string) throw new CircleResponseLimitError('json_shape')
       pending.push({ value: (value as Record<string, unknown>)[key], depth: depth + 1 })
     }
   }
 }
 export function createBoundedCircleFetch(underlying: typeof fetch): typeof fetch {
   const bounded: typeof fetch = async (input, init) => {
-    if (!isCircleGuardedRequest(input)) return underlying(input, init)
+    const profile = guardProfile(input)
+    if (!profile) return underlying(input, init)
+    const limits = profile.limits
     const controller = new AbortController(), signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
     if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
     let rejectAbort: (reason: unknown) => void = () => {}
@@ -46,7 +62,7 @@ export function createBoundedCircleFetch(underlying: typeof fetch): typeof fetch
       if (controller.signal.aborted) { void response.body?.cancel().catch(() => {}); throw controller.signal.reason }
       if (!response.body) return response
       const declared = response.headers.get('content-length')
-      if (declared !== null && /^\d+$/.test(declared) && BigInt(declared) > BigInt(CIRCLE_RESPONSE_LIMITS.bytes)) {
+      if (declared !== null && /^\d+$/.test(declared) && BigInt(declared) > BigInt(limits.bytes)) {
         void response.body.cancel().catch(() => {}); throw new CircleResponseLimitError('body_size')
       }
       reader = response.body.getReader()
@@ -57,16 +73,17 @@ export function createBoundedCircleFetch(underlying: typeof fetch): typeof fetch
         const { done, value } = await reader.read()
         if (done) break
         size += value.byteLength
-        if (size > CIRCLE_RESPONSE_LIMITS.bytes) throw new CircleResponseLimitError('body_size')
+        if (size > limits.bytes) throw new CircleResponseLimitError('body_size')
         chunks.push(value)
       }
       const bytes = new Uint8Array(size)
       let offset = 0
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
-      if (size) {
+      // Error bodies of profiles that do not validate them stay byte-bounded but unparsed (HTML/plain error pages pass).
+      if (size && (response.ok || profile.validateErrorBodies)) {
         let text: string
         try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { throw new CircleResponseLimitError('invalid_json') }
-        assertBoundedCircleJson(text)
+        assertBoundedCircleJson(text, limits)
       }
       // Preserve original JSON bytes: no number/decimal/calldata reserialization.
       const headers = new Headers(response.headers); headers.delete('content-encoding'); headers.delete('content-length')
@@ -76,7 +93,7 @@ export function createBoundedCircleFetch(underlying: typeof fetch): typeof fetch
     }
     try {
       return await Promise.race([interrupted, work(), new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => { timeout = true; controller.abort(); reject(new CircleResponseLimitError('timeout')) }, CIRCLE_RESPONSE_LIMITS.timeoutMs)
+        timer = setTimeout(() => { timeout = true; controller.abort(); reject(new CircleResponseLimitError('timeout')) }, limits.timeoutMs)
       })])
     } catch (error) {
       controller.abort()
