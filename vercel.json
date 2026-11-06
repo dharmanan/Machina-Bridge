@@ -1,7 +1,7 @@
 {
-  "buildCommand": "npm run build",
+  "buildCommand": "node scripts/apply-zod-collection-backport.mjs --check && npm run build",
   "outputDirectory": "dist",
-  "installCommand": "npm ci",
+  "installCommand": "npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs",
   "framework": "vite",
   "headers": [
     {
