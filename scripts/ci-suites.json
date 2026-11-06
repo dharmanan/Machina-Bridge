@@ -78,7 +78,8 @@
    "verify-solana-bridge-tx-policy",
    "verify-solana-source-stability",
    "verify-solana-bidirectional-sdk",
-   "verify-solana-fee-estimate"
+   "verify-solana-fee-estimate",
+   "verify-earn-fee-disclosure"
   ],
   "full": [
    "verify-release-dependency-security",
@@ -182,6 +183,7 @@
   "verify-fee-display": "sui-bridge",
   "verify-mainnet-cctp-send-ui": "evm-bridge",
   "verify-mainnet-earn-safety-ui": "earn",
+  "verify-earn-fee-disclosure": "earn",
   "verify-swap-execution-config": "swap",
   "verify-earn-kit-real-provider": "earn",
   "verify-swap-unified-ui-a": "swap",
