@@ -433,7 +433,7 @@ export function useBridgeKit() {
     const initBridgeKit = async () => {
       try {
         if (!bridgeKitInstance) {
-          bridgeKitInstance = new BridgeKit();
+          bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
           logger.debug('✅ Bridge Kit initialized');
         }
       } catch (err) {
@@ -693,7 +693,7 @@ export function useBridgeKit() {
         const provider = await getConnectedProvider(sourceChainId);
 
         if (!bridgeKitInstance) {
-          bridgeKitInstance = new BridgeKit();
+          bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
         }
 
         logger.debug(`🌉 Bridging ${amount} ${token} from ${getChainName(sourceChainId)} to ${getChainName(destinationChainId)}`);
@@ -1000,7 +1000,7 @@ export function useBridgeKit() {
       }
 
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       try {
@@ -1093,7 +1093,7 @@ export function useBridgeKit() {
       }
 
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       const supportedChains = bridgeKitInstance.getSupportedChains();
@@ -1147,7 +1147,7 @@ export function useBridgeKit() {
       }
 
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       const supportedChains = bridgeKitInstance.getSupportedChains();
@@ -1216,7 +1216,7 @@ export function useBridgeKit() {
       }
 
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       const all = readBridgeActivitiesForWallet(walletAddress);
@@ -1323,7 +1323,7 @@ export function useBridgeKit() {
   const isTransferReadyToMint = useCallback(
     async (sourceChainId: number, sourceTxHash: string, destinationChainId?: number) => {
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       const supportedChains = bridgeKitInstance.getSupportedChains();
@@ -1374,7 +1374,7 @@ export function useBridgeKit() {
       }
 
       if (!bridgeKitInstance) {
-        bridgeKitInstance = new BridgeKit();
+        bridgeKitInstance = new BridgeKit({ disableErrorReporting: true });
       }
 
       if (!cctpProviderInstance) {

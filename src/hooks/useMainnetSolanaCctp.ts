@@ -605,7 +605,7 @@ export function useMainnetSolanaCctp(
 
   const kitSupport = useMemo(() => {
     try {
-      const kit = new BridgeKit()
+      const kit = new BridgeKit({ disableErrorReporting: true })
       const { solana, arc } = resolveChains(kit)
       return { ready: true, solanaName: solana.name, arcName: arc.name, error: null }
     } catch (error) {
@@ -923,7 +923,7 @@ export function useMainnetSolanaCctp(
       }
       const receiveEntryId = gate.entryId
 
-      const kit = new BridgeKit()
+      const kit = new BridgeKit({ disableErrorReporting: true })
       const { solana, arc } = resolveChains(kit)
       const solanaBridgeChain = {
         ...(solana as any),
@@ -1063,7 +1063,7 @@ export function useMainnetSolanaCctp(
         throw new Error('Connect Phantom first.')
       }
 
-      const kit = new BridgeKit()
+      const kit = new BridgeKit({ disableErrorReporting: true })
       const { solana, arc } = resolveChains(kit)
       const solanaBridgeChain = {
         ...(solana as any),
@@ -1244,7 +1244,7 @@ export function useMainnetSolanaCctp(
         checkFee()
         sourceExecutionStarted = true
         const solanaPolicy = solanaTxExpectation(direction, amount, evmAddress, phantomAddress)
-        const kit = new BridgeKit()
+        const kit = new BridgeKit({ disableErrorReporting: true })
         const { solana, arc } = resolveChains(kit)
         // SDK capability probes derive WSS from rpcEndpoint, not wsEndpoint.
         // The connection's fetch port sends HTTP to our same-origin proxy.

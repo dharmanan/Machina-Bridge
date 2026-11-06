@@ -334,7 +334,7 @@ export function useSolanaBridge() {
         status: 'Confirm the burn on Solana Devnet in Phantom.',
       })
 
-      const kit = new BridgeKit()
+      const kit = new BridgeKit({ disableErrorReporting: true })
       let observedSourceTxHash: string | undefined
       let observedReceiveTxHash: string | undefined
 

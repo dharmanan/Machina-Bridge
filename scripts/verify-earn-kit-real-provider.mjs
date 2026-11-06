@@ -135,10 +135,13 @@ function withdrawParams({ vault = VAULT_A, amount, shares = 4n * 10n ** 17n, rec
     tokens: [{ token: USDC, beneficiary }, { token: vault, beneficiary }], execId: '0x' + 'cd'.repeat(16), deadline: deadline(), metadata: '0x' }
 }
 const realFetch = globalThis.fetch
+const telemetry = []
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url)
   if (url.origin !== 'https://api.circle.com') throw new Error('unexpected network request ' + url)
   const body = init.body ? JSON.parse(init.body) : {}
+  // F5: Circle SDK telemetry is counted separately from the operational Earn API.
+  if (url.pathname === '/v1/stablecoinKits/logs') { telemetry.push(body); return Response.json({}) }
   if (url.pathname.endsWith('/earnKit/deposit') || url.pathname.endsWith('/earnKit/withdraw')) {
     api.requests.push({ path: url.pathname, body })
     const executionParams = api.params(body)
@@ -154,10 +157,12 @@ globalThis.fetch = createBoundedCircleFetch(globalThis.fetch)
 void realFetch
 
 // ---------- one Earn operation, exactly as the app runs it ----------
-const kit = new EarnKit()
+// Same constructor options as src/components/MainnetEarn{Actions,Preview}.tsx (F5: Circle SDK telemetry off).
+const PRODUCTION_EARN_KIT_OPTIONS = { disableAnalytics: true, disableErrorReporting: true }
+const kit = new EarnKit(PRODUCTION_EARN_KIT_OPTIONS), globalKit = kit
 // createViemAdapterFromProvider is async (returns a Promise).
 const createAdapter = async provider => createViemAdapterFromProvider({ provider, getPublicClient: () => publicClient })
-async function run(action, amount, vault = VAULT_A) {
+async function run(action, amount, vault = VAULT_A, kit = globalKit) {
   const amountRaw = raw(amount)
   if (J.runEarnOperation) return J.runEarnOperation({ kit, walletProvider, client: publicClient, createAdapter, chain: 'Arc', account: wallet.account, vault, action, amount, amountRaw })
   // Before the fix: the same sequence the component used.
@@ -323,6 +328,33 @@ await test('the approval itself reverts: the SDK never requests the execute; not
 })
 await test('the journal cannot be written: the real SDK is never called and nothing reaches the wallet', async () => {
   fresh(); storageBroken = true; await assert.rejects(run('deposit', '1'), /could not be saved/); assert.equal(wallet.sends.length, 0); assert.equal(api.requests.length, 0)
+})
+// ---------- F5: Circle SDK telemetry ----------
+const productionTelemetry = telemetry.length
+await test('F5: the production EarnKit options sent no Circle SDK telemetry in any deposit/withdraw success or failure above', () => {
+  assert.equal(productionTelemetry, 0, JSON.stringify(telemetry))
+})
+await test('F5 baseline: the default EarnKit reports a deposit and a withdraw (with txHash); the production options give the same Earn API requests, wallet sends and outcome with none', async () => {
+  const observe = async (action, earnKit) => {
+    fresh(); if (action === 'withdraw') api.params = b => withdrawParams({ amount: v.parseUnits(b.amount, 6) })
+    const before = telemetry.length, { record, sdkError } = await run(action, action === 'deposit' ? '1.25' : '0.4', VAULT_A, earnKit)
+    await new Promise(r => setTimeout(r, 20))
+    return { sent: telemetry.slice(before), api: api.requests.map(r => [r.path, r.body.amount]), sends: sentKinds(), outcome: record.outcome, kinds: record.requests.map(r => [r.kind, r.state]), sdkError: sdkError?.name }
+  }
+  for (const action of ['deposit', 'withdraw']) {
+    const dflt = await observe(action, new EarnKit()), prod = await observe(action, new EarnKit(PRODUCTION_EARN_KIT_OPTIONS))
+    assert.ok(dflt.sent.length >= 1 && dflt.sent.every(t => t.sdkName === 'earn-kit'), `default ${action} reports to /v1/stablecoinKits/logs`)
+    assert.ok(dflt.sent.some(t => t.eventType === `earn_${action}` && /^0x[0-9a-f]{64}$/.test(t.txHash ?? '')), `default ${action} success event carries the txHash`)
+    assert.deepEqual(prod.sent, [], `production ${action} sends no telemetry`)
+    assert.deepEqual({ ...prod, sent: [] }, { ...dflt, sent: [] }, `${action}: identical Earn API requests, wallet sends and journal outcome`)
+    assert.equal(prod.outcome, 'success')
+  }
+})
+await test('F5 baseline: a failing deposit (execute rejected) reports with the default EarnKit and stays silent with the production options; same outcome', async () => {
+  const observe = async earnKit => { fresh(); wallet.queue = ['ok', 'reject']; const before = telemetry.length, { record, sdkError } = await run('deposit', '1', VAULT_A, earnKit); await new Promise(r => setTimeout(r, 20)); return { sent: telemetry.slice(before), outcome: record.outcome, sends: sentKinds(), sdkError: sdkError?.name } }
+  const dflt = await observe(new EarnKit()), prod = await observe(new EarnKit(PRODUCTION_EARN_KIT_OPTIONS))
+  assert.ok(dflt.sent.some(t => t.errorDetails), 'default reports the error'); assert.deepEqual(prod.sent, [])
+  assert.deepEqual({ ...prod, sent: [] }, { ...dflt, sent: [] })
 })
 if (failures.length) { console.log(`RESULT ${count} PASS, ${failures.length} FAIL`); process.exit(1) }
 console.log(`RESULT ${count}/${count} real Earn Kit provider groups PASS; real EarnKit + viem adapter, controlled Arc chain and Circle API; no network.`)

@@ -52,7 +52,7 @@ const ERC20_BALANCE_ABI = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
 ])
 
-const earnKit = new EarnKit()
+const earnKit = new EarnKit({ disableAnalytics: true, disableErrorReporting: true })
 const DEFAULT_AMOUNT = '0.1'
 const REVIEW_TTL_MS = 120_000
 const EXPLORER_BASE = MAINNET_NETWORKS.arc.explorerUrl?.replace(/\/$/, '')
