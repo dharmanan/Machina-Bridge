@@ -147,6 +147,10 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.pathname.endsWith('/earnKit/transactionReport')) return Response.json({ data: { status: 'recorded' } })
   return new Response('{"message":"not found"}', { status: 404 })
 }
+// Run the real SDK's controlled deposit/withdraw signing API through the production fetch guard.
+// No network, wallet broadcast beyond the in-memory chain model, or live Circle calls.
+const { createBoundedCircleFetch } = require('../src/lib/circleResponseLimits.ts')
+globalThis.fetch = createBoundedCircleFetch(globalThis.fetch)
 void realFetch
 
 // ---------- one Earn operation, exactly as the app runs it ----------

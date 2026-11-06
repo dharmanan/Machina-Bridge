@@ -1,15 +1,20 @@
 // Permanent, origin/path-scoped guard, never a temporary fetch replacement around an awaited SDK call.
-// Bounded: Borrow/Swap service bodies and Circle Iris CCTP message reads (`/v2/messages/` only).
-// Earn, Iris fee quotes and reattestation, wallet RPC and all other fetches pass through unchanged.
+// Bounded: Borrow/Swap service bodies, Circle Iris CCTP message reads and Circle EarnKit service responses.
+// Iris fee quotes and reattestation, wallet RPC and unrelated origins pass through unchanged.
 export const CIRCLE_RESPONSE_LIMITS = Object.freeze({ bytes: 256 * 1024, nodes: 8192, depth: 32, width: 256, string: 128 * 1024, timeoutMs: 8000 })
 // Iris messages: a real Mainnet response is ~1.3 KB per message; app recovery already caps it at 256 KiB/10 s.
 // BridgeKit polling passes its own 2 s abort signal, which still wins for SDK calls. Non-2xx bodies keep their
 // bytes, status and headers unparsed (404/429/5xx handling stays with the caller and the SDK retry policy).
 export const IRIS_MESSAGES_RESPONSE_LIMITS = Object.freeze({ bytes: 256 * 1024, nodes: 8192, depth: 32, width: 256, string: 128 * 1024, timeoutMs: 10_000 })
+// F4-B2: separately sized for Earn's growing vault discovery. Observed Mainnet explore: 50.18 KiB,
+// 2562 nodes, 38 vaults, 371 ms; position/quotes: < 0.5 KiB, < 500 ms. Other legitimate
+// responses and future vault growth remain uncertain. Error bodies keep their SDK semantics.
+export const EARN_RESPONSE_LIMITS = Object.freeze({ bytes: 2 * 1024 * 1024, nodes: 65_536, depth: 48, width: 1_024, string: 128 * 1024, timeoutMs: 15_000 })
 type CircleResponseLimits = Readonly<Record<'bytes' | 'nodes' | 'depth' | 'width' | 'string' | 'timeoutMs', number>>
 type GuardProfile = { limits: CircleResponseLimits; validateErrorBodies: boolean }
 const SERVICE_PROFILE: GuardProfile = { limits: CIRCLE_RESPONSE_LIMITS, validateErrorBodies: true }
 const IRIS_MESSAGES_PROFILE: GuardProfile = { limits: IRIS_MESSAGES_RESPONSE_LIMITS, validateErrorBodies: false }
+const EARN_PROFILE: GuardProfile = { limits: EARN_RESPONSE_LIMITS, validateErrorBodies: false }
 export class CircleResponseLimitError extends Error {
   constructor(readonly code: 'body_size' | 'json_shape' | 'timeout' | 'invalid_json') { super(`Circle service response unavailable (${code}).`); this.name = 'CircleResponseLimitError' }
 }
@@ -18,6 +23,7 @@ function guardProfile(input: RequestInfo | URL): GuardProfile | null {
   try {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.origin === 'https://api.circle.com' && (url.pathname.startsWith('/v1/borrowKit/') || url.pathname.startsWith('/v1/stablecoinKits/'))) return SERVICE_PROFILE
+    if (url.origin === 'https://api.circle.com' && url.pathname.startsWith('/v1/earnKit/')) return EARN_PROFILE
     if (url.origin === 'https://iris-api.circle.com' && url.pathname.startsWith('/v2/messages/')) return IRIS_MESSAGES_PROFILE
     return null
   } catch { return null }
