@@ -1,6 +1,6 @@
 // No SDK, network, wallet or environment mutation. These tests ensure the CI guard rejects actual gate openings.
 import assert from 'node:assert/strict'
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -71,7 +71,21 @@ test('Vercel installs exactly the lockfile with the same Node major as CI', () =
   const vercel = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   const workflow = readFileSync(new URL('../.github/workflows/machina-production-verification.yml', import.meta.url), 'utf8')
-  assert.equal(vercel.installCommand, 'npm ci')
+  // Third-party install hooks never run; the repository's own reviewed lifecycle steps run explicitly.
+  const SAFE_INSTALL = 'npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs'
+  assert.equal(vercel.installCommand, SAFE_INSTALL)
+  assert.equal(pkg.scripts.postinstall, 'node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs', 'explicit install steps mirror postinstall')
+  // The explicit check does not depend on npm running the prebuild hook (skipped when ignore-scripts is configured).
+  assert.equal(vercel.buildCommand, 'node scripts/apply-zod-collection-backport.mjs --check && npm run build')
+  assert.equal(pkg.scripts.prebuild, 'node scripts/apply-zod-collection-backport.mjs --check')
+  const installs = [...workflow.matchAll(/^\s*- run: (npm ci\b.*)$/gm)].map(m => m[1].trim())
+  assert.ok(installs.length >= 4, 'every CI job installs the lockfile')
+  for (const command of installs) assert.equal(command, SAFE_INSTALL, 'every CI install uses the reviewed safe install')
+  assert.doesNotMatch(workflow, /NPM_CONFIG_IGNORE_SCRIPTS|npm_config_ignore_scripts/i, 'ignore-scripts must never be a global setting')
+  for (const rc of ['.npmrc', '.github/.npmrc']) {
+    const path = new URL('../' + rc, import.meta.url)
+    if (existsSync(path)) assert.doesNotMatch(readFileSync(path, 'utf8'), /ignore-scripts/i, `${rc} would also skip the prebuild security check`)
+  }
   const ci = [...new Set([...workflow.matchAll(/node-version: '([^']+)'/g)].map(m => m[1]))]
   assert.deepEqual(ci, ['24'], 'every CI job runs the same Node major')
   assert.equal(pkg.engines?.node, ci[0] + '.x', 'Vercel reads engines.node for its runtime and build image')

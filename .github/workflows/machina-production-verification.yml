@@ -34,7 +34,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs
       # Suite scope lives in scripts/ci-suites.json; verify-ci-coverage keeps it in step with the app.
       - name: Typecheck and fast safety suites (CCTP, Sui/Arc wallets, recovery, mismatch, gates)
         run: |
@@ -53,7 +53,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs
       - name: Lint and production bundle (the build runs tsc)
         run: |
           npm run lint
@@ -79,7 +79,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs
       - name: Raw dependency advisories and explicit risk report
         run: |
           if npm audit --omit=dev --json > npm-audit-production.json; then
@@ -113,7 +113,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs
       - name: Playwright browser cache
         id: pw-cache
         uses: actions/cache@v4
@@ -154,7 +154,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts && node scripts/fix-viem-tsconfig.mjs && node scripts/apply-zod-collection-backport.mjs
       - name: Prepare Chromium test dependencies
         run: |
           npm install --no-save --package-lock=false --ignore-scripts playwright-core@1.58.2
