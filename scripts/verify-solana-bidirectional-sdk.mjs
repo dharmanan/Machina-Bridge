@@ -173,4 +173,12 @@ const cases=[
 ]
 for(const[direction,options]of cases)await scenario(direction,options)
 assert.equal(locks.size,0)
-console.log(`RESULT ${cases.length}/${cases.length} real SDK lifecycle groups PASS; all transports controlled; no real signatures, network broadcast or kit.retry`)
+// F4-B1: the same real SDK lifecycles again with the app's startup Circle response guard installed over the
+// controlled transport (Iris /v2/messages/ reads become byte/time bounded; everything else passes through).
+const CRL=require('../src/lib/circleResponseLimits.ts'),unguarded=globalThis.fetch
+let irisGuarded=0
+globalThis.fetch=CRL.createBoundedCircleFetch(async(url,init)=>{if(CRL.isCircleGuardedRequest(url))irisGuarded++;return unguarded(url,init)})
+for(const[direction,options]of cases)await scenario(direction,{...options,name:`${options.name??'happy path'} [Iris guard]`})
+assert.equal(locks.size,0);assert.ok(irisGuarded>0,'BridgeKit attestation reads went through the Iris guard')
+globalThis.fetch=unguarded
+console.log(`RESULT ${cases.length*2}/${cases.length*2} real SDK lifecycle groups PASS (${cases.length} with the Iris response guard; ${irisGuarded} guarded Iris reads); all transports controlled; no real signatures, network broadcast or kit.retry`)
