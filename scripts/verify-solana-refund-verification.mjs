@@ -93,6 +93,16 @@ await test('proxy: 429/503 providers are skipped and the first provider that has
   assert.equal(r.json.result.transaction.signatures[0], d.signature)
   assert.equal(world.upstream.at(-1), 'api.mainnet.solana.com getTransaction')
 })
+await test('proxy: getSignaturesForAddress [] from a provider without history asks the next; [] only when none has history', async () => {
+  const sig = { signature: randomSignature(), slot: 1, err: null, memo: null, blockTime: now(), confirmationStatus: 'finalized' }
+  world.providers[P.publicnode] = { fail: () => Response.json({ jsonrpc: '2.0', id: 1, result: [] }) }
+  world.providers[P.beta] = { fail: () => Response.json({ jsonrpc: '2.0', id: 1, result: [sig] }) }
+  const r = await rpc('getSignaturesForAddress', [randomKey(), { limit: 10, commitment: 'finalized' }])
+  assert.deepEqual(r.json.result, [sig]); assert.deepEqual(world.upstream, ['solana-rpc.publicnode.com getSignaturesForAddress', 'solana.drpc.org getSignaturesForAddress', 'api.mainnet-beta.solana.com getSignaturesForAddress'])
+  world.providers[P.beta] = { fail: () => Response.json({ jsonrpc: '2.0', id: 1, result: [] }) }; world.providers[P.mainnet] = { fail: () => Response.json({ jsonrpc: '2.0', id: 1, result: [] }) }
+  const none = await rpc('getSignaturesForAddress', [randomKey(), { limit: 10 }])
+  assert.equal(none.status, 200); assert.deepEqual(none.json.result, [])
+})
 await test('proxy: null is retried for getTransaction only; an absent account (getAccountInfo null) is the first answer', async () => {
   const r = await rpc('getAccountInfo', [randomKey(), { encoding: 'base64' }])
   assert.equal(r.json.result.value, null); assert.deepEqual(world.upstream, ['solana-rpc.publicnode.com getAccountInfo'])

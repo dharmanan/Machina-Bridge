@@ -131,7 +131,7 @@ await test('Solana bridge SDK Connection works unchanged through the proxy (ever
   assert.equal(sent.length, 2)
   assert.equal(sent[0].body.params[0], Buffer.from(burn.serialize()).toString('base64'))
   assert.equal(sent[1].body.params[0], Buffer.from(receive.serialize()).toString('base64'))
-  assert.ok(upstream.filter(u => u.body.method !== 'getTransaction').every(u => u.url === PROVIDERS[0]), 'happy path stays on the first provider')
+  assert.ok(upstream.filter(u => !['getTransaction', 'getSignaturesForAddress'].includes(u.body.method)).every(u => u.url === PROVIDERS[0]), 'happy path stays on the first provider')
   // getTransaction answered null (no history) by every fake provider: each is asked once, then null is returned.
   assert.deepEqual(upstream.filter(u => u.body.method === 'getTransaction').map(u => u.url), PROVIDERS)
 })
@@ -154,7 +154,8 @@ await test('app direct proxy calls keep their exact shapes (reclaim, recovery, h
     assert.equal(r.status, 200, method)
     assert.deepEqual(r.json.result, RESULTS[method])
     // A null getTransaction (no history on that provider) is asked of every provider; anything else stops at the first.
-    assert.equal(upstream.length, method === 'getTransaction' ? PROVIDERS.length : 1, method)
+    // getSignaturesForAddress [] (fake answers have no history) is also asked of every provider.
+    assert.equal(upstream.length, ['getTransaction', 'getSignaturesForAddress'].includes(method) ? PROVIDERS.length : 1, method)
     for (const u of upstream) assert.deepEqual(u.body, { jsonrpc: '2.0', id: 1, method, params }, `${method} forwarded unchanged`)
   }
 })
