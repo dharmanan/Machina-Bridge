@@ -44,12 +44,13 @@ const unavailable = { 'rpc.ankr.com': all(ANKR), 'solana.drpc.org': all(DRPC) }
 
 let plan, log, signs, sent
 const host = c => new URL(c.rpcEndpoint).hostname
-const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
+const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
 const answers = {
   getAccountInfo: h => (plan[h] && 'info' in plan[h] ? plan[h].info : plan.info === undefined ? account() : plan.info),
   getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
   getLatestBlockhash: () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 100 }),
-  simulateTransaction: () => ({ value: { err: plan.simErr ?? null } }), sendRawTransaction: () => 'controlled-signature', confirmTransaction: () => ({ value: { err: plan.confirmErr ?? null } }),
+  getRecentPrioritizationFees: () => [],
+  simulateTransaction: () => ({ value: { err: plan.simErr ?? null, unitsConsumed: 145_000 } }), sendRawTransaction: () => 'controlled-signature', confirmTransaction: () => ({ value: { err: plan.confirmErr ?? null } }),
 }
 for (const [name, kind] of Object.entries(kinds)) Connection.prototype[name] = async function (...args) {
   const h = host(this); log.push(`${h} ${name}`)

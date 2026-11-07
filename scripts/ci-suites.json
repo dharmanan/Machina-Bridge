@@ -84,6 +84,7 @@
    "verify-circle-telemetry-disabled",
    "verify-solana-reclaim-rpc",
    "verify-solana-refund-verification",
+   "verify-solana-reclaim-signing",
    "verify-earn-response-limits",
    "verify-earn-fee-disclosure"
   ],
@@ -216,6 +217,7 @@
   "verify-testnet-bridge-history-ui": "testnet",
   "verify-solana-reclaim-rpc": "solana-bridge",
   "verify-solana-refund-verification": "solana-bridge",
+  "verify-solana-reclaim-signing": "solana-bridge",
   "verify-earn-response-limits": "security"
  },
  "manual": {
