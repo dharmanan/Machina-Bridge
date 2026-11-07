@@ -216,6 +216,14 @@ export function BridgeTab() {
     }
   })
   const [trackerSnapshot, setTrackerSnapshot] = useState<PendingBridgeRecord | null>(null)
+  // arc_pending_bridge is one record per browser. It is shown, acted on or cleaned up only while the
+  // wallet that started it is connected; for any other wallet it is left untouched in storage, so the
+  // owner can still recover it after reconnecting.
+  const isConnectedWalletRecord = (record: PendingBridgeRecord | null) => Boolean(
+    record && address && String(record.walletAddress ?? '').toLowerCase() === address.toLowerCase(),
+  )
+  const walletPendingBridge = isConnectedWalletRecord(pendingBridge) ? pendingBridge : null
+  const walletTrackerSnapshot = isConnectedWalletRecord(trackerSnapshot) ? trackerSnapshot : null
   const [isBridgeTrackerOpen, setIsBridgeTrackerOpen] = useState(false)
   const [isActivityOpen, setIsActivityOpen] = useState(false)
   const [showFeeDetails, setShowFeeDetails] = useState(false)
@@ -320,8 +328,8 @@ export function BridgeTab() {
       }
     : null
   const trackedBridge = selectedTrackedBridge
-    ?? pendingBridge
-    ?? trackerSnapshot
+    ?? walletPendingBridge
+    ?? walletTrackerSnapshot
     ?? null
   const trackedSourceChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.sourceChainId) : ''
   const trackedDestinationChainName = trackedBridge ? getSupportedEvmChainName(trackedBridge.destinationChainId) : ''
@@ -692,7 +700,7 @@ export function BridgeTab() {
 
   const hasPendingActivity = activityRecords.some(
     (activity) => activity.status !== 'minted' && activity.status !== 'dismissed',
-  ) || Boolean(pendingBridge)
+  ) || Boolean(walletPendingBridge)
 
   useEffect(() => {
     if (!isConnected || !address) {
@@ -764,7 +772,7 @@ export function BridgeTab() {
   }, [trackedBridge, isBridgeTrackerOpen])
 
   useEffect(() => {
-    if (isBridgeTrackerOpen || pendingBridge?.status !== 'minted') {
+    if (isBridgeTrackerOpen || walletPendingBridge?.status !== 'minted') {
       return
     }
 
@@ -773,7 +781,7 @@ export function BridgeTab() {
     setPendingBridge(null)
     setTrackerSnapshot(null)
     setSelectedTrackerKey(null)
-  }, [isBridgeTrackerOpen, pendingBridge])
+  }, [isBridgeTrackerOpen, walletPendingBridge])
 
   useEffect(() => {
     if (!isSolanaMode || SOLANA_FORWARD_CHAIN_IDS.includes(sourceEvmChainId)) {
@@ -1121,9 +1129,9 @@ export function BridgeTab() {
       return
     }
 
-    if (state.step === 'success') {
-      if (pendingBridge) {
-        setTrackerSnapshot(pendingBridge)
+    if (state.step === 'success' && (walletPendingBridge || !pendingBridge)) {
+      if (walletPendingBridge) {
+        setTrackerSnapshot(walletPendingBridge)
       }
       localStorage.removeItem(PENDING_BRIDGE_KEY)
       lastPendingBridgeJsonRef.current = null
@@ -1156,22 +1164,22 @@ export function BridgeTab() {
         localStorage.setItem('bridgeTransactions', JSON.stringify(existingTransactions.slice(0, 100)))
       }
     }
-  }, [bridgeMode, state.step, state.sourceChainId, state.destinationChainId, amount, state.sourceTxHash, state.receiveTxHash, pendingBridge])
+  }, [bridgeMode, state.step, state.sourceChainId, state.destinationChainId, amount, state.sourceTxHash, state.receiveTxHash, pendingBridge, walletPendingBridge])
 
   useEffect(() => {
-    if (!pendingBridge?.receiveTxHash) {
+    if (!walletPendingBridge?.receiveTxHash) {
       return
     }
 
-    const nextKey = JSON.stringify(pendingBridge)
+    const nextKey = JSON.stringify(walletPendingBridge)
     const currentKey = trackerSnapshot ? JSON.stringify(trackerSnapshot) : null
     if (nextKey !== currentKey) {
-      setTrackerSnapshot(pendingBridge)
+      setTrackerSnapshot(walletPendingBridge)
     }
     localStorage.removeItem(PENDING_BRIDGE_KEY)
     lastPendingBridgeJsonRef.current = null
     setPendingBridge(null)
-  }, [pendingBridge, trackerSnapshot])
+  }, [walletPendingBridge, trackerSnapshot])
 
   useEffect(() => {
     if (bridgeMode !== 'solana' || gatewayState.step !== 'success' || !amount || !gatewayState.transferId) {
@@ -1243,24 +1251,24 @@ export function BridgeTab() {
   }, [address])
 
   const handleApprovePendingBridge = useCallback(async () => {
-    if (!pendingBridge) {
+    if (!walletPendingBridge) {
       return
     }
 
-    await approvePendingBridge(pendingBridge)
+    await approvePendingBridge(walletPendingBridge)
     refreshPendingBridge()
     void refreshTrackedTransfers()
-  }, [approvePendingBridge, pendingBridge, refreshTrackedTransfers])
+  }, [approvePendingBridge, walletPendingBridge, refreshTrackedTransfers])
 
   const handleStartPendingBridge = useCallback(async () => {
-    if (!pendingBridge) {
+    if (!walletPendingBridge) {
       return
     }
 
-    await startPendingBridge(pendingBridge)
+    await startPendingBridge(walletPendingBridge)
     refreshPendingBridge()
     void refreshTrackedTransfers()
-  }, [pendingBridge, refreshTrackedTransfers, startPendingBridge])
+  }, [walletPendingBridge, refreshTrackedTransfers, startPendingBridge])
 
   const handleOpenTransferInTracker = useCallback((transfer: TrackedTransfer) => {
     const requestedKey = getTransferKey(transfer.sourceTxHash, transfer.id)
@@ -2545,7 +2553,7 @@ export function BridgeTab() {
                   <ExternalLink size={14} />
                 </a>
               )}
-              {pendingBridge && (
+              {walletPendingBridge && (
                 <button
                   onClick={() => setIsBridgeTrackerOpen(false)}
                   className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
