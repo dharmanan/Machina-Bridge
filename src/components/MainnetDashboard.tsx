@@ -350,7 +350,14 @@ export default function MainnetDashboard() {
       if (!phantomProvider || !phantomAddress) throw new Error('Connect Phantom before reclaiming the refundable SOL deposit.')
       const result = await reclaimMainnetSolanaDeposit({ provider: phantomProvider, connectedWallet: phantomAddress, originalWallet: phantomAddress, metadata: refund })
       const local = findSolanaRefundRecord(phantomAddress, refund.sourceTxHash)
-      if (local) updateMainnetSolanaActivity(local.id, { refundStatus: 'reclaimed', refundTxHash: result.txHash, reclaimedAt: Date.now() })
+      if (local) updateMainnetSolanaActivity(local.id, {
+        messageSentEventAccount: refund.messageSentEventAccount,
+        refundableDepositSol: refund.refundableDepositSol,
+        refundAvailableAt: refund.refundAvailableAt,
+        refundStatus: 'reclaimed',
+        refundTxHash: result.txHash,
+        reclaimedAt: Date.now(),
+      })
       rememberChainReclaim({ wallet: phantomAddress, eventAccount: refund.messageSentEventAccount, sourceTxHash: refund.sourceTxHash, sol: refund.refundableDepositSol, txHash: result.txHash ?? '', at: Date.now() })
       setRefundActions((current) => ({ ...current, [key]: { loading: false, error: null } }))
     } catch (error) {
@@ -545,7 +552,11 @@ export default function MainnetDashboard() {
                       <div>
                         <p className="font-semibold text-slate-900">
                           {reclaimed || verified
-                            ? `${item.refundableDepositSol} SOL refundable`
+                            ? (() => {
+                              // Older records reclaimed from the chain list may lack the amount: use the remembered reclaim.
+                              const amount = item.refundableDepositSol ?? chainReclaims.find((x) => x.sourceTxHash === item.sourceTxHash && x.wallet === item.solanaWallet)?.sol ?? estimate.sol
+                              return amount ? `${amount} SOL refundable` : 'SOL deposit'
+                            })()
                             : estimate.sol
                               ? `~${estimate.sol} SOL refundable (estimate)`
                               : 'Refundable SOL not verified yet'}

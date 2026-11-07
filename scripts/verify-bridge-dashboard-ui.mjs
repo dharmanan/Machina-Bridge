@@ -258,6 +258,13 @@ try {
     await page.reload(); await page.waitForFunction(() => Boolean(window.dashboardUi))
     await page.locator(`[data-refund-source="${elsewhere.signature}"][data-refund-state="reclaimed"]`).waitFor()
     assert.match(await card(elsewhere.signature).innerText(), /Reclaimed/)
+    // An older local record of that transfer marked reclaimed without an amount takes the remembered amount (never "undefined").
+    await page.evaluate(({ s, w, evm }) => localStorage.setItem('machina_mainnet_solana_transfers_v1', JSON.stringify([{ id: 'r-old', evmWallet: evm, solanaWallet: w, direction: 'solana-to-arc', amount: '0.1', status: 'complete', createdAt: Date.now() - 1000, sourceTxHash: s, refundStatus: 'reclaimed', refundTxHash: 'reclaim-tx' }])), { s: elsewhere.signature, w: PHANTOM_FIXTURE, evm: REAL.evm })
+    await page.reload(); await page.waitForFunction(() => Boolean(window.dashboardUi))
+    await card(elsewhere.signature).first().waitFor()
+    const text = await page.locator('[data-refund-state]').allInnerTexts()
+    assert.ok(text.every(t => !/undefined/.test(t)), text.join(' | ')); assert.match(text.join(' '), /0\.0039 SOL refundable[\s\S]*Reclaimed/)
+    assert.equal(await card(elsewhere.signature).count(), 1, 'shown once')
   })
   assert.deepEqual(errors, []); assert.deepEqual(external, [])
   console.log(`RESULT ${count}/${count} Chromium Dashboard/Activity/Bridge groups PASS; 5 real Sui <-> Arc transfers; controlled RPC, gRPC and wallet ports; real network/signatures/broadcasts=0.`)
