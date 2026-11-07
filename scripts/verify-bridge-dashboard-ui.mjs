@@ -9,6 +9,26 @@ import { createServer } from 'vite'
 import { GrpcTypes } from '@mysten/sui/grpc'
 const require = createRequire(import.meta.url)
 const { REAL_SUI_TRANSFERS: REAL, realSuiRecords } = require('./fixtures/real-sui-transfers.cjs')
+// Solana refundable deposits: generated deposits served by the real /api/solana-rpc handler over fake providers.
+const { readFileSync } = require('node:fs'), ts = require('typescript')
+require.extensions['.ts'] = (m, f) => m._compile(ts.transpileModule(readFileSync(f, 'utf8').replaceAll('import.meta.env', '({})'), { fileName: f, compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, f)
+const { makeDeposit } = require('./fixtures/solana-refund-deposits.cjs')
+delete process.env.SOLANA_MAINNET_RPC
+const { default: solanaRpcHandler } = await import('../api/solana-rpc.js')
+const PHANTOM_FIXTURE = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU' // the fixture's Phantom address
+const solanaChain = { txs: new Map(), accounts: new Map(), iris: new Map(), upstream: [] }
+const HISTORY = new Set(['https://api.mainnet-beta.solana.com', 'https://api.mainnet.solana.com'])
+const PROVIDERS = new Set(['https://solana-rpc.publicnode.com', 'https://solana.drpc.org', ...HISTORY, 'https://rpc.ankr.com/solana'])
+const nodeFetch = globalThis.fetch
+globalThis.fetch = async (input, init) => {
+  const url = String(input)
+  if (!PROVIDERS.has(url)) return nodeFetch(input, init)
+  const body = JSON.parse(init.body), ok = result => Response.json({ jsonrpc: '2.0', id: body.id, result })
+  solanaChain.upstream.push(`${new URL(url).hostname} ${body.method}`)
+  if (body.method === 'getTransaction') return ok(HISTORY.has(url) ? solanaChain.txs.get(body.params[0]) ?? null : null) // publicnode: no old history
+  if (body.method === 'getMultipleAccounts') return ok({ context: { slot: 1 }, value: body.params[0].map(a => solanaChain.accounts.get(a) ?? null) })
+  return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'not used here' } })
+}
 let chromium; try { ({ chromium } = require('playwright-core')) } catch { ({ chromium } = require('/opt/codex/runtimes/cua/lib/node_modules/playwright-core')) }
 const root = fileURLToPath(new URL('..', import.meta.url)), out = process.env.MACHINA_SUI_SCREEN_DIR || '/tmp/machina-bridge-dashboard-screens'; mkdirSync(out, { recursive: true })
 const wagmiMock = `export function useAccount(){const on=window.dashboardUi?.state.wallets.evm!==false;return on?{address:'${REAL.evm}',isConnected:true,chainId:5042,connector:{name:'MetaMask'}}:{address:undefined,isConnected:false}}
@@ -18,6 +38,12 @@ const server = await createServer({ root, configFile: false, cacheDir: '/tmp/mac
   resolveId(id) { if (id === 'wagmi') return '\0dash-wagmi'; if (id === 'wagmi/actions') return '\0dash-wagmi-actions'; if (id.endsWith('/lib/wagmi.config')) return '\0dash-wagmi-config' },
   load(id) { if (id === '\0dash-wagmi') return wagmiMock; if (id === '\0dash-wagmi-actions') return 'export async function getWalletClient(){throw Error("not used")}'; if (id === '\0dash-wagmi-config') return 'export const wagmiConfig={}' },
   configureServer(s) {
+    s.middlewares.use('/api/solana-rpc', async (req, res) => {
+      let raw = ''; for await (const chunk of req) raw += chunk
+      const out = { statusCode: 0, body: '', status(c) { this.statusCode = c; return this }, setHeader(k, v) { res.setHeader(k, v); return this }, send(b) { this.body = b; return this } }
+      await solanaRpcHandler({ method: req.method, headers: { 'content-type': 'application/json' }, body: JSON.parse(raw) }, out)
+      res.statusCode = out.statusCode; res.end(out.body)
+    })
     s.middlewares.use('/api/arc-wallet-activity', (_req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ transactions: [], tokenTransfers: [], limit: 30 })) })
     s.middlewares.use('/__dashboard', async (_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(await s.transformIndexHtml('/__dashboard', '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div><script type="module" src="/scripts/fixtures/bridge-dashboard-ui.tsx"></script></body></html>')) })
   } }], server: { host: '127.0.0.1', port: 0 } })
@@ -50,6 +76,10 @@ try {
         response = GrpcTypes.GetBalanceResponse.fromJson({ balance: { coinType: input.coinType, balance: usdc ? '300000' : '1000000000', coinBalance: usdc ? '300000' : '1000000000', addressBalance: '0' } })
       } else throw Error('Unapproved Sui method ' + name)
       return route.fulfill({ status: 200, headers, body: frame(Buffer.from(GrpcTypes[name + 'Response'].toBinary(response))) })
+    }
+    if (url.hostname === 'iris-api.circle.com') {
+      const payload = solanaChain.iris.get(url.searchParams.get('transactionHash'))
+      return route.fulfill({ status: payload ? 200 : 404, headers: { 'access-control-allow-origin': '*', 'content-type': 'application/json' }, body: payload ? JSON.stringify(payload) : '' })
     }
     if (url.hostname === 'solana-rpc.publicnode.com') return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ jsonrpc: '2.0', id: 1, result: { value: { data: { parsed: { info: { tokenAmount: { uiAmountString: '2.5' } } } } } } }) })
     if (req.method() === 'POST' && /"jsonrpc"/.test(req.postData() ?? '')) {
@@ -155,6 +185,49 @@ try {
       for (const t of ['dashboard', 'activity']) { await tab(t); await rows().first().waitFor(); assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${t} ${name}`); await page.screenshot({ path: `${out}/${t}-${name}.png`, fullPage: true }) }
     }
     await page.setViewportSize({ width: 1280, height: 900 })
+  })
+  await test('Solana deposits: estimates never mean eligible; Verify deposit is read-only and writes chain values to the exact record only', async () => {
+    const now = Math.floor(Date.now() / 1000), DAY = 86400
+    const eligible = makeDeposit({ wallet: PHANTOM_FIXTURE, evm: REAL.evm, createdAtSec: now - 8 * DAY, lamports: 3_900_000 })
+    const notYet = makeDeposit({ wallet: PHANTOM_FIXTURE, evm: REAL.evm, createdAtSec: now - 1 * DAY, lamports: 4_100_000 })
+    const foreign = makeDeposit({ evm: REAL.evm, createdAtSec: now - 8 * DAY }) // another Phantom wallet's deposit
+    for (const d of [eligible, notYet, foreign]) { solanaChain.txs.set(d.signature, d.tx); solanaChain.accounts.set(d.eventAccount, d.accountInfo); solanaChain.iris.set(d.signature, d.iris) }
+    // Estimates say "window passed" for all of them; only the chain decides.
+    const record = (id, d, wallet = d.wallet, at = Date.now() - 2 * DAY * 1000) => ({ id, evmWallet: REAL.evm, solanaWallet: wallet, direction: 'solana-to-arc', amount: '0.1', status: 'complete', createdAt: at, sourceTxHash: d.signature, destinationTxHash: '0x' + 'dd'.repeat(32), refundStatus: 'pending', estimatedRefundableDepositSol: '0.0031', estimatedRefundAvailableAt: Date.now() - 1000 })
+    const records = [record('r-eligible', eligible), record('r-not-yet', notYet, undefined, Date.now() - 3 * DAY * 1000), record('r-wrong-wallet', foreign, PHANTOM_FIXTURE, Date.now() - 4 * DAY * 1000)]
+    await page.evaluate(r => { localStorage.setItem('machina_mainnet_solana_transfers_v1', JSON.stringify(r)) }, records)
+    await page.addInitScript(() => { window.__solanaSigns = 0; const p = window.phantom?.solana; if (p) p.signTransaction = async () => { window.__solanaSigns++; throw new Error('controlled: no signature') } })
+    await open('dashboard')
+    const card = src => page.locator(`[data-refund-source="${src}"]`)
+    await card(eligible.signature).waitFor()
+    assert.equal(await page.locator('[data-refund-state]').count(), 3)
+    assert.equal(await page.locator('[data-refund-state="unverified"]').count(), 3)
+    const before = await page.locator('section, main, body').first().innerText()
+    assert.ok(!/Eligible now/.test(before), 'an estimate never shows "Eligible now"'); assert.ok(!/Reclaim \d/.test(before), 'no Reclaim before verification')
+    assert.match(await card(eligible.signature).innerText(), /~0\.0031 SOL refundable \(estimate\)[\s\S]*not verified on Solana yet[\s\S]*Verify deposit/)
+    // Verify: read-only proxy reads (the first provider has no history), Circle Iris, no Phantom request.
+    await card(eligible.signature).getByRole('button', { name: 'Verify deposit' }).click()
+    await page.locator(`[data-refund-source="${eligible.signature}"][data-refund-state="verified"]`).waitFor()
+    const verifiedText = await card(eligible.signature).innerText()
+    assert.match(verifiedText, /0\.0039 SOL refundable/); assert.match(verifiedText, /Verified on Solana · Eligible now/)
+    assert.equal(await card(eligible.signature).getByRole('button', { name: 'Reclaim 0.0039 SOL' }).isEnabled(), true)
+    assert.ok(solanaChain.upstream.includes('solana-rpc.publicnode.com getTransaction') && solanaChain.upstream.includes('api.mainnet-beta.solana.com getTransaction'))
+    await card(notYet.signature).getByRole('button', { name: 'Verify deposit' }).click()
+    await page.locator(`[data-refund-source="${notYet.signature}"][data-refund-state="verified"]`).waitFor()
+    assert.match(await card(notYet.signature).innerText(), /0\.0041 SOL refundable[\s\S]*Verified on Solana · Eligible in (3d 2[0-9]h|4d)/)
+    assert.equal(await card(notYet.signature).getByRole('button', { name: /Eligible in/ }).isDisabled(), true, 'chain time decides, not the passed estimate')
+    // A record of this wallet pointing at another wallet's transfer is refused and stays unverified.
+    await card(foreign.signature).getByRole('button', { name: 'Verify deposit' }).click()
+    await card(foreign.signature).getByText(/not signed by this Phantom wallet/).first().waitFor()
+    assert.equal(await card(foreign.signature).getAttribute('data-refund-state'), 'unverified')
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('machina_mainnet_solana_transfers_v1')))
+    const s = id => stored.find(x => x.id === id)
+    assert.equal(s('r-eligible').messageSentEventAccount, eligible.eventAccount); assert.equal(s('r-eligible').refundAvailableAt, (eligible.createdAtSec + 5 * DAY) * 1000)
+    assert.equal(s('r-eligible').refundableDepositSol, '0.0039'); assert.equal(s('r-eligible').estimatedRefundableDepositSol, '0.0031')
+    assert.equal(s('r-not-yet').messageSentEventAccount, notYet.eventAccount)
+    assert.equal(s('r-wrong-wallet').refundVerifiedAt, undefined); assert.equal(s('r-wrong-wallet').messageSentEventAccount, undefined); assert.match(s('r-wrong-wallet').refundVerificationError, /not signed by this Phantom wallet/)
+    assert.equal(await page.evaluate(() => window.__solanaSigns), 0, 'Verify deposit never requests a Phantom signature')
+    assert.ok(!solanaChain.upstream.some(l => /simulate|send/i.test(l)), 'verification sends nothing')
   })
   assert.deepEqual(errors, []); assert.deepEqual(external, [])
   console.log(`RESULT ${count}/${count} Chromium Dashboard/Activity/Bridge groups PASS; 5 real Sui <-> Arc transfers; controlled RPC, gRPC and wallet ports; real network/signatures/broadcasts=0.`)

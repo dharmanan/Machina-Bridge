@@ -14,8 +14,10 @@ import { parseUsdcAmountInput } from '../lib/usdcAmountInput'
 import SolanaArcRecoveryPanel from './SolanaArcRecoveryPanel'
 import { useOpenSolanaSendAttempt } from '../lib/solanaSendRuntime'
 import {
-  listMainnetSolanaActivity,
+  applyVerifiedSolanaRefund,
+  findSolanaRefundRecord,
   recordMainnetSolanaActivity,
+  recordSolanaRefundVerificationError,
   updateMainnetSolanaActivity,
 } from '../lib/mainnetSolanaActivity'
 import {
@@ -198,17 +200,16 @@ export default function MainnetSolanaCanary() {
         metadata: refund,
       })
 
-      const localRecord = listMainnetSolanaActivity(
-        evmAddress,
-        phantomAddress,
-      ).find(
-        (item) =>
-          item.sourceTxHash?.toLowerCase() === refund.sourceTxHash.toLowerCase(),
-      )
+      // Only the record of this exact Phantom wallet and source signature is updated.
+      const localRecord = findSolanaRefundRecord(phantomAddress, refund.sourceTxHash)
 
       if (localRecord) {
         updateMainnetSolanaActivity(localRecord.id, {
-          ...refund,
+          messageSentEventAccount: refund.messageSentEventAccount,
+          refundDestinationMessage: refund.refundDestinationMessage,
+          refundAttestation: refund.refundAttestation,
+          refundableDepositSol: refund.refundableDepositSol,
+          refundAvailableAt: refund.refundAvailableAt,
           refundStatus: 'reclaimed',
           refundTxHash: result.txHash,
           reclaimedAt: Date.now(),
@@ -224,7 +225,7 @@ export default function MainnetSolanaCanary() {
     } finally {
       setReclaimingRefund(null)
     }
-  }, [evmAddress, phantomAddress, provider, refreshRefunds])
+  }, [phantomAddress, provider, refreshRefunds])
 
   useEffect(() => {
     if (!evmAddress || !phantomAddress || state.isLoading) return
@@ -287,11 +288,12 @@ export default function MainnetSolanaCanary() {
       return
     }
 
-    const refundableDepositSol =
+    // Fee-quote estimates only: shown as estimates until the deposit is verified on chain.
+    const estimatedRefundableDepositSol =
       direction === 'solana-to-arc'
         ? feeEstimate?.solanaEventRentSol ?? undefined
         : undefined
-    const refundAvailableAt =
+    const estimatedRefundAvailableAt =
       direction === 'solana-to-arc'
       && feeEstimate?.solanaEventRentRefundableAfterDays
         ? Date.now() + (feeEstimate.solanaEventRentRefundableAfterDays * 24 * 60 * 60 * 1000)
@@ -306,24 +308,26 @@ export default function MainnetSolanaCanary() {
       destinationTxHash: result.destinationTxHash,
       // Complete only when the receive was verified on chain; otherwise it stays "not rechecked".
       ...(result.destinationVerified === true ? { status: 'complete' as const } : {}),
-      refundableDepositSol,
-      refundAvailableAt,
+      estimatedRefundableDepositSol,
+      estimatedRefundAvailableAt,
       refundStatus: direction === 'solana-to-arc' ? 'pending' : undefined,
     })
 
     if (direction === 'solana-to-arc') {
       try {
-        const refundMetadata = await loadMainnetSolanaRefundMetadata(
-          result.sourceTxHash,
-          phantomAddress,
+        const verified = await loadMainnetSolanaRefundMetadata(
+          activityRecord.sourceTxHash ?? result.sourceTxHash,
+          activityRecord.solanaWallet,
         )
-        updateMainnetSolanaActivity(activityRecord.id, {
-          ...refundMetadata,
-          refundStatus: 'pending',
-        })
-      } catch {
-        // Transfer is already complete. On-chain discovery below remains the
-        // source of truth even if metadata hydration is temporarily unavailable.
+        if (!applyVerifiedSolanaRefund(verified)) throw new Error('The verified deposit does not match exactly one local record of this wallet; nothing was saved.')
+      } catch (error) {
+        // The transfer itself is complete. The deposit stays "not verified" (no reclaim offered) and
+        // the reason is kept so it can be verified again later from the Dashboard.
+        recordSolanaRefundVerificationError(
+          activityRecord.solanaWallet,
+          activityRecord.sourceTxHash ?? result.sourceTxHash,
+          error instanceof Error ? error.message : 'Deposit verification failed.',
+        )
       }
 
       void refreshRefunds()

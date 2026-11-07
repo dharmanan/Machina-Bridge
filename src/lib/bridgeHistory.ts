@@ -4,7 +4,7 @@
 import { MAINNET_NETWORKS } from '../config/mainnetNetworks'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 import type { MainnetTransferRecord } from './mainnetTransferQueue'
-import { mainnetSolanaTransferStatus, type MainnetSolanaActivityRecord } from './mainnetSolanaActivity'
+import { isVerifiedSolanaRefund, mainnetSolanaTransferStatus, type MainnetSolanaActivityRecord } from './mainnetSolanaActivity'
 import type { SuiRecoveryRecord } from './mainnetSuiQueue'
 import type { SuiRecoveryResult } from './mainnetSuiRecovery'
 
@@ -82,8 +82,15 @@ export function solanaHistoryItem(r: MainnetSolanaActivityRecord, now = Date.now
     statusLabel: mainnetSolanaTransferStatus(r), verification: 'saved',
     sourceId: r.sourceTxHash ? (fromSolana ? r.sourceTxHash : r.sourceTxHash.toLowerCase()) : undefined,
     sourceUrl: fromSolana ? solanaTx(r.sourceTxHash) : arcTx(r.sourceTxHash), destinationUrl: fromSolana ? arcTx(r.destinationTxHash) : solanaTx(r.destinationTxHash),
-    refund: r.refundableDepositSol && r.refundAvailableAt && r.refundStatus !== 'reclaimed' ? `${r.refundableDepositSol} SOL · ${r.refundAvailableAt <= now ? 'reclaimable now' : `reclaimable from ${new Date(r.refundAvailableAt).toLocaleDateString()}`}` : null,
+    refund: solanaRefundLabel(r, now),
   }
+}
+// "reclaimable" only from on-chain verified data; a fee-quote estimate is labelled as such.
+function solanaRefundLabel(r: MainnetSolanaActivityRecord, now: number): string | null {
+  if (r.direction !== 'solana-to-arc' || r.refundStatus === 'reclaimed') return null
+  if (isVerifiedSolanaRefund(r)) return `${r.refundableDepositSol} SOL · ${r.refundAvailableAt! <= now ? 'reclaimable now' : `reclaimable from ${new Date(r.refundAvailableAt!).toLocaleDateString()}`}`
+  const estimate = r.estimatedRefundableDepositSol ?? r.refundableDepositSol
+  return estimate ? `~${estimate} SOL (estimate) · not verified on Solana yet` : null
 }
 export function suiHistoryItem(r: SuiRecoveryRecord, checks: ReadonlyMap<string, { stage: SuiRecoveryResult['stage']; checkedAt: number }> = suiChecks): BridgeHistoryItem {
   const toSui = r.direction === 'arc-to-sui', check = checks.get(r.id)

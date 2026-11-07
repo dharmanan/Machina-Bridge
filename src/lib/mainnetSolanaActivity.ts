@@ -21,6 +21,13 @@ export type MainnetSolanaActivityRecord = {
   refundStatus?: 'pending' | 'reclaimed'
   refundTxHash?: string
   reclaimedAt?: number
+  // Fee-quote estimates shown before on-chain verification. Never used for eligibility or reclaim.
+  estimatedRefundableDepositSol?: string
+  estimatedRefundAvailableAt?: number
+  // Set only by applyVerifiedSolanaRefund, from chain and Circle evidence; refundableDepositSol and
+  // refundAvailableAt are then the on-chain lamports and created_at + 5 days.
+  refundVerifiedAt?: number
+  refundVerificationError?: string
 }
 
 const MAX_RECORDS = 100
@@ -126,6 +133,72 @@ export function listMainnetSolanaActivity(
     (evm && normalize(item.evmWallet) === evm)
     || (solana && item.solanaWallet === solana),
   )
+}
+
+// ---- Solana refundable deposits: verified metadata is written only to the one exactly matching record ----
+
+const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+const HEX = /^0x(?:[0-9a-fA-F]{2})+$/
+
+export function isVerifiedSolanaRefund(item: MainnetSolanaActivityRecord): boolean {
+  return item.direction === 'solana-to-arc'
+    && typeof item.refundVerifiedAt === 'number'
+    && Boolean(item.messageSentEventAccount && item.refundDestinationMessage && item.refundAttestation && item.refundableDepositSol)
+    && typeof item.refundAvailableAt === 'number'
+}
+
+// The single Solana -> Arc record of exactly this Phantom wallet and source signature. Solana base58
+// values are case-sensitive and compared exactly. Zero or several matches return null (nothing is written).
+export function findSolanaRefundRecord(solanaWallet: string, sourceTxHash: string): MainnetSolanaActivityRecord | null {
+  if (!solanaWallet || !sourceTxHash) return null
+  const matches = readMainnetSolanaActivity().filter((item) =>
+    item.direction === 'solana-to-arc'
+    && item.solanaWallet === solanaWallet
+    && item.sourceTxHash === sourceTxHash)
+  return matches.length === 1 ? matches[0] : null
+}
+
+export type VerifiedSolanaRefundInput = {
+  solanaWallet: string
+  sourceTxHash: string
+  messageSentEventAccount: string
+  refundableDepositSol: string
+  refundAvailableAt: number
+  refundDestinationMessage: string
+  refundAttestation: string
+}
+
+export function applyVerifiedSolanaRefund(input: VerifiedSolanaRefundInput): MainnetSolanaActivityRecord | null {
+  if (
+    !SOLANA_ADDRESS.test(input?.messageSentEventAccount ?? '')
+    || !/^\d+(?:\.\d+)?$/.test(input?.refundableDepositSol ?? '')
+    || !Number.isSafeInteger(input?.refundAvailableAt) || input.refundAvailableAt <= 0
+    || !HEX.test(input?.refundDestinationMessage ?? '')
+    || !HEX.test(input?.refundAttestation ?? '')
+  ) return null
+  const record = findSolanaRefundRecord(input.solanaWallet, input.sourceTxHash)
+  if (!record || record.refundStatus === 'reclaimed') return null
+
+  const firstVerification = typeof record.refundVerifiedAt !== 'number'
+  return updateMainnetSolanaActivity(record.id, {
+    // Keep the pre-verification estimates for display; legacy records stored them in the main fields.
+    estimatedRefundableDepositSol: record.estimatedRefundableDepositSol ?? (firstVerification ? record.refundableDepositSol : undefined),
+    estimatedRefundAvailableAt: record.estimatedRefundAvailableAt ?? (firstVerification ? record.refundAvailableAt : undefined),
+    messageSentEventAccount: input.messageSentEventAccount,
+    refundableDepositSol: input.refundableDepositSol,
+    refundAvailableAt: input.refundAvailableAt,
+    refundDestinationMessage: input.refundDestinationMessage,
+    refundAttestation: input.refundAttestation,
+    refundStatus: 'pending',
+    refundVerifiedAt: Date.now(),
+    refundVerificationError: undefined,
+  })
+}
+
+export function recordSolanaRefundVerificationError(solanaWallet: string, sourceTxHash: string, message: string) {
+  const record = findSolanaRefundRecord(solanaWallet, sourceTxHash)
+  if (!record) return null
+  return updateMainnetSolanaActivity(record.id, { refundVerificationError: String(message).slice(0, 300) })
 }
 
 export function subscribeMainnetSolanaActivity(listener: () => void) {
