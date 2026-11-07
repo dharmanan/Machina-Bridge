@@ -21,7 +21,6 @@ import {
 } from '../lib/chains';
 import { logger } from '../lib/logger';
 import { wagmiConfig } from '../lib/wagmi.config';
-import { markTrackedTransferMinted, registerTrackedTransfer, upsertServerBridgeActivity } from '../lib/transferTrackerApi';
 
 export const SEPOLIA_CHAIN_ID = SEPOLIA_EVM_CHAIN_ID;
 export const ARC_CHAIN_ID = ARC_EVM_CHAIN_ID;
@@ -293,23 +292,6 @@ const upsertBridgeActivity = (record: BridgeActivityRecord) => {
   ];
   writeBridgeActivities(next);
 
-  void upsertServerBridgeActivity({
-    id: normalized.id,
-    walletAddress: normalized.walletAddress,
-    sourceChainId: normalized.sourceChainId,
-    destinationChainId: normalized.destinationChainId,
-    amount: normalized.amount,
-    token: normalized.token,
-    startedAt: normalized.startedAt,
-    status: normalized.status,
-    step: normalized.step,
-    signatureCount: normalized.signatureCount,
-    approvalTxHash: normalized.approvalTxHash,
-    sourceTxHash: normalized.sourceTxHash,
-    receiveTxHash: normalized.receiveTxHash,
-    txHashes: normalized.txHashes,
-    updatedAt: normalized.updatedAt,
-  });
 };
 
 export const readBridgeActivitiesForWallet = (walletAddress?: string | null): BridgeActivityRecord[] => {
@@ -342,22 +324,6 @@ const buildRetryStepsFromTxHashes = (txHashes: string[]): RetryStep[] => {
   ];
 };
 
-const getActivitySyncFingerprint = (activity: BridgeActivityRecord) => JSON.stringify({
-  walletAddress: activity.walletAddress,
-  sourceChainId: activity.sourceChainId,
-  destinationChainId: activity.destinationChainId,
-  amount: activity.amount,
-  token: activity.token,
-  startedAt: activity.startedAt,
-  status: activity.status,
-  step: activity.step,
-  signatureCount: activity.signatureCount,
-  approvalTxHash: activity.approvalTxHash,
-  sourceTxHash: activity.sourceTxHash,
-  receiveTxHash: activity.receiveTxHash,
-  txHashes: activity.txHashes,
-  updatedAt: activity.updatedAt,
-});
 
 // ERC20 ABI for balance reading
 const ERC20_ABI = parseAbi([
@@ -411,7 +377,6 @@ export function useBridgeKit() {
   const { address, isConnected, chainId } = useAccount();
   const { switchChainAsync } = useSwitchChain();
   const { data: walletClient } = useWalletClient();
-  const syncedActivityFingerprintsRef = useRef<Record<string, string>>({});
 
   const [state, setState] = useState<BridgeState>({
     step: 'idle',
@@ -918,21 +883,6 @@ export function useBridgeKit() {
         }
         logger.debug('🔄 Step changed to: waiting-receive-message');
 
-        if (shouldTrackPendingBridge && sourceTxHash) {
-          void registerTrackedTransfer({
-            walletAddress: address,
-            sourceChainId,
-            destinationChainId,
-            amount,
-            token,
-            sourceTxHash,
-          });
-        }
-
-        if (shouldTrackPendingBridge && sourceTxHash && receiveTxHash) {
-          void markTrackedTransferMinted(sourceTxHash, receiveTxHash)
-        }
-
         setState({
           step: 'success',
           error: null,
@@ -1194,14 +1144,6 @@ export function useBridgeKit() {
       writePendingBridge(updated);
       upsertBridgeActivity({ ...(updated as BridgeActivityRecord), id: updated.id ?? `activity-${Date.now()}`, updatedAt: Date.now() });
 
-      void registerTrackedTransfer({
-        walletAddress: address,
-        sourceChainId: pending.sourceChainId,
-        destinationChainId: pending.destinationChainId,
-        amount: pending.amount,
-        token: pending.token,
-        sourceTxHash,
-      });
 
       setState((prev) => ({ ...prev, isLoading: false, step: 'waiting-receive-message', sourceTxHash }));
       return sourceTxHash;
@@ -1268,45 +1210,19 @@ export function useBridgeKit() {
         return activity;
       }));
 
-      writeBridgeActivities(next);
-
-      const syncCandidates = next.filter((activity) => {
-        const fingerprint = getActivitySyncFingerprint(activity);
-        return syncedActivityFingerprintsRef.current[activity.id] !== fingerprint;
+      // Merge into the store as it is now: other wallets' records stay (they are no longer restored from a
+      // server), and a change made while Iris was being read (e.g. a dismiss) is not overwritten.
+      const refreshed = new Map(next.map((activity) => [activity.id, activity]));
+      const merged = readBridgeActivities().map((item) => {
+        const candidate = refreshed.get(item.id);
+        return candidate && Number(candidate.updatedAt ?? 0) > Number(item.updatedAt ?? 0) ? candidate : item;
       });
-
-      if (syncCandidates.length > 0) {
-        void Promise.all(
-          syncCandidates.map(async (activity) => {
-            const fingerprint = getActivitySyncFingerprint(activity);
-            const ok = await upsertServerBridgeActivity({
-              id: activity.id,
-              walletAddress: activity.walletAddress,
-              sourceChainId: activity.sourceChainId,
-              destinationChainId: activity.destinationChainId,
-              amount: activity.amount,
-              token: activity.token,
-              startedAt: activity.startedAt,
-              status: activity.status,
-              step: activity.step,
-              signatureCount: activity.signatureCount,
-              approvalTxHash: activity.approvalTxHash,
-              sourceTxHash: activity.sourceTxHash,
-              receiveTxHash: activity.receiveTxHash,
-              txHashes: activity.txHashes,
-              updatedAt: activity.updatedAt,
-            });
-
-            if (ok) {
-              syncedActivityFingerprintsRef.current[activity.id] = fingerprint;
-            }
-          }),
-        );
-      }
+      writeBridgeActivities(merged);
+      const walletActivities = merged.filter((item) => item.walletAddress.toLowerCase() === walletAddress.toLowerCase());
 
       const pendingCurrent = readPendingBridge();
       if (pendingCurrent?.sourceTxHash) {
-        const matched = next.find((item) => item.sourceTxHash?.toLowerCase() === pendingCurrent.sourceTxHash?.toLowerCase());
+        const matched = walletActivities.find((item) => item.sourceTxHash?.toLowerCase() === pendingCurrent.sourceTxHash?.toLowerCase());
         if (matched && pendingCurrent.status !== matched.status) {
           writePendingBridge({
             ...pendingCurrent,
@@ -1315,7 +1231,7 @@ export function useBridgeKit() {
         }
       }
 
-      return next;
+      return walletActivities;
     },
     [],
   );
@@ -1439,8 +1355,6 @@ export function useBridgeKit() {
           throw new Error('Claim transaction hash is missing.');
         }
 
-        void markTrackedTransferMinted(sourceTxHash, receiveTxHash);
-
         const existing = readBridgeActivities().find((item) => item.sourceTxHash?.toLowerCase() === sourceTxHash.toLowerCase());
         if (existing) {
           upsertBridgeActivity({
@@ -1477,8 +1391,6 @@ export function useBridgeKit() {
       } catch (err: any) {
         if (isNonceAlreadyUsedError(err)) {
           const now = Date.now();
-          void markTrackedTransferMinted(sourceTxHash);
-
           const existing = readBridgeActivities().find((item) => item.sourceTxHash?.toLowerCase() === sourceTxHash.toLowerCase());
           if (existing) {
             upsertBridgeActivity({

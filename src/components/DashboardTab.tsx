@@ -22,7 +22,6 @@ import {
   getSupportedEvmChainName,
 } from '../lib/chains'
 import { fetchSolanaUsdcBalance } from '../lib/solana'
-import { fetchServerBridgeActivities, type ServerBridgeActivity } from '../lib/transferTrackerApi'
 
 interface Transaction {
   id: string;
@@ -138,7 +137,7 @@ function isCompletedTransaction(transaction: Transaction) {
   return transaction.type === 'bridge' && transaction.updatedAt == null
 }
 
-function activityToTransaction(activity: BridgeActivityRecord | ServerBridgeActivity): Transaction {
+function activityToTransaction(activity: BridgeActivityRecord): Transaction {
   const fromNetwork = getSupportedEvmChainName(activity.sourceChainId)
   const toNetwork = getSupportedEvmChainName(activity.destinationChainId)
   const direction = `${fromNetwork.toLowerCase().replace(/\s+/g, '-')}-to-${toNetwork.toLowerCase().replace(/\s+/g, '-')}`
@@ -274,7 +273,6 @@ export function DashboardTab() {
 
     const loadActivity = async () => {
       const localActivities = readBridgeActivitiesForWallet(address).filter((activity) => activity.status !== 'dismissed')
-      const serverActivities = (await fetchServerBridgeActivities(address)).filter((activity) => activity.status !== 'dismissed')
 
       let legacyTransactions: Transaction[] = []
       try {
@@ -316,7 +314,6 @@ export function DashboardTab() {
       }
 
       localActivities.map(activityToTransaction).forEach(keepNewest)
-      serverActivities.map(activityToTransaction).forEach(keepNewest)
       legacyTransactions.forEach(keepNewest)
 
       const sortedTransactions = [...byId.values()].sort((left, right) => {
