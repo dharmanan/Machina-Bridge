@@ -120,7 +120,8 @@
    "verify-sui-recovery-ui",
    "verify-mainnet-transfer-recovery-ui",
    "verify-sui-write-browser",
-   "verify-sui-wallet-foundation-ui"
+   "verify-sui-wallet-foundation-ui",
+   "verify-testnet-bridge-history-ui"
   ],
   "legacy": [
    "verify-mainnet-borrow",
@@ -210,6 +211,7 @@
   "verify-solana-rpc-proxy-security": "security",
   "verify-iris-response-limits": "security",
   "verify-circle-telemetry-disabled": "security",
+  "verify-testnet-bridge-history-ui": "testnet",
   "verify-earn-response-limits": "security"
  },
  "manual": {

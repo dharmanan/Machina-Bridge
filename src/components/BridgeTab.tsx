@@ -21,15 +21,7 @@ import { useSolanaBridge } from '../hooks/useSolanaBridge'
 import { getSupportedEvmChain, getSupportedEvmChainName, SUPPORTED_EVM_CHAIN_OPTIONS } from '../lib/chains'
 import { deriveSolanaUsdcAta, isValidSolanaAddress, SOLANA_DEVNET_NAME } from '../lib/solana'
 import { logger } from '../lib/logger'
-import {
-  dismissServerBridgeActivity,
-  dismissTrackedTransfer,
-  dismissTrackedTransferBySourceTxHash,
-  fetchServerBridgeActivities,
-  fetchTrackedTransfers,
-  ServerBridgeActivity,
-  TrackedTransfer,
-} from '../lib/transferTrackerApi'
+import { dismissLocalBridgeActivity, type TrackedTransfer } from '../lib/localBridgeActivity'
 import { ArrowLeftRight, Loader2, CheckCircle, AlertCircle, ExternalLink, RefreshCw, Clock, X, Bell } from 'lucide-react'
 
 const EVM_BRIDGE_CHAIN_IDS = [SEPOLIA_CHAIN_ID, ARC_CHAIN_ID, BASE_CHAIN_ID, OPTIMISM_CHAIN_ID, ARBITRUM_CHAIN_ID]
@@ -154,36 +146,6 @@ function findFirstStringMatch(value: unknown, pattern: RegExp, seen = new WeakSe
   return undefined
 }
 
-function mergeLocalAndServerActivities(
-  localActivities: BridgeActivityRecord[],
-  serverActivities: ServerBridgeActivity[],
-): BridgeActivityRecord[] {
-  const byId = new Map<string, BridgeActivityRecord>()
-
-  const ingest = (activity: BridgeActivityRecord) => {
-    const key = String(activity.id).toLowerCase()
-    const previous = byId.get(key)
-
-    if (!previous) {
-      byId.set(key, activity)
-      return
-    }
-
-    const prevUpdated = Number(previous.updatedAt ?? previous.startedAt ?? 0)
-    const nextUpdated = Number(activity.updatedAt ?? activity.startedAt ?? 0)
-    if (nextUpdated >= prevUpdated) {
-      byId.set(key, activity)
-    }
-  }
-
-  localActivities.forEach(ingest)
-  serverActivities.forEach((serverActivity) => ingest(serverActivity as BridgeActivityRecord))
-
-  return [...byId.values()].sort(
-    (a, b) => Number(b.updatedAt ?? b.startedAt ?? 0) - Number(a.updatedAt ?? a.startedAt ?? 0),
-  )
-}
-
 export function BridgeTab() {
   const { address, isConnected, chainId } = useAccount()
   const { switchChainAsync, isPending: isSwitchingChain } = useSwitchChain()
@@ -264,7 +226,6 @@ export function BridgeTab() {
   const [validatedReadyKeys, setValidatedReadyKeys] = useState<Record<string, boolean>>({})
   const lastPendingBridgeJsonRef = useRef<string | null>(null)
   const lastMintReadyCheckKeyRef = useRef<string | null>(null)
-  const [trackedTransfers, setTrackedTransfers] = useState<TrackedTransfer[]>([])
   const [activityRecords, setActivityRecords] = useState<BridgeActivityRecord[]>([])
   const [isLoadingTrackedTransfers, setIsLoadingTrackedTransfers] = useState(false)
   const [gatewayQuote, setGatewayQuote] = useState<{
@@ -335,9 +296,6 @@ export function BridgeTab() {
   const selectedActivity = selectedTrackerKey
     ? activityRecords.find((activity) => getTransferKey(activity.sourceTxHash, activity.id) === selectedTrackerKey)
     : null
-  const selectedTransfer = selectedTrackerKey
-    ? trackedTransfers.find((transfer) => getTransferKey(transfer.sourceTxHash, transfer.id) === selectedTrackerKey)
-    : null
   const selectedTrackedBridge = selectedActivity
     ? {
         id: selectedActivity.id,
@@ -360,22 +318,7 @@ export function BridgeTab() {
               : 'waiting-receive-message',
         status: selectedActivity.status,
       }
-    : (selectedTransfer
-      ? {
-          sourceChainId: selectedTransfer.sourceChainId,
-          destinationChainId: selectedTransfer.destinationChainId,
-          amount: selectedTransfer.amount,
-          token: selectedTransfer.token,
-          walletAddress: address ?? selectedTransfer.walletAddress,
-          startedAt: selectedTransfer.createdAt,
-          step: selectedTransfer.status === 'minted' ? 'success' : 'waiting-receive-message',
-          sourceTxHash: selectedTransfer.sourceTxHash,
-          receiveTxHash: selectedTransfer.destinationTxHash ?? undefined,
-          txHashes: selectedTransfer.destinationTxHash
-            ? [selectedTransfer.sourceTxHash, selectedTransfer.destinationTxHash]
-            : [selectedTransfer.sourceTxHash],
-        }
-      : null)
+    : null
   const trackedBridge = selectedTrackedBridge
     ?? pendingBridge
     ?? trackerSnapshot
@@ -412,7 +355,6 @@ export function BridgeTab() {
   const hasOnlyOffchainSignature = trackedSignatureCount > 0 && trackedTxHashes.length === 0
   const hasApproveCompleted = Boolean(trackedApprovalTxHash || trackedSourceTxHash || trackedReceiveTxHash)
   const hasBurnCompleted = Boolean(trackedSourceTxHash)
-  const visibleTrackedTransfers = trackedTransfers.filter((transfer) => transfer.status !== 'dismissed')
   const activityStatusByKey = activityRecords.reduce<Record<string, BridgeActivityRecord['status']>>((acc, activity) => {
     acc[getTransferKey(activity.sourceTxHash, activity.id)] = activity.status
     return acc
@@ -438,7 +380,19 @@ export function BridgeTab() {
       createdAt: activity.startedAt,
       updatedAt: activity.updatedAt,
     }))
+  // Keys of rows the user dismissed. The pending-bridge fallback row for the same transfer stays hidden too;
+  // its resume record (arc_pending_bridge) is kept, so recovery is not affected by dismissing.
+  const dismissedTransferKeys = new Set(
+    activityRecords
+      .filter((activity) => activity.status === 'dismissed')
+      .flatMap((activity) => [activity.sourceTxHash?.toLowerCase(), String(activity.id).toLowerCase()])
+      .filter((key): key is string => Boolean(key)),
+  )
+  // The pending-bridge record is per browser; list it only in the history of the wallet that started it.
   const localFallbackTransfer: TrackedTransfer | null = trackedBridge
+    && Boolean(address) && String(trackedBridge.walletAddress ?? '').toLowerCase() === String(address).toLowerCase()
+    && !dismissedTransferKeys.has(String(trackedBridge.sourceTxHash ?? '').toLowerCase())
+    && !dismissedTransferKeys.has(String(trackedBridge.id ?? '').toLowerCase())
     ? {
         id: trackedBridge.id ?? `local-${trackedBridge.sourceTxHash ?? trackedBridge.startedAt}`,
         walletAddress: trackedBridge.walletAddress,
@@ -453,7 +407,7 @@ export function BridgeTab() {
         updatedAt: Date.now(),
       }
     : null
-  const mergedTrackedTransfers = [...activityTransfers, ...visibleTrackedTransfers, ...(localFallbackTransfer ? [localFallbackTransfer] : [])]
+  const mergedTrackedTransfers = [...activityTransfers, ...(localFallbackTransfer ? [localFallbackTransfer] : [])]
     .reduce<Map<string, TrackedTransfer>>((acc, transfer) => {
       const transferKey = transfer.sourceTxHash?.toLowerCase() || transfer.id
       if (!transferKey) {
@@ -600,9 +554,9 @@ export function BridgeTab() {
     }
   }
 
+  // Testnet history comes only from this browser's records; readiness is always re-checked against Iris.
   const refreshTrackedTransfers = useCallback(async () => {
     if (!isConnected || !address) {
-      setTrackedTransfers([])
       setActivityRecords([])
       setValidatedReadyKeys({})
       return
@@ -610,34 +564,17 @@ export function BridgeTab() {
 
     setIsLoadingTrackedTransfers(true)
     try {
-      const [localActivities, serverActivities, transfers] = await Promise.all([
-        refreshBridgeActivities(address),
-        fetchServerBridgeActivities(address, 30),
-        fetchTrackedTransfers(address),
-      ])
+      const localActivities = await refreshBridgeActivities(address)
+      setActivityRecords(localActivities)
 
-      const mergedActivities = mergeLocalAndServerActivities(localActivities, serverActivities)
-      setActivityRecords(mergedActivities)
-      setTrackedTransfers(transfers)
-
-      const readyCandidates = [
-        ...mergedActivities
-          .filter((activity) => activity.status !== 'minted' && Boolean(activity.sourceTxHash))
-          .map((activity) => ({
-            sourceChainId: activity.sourceChainId,
-            sourceTxHash: activity.sourceTxHash as string,
-            destinationChainId: activity.destinationChainId,
-            id: activity.id,
-          })),
-        ...transfers
-          .filter((transfer) => transfer.status !== 'minted' && Boolean(transfer.sourceTxHash))
-          .map((transfer) => ({
-            sourceChainId: transfer.sourceChainId,
-            sourceTxHash: transfer.sourceTxHash,
-            destinationChainId: transfer.destinationChainId,
-            id: transfer.id,
-          })),
-      ]
+      const readyCandidates = localActivities
+        .filter((activity) => activity.status !== 'minted' && activity.status !== 'dismissed' && Boolean(activity.sourceTxHash))
+        .map((activity) => ({
+          sourceChainId: activity.sourceChainId,
+          sourceTxHash: activity.sourceTxHash as string,
+          destinationChainId: activity.destinationChainId,
+          id: activity.id,
+        }))
         .reduce<Array<{ sourceChainId: number; sourceTxHash: string; destinationChainId?: number; id: string }>>((acc, item) => {
           const key = getTransferKey(item.sourceTxHash, item.id)
           if (!key || acc.some((entry) => getTransferKey(entry.sourceTxHash, entry.id) === key)) {
@@ -661,15 +598,7 @@ export function BridgeTab() {
       }, {})
       setValidatedReadyKeys(nextReadiness)
     } catch {
-      try {
-        const [localFallback, serverFallback] = await Promise.all([
-          Promise.resolve(readBridgeActivitiesForWallet(address)),
-          fetchServerBridgeActivities(address, 30),
-        ])
-        setActivityRecords(mergeLocalAndServerActivities(localFallback, serverFallback))
-      } catch {
-        setActivityRecords(readBridgeActivitiesForWallet(address))
-      }
+      setActivityRecords(readBridgeActivitiesForWallet(address))
       setValidatedReadyKeys({})
     } finally {
       setIsLoadingTrackedTransfers(false)
@@ -761,9 +690,7 @@ export function BridgeTab() {
     }
   }, [pendingBridge, trackerSnapshot])
 
-  const hasPendingActivity = trackedTransfers.some(
-    (t) => t.status !== 'minted' && t.status !== 'dismissed',
-  ) || activityRecords.some(
+  const hasPendingActivity = activityRecords.some(
     (activity) => activity.status !== 'minted' && activity.status !== 'dismissed',
   ) || Boolean(pendingBridge)
 
@@ -774,8 +701,7 @@ export function BridgeTab() {
 
     void refreshTrackedTransfers()
 
-    // Only keep polling while there is an active/pending transfer.
-    // When everything is minted or dismissed, stop hitting Redis.
+    // Only keep polling (local records + Iris readiness) while there is an active/pending transfer.
     if (!hasPendingActivity) {
       return
     }
@@ -1409,20 +1335,21 @@ export function BridgeTab() {
       return
     }
 
-    const results = await Promise.all([
-      dismissTrackedTransfer(transfer.id),
-      dismissServerBridgeActivity(transfer.id),
-      transfer.sourceTxHash ? dismissTrackedTransferBySourceTxHash(transfer.sourceTxHash) : Promise.resolve(false),
-    ])
-
-    const ok = results.some(Boolean)
-    if (ok) {
-      void refreshTrackedTransfers()
+    // Local only: hides the row for this wallet in this browser. Nothing is sent, signed or cancelled,
+    // and the pending-bridge resume record is kept for recovery.
+    if (!address) {
       return
     }
-
-    logger.warn('Dismiss failed for transfer', transfer)
-  }, [refreshTrackedTransfers])
+    const changed = dismissLocalBridgeActivity({
+      walletAddress: address,
+      id: transfer.id,
+      sourceTxHash: transfer.sourceTxHash || undefined,
+    })
+    if (!changed) {
+      logger.warn('Dismiss found no local record for this wallet', transfer)
+    }
+    void refreshTrackedTransfers()
+  }, [address, refreshTrackedTransfers])
 
   useEffect(() => {
     if (!isActivityOpen) {
