@@ -1,6 +1,8 @@
 import { Buffer } from 'buffer'
 import {
+  ComputeBudgetProgram,
   Connection,
+  Message,
   PublicKey,
   Transaction,
   TransactionInstruction,
@@ -16,6 +18,16 @@ import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
 const MESSAGE_SENT_ACCOUNT_DISCRIMINATOR = Buffer.from('83648538a6e1973c', 'hex')
 const RECLAIM_EVENT_ACCOUNT_DISCRIMINATOR = Buffer.from('5ec6b49f83ec0fae', 'hex')
 const EVENT_ACCOUNT_WINDOW_MS = 5 * 24 * 60 * 60 * 1000
+
+// Compute budget of the reclaim transaction. Wallets (Phantom) add their own compute budget instructions
+// to a transaction that has none, which changes the signed message and must block the broadcast. The
+// reclaim therefore carries its own, bounded, budget: the limit comes from simulating this exact
+// reclaim, the price from recent fees on its writable accounts, and the priority fee is capped.
+// A real Mainnet reclaim_event_account consumed ~145k CU (under the 200k default per instruction).
+export const RECLAIM_MAX_COMPUTE_UNITS = 400_000
+export const RECLAIM_MIN_CU_PRICE_MICROLAMPORTS = 1_000
+export const RECLAIM_MAX_PRIORITY_FEE_LAMPORTS = 50_000 // 0.00005 SOL
+const RECLAIM_BASE_FEE_LAMPORTS = 5_000 // one signature (the rent payer)
 
 // dRPC rejects Solana on its free plan (HTTP 400, JSON-RPC 35 "chain is not available on free plan"),
 // so it can never serve a reclaim; it only hid the real cause as the last fallback.
@@ -544,11 +556,7 @@ async function performMainnetSolanaReclaim(input: {
     borshVec(destinationMessage),
   ])
 
-  const latest = await connection.getLatestBlockhash('confirmed')
-  const transaction = new Transaction({
-    feePayer: payee,
-    recentBlockhash: latest.blockhash,
-  }).add(new TransactionInstruction({
+  const reclaimInstruction = new TransactionInstruction({
     programId,
     keys: [
       { pubkey: payee, isSigner: true, isWritable: true },
@@ -556,10 +564,39 @@ async function performMainnetSolanaReclaim(input: {
       { pubkey: eventAccount, isSigner: false, isWritable: true },
     ],
     data: instructionData,
-  }))
+  })
+  const latest = await connection.getLatestBlockhash('confirmed')
+  const build = (units: number, microLamports: number) => new Transaction({
+    feePayer: payee,
+    recentBlockhash: latest.blockhash,
+  }).add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports }),
+    reclaimInstruction,
+  )
 
+  // 1) Measure the reclaim with the maximum budget.
+  const recentPrice = await reclaimComputeUnitPrice(connection, [messageTransmitter, eventAccount])
+  const probe = await connection.simulateTransaction(build(RECLAIM_MAX_COMPUTE_UNITS, recentPrice))
+  if (probe.value.err) throw new Error('Solana reclaim simulation failed; no wallet signature was requested.')
+  const used = probe.value.unitsConsumed
+  if (typeof used !== 'number' || !Number.isSafeInteger(used) || used <= 0 || used > RECLAIM_MAX_COMPUTE_UNITS) {
+    throw new Error('Solana reclaim simulation did not report a usable compute budget; no wallet signature was requested.')
+  }
+  const units = Math.min(RECLAIM_MAX_COMPUTE_UNITS, Math.ceil(used * 1.2) + 1_000)
+  // The price is lowered (never the cap raised) so the priority fee stays within the ceiling.
+  const microLamports = Math.min(recentPrice, Math.floor((RECLAIM_MAX_PRIORITY_FEE_LAMPORTS * 1_000_000) / units))
+  const priorityFee = Math.ceil((microLamports * units) / 1_000_000)
+  if (microLamports < 0 || priorityFee > RECLAIM_MAX_PRIORITY_FEE_LAMPORTS) throw new Error('The reclaim priority fee is above the allowed ceiling; no wallet signature was requested.')
+  if (RECLAIM_BASE_FEE_LAMPORTS + priorityFee >= eventInfo.lamports) throw new Error('The reclaim network fee would exceed the refundable deposit; no wallet signature was requested.')
+
+  // 2) The exact transaction Phantom is asked to sign is simulated as built.
+  const transaction = build(units, microLamports)
   const simulation = await connection.simulateTransaction(transaction)
-  if (simulation.value.err) throw new Error('Solana reclaim simulation failed; no wallet signature was requested.')
+  const simulatedUnits = simulation.value.unitsConsumed
+  if (simulation.value.err || typeof simulatedUnits !== 'number' || simulatedUnits > units) {
+    throw new Error('Solana reclaim simulation failed; no wallet signature was requested.')
+  }
   const expectedMessage = transaction.serializeMessage()
   if (input.provider.publicKey && input.provider.publicKey.toBase58() !== input.connectedWallet) throw new Error('Phantom account changed before signing.')
   // Phantom signs exactly once. RPC failover never causes a second wallet prompt.
@@ -568,7 +605,12 @@ async function performMainnetSolanaReclaim(input: {
     throw new Error('Phantom did not return a signed Solana transaction.')
   }
 
-  if (!signed.serializeMessage().equals(expectedMessage)) throw new Error('Phantom changed the reclaim transaction; broadcasting is blocked.')
+  // The signed message must be byte-for-byte the simulated one: no tolerance for any change
+  // (fee payer, blockhash, instructions, order, programs, accounts, data or compute budget).
+  const signedMessage = typeof signed.serializeMessage === 'function' ? signed.serializeMessage() : null
+  if (!signedMessage || !signedMessage.equals(expectedMessage)) {
+    throw new Error(`Phantom changed the reclaim transaction (${describeReclaimMessageChange(expectedMessage, signedMessage)}); broadcasting is blocked. Nothing was sent.`)
+  }
   const raw = signed.serialize()
   let txHash: string | null = null
   const sendErrors: unknown[] = []
@@ -613,6 +655,46 @@ async function performMainnetSolanaReclaim(input: {
   return {
     txHash,
     alreadyClosed: false,
+  }
+}
+
+// Recent priority fee (75th percentile) on the reclaim's writable accounts, with a small floor.
+// A failed read falls back to the floor; the cap is applied by the caller.
+async function reclaimComputeUnitPrice(connection: Connection, accounts: PublicKey[]): Promise<number> {
+  try {
+    const fees = await connection.getRecentPrioritizationFees({ lockedWritableAccounts: accounts })
+    const values = (Array.isArray(fees) ? fees : [])
+      .map((fee) => fee?.prioritizationFee)
+      .filter((fee): fee is number => Number.isSafeInteger(fee) && fee >= 0)
+      .sort((a, b) => a - b)
+    const p75 = values.length ? values[Math.min(values.length - 1, Math.floor(values.length * 0.75))] : 0
+    return Math.max(RECLAIM_MIN_CU_PRICE_MICROLAMPORTS, p75)
+  } catch {
+    return RECLAIM_MIN_CU_PRICE_MICROLAMPORTS
+  }
+}
+
+const COMPUTE_BUDGET_PROGRAM = ComputeBudgetProgram.programId.toBase58()
+
+// Names what a wallet changed in a signed reclaim message (for the error shown to the user only).
+export function describeReclaimMessageChange(expected: Buffer, signed: Buffer | null): string {
+  if (!signed) return 'no signed message was returned'
+  try {
+    const a = Message.from(expected), b = Message.from(signed)
+    const program = (m: Message, i: number) => m.accountKeys[m.instructions[i].programIdIndex]?.toBase58()
+    const metas = (m: Message, i: number) => m.instructions[i].accounts.map((k) => `${m.accountKeys[k]?.toBase58()}:${m.isAccountSigner(k)}:${m.isAccountWritable(k)}`).join(',')
+    if (!a.accountKeys[0]?.equals(b.accountKeys[0])) return 'fee payer'
+    if (a.recentBlockhash !== b.recentBlockhash) return 'blockhash'
+    const budget = (m: Message) => m.instructions.filter((_, i) => program(m, i) === COMPUTE_BUDGET_PROGRAM).length
+    if (a.instructions.length !== b.instructions.length) return budget(a) !== budget(b) ? 'compute budget instructions added or removed' : 'instructions added or removed'
+    for (let i = 0; i < a.instructions.length; i += 1) {
+      if (program(a, i) !== program(b, i)) return 'instruction order or program'
+      if (metas(a, i) !== metas(b, i)) return 'instruction accounts'
+      if (a.instructions[i].data !== b.instructions[i].data) return program(a, i) === COMPUTE_BUDGET_PROGRAM ? 'compute budget (fee) values' : 'instruction data'
+    }
+    return 'message header or account list'
+  } catch {
+    return 'an unreadable message'
   }
 }
 
