@@ -14,8 +14,14 @@ globalThis.window = { localStorage: { getItem: () => null, setItem() {}, removeI
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { locks: { request: async (_n, _o, run) => run({}) } } })
 // The reclaim reads the source transaction of a closed account through the same-origin proxy (history is
 // not readable from browsers); plan.proxyTx controls that answer. Everything else is forbidden.
-globalThis.fetch = async input => {
-  if (String(input) === '/api/solana-rpc') { log.push('proxy getTransaction'); return Response.json({ jsonrpc: '2.0', id: 1, result: plan.proxyTx === undefined ? creation : plan.proxyTx }) }
+globalThis.fetch = async (input, init) => {
+  if (String(input) === '/api/solana-rpc') {
+    const { method, params } = JSON.parse(init.body); log.push(`proxy ${method}`)
+    const result = method === 'getSignaturesForAddress' ? (plan.proxySigs ?? [])
+      : method === 'getSignatureStatuses' ? { context: { slot: 1 }, value: [plan.proxyStatus ?? null] }
+      : params[0] === 'source-signature' ? (plan.proxyTx === undefined ? creation : plan.proxyTx) : (plan.proxyReclaimTx ?? null)
+    return Response.json({ jsonrpc: '2.0', id: 1, result })
+  }
   throw new Error(`Network forbidden: ${String(input)}`)
 }
 
@@ -44,13 +50,14 @@ const unavailable = { 'rpc.ankr.com': all(ANKR), 'solana.drpc.org': all(DRPC) }
 
 let plan, log, signs, sent
 const host = c => new URL(c.rpcEndpoint).hostname
-const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', getBalance: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
+const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', getBalance: 'read', getSignatureStatuses: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
 const answers = {
   getAccountInfo: h => (plan[h] && 'info' in plan[h] ? plan[h].info : plan.info === undefined ? account() : plan.info),
   getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
   getLatestBlockhash: () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 100 }),
   getRecentPrioritizationFees: () => [],
   getBalance: () => 10_000_000,
+  getSignatureStatuses: () => ({ context: { slot: 1 }, value: [plan.status ?? null] }),
   // The signed bytes (VersionedTransaction) are re-simulated: a successful reclaim credits the deposit.
   simulateTransaction: (_h, tx) => tx instanceof VersionedTransaction
     ? { value: { err: plan.simErr ?? null, unitsConsumed: 150_000, accounts: [{ lamports: 10_000_000 + 2_000_000 }, null] } }
@@ -129,4 +136,28 @@ await test('M. confirmation unknown after submission: the signature is reported 
   r => { assert.match(r.error, /controlled-signature was submitted but its confirmation is unknown/); assert.equal(signs, 1); assert.equal(sent.length, 1) })
 await test('N. a landed-but-failed reclaim stays a definite failure (not unknown)', { confirmErr: { InstructionError: [0, { Custom: 2 }] } },
   r => { assert.match(r.error, /reclaim transaction failed/); assert.doesNotMatch(r.error, /unknown/); assert.equal(signs, 1) })
+// ---------------------------------------------------------------- a landed reclaim whose confirmation watcher missed it
+await test('Q. confirmation watcher expires but the signature status shows the reclaim landed: reported as success, one signature',
+  { 'solana-rpc.publicnode.com': { confirm: EXPIRED }, status: { confirmationStatus: 'finalized', err: null, slot: 9 } },
+  r => { assert.deepEqual(r.ok, { txHash: 'controlled-signature', alreadyClosed: false }); assert.equal(signs, 1); assert.equal(sent.length, 1) })
+await test('R. confirmation watcher expires and the status shows an on-chain failure: definite failure, not unknown, one signature',
+  { 'solana-rpc.publicnode.com': { confirm: EXPIRED }, proxyStatus: { confirmationStatus: 'confirmed', err: { InstructionError: [4, { Custom: 1 }] } } },
+  r => { assert.match(r.error, /reclaim transaction failed/); assert.doesNotMatch(r.error, /unknown/); assert.equal(signs, 1) })
+await test('S. a "processed"-only status is not proof: still unknown, no second signature',
+  { 'solana-rpc.publicnode.com': { confirm: EXPIRED }, status: { confirmationStatus: 'processed', err: null } },
+  r => { assert.match(r.error, /confirmation is unknown/); assert.equal(signs, 1); assert.equal(sent.length, 1) })
+// ---------------------------------------------------------------- closure proven by the payee's own reclaim (browser: no second RPC)
+const reclaimTx = (o = {}) => ({ meta: { err: null, innerInstructions: [], logMessages: ['Program CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC invoke [1]', 'Program log: Instruction: ReclaimEventAccount'], ...o.meta },
+  transaction: { signatures: ['reclaim-signature'], message: { accountKeys: [{ pubkey: wallet.toBase58(), signer: true }, { pubkey: eventAccount.toBase58(), signer: false }],
+    instructions: [{ programId: program.toBase58(), accounts: [wallet.toBase58(), 'mt-pda', eventAccount.toBase58()], data: 'x' }] }, ...o.transaction } })
+const closedNoSecondRpc = extra => ({ info: null, 'api.mainnet.solana.com': { read: DOWN }, proxySigs: [{ signature: 'reclaim-signature', err: null }], ...extra })
+await test('T. account closed, no second RPC: the payee\'s own successful ReclaimEventAccount proves closure (alreadyClosed, no signature)',
+  closedNoSecondRpc({ proxyReclaimTx: reclaimTx() }), r => { assert.deepEqual(r.ok, { alreadyClosed: true }); assert.equal(signs, 0); assert.equal(sent.length, 0) })
+await test('U. the closure proof refuses a failed, foreign-signed, other-account or non-reclaim transaction',
+  closedNoSecondRpc({ proxyReclaimTx: reclaimTx({ meta: { err: { InstructionError: [0, { Custom: 1 }] } } }) }), r => { assert.match(r.error, /closure could not be confirmed/); assert.equal(signs, 0) })
+for (const [name, tx] of [['foreign signer', reclaimTx({ transaction: { message: { accountKeys: [{ pubkey: Keypair.generate().publicKey.toBase58(), signer: true }], instructions: reclaimTx().transaction.message.instructions } } })],
+  ['other event account', reclaimTx({ transaction: { message: { accountKeys: reclaimTx().transaction.message.accountKeys, instructions: [{ programId: program.toBase58(), accounts: [wallet.toBase58(), Keypair.generate().publicKey.toBase58()], data: 'x' }] } } })],
+  ['no ReclaimEventAccount log', reclaimTx({ meta: { logMessages: ['Program log: Instruction: SendMessage'] } })],
+  ['other signature returned', reclaimTx({ transaction: { signatures: ['different'] } })]])
+  await test(`U. closure proof refused: ${name}`, closedNoSecondRpc({ proxyReclaimTx: tx }), r => { assert.match(r.error, /closure could not be confirmed/); assert.equal(signs, 0) })
 console.log(`RESULT ${count}/${count} Solana reclaim RPC groups PASS; controlled providers, one Phantom signature at most; no network, wallet or transaction`)

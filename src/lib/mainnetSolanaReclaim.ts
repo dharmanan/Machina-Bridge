@@ -417,7 +417,27 @@ async function getReclaimConnection(eventAccount: PublicKey) {
   throw reclaimRpcFailure(errors, 'Solana mainnet RPC is unavailable for reclaim.')
 }
 
-async function confirmClosedOnAnotherProvider(eventAccount: PublicKey, checkedRpcUrl: string) {
+// Proof that `payee` itself closed the deposit: a finalized, successful transaction signed by the payee
+// whose Circle MessageTransmitterV2 instruction uses this event account and the payee and logs
+// ReclaimEventAccount (the only instruction that closes a MessageSent account, to its rent payer).
+async function reclaimedByPayee(eventAccount: PublicKey, payee: PublicKey): Promise<boolean> {
+  const signatures = await callSameOriginSolanaRpc('getSignaturesForAddress', [eventAccount.toBase58(), { limit: 10, commitment: 'finalized' }])
+  if (!Array.isArray(signatures)) return false
+  for (const s of signatures.filter((x: any) => x && !x.err && typeof x.signature === 'string')) {
+    const tx = await callSameOriginSolanaRpc('getTransaction', [s.signature, { encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 0 }]).catch(() => null)
+    if (!tx || tx.transaction?.signatures?.[0] !== s.signature || !tx.meta || tx.meta.err !== null) continue
+    const keys: any[] = tx.transaction.message?.accountKeys ?? []
+    if (!keys.some((k) => k?.signer === true && keyOf(k.pubkey) === payee.toBase58())) continue
+    const instructions = [...(tx.transaction.message?.instructions ?? []), ...(tx.meta.innerInstructions?.flatMap((x: any) => x.instructions) ?? [])]
+    const usesBoth = instructions.some((i: any) => keyOf(i.programId) === SOLANA_MAINNET_CCTP.messageTransmitterProgram
+      && i.accounts?.some((a: any) => keyOf(a) === eventAccount.toBase58()) && i.accounts?.some((a: any) => keyOf(a) === payee.toBase58()))
+    const logged = (tx.meta.logMessages ?? []).includes('Program log: Instruction: ReclaimEventAccount')
+    if (usesBoth && logged) return true
+  }
+  return false
+}
+
+async function confirmClosedOnAnotherProvider(eventAccount: PublicKey, checkedRpcUrl: string, payee?: PublicKey) {
   const errors: unknown[] = []
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     if (rpcUrl === checkedRpcUrl) continue
@@ -430,7 +450,28 @@ async function confirmClosedOnAnotherProvider(eventAccount: PublicKey, checkedRp
       errors.push(error)
     }
   }
+  // Browsers cannot reach a second independent RPC (public archive RPCs refuse browser origins): accept
+  // instead the payee's own successful reclaim transaction for this account, read through the proxy.
+  if (payee && await reclaimedByPayee(eventAccount, payee).catch(() => false)) return
   throw new Error(`The deposit account closure could not be confirmed by a second Solana RPC (${reclaimRpcFailure(errors, 'no other provider').message}). Nothing was signed or recorded; retry later.`)
+}
+
+// After a confirmation error the transaction may still have landed (the confirmation watcher can miss it).
+// The signature status decides: landed, failed on chain, or still unknown. Read-only; never re-signs.
+async function settleSubmittedReclaim(connection: Connection, txHash: string): Promise<'landed' | 'unknown' | { failed: unknown }> {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const reads = [
+      connection.getSignatureStatuses([txHash], { searchTransactionHistory: true }).then((r) => r?.value?.[0] ?? null),
+      callSameOriginSolanaRpc('getSignatureStatuses', [[txHash], { searchTransactionHistory: true }]).then((r: any) => r?.value?.[0] ?? null),
+    ]
+    for (const read of reads) {
+      const status: any = await read.catch(() => null)
+      if (!status || !['confirmed', 'finalized'].includes(status.confirmationStatus)) continue
+      return status.err === null || status.err === undefined ? 'landed' : { failed: status.err }
+    }
+    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 2_500))
+  }
+  return 'unknown'
 }
 
 // Verifies one Solana -> Arc deposit from chain and Circle data only (read-only, never a wallet request):
@@ -521,7 +562,7 @@ async function performMainnetSolanaReclaim(input: {
     if (!provesIdentity) throw new Error('The absent account cannot be bound to a successful Circle source transaction.')
     // One RPC answering "no account" is not proof of closure (it may lag or misbehave). An independent
     // provider must also see the account absent; otherwise nothing is signed and nothing is recorded.
-    await confirmClosedOnAnotherProvider(eventAccount, connection.rpcEndpoint)
+    await confirmClosedOnAnotherProvider(eventAccount, connection.rpcEndpoint, payee)
     return { alreadyClosed: true }
   }
 
@@ -668,6 +709,9 @@ async function performMainnetSolanaReclaim(input: {
       lastValidBlockHeight: latest.lastValidBlockHeight,
     }, 'confirmed')
   } catch (error) {
+    const outcome = await settleSubmittedReclaim(connection, txHash)
+    if (outcome === 'landed') return { txHash, alreadyClosed: false }
+    if (outcome !== 'unknown') throw new Error(`Solana reclaim transaction failed: ${JSON.stringify(outcome.failed)}`)
     throw new Error(`Solana reclaim ${txHash} was submitted but its confirmation is unknown (${error instanceof Error ? error.message : String(error)}). Re-check the deposit before signing again.`)
   }
 
