@@ -12,6 +12,8 @@ dist/
 # Local-only markdown docs
 *.md
 !README.md
+!SECURITY.md
+!docs/SECURITY_STATUS.md
 
 # Security reports and local audit files
 *.pdf
