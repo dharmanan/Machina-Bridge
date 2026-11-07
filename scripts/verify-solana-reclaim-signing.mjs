@@ -170,6 +170,111 @@ await test('Circle checks still precede any budget work: wrong rent payer or unb
   const s2 = setup(); s2.metadata = { ...s2.metadata }; plan.info = { ...plan.info, data: Buffer.from(makeDeposit({ createdAtSec: now() - 6 * DAY }).accountInfo.data[0], 'base64') }
   assert.match((await run(s2)).error, /rent payer/); assert.equal(calls.simulated.length, 0); assert.equal(calls.signs, 0)
 })
+// ---------------------------------------------------------------- change diagnostics (UI error text only)
+// What the error may show: positions, program ids (known by name, others shortened), account counts and
+// the compute unit limit/price. What it must never show: signatures, transaction bytes, instruction data
+// (attestation, Circle message) or full addresses. Every changed transaction stays unbroadcast.
+const short = id => `${id.slice(0, 6)}…${id.slice(-4)}`
+const details = r => { const m = /Details: (.*)$/.exec(r.error); assert.ok(m, 'a Details section'); return m[1] }
+function assertPrivate(r, s, extra = []) {
+  const text = r.error, signedSig = calls.sentSignature
+  for (const secret of [s.wallet, s.d.eventAccount, s.metadata.refundAttestation.slice(2), s.metadata.refundAttestation.slice(2, 40), s.d.attestedMessage.slice(2, 60),
+    s.metadata.refundDestinationMessage.slice(2), s.phantom.secretKey && Buffer.from(s.phantom.secretKey).toString('hex').slice(0, 32), ...extra].filter(Boolean))
+    assert.ok(!text.includes(secret), `the error leaks ${String(secret).slice(0, 8)}…`)
+  assert.ok(!/[0-9a-f]{64}/i.test(text), 'no long hex (bytes, attestation, message)')
+  assert.ok(!/[1-9A-HJ-NP-Za-km-z]{32,}/.test(text), 'no full base58 address or signature')
+  assert.ok(text.length <= 900, `bounded error text (${text.length})`)
+}
+const withQuietSinks = async fn => {
+  const seen = []
+  const methods = ['log', 'info', 'warn', 'error', 'debug', 'trace']
+  const saved = Object.fromEntries(methods.map(m => [m, console[m]]))
+  const savedSet = globalThis.window.localStorage.setItem, savedFetch = globalThis.fetch
+  for (const m of methods) console[m] = (...a) => seen.push(`console.${m}`)
+  globalThis.window.localStorage.setItem = () => seen.push('localStorage.setItem')
+  globalThis.fetch = async u => { seen.push(`fetch ${u}`); throw new Error('Network forbidden') }
+  try { return await fn() } finally { Object.assign(console, saved); globalThis.window.localStorage.setItem = savedSet; globalThis.fetch = savedFetch; assert.deepEqual(seen, [], 'nothing written to console, storage or network') }
+}
+const signedWith = (tx, instructions) => rebuild(tx, { instructions })
+const foreignIx = (tx, accounts = 4) => new TransactionInstruction({ programId: new PublicKey(randomKey()),
+  keys: [tx.instructions[2].keys[0], tx.instructions[2].keys[2], ...Array.from({ length: accounts - 2 }, () => ({ pubkey: new PublicKey(randomKey()), isSigner: false, isWritable: false }))],
+  data: Buffer.from(tx.instructions[2].data).subarray(0, 120) })
+
+await test('diagnostics: an appended non-Compute-Budget instruction is named by position and short program id; limit/price shown as same; nothing leaks or is written anywhere', async () => {
+  const s = setup(); let extra
+  const r = await withQuietSinks(() => run(s, tx => { extra = foreignIx(tx); return signedWith(tx, [...tx.instructions, extra]) }))
+  blocked(r, 'instructions added or removed')
+  const d = details(r), b = budgetOf(calls.shown)
+  assert.match(d, /^instructions expected 3, signed 4; /)
+  assert.ok(d.includes(`added: #3 program ${short(extra.programId.toBase58())} (4 accounts)`), d)
+  assert.ok(d.includes('removed: none'), d); assert.ok(d.includes('order differs'), d)
+  assert.ok(d.includes(`limit same (${b.limit})`) && d.includes(`price same (${b.price})`), d)
+  assertPrivate(r, s, [extra.programId.toBase58()])
+})
+await test('diagnostics: instructions inserted before and between the reclaim are listed with their signed positions', async () => {
+  const s = setup(); let x, y
+  const r = await run(s, tx => { x = foreignIx(tx, 3); y = foreignIx(tx, 5); return signedWith(tx, [x, tx.instructions[0], tx.instructions[1], y, tx.instructions[2]]) })
+  blocked(r, 'instructions added or removed')
+  const d = details(r)
+  assert.ok(d.includes(`added: #0 program ${short(x.programId.toBase58())} (3 accounts), #3 program ${short(y.programId.toBase58())} (5 accounts)`), d)
+  assert.ok(d.includes('removed: none'), d); assertPrivate(r, s)
+})
+await test('diagnostics: a removed reclaim instruction is named (CircleMessageTransmitterV2)', async () => {
+  const s = setup()
+  const r = await run(s, tx => signedWith(tx, [tx.instructions[0], tx.instructions[1]]))
+  blocked(r, 'instructions added or removed')
+  const d = details(r)
+  assert.ok(d.includes('instructions expected 3, signed 2'), d); assert.ok(d.includes('added: none; removed: #2 CircleMessageTransmitterV2'), d); assertPrivate(r, s)
+})
+await test('diagnostics: replaced instruction (reclaim swapped for another program) shows both the removal and the addition', async () => {
+  const s = setup(); let x
+  const r = await run(s, tx => { x = foreignIx(tx); return signedWith(tx, [tx.instructions[0], tx.instructions[1], x]) })
+  blocked(r, 'instruction order or program')
+  const d = details(r)
+  assert.ok(d.includes(`added: #2 program ${short(x.programId.toBase58())} (4 accounts); removed: #2 CircleMessageTransmitterV2`), d); assertPrivate(r, s)
+})
+await test('diagnostics: changed price and limit are reported as values (old -> new), never as added/removed', async () => {
+  const s = setup()
+  const r = await run(s, tx => signedWith(tx, [ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 777_777 }), tx.instructions[2]]))
+  blocked(r, 'compute budget \\(fee\\) values')
+  const d = details(r), e = budgetOf(calls.shown)
+  assert.ok(d.includes('added: none; removed: none; order same'), d)
+  assert.ok(d.includes(`limit ${e.limit} -> 300000 (changed)`) && d.includes(`price ${e.price} -> 777777 (changed)`), d); assertPrivate(r, s)
+})
+await test('diagnostics: a third Compute Budget instruction (e.g. loaded-accounts data limit) is named by its type; limit and price compared', async () => {
+  const s = setup()
+  const r = await run(s, tx => signedWith(tx, [new TransactionInstruction({ programId: ComputeBudgetProgram.programId, keys: [], data: Buffer.from([4, 0, 0, 4, 0]) }), ...tx.instructions]))
+  blocked(r, 'compute budget instructions added or removed')
+  const d = details(r)
+  assert.ok(d.includes('added: #0 ComputeBudget:type4'), d); assert.match(d, /limit same \(\d+\), price same \(\d+\)/); assertPrivate(r, s)
+})
+await test('diagnostics: compute budget removed by the wallet shows limit/price as absent in the signed message', async () => {
+  const s = setup()
+  const r = await run(s, tx => signedWith(tx, [tx.instructions[2]]))
+  blocked(r, 'compute budget instructions added or removed')
+  const d = details(r)
+  assert.ok(d.includes('removed: #0 ComputeBudget:limit, #1 ComputeBudget:price'), d); assert.match(d, /limit \d+ -> absent \(changed\), price \d+ -> absent \(changed\)/); assertPrivate(r, s)
+})
+await test('diagnostics: reordered instructions are reported as an order change; the list is bounded for many added instructions', async () => {
+  const s = setup()
+  const r = await run(s, tx => signedWith(tx, [tx.instructions[2], tx.instructions[0], tx.instructions[1]]))
+  blocked(r, 'instruction order or program'); assert.ok(details(r).includes('order differs') || details(r).includes('order changed')); assertPrivate(r, s)
+  const s2 = setup()
+  const r2 = await run(s2, tx => signedWith(tx, [...tx.instructions, ...Array.from({ length: 9 }, () => new TransactionInstruction({ programId: new PublicKey(randomKey()), keys: [], data: Buffer.alloc(0) }))]))
+  blocked(r2, 'instructions added or removed')
+  const d2 = details(r2); assert.ok(d2.includes('+3 more'), d2); assert.ok(d2.includes('signed 12'), d2); assertPrivate(r2, s2)
+})
+await test('no automatic exception: an added instruction is blocked whatever its program (no allowlist exists), including wallet-safety assertions', async () => {
+  const text = readFileSync(root + 'src/lib/mainnetSolanaReclaim.ts', 'utf8')
+  assert.ok(!/lighthouse/i.test(text), 'no Lighthouse special case in the reclaim code')
+  for (let n = 0; n < 3; n++) { const s = setup(); blocked(await run(s, tx => signedWith(tx, [...tx.instructions, foreignIx(tx, 2 + n)])), 'instructions added or removed') }
+})
+await test('diagnostics helper is pure and safe on malformed input', async () => {
+  const s = setup(); await run(s)
+  assert.equal(sol.reclaimMessageDiagnostics(calls.shown, null), '')
+  assert.equal(sol.reclaimMessageDiagnostics(calls.shown, Buffer.from([1, 2, 3])), 'the signed message could not be read.')
+  assert.match(sol.reclaimMessageDiagnostics(calls.shown, calls.shown), /^instructions expected 3, signed 3; added: none; removed: none; order same; compute budget limit same \(\d+\), price same \(\d+\)\.$/)
+})
 await test('production code holds no specific wallet, signature or account (generated values only in this test)', async () => {
   const text = readFileSync(root + 'src/lib/mainnetSolanaReclaim.ts', 'utf8')
   for (const v of ['7bJT7x7UBeMLS5PwhqazRZPjbZa5amnnRHbD9zrG8YQR', '5BfmjJL8atsQ8LDRr3AoNU4PKu4oy1AH7Bn4Yn846uHz', '8DEFF2A3aQs5Pv5mjYv8bzfF93q1GAtmMzpkwnee4Drq']) assert.ok(!text.includes(v))

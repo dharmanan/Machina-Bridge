@@ -609,7 +609,8 @@ async function performMainnetSolanaReclaim(input: {
   // (fee payer, blockhash, instructions, order, programs, accounts, data or compute budget).
   const signedMessage = typeof signed.serializeMessage === 'function' ? signed.serializeMessage() : null
   if (!signedMessage || !signedMessage.equals(expectedMessage)) {
-    throw new Error(`Phantom changed the reclaim transaction (${describeReclaimMessageChange(expectedMessage, signedMessage)}); broadcasting is blocked. Nothing was sent.`)
+    const details = reclaimMessageDiagnostics(expectedMessage, signedMessage)
+    throw new Error(`Phantom changed the reclaim transaction (${describeReclaimMessageChange(expectedMessage, signedMessage)}); broadcasting is blocked. Nothing was sent.${details ? ` Details: ${details}` : ''}`)
   }
   const raw = signed.serialize()
   let txHash: string | null = null
@@ -695,6 +696,75 @@ export function describeReclaimMessageChange(expected: Buffer, signed: Buffer | 
     return 'message header or account list'
   } catch {
     return 'an unreadable message'
+  }
+}
+
+// Bounded, privacy-safe structure of the change, for the UI error text only (never logged or stored).
+// It names instructions by position and program (known programs by name, others shortened) and compares
+// the compute unit limit and price. It never includes instruction data (attestation, Circle message),
+// signatures, transaction bytes or account addresses. It does not accept any change: the caller still
+// blocks the broadcast.
+const RECLAIM_DIAGNOSTIC_MAX_CHARS = 600
+const RECLAIM_DIAGNOSTIC_MAX_INSTRUCTIONS = 64
+const RECLAIM_DIAGNOSTIC_MAX_LISTED = 6
+type InstructionShape = { index: number; key: string; label: string; limit?: number; price?: bigint }
+
+const shortProgramId = (id?: string) => (id && id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : 'unknown')
+
+function instructionShapes(m: Message): InstructionShape[] {
+  const known: Record<string, string> = {
+    [COMPUTE_BUDGET_PROGRAM]: 'ComputeBudget',
+    [SOLANA_MAINNET_CCTP.messageTransmitterProgram]: 'CircleMessageTransmitterV2',
+  }
+  return m.compiledInstructions.map((ix, index) => {
+    const id = m.accountKeys[ix.programIdIndex]?.toBase58()
+    if (id === COMPUTE_BUDGET_PROGRAM) {
+      const d = Buffer.from(ix.data)
+      if (d[0] === 2 && d.length === 5) return { index, key: 'cb:limit', label: 'ComputeBudget:limit', limit: d.readUInt32LE(1) }
+      if (d[0] === 3 && d.length === 9) return { index, key: 'cb:price', label: 'ComputeBudget:price', price: d.readBigUInt64LE(1) }
+      return { index, key: `cb:type${d[0] ?? '?'}`, label: `ComputeBudget:type${d[0] ?? '?'}` }
+    }
+    const name = id ? known[id] : undefined
+    return { index, key: `p:${id ?? '?'}`, label: name ?? `program ${shortProgramId(id)} (${ix.accountKeyIndexes.length} accounts)` }
+  })
+}
+
+// Order-preserving diff (longest common subsequence) of instruction kinds.
+function instructionDiff(a: InstructionShape[], b: InstructionShape[]) {
+  const L = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
+  for (let i = a.length - 1; i >= 0; i -= 1) for (let j = b.length - 1; j >= 0; j -= 1) {
+    L[i][j] = a[i].key === b[j].key ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1])
+  }
+  const removed: InstructionShape[] = [], added: InstructionShape[] = []
+  let i = 0, j = 0
+  while (i < a.length && j < b.length) {
+    if (a[i].key === b[j].key) { i += 1; j += 1 }
+    else if (L[i + 1][j] >= L[i][j + 1]) removed.push(a[i++])
+    else added.push(b[j++])
+  }
+  return { removed: [...removed, ...a.slice(i)], added: [...added, ...b.slice(j)] }
+}
+
+export function reclaimMessageDiagnostics(expected: Buffer, signed: Buffer | null): string {
+  if (!signed) return ''
+  try {
+    const a = instructionShapes(Message.from(expected)), b = instructionShapes(Message.from(signed))
+    if (a.length > RECLAIM_DIAGNOSTIC_MAX_INSTRUCTIONS || b.length > RECLAIM_DIAGNOSTIC_MAX_INSTRUCTIONS) return 'too many instructions to compare.'
+    const list = (items: InstructionShape[]) => items.length === 0 ? 'none'
+      : items.slice(0, RECLAIM_DIAGNOSTIC_MAX_LISTED).map((x) => `#${x.index} ${x.label}`).join(', ') + (items.length > RECLAIM_DIAGNOSTIC_MAX_LISTED ? ` +${items.length - RECLAIM_DIAGNOSTIC_MAX_LISTED} more` : '')
+    const { removed, added } = instructionDiff(a, b)
+    const sameKinds = a.length === b.length && a.every((x, i) => x.key === b[i].key)
+    const order = sameKinds ? 'same' : removed.length === 0 && added.length === 0 ? 'changed' : 'differs'
+    const budget = (name: 'limit' | 'price') => {
+      const pick = (s: InstructionShape[]) => s.filter((x) => x.key === `cb:${name}`).map((x) => String(name === 'limit' ? x.limit : x.price))
+      const x = pick(a), y = pick(b)
+      const show = (v: string[]) => (v.length === 0 ? 'absent' : v.join('+'))
+      return x.join(',') === y.join(',') ? `${name} same (${show(x)})` : `${name} ${show(x)} -> ${show(y)} (changed)`
+    }
+    const text = `instructions expected ${a.length}, signed ${b.length}; added: ${list(added)}; removed: ${list(removed)}; order ${order}; compute budget ${budget('limit')}, ${budget('price')}.`
+    return text.length > RECLAIM_DIAGNOSTIC_MAX_CHARS ? `${text.slice(0, RECLAIM_DIAGNOSTIC_MAX_CHARS - 1)}…` : text
+  } catch {
+    return 'the signed message could not be read.'
   }
 }
 
