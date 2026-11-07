@@ -12,7 +12,7 @@
 // on-chain IDLs of the three programs. Branches not seen on chain yet (ATA creation, the
 // separate ATA-only fallback transaction) are allowed only in the narrow form the installed
 // adapter builds.
-import { PublicKey } from '@solana/web3.js'
+import { AddressLookupTableAccount, PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js'
 import { decodeCctpRecoveryMessage } from './mainnetCctpRecovery'
 
 export const SOLANA_BRIDGE_PROGRAMS = Object.freeze({
@@ -26,6 +26,18 @@ export const SOLANA_BRIDGE_PROGRAMS = Object.freeze({
 })
 export const SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 export const SOLANA_CCTP_ALT = 'qj4EYgsGpnRdt9rvQW3wWZR8JVaKPg9rG9EB8DNgfz8'
+// Entries of Circle's Solana CCTP lookup table, in table order. The table is frozen on chain (no
+// authority, never deactivated), so these entries can never change. They are pinned here so the burn
+// compression below never depends on an RPC answer about the table's contents.
+export const SOLANA_CCTP_ALT_ADDRESSES: readonly string[] = Object.freeze([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
+  'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  '11111111111111111111111111111111', 'AawthJCGRmggpfv9MMWV6Jmo9cue4gL9wUZgRBShg58W',
+  'E1bQJ8eMMn3zmeSewW3HQ8zmJr7KR75JonbwAtWx2bux', 'W1k5ijkaSTo5iA5zChNpfzcy796fLhkBxfmJuR8W8HU',
+  'CRBBbuLCyrkQy4dCTHxqstSmDQv4ajBeUVb9qUdMVaP1', '6xTBTqJMBr5m7BKqVxmW2x11DfqUwtD3TJsqpxELx72L',
+  'DsAdX23SVpTPYhKP2ua1mx8gTPqLyzx7a43cyxYjS2up', '6TCCnJ9R1m1RXFzyoH7GYH2J6NJDtZaUvfipPuLWxHNd',
+  'H1AL6KrVjbL3brz8YUd8MFiZ1vGmfi41HEDJq4LXvLjT',
+])
 // Bridge Kit funds the burn's MessageSent event account with exactly this amount (adapter constant).
 export const KIT_EVENT_ACCOUNT_LAMPORTS = 3_900_000n
 // Ceilings for values the SDK chooses. A higher value is refused (fails safe).
@@ -249,8 +261,53 @@ export function createStrictSolanaProvider(provider: PhantomSolanaProvider, expe
     disconnect: async () => provider.disconnect(),
     signTransaction: async (transaction: unknown) => {
       assertSolanaBridgeSigningRequest(provider, transaction, expected)
-      return provider.signTransaction!(transaction)
+      // The validated burn is handed to Phantom in an equivalent, smaller form (see compressSolanaBurnWithCctpAlt),
+      // leaving room for the security assertions Phantom adds before signing.
+      return provider.signTransaction!(expected.kind === 'burn' ? compressSolanaBurnWithCctpAlt(transaction) : transaction)
     },
+  }
+}
+
+const cctpLookupTable = () => new AddressLookupTableAccount({
+  key: new PublicKey(SOLANA_CCTP_ALT),
+  state: { deactivationSlot: BigInt('18446744073709551615'), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0, authority: undefined, addresses: SOLANA_CCTP_ALT_ADDRESSES.map((a) => new PublicKey(a)) },
+})
+
+type Decompiled = ReturnType<typeof TransactionMessage.decompile>
+function sameMessage(a: Decompiled, b: Decompiled) {
+  return a.payerKey.equals(b.payerKey) && a.recentBlockhash === b.recentBlockhash && a.instructions.length === b.instructions.length
+    && a.instructions.every((x, i) => {
+      const y = b.instructions[i]
+      return x.programId.equals(y.programId) && Buffer.from(x.data).equals(Buffer.from(y.data)) && x.keys.length === y.keys.length
+        && x.keys.every((k, j) => k.pubkey.equals(y.keys[j].pubkey) && k.isSigner === y.keys[j].isSigner && k.isWritable === y.keys[j].isWritable)
+    })
+}
+
+// Rewrites an unsigned, already validated burn (v0, no lookup table) to use Circle's frozen CCTP lookup
+// table (pinned above), as other CCTP integrations do: the same instructions, programs, accounts,
+// permissions, signers, fee payer and blockhash, written with table indexes instead of full addresses
+// (about 1039 -> 794 bytes). Phantom then has room for its Lighthouse assertions. The result is decoded
+// again with the pinned table and compared with the original; any difference, a signed input, an
+// unexpected shape or no size gain returns the original transaction unchanged (today's behaviour).
+// Bridge Kit signs the event account on the transaction Phantom returns and sends that one.
+export function compressSolanaBurnWithCctpAlt(transaction: unknown): unknown {
+  try {
+    const tx = transaction as VersionedTransaction
+    const m = tx?.message as VersionedTransaction['message'] | undefined
+    if (!m || tx.version !== 0 || !Array.isArray(m.staticAccountKeys) || m.addressTableLookups.length !== 0) return transaction
+    if (tx.signatures.some((signature) => signature.some((byte) => byte !== 0))) return transaction
+    const original = TransactionMessage.decompile(m)
+    const table = cctpLookupTable()
+    const compressed = new VersionedTransaction(new TransactionMessage(original).compileToV0Message([table]))
+    const c = compressed.message
+    const signers = (x: typeof m) => x.staticAccountKeys.slice(0, x.header.numRequiredSignatures).map((k) => k.toBase58()).join(',')
+    if (!sameMessage(original, TransactionMessage.decompile(c, { addressLookupTableAccounts: [table] }))) return transaction
+    if (signers(c) !== signers(m) || c.header.numReadonlySignedAccounts !== m.header.numReadonlySignedAccounts) return transaction
+    if (c.addressTableLookups.length !== 1 || !c.addressTableLookups[0].accountKey.equals(table.key)) return transaction
+    if (compressed.serialize().length >= tx.serialize().length) return transaction
+    return compressed
+  } catch {
+    return transaction
   }
 }
 

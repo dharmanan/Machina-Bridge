@@ -259,4 +259,66 @@ await test('combined B1: changed Phantom account is refused before signing journ
  await assert.rejects(withSolanaSendGuard(sendInput,async guard=>guard.solana(P.createStrictSolanaProvider(wallet,BURN),tx=>P.assertSolanaBridgeSigningRequest(wallet,tx,BURN)).signTransaction(realBurn()),evidence()),e=>e instanceof P.SolanaTxPolicyError&&e.code==='wallet')
  assert.deepEqual(wallet.calls,[]);const record=G.readSolanaSendAttempts()[0];assert.equal(record.phase,'released');assert.equal(record.signingAt,undefined)
 })
+// ---------------------------------------------------------------- burn compression with Circle's frozen CCTP lookup table
+const crypto = require('node:crypto')
+const ed25519Verify = (pubkey, message, signature) => crypto.verify(null, Buffer.from(message),
+  crypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(pubkey.toBytes())]), format: 'der', type: 'spki' }), Buffer.from(signature))
+// The SDK hands Phantom the burn unsigned; the fixture is the signed on-chain copy.
+const unsignedBurn = () => { const t = realBurn(); t.signatures = t.signatures.map(() => new Uint8Array(64)); return t }
+const resolve = (vtx, alts = []) => TransactionMessage.decompile(vtx.message, { addressLookupTableAccounts: alts })
+const sameIxs = (a, b) => a.payerKey.equals(b.payerKey) && a.recentBlockhash === b.recentBlockhash && a.instructions.length === b.instructions.length
+  && a.instructions.every((x, i) => x.programId.equals(b.instructions[i].programId) && Buffer.from(x.data).equals(Buffer.from(b.instructions[i].data))
+    && x.keys.every((k, j) => k.pubkey.equals(b.instructions[i].keys[j].pubkey) && k.isSigner === b.instructions[i].keys[j].isSigner && k.isWritable === b.instructions[i].keys[j].isWritable))
+
+await test('ALT: the pinned table entries equal Circle\'s on-chain CCTP lookup table (frozen: no authority, never deactivated)', () => {
+  assert.deepEqual(P.SOLANA_CCTP_ALT_ADDRESSES, alt.state.addresses.map(String))
+  assert.equal(alt.state.authority, undefined, 'frozen'); assert.equal(alt.state.deactivationSlot, BigInt('18446744073709551615'))
+  assert.equal(alt.key.toBase58(), P.SOLANA_CCTP_ALT)
+})
+await test('ALT: the real Mainnet burn compresses to an equivalent, smaller transaction (same instructions, accounts, permissions, signers, payer, blockhash)', () => {
+  const burn = unsignedBurn(), compressed = P.compressSolanaBurnWithCctpAlt(burn)
+  assert.notEqual(compressed, burn)
+  const before = burn.serialize().length, after = compressed.serialize().length
+  assert.ok(after <= 800 && before - after >= 200, `${before} -> ${after} bytes`)
+  assert.ok(sameIxs(resolve(burn), resolve(compressed, [alt])), 'resolved with the real on-chain table, the instructions are identical')
+  assert.deepEqual(compressed.message.staticAccountKeys.slice(0, 2).map(String), burn.message.staticAccountKeys.slice(0, 2).map(String), 'signers stay static, in order')
+  assert.equal(compressed.message.header.numRequiredSignatures, 2); assert.equal(compressed.message.addressTableLookups.length, 1)
+  assert.equal(compressed.message.addressTableLookups[0].accountKey.toBase58(), P.SOLANA_CCTP_ALT)
+  P.assertSolanaBridgeTransaction(burn, BURN) // the policy still runs on the original, uncompressed burn
+})
+await test('ALT: Phantom receives the compressed burn only after the full policy; the receive path is not changed', async () => {
+  const wallet = phantom(FX.burn.owner), strict = P.createStrictSolanaProvider(wallet, BURN), seen = []
+  const inner = wallet.signTransaction; wallet.signTransaction = async tx => { seen.push(tx); return inner(tx) }
+  const signed = await strict.signTransaction(unsignedBurn())
+  assert.equal(seen.length, 1); assert.equal(seen[0].message.addressTableLookups.length, 1, 'Phantom sees the compressed burn'); assert.equal(signed, seen[0])
+  const bad = editBurn(ixs => { ixs[kitIx(ixs)].keys[1].pubkey = ATTACKER; return ixs })
+  await assert.rejects(() => strict.signTransaction(bad), P.SolanaTxPolicyError); assert.equal(seen.length, 1, 'a refused burn never reaches Phantom, compressed or not')
+  const rWallet = phantom(FX.receive.owner), rSeen = [], rInner = rWallet.signTransaction; rWallet.signTransaction = async tx => { rSeen.push(tx); return rInner(tx) }
+  const recv = realReceive()
+  await P.createStrictSolanaProvider(rWallet, { ...RECV, exactMessage: receiveMessage(recv) }).signTransaction(recv)
+  assert.equal(rSeen[0], recv, 'the receive is passed through unchanged')
+})
+await test('ALT: Bridge Kit\'s order (wallet signs the returned transaction, then the event account) yields valid signatures on the compressed message', () => {
+  const wallet = Keypair.generate(), event = Keypair.generate(), pinned = P.SOLANA_CCTP_ALT_ADDRESSES.map(a => new PublicKey(a))
+  const ix = new TransactionInstruction({ programId: pinned[2], data: Buffer.from([1, 2, 3]), keys: [
+    { pubkey: wallet.publicKey, isSigner: true, isWritable: true }, { pubkey: event.publicKey, isSigner: true, isWritable: true },
+    ...pinned.slice(5, 12).map((pubkey, i) => ({ pubkey, isSigner: false, isWritable: i % 2 === 0 })), { pubkey: pinned[0], isSigner: false, isWritable: false }] })
+  const tx = new VersionedTransaction(new TransactionMessage({ payerKey: wallet.publicKey, recentBlockhash: Keypair.generate().publicKey.toBase58(), instructions: [ix] }).compileToV0Message())
+  const compressed = P.compressSolanaBurnWithCctpAlt(tx)
+  assert.equal(compressed.message.addressTableLookups.length, 1); assert.ok(sameIxs(resolve(tx), resolve(compressed, [alt])))
+  compressed.sign([wallet]) // Phantom
+  compressed.sign([event])  // Bridge Kit: signedVersionedTx.sign(additionalSigners)
+  const bytes = compressed.message.serialize()
+  assert.ok(ed25519Verify(wallet.publicKey, bytes, compressed.signatures[0]) && ed25519Verify(event.publicKey, bytes, compressed.signatures[1]), 'both signatures are valid for the compressed message')
+  assert.equal(VersionedTransaction.deserialize(compressed.serialize()).message.addressTableLookups.length, 1)
+})
+await test('ALT: falls back to the original transaction when compression is not safe or not useful', () => {
+  const burn = unsignedBurn(); burn.signatures[0] = Uint8Array.from({ length: 64 }, () => 7)
+  assert.equal(P.compressSolanaBurnWithCctpAlt(burn), burn, 'an already signed transaction is never changed')
+  const withAlt = realReceive(); assert.equal(P.compressSolanaBurnWithCctpAlt(withAlt), withAlt, 'a transaction that already uses a lookup table is not changed')
+  const k = Keypair.generate(), plain = new VersionedTransaction(new TransactionMessage({ payerKey: k.publicKey, recentBlockhash: Keypair.generate().publicKey.toBase58(),
+    instructions: [new TransactionInstruction({ programId: Keypair.generate().publicKey, data: Buffer.alloc(0), keys: [{ pubkey: k.publicKey, isSigner: true, isWritable: true }] })] }).compileToV0Message())
+  assert.equal(P.compressSolanaBurnWithCctpAlt(plain), plain, 'no size gain: unchanged')
+  const legacy = new Transaction(); assert.equal(P.compressSolanaBurnWithCctpAlt(legacy), legacy); assert.equal(P.compressSolanaBurnWithCctpAlt(null), null)
+})
 console.log(`RESULT ${count}/${count} Solana Bridge transaction-policy groups PASS; real mainnet transactions and IDLs as fixtures, falsified IDL via Anchor Program.at; no network, wallet or signature.`)
