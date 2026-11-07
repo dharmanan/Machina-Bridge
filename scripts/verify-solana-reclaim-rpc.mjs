@@ -12,7 +12,12 @@ const sol = require(root + 'src/lib/mainnetSolanaReclaim.ts'), { SOLANA_MAINNET_
 const { owner, nonce, zero, word, message, source, sc } = require('./fixtures/cctp-recovery.cjs')
 globalThis.window = { localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, dispatchEvent() {}, addEventListener() {}, removeEventListener() {} }
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { locks: { request: async (_n, _o, run) => run({}) } } })
-globalThis.fetch = async input => { throw new Error(`Network forbidden: ${String(input)}`) }
+// The reclaim reads the source transaction of a closed account through the same-origin proxy (history is
+// not readable from browsers); plan.proxyTx controls that answer. Everything else is forbidden.
+globalThis.fetch = async input => {
+  if (String(input) === '/api/solana-rpc') { log.push('proxy getTransaction'); return Response.json({ jsonrpc: '2.0', id: 1, result: plan.proxyTx === undefined ? creation : plan.proxyTx }) }
+  throw new Error(`Network forbidden: ${String(input)}`)
+}
 
 const wallet = Keypair.generate().publicKey, eventAccount = Keypair.generate().publicKey, program = new PublicKey(sc.messageTransmitterProgram)
 const solWord = x => '0x' + new PublicKey(x).toBuffer().toString('hex')
@@ -23,7 +28,7 @@ function account(age = 6 * 86400) {
   data.writeBigInt64LE(BigInt(Math.floor(Date.now() / 1000) - age), 40); data.writeUInt32LE(376, 48); Buffer.from(solMessage.slice(2), 'hex').copy(data, 52)
   return { owner: program, lamports: 2000000, data }
 }
-const creation = { meta: { err: null, innerInstructions: [] }, transaction: { message: { accountKeys: [{ pubkey: eventAccount, signer: true }, { pubkey: wallet, signer: true }], instructions: [{ programId: program, accounts: [eventAccount, wallet] }] } } }
+const creation = { meta: { err: null, innerInstructions: [] }, transaction: { signatures: ['source-signature'], message: { accountKeys: [{ pubkey: eventAccount, signer: true }, { pubkey: wallet, signer: true }], instructions: [{ programId: program, accounts: [eventAccount, wallet] }] } } }
 const metadata = { sourceTxHash: 'source-signature', messageSentEventAccount: eventAccount.toBase58(), refundableDepositSol: '0.002', refundAvailableAt: Date.now() - 1000, refundDestinationMessage: solSigned, refundAttestation: '0x' + 'ab'.repeat(65) }
 
 // Provider answers observed in production / encoded in api/solana-rpc.js (free plan, personal token).
@@ -39,10 +44,10 @@ const unavailable = { 'rpc.ankr.com': all(ANKR), 'solana.drpc.org': all(DRPC) }
 
 let plan, log, signs, sent
 const host = c => new URL(c.rpcEndpoint).hostname
-const kinds = { getAccountInfo: 'read', getParsedTransaction: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
+const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
 const answers = {
   getAccountInfo: h => (plan[h] && 'info' in plan[h] ? plan[h].info : plan.info === undefined ? account() : plan.info),
-  getParsedTransaction: () => creation, getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
+  getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
   getLatestBlockhash: () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 100 }),
   simulateTransaction: () => ({ value: { err: plan.simErr ?? null } }), sendRawTransaction: () => 'controlled-signature', confirmTransaction: () => ({ value: { err: plan.confirmErr ?? null } }),
 }
@@ -52,6 +57,8 @@ for (const [name, kind] of Object.entries(kinds)) Connection.prototype[name] = a
   const e = plan[h]?.[kind]; if (e) throw e
   return answers[name](h)
 }
+// Browser-direct history reads fail on public RPCs (publicnode: no history, Foundation: 403 for browser origins).
+Connection.prototype.getParsedTransaction = async function () { log.push(`${host(this)} getParsedTransaction`); throw new Error('direct history read is not allowed in reclaim') }
 const run = (o = {}) => sol.reclaimMainnetSolanaDeposit({ connectedWallet: o.connected ?? wallet.toBase58(), originalWallet: wallet.toBase58(), metadata,
   provider: { signTransaction: async tx => { signs++; return { serialize: () => Buffer.from([1, 2, 3]), serializeMessage: () => tx.serializeMessage() } } } })
 let count = 0
@@ -98,7 +105,13 @@ await test('J. "no account" without any second provider able to confirm: refused
   r => { assert.match(r.error, /closure could not be confirmed by a second Solana RPC \(failed to get info about account: 503/); assert.equal(signs, 0) })
 await test('K. closure confirmed by an independent provider plus the bound source transaction: alreadyClosed, no signature', { info: null },
   r => { assert.deepEqual(r.ok, { alreadyClosed: true }); assert.equal(signs, 0); assert.equal(sent.length, 0)
-    assert.ok(log.includes('solana-rpc.publicnode.com getAccountInfo') && log.includes('api.mainnet.solana.com getAccountInfo')) })
+    assert.ok(log.includes('solana-rpc.publicnode.com getAccountInfo') && log.includes('api.mainnet.solana.com getAccountInfo'))
+    assert.ok(log.includes('proxy getTransaction'), 'the source transaction is read through the proxy') })
+await test('O. closed account whose source transaction no provider returns: refused, never alreadyClosed or reclaimed', { info: null, proxyTx: null },
+  r => { assert.equal(r.ok, undefined); assert.match(r.error, /not available from the Solana RPC providers yet/); assert.equal(signs, 0) })
+await test('P. closed account bound to a source transaction of another wallet or another signature: refused', { info: null,
+  proxyTx: { ...creation, transaction: { ...creation.transaction, message: { ...creation.transaction.message, accountKeys: [{ pubkey: eventAccount.toBase58(), signer: true }, { pubkey: Keypair.generate().publicKey.toBase58(), signer: true }] } } } },
+  r => { assert.match(r.error, /cannot be bound to a successful Circle source transaction/); assert.equal(signs, 0) })
 
 // ---------------- after the single Phantom signature: never assume "not sent", never sign again
 await test('L. every broadcast attempt errors: outcome reported as unknown; same signed bytes only, one signature, no new reclaim built',

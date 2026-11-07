@@ -154,6 +154,10 @@ export default async function handler(req, res) {
   }
 
   let lastTransportError = null
+  // getTransaction only: a provider without this transaction's history (pruned ledger) answers
+  // result:null. That is "not on this provider", not proof that the transaction does not exist,
+  // so the next provider is asked. null is returned only when no provider has it.
+  let notFoundPayload = null
   const deadline = createDeadline(TOTAL_DEADLINE_MS)
 
   for (const rpc of getRpcCandidates()) {
@@ -166,6 +170,10 @@ export default async function handler(req, res) {
       const { response, payload } = await callRpc(rpc, requestBody, timeoutMs)
 
       if (response.ok && payload && !payload.error) {
+        if (method === 'getTransaction' && payload.result === null) {
+          notFoundPayload = payload
+          continue
+        }
         return send(res, 200, payload)
       }
 
@@ -194,6 +202,8 @@ export default async function handler(req, res) {
       lastTransportError = error instanceof Error ? error.message : String(error)
     }
   }
+
+  if (notFoundPayload) return send(res, 200, notFoundPayload)
 
   return send(res, 502, {
     jsonrpc: '2.0',

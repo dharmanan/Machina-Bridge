@@ -19,6 +19,9 @@ import { useMainnetSolanaActivity } from '../hooks/useMainnetSolanaActivity'
 import { useSuiWallet } from '../hooks/useSuiWallet'
 import { useBridgeHistory } from '../hooks/useBridgeHistory'
 import {
+  applyVerifiedSolanaRefund,
+  isVerifiedSolanaRefund,
+  recordSolanaRefundVerificationError,
   updateMainnetSolanaActivity,
   type MainnetSolanaActivityRecord,
 } from '../lib/mainnetSolanaActivity'
@@ -63,6 +66,22 @@ function timeUntil(timestamp: number) {
   return remainingHours > 0
     ? `Eligible in ${days}d ${remainingHours}h`
     : `Eligible in ${days}d`
+}
+
+// Fee-quote estimate of a not yet verified deposit (legacy records kept it in the main fields).
+// It is display-only: it never makes a deposit eligible or offers a reclaim.
+function refundEstimate(item: MainnetSolanaActivityRecord) {
+  const verified = isVerifiedSolanaRefund(item)
+  return {
+    sol: item.estimatedRefundableDepositSol ?? (verified ? undefined : item.refundableDepositSol),
+    at: item.estimatedRefundAvailableAt ?? (verified ? undefined : item.refundAvailableAt),
+  }
+}
+
+function estimateLabel(at?: number) {
+  if (!at) return 'Refund time not verified yet'
+  if (at <= Date.now()) return 'Estimated window passed · not verified on Solana yet'
+  return `Estimated ${timeUntil(at).replace('Eligible', 'eligible')} · not verified on Solana yet`
 }
 
 function WalletCard({ name, purpose, address, state }: { name: string; purpose: string; address?: string | null; state: { label: string; tone: 'ok' | 'warn' | 'off' } }) {
@@ -242,45 +261,46 @@ export default function MainnetDashboard() {
   const pendingRefunds = solanaActivity.filter(
     (item) =>
       item.direction === 'solana-to-arc'
-      && item.refundableDepositSol
-      && item.refundAvailableAt,
+      && item.sourceTxHash
+      && (
+        isVerifiedSolanaRefund(item)
+        || item.refundStatus === 'reclaimed'
+        || Boolean(refundEstimate(item).sol && refundEstimate(item).at)
+      ),
   )
 
-  const getRefundMetadata = async (
+  // Only on-chain verified metadata reaches the reclaim. An unverified record never opens Phantom.
+  const getRefundMetadata = (
     item: MainnetSolanaActivityRecord,
-  ): Promise<MainnetSolanaRefundMetadata> => {
-    if (
-      item.messageSentEventAccount
-      && item.refundDestinationMessage
-      && item.refundAttestation
-      && item.refundAvailableAt
-      && item.refundableDepositSol
-    ) {
-      return {
-        sourceTxHash:item.sourceTxHash,
-        messageSentEventAccount: item.messageSentEventAccount,
-        refundDestinationMessage: item.refundDestinationMessage,
-        refundAttestation: item.refundAttestation,
-        refundAvailableAt: item.refundAvailableAt,
-        refundableDepositSol: item.refundableDepositSol,
+  ): MainnetSolanaRefundMetadata => {
+    if (!isVerifiedSolanaRefund(item)) {
+      throw new Error('This deposit is not verified on Solana yet. Verify it first; no wallet signature was requested.')
+    }
+    return {
+      sourceTxHash: item.sourceTxHash,
+      messageSentEventAccount: item.messageSentEventAccount!,
+      refundDestinationMessage: item.refundDestinationMessage!,
+      refundAttestation: item.refundAttestation!,
+      refundAvailableAt: item.refundAvailableAt!,
+      refundableDepositSol: item.refundableDepositSol!,
+    }
+  }
+
+  // Read-only: reads the source transaction, the deposit account and Circle's attestation. No wallet request.
+  const handleVerify = async (item: MainnetSolanaActivityRecord) => {
+    setRefundActions((current) => ({ ...current, [item.id]: { loading: true, error: null } }))
+    try {
+      if (!item.sourceTxHash) throw new Error('Solana source transaction is missing from this activity record.')
+      const verified = await loadMainnetSolanaRefundMetadata(item.sourceTxHash, item.solanaWallet)
+      if (!applyVerifiedSolanaRefund(verified)) {
+        throw new Error('The verified deposit does not match exactly one local record of this wallet; nothing was saved.')
       }
+      setRefundActions((current) => ({ ...current, [item.id]: { loading: false, error: null } }))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Deposit verification failed.'
+      if (item.sourceTxHash) recordSolanaRefundVerificationError(item.solanaWallet, item.sourceTxHash, message)
+      setRefundActions((current) => ({ ...current, [item.id]: { loading: false, error: message } }))
     }
-
-    if (!item.sourceTxHash) {
-      throw new Error('Solana source transaction is missing from this activity record.')
-    }
-
-    const metadata = await loadMainnetSolanaRefundMetadata(
-      item.sourceTxHash,
-      item.solanaWallet,
-    )
-
-    updateMainnetSolanaActivity(item.id, {
-      ...metadata,
-      refundStatus: item.refundStatus ?? 'pending',
-    })
-
-    return metadata
   }
 
   const handleRefund = async (item: MainnetSolanaActivityRecord) => {
@@ -294,7 +314,7 @@ export default function MainnetDashboard() {
         throw new Error('Connect Phantom before reclaiming the refundable SOL deposit.')
       }
 
-      const metadata = await getRefundMetadata(item)
+      const metadata = getRefundMetadata(item)
       const result = await reclaimMainnetSolanaDeposit({
         provider: phantomProvider,
         connectedWallet: phantomAddress,
@@ -441,8 +461,12 @@ export default function MainnetDashboard() {
               {pendingRefunds.map((item) => {
                 const action = refundActions[item.id]
                 const reclaimed = item.refundStatus === 'reclaimed'
+                // Eligibility only from the on-chain created_at of a verified deposit, never from estimates.
+                const verified = isVerifiedSolanaRefund(item)
+                const estimate = refundEstimate(item)
                 const eligible = Boolean(
-                  item.refundAvailableAt
+                  verified
+                  && item.refundAvailableAt
                   && Date.now() >= item.refundAvailableAt
                 )
                 const correctWallet = Boolean(
@@ -454,6 +478,8 @@ export default function MainnetDashboard() {
                 return (
                   <div
                     key={item.id}
+                    data-refund-state={reclaimed ? 'reclaimed' : verified ? 'verified' : 'unverified'}
+                    data-refund-source={item.sourceTxHash}
                     className={`rounded-xl border p-4 ${
                       reclaimed
                         ? 'border-emerald-200 bg-emerald-50'
@@ -463,14 +489,18 @@ export default function MainnetDashboard() {
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <p className="font-semibold text-slate-900">
-                          {item.refundableDepositSol} SOL refundable
+                          {reclaimed || verified
+                            ? `${item.refundableDepositSol} SOL refundable`
+                            : estimate.sol
+                              ? `~${estimate.sol} SOL refundable (estimate)`
+                              : 'Refundable SOL not verified yet'}
                         </p>
                         <p className="mt-1 text-xs text-slate-600">
                           {reclaimed
                             ? 'Reclaimed'
-                            : item.refundAvailableAt
-                              ? timeUntil(item.refundAvailableAt)
-                              : 'Eligibility time unknown'}
+                            : verified
+                              ? `Verified on Solana · ${timeUntil(item.refundAvailableAt!)}`
+                              : estimateLabel(estimate.at)}
                         </p>
                       </div>
 
@@ -478,6 +508,16 @@ export default function MainnetDashboard() {
                         <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
                           Reclaimed
                         </span>
+                      ) : !verified ? (
+                        <button
+                          type="button"
+                          disabled={action?.loading}
+                          onClick={() => void handleVerify(item)}
+                          className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-xs font-semibold text-slate-900 disabled:cursor-not-allowed disabled:text-slate-400"
+                        >
+                          <RefreshCw size={14} />
+                          {action?.loading ? 'Verifying deposit...' : 'Verify deposit'}
+                        </button>
                       ) : (
                         <button
                           type="button"
@@ -489,9 +529,7 @@ export default function MainnetDashboard() {
                           {action?.loading
                             ? 'Preparing reclaim...'
                             : !eligible
-                              ? item.refundAvailableAt
-                                ? timeUntil(item.refundAvailableAt)
-                                : 'Not ready'
+                              ? timeUntil(item.refundAvailableAt!)
                               : !correctWallet
                                 ? 'Connect original Phantom'
                                 : `Reclaim ${item.refundableDepositSol} SOL`}
@@ -499,7 +537,14 @@ export default function MainnetDashboard() {
                       )}
                     </div>
 
-                    {!reclaimed && (
+                    {!reclaimed && !verified && (
+                      <p className="mt-3 text-[11px] leading-5 text-amber-900/80">
+                        Verify deposit only reads Solana and Circle; it never opens Phantom. Reclaim is offered after the deposit account, its rent payer and Circle&apos;s attestation are verified.
+                        {item.refundVerificationError && !action?.error ? ` Last check: ${item.refundVerificationError}` : ''}
+                      </p>
+                    )}
+
+                    {!reclaimed && verified && (
                       <p className="mt-3 text-[11px] leading-5 text-amber-900/80">
                         Phantom shows the reclaim transaction before signing. Only the original rent-paying Phantom wallet can receive this SOL.
                       </p>

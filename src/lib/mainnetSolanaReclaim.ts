@@ -52,6 +52,11 @@ export type MainnetSolanaDiscoveredRefund = MainnetSolanaRefundMetadata & {
   createdAt: number
 }
 
+// A deposit proven by loadMainnetSolanaRefundMetadata, bound to the wallet it was verified for.
+export type MainnetSolanaVerifiedRefund = MainnetSolanaDiscoveredRefund & {
+  solanaWallet: string
+}
+
 function formatLamports(lamports: number) {
   const whole = Math.floor(lamports / 1_000_000_000)
   const fraction = String(lamports % 1_000_000_000)
@@ -82,56 +87,6 @@ function borshVec(bytes: Buffer) {
   const length = Buffer.alloc(4)
   length.writeUInt32LE(bytes.length, 0)
   return Buffer.concat([length, bytes])
-}
-
-async function withReadableSolanaConnection<T>(
-  operation: (connection: Connection) => Promise<T | null>,
-): Promise<T> {
-  const errors: unknown[] = []
-  let answered = false
-
-  for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
-    try {
-      const result = await operation(new Connection(rpcUrl, 'confirmed'))
-      if (result !== null) return result
-      answered = true
-    } catch (error) {
-      errors.push(error)
-    }
-  }
-
-  const failure = reclaimRpcFailure(errors, 'Solana mainnet RPC did not return the requested reclaim data.')
-  // A provider that answered "not found" outranks another provider's outage message.
-  if (answered && RPC_UNAVAILABLE.test(failure.message)) throw new Error('Solana mainnet RPC did not return the requested reclaim data.')
-  throw failure
-}
-
-async function findMessageSentEventAccount(
-  sourceTxHash: string,
-  solanaWallet: string,
-) {
-  const programId = new PublicKey(SOLANA_MAINNET_CCTP.messageTransmitterProgram)
-  const payee = new PublicKey(solanaWallet)
-
-  return withReadableSolanaConnection(async (connection) => {
-    const parsed = await connection.getParsedTransaction(sourceTxHash, {
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
-    })
-
-    if (!parsed) return null
-
-    if (!parsed.meta || parsed.meta.err !== null || !parsed.transaction.message.accountKeys.some(k => k.signer && k.pubkey.equals(payee))) throw new Error('The Solana source transaction did not succeed for the connected Phantom wallet.')
-    const keys = parsed.transaction.message.accountKeys.map(item => new PublicKey(item.pubkey.toBase58()))
-    const infos = await connection.getMultipleAccountsInfo(keys, 'finalized')
-    const found = infos.flatMap((info, i) => {
-      if (!info || !info.owner.equals(programId)) return []
-      const candidate = parseOpenMessageSentAccount({pubkey:keys[i],lamports:info.lamports,data:Buffer.from(info.data),owner:info.owner,payee})
-      return candidate && isSolanaEventCreation(parsed, keys[i]) ? [candidate] : []
-    })
-    if (found.length !== 1) throw new Error('No unique open Circle deposit account matches this source transaction.')
-    return found[0]
-  })
 }
 
 async function fetchSolanaSourceAttestation(sourceTxHash: string, sourceMessage: string) {
@@ -189,8 +144,10 @@ export function parseOpenMessageSentAccount(input: {
   }
 }
 
+const keyOf = (x: any): string | undefined => typeof x === 'string' ? x : x?.toBase58?.()
+
 export function isSolanaEventCreation(tx: any, eventAccount: PublicKey): boolean {
-  const key = (x: any) => typeof x === 'string' ? x : x?.toBase58?.()
+  const key = keyOf
   if (!tx?.meta || tx.meta.err !== null || !tx.transaction?.message?.accountKeys?.some((k: any)=>k.signer === true && key(k.pubkey) === eventAccount.toBase58())) return false
   const instructions = [...(tx.transaction.message.instructions ?? []), ...(tx.meta.innerInstructions?.flatMap((x: any)=>x.instructions) ?? [])]
   return instructions.some((i: any)=>key(i.programId) === SOLANA_MAINNET_CCTP.messageTransmitterProgram && i.accounts?.some((a: any)=>key(a) === eventAccount.toBase58()))
@@ -236,6 +193,19 @@ async function callSameOriginSolanaRpc(
   return payload?.result
 }
 
+// The proxy asks the next provider when one answers null (pruned history), so null here means that
+// no provider returned the transaction: it is "not available yet", never proof that it does not exist.
+async function readSourceTransactionThroughProxy(sourceTxHash: string): Promise<any> {
+  const tx = await callSameOriginSolanaRpc('getTransaction', [sourceTxHash, {
+    encoding: 'jsonParsed',
+    commitment: 'finalized',
+    maxSupportedTransactionVersion: 0,
+  }])
+  if (tx === null || tx === undefined) throw new Error('The Solana source transaction is not available from the Solana RPC providers yet. Nothing was signed or recorded; retry later.')
+  if (tx?.transaction?.signatures?.[0] !== sourceTxHash) throw new Error('Solana RPC returned a different transaction than the one requested. Nothing was signed or recorded.')
+  return tx
+}
+
 async function discoverProgramAccountsThroughProxy(
   programId: PublicKey,
   payee: PublicKey,
@@ -272,7 +242,7 @@ async function findSourceTransactionThroughProxy(eventAccount: PublicKey, _creat
   const found: string[] = []
   for (const s of signatures.filter(s=>!s.err && typeof s.signature === 'string')) {
     const tx = await callSameOriginSolanaRpc('getTransaction',[s.signature,{encoding:'jsonParsed',commitment:'finalized',maxSupportedTransactionVersion:0}])
-    if (isSolanaEventCreation(tx,eventAccount)) found.push(s.signature)
+    if (tx?.transaction?.signatures?.[0] === s.signature && isSolanaEventCreation(tx,eventAccount)) found.push(s.signature)
   }
   if (found.length !== 1) throw new Error('The exact Solana source transaction could not be proven. No amount/time matching is used.')
   return found[0]
@@ -449,17 +419,61 @@ async function confirmClosedOnAnotherProvider(eventAccount: PublicKey, checkedRp
   throw new Error(`The deposit account closure could not be confirmed by a second Solana RPC (${reclaimRpcFailure(errors, 'no other provider').message}). Nothing was signed or recorded; retry later.`)
 }
 
+// Verifies one Solana -> Arc deposit from chain and Circle data only (read-only, never a wallet request):
+// 1. the source transaction, read through the same-origin proxy (browsers cannot read history directly:
+//    public archive RPCs refuse browser origins), is exactly the requested signature, succeeded and was
+//    signed by `solanaWallet`;
+// 2. it created exactly one Circle MessageTransmitter event account (a co-signer used by that program);
+// 3. that account is open now, owned by MessageTransmitterV2, its rent payer and message sender are
+//    `solanaWallet`, and its message is a supported USDC burn to Arc;
+// 4. Circle Iris returns a complete attestation for this transaction whose message matches the account.
+// Amount and refund time come from the account (lamports, on-chain created_at + 5 days), never estimates.
 export async function loadMainnetSolanaRefundMetadata(
   sourceTxHash: string,
   solanaWallet: string,
-): Promise<MainnetSolanaRefundMetadata> {
+): Promise<MainnetSolanaVerifiedRefund> {
   if (!sourceTxHash) throw new Error('Solana source transaction is missing.')
   if (!solanaWallet) throw new Error('Original Phantom wallet is missing.')
+  const payee = new PublicKey(solanaWallet)
 
-  const eventAccount = await findMessageSentEventAccount(sourceTxHash, solanaWallet)
-  const iris = await fetchSolanaSourceAttestation(sourceTxHash, eventAccount.sourceMessage)
-  return { ...eventAccount, ...iris, sourceTxHash }
+  const tx = await readSourceTransactionThroughProxy(sourceTxHash)
+  if (!tx.meta || tx.meta.err !== null) throw new Error('The Solana source transaction did not succeed. Nothing can be reclaimed from it.')
+  const accountKeys: any[] = Array.isArray(tx.transaction?.message?.accountKeys) ? tx.transaction.message.accountKeys : []
+  if (!accountKeys.some((k) => k?.signer === true && keyOf(k.pubkey) === payee.toBase58())) {
+    throw new Error('The Solana source transaction was not signed by this Phantom wallet.')
+  }
+  const candidates = accountKeys
+    .filter((k) => k?.signer === true && keyOf(k.pubkey) !== payee.toBase58())
+    .map((k) => new PublicKey(String(keyOf(k.pubkey))))
+    .filter((key) => isSolanaEventCreation(tx, key))
+  if (candidates.length !== 1) throw new Error('The source transaction does not create exactly one Circle deposit account.')
+  const eventAccount = candidates[0]
 
+  const accounts = await callSameOriginSolanaRpc('getMultipleAccounts', [[eventAccount.toBase58()], { encoding: 'base64', commitment: 'finalized' }])
+  if (!Array.isArray(accounts?.value) || accounts.value.length !== 1) throw new Error('Invalid Solana account response. Nothing was recorded.')
+  const info = accounts.value[0]
+  if (!info) throw new Error('The Circle deposit account of this transfer is closed or not visible yet. Nothing was signed or recorded.')
+  if (!Array.isArray(info.data) || info.data[1] !== 'base64') throw new Error('Invalid Solana account encoding. Nothing was recorded.')
+  const deposit = parseOpenMessageSentAccount({
+    pubkey: eventAccount,
+    lamports: Number(info.lamports),
+    data: Buffer.from(String(info.data[0]), 'base64'),
+    owner: new PublicKey(String(info.owner)),
+    payee,
+  })
+  if (!deposit) throw new Error('The Circle deposit account is not an open deposit paid by this Phantom wallet.')
+  if (deposit.destinationDomain !== CIRCLE_MAINNET.chains.arc.cctpDomain) throw new Error('This deposit is not a Solana to Arc transfer.')
+
+  const iris = await fetchSolanaSourceAttestation(sourceTxHash, deposit.sourceMessage)
+  return {
+    sourceTxHash,
+    solanaWallet: payee.toBase58(),
+    createdAt: deposit.createdAt,
+    messageSentEventAccount: deposit.messageSentEventAccount,
+    refundableDepositSol: deposit.refundableDepositSol,
+    refundAvailableAt: deposit.refundAvailableAt,
+    ...iris,
+  }
 }
 
 async function performMainnetSolanaReclaim(input: {
@@ -487,8 +501,9 @@ async function performMainnetSolanaReclaim(input: {
   const { connection, eventInfo } = await getReclaimConnection(eventAccount)
   if (!eventInfo) {
     if (!input.metadata.sourceTxHash) throw new Error('Account is absent, but its source identity cannot be verified. No reclaim is requested.')
-    const source = await connection.getParsedTransaction(input.metadata.sourceTxHash, {commitment:'finalized',maxSupportedTransactionVersion:0})
-    const provesIdentity = isSolanaEventCreation(source, eventAccount) && source!.transaction.message.accountKeys.some(k=>k.signer && k.pubkey.equals(payee))
+    // History is read through the proxy: browser-origin reads of old transactions fail on public RPCs.
+    const source = await readSourceTransactionThroughProxy(input.metadata.sourceTxHash)
+    const provesIdentity = isSolanaEventCreation(source, eventAccount) && source.transaction.message.accountKeys.some((k: any) => k?.signer === true && keyOf(k.pubkey) === payee.toBase58())
     if (!provesIdentity) throw new Error('The absent account cannot be bound to a successful Circle source transaction.')
     // One RPC answering "no account" is not proof of closure (it may lag or misbehave). An independent
     // provider must also see the account absent; otherwise nothing is signed and nothing is recorded.
