@@ -585,7 +585,7 @@ async function performMainnetSolanaReclaim(input: {
 
   const actual = parseOpenMessageSentAccount({ pubkey:eventAccount,lamports:eventInfo.lamports,data:eventData,owner:eventInfo.owner,payee })
   if (!actual || !immutableMessageMatches(decodeCctpRecoveryMessage(actual.sourceMessage), decodeCctpRecoveryMessage(input.metadata.refundDestinationMessage))) throw new Error('The refund attestation is not bound to this deposit account.')
-  const chainTime = await connection.getBlockTime(await connection.getSlot('finalized'))
+  const chainTime = await finalizedChainTime(connection)
   if (typeof chainTime !== 'number' || chainTime * 1000 < actual.refundAvailableAt) throw new Error('The five-day refund window is not proven elapsed on Solana.')
   const attestation = hexBytes(input.metadata.refundAttestation, 'Circle attestation')
   const destinationMessage = hexBytes(
@@ -723,6 +723,26 @@ async function performMainnetSolanaReclaim(input: {
     txHash,
     alreadyClosed: false,
   }
+}
+
+// On-chain time of a recent finalized block. An RPC can briefly lack the newest finalized block
+// ("Block not available for slot"); an earlier finalized block is then used. An earlier time can only
+// make the five-day check stricter, never looser.
+async function finalizedChainTime(connection: Connection): Promise<number | null> {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const slot = await connection.getSlot('finalized')
+    for (let back = 0; back < 8; back += 1) {
+      try {
+        const time = await connection.getBlockTime(slot - back)
+        if (typeof time === 'number') return time
+      } catch (error) {
+        lastError = error
+      }
+    }
+  }
+  if (lastError) throw lastError
+  return null
 }
 
 // Recent priority fee (75th percentile) on the reclaim's writable accounts, with a small floor.

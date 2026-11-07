@@ -53,7 +53,7 @@ const host = c => new URL(c.rpcEndpoint).hostname
 const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', getBalance: 'read', getSignatureStatuses: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
 const answers = {
   getAccountInfo: h => (plan[h] && 'info' in plan[h] ? plan[h].info : plan.info === undefined ? account() : plan.info),
-  getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
+  getSlot: () => 100, getBlockTime: (_h, slot) => { if (plan.missingBlocks?.includes(slot)) throw new Error(`failed to get block time for slot ${slot}: Block not available for slot ${slot}`); return Math.floor(Date.now() / 1000) },
   getLatestBlockhash: () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 100 }),
   getRecentPrioritizationFees: () => [],
   getBalance: () => 10_000_000,
@@ -136,6 +136,10 @@ await test('M. confirmation unknown after submission: the signature is reported 
   r => { assert.match(r.error, /controlled-signature was submitted but its confirmation is unknown/); assert.equal(signs, 1); assert.equal(sent.length, 1) })
 await test('N. a landed-but-failed reclaim stays a definite failure (not unknown)', { confirmErr: { InstructionError: [0, { Custom: 2 }] } },
   r => { assert.match(r.error, /reclaim transaction failed/); assert.doesNotMatch(r.error, /unknown/); assert.equal(signs, 1) })
+await test('V. newest finalized block not available on the RPC: an earlier finalized block time is used; reclaim proceeds, one signature', { missingBlocks: [100, 99] },
+  r => { assert.deepEqual(r.ok, { txHash: 'controlled-signature', alreadyClosed: false }); assert.equal(signs, 1) })
+await test('W. no recent block time available at all: refused before any signature', { missingBlocks: Array.from({ length: 20 }, (_, i) => 100 - i) },
+  r => { assert.match(r.error, /Block not available/); assert.equal(signs, 0); assert.equal(sent.length, 0) })
 // ---------------------------------------------------------------- a landed reclaim whose confirmation watcher missed it
 await test('Q. confirmation watcher expires but the signature status shows the reclaim landed: reported as success, one signature',
   { 'solana-rpc.publicnode.com': { confirm: EXPIRED }, status: { confirmationStatus: 'finalized', err: null, slot: 9 } },

@@ -310,7 +310,20 @@ export default function MainnetDashboard() {
   // Each is proven by the same discovery as the Bridge panel: account, rent payer, source transaction
   // and Circle attestation. Deposits already shown from this browser's records are not repeated.
   const [chainRefunds, setChainRefunds] = useState<MainnetSolanaDiscoveredRefund[]>([])
-  const [chainReclaimed, setChainReclaimed] = useState<Record<string, string>>({})
+  // Reclaims of chain-found deposits are remembered in this browser (the closed account no longer appears
+  // on chain), so they stay visible as Reclaimed after a reload. Display only; never used for a decision.
+  const CHAIN_RECLAIMS_KEY = 'machina_solana_chain_reclaims_v1'
+  type ChainReclaim = { wallet: string; eventAccount: string; sourceTxHash: string; sol: string; txHash: string; at: number }
+  const readChainReclaims = (): ChainReclaim[] => {
+    try { const v = JSON.parse(window.localStorage.getItem(CHAIN_RECLAIMS_KEY) ?? '[]'); return Array.isArray(v) ? v.filter((x) => x && typeof x.eventAccount === 'string' && typeof x.wallet === 'string') : [] } catch { return [] }
+  }
+  const [chainReclaims, setChainReclaims] = useState<ChainReclaim[]>(() => readChainReclaims())
+  const chainReclaimed = Object.fromEntries(chainReclaims.filter((x) => x.wallet === phantomAddress).map((x) => [x.eventAccount, x.txHash]))
+  const rememberChainReclaim = (entry: ChainReclaim) => {
+    const next = [entry, ...readChainReclaims().filter((x) => x.eventAccount !== entry.eventAccount)].slice(0, 50)
+    try { window.localStorage.setItem(CHAIN_RECLAIMS_KEY, JSON.stringify(next)) } catch { /* display only */ }
+    setChainReclaims(next)
+  }
   useEffect(() => {
     let active = true
     setChainRefunds([])
@@ -320,8 +333,15 @@ export default function MainnetDashboard() {
       .catch(() => { if (active) setChainRefunds([]) }) // the Bridge panel shows scan errors
     return () => { active = false }
   }, [phantomAddress])
-  const chainOnlyRefunds = chainRefunds.filter((refund) => !pendingRefunds.some((item) =>
-    item.sourceTxHash === refund.sourceTxHash && item.solanaWallet === phantomAddress && item.refundStatus !== 'reclaimed'))
+  const chainOnlyRefunds = [
+    ...chainRefunds.filter((refund) => !pendingRefunds.some((item) =>
+      item.sourceTxHash === refund.sourceTxHash && item.solanaWallet === phantomAddress && item.refundStatus !== 'reclaimed')),
+    // Remembered reclaims of chain-found deposits (closed, so no longer returned by the scan).
+    ...chainReclaims
+      .filter((x) => x.wallet === phantomAddress && !chainRefunds.some((r) => r.messageSentEventAccount === x.eventAccount)
+        && !pendingRefunds.some((item) => item.sourceTxHash === x.sourceTxHash && item.solanaWallet === phantomAddress))
+      .map((x) => ({ messageSentEventAccount: x.eventAccount, sourceTxHash: x.sourceTxHash, refundableDepositSol: x.sol, refundAvailableAt: 0, createdAt: 0, refundDestinationMessage: '', refundAttestation: '' })),
+  ]
 
   const handleChainRefund = async (refund: MainnetSolanaDiscoveredRefund) => {
     const key = `chain:${refund.messageSentEventAccount}`
@@ -331,7 +351,7 @@ export default function MainnetDashboard() {
       const result = await reclaimMainnetSolanaDeposit({ provider: phantomProvider, connectedWallet: phantomAddress, originalWallet: phantomAddress, metadata: refund })
       const local = findSolanaRefundRecord(phantomAddress, refund.sourceTxHash)
       if (local) updateMainnetSolanaActivity(local.id, { refundStatus: 'reclaimed', refundTxHash: result.txHash, reclaimedAt: Date.now() })
-      setChainReclaimed((current) => ({ ...current, [refund.messageSentEventAccount]: result.txHash ?? '' }))
+      rememberChainReclaim({ wallet: phantomAddress, eventAccount: refund.messageSentEventAccount, sourceTxHash: refund.sourceTxHash, sol: refund.refundableDepositSol, txHash: result.txHash ?? '', at: Date.now() })
       setRefundActions((current) => ({ ...current, [key]: { loading: false, error: null } }))
     } catch (error) {
       setRefundActions((current) => ({ ...current, [key]: { loading: false, error: error instanceof Error ? error.message : 'SOL reclaim failed.' } }))

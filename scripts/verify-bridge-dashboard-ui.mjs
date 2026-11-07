@@ -252,6 +252,12 @@ try {
     assert.equal(await card(elsewhere.signature).getByRole('button', { name: 'Reclaim 0.0039 SOL' }).isEnabled(), true)
     assert.equal(await card(local.signature).count(), 1, 'the locally recorded deposit is shown once')
     assert.equal(await page.evaluate(() => window.__solanaSigns ?? 0), 0, 'nothing is signed by listing')
+    // A chain-found deposit reclaimed earlier (account now closed, so no longer scanned) stays visible after a reload.
+    solanaChain.accounts.delete(elsewhere.eventAccount)
+    await page.evaluate(({ w, a, s }) => localStorage.setItem('machina_solana_chain_reclaims_v1', JSON.stringify([{ wallet: w, eventAccount: a, sourceTxHash: s, sol: '0.0039', txHash: 'reclaim-tx', at: Date.now() }])), { w: PHANTOM_FIXTURE, a: elsewhere.eventAccount, s: elsewhere.signature })
+    await page.reload(); await page.waitForFunction(() => Boolean(window.dashboardUi))
+    await page.locator(`[data-refund-source="${elsewhere.signature}"][data-refund-state="reclaimed"]`).waitFor()
+    assert.match(await card(elsewhere.signature).innerText(), /Reclaimed/)
   })
   assert.deepEqual(errors, []); assert.deepEqual(external, [])
   console.log(`RESULT ${count}/${count} Chromium Dashboard/Activity/Bridge groups PASS; 5 real Sui <-> Arc transfers; controlled RPC, gRPC and wallet ports; real network/signatures/broadcasts=0.`)
