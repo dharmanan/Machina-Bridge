@@ -16,7 +16,8 @@ const { makeDeposit } = require('./fixtures/solana-refund-deposits.cjs')
 delete process.env.SOLANA_MAINNET_RPC
 const { default: solanaRpcHandler } = await import('../api/solana-rpc.js')
 const PHANTOM_FIXTURE = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU' // the fixture's Phantom address
-const solanaChain = { txs: new Map(), accounts: new Map(), iris: new Map(), upstream: [] }
+const solanaChain = { txs: new Map(), accounts: new Map(), iris: new Map(), sigs: new Map(), upstream: [] }
+const { PublicKey: SolanaKey } = require('@solana/web3.js')
 const HISTORY = new Set(['https://api.mainnet-beta.solana.com', 'https://api.mainnet.solana.com'])
 const PROVIDERS = new Set(['https://solana-rpc.publicnode.com', 'https://solana.drpc.org', ...HISTORY, 'https://rpc.ankr.com/solana'])
 const nodeFetch = globalThis.fetch
@@ -26,6 +27,13 @@ globalThis.fetch = async (input, init) => {
   const body = JSON.parse(init.body), ok = result => Response.json({ jsonrpc: '2.0', id: body.id, result })
   solanaChain.upstream.push(`${new URL(url).hostname} ${body.method}`)
   if (body.method === 'getTransaction') return ok(HISTORY.has(url) ? solanaChain.txs.get(body.params[0]) ?? null : null) // publicnode: no old history
+  // As on Mainnet: publicnode refuses indexed requests without a personal token (HTTP 403).
+  if (body.method === 'getProgramAccounts' && !HISTORY.has(url)) return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32602, message: 'Indexed requests require a personal token' } }, { status: 403 })
+  if (body.method === 'getProgramAccounts' && HISTORY.has(url)) {
+    const payer = body.params[1].filters[0].memcmp.bytes
+    return ok([...solanaChain.accounts].filter(([, info]) => new SolanaKey(Buffer.from(info.data[0], 'base64').subarray(8, 40)).toBase58() === payer).map(([pubkey, account]) => ({ pubkey, account })))
+  }
+  if (body.method === 'getSignaturesForAddress') return ok(HISTORY.has(url) ? solanaChain.sigs.get(body.params[0]) ?? [] : [])
   if (body.method === 'getMultipleAccounts') return ok({ context: { slot: 1 }, value: body.params[0].map(a => solanaChain.accounts.get(a) ?? null) })
   return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'not used here' } })
 }
@@ -228,6 +236,22 @@ try {
     assert.equal(s('r-wrong-wallet').refundVerifiedAt, undefined); assert.equal(s('r-wrong-wallet').messageSentEventAccount, undefined); assert.match(s('r-wrong-wallet').refundVerificationError, /not signed by this Phantom wallet/)
     assert.equal(await page.evaluate(() => window.__solanaSigns), 0, 'Verify deposit never requests a Phantom signature')
     assert.ok(!solanaChain.upstream.some(l => /simulate|send/i.test(l)), 'verification sends nothing')
+  })
+  await test('Solana deposits found on chain (made in another browser) appear on the Dashboard with Reclaim; a deposit already in a local record is not repeated', async () => {
+    const now = Math.floor(Date.now() / 1000), DAY = 86400
+    const elsewhere = makeDeposit({ wallet: PHANTOM_FIXTURE, evm: REAL.evm, createdAtSec: now - 40 * DAY, lamports: 3_900_000 })
+    const local = makeDeposit({ wallet: PHANTOM_FIXTURE, evm: REAL.evm, createdAtSec: now - 7 * DAY, lamports: 3_900_000 })
+    solanaChain.accounts.clear()
+    for (const d of [elsewhere, local]) { solanaChain.txs.set(d.signature, d.tx); solanaChain.accounts.set(d.eventAccount, d.accountInfo); solanaChain.iris.set(d.signature, d.iris)
+      solanaChain.sigs.set(d.eventAccount, [{ signature: d.signature, slot: d.tx.slot, err: null, memo: null, blockTime: d.createdAtSec, confirmationStatus: 'finalized' }]) }
+    await page.evaluate(r => { localStorage.setItem('machina_mainnet_solana_transfers_v1', JSON.stringify(r)) }, [{ id: 'r-local', evmWallet: REAL.evm, solanaWallet: PHANTOM_FIXTURE, direction: 'solana-to-arc', amount: '0.1', status: 'complete', createdAt: Date.now() - 7 * DAY * 1000, sourceTxHash: local.signature, refundStatus: 'pending', estimatedRefundableDepositSol: '0.0031', estimatedRefundAvailableAt: Date.now() - 1000 }])
+    await open('dashboard')
+    const card = src => page.locator(`[data-refund-source="${src}"]`)
+    await card(elsewhere.signature).waitFor()
+    assert.match(await card(elsewhere.signature).innerText(), /0\.0039 SOL refundable[\s\S]*Found on Solana · Eligible now/)
+    assert.equal(await card(elsewhere.signature).getByRole('button', { name: 'Reclaim 0.0039 SOL' }).isEnabled(), true)
+    assert.equal(await card(local.signature).count(), 1, 'the locally recorded deposit is shown once')
+    assert.equal(await page.evaluate(() => window.__solanaSigns ?? 0), 0, 'nothing is signed by listing')
   })
   assert.deepEqual(errors, []); assert.deepEqual(external, [])
   console.log(`RESULT ${count}/${count} Chromium Dashboard/Activity/Bridge groups PASS; 5 real Sui <-> Arc transfers; controlled RPC, gRPC and wallet ports; real network/signatures/broadcasts=0.`)

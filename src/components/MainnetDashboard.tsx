@@ -20,14 +20,17 @@ import { useSuiWallet } from '../hooks/useSuiWallet'
 import { useBridgeHistory } from '../hooks/useBridgeHistory'
 import {
   applyVerifiedSolanaRefund,
+  findSolanaRefundRecord,
   isVerifiedSolanaRefund,
   recordSolanaRefundVerificationError,
   updateMainnetSolanaActivity,
   type MainnetSolanaActivityRecord,
 } from '../lib/mainnetSolanaActivity'
 import {
+  discoverMainnetSolanaRefunds,
   loadMainnetSolanaRefundMetadata,
   reclaimMainnetSolanaDeposit,
+  type MainnetSolanaDiscoveredRefund,
   type MainnetSolanaRefundMetadata,
 } from '../lib/mainnetSolanaReclaim'
 import { deriveSolanaUsdcAta } from '../lib/solana'
@@ -303,6 +306,38 @@ export default function MainnetDashboard() {
     }
   }
 
+  // Open deposits of the connected Phantom wallet found on chain (also those made in another browser).
+  // Each is proven by the same discovery as the Bridge panel: account, rent payer, source transaction
+  // and Circle attestation. Deposits already shown from this browser's records are not repeated.
+  const [chainRefunds, setChainRefunds] = useState<MainnetSolanaDiscoveredRefund[]>([])
+  const [chainReclaimed, setChainReclaimed] = useState<Record<string, string>>({})
+  useEffect(() => {
+    let active = true
+    setChainRefunds([])
+    if (!phantomAddress) return () => { active = false }
+    discoverMainnetSolanaRefunds(phantomAddress)
+      .then((found) => { if (active) setChainRefunds(found) })
+      .catch(() => { if (active) setChainRefunds([]) }) // the Bridge panel shows scan errors
+    return () => { active = false }
+  }, [phantomAddress])
+  const chainOnlyRefunds = chainRefunds.filter((refund) => !pendingRefunds.some((item) =>
+    item.sourceTxHash === refund.sourceTxHash && item.solanaWallet === phantomAddress && item.refundStatus !== 'reclaimed'))
+
+  const handleChainRefund = async (refund: MainnetSolanaDiscoveredRefund) => {
+    const key = `chain:${refund.messageSentEventAccount}`
+    setRefundActions((current) => ({ ...current, [key]: { loading: true, error: null } }))
+    try {
+      if (!phantomProvider || !phantomAddress) throw new Error('Connect Phantom before reclaiming the refundable SOL deposit.')
+      const result = await reclaimMainnetSolanaDeposit({ provider: phantomProvider, connectedWallet: phantomAddress, originalWallet: phantomAddress, metadata: refund })
+      const local = findSolanaRefundRecord(phantomAddress, refund.sourceTxHash)
+      if (local) updateMainnetSolanaActivity(local.id, { refundStatus: 'reclaimed', refundTxHash: result.txHash, reclaimedAt: Date.now() })
+      setChainReclaimed((current) => ({ ...current, [refund.messageSentEventAccount]: result.txHash ?? '' }))
+      setRefundActions((current) => ({ ...current, [key]: { loading: false, error: null } }))
+    } catch (error) {
+      setRefundActions((current) => ({ ...current, [key]: { loading: false, error: error instanceof Error ? error.message : 'SOL reclaim failed.' } }))
+    }
+  }
+
   const handleRefund = async (item: MainnetSolanaActivityRecord) => {
     setRefundActions((current) => ({
       ...current,
@@ -451,7 +486,7 @@ export default function MainnetDashboard() {
           </div>
         </Card>
 
-        {pendingRefunds.length > 0 && (
+        {(pendingRefunds.length > 0 || chainOnlyRefunds.length > 0) && (
           <Card>
             <h3 className="text-lg font-semibold">Solana Refundable Deposits</h3>
             <p className="mt-1 text-xs leading-5 text-slate-500">
@@ -565,6 +600,56 @@ export default function MainnetDashboard() {
                       <p className="mt-3 rounded-xl border border-red-200 bg-white px-3 py-2 text-[11px] leading-5 text-red-700">
                         {action.error}
                       </p>
+                    )}
+                  </div>
+                )
+              })}
+              {chainOnlyRefunds.map((refund) => {
+                const key = `chain:${refund.messageSentEventAccount}`
+                const action = refundActions[key]
+                const reclaimedTx = chainReclaimed[refund.messageSentEventAccount]
+                const reclaimed = reclaimedTx !== undefined
+                const eligible = Date.now() >= refund.refundAvailableAt
+                return (
+                  <div
+                    key={key}
+                    data-refund-state={reclaimed ? 'reclaimed' : 'verified'}
+                    data-refund-source={refund.sourceTxHash}
+                    className={`rounded-xl border p-4 ${reclaimed ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-slate-900">{refund.refundableDepositSol} SOL refundable</p>
+                        <p className="mt-1 text-xs text-slate-600">
+                          {reclaimed ? 'Reclaimed' : `Found on Solana · ${timeUntil(refund.refundAvailableAt)}`}
+                        </p>
+                      </div>
+                      {reclaimed ? (
+                        <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-emerald-800">Reclaimed</span>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={!eligible || !phantomConnected || action?.loading}
+                          onClick={() => void handleChainRefund(refund)}
+                          className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
+                        >
+                          <RotateCcw size={14} />
+                          {action?.loading ? 'Preparing reclaim...' : !eligible ? timeUntil(refund.refundAvailableAt) : `Reclaim ${refund.refundableDepositSol} SOL`}
+                        </button>
+                      )}
+                    </div>
+                    {!reclaimed && (
+                      <p className="mt-3 text-[11px] leading-5 text-amber-900/80">
+                        Made from this Phantom wallet, also from another browser. Phantom shows the reclaim transaction before signing.
+                      </p>
+                    )}
+                    {reclaimedTx && (
+                      <a href={`${SOLANA_MAINNET_CCTP.explorerUrl}/tx/${reclaimedTx}`} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800 hover:underline">
+                        Reclaim transaction <ExternalLink size={11} />
+                      </a>
+                    )}
+                    {action?.error && (
+                      <p className="mt-3 rounded-xl border border-red-200 bg-white px-3 py-2 text-[11px] leading-5 text-red-700">{action.error}</p>
                     )}
                   </div>
                 )
