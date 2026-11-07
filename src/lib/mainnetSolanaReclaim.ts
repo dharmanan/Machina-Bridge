@@ -17,10 +17,21 @@ const MESSAGE_SENT_ACCOUNT_DISCRIMINATOR = Buffer.from('83648538a6e1973c', 'hex'
 const RECLAIM_EVENT_ACCOUNT_DISCRIMINATOR = Buffer.from('5ec6b49f83ec0fae', 'hex')
 const EVENT_ACCOUNT_WINDOW_MS = 5 * 24 * 60 * 60 * 1000
 
-const SOLANA_RECLAIM_RPCS = Array.from(new Set([
+// dRPC rejects Solana on its free plan (HTTP 400, JSON-RPC 35 "chain is not available on free plan"),
+// so it can never serve a reclaim; it only hid the real cause as the last fallback.
+const RECLAIM_EXCLUDED_RPCS = new Set(['https://solana.drpc.org'])
+export const SOLANA_RECLAIM_RPCS = Array.from(new Set([
   'https://solana-rpc.publicnode.com',
   ...SOLANA_MAINNET_CCTP.rpcUrls,
-]))
+])).filter((rpcUrl) => !RECLAIM_EXCLUDED_RPCS.has(rpcUrl))
+
+// Provider-availability failures (plan, auth, rate limit, outage, transport). Any other error is the
+// real answer of a working provider (e.g. a preflight or program error) and must be the one reported.
+const RPC_UNAVAILABLE = /free plan|chain is not available|personal token|api key|unauthori[sz]ed|forbidden|too many requests|rate limit|\b(401|403|408|429|5\d\d)\b|fetch failed|failed to fetch|network|timed? ?out|unavailable/i
+function reclaimRpcFailure(errors: unknown[], fallback: string): Error {
+  const failures = errors.filter((error): error is Error => error instanceof Error)
+  return failures.find((error) => !RPC_UNAVAILABLE.test(error.message)) ?? failures[0] ?? new Error(fallback)
+}
 
 export type MainnetSolanaRefundMetadata = {
   sourceTxHash?: string
@@ -76,19 +87,23 @@ function borshVec(bytes: Buffer) {
 async function withReadableSolanaConnection<T>(
   operation: (connection: Connection) => Promise<T | null>,
 ): Promise<T> {
-  let lastError: unknown = null
+  const errors: unknown[] = []
+  let answered = false
 
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     try {
       const result = await operation(new Connection(rpcUrl, 'confirmed'))
       if (result !== null) return result
+      answered = true
     } catch (error) {
-      lastError = error
+      errors.push(error)
     }
   }
 
-  if (lastError instanceof Error) throw lastError
-  throw new Error('Solana mainnet RPC did not return the requested reclaim data.')
+  const failure = reclaimRpcFailure(errors, 'Solana mainnet RPC did not return the requested reclaim data.')
+  // A provider that answered "not found" outranks another provider's outage message.
+  if (answered && RPC_UNAVAILABLE.test(failure.message)) throw new Error('Solana mainnet RPC did not return the requested reclaim data.')
+  throw failure
 }
 
 async function findMessageSentEventAccount(
@@ -403,7 +418,7 @@ export async function discoverMainnetSolanaRefunds(
 }
 
 async function getReclaimConnection(eventAccount: PublicKey) {
-  let lastError: unknown = null
+  const errors: unknown[] = []
 
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     try {
@@ -411,12 +426,27 @@ async function getReclaimConnection(eventAccount: PublicKey) {
       const eventInfo = await connection.getAccountInfo(eventAccount, 'finalized')
       return { connection, eventInfo }
     } catch (error) {
-      lastError = error
+      errors.push(error)
     }
   }
 
-  if (lastError instanceof Error) throw lastError
-  throw new Error('Solana mainnet RPC is unavailable for reclaim.')
+  throw reclaimRpcFailure(errors, 'Solana mainnet RPC is unavailable for reclaim.')
+}
+
+async function confirmClosedOnAnotherProvider(eventAccount: PublicKey, checkedRpcUrl: string) {
+  const errors: unknown[] = []
+  for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
+    if (rpcUrl === checkedRpcUrl) continue
+    try {
+      const info = await new Connection(rpcUrl, 'confirmed').getAccountInfo(eventAccount, 'finalized')
+      if (info) throw new Error('Solana RPC providers disagree about this deposit account. Nothing was signed or recorded; retry later.')
+      return
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('Solana RPC providers disagree')) throw error
+      errors.push(error)
+    }
+  }
+  throw new Error(`The deposit account closure could not be confirmed by a second Solana RPC (${reclaimRpcFailure(errors, 'no other provider').message}). Nothing was signed or recorded; retry later.`)
 }
 
 export async function loadMainnetSolanaRefundMetadata(
@@ -460,6 +490,9 @@ async function performMainnetSolanaReclaim(input: {
     const source = await connection.getParsedTransaction(input.metadata.sourceTxHash, {commitment:'finalized',maxSupportedTransactionVersion:0})
     const provesIdentity = isSolanaEventCreation(source, eventAccount) && source!.transaction.message.accountKeys.some(k=>k.signer && k.pubkey.equals(payee))
     if (!provesIdentity) throw new Error('The absent account cannot be bound to a successful Circle source transaction.')
+    // One RPC answering "no account" is not proof of closure (it may lag or misbehave). An independent
+    // provider must also see the account absent; otherwise nothing is signed and nothing is recorded.
+    await confirmClosedOnAnotherProvider(eventAccount, connection.rpcEndpoint)
     return { alreadyClosed: true }
   }
 
@@ -523,7 +556,7 @@ async function performMainnetSolanaReclaim(input: {
   if (!signed.serializeMessage().equals(expectedMessage)) throw new Error('Phantom changed the reclaim transaction; broadcasting is blocked.')
   const raw = signed.serialize()
   let txHash: string | null = null
-  let sendError: unknown = null
+  const sendErrors: unknown[] = []
 
   for (const rpcUrl of SOLANA_RECLAIM_RPCS) {
     try {
@@ -536,21 +569,27 @@ async function performMainnetSolanaReclaim(input: {
       })
       break
     } catch (error) {
-      sendError = error
+      sendErrors.push(error)
     }
   }
 
+  // After the single Phantom signature an RPC error does not prove the transaction was not broadcast.
+  // Report the outcome as unknown; no second signature or new reclaim transaction is created here.
   if (!txHash) {
-    throw sendError instanceof Error
-      ? sendError
-      : new Error('Unable to submit the Solana reclaim transaction.')
+    const cause = reclaimRpcFailure(sendErrors, 'Unable to submit the Solana reclaim transaction.')
+    throw new Error(`The signed reclaim could not be confirmed as submitted (${cause.message}). It may still be processed: re-check the deposit before signing again.`)
   }
 
-  const confirmation = await connection.confirmTransaction({
-    signature: txHash,
-    blockhash: latest.blockhash,
-    lastValidBlockHeight: latest.lastValidBlockHeight,
-  }, 'confirmed')
+  let confirmation: Awaited<ReturnType<Connection['confirmTransaction']>>
+  try {
+    confirmation = await connection.confirmTransaction({
+      signature: txHash,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+    }, 'confirmed')
+  } catch (error) {
+    throw new Error(`Solana reclaim ${txHash} was submitted but its confirmation is unknown (${error instanceof Error ? error.message : String(error)}). Re-check the deposit before signing again.`)
+  }
 
   if (confirmation.value.err) {
     throw new Error(`Solana reclaim transaction failed: ${JSON.stringify(confirmation.value.err)}`)
