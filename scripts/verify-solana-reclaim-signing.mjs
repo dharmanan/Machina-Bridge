@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 const require = createRequire(import.meta.url), ts = require('typescript'), root = fileURLToPath(new URL('..', import.meta.url))
 require.extensions['.ts'] = (m, f) => m._compile(ts.transpileModule(readFileSync(f, 'utf8').replaceAll('import.meta.env', '({})'), { fileName: f,
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, f)
-const { Keypair, PublicKey, Connection, Transaction, TransactionInstruction, ComputeBudgetProgram, Message } = require('@solana/web3.js')
+const { Keypair, PublicKey, Connection, Transaction, TransactionInstruction, ComputeBudgetProgram, Message, VersionedTransaction, SystemProgram } = require('@solana/web3.js')
 const { makeDeposit, randomKey } = require('./fixtures/solana-refund-deposits.cjs')
 const sol = require(root + 'src/lib/mainnetSolanaReclaim.ts'), { SOLANA_MAINNET_CCTP: SC } = require(root + 'src/config/mainnetSolana.ts')
 globalThis.window = { localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, dispatchEvent() {}, addEventListener() {}, removeEventListener() {} }
@@ -26,9 +26,24 @@ const answers = {
   getSlot: () => 1, getBlockTime: () => now(),
   getLatestBlockhash: () => ({ blockhash: plan.blockhash, lastValidBlockHeight: 100 }),
   getRecentPrioritizationFees: () => { if (plan.feesError) throw new Error('fees unavailable'); return plan.fees.map((prioritizationFee, slot) => ({ slot, prioritizationFee })) },
-  simulateTransaction: tx => { calls.simulated.push(Buffer.from(tx.serializeMessage())); const units = plan.units(calls.simulated.length); return { context: { slot: 1 }, value: { err: plan.simErr ?? null, unitsConsumed: units, logs: [] } } },
+  getBalance: () => { if (plan.balanceError) throw new Error('balance unavailable'); return plan.walletBalance },
+  simulateTransaction: (tx, cfg) => {
+    if (tx instanceof VersionedTransaction) return signedSimulation(tx, cfg) // the exact signed bytes
+    calls.simulated.push(Buffer.from(tx.serializeMessage())); const units = plan.units(calls.simulated.length); return { context: { slot: 1 }, value: { err: plan.simErr ?? null, unitsConsumed: units, logs: [] } }
+  },
   sendRawTransaction: raw => { calls.sent.push(Buffer.from(raw)); return 'controlled-signature' },
   confirmTransaction: () => ({ value: { err: null } }),
+}
+// Default chain answer for the signed transaction: a successful reclaim (deposit closed, wallet += deposit - fee).
+function signedSimulation(tx, cfg) {
+  calls.signedSims.push({ bytes: Buffer.from(tx.serialize()), cfg })
+  const m = tx.message, budget = {}
+  for (const ix of m.compiledInstructions) if (m.staticAccountKeys[ix.programIdIndex].toBase58() === CB) { const d = Buffer.from(ix.data); if (d[0] === 2) budget.limit = d.readUInt32LE(1); if (d[0] === 3) budget.price = Number(d.readBigUInt64LE(1)) }
+  const fee = 5000 * m.header.numRequiredSignatures + Math.ceil((budget.price ?? 0) * (budget.limit ?? 0) / 1e6)
+  const o = plan.signed ?? {}
+  const after = plan.walletBalance + plan.info.lamports - fee + (o.walletDelta ?? 0)
+  return { context: { slot: 1 }, value: { err: o.err ?? null, unitsConsumed: 'units' in o ? o.units : 160_000, logs: [],
+    accounts: 'accounts' in o ? o.accounts : [{ lamports: after, owner: SystemProgram.programId.toBase58(), data: ['', 'base64'], executable: false, rentEpoch: 0 }, o.depositOpen ? { lamports: plan.info.lamports, owner: MT.toBase58(), data: ['', 'base64'], executable: false, rentEpoch: 0 } : null] } }
 }
 for (const [name, fn] of Object.entries(answers)) Connection.prototype[name] = async function (...args) { calls.rpc.push(name); return fn(...args) }
 Connection.prototype.getParsedTransaction = async () => { throw new Error('not used') }
@@ -37,8 +52,8 @@ function setup(over = {}) {
   const phantom = Keypair.generate(), wallet = phantom.publicKey.toBase58()
   const d = makeDeposit({ wallet, createdAtSec: now() - 6 * DAY, lamports: over.lamports ?? 3_900_000 })
   const data = Buffer.from(d.accountInfo.data[0], 'base64')
-  plan = { info: { owner: MT, lamports: d.lamports, data, executable: false }, blockhash: blockhash(), fees: [0, 0, 0, 0], units: () => 145_226, ...over.plan }
-  calls = { simulated: [], sent: [], rpc: [], signs: 0, shown: null }
+  plan = { info: { owner: MT, lamports: d.lamports, data, executable: false }, blockhash: blockhash(), fees: [0, 0, 0, 0], units: () => 145_226, walletBalance: 50_000_000, ...over.plan }
+  calls = { simulated: [], signedSims: [], sent: [], rpc: [], signs: 0, shown: null }
   const metadata = { sourceTxHash: d.signature, messageSentEventAccount: d.eventAccount, refundableDepositSol: '0.0039', refundAvailableAt: (d.createdAtSec + 5 * DAY) * 1000,
     refundDestinationMessage: d.attestedMessage, refundAttestation: d.iris.messages[0].attestation }
   return { phantom, wallet, d, metadata }
@@ -264,9 +279,7 @@ await test('diagnostics: reordered instructions are reported as an order change;
   blocked(r2, 'instructions added or removed')
   const d2 = details(r2); assert.ok(d2.includes('+3 more'), d2); assert.ok(d2.includes('signed 12'), d2); assertPrivate(r2, s2)
 })
-await test('no automatic exception: an added instruction is blocked whatever its program (no allowlist exists), including wallet-safety assertions', async () => {
-  const text = readFileSync(root + 'src/lib/mainnetSolanaReclaim.ts', 'utf8')
-  assert.ok(!/lighthouse/i.test(text), 'no Lighthouse special case in the reclaim code')
+await test('no general exception: an added instruction of any program other than Lighthouse is blocked', async () => {
   for (let n = 0; n < 3; n++) { const s = setup(); blocked(await run(s, tx => signedWith(tx, [...tx.instructions, foreignIx(tx, 2 + n)])), 'instructions added or removed') }
 })
 await test('diagnostics helper is pure and safe on malformed input', async () => {
@@ -274,6 +287,167 @@ await test('diagnostics helper is pure and safe on malformed input', async () =>
   assert.equal(sol.reclaimMessageDiagnostics(calls.shown, null), '')
   assert.equal(sol.reclaimMessageDiagnostics(calls.shown, Buffer.from([1, 2, 3])), 'the signed message could not be read.')
   assert.match(sol.reclaimMessageDiagnostics(calls.shown, calls.shown), /^instructions expected 3, signed 3; added: none; removed: none; order same; compute budget limit same \(\d+\), price same \(\d+\)\.$/)
+})
+// ---------------------------------------------------------------- Lighthouse assertions (Phantom transaction guard)
+// Encoders mirror the Lighthouse program layout (Borsh, u8 tags, CompactU64 = unsigned LEB128): jac0xb/lighthouse
+// programs/lighthouse/src/instruction.rs and lighthouse-sdk 2.1.0. Phantom's real reclaim placed three at #2, #3, #5.
+const LH = new PublicKey('L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95')
+const leb = n => { const out = []; do { let b = n % 128; n = Math.floor(n / 128); if (n) b |= 0x80; out.push(b) } while (n); return out }
+const u64le = v => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return [...b] }
+const LHD = {
+  infoLamports: (min = 1, log = 0) => Buffer.from([5, log, 0, ...u64le(min), 4]),                   // AssertAccountInfo Lamports >= min
+  infoOwner: owner => Buffer.from([5, 0, 2, ...new PublicKey(owner).toBuffer(), 0]),               // AssertAccountInfo Owner ==
+  infoMulti: () => Buffer.from([6, 1, ...leb(3), 0, ...u64le(10), 4, 5, 1, 0, 8, ...Buffer.alloc(32, 7), ...leb(0), ...leb(300)]), // lamports, IsSigner, VerifyDatahash
+  data: () => Buffer.from([2, 2, ...leb(8), 7, ...u64le(5), 2]),                                  // AssertAccountData U64 at 8 > 5
+  dataMulti: () => Buffer.from([3, 3, ...leb(2), ...leb(0), 1, 0x83, 0, ...leb(200), 11, ...leb(3), 1, 2, 3, 0]), // U8 at 0, Bytes at 200
+  memoryWrite: () => Buffer.from([0, 0, 0, 0, 0]),
+  memoryClose: () => Buffer.from([1, 0, 0]),
+  delta: () => Buffer.from([4, 0, 0, ...u64le(0), ...u64le(0), 0]),
+  clock: () => Buffer.from([15, 0, 0, ...u64le(1), 4]),
+  token: () => Buffer.from([9, 0, 0, ...Buffer.alloc(32), 0]),
+  unknown: () => Buffer.from([42, 0, 0]),
+}
+const ro = pubkey => ({ pubkey: typeof pubkey === 'string' ? new PublicKey(pubkey) : pubkey, isSigner: false, isWritable: false })
+const lh = (data, keys, programId = LH) => new TransactionInstruction({ programId, keys, data })
+// Phantom-like: [limit, price, assert wallet, assert deposit, reclaim, assert wallet afterwards]
+const guarded = (s, extra = {}) => tx => signedWith(tx, [tx.instructions[0], tx.instructions[1],
+  extra.first ?? lh(LHD.infoLamports(1), [ro(s.wallet)]), extra.second ?? lh(LHD.data(), [ro(s.d.eventAccount)]),
+  extra.reclaim ?? tx.instructions[2], extra.last ?? lh(LHD.infoMulti(), [ro(s.wallet)]), ...(extra.more ?? [])])
+const passes = (r, s) => { assert.ok(r.ok, r.error); assert.equal(calls.signs, 1); assert.equal(calls.sent.length, 1)
+  assert.equal(calls.signedSims.length, 1, 'the signed bytes are simulated once'); assert.ok(calls.signedSims[0].bytes.equals(calls.sent[0]), 'the simulated bytes are the broadcast bytes')
+  assert.equal(calls.signedSims[0].cfg.sigVerify, true); assert.deepEqual(calls.signedSims[0].cfg.accounts.addresses, [s.wallet, s.d.eventAccount])
+  assert.ok(Transaction.from(calls.sent[0]).verifySignatures()) }
+const refused = (r, s, reason) => { assert.match(r.error, /broadcasting is blocked\. Nothing was sent\./); if (reason) assert.match(r.error, reason)
+  assert.equal(calls.sent.length, 0, 'nothing is broadcast'); assert.equal(calls.signs, 1, 'one wallet request, never a second'); assertPrivate(r, s) }
+
+await test('Lighthouse: Phantom\'s observed shape (#2, #3, #5 read-only assertions) is accepted, re-simulated with signature verification and broadcast once', async () => {
+  const s = setup(), r = await run(s, guarded(s))
+  passes(r, s)
+  const m = Message.from(Transaction.from(calls.sent[0]).serializeMessage())
+  assert.deepEqual(m.instructions.map(i => m.accountKeys[i.programIdIndex].toBase58()), [CB, CB, LH.toBase58(), LH.toBase58(), SC.messageTransmitterProgram, LH.toBase58()])
+})
+await test('Lighthouse: every allowed type (2, 3, 5, 6) with each valid body passes; targets may be the wallet, the deposit, the Circle PDA or a program in the reclaim', async () => {
+  const pda = PublicKey.findProgramAddressSync([Buffer.from('message_transmitter')], MT)[0]
+  for (const [data, target] of [[LHD.infoLamports(5, 6), 'wallet'], [LHD.infoOwner(SystemProgram.programId), 'wallet'], [LHD.infoMulti(), 'event'], [LHD.data(), 'pda'], [LHD.dataMulti(), 'program']]) {
+    const s = setup(), key = { wallet: s.wallet, event: s.d.eventAccount, pda, program: MT }[target]
+    passes(await run(s, tx => signedWith(tx, [...tx.instructions, lh(data, [ro(key)])])), s)
+  }
+})
+await test('Lighthouse: MemoryWrite, MemoryClose, AssertAccountDelta, token and unknown types are refused by name', async () => {
+  for (const [data, name] of [[LHD.memoryWrite(), 'MemoryWrite'], [LHD.memoryClose(), 'MemoryClose'], [LHD.delta(), 'AssertAccountDelta'], [LHD.token(), 'AssertTokenAccount'], [LHD.unknown(), 'unknown type 42']]) {
+    const s = setup(), r = await run(s, guarded(s, { second: lh(data, [ro(s.d.eventAccount)]) }))
+    refused(r, s, new RegExp(`Reason: Lighthouse ${name} is not an allowed read-only assertion \\(#3\\)`))
+    assert.match(r.error, new RegExp(`Lighthouse:${name.split(' ')[0]}`), 'the type name is also in the instruction list')
+  }
+})
+await test('Lighthouse: a program id that is not exactly the Lighthouse address (look-alike / other program) is not an exception', async () => {
+  const s = setup(), fake = new PublicKey(randomKey())
+  refused(await run(s, guarded(s, { second: lh(LHD.data(), [ro(s.d.eventAccount)], fake) })), s, /a new account was added|the original reclaim or compute budget instructions changed/)
+})
+await test('Lighthouse: malformed bodies are refused (trailing byte, truncated, bad log level, operator, variant, boolean, empty or oversized multi, non-canonical length)', async () => {
+  const bodies = [Buffer.concat([LHD.infoLamports(), Buffer.from([0])]), LHD.infoLamports().subarray(0, 6), Buffer.from([5, 7, 0, ...u64le(1), 4]), Buffer.from([5, 0, 0, ...u64le(1), 8]),
+    Buffer.from([5, 0, 9, ...u64le(1), 4]), Buffer.from([5, 0, 5, 2, 0]), Buffer.from([6, 0, ...leb(0)]), Buffer.from([6, 0, ...leb(17), ...Array(17).fill([0, ...u64le(1), 4]).flat()]),
+    Buffer.from([2, 0, 0x88, 0x00, 7, ...u64le(5), 2]), Buffer.from([2, 0, ...leb(0), 13, 0])]
+  for (const body of bodies) { const s = setup(); refused(await run(s, guarded(s, { second: lh(body, [ro(s.d.eventAccount)]) })), s, /Reason: Lighthouse .*(malformed body|not an allowed)/) }
+})
+await test('Lighthouse decoder (pure): limits and exact consumption, independent of transaction size', async () => {
+  const { decodeLighthouseAssertion, LIGHTHOUSE_ALLOWED_TYPES, LIGHTHOUSE_PROGRAM_ID } = require(root + 'src/lib/solanaLighthousePolicy.ts')
+  assert.equal(LIGHTHOUSE_PROGRAM_ID, LH.toBase58()); assert.deepEqual([...LIGHTHOUSE_ALLOWED_TYPES].sort((a, b) => a - b), [2, 3, 5, 6, 15])
+  assert.throws(() => decodeLighthouseAssertion(Buffer.from([2, 0, ...leb(0), 11, ...leb(1025), ...Buffer.alloc(1025), 0])), /byte assertion too long/)
+  assert.deepEqual(decodeLighthouseAssertion(Buffer.from([2, 0, ...leb(0), 11, ...leb(1024), ...Buffer.alloc(1024), 1])), { type: 2, name: 'AssertAccountData' })
+  assert.throws(() => decodeLighthouseAssertion(Buffer.from([5, 0, 8, ...Buffer.alloc(32), 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0])), /length out of range|malformed/)
+  for (const t of [0, 1, 4, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 255]) assert.throws(() => decodeLighthouseAssertion(Buffer.from([t, 0, 0])), /is not an allowed read-only assertion/)
+  assert.throws(() => decodeLighthouseAssertion(Buffer.alloc(0)), /not an allowed/)
+})
+const CLOCK = new PublicKey('SysvarC1ock11111111111111111111111111111111')
+await test('Lighthouse AssertSysvarClock (15): accepted with no account or with only the read-only Clock sysvar, every clock variant', async () => {
+  for (const [variant, keys] of [[0, () => []], [1, () => [ro(CLOCK)]], [2, () => []], [3, () => [ro(CLOCK)]], [4, () => [ro(CLOCK)]]]) {
+    const s = setup()
+    passes(await run(s, guarded(s, { first: lh(Buffer.from([15, variant % 7, variant, ...u64le(1), 4]), keys()) })), s)
+  }
+  const s = setup() // Phantom-like: clock before, data before, info after
+  passes(await run(s, guarded(s, { first: lh(LHD.clock(), [ro(CLOCK)]) })), s)
+})
+await test('Lighthouse AssertSysvarClock (15): any other account shape, a writable Clock, or the Clock used elsewhere is refused', async () => {
+  const cases = s => [
+    [lh(LHD.clock(), [ro(s.wallet)]), /may reference only the Clock sysvar/],
+    [lh(LHD.clock(), [ro(s.d.eventAccount)]), /may reference only the Clock sysvar/],
+    [lh(LHD.clock(), [ro(CLOCK), ro(CLOCK)]), /may reference only the Clock sysvar/],
+    [lh(LHD.clock(), [ro(CLOCK), ro(s.wallet)]), /may reference only the Clock sysvar/],
+    [lh(LHD.clock(), [ro(randomKey())]), /a new account was added/],
+    [lh(LHD.clock(), [{ pubkey: CLOCK, isSigner: false, isWritable: true }]), /writable accounts changed/],
+    [lh(LHD.infoLamports(), [ro(CLOCK)]), /targets an account outside the reclaim/],
+    [lh(LHD.data(), [ro(CLOCK)]), /targets an account outside the reclaim/],
+  ]
+  for (let i = 0; i < 8; i++) { const s = setup(); const [ix, why] = cases(s)[i]; refused(await run(s, guarded(s, { second: ix })), s, why) }
+  // Clock as a program id (not Lighthouse) is not an exception either.
+  const s = setup(); refused(await run(s, guarded(s, { more: [new TransactionInstruction({ programId: CLOCK, keys: [], data: Buffer.alloc(0) })] })), s, /original reclaim|Clock sysvar was added outside/)
+})
+await test('Lighthouse AssertSysvarClock (15): malformed bodies are refused (variant, operator, log level, truncated, trailing)', async () => {
+  for (const body of [Buffer.from([15, 0, 5, ...u64le(1), 4]), Buffer.from([15, 0, 0, ...u64le(1), 8]), Buffer.from([15, 7, 0, ...u64le(1), 4]), Buffer.from([15, 0, 0, 1, 2, 3]), Buffer.from([15, 0, 0, ...u64le(1), 4, 0])]) {
+    const s = setup(); refused(await run(s, guarded(s, { first: lh(body, []) })), s, /Reason: Lighthouse AssertSysvarClock has a malformed body/)
+  }
+})
+await test('Lighthouse: wrong account shape is refused (two accounts, none, an account outside the reclaim, a new signer or new writable account)', async () => {
+  const outsider = Keypair.generate()
+  const cases = s => [
+    [lh(LHD.data(), [ro(s.d.eventAccount), ro(s.wallet)]), /must target exactly one account/],
+    [lh(LHD.data(), []), /must target exactly one account/],
+    [lh(LHD.data(), [ro(randomKey())]), /a new account was added/],
+    [lh(LHD.data(), [{ pubkey: outsider.publicKey, isSigner: true, isWritable: false }]), /signers changed|a new account was added/],
+    [lh(LHD.data(), [{ pubkey: new PublicKey(randomKey()), isSigner: false, isWritable: true }]), /a new account was added|writable accounts changed/],
+    [lh(LHD.data(), [ro(LH)]), /targets an account outside the reclaim/],
+  ]
+  for (let i = 0; i < 6; i++) { const s = setup(); const [ix, why] = cases(s)[i]
+    refused(await run(s, tx => { const t = guarded(s, { second: ix })(tx); if (i === 3) t.partialSign(outsider); return t }), s, why) }
+})
+await test('Lighthouse: an assertion that makes an existing read-only account writable (or a signer) is refused', async () => {
+  const s = setup()
+  refused(await run(s, guarded(s, { second: lh(LHD.data(), [{ pubkey: MT, isSigner: false, isWritable: true }]) })), s, /writable accounts changed/)
+  const s2 = setup(), pda = PublicKey.findProgramAddressSync([Buffer.from('message_transmitter')], MT)[0]
+  refused(await run(s2, guarded(s2, { second: lh(LHD.data(), [{ pubkey: ComputeBudgetProgram.programId, isSigner: false, isWritable: true }]) })), s2, /writable accounts changed/)
+  void pda
+})
+await test('Lighthouse: placed before the compute budget, more than 8 assertions, or added to a changed transaction is refused', async () => {
+  const s = setup()
+  refused(await run(s, tx => signedWith(tx, [lh(LHD.data(), [ro(s.d.eventAccount)]), ...tx.instructions])), s, /placed before the compute budget \(#0\)/)
+  const s2 = setup()
+  refused(await run(s2, guarded(s2, { more: Array.from({ length: 6 }, () => lh(LHD.infoLamports(), [ro(s2.wallet)])) })), s2, /too many wallet assertions/)
+  const s3 = setup()
+  refused(await run(s3, tx => { const data = Buffer.from(tx.instructions[2].data); data[30] ^= 1
+    return guarded(s3, { reclaim: new TransactionInstruction({ programId: MT, keys: tx.instructions[2].keys, data }) })(tx) }), s3, /original reclaim or compute budget instructions changed/)
+  const s4 = setup()
+  refused(await run(s4, tx => signedWith(tx, [tx.instructions[0], ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 999_999 }), lh(LHD.data(), [ro(s4.d.eventAccount)]), tx.instructions[2]])), s4, /original reclaim or compute budget instructions changed/)
+  const s5 = setup()
+  refused(await run(s5, tx => { const t = rebuild(guarded(s5)(tx), { recentBlockhash: blockhash() }); return t }), s5, /blockhash changed/)
+  const s6 = setup(), other = Keypair.generate()
+  refused(await run(s6, tx => { const t = rebuild(guarded(s6)(tx), { feePayer: other.publicKey }); t.partialSign(other); return t }), s6, /fee payer changed/)
+  const s7 = setup()
+  refused(await run(s7, guarded(s7, { more: [SystemProgram.transfer({ fromPubkey: new PublicKey(s7.wallet), toPubkey: new PublicKey(randomKey()), lamports: 1_000_000 })] })), s7, /a new account was added|original reclaim/)
+})
+await test('signatures: a tampered, missing or foreign signature is refused before the final simulation and broadcast', async () => {
+  const s = setup()
+  refused(await run(s, tx => { const t = guarded(s)(tx); t.partialSign(s.phantom); t.signatures[0].signature[5] ^= 1; return { serializeMessage: () => t.serializeMessage(), serialize: () => t.serialize({ verifySignatures: false }), signatures: t.signatures, verifySignatures: () => t.verifySignatures(), partialSign() {} } }), s, /missing or invalid signature/)
+  assert.equal(calls.signedSims.length, 0)
+  const s2 = setup()
+  refused(await run(s2, tx => ({ serializeMessage: () => tx.serializeMessage(), serialize: () => Buffer.from([1]), signatures: [{ publicKey: new PublicKey(s2.wallet), signature: null }], verifySignatures: () => false, partialSign() {} })), s2, /missing or invalid signature/)
+})
+await test('final simulation of the signed bytes: failure, budget overrun, missing effects, deposit left open or a short wallet credit block the broadcast', async () => {
+  for (const [signed, why] of [[{ err: { InstructionError: [3, { Custom: 6400 }] } }, /would fail/], [{ units: 175_634_000 }, /compute budget was exceeded/], [{ units: undefined }, /compute budget was exceeded or not reported/],
+    [{ accounts: undefined }, /account effects were not reported/], [{ accounts: [null, null] }, /wallet effect was not reported/], [{ depositOpen: true }, /deposit account would stay open/], [{ walletDelta: -1 }, /less than the deposit minus the network fee/]]) {
+    const s = setup({ plan: { signed } }), r = await run(s, guarded(s))
+    refused(r, s, why); assert.equal(calls.signedSims.length, 1)
+  }
+  const s = setup({ plan: { balanceError: true } }); refused(await run(s, guarded(s)), s, /wallet balance could not be read/)
+})
+await test('an unchanged signed transaction is also re-simulated with the same effect checks', async () => {
+  const s = setup(); passes(await run(s), s)
+  const s2 = setup({ plan: { signed: { walletDelta: -5000 } } }); refused(await run(s2), s2, /less than the deposit minus the network fee/)
+})
+await test('different wallets and deposits: the policy has no wallet- or deposit-specific data', async () => {
+  for (const lamports of [2_039_280, 3_900_000, 4_100_000]) { const s = setup({ lamports }); passes(await run(s, guarded(s)), s) }
+  const text = readFileSync(root + 'src/lib/solanaLighthousePolicy.ts', 'utf8') + readFileSync(root + 'src/lib/mainnetSolanaReclaim.ts', 'utf8')
+  assert.equal((text.match(/L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95/g) ?? []).length, 2, 'the Lighthouse id appears once as a constant (and once in its evidence note)')
 })
 await test('production code holds no specific wallet, signature or account (generated values only in this test)', async () => {
   const text = readFileSync(root + 'src/lib/mainnetSolanaReclaim.ts', 'utf8')
