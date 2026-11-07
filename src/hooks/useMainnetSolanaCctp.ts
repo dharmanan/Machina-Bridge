@@ -1368,6 +1368,12 @@ export function useMainnetSolanaCctp(
             setState({ isLoading: false, error: null, status: 'The Solana burn is verified. Arc receive is not yet verified; use Activity to recover this existing burn. Do not send again.', result: pendingResult })
             return pendingResult
           }
+          // Chain evidence (a landed transaction with an error, or an expired blockhash) proves this
+          // signed burn moved no USDC; the attempt is released, so a fresh transfer is safe.
+          if (sourceStage === 'wallet-signed' && settled?.verdict.kind === 'not-sent') {
+            setState({ isLoading: false, error: `${settled.verdict.reason} You can start the transfer again.`, status: null, result: finalResult })
+            return finalResult
+          }
           setState({ isLoading: false, error: safePreWalletFailure(finalResult?.error), status: null, result: finalResult })
           return finalResult
         }
