@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 const require = createRequire(import.meta.url), ts = require('typescript'), root = fileURLToPath(new URL('..', import.meta.url))
 require.extensions['.ts'] = (m, f) => m._compile(ts.transpileModule(readFileSync(f, 'utf8').replaceAll('import.meta.env', '({})'), { fileName: f,
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, f)
-const { PublicKey, Keypair, Connection } = require('@solana/web3.js'), { Buffer } = require('buffer')
+const { PublicKey, Keypair, Connection, VersionedTransaction } = require('@solana/web3.js'), { Buffer } = require('buffer')
 const sol = require(root + 'src/lib/mainnetSolanaReclaim.ts'), { SOLANA_MAINNET_CCTP } = require(root + 'src/config/mainnetSolana.ts')
 const { owner, nonce, zero, word, message, source, sc } = require('./fixtures/cctp-recovery.cjs')
 globalThis.window = { localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, dispatchEvent() {}, addEventListener() {}, removeEventListener() {} }
@@ -19,7 +19,7 @@ globalThis.fetch = async input => {
   throw new Error(`Network forbidden: ${String(input)}`)
 }
 
-const wallet = Keypair.generate().publicKey, eventAccount = Keypair.generate().publicKey, program = new PublicKey(sc.messageTransmitterProgram)
+const walletKey = Keypair.generate(), wallet = walletKey.publicKey, eventAccount = Keypair.generate().publicKey, program = new PublicKey(sc.messageTransmitterProgram)
 const solWord = x => '0x' + new PublicKey(x).toBuffer().toString('hex')
 const msg = extra => message({ src: 5, dst: 26, sender: solWord(sc.tokenMessengerMinterProgram), recipient: word(source.tokenMessengerAddress), caller: zero, burn: solWord(sc.usdcMint), mint: word(owner), from: solWord(wallet), ...extra })
 const solMessage = msg({}), solSigned = msg({ nonce, executed: 2000 })
@@ -44,24 +44,28 @@ const unavailable = { 'rpc.ankr.com': all(ANKR), 'solana.drpc.org': all(DRPC) }
 
 let plan, log, signs, sent
 const host = c => new URL(c.rpcEndpoint).hostname
-const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
+const kinds = { getAccountInfo: 'read', getSlot: 'read', getBlockTime: 'read', getLatestBlockhash: 'read', getRecentPrioritizationFees: 'read', getBalance: 'read', simulateTransaction: 'simulate', sendRawTransaction: 'send', confirmTransaction: 'confirm' }
 const answers = {
   getAccountInfo: h => (plan[h] && 'info' in plan[h] ? plan[h].info : plan.info === undefined ? account() : plan.info),
   getSlot: () => 1, getBlockTime: () => Math.floor(Date.now() / 1000),
   getLatestBlockhash: () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 100 }),
   getRecentPrioritizationFees: () => [],
-  simulateTransaction: () => ({ value: { err: plan.simErr ?? null, unitsConsumed: 145_000 } }), sendRawTransaction: () => 'controlled-signature', confirmTransaction: () => ({ value: { err: plan.confirmErr ?? null } }),
+  getBalance: () => 10_000_000,
+  // The signed bytes (VersionedTransaction) are re-simulated: a successful reclaim credits the deposit.
+  simulateTransaction: (_h, tx) => tx instanceof VersionedTransaction
+    ? { value: { err: plan.simErr ?? null, unitsConsumed: 150_000, accounts: [{ lamports: 10_000_000 + 2_000_000 }, null] } }
+    : { value: { err: plan.simErr ?? null, unitsConsumed: 145_000 } }, sendRawTransaction: () => 'controlled-signature', confirmTransaction: () => ({ value: { err: plan.confirmErr ?? null } }),
 }
 for (const [name, kind] of Object.entries(kinds)) Connection.prototype[name] = async function (...args) {
   const h = host(this); log.push(`${h} ${name}`)
   if (name === 'sendRawTransaction') sent.push(Buffer.from(args[0]).toString('hex'))
   const e = plan[h]?.[kind]; if (e) throw e
-  return answers[name](h)
+  return answers[name](h, ...args)
 }
 // Browser-direct history reads fail on public RPCs (publicnode: no history, Foundation: 403 for browser origins).
 Connection.prototype.getParsedTransaction = async function () { log.push(`${host(this)} getParsedTransaction`); throw new Error('direct history read is not allowed in reclaim') }
 const run = (o = {}) => sol.reclaimMainnetSolanaDeposit({ connectedWallet: o.connected ?? wallet.toBase58(), originalWallet: wallet.toBase58(), metadata,
-  provider: { signTransaction: async tx => { signs++; return { serialize: () => Buffer.from([1, 2, 3]), serializeMessage: () => tx.serializeMessage() } } } })
+  provider: { signTransaction: async tx => { signs++; tx.partialSign(walletKey); return tx } } })
 let count = 0
 async function test(name, p, check, o) {
   plan = { ...unavailable, ...p }; log = []; signs = 0; sent = []

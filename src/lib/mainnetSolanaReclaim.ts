@@ -6,11 +6,13 @@ import {
   PublicKey,
   Transaction,
   TransactionInstruction,
+  VersionedTransaction,
 } from '@solana/web3.js'
 import { decodeCctpRecoveryMessage, immutableMessageMatches, readBoundCctpAttestation, cctpWord } from './mainnetCctpRecovery'
 import { getMainnetCctpChain } from '../config/mainnetCctp'
 import { CIRCLE_MAINNET } from '../config/circle'
 import { SOLANA_MAINNET_CCTP } from '../config/mainnetSolana'
+import { LIGHTHOUSE_PROGRAM_ID, SYSVAR_CLOCK_ID, LighthousePolicyError, decodeLighthouseAssertion, lighthouseAccountRule, lighthouseInstructionName } from './solanaLighthousePolicy'
 
 // Anchor discriminators:
 // account:MessageSent -> 83648538a6e1973c
@@ -605,14 +607,34 @@ async function performMainnetSolanaReclaim(input: {
     throw new Error('Phantom did not return a signed Solana transaction.')
   }
 
-  // The signed message must be byte-for-byte the simulated one: no tolerance for any change
-  // (fee payer, blockhash, instructions, order, programs, accounts, data or compute budget).
-  const signedMessage = typeof signed.serializeMessage === 'function' ? signed.serializeMessage() : null
+  // The signed message must be byte-for-byte the simulated one, with a single narrow exception:
+  // read-only Lighthouse assertions that Phantom inserts (verifyWalletAssertions). Any other change
+  // (fee payer, blockhash, signers, writable accounts, the three original instructions, order,
+  // programs, accounts, data or compute budget) blocks the broadcast.
+  let signedMessage: Buffer | null = null
+  try { signedMessage = typeof signed.serializeMessage === 'function' ? signed.serializeMessage() : null } catch { signedMessage = null }
   if (!signedMessage || !signedMessage.equals(expectedMessage)) {
-    const details = reclaimMessageDiagnostics(expectedMessage, signedMessage)
-    throw new Error(`Phantom changed the reclaim transaction (${describeReclaimMessageChange(expectedMessage, signedMessage)}); broadcasting is blocked. Nothing was sent.${details ? ` Details: ${details}` : ''}`)
+    const assertions = signedMessage ? verifyWalletAssertions(expectedMessage, signedMessage) : { ok: false as const, reason: '' }
+    if (!assertions.ok) {
+      const details = reclaimMessageDiagnostics(expectedMessage, signedMessage)
+      throw new Error(`Phantom changed the reclaim transaction (${describeReclaimMessageChange(expectedMessage, signedMessage)}); broadcasting is blocked. Nothing was sent.${assertions.reason ? ` Reason: ${assertions.reason}.` : ''}${details ? ` Details: ${details}` : ''}`)
+    }
+  }
+  // Exactly one signature, by the rent payer, valid for the message Phantom returned.
+  const signature = signed.signatures?.[0]
+  if (signed.signatures?.length !== 1 || !signature?.signature || !signature.publicKey.equals(payee) || !signed.verifySignatures()) {
+    throw new Error('Phantom returned a missing or invalid signature; broadcasting is blocked. Nothing was sent.')
   }
   const raw = signed.serialize()
+  // The exact signed bytes are simulated again with signature verification; their wallet and deposit
+  // effects must match a reclaim before anything is sent.
+  await assertSignedReclaimSimulation(connection, raw, {
+    payee,
+    eventAccount,
+    eventLamports: eventInfo.lamports,
+    units,
+    fee: RECLAIM_BASE_FEE_LAMPORTS + priorityFee,
+  })
   let txHash: string | null = null
   const sendErrors: unknown[] = []
 
@@ -676,6 +698,93 @@ async function reclaimComputeUnitPrice(connection: Connection, accounts: PublicK
 }
 
 const COMPUTE_BUDGET_PROGRAM = ComputeBudgetProgram.programId.toBase58()
+const MAX_WALLET_ASSERTIONS = 8
+
+// Accepts a signed message that equals the expected one except for inserted read-only Lighthouse
+// assertions (exact program id, allowed type, strictly decoded body, one target already in the reclaim).
+export function verifyWalletAssertions(expected: Buffer, signed: Buffer): { ok: true; added: { index: number; name: string }[] } | { ok: false; reason: string } {
+  const fail = (reason: string) => ({ ok: false as const, reason })
+  let a: Message, b: Message
+  try { a = Message.from(expected); b = Message.from(signed) } catch { return fail('the signed message could not be read') }
+  const key = (m: Message, i: number) => m.accountKeys[i]?.toBase58()
+  if (!a.accountKeys[0] || !b.accountKeys[0] || !a.accountKeys[0].equals(b.accountKeys[0])) return fail('the fee payer changed')
+  if (a.recentBlockhash !== b.recentBlockhash) return fail('the blockhash changed')
+  if (a.header.numRequiredSignatures !== b.header.numRequiredSignatures) return fail('the signers changed')
+  const expectedKeys = new Set(a.accountKeys.map((k) => k.toBase58()))
+  const roles = (m: Message, pick: (i: number) => boolean) => m.accountKeys.map((k, i) => (pick(i) ? k.toBase58() : null)).filter(Boolean).sort().join(',')
+  // New keys: only the Lighthouse program and, for AssertSysvarClock alone, the read-only Clock sysvar (checked below).
+  for (const k of b.accountKeys) if (!expectedKeys.has(k.toBase58()) && k.toBase58() !== LIGHTHOUSE_PROGRAM_ID && k.toBase58() !== SYSVAR_CLOCK_ID) return fail('a new account was added')
+  if (roles(a, (i) => a.isAccountSigner(i)) !== roles(b, (i) => b.isAccountSigner(i))) return fail('the signers changed')
+  if (roles(a, (i) => a.isAccountWritable(i)) !== roles(b, (i) => b.isAccountWritable(i))) return fail('the writable accounts changed')
+  const resolve = (m: Message) => m.compiledInstructions.map((ix) => ({
+    program: key(m, ix.programIdIndex),
+    accounts: ix.accountKeyIndexes.map((i) => `${key(m, i)}:${m.isAccountSigner(i)}:${m.isAccountWritable(i)}`).join(','),
+    targets: ix.accountKeyIndexes.map((i) => key(m, i)),
+    data: Buffer.from(ix.data),
+  }))
+  const original = resolve(a), returned = resolve(b)
+  const kept = returned.filter((x) => x.program !== LIGHTHOUSE_PROGRAM_ID)
+  if (kept.length !== original.length || !kept.every((x, i) => x.program === original[i].program && x.accounts === original[i].accounts && x.data.equals(original[i].data))) {
+    return fail('the original reclaim or compute budget instructions changed')
+  }
+  const added: { index: number; name: string }[] = []
+  for (let index = 0; index < returned.length; index += 1) {
+    const x = returned[index]
+    if (x.program !== LIGHTHOUSE_PROGRAM_ID) continue
+    let name = lighthouseInstructionName(x.data[0])
+    try { name = decodeLighthouseAssertion(x.data).name } catch (error) {
+      return fail(error instanceof LighthousePolicyError ? `${error.message} (#${index})` : `Lighthouse ${name} could not be verified (#${index})`)
+    }
+    if (index < 2) return fail(`Lighthouse ${name} was placed before the compute budget (#${index})`)
+    if (lighthouseAccountRule(x.data[0]) === 'clock-only') {
+      // No account, or exactly the Clock sysvar (read-only, never a signer: the role checks above).
+      if (x.targets.length > 1 || (x.targets.length === 1 && x.targets[0] !== SYSVAR_CLOCK_ID)) return fail(`Lighthouse ${name} may reference only the Clock sysvar (#${index})`)
+      added.push({ index, name })
+      continue
+    }
+    if (x.targets.length !== 1) return fail(`Lighthouse ${name} must target exactly one account (#${index})`)
+    const target = x.targets[0]
+    if (!target || !expectedKeys.has(target) || target === LIGHTHOUSE_PROGRAM_ID) return fail(`Lighthouse ${name} targets an account outside the reclaim (#${index})`)
+    added.push({ index, name })
+  }
+  // The Clock sysvar may appear only as the single account of AssertSysvarClock, never as a program.
+  if (!expectedKeys.has(SYSVAR_CLOCK_ID) && b.accountKeys.some((k) => k.toBase58() === SYSVAR_CLOCK_ID)) {
+    const clockUses = returned.filter((x) => x.program === SYSVAR_CLOCK_ID || x.targets.includes(SYSVAR_CLOCK_ID))
+    if (!clockUses.length || clockUses.some((x) => x.program !== LIGHTHOUSE_PROGRAM_ID || lighthouseAccountRule(x.data[0]) !== 'clock-only')) return fail('the Clock sysvar was added outside AssertSysvarClock')
+  }
+  if (added.length === 0) return fail('the message changed without an added assertion')
+  if (added.length > MAX_WALLET_ASSERTIONS) return fail('too many wallet assertions')
+  return { ok: true, added }
+}
+
+// Re-simulates the exact signed bytes (signature verified) and requires the effects of a reclaim:
+// success within the compute limit, the deposit account closed, and the wallet receiving at least the
+// deposit minus the fee. Missing or unclear results block the broadcast.
+async function assertSignedReclaimSimulation(connection: Connection, raw: Buffer, x: { payee: PublicKey; eventAccount: PublicKey; eventLamports: number; units: number; fee: number }) {
+  const blocked = (why: string) => new Error(`The signed reclaim did not pass the final simulation (${why}); broadcasting is blocked. Nothing was sent.`)
+  let before: number
+  try { before = await connection.getBalance(x.payee, 'confirmed') } catch { throw blocked('the wallet balance could not be read') }
+  let result: Awaited<ReturnType<Connection['simulateTransaction']>>
+  try {
+    result = await connection.simulateTransaction(VersionedTransaction.deserialize(raw), {
+      sigVerify: true,
+      replaceRecentBlockhash: false,
+      commitment: 'confirmed',
+      accounts: { encoding: 'base64', addresses: [x.payee.toBase58(), x.eventAccount.toBase58()] },
+    })
+  } catch {
+    throw blocked('the simulation could not be run')
+  }
+  const v = result?.value
+  if (!v || v.err) throw blocked('the signed transaction would fail')
+  if (typeof v.unitsConsumed !== 'number' || v.unitsConsumed > x.units) throw blocked('the compute budget was exceeded or not reported')
+  const accounts = v.accounts
+  if (!Array.isArray(accounts) || accounts.length !== 2) throw blocked('the account effects were not reported')
+  const after = accounts[0]?.lamports, deposit = accounts[1]
+  if (!Number.isSafeInteger(before) || typeof after !== 'number' || !Number.isSafeInteger(after)) throw blocked('the wallet effect was not reported')
+  if (deposit && deposit.lamports !== 0) throw blocked('the deposit account would stay open')
+  if (after - before < x.eventLamports - x.fee) throw blocked('the wallet would receive less than the deposit minus the network fee')
+}
 
 // Names what a wallet changed in a signed reclaim message (for the error shown to the user only).
 export function describeReclaimMessageChange(expected: Buffer, signed: Buffer | null): string {
@@ -723,6 +832,10 @@ function instructionShapes(m: Message): InstructionShape[] {
       if (d[0] === 2 && d.length === 5) return { index, key: 'cb:limit', label: 'ComputeBudget:limit', limit: d.readUInt32LE(1) }
       if (d[0] === 3 && d.length === 9) return { index, key: 'cb:price', label: 'ComputeBudget:price', price: d.readBigUInt64LE(1) }
       return { index, key: `cb:type${d[0] ?? '?'}`, label: `ComputeBudget:type${d[0] ?? '?'}` }
+    }
+    if (id === LIGHTHOUSE_PROGRAM_ID) {
+      const type = lighthouseInstructionName(ix.data[0])
+      return { index, key: `lh:${ix.data[0] ?? '?'}`, label: `Lighthouse:${type} (${ix.accountKeyIndexes.length} accounts)` }
     }
     const name = id ? known[id] : undefined
     return { index, key: `p:${id ?? '?'}`, label: name ?? `program ${shortProgramId(id)} (${ix.accountKeyIndexes.length} accounts)` }
