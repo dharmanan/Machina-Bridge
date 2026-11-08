@@ -32,6 +32,7 @@ These paths are covered by negative tests: a refused transaction must never reac
 - **Solana RPC proxies:** limit methods, parameters, request and response size, and time per call, plus 600 requests per minute per client.
 - **Browser hardening:** CSP with `frame-ancestors 'none'` and a hashed inline script; HSTS.
 - **CI:** GitHub Actions are pinned to full commit SHAs, and a test fails if one is not.
+- **SBOM:** a software bill of materials (SPDX) of every dependency can be exported from GitHub at any time: Insights → Dependency graph → Export SBOM.
 
 ## What Machina trusts without verifying
 
@@ -50,7 +51,7 @@ These are known, tracked and of low or medium impact. None of them lets a third 
 | Release process | A change merged to `main` is deployed by Vercel without waiting for the GitHub CI run. | Every change is tested locally before it is pushed. On `main`, CI runs the fast safety suites and the dependency audit unless a commit opts out with `[skip ci]`; the browser and source suites run on pull requests and release checks. |
 | Solana RPC proxies | The per-client limit (600 requests per minute) is counted in the memory of each serverless instance, so it is best effort rather than a global limit. | Allowed methods, parameters, request and response sizes, and time per call are also limited. A limited request never reaches a provider. |
 | Dependencies | `npm audit` reports two upstream advisories: Zod (memory use on oversized collections) and elliptic (a risky cryptographic primitive). | Zod is guarded by a backport and response size limits. elliptic was not found reachable in the production bundle. Both wait for upstream fixes. |
-| CI and browser hardening | The CSP allows HTTPS and WSS connections broadly, because wallets and RPC providers vary; there is no CodeQL scan or SBOM yet. | CI runs `npm audit` and the security regression suites. Narrowing the CSP needs testing with real wallets and is planned. |
+| CI and browser hardening | The CSP allows HTTPS and WSS connections broadly, because wallets and RPC providers vary; there is no CodeQL scan yet. | CI runs `npm audit` and the security regression suites. Narrowing the CSP needs testing with real wallets and is planned. |
 | Phantom, Solana → Arc | Phantom adds a check that pins the USDC mint account, which changes often. A burn confirmed slowly can therefore fail on chain. | No USDC moves; only the network fee (~0.00009 SOL) is lost, and the app says the transfer can be retried. Confirm promptly when Phantom opens. A fix depends on Phantom. |
 
 ## Not in the live product
