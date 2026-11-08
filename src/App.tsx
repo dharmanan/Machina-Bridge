@@ -25,6 +25,7 @@ import './index.css'
 const MainnetSwapPreview = lazy(() => import('./components/MainnetSwapScreen'))
 
 type Tab = 'swap' | 'bridge' | 'earn' | 'dashboard' | 'activity'
+const TESTNET_RENDERED_TABS: ReadonlySet<Tab> = new Set(['swap', 'bridge', 'dashboard'])
 
 export default function App() {
   const [appNetwork, setAppNetwork] = useState<AppNetwork>(() => readStoredAppNetwork())
@@ -120,7 +121,9 @@ export default function App() {
     storeAppNetwork(network)
     setShowNetworkDropdown(false)
 
-    if (network === 'mainnet' || activeTab === 'activity') {
+    // Testnet renders only Swap, Bridge and Dashboard: a mainnet-only tab (Earn, Activity)
+    // would leave the page empty, so it falls back to Bridge.
+    if (network === 'mainnet' || !TESTNET_RENDERED_TABS.has(activeTab)) {
       setActiveTab('bridge')
     }
   }

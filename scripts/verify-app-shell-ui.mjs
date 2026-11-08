@@ -126,6 +126,16 @@ try {
     await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(base); await page.evaluate(n => localStorage.setItem('machina_app_network', n), network); await page.goto(base)
     for (const tab of tabs) { const before = pageErrors.length; await page.getByRole('button', { name: tab, exact: true }).first().click(); await page.waitForTimeout(400); assert.ok(await page.locator('main, #root').first().innerText().then(t => t.length > 40), `${network} ${tab} rendered`); assert.deepEqual(pageErrors.slice(before), [], `${network} ${tab}`) }
   })
+  await test('switching to Testnet from any mainnet tab (Earn and Activity included) never leaves the page empty', async () => {
+    await page.setViewportSize({ width: 1280, height: 900 })
+    for (const tab of ['Bridge', 'Swap', 'Earn', 'Dashboard', 'Activity']) {
+      await page.goto(base); await page.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet')); await page.goto(base)
+      await page.getByRole('button', { name: tab, exact: true }).first().click(); await page.waitForTimeout(300)
+      await page.getByRole('button', { name: 'Testnet', exact: true }).first().click(); await page.waitForTimeout(400)
+      const text = await page.locator('main').first().innerText()
+      assert.ok(text.trim().length > 40, `Testnet after mainnet ${tab} rendered content`)
+    }
+  })
   await test('desktop and mobile top bar and Sui bridge fit without horizontal overflow', async () => {
     await page.evaluate(() => localStorage.setItem('machina_app_network', 'mainnet'))
     for (const [name, width, height] of [['desktop', 1280, 900], ['mobile', 390, 844]]) {
