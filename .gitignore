@@ -14,6 +14,8 @@ dist/
 !README.md
 !SECURITY.md
 !docs/SECURITY_STATUS.md
+!RISK.md
+!PRIVACY.md
 
 # Security reports and local audit files
 *.pdf

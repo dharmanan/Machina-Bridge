@@ -1,5 +1,6 @@
 import {
   RpcRequestError,
+  createClientRateLimiter,
   createDeadline,
   readJsonBody,
   readLimitedText,
@@ -43,6 +44,8 @@ const ALLOWED_METHODS = new Set([
   'sendTransaction',
   'simulateTransaction',
 ])
+
+const rateLimiter = createClientRateLimiter()
 
 function send(res, status, body) {
   res
@@ -123,6 +126,16 @@ export default async function handler(req, res) {
       jsonrpc: '2.0',
       id: null,
       error: { code: -32600, message: 'Method not allowed' },
+    })
+  }
+
+  const wait = rateLimiter.retryAfter(req)
+  if (wait) {
+    res.setHeader('Retry-After', String(wait))
+    return send(res, 429, {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32005, message: 'Too many Solana RPC requests. Try again shortly.' },
     })
   }
 

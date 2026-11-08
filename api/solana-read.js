@@ -1,5 +1,6 @@
 import {
   RpcRequestError,
+  createClientRateLimiter,
   createDeadline,
   readJsonBody,
   readLimitedText,
@@ -22,6 +23,8 @@ const ALLOWED_METHODS = new Set([
   'getAccountInfo',
   'getSignatureStatuses',
 ])
+
+const rateLimiter = createClientRateLimiter()
 
 function send(res, status, body) {
   res.status(status).setHeader('Content-Type', 'application/json; charset=utf-8').send(JSON.stringify(body))
@@ -72,6 +75,12 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST')
     return send(res, 405, { error: 'Method not allowed' })
+  }
+
+  const wait = rateLimiter.retryAfter(req)
+  if (wait) {
+    res.setHeader('Retry-After', String(wait))
+    return send(res, 429, { error: 'Too many Solana read requests. Try again shortly.' })
   }
 
   let call

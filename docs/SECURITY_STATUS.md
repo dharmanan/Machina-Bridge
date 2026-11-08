@@ -1,6 +1,6 @@
 # Security status
 
-Last reviewed: 7 November 2026 (main `8972fae`).
+Last reviewed: 8 November 2026.
 
 Machina Bridge is a **Public Beta**. It has not had an independent security audit. This page says what Machina checks before your wallet is asked to sign, what it trusts without verifying, and which limitations are known. It does not claim the application is free of vulnerabilities.
 
@@ -28,8 +28,9 @@ These paths are covered by negative tests: a refused transaction must never reac
 - **Third-party responses:** responses from Circle Iris, Earn Kit and other APIs are size-limited, and a Zod collection backport limits validation cost. See [`docs/dependency-security/REVIEW.md`](dependency-security/REVIEW.md).
 - **Telemetry:** SDK telemetry is turned off where the SDK supports it.
 - **Server-side state:** there is no server-side database for user transfers. The former Redis/Upstash records were removed, and transfer and recovery records stay in the user's browser.
-- **Solana RPC proxy:** limits methods, parameters, request and response size, and time per call.
-- **Browser hardening:** CSP with `frame-ancestors 'none'` and a hashed inline script.
+- **Solana RPC proxies:** limit methods, parameters, request and response size, and time per call, plus 600 requests per minute per client.
+- **Browser hardening:** CSP with `frame-ancestors 'none'` and a hashed inline script; HSTS.
+- **CI:** GitHub Actions are pinned to full commit SHAs, and a test fails if one is not.
 
 ## What Machina trusts without verifying
 
@@ -46,9 +47,9 @@ These are known, tracked and of low or medium impact. None of them lets a third 
 | Area | Limitation | What is in place |
 | --- | --- | --- |
 | Release process | A change merged to `main` is deployed by Vercel without waiting for the GitHub CI run. | Every change is tested locally before it is pushed, and CI also runs on `main` unless a commit opts out with `[skip ci]`. |
-| Solana RPC proxy | Requests are not rate-limited per client. | Allowed methods, parameters, request and response sizes, and time per call are limited. |
+| Solana RPC proxies | The per-client limit (600 requests per minute) is counted in the memory of each serverless instance, so it is best effort rather than a global limit. | Allowed methods, parameters, request and response sizes, and time per call are also limited. A limited request never reaches a provider. |
 | Dependencies | `npm audit` reports two upstream advisories: Zod (memory use on oversized collections) and elliptic (a risky cryptographic primitive). | Zod is guarded by a backport and response size limits. elliptic was not found reachable in the production bundle. Both wait for upstream fixes. |
-| CI and browser hardening | GitHub Actions use version tags rather than pinned commits; the CSP allows HTTPS and WSS connections broadly; there is no CodeQL scan or SBOM yet. | CI runs `npm audit` and the security regression suites. These are planned hardening steps. |
+| CI and browser hardening | The CSP allows HTTPS and WSS connections broadly, because wallets and RPC providers vary; there is no CodeQL scan or SBOM yet. | CI runs `npm audit` and the security regression suites. Narrowing the CSP needs testing with real wallets and is planned. |
 | Phantom, Solana → Arc | Phantom adds a check that pins the USDC mint account, which changes often. A burn confirmed slowly can therefore fail on chain. | No USDC moves; only the network fee (~0.00009 SOL) is lost, and the app says the transfer can be retried. Confirm promptly when Phantom opens. A fix depends on Phantom. |
 
 ## Not in the live product

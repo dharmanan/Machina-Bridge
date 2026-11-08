@@ -1,6 +1,42 @@
 // Request and upstream limits for the same-origin Solana RPC proxies (api/solana-rpc.js,
 // api/solana-read.js). No storage, no external service, no dependency: every check is a pure
-// function of the request or of the upstream response. Rate limiting is NOT done here.
+// function of the request or of the upstream response, except the per-client request counter
+// below, which lives only in the memory of one serverless instance.
+
+// Per-client request limit. The heaviest real use (deposit discovery plus a transfer being
+// confirmed) stays far below it; it only stops a client from draining the providers' quota.
+// The counter is per instance and resets when the instance is recycled: a best-effort limit,
+// not a guarantee across all instances.
+export const CLIENT_RATE_WINDOW_MS = 60_000
+export const CLIENT_RATE_LIMIT = 600
+const MAX_TRACKED_CLIENTS = 1000
+
+function clientKey(req) {
+  const forwarded = req.headers?.['x-vercel-forwarded-for'] || req.headers?.['x-forwarded-for']
+  const value = typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : ''
+  return value.slice(0, 80) || 'unknown'
+}
+
+export function createClientRateLimiter({ limit = CLIENT_RATE_LIMIT, windowMs = CLIENT_RATE_WINDOW_MS, now = Date.now } = {}) {
+  const buckets = new Map()
+  return {
+    // Returns 0 when the request may proceed, or the seconds to wait before retrying.
+    retryAfter(req) {
+      const t = now()
+      const key = clientKey(req)
+      const current = buckets.get(key)
+      if (!current || current.resetAt <= t) {
+        buckets.delete(key)
+        if (buckets.size >= MAX_TRACKED_CLIENTS) buckets.delete(buckets.keys().next().value)
+        buckets.set(key, { count: 1, resetAt: t + windowMs })
+        return 0
+      }
+      current.count += 1
+      return current.count > limit ? Math.max(1, Math.ceil((current.resetAt - t) / 1000)) : 0
+    },
+    size: () => buckets.size,
+  }
+}
 
 export const MAX_RPC_BODY_BYTES = 16 * 1024
 export const MAX_UPSTREAM_RESPONSE_BYTES = 2 * 1024 * 1024

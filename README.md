@@ -4,7 +4,7 @@
 
 Machina Bridge is an independent, community-built interface for supported Arc blockchain and DeFi services. The application is available as a **Public Beta**. It runs on mainnet with real funds and has **not** had an independent security audit; see [Security](#independence-security-and-license).
 
-**[Launch Machina Bridge](https://www.machinabridge.xyz/)** · [Arc documentation](https://docs.arc.network/) · [Security status](docs/SECURITY_STATUS.md)
+**[Launch Machina Bridge](https://www.machinabridge.xyz/)** · [Arc documentation](https://docs.arc.network/) · [Security status](docs/SECURITY_STATUS.md) · [Risks](RISK.md) · [Privacy](PRIVACY.md)
 
 ## Features
 
@@ -67,7 +67,7 @@ Machina currently charges no service commission on its supported transaction flo
 
 Machina keeps no server-side database of user transfers. Transfer, recovery and testnet history stay in your browser; chain data is read through public RPCs, Circle's attestation service and Blockscout, using same-origin proxies where needed.
 
-Transactions involving real assets are irreversible and carry financial risks. Use a wallet you control and never share a seed phrase or private key.
+Transactions involving real assets are irreversible and carry financial risks. Use a wallet you control and never share a seed phrase or private key. Read the [risk disclosure](RISK.md) and the [privacy notes](PRIVACY.md) before using mainnet.
 
 ## Technology and architecture
 

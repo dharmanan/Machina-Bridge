@@ -32,7 +32,11 @@ test('CI records the real audit, reports known risks, preserves JSON and runs fu
   assert.match(workflow, /node scripts\/run-suites\.mjs fast/)
   assert.match(workflow, /if npm audit --omit=dev --json > npm-audit-production.json/)
   assert.match(workflow, /report-dependency-audit\.mjs npm-audit-production.json/)
-  assert.match(workflow, /actions\/upload-artifact@v4/)
+  assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40} # v4\./)
+  // Every third-party action is pinned to a full commit SHA, never a moving tag.
+  const uses = [...workflow.matchAll(/uses:\s*(\S+)/g)].map(m => m[1])
+  assert.ok(uses.length >= 10, 'workflow actions found')
+  for (const ref of uses) assert.match(ref, /^[\w.-]+\/[\w.-]+@[0-9a-f]{40}$/, `unpinned action: ${ref}`)
   assert.equal((workflow.match(/contains\(github.event.head_commit.message, '\[release-check\]'\)/g) ?? []).length, 2)
   assert.doesNotMatch(workflow, /feature\/uniswap-swap-preview/)
   assert.match(workflow, /refs\/heads\/main/)

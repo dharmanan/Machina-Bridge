@@ -367,12 +367,47 @@ await test('total time budget: hanging providers stop at 25 s (rpc) and 20 s (re
   assert.equal(d.attemptTimeout(12_000), 0)
 })
 
-await test('no new runtime dependency, storage or rate-limit state in the proxy path', async () => {
+await test('no runtime dependency or external storage; the only state is the in-memory client counter', async () => {
   for (const file of ['api/solana-rpc.js', 'api/solana-read.js', 'api/_lib/solana-rpc-guard.js']) {
     const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
     const imports = [...src.matchAll(/from\s+['"]([^'"]+)['"]/g)].map(m => m[1])
     assert.ok(imports.every(i => i === './_lib/solana-rpc-guard.js'), `${file} imports ${imports}`)
-    assert.doesNotMatch(src, /redis|upstash|enforceRateLimit|new Map\(/i, `${file} must stay stateless`)
+    assert.doesNotMatch(src, /redis|upstash|kv\.|@vercel\//i, `${file} must not use external storage`)
+    assert.equal((src.match(/new Map\(/g) ?? []).length, file === 'api/_lib/solana-rpc-guard.js' ? 1 : 0, `${file}: only the rate counter keeps state`)
+  }
+})
+
+await test('per-client rate limit: 600 requests per minute pass, the 601st is refused before any provider', async () => {
+  let t = 1_000_000
+  const limiter = guard.createClientRateLimiter({ now: () => t })
+  const client = ip => ({ headers: { 'x-forwarded-for': `${ip}, 10.0.0.1` } })
+  for (let i = 0; i < guard.CLIENT_RATE_LIMIT; i += 1) assert.equal(limiter.retryAfter(client('198.51.100.1')), 0)
+  assert.equal(limiter.retryAfter(client('198.51.100.1')), 60, 'over the limit: wait for the window')
+  assert.equal(limiter.retryAfter(client('198.51.100.2')), 0, 'another client is not affected')
+  t += 30_000
+  assert.equal(limiter.retryAfter(client('198.51.100.1')), 30)
+  t += 30_000
+  assert.equal(limiter.retryAfter(client('198.51.100.1')), 0, 'a new window starts after one minute')
+  for (let i = 0; i < 1500; i += 1) limiter.retryAfter(client(`203.0.113.${i % 250}-${i}`))
+  assert.ok(limiter.size() <= 1000, 'the counter stays bounded')
+
+  // The real handlers: one client is refused with 429 and Retry-After, without reaching a provider.
+  for (const [handler, body] of [[rpcHandler, { jsonrpc: '2.0', id: 1, method: 'getSlot', params: [] }], [readHandler, { method: 'getAccountInfo', params: [payee] }]]) {
+    const headers = { ...jsonHeaders, 'x-forwarded-for': `192.0.2.${handler === rpcHandler ? 1 : 2}` }
+    for (let i = 0; i < guard.CLIENT_RATE_LIMIT; i += 1) {
+      const res = mockRes()
+      await handler(vercelRequest({ headers, body }), res)
+      assert.equal(res.statusCode, 200)
+    }
+    upstream = []
+    const res = mockRes()
+    await handler(vercelRequest({ headers, body }), res)
+    assert.equal(res.statusCode, 429)
+    assert.ok(Number(res.getHeader('retry-after')) >= 1)
+    assert.equal(upstream.length, 0, 'a limited request must not reach any provider')
+    const other = mockRes()
+    await handler(vercelRequest({ headers: { ...jsonHeaders, 'x-forwarded-for': '192.0.2.99' }, body }), other)
+    assert.equal(other.statusCode, 200, 'other clients keep working')
   }
 })
 
